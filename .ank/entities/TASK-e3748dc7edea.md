@@ -5,7 +5,7 @@ slug: tape-scenes-changements-de-plan-et-images-cl-s
 title: "Étape scenes : changements de plan et images clés"
 created: 2026-09-25T09:39:38Z
 author: claude-plan
-status: open
+status: done
 scope:
   - clipper/scenes.py
   - tests/test_scenes.py
@@ -15,6 +15,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/ef30e59d2a8b@615afdc
+    tree: scope/e14db3f6006d
+    criteria: f59ce4053c9c
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 2
+version: 4
 ---
