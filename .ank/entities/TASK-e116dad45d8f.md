@@ -5,7 +5,7 @@ slug: tape-qa-contr-le-qualit-du-clip-rendu-par-claude
 title: "Étape qa : contrôle qualité du clip rendu par Claude"
 created: 2026-09-25T09:39:47Z
 author: claude-plan
-status: open
+status: done
 scope:
   - clipper/qa.py
   - tests/test_qa.py
@@ -15,6 +15,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/2fcd84ca3e0a@adab013
+    tree: scope/f16945f1f10d
+    criteria: d7dfc01719ea
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---
