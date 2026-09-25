@@ -17,7 +17,7 @@ criteria_by: creator
 verify: [tests]
 method: tdd
 schema: 4
-version: 1
+version: 3
 ---
 
 Police libre embarquée (ex. Montserrat ou Poppins ExtraBold, licence OFL).
