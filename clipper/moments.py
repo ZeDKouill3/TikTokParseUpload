@@ -13,12 +13,24 @@ Entrees (workspace/<video_id>/) :
 Sortie : workspace/<video_id>/moments.json
 
     {"video_id", "rubric": {"path", "weights", "min_score"}, "chunked",
+     "selection": "single" | "jury",
+     "jury": {"judges", "seed", "threshold", "quorum", "failed", "debated"},  # jury
      "moments": [{"id", "start", "end", "duration", "format", "parts",
                   "scores", "bonus", "final_score", "justification",
-                  "hook_text"}],
+                  "hook_text", "jury"}],                     # jury : si jury
      "rejected": [{"start", "end", "reason", ...}],
      "rescored": {"source", "changed": [{"id", "start", "end", "hook_text",
                                           "before", "after"}]}}   # re-notation
+
+Selection par le jury (ADR-ff87), en mode auto ou si [moments] selection =
+"jury" : l'appel ``moments`` ne sert qu'a proposer une liste large de
+candidats ; clipper.jury les note ensuite sur la meme grille, et ses notes
+agregees (``scores``) remplacent celles du proposeur dans le score final
+(bonus, ``min_score`` et non-chevauchement inchanges). ``jury`` de chaque
+candidat garde les notes et la justification du proposeur, le score du jury,
+son veto et sa trace (tours, revisions, dissidences). Un veto rejette le
+candidat avec sa raison, sans score final. Juge invalide : l'erreur remonte,
+rien n'est ecrit (ADR-ad2e).
 
 Re-notation : si moments.json existe et que vision.json est plus recent,
 l'etape (sans ``force``) ne rappelle pas le LLM ; elle recalcule le bonus
@@ -40,7 +52,8 @@ tout le reste est fait ici, de facon verifiable :
 Transcription trop longue pour un appel (``max_transcript_chars``) : tranches
 avec recouvrement, puis un tour de comparaison final qui re-note ensemble
 tous les candidats, pour que les notes de tranches differentes soient
-comparables. Reponse invalide ou Claude indisponible : l'erreur remonte, rien
+comparables (sauf avec le jury, qui note deja tous les candidats ensemble).
+Reponse invalide ou Claude indisponible : l'erreur remonte, rien
 n'est ecrit (ADR-ad2e).
 """
 
@@ -53,9 +66,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from clipper import llm
+from clipper import jury, llm
 
 CONFIG_DEFAULTS: dict[str, object] = {
+    # Qui note les candidats du proposeur : "single" (le proposeur seul) ou
+    # "jury" (clipper.jury, ADR-ff87). En mode auto, le jury note toujours.
+    "selection": "single",
     # Grille de notation (SPEC-53f3), relative au dossier courant.
     "rubric_path": "rubric.toml",
     # Au-dela, la transcription part en tranches (environ 4 caracteres par
@@ -70,6 +86,7 @@ CONFIG_DEFAULTS: dict[str, object] = {
 }
 
 FORMATS = ("single", "multipart")
+SELECTIONS = ("single", "jury")
 _SENTENCE_END = (".", "!", "?", "…")
 _EXAMPLE_TEXT_CHARS = 600
 
@@ -598,7 +615,54 @@ def _public(c: dict[str, Any]) -> dict[str, Any]:
         "final_score": c["final_score"],
         "justification": c["justification"],
         "hook_text": c["hook_text"],
+        **({"jury": c["jury"]} if "jury" in c else {}),
     }
+
+
+# --------------------------------------------------------------------------
+# Jury
+# --------------------------------------------------------------------------
+
+
+def _judge(
+    candidates: list[dict[str, Any]], sents: list[Sentence], rubric: dict[str, Any], context: str, config: Any
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Fait noter les candidats par clipper.jury ; renvoie (deroulement du
+    jury sans les candidats, candidats non vetes, rejets pour veto). Les
+    notes agregees du jury remplacent celles du proposeur, gardees avec la
+    trace du jury dans ``jury`` de chaque candidat."""
+    items = [
+        {
+            "id": f"m{n}",
+            "text": " ".join(s.text for s in sents[c["_first"] : c["_last"] + 1]),
+            "context": f"[{_span(c['_start'], c['_end'])}] s, {c['format']}",
+        }
+        for n, c in enumerate(candidates)
+    ]
+    result = jury.deliberate(items, rubric, context=context, config=config)
+    kept: list[dict[str, Any]] = []
+    vetoed: list[dict[str, Any]] = []
+    for c, verdict in zip(candidates, result["candidates"], strict=True):
+        c["jury"] = {
+            "proposer": {"scores": c["scores"], "justification": c["justification"]},
+            **{k: verdict[k] for k in ("score", "veto", "debated", "trace")},
+        }
+        c["scores"] = verdict["scores"]
+        if verdict["veto"] is None:
+            kept.append(c)
+            continue
+        # Sans final_score : la re-notation apres vision ne le reprend pas.
+        vetoed.append({
+            "start": _floor1(c["_start"]),
+            "end": _ceil1(c["_end"]),
+            "reason": f"veto du juge {verdict['veto']['judge']} : {verdict['veto']['reason']}",
+            "format": c["format"],
+            "hook_text": c["hook_text"],
+            "justification": c["justification"],
+            "scores": c["scores"],
+            "jury": c["jury"],
+        })
+    return {k: v for k, v in result.items() if k != "candidates"}, kept, vetoed
 
 
 # --------------------------------------------------------------------------
@@ -615,11 +679,16 @@ def _read_json(path: Path, optional: bool = False) -> Any:
 
 
 def _settings(config: Any) -> dict[str, Any]:
-    if config is None:
-        from clipper.config import load_config
-
-        config = load_config()
     return {**CONFIG_DEFAULTS, **config.section("moments")}
+
+
+def _selection(config: Any, settings: dict[str, Any]) -> str:
+    """"jury" en mode auto (ADR-ff87) ou si [moments] selection = "jury" ;
+    sinon "single"."""
+    selection = settings["selection"]
+    if selection not in SELECTIONS:
+        raise MomentsError(f"[moments] selection invalide : {selection!r} (attendu : {' | '.join(SELECTIONS)})")
+    return "jury" if config.mode == "auto" else selection
 
 
 def run(
@@ -634,6 +703,10 @@ def run(
     dont le chemin est renvoye. Un resultat deja present n'est pas refait,
     sauf ``force`` ; si vision.json est plus recent que lui, il est seulement
     re-note, sans appel LLM (voir ``_rescore``)."""
+    if config is None:
+        from clipper.config import load_config
+
+        config = load_config()
     video_dir = Path(workspace_dir) / video_id
     out = video_dir / "moments.json"
     if out.exists() and not force:
@@ -647,6 +720,7 @@ def run(
     audio = _read_json(video_dir / "audio.json")
     vision = _read_json(video_dir / "vision.json", optional=True)
     settings = _settings(config)
+    selection = _selection(config, settings)
     rubric_path = Path(settings["rubric_path"])
     rubric = load_rubric(rubric_path)
     examples = list(examples or [])
@@ -682,7 +756,12 @@ def run(
             candidates.append(candidate)
     candidates.sort(key=lambda c: c["_start"])
 
-    if chunked and candidates:
+    jury_info = None
+    if selection == "jury":
+        # Le jury note tous les candidats ensemble : pas de tour de comparaison.
+        jury_info, candidates, vetoed = _judge(candidates, sents, rubric, context, config)
+        rejected += vetoed
+    elif chunked and candidates:
         answer = llm.ask(
             "moments",
             _comparison_prompt(context, rubric, candidates, sents),
@@ -708,6 +787,8 @@ def run(
         "video_id": video_id,
         "rubric": _rubric_info(rubric_path, rubric),
         "chunked": chunked,
+        "selection": selection,
+        **({"jury": jury_info} if jury_info is not None else {}),
         "moments": [{"id": n, **_public(c)} for n, c in enumerate(kept)],
         "rejected": rejected + rejected_scored,
     }
@@ -738,6 +819,7 @@ def _restore(entry: dict[str, Any], sents: list[Sentence], retained: bool) -> di
         "_end": sents[last].end,
         "_before": {"final_score": entry["final_score"], "retained": retained},
         **{k: entry[k] for k in ("format", "parts", "scores", "bonus", "final_score", "justification", "hook_text")},
+        **({"jury": entry["jury"]} if "jury" in entry else {}),
     }
 
 
