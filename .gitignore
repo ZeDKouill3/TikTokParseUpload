@@ -1,1 +1,7 @@
 .ank/index.db
+.venv/
+workspace/
+output/
+*.egg-info/
+__pycache__/
+*.pyc
