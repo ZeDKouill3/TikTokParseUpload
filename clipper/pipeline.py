@@ -9,8 +9,9 @@ Enchainement, par video (``STEPS``, dans l'ordre d'execution) :
 - chaque etape saute d'elle-meme ce qui est deja fait (resultat present sous
   workspace/<video_id>/ ou output/<video_id>/), sauf ``force`` ;
 - ``moments`` recoit ``examples=feedback.examples(k)`` ; apres ``vision``,
-  moments est relance si vision.json est plus recent que moments.json (bonus
-  des images marquantes) ;
+  moments est relance sans force : si vision.json est plus recent que
+  moments.json, ses candidats sont re-notes (bonus des images marquantes)
+  sans nouvel appel LLM ;
 - un seul modele lourd en VRAM a la fois (ADR-fb9b) : les etapes tournent en
   sequence et chacune libere son modele (whisper dans transcribe, detecteur de
   visages dans reframe) avant de rendre la main ;
@@ -306,10 +307,9 @@ class _Run:
 
     def vision(self) -> None:
         vision.run(self.video_id, self.ws, config=self.config, force=self.force, **self.opts("vision"))
-        # moments relance pour le bonus visuel si vision.json est plus recent.
-        vision_mtime = (self.dir / "vision.json").stat().st_mtime_ns
-        if vision_mtime > (self.dir / "moments.json").stat().st_mtime_ns:
-            self._moments(True)
+        # vision.json plus recent que moments.json : moments, relance sans
+        # force, re-note ses candidats (bonus visuel) sans rappeler le LLM.
+        self._moments(False)
 
     def parts(self) -> None:
         parts.run(self.video_id, self.ws, config=self.config, force=self.force, **self.opts("parts"))
