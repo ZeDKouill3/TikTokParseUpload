@@ -15,8 +15,10 @@ Enchainement, par video (``STEPS``, dans l'ordre d'execution) :
 - un seul modele lourd en VRAM a la fois (ADR-fb9b) : les etapes tournent en
   sequence et chacune libere son modele (whisper dans transcribe, detecteur de
   visages dans reframe) avant de rendre la main ;
-- ``reframe`` passe avant ``subtitles`` : la bande a ne pas recouvrir
-  (``avoid_zone``) se deduit des visages du plan de recadrage ;
+- ``reframe`` passe avant ``subtitles`` : les bandes a ne pas recouvrir
+  (``avoid_zones``) se deduisent plan par plan des visages du plan de
+  recadrage, et la bande de l'accroche (``hook_zones``) des reglages de
+  render ;
 - un clip n'est pret que si ``qa.is_ready`` le dit.
 
 Modes (``mode`` de config.toml, ADR-ad2e) :
@@ -328,8 +330,8 @@ class _Run:
         for clip in self.clips():
             plan = _read_json(self.dir / "reframe" / f"{clip['id']}.json")
             subtitles.generate(self.video_id, clip["id"], clip["start"], clip["end"], self.ws,
-                               config=self.config, force=self.force, avoid_zone=avoid_zone(plan),
-                               **self.opts("subtitles"))
+                               config=self.config, force=self.force, avoid_zones=avoid_zones(plan),
+                               reserved_zones=hook_zones(clip, self.config), **self.opts("subtitles"))
 
     def render(self) -> None:
         for clip in self.clips():
@@ -342,13 +344,18 @@ class _Run:
         qa.run(self.video_id, self.ws, self.out, config=self.config, force=self.force, **self.opts("qa"))
 
 
-def avoid_zone(plan: dict[str, Any]) -> tuple[float, float] | None:
-    """Bande verticale [haut, bas] (fraction de la hauteur de sortie) couverte
-    par les visages d'un plan de recadrage (reframe/<clip_id>.json), a ne pas
-    recouvrir de sous-titres (SPEC-350f) ; None sans visage visible."""
+def avoid_zones(plan: dict[str, Any]) -> list[dict[str, Any]]:
+    """Bandes verticales [haut, bas] (fraction de la hauteur de sortie)
+    couvertes par les visages, plan par plan d'un plan de recadrage
+    (reframe/<clip_id>.json) : ``[{"start", "end", "bands"}]``, temps en
+    secondes de la video. Chaque visage visible dans un panneau donne sa
+    propre bande (deux visages eloignes ne bloquent pas l'espace entre eux) ;
+    le fond flou ne compte pas. Les sous-titres ne recouvrent pas ces bandes
+    (SPEC-350f)."""
     out_h = float(plan["output"]["height"])
-    top = bottom = None
+    zones = []
     for p in plan["plans"]:
+        bands: list[list[float]] = []
         for face in p["faces"]:
             x0, y0, x1, y1 = face["box"]
             for panel in p["panels"]:
@@ -364,11 +371,27 @@ def avoid_zone(plan: dict[str, Any]) -> tuple[float, float] | None:
                     scale = dest["h"] / r["h"]
                     fy0 = dest["y"] + (iy0 - r["y"]) * scale
                     fy1 = dest["y"] + (iy1 - r["y"]) * scale
-                    top = fy0 if top is None else min(top, fy0)
-                    bottom = fy1 if bottom is None else max(bottom, fy1)
-    if top is None:
-        return None
-    return (max(0.0, top / out_h), min(1.0, bottom / out_h))
+                    band = [max(0.0, fy0 / out_h), min(1.0, fy1 / out_h)]
+                    if band not in bands:
+                        bands.append(band)
+        zones.append({"start": p["start"], "end": p["end"], "bands": bands})
+    return zones
+
+
+# Hauteur de ligne de l'accroche, en multiple de sa taille de police : marge
+# pour les jambages et le contour du texte dessine par render (drawtext).
+HOOK_LINE_HEIGHT = 1.5
+
+
+def hook_zones(clip: dict[str, Any], config: Config) -> list[dict[str, Any]]:
+    """Bande de l'accroche que render dessine en haut du clip (une ligne a
+    ``hook_margin_top`` px, ``hook_seconds`` premieres secondes), au format de
+    ``avoid_zones`` : les sous-titres ne la recouvrent jamais."""
+    s = config.section("render")
+    top = float(s["hook_margin_top"])
+    bottom = top + HOOK_LINE_HEIGHT * float(s["hook_font_size"])
+    return [{"start": clip["start"], "end": clip["start"] + float(s["hook_seconds"]),
+             "bands": [[top / subtitles.PLAY_RES_Y, bottom / subtitles.PLAY_RES_Y]]}]
 
 
 # --------------------------------------------------------------------------

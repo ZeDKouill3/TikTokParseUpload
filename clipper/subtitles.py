@@ -6,16 +6,27 @@ l'intervalle [start, end] du clip (secondes, relatif au debut de la video).
 Sortie  : workspace/<video_id>/subtitles/<clip_id>.ass, timecodes relatifs
 au debut du clip (start devient 0).
 
-Le rendu (recadrage, position des visages) est decide par l'etape render :
-cette etape ne detecte aucun visage, elle expose seulement une position
-verticale parametrable (``avoid_zone``, une bande [haut, bas] en fraction de
-la hauteur d'image 0..1 a ne pas recouvrir) que l'appelant fixe d'apres le
-resultat de reframe (voir SPEC-350f : jamais de sous-titre sur un visage).
+Cette etape ne detecte aucun visage : l'appelant (clipper.pipeline) lui
+donne, d'apres le plan de recadrage, les bandes a eviter plan par plan
+(``avoid_zones`` : visages, SPEC-350f) et les bandes interdites
+(``reserved_zones`` : l'accroche dessinee par render), au format
+``[{"start", "end", "bands": [[haut, bas], ...]}]`` (temps en secondes de la
+video, bandes en fraction 0..1 de la hauteur d'image).
+
+Chaque evenement prend sa propre position (MarginV, texte aligne en bas),
+choisie parmi des hauteurs candidates de la zone sure TikTok (``safe_zone`` :
+hors de l'interface masquee en haut et en bas), de bas en haut, donc d'abord
+dans le tiers inferieur de la zone : la premiere qui ne recouvre aucune bande
+a eviter des plans ou il s'affiche. Sans position libre, la moins recouvrante
+est prise et journalisee. Une bande interdite n'est jamais recouverte ; si
+elle ne laisse aucune position, c'est une erreur.
 """
 
 from __future__ import annotations
 
 import json
+import logging
+import math
 from pathlib import Path
 from typing import Any
 
@@ -24,16 +35,28 @@ from clipper import llm
 PLAY_RES_X = 1080
 PLAY_RES_Y = 1920
 
+log = logging.getLogger(__name__)
+
+# Debut d'un jeton colle au mot precedent par la transcription (elision,
+# inversion) : " m" + "'a", " viens" + "-tu".
+_GLUED_PREFIXES = ("'", "\u2019", "-")
+
 CONFIG_DEFAULTS: dict[str, object] = {
     "font_name": "Poppins ExtraBold",
     "font_size": 96,
     "outline": 6,
     "min_words_per_group": 2,
     "max_words_per_group": 4,
-    # Distance (px) au bord ecran de la position par defaut (bas de l'image).
-    "margin_v": 160,
-    # Hauteur (px) reservee au texte pour decider si une avoid_zone la recouvre.
+    # Zone sure [haut, bas] (fraction de la hauteur) ou placer le texte :
+    # l'interface TikTok masque le haut (~15 %) et le bas (~20 %).
+    "safe_zone": [0.20, 0.78],
+    # Ecart (px) entre deux hauteurs candidates, de bas en haut de la zone sure.
+    "position_step": 16,
+    # Hauteur (px) occupee par le texte (deux lignes et contour).
     "text_band_height": 260,
+    "margin_left": 60,
+    # Colonne des icones TikTok (j'aime, commentaires, partage) a droite.
+    "margin_right": 150,
     "primary_color": "&H00FFFFFF&",   # blanc : mots deja prononces
     "secondary_color": "&H0080FFFF&", # jaune clair : mots pas encore prononces
     "outline_color": "&H00000000&",   # noir
@@ -95,19 +118,32 @@ def _ask_emphasis(words: list[dict[str, Any]], config: Any) -> set[int]:
     return set(answer["indices"])
 
 
+def _units(words: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    """Mots au sens du regroupement : un jeton qui commence par une apostrophe
+    ou un trait d'union colle ("'a", "-tu") reste avec le mot precedent."""
+    units: list[list[dict[str, Any]]] = []
+    for w in words:
+        if units and w["word"].startswith(_GLUED_PREFIXES):
+            units[-1].append(w)
+        else:
+            units.append([w])
+    return units
+
+
 def _group_words(words: list[dict[str, Any]], min_size: int, max_size: int) -> list[list[dict[str, Any]]]:
     """Groupe les mots par lots de ``min_size`` a ``max_size``, sans jamais
     laisser un reliquat plus petit que ``min_size`` (sauf si l'intervalle
-    entier en compte moins)."""
+    entier en compte moins). Un mot et ses jetons colles comptent pour un."""
+    units = _units(words)
     groups: list[list[dict[str, Any]]] = []
-    n = len(words)
+    n = len(units)
     i = 0
     while i < n:
         remaining = n - i
         take = min(max_size, remaining)
         if 0 < remaining - take < min_size:
             take = remaining - min_size
-        groups.append(words[i : i + take])
+        groups.append([w for unit in units[i : i + take] for w in unit])
         i += take
     return groups
 
@@ -124,25 +160,73 @@ def _format_timestamp(seconds: float) -> str:
     return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
 
 
-def _resolve_position(
-    avoid_zone: tuple[float, float] | None, settings: dict[str, Any]
-) -> tuple[int, int]:
-    """(alignment, MarginV) pour la position par defaut (bas de l'image),
-    deplacee en haut si ``avoid_zone`` (fraction 0..1 de la hauteur) recouvre
-    la bande de texte par defaut."""
-    margin_v = int(settings["margin_v"])
+def _candidates(settings: dict[str, Any]) -> list[tuple[int, int]]:
+    """Bandes [haut, bas] (px) ou poser le texte dans la zone sure, de bas en
+    haut (le tiers inferieur de la zone d'abord)."""
     band = int(settings["text_band_height"])
-    if avoid_zone is None:
-        return 2, margin_v  # bas, centre
+    step = int(settings["position_step"])
+    safe_top, safe_bottom = settings["safe_zone"]
+    lowest = math.floor(float(safe_bottom) * PLAY_RES_Y)
+    highest = math.ceil(float(safe_top) * PLAY_RES_Y) + band
+    if lowest < highest:
+        raise SubtitlesError(
+            f"zone sure {settings['safe_zone']} trop petite pour {band} px de texte"
+        )
+    bottoms = list(range(lowest, highest - 1, -step))
+    if bottoms[-1] != highest:
+        bottoms.append(highest)
+    return [(b - band, b) for b in bottoms]
 
-    default_top = PLAY_RES_Y - margin_v - band
-    default_bottom = PLAY_RES_Y - margin_v
-    zone_top = avoid_zone[0] * PLAY_RES_Y
-    zone_bottom = avoid_zone[1] * PLAY_RES_Y
-    overlaps = zone_top < default_bottom and zone_bottom > default_top
-    if not overlaps:
-        return 2, margin_v
-    return 8, margin_v  # haut, centre
+
+def _bands_at(zones: list[dict[str, Any]], start: float, end: float) -> list[tuple[float, float]]:
+    """Bandes (px) des zones dont l'intervalle de temps recoupe [start, end]."""
+    return [
+        (top * PLAY_RES_Y, bottom * PLAY_RES_Y)
+        for z in zones
+        if z["start"] < end and z["end"] > start
+        for top, bottom in z["bands"]
+    ]
+
+
+def _covered(band: tuple[int, int], zones: list[tuple[float, float]]) -> float:
+    """Hauteur (px) de ``band`` recouverte par l'union de ``zones``."""
+    covered = 0.0
+    reach = float(band[0])
+    for top, bottom in sorted(zones):
+        top, bottom = max(top, reach), min(bottom, band[1])
+        if bottom > top:
+            covered += bottom - top
+            reach = bottom
+    return covered
+
+
+def _position(
+    start: float,
+    end: float,
+    candidates: list[tuple[int, int]],
+    avoid_zones: list[dict[str, Any]],
+    reserved_zones: list[dict[str, Any]],
+    where: str,
+) -> tuple[int, int]:
+    """Bande [haut, bas] (px) d'un evenement affiche de ``start`` a ``end``
+    (secondes de la video)."""
+    reserved = _bands_at(reserved_zones, start, end)
+    allowed = [c for c in candidates if _covered(c, reserved) == 0]
+    if not allowed:
+        raise SubtitlesError(
+            f"{where} {start:.2f}-{end:.2f}s : aucune position de la zone sure hors des "
+            f"bandes reservees {reserved}"
+        )
+    faces = _bands_at(avoid_zones, start, end)
+    best = min(allowed, key=lambda c: _covered(c, faces))  # le plus bas a egalite
+    covered = _covered(best, faces)
+    if covered > 0:
+        log.warning(
+            "subtitles %s %.2f-%.2fs : aucune position libre de visage, la moins "
+            "recouvrante est prise (%d-%d px, %.0f px recouverts)",
+            where, start, end, best[0], best[1], covered,
+        )
+    return best
 
 
 def _karaoke_run(word: dict[str, Any], prev_end: float, emphasized: bool, settings: dict[str, Any]) -> str:
@@ -161,6 +245,7 @@ def _dialogue_line(
     emphasis: set[int],
     offset: int,
     settings: dict[str, Any],
+    margin_v: int,
 ) -> str:
     start = group[0]["start"] - clip_start
     end = group[-1]["end"] - clip_start
@@ -172,7 +257,7 @@ def _dialogue_line(
     text = "".join(runs)
     return (
         f"Dialogue: 0,{_format_timestamp(start)},{_format_timestamp(end)},"
-        f"Default,,0,0,0,,{text}"
+        f"Default,,0,0,{margin_v},,{text}"
     )
 
 
@@ -181,20 +266,24 @@ def _render_ass(
     clip_start: float,
     settings: dict[str, Any],
     emphasis: set[int],
-    avoid_zone: tuple[float, float] | None,
+    avoid_zones: list[dict[str, Any]],
+    reserved_zones: list[dict[str, Any]],
+    where: str,
 ) -> str:
-    alignment, margin_v = _resolve_position(avoid_zone, settings)
+    candidates = _candidates(settings)
     groups = _group_words(words, int(settings["min_words_per_group"]), int(settings["max_words_per_group"]))
 
     events = []
     offset = 0
     for group in groups:
-        events.append(_dialogue_line(group, clip_start, emphasis, offset, settings))
+        _, bottom = _position(group[0]["start"], group[-1]["end"], candidates,
+                              avoid_zones, reserved_zones, where)
+        events.append(_dialogue_line(group, clip_start, emphasis, offset, settings, PLAY_RES_Y - bottom))
         offset += len(group)
 
     style = (
         "Style: Default,{font},{size},{primary},{secondary},{outline_color},&H00000000,"
-        "-1,0,0,0,100,100,0,0,1,{outline},0,{alignment},40,40,{margin_v},1"
+        "-1,0,0,0,100,100,0,0,1,{outline},0,2,{margin_l},{margin_r},{margin_v},1"
     ).format(
         font=settings["font_name"],
         size=settings["font_size"],
@@ -202,8 +291,9 @@ def _render_ass(
         secondary=settings["secondary_color"],
         outline_color=settings["outline_color"],
         outline=settings["outline"],
-        alignment=alignment,
-        margin_v=margin_v,
+        margin_l=settings["margin_left"],
+        margin_r=settings["margin_right"],
+        margin_v=PLAY_RES_Y - candidates[0][1],
     )
 
     return (
@@ -234,11 +324,13 @@ def generate(
     *,
     config: Any = None,
     force: bool = False,
-    avoid_zone: tuple[float, float] | None = None,
+    avoid_zones: list[dict[str, Any]] | None = None,
+    reserved_zones: list[dict[str, Any]] | None = None,
 ) -> Path:
     """Genere workspace/<video_id>/subtitles/<clip_id>.ass pour [start, end]
     et renvoie ce chemin. Un .ass deja present n'est pas refait (ADR-b16b),
-    sauf ``force``."""
+    sauf ``force``. ``avoid_zones`` (visages) et ``reserved_zones``
+    (accroche) : voir la docstring du module."""
     video_dir = Path(workspace_dir) / video_id
     out = video_dir / "subtitles" / f"{clip_id}.ass"
     if out.exists() and not force:
@@ -254,7 +346,8 @@ def generate(
 
     emphasis = _ask_emphasis(words, config) if settings["emphasis"] else set()
 
-    ass_text = _render_ass(words, start, settings, emphasis, avoid_zone)
+    ass_text = _render_ass(words, start, settings, emphasis, avoid_zones or [],
+                           reserved_zones or [], f"{video_id}/{clip_id}")
 
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_suffix(".ass.tmp")

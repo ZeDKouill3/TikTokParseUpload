@@ -5,7 +5,7 @@ slug: subtitles-zone-s-re-tiktok-placement-hors-visage
 title: "subtitles : zone sûre TikTok, placement hors visages et hors accroche, apostrophes"
 created: 2026-09-25T19:31:56Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/subtitles.py
   - clipper/pipeline.py
@@ -17,6 +17,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/ad1e38593562@2c9612b
+    tree: scope/7172031c0cf2
+    criteria: afdff4f1b815
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---
