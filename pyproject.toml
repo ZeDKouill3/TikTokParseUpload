@@ -14,15 +14,21 @@ dependencies = [
     "scenedetect",
     "faster-whisper",
     "mediapipe",
+    "fastapi",
+    "uvicorn",
 ]
 
 [project.optional-dependencies]
 test = [
     "pytest>=8",
+    "httpx",
 ]
 
 [tool.setuptools.packages.find]
 include = ["clipper", "clipper.*"]
+
+[tool.setuptools.package-data]
+clipper = ["assets/**/*"]
 
 [tool.uv]
 # mediapipe impose opencv-contrib-python ; scenedetect demande opencv-python (meme
