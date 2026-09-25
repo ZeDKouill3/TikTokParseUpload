@@ -5,7 +5,7 @@ slug: transcribe-correction-du-texte-par-grosses-tranc
 title: "transcribe : correction du texte par grosses tranches en parallèle, et reprise sans refaire whisper"
 created: 2026-09-25T17:16:52Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/transcribe.py
   - tests/test_transcribe.py
@@ -15,8 +15,15 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/70bc254f24b3@d7c2f70
+    tree: scope/2cd95ec7b957
+    criteria: 4916db8a0292
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---
 
 Essai réel 2026-09-25 (1 h 52, ~18 000 mots) : tranches de 400 mots en série = ~45 appels claude -p de ~25 s (dont ~5 s de démarrage fixe), soit ~20 min. Avec 3000 mots x4 en parallèle : ~2 min. Et un échec de correction obligeait à refaire 6 min de whisper.

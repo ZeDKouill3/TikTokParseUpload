@@ -2,7 +2,8 @@
 des noms propres par clipper.llm.
 
 Entrees : workspace/<video_id>/<video_id>.mp4 et meta.json (etape download).
-Sortie  : workspace/<video_id>/transcript.json
+Sortie  : workspace/<video_id>/transcript.json (et un intermediaire,
+transcript_raw.json, garde avant la correction)
 
     {"video_id", "language", "language_probability", "duration", "model",
      "vocab": [...],
@@ -14,10 +15,16 @@ Deroulement :
    passes a whisper en initial_prompt et hotwords (avant de charger le
    modele : jamais un LLM local et whisper en meme temps, ADR-fb9b) ;
 2. extraction de l'audio (ffmpeg, wav 16 kHz mono), transcription, puis
-   liberation du modele ;
-3. usage ``transcript_fix`` par tranches : la reponse ne liste que des
+   liberation du modele ; le resultat brut est ecrit dans
+   transcript_raw.json avant la correction ;
+3. usage ``transcript_fix`` par tranches de ``fix_chunk_words`` mots,
+   jusqu'a ``fix_parallel`` tranches en meme temps (threads : les appels
+   clipper.llm sont des sous-processus) : la reponse ne liste que des
    corrections {i, word} par index de mot, donc ni le nombre de mots ni
    leurs timecodes ne peuvent changer.
+
+Si transcript_raw.json existe deja (retour apres un echec de la correction),
+il est reutilise et whisper n'est pas relance, sauf ``force``.
 
 Claude indisponible : l'erreur remonte, rien n'est ecrit (ADR-ad2e). Seul
 ``vocab = false`` / ``transcript_fix = false`` dans [transcribe] saute ces
@@ -32,6 +39,7 @@ import os
 import subprocess
 import sys
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from importlib.util import find_spec
 from pathlib import Path
 from typing import Any
@@ -52,7 +60,10 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "transcript_fix": True,
     # Nombre de mots vises par tranche de correction (une tranche ne coupe
     # jamais un segment).
-    "fix_chunk_words": 400,
+    "fix_chunk_words": 3000,
+    # Nombre de tranches de correction traitees en meme temps (appels
+    # clipper.llm en sous-processus, pas de cout CPU Python).
+    "fix_parallel": 4,
 }
 
 VOCAB_SCHEMA: dict[str, Any] = {
@@ -270,6 +281,23 @@ def _fix_chunk(chunk: list[dict[str, Any]], vocab: list[str], config: Any) -> No
             seg["text"] = "".join(w["word"] for w in seg["words"])
 
 
+def _fix_chunks(
+    chunks: list[list[dict[str, Any]]], vocab: list[str], config: Any, parallel: int
+) -> None:
+    """Corrige jusqu'a ``parallel`` tranches en meme temps (threads : les
+    appels clipper.llm sont des sous-processus, pas du calcul CPU Python).
+    Chaque tranche porte des segments distincts, donc les threads n'ecrivent
+    jamais dans la meme structure. Une tranche en echec fait echouer l'etape
+    avec sa raison (ADR-ad2e) ; les autres deja lancees terminent avant que
+    l'exception ne remonte."""
+    if not chunks:
+        return
+    with ThreadPoolExecutor(max_workers=max(1, parallel)) as executor:
+        futures = [executor.submit(_fix_chunk, chunk, vocab, config) for chunk in chunks]
+        for future in futures:
+            future.result()
+
+
 def transcribe(
     video_id: str,
     workspace_dir: str | Path = "workspace",
@@ -281,38 +309,55 @@ def transcribe(
 ) -> Path:
     """Transcrit workspace/<video_id>/<video_id>.mp4 dans transcript.json et
     renvoie ce chemin. Un transcript deja present n'est pas refait, sauf
-    ``force``."""
+    ``force``. Le resultat brut de whisper est garde dans
+    transcript_raw.json avant la correction : une relance apres un echec de
+    la correction reutilise ce fichier au lieu de refaire whisper."""
     video_dir = Path(workspace_dir) / video_id
     out = video_dir / "transcript.json"
     if out.exists() and not force:
         return out
 
-    video = video_dir / f"{video_id}.mp4"
-    meta_file = video_dir / "meta.json"
-    if not video.exists():
-        raise TranscribeError(f"video absente : {video}")
-    if not meta_file.exists():
-        raise TranscribeError(f"meta.json absent : {meta_file}")
-    meta = json.loads(meta_file.read_text(encoding="utf-8"))
-
     settings = _settings(config)
-    vocab = _ask_vocab(meta, config) if settings["vocab"] else []
+    raw_path = video_dir / "transcript_raw.json"
 
-    audio = video_dir / "transcribe_audio.wav"
-    try:
-        audio_extractor(video, audio)
-        segments, header = _run_whisper(model_factory, audio, settings, vocab)
-    finally:
-        audio.unlink(missing_ok=True)
+    if raw_path.exists() and not force:
+        raw = json.loads(raw_path.read_text(encoding="utf-8"))
+        header = {k: raw[k] for k in ("language", "language_probability", "duration")}
+        model_name = raw["model"]
+        vocab = raw["vocab"]
+        segments = raw["segments"]
+    else:
+        video = video_dir / f"{video_id}.mp4"
+        meta_file = video_dir / "meta.json"
+        if not video.exists():
+            raise TranscribeError(f"video absente : {video}")
+        if not meta_file.exists():
+            raise TranscribeError(f"meta.json absent : {meta_file}")
+        meta = json.loads(meta_file.read_text(encoding="utf-8"))
+
+        vocab = _ask_vocab(meta, config) if settings["vocab"] else []
+
+        audio = video_dir / "transcribe_audio.wav"
+        try:
+            audio_extractor(video, audio)
+            segments, header = _run_whisper(model_factory, audio, settings, vocab)
+        finally:
+            audio.unlink(missing_ok=True)
+
+        model_name = settings["model"]
+        raw = {"video_id": video_id, **header, "model": model_name, "vocab": vocab, "segments": segments}
+        tmp_raw = raw_path.with_suffix(".json.tmp")
+        tmp_raw.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp_raw.replace(raw_path)
 
     if settings["transcript_fix"]:
-        for chunk in _chunks(segments, int(settings["fix_chunk_words"])):
-            _fix_chunk(chunk, vocab, config)
+        chunks = _chunks(segments, int(settings["fix_chunk_words"]))
+        _fix_chunks(chunks, vocab, config, int(settings["fix_parallel"]))
 
     transcript = {
         "video_id": video_id,
         **header,
-        "model": settings["model"],
+        "model": model_name,
         "vocab": vocab,
         "segments": segments,
     }

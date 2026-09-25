@@ -5,6 +5,8 @@ import json
 import os
 import shutil
 import subprocess
+import threading
+import time
 import wave
 import weakref
 from pathlib import Path
@@ -455,6 +457,181 @@ def test_transient_llm_error_during_fix_propagates_without_writing(tmp_path, vid
 
 
 # --------------------------------------------------------------------------
+# C12 : tranches de correction traitees en parallele (fix_parallel)
+# --------------------------------------------------------------------------
+
+
+def _many_word_segments(n):
+    return [
+        _segment(i, [_word(f" mot{i}", i * 1.0, i * 1.0 + 0.4)])
+        for i in range(n)
+    ]
+
+
+class ConcurrencyTracker:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.current = 0
+        self.peak = 0
+
+    def response(self, request):
+        with self.lock:
+            self.current += 1
+            self.peak = max(self.peak, self.current)
+        time.sleep(0.05)
+        with self.lock:
+            self.current -= 1
+        return {"corrections": []}
+
+
+def test_fix_chunks_run_concurrently_up_to_fix_parallel(tmp_path, video_dir, cpu):
+    segments = _many_word_segments(12)  # fix_chunk_words=2 -> 6 tranches
+    tracker = ConcurrencyTracker()
+    fake = FakeBackend([VOCAB] + [tracker.response] * 6)
+    with llm.use_backend(fake):
+        run(
+            tmp_path,
+            ModelFactory(segments=segments),
+            config=make_config(tmp_path, fix_chunk_words=2, fix_parallel=3),
+        )
+    assert tracker.peak == 3
+
+
+def test_fix_parallel_defaults_to_config_value_of_four(tmp_path, video_dir, cpu):
+    segments = _many_word_segments(16)  # fix_chunk_words=2 -> 8 tranches
+    tracker = ConcurrencyTracker()
+    fake = FakeBackend([VOCAB] + [tracker.response] * 8)
+    with llm.use_backend(fake):
+        run(
+            tmp_path,
+            ModelFactory(segments=segments),
+            config=make_config(tmp_path, fix_chunk_words=2),
+        )
+    assert tracker.peak == 4
+
+
+def test_fix_parallel_result_matches_sequential_processing_regardless_of_scheduling(
+    tmp_path, video_dir, cpu
+):
+    """Chaque tranche est corrigee d'apres son propre contenu (pas d'apres
+    l'ordre d'arrivee des reponses scriptees) : le resultat final est le
+    meme que le traitement sequentiel, quel que soit l'ordre d'execution des
+    threads."""
+    segments = _many_word_segments(10)  # fix_chunk_words=2 -> 5 tranches
+
+    def make_fix(chunk_index):
+        def respond(request):
+            time.sleep(0.01 * (5 - chunk_index))  # ordre d'arrivee inverse
+            assert f"mot{chunk_index * 2}" in request.prompt
+            return {"corrections": [{"i": 0, "word": f"CORRIGE{chunk_index}"}]}
+
+        return respond
+
+    fake = FakeBackend([VOCAB, *(make_fix(i) for i in range(5))])
+    with llm.use_backend(fake):
+        run(
+            tmp_path,
+            ModelFactory(segments=segments),
+            config=make_config(tmp_path, fix_chunk_words=2, fix_parallel=5),
+        )
+
+    words = [w["word"] for s in read_transcript(video_dir)["segments"] for w in s["words"]]
+    assert words == [
+        " CORRIGE0", " mot1",
+        " CORRIGE1", " mot3",
+        " CORRIGE2", " mot5",
+        " CORRIGE3", " mot7",
+        " CORRIGE4", " mot9",
+    ]
+
+
+def test_one_chunk_failure_fails_the_step_with_its_reason_others_may_run(
+    tmp_path, video_dir, cpu
+):
+    from clipper.transcribe import TranscribeError
+
+    segments = _many_word_segments(8)  # fix_chunk_words=2 -> 4 tranches
+
+    def boom(request):
+        raise TranscribeError("tranche corrompue")
+
+    fake = FakeBackend([VOCAB, {"corrections": []}, boom, {"corrections": []}, {"corrections": []}])
+    with llm.use_backend(fake):
+        with pytest.raises(TranscribeError, match="tranche corrompue"):
+            run(
+                tmp_path,
+                ModelFactory(segments=segments),
+                config=make_config(tmp_path, fix_chunk_words=2, fix_parallel=4),
+            )
+    assert not (video_dir / "transcript.json").exists()
+
+
+# --------------------------------------------------------------------------
+# C13 : transcript_raw.json (resultat brut de whisper) et reprise sans
+# relancer whisper apres un echec de la correction
+# --------------------------------------------------------------------------
+
+
+def read_raw(video_dir):
+    return json.loads((video_dir / "transcript_raw.json").read_text(encoding="utf-8"))
+
+
+def test_transcript_raw_json_written_before_correction(tmp_path, video_dir, cpu):
+    factory = ModelFactory()
+    with llm.use_backend(FakeBackend([VOCAB, NO_FIX])):
+        run(tmp_path, factory)
+
+    raw = read_raw(video_dir)
+    assert raw["language"] == "fr"
+    assert raw["vocab"] == ["Rockstar", "Vice City", "Lucia", "Jason"]
+    # le brut garde le mot non corrige, transcript.json aura la correction
+    assert raw["segments"][0]["words"][1]["word"] == " Rokstar"
+
+
+def test_retry_after_fix_failure_reuses_raw_and_does_not_rerun_whisper(tmp_path, video_dir, cpu):
+    factory = ModelFactory()
+    with llm.use_backend(FakeBackend([VOCAB, llm.TransientLLMError("quota")])):
+        with pytest.raises(llm.TransientLLMError):
+            run(tmp_path, factory)
+    assert len(factory.built) == 1
+    assert (video_dir / "transcript_raw.json").exists()
+    assert not (video_dir / "transcript.json").exists()
+
+    fake_retry = FakeBackend([NO_FIX])
+    with llm.use_backend(fake_retry):
+        run(tmp_path, factory)
+
+    assert len(factory.built) == 1  # whisper pas relance
+    assert [c.usage for c in fake_retry.calls] == ["transcript_fix"]  # vocab pas redemande
+    assert read_transcript(video_dir)["language"] == "fr"
+
+
+def test_retry_reuses_raw_vocab_and_applies_correction(tmp_path, video_dir, cpu):
+    factory = ModelFactory()
+    with llm.use_backend(FakeBackend([VOCAB, llm.TransientLLMError("quota")])):
+        with pytest.raises(llm.TransientLLMError):
+            run(tmp_path, factory)
+
+    with llm.use_backend(FakeBackend([{"corrections": [{"i": 1, "word": "Rockstar"}]}])):
+        run(tmp_path, factory)
+
+    data = read_transcript(video_dir)
+    assert data["vocab"] == ["Rockstar", "Vice City", "Lucia", "Jason"]
+    assert data["segments"][0]["words"][1]["word"] == " Rockstar"
+
+
+def test_force_redoes_whisper_even_if_raw_transcript_exists(tmp_path, video_dir, cpu):
+    factory = ModelFactory()
+    with llm.use_backend(FakeBackend([VOCAB, NO_FIX])):
+        run(tmp_path, factory)
+    assert len(factory.built) == 1
+
+    with llm.use_backend(FakeBackend([VOCAB, NO_FIX])):
+        run(tmp_path, factory, force=True)
+    assert len(factory.built) == 2
+
+
+# --------------------------------------------------------------------------
 # C9 : cache par video (ADR-b16b)
 # --------------------------------------------------------------------------
 
@@ -471,6 +648,13 @@ def test_existing_transcript_is_not_redone_unless_forced(tmp_path, video_dir, cp
     with llm.use_backend(FakeBackend([VOCAB, NO_FIX])):
         run(tmp_path, factory, force=True)
     assert read_transcript(video_dir)["language"] == "fr"
+
+
+def test_default_fix_chunk_words_and_fix_parallel(tmp_path):
+    from clipper.transcribe import CONFIG_DEFAULTS
+
+    assert CONFIG_DEFAULTS["fix_chunk_words"] == 3000
+    assert CONFIG_DEFAULTS["fix_parallel"] == 4
 
 
 def test_config_section_is_accepted_by_clipper_config(tmp_path):
