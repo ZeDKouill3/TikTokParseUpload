@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "skills": {
+    "ank": {
+      "source": "../../AppData/Local/Temp/ank-skills-48044-679297100-0",
+      "sourceType": "local",
+      "computedHash": "3d2359df25b9a790da83940fa1d64fb4ad8cada6ea296979899ef0afd27dc1c4"
+    },
+    "ank-diagnose": {
+      "source": "../../AppData/Local/Temp/ank-skills-48044-679297100-0",
+      "sourceType": "local",
+      "computedHash": "393770100ade36333fe3a0c21973aa9a4c99968287aa19ece8463bd016b5fef2"
+    },
+    "ank-drift": {
+      "source": "../../AppData/Local/Temp/ank-skills-48044-679297100-0",
+      "sourceType": "local",
+      "computedHash": "1a529226c3d053b5691496028ec7fe906d507378b9e7151c8828350c3ec3fa38"
+    },
+    "ank-loop": {
+      "source": "../../AppData/Local/Temp/ank-skills-48044-679297100-0",
+      "sourceType": "local",
+      "computedHash": "a968b26dca1f6563093a0309f51485de33c6cd5446914339754d72d7932f79e6"
+    },
+    "ank-plan": {
+      "source": "../../AppData/Local/Temp/ank-skills-48044-679297100-0",
+      "sourceType": "local",
+      "computedHash": "303143d3ff5841461dac5437d4566fbb1d3a36d61116fa9ba86da8734a84a6bf"
+    },
+    "ank-tdd": {
+      "source": "../../AppData/Local/Temp/ank-skills-48044-679297100-0",
+      "sourceType": "local",
+      "computedHash": "d2b0ced96624567f7ccaed2b6cb86588f0b64f7bd0d2e1364119fb053c70bbed"
+    }
+  }
+}

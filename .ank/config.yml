@@ -1,0 +1,15 @@
+schema: 1
+context_budget: 8000
+claim_ttl_max: 2h
+verifiers: {}
+roles:
+  agent:
+    can: [context, find, claim, log, done, new:task, new:adr:proposed]
+    cannot: [adr:accept, adr:edit-constraint, task:close, delete]
+  human:
+    can: ["*"]
+identities: {}
+weight:
+  hot_files: 3000
+  plane_bytes: 4000000
+default_branch: main
