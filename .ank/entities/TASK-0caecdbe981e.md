@@ -5,7 +5,7 @@ slug: tape-transcribe-faster-whisper-mot-par-mot-vocab
 title: "Étape transcribe : faster-whisper mot par mot + vocabulaire et correction par Claude"
 created: 2026-09-25T09:39:37Z
 author: claude-plan
-status: open
+status: done
 scope:
   - clipper/transcribe.py
   - tests/test_transcribe.py
@@ -15,8 +15,15 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/0ce6fb2ac5cb@615afdc
+    tree: scope/4fa6f0503d1d
+    criteria: 9b4b2b18cf82
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 2
+version: 4
 ---
 
 Sur 2-3 h, la correction se fait par tranches. Claude indisponible : ADR-ad2e562b1810, pas de repli silencieux (échec transitoire, ou vocab/correction désactivés explicitement en config).
