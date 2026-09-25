@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+import threading
+import time
 from pathlib import Path
 
+import cv2
+import numpy as np
 import pytest
 
 from clipper import llm
@@ -12,39 +16,76 @@ from clipper.llm.fake import FakeBackend
 
 VIDEO_ID = "abcdefghijk"
 
-# Candidats de moments.json : un moment retenu [100-130] et un rejete
-# [300-330] ; fenetres +/-10 s : [90-140] et [290-340].
-MOMENTS = {
-    "video_id": VIDEO_ID,
-    "moments": [{"id": 0, "start": 100.0, "end": 130.0, "hook_text": "accroche"}],
-    "rejected": [{"start": 300.0, "end": 330.0, "reason": "score 55.0 < min_score 60"}],
-}
-
-# Images cles de scenes.json ; seules 91, 115, 139, 295 et 335 tombent
-# dans une fenetre.
+# Fenetres +/-10 s : moment retenu [100-130] -> [90-140] ; rejet rattrapable
+# [300-330] -> [290-340] (score 59 < min_score 60, +2 de bonus visuel = 61).
 TIMECODES = [50.0, 89.0, 91.0, 115.0, 139.0, 141.0, 200.0, 295.0, 335.0, 345.0]
+
+FRAME_WIDTH = 800
+FRAME_HEIGHT = 450
 
 
 def frame_name(t):
     return f"frames/f{int(t):04d}.jpg"
 
 
-def seed_scenes(video_dir, timecodes=TIMECODES):
+def image_size(path):
+    img = cv2.imread(str(path))
+    h, w = img.shape[:2]
+    return w, h
+
+
+def seed_scenes(video_dir, timecodes=TIMECODES, width=FRAME_WIDTH, height=FRAME_HEIGHT):
     (video_dir / "frames").mkdir(exist_ok=True)
     frames = []
     for n, t in enumerate(timecodes):
-        (video_dir / frame_name(t)).write_bytes(b"\xff\xd8\xff\xe0 jpeg de test")
+        img = np.zeros((height, width, 3), dtype=np.uint8)
+        cv2.imwrite(str(video_dir / frame_name(t)), img)
         frames.append({"path": frame_name(t), "timecode": t, "scene": n})
     (video_dir / "scenes.json").write_text(
         json.dumps({"scenes": [{"start": 0.0, "end": 500.0}], "frames": frames}), encoding="utf-8"
     )
 
 
+def seed_rubric(tmp_path, visual=2, max_total=6):
+    path = tmp_path / "rubric.toml"
+    path.write_text(f"[bonus]\nvisual = {visual}\nmax_total = {max_total}\n", encoding="utf-8")
+    return path
+
+
+def make_moments(tmp_path, *, min_score=60, moments=None, rejected=None):
+    """moments.json realiste : un moment retenu et un rejet rattrapable par
+    le bonus visuel (score 59 + visual 2 = 61 >= min_score 60), comme le
+    produirait clipper.moments (rubric.path/min_score, final_score, bonus)."""
+    rubric_path = seed_rubric(tmp_path)
+    if moments is None:
+        moments = [{"id": 0, "start": 100.0, "end": 130.0, "hook_text": "accroche"}]
+    if rejected is None:
+        rejected = [
+            {
+                "start": 300.0, "end": 330.0, "reason": "score 59.0 < min_score 60",
+                "final_score": 59.0,
+                "bonus": {"replayed": 0.0, "audio_peaks": 0.0, "visual": 0.0, "total": 0.0},
+            }
+        ]
+    return {
+        "video_id": VIDEO_ID,
+        "rubric": {"path": str(rubric_path), "min_score": min_score},
+        "moments": moments,
+        "rejected": rejected,
+    }
+
+
+def write_moments(video_dir, tmp_path, **overrides):
+    data = make_moments(tmp_path, **overrides)
+    (video_dir / "moments.json").write_text(json.dumps(data), encoding="utf-8")
+    return data
+
+
 @pytest.fixture
 def video_dir(tmp_path):
     d = tmp_path / "workspace" / VIDEO_ID
     d.mkdir(parents=True)
-    (d / "moments.json").write_text(json.dumps(MOMENTS), encoding="utf-8")
+    write_moments(d, tmp_path)
     seed_scenes(d)
     return d
 
@@ -58,11 +99,23 @@ def make_config(tmp_path, **sections):
     )
 
 
-def describe_all(striking_at=(), tags=("plan large",)):
+def strip_index(name):
+    """Un nom de fichier redimensionne porte un prefixe d'index (00000_...) :
+    l'original s'en deduit."""
+    return name.split("_", 1)[1]
+
+
+def describe_all(striking_at=(), tags=("plan large",), record=None):
     """Reponse fake : decrit chaque image du lot, marquante si son timecode
-    (lu dans le prompt) est dans ``striking_at``."""
+    (lu dans le prompt) est dans ``striking_at``. Si ``record`` est fourni,
+    y ajoute la taille (largeur, hauteur) de chaque image recue : le fichier
+    temporaire redimensionne est supprime des la fin de l'etape, donc lire sa
+    taille doit se faire pendant l'appel."""
 
     def answer(request):
+        if record is not None:
+            for p in request.images:
+                record.append(image_size(p))
         frames = []
         for n, _ in enumerate(request.images):
             t = float(request.prompt.split(f"Image {n} : ")[1].split(" s")[0])
@@ -94,26 +147,21 @@ def sent_images(fake, video_dir):
 
 
 # --------------------------------------------------------------------------
-# Selection des images : fenetres des candidats +/-10 s
+# Selection des candidats : moments retenus + rejets rattrapables seulement
 # --------------------------------------------------------------------------
 
 
-def test_only_keyframes_inside_candidate_windows_are_sent(tmp_path, video_dir):
+def test_kept_moment_and_rescuable_rejected_windows_are_sent(tmp_path, video_dir):
     fake, _ = run_vision(tmp_path, [describe_all()] * 5)
 
-    assert sorted(sent_images(fake, video_dir)) == [
-        "frames/f0091.jpg",
-        "frames/f0115.jpg",
-        "frames/f0139.jpg",
-        "frames/f0295.jpg",
-        "frames/f0335.jpg",
-    ]
+    # les images envoyees sont des copies redimensionnees dans un dossier
+    # temporaire, pas les originaux, mais elles en portent le nom
+    names = sorted(strip_index(p.name) for call in fake.calls for p in call.images)
+    assert names == ["f0091.jpg", "f0115.jpg", "f0139.jpg", "f0295.jpg", "f0335.jpg"]
 
 
 def test_no_candidate_window_means_no_llm_call(tmp_path, video_dir):
-    (video_dir / "moments.json").write_text(
-        json.dumps({"video_id": VIDEO_ID, "moments": [], "rejected": []}), encoding="utf-8"
-    )
+    write_moments(video_dir, tmp_path, moments=[], rejected=[])
 
     fake, path = run_vision(tmp_path, [])
 
@@ -122,12 +170,65 @@ def test_no_candidate_window_means_no_llm_call(tmp_path, video_dir):
 
 
 def test_rejection_without_bounds_opens_no_window(tmp_path, video_dir):
-    data = {**MOMENTS, "rejected": [{"reason": "bornes absentes"}]}
-    (video_dir / "moments.json").write_text(json.dumps(data), encoding="utf-8")
+    write_moments(
+        video_dir, tmp_path,
+        rejected=[{
+            "reason": "bornes absentes", "final_score": 59.0,
+            "bonus": {"total": 0.0, "visual": 0.0},
+        }],
+    )
 
-    fake, _ = run_vision(tmp_path, [describe_all()] * 5)
+    fake, _ = run_vision(tmp_path, [describe_all()] * 3)
 
-    assert sorted(sent_images(fake, video_dir)) == ["frames/f0091.jpg", "frames/f0115.jpg", "frames/f0139.jpg"]
+    names = sorted(strip_index(p.name) for call in fake.calls for p in call.images)
+    assert names == ["f0091.jpg", "f0115.jpg", "f0139.jpg"]
+
+
+def test_rejected_candidate_below_min_score_even_with_visual_bonus_gets_no_window(tmp_path, video_dir):
+    write_moments(
+        video_dir, tmp_path,
+        rejected=[{
+            "start": 300.0, "end": 330.0, "reason": "score 50.0 < min_score 60",
+            "final_score": 50.0,
+            "bonus": {"total": 0.0, "visual": 0.0},
+        }],
+    )
+
+    fake, _ = run_vision(tmp_path, [describe_all()] * 3)
+
+    names = sorted(strip_index(p.name) for call in fake.calls for p in call.images)
+    assert names == ["f0091.jpg", "f0115.jpg", "f0139.jpg"]
+
+
+def test_rejected_candidate_already_at_bonus_max_total_gets_no_window(tmp_path, video_dir):
+    write_moments(
+        video_dir, tmp_path,
+        rejected=[{
+            "start": 300.0, "end": 330.0, "reason": "score 59.0 < min_score 60",
+            "final_score": 59.0,
+            "bonus": {"total": 6.0, "visual": 0.0},  # deja au max_total (6) : pas de place pour le visuel
+        }],
+    )
+
+    fake, _ = run_vision(tmp_path, [describe_all()] * 3)
+
+    names = sorted(strip_index(p.name) for call in fake.calls for p in call.images)
+    assert names == ["f0091.jpg", "f0115.jpg", "f0139.jpg"]
+
+
+def test_rejected_candidate_without_score_data_gets_no_window(tmp_path, video_dir):
+    write_moments(
+        video_dir, tmp_path,
+        rejected=[{
+            "start": 300.0, "end": 330.0,
+            "reason": "chevauche un segment SponsorBlock sponsor [300.0-330.0]",
+        }],
+    )
+
+    fake, _ = run_vision(tmp_path, [describe_all()] * 3)
+
+    names = sorted(strip_index(p.name) for call in fake.calls for p in call.images)
+    assert names == ["f0091.jpg", "f0115.jpg", "f0139.jpg"]
 
 
 # --------------------------------------------------------------------------
@@ -136,11 +237,12 @@ def test_rejection_without_bounds_opens_no_window(tmp_path, video_dir):
 
 
 def test_frames_are_described_by_llm_vision_in_batches(tmp_path, video_dir):
-    fake, _ = run_vision(tmp_path, [describe_all()] * 3, batch_size=2)
+    sizes = []
+    fake, _ = run_vision(tmp_path, [describe_all(record=sizes)] * 3, batch_size=2, parallel=1)
 
     assert [c.usage for c in fake.calls] == ["vision", "vision", "vision"]
     assert [len(c.images) for c in fake.calls] == [2, 2, 1]
-    assert all(p.is_file() for c in fake.calls for p in c.images)
+    assert len(sizes) == 5  # chaque image existait bien au moment de l'appel
     assert "115.0 s" in fake.calls[0].prompt
 
 
@@ -218,7 +320,175 @@ def test_missing_frame_file_is_an_error(tmp_path, video_dir):
 
 def test_vision_section_is_configurable(tmp_path):
     config = make_config(tmp_path)
-    assert config.section("vision")["window_seconds"] == 10
+    section = config.section("vision")
+    assert section["window_seconds"] == 10
+    assert section["batch_size"] == 8
+    assert section["max_width"] == 768
+    assert section["parallel"] == 4
+
+
+# --------------------------------------------------------------------------
+# Images reduites : max_width, proportions conservees, originaux intacts,
+# dossier temporaire supprime en fin d'etape
+# --------------------------------------------------------------------------
+
+
+def test_images_sent_are_resized_to_max_width_preserving_aspect_ratio(tmp_path, video_dir):
+    sizes = []
+    run_vision(tmp_path, [describe_all(record=sizes)] * 5, max_width=200)
+
+    assert len(sizes) == 5
+    for w, h in sizes:
+        assert w == 200
+        assert abs(h / w - FRAME_HEIGHT / FRAME_WIDTH) < 0.01
+
+
+def test_images_narrower_than_max_width_are_not_upscaled(tmp_path, video_dir):
+    sizes = []
+    run_vision(tmp_path, [describe_all(record=sizes)] * 5, max_width=4000)
+
+    assert sizes and set(sizes) == {(FRAME_WIDTH, FRAME_HEIGHT)}
+
+
+def test_original_frame_files_are_untouched_after_resize(tmp_path, video_dir):
+    frames_dir = video_dir / "frames"
+    before = {p.name: image_size(p) for p in frames_dir.glob("*.jpg")}
+
+    run_vision(tmp_path, [describe_all()] * 5, max_width=100)
+
+    after = {p.name: image_size(p) for p in frames_dir.glob("*.jpg")}
+    assert after == before
+
+
+def test_temporary_resize_folder_is_removed_after_a_successful_step(tmp_path, video_dir):
+    before = set(video_dir.iterdir())
+
+    run_vision(tmp_path, [describe_all()] * 5)
+
+    after = set(video_dir.iterdir())
+    assert after - before == {video_dir / "vision.json"}
+
+
+def test_temporary_resize_folder_is_removed_even_if_a_batch_fails(tmp_path, video_dir):
+    before = set(video_dir.iterdir())
+
+    with pytest.raises(llm.TransientLLMError):
+        run_vision(tmp_path, [llm.TransientLLMError("quota")])
+
+    after = set(video_dir.iterdir())
+    assert after - before <= {video_dir / "vision_partial.json"}
+
+
+# --------------------------------------------------------------------------
+# Lots traites en parallele (parallel), meme resultat que sequentiel
+# --------------------------------------------------------------------------
+
+
+class ConcurrencyTracker:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.current = 0
+        self.peak = 0
+
+    def response(self, request):
+        with self.lock:
+            self.current += 1
+            self.peak = max(self.peak, self.current)
+        time.sleep(0.05)
+        with self.lock:
+            self.current -= 1
+        return {
+            "frames": [
+                {"index": n, "description": "x", "tags": [], "striking": False}
+                for n in range(len(request.images))
+            ]
+        }
+
+
+def test_batches_run_concurrently_up_to_parallel_setting(tmp_path, video_dir):
+    tracker = ConcurrencyTracker()
+    fake, _ = run_vision(tmp_path, [tracker.response] * 5, batch_size=1, parallel=3)
+
+    assert tracker.peak == 3
+    assert len(fake.calls) == 5
+
+
+def test_parallel_defaults_to_four(tmp_path, video_dir):
+    tracker = ConcurrencyTracker()
+    fake, _ = run_vision(tmp_path, [tracker.response] * 5, batch_size=1)
+
+    assert tracker.peak == 4
+
+
+def test_vision_json_order_matches_sequential_regardless_of_batch_completion_order(tmp_path, video_dir):
+    """Chaque lot est decrit d'apres son propre contenu (pas d'apres l'ordre
+    d'arrivee des reponses scriptees) : le resultat final reste trie par
+    timecode, quel que soit l'ordre d'execution des threads."""
+
+    def make_response(batch_index):
+        def respond(request):
+            time.sleep(0.01 * (5 - batch_index))  # ordre d'arrivee inverse
+            return {"frames": [{"index": 0, "description": f"lot{batch_index}", "tags": [], "striking": False}]}
+
+        return respond
+
+    fake, path = run_vision(
+        tmp_path, [make_response(i) for i in range(5)], batch_size=1, parallel=5
+    )
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert [f["timecode"] for f in data["frames"]] == [91.0, 115.0, 139.0, 295.0, 335.0]
+    assert [f["description"] for f in data["frames"]] == [f"lot{i}" for i in range(5)]
+
+
+# --------------------------------------------------------------------------
+# Reprise : vision_partial.json enregistre au fil de l'eau, un lot deja
+# decrit n'est pas redemande apres une relance
+# --------------------------------------------------------------------------
+
+
+def test_partial_file_stays_valid_after_concurrent_batch_writes(tmp_path, video_dir):
+    def boom(request):
+        raise llm.TransientLLMError("quota")
+
+    with pytest.raises(llm.TransientLLMError):
+        run_vision(
+            tmp_path,
+            [describe_all(), describe_all(), boom, describe_all(), describe_all()],
+            batch_size=1, parallel=4,
+        )
+
+    partial = json.loads((video_dir / "vision_partial.json").read_text(encoding="utf-8"))
+    assert sorted(int(k) for k in partial["batches"]) == [0, 1, 3, 4]
+    assert len(partial["batches"]["0"]) == 1
+
+
+def test_retry_after_batch_failure_does_not_redescribe_completed_batches(tmp_path, video_dir):
+    with pytest.raises(llm.TransientLLMError):
+        run_vision(
+            tmp_path,
+            [describe_all(), llm.TransientLLMError("quota"), describe_all(), describe_all(), describe_all()],
+            batch_size=1, parallel=4,
+        )
+    partial_before = json.loads((video_dir / "vision_partial.json").read_text(encoding="utf-8"))
+    assert sorted(int(k) for k in partial_before["batches"]) == [0, 2, 3, 4]
+
+    fake, path = run_vision(tmp_path, [describe_all()], batch_size=1, parallel=4)
+
+    assert [c.usage for c in fake.calls] == ["vision"]  # seul le lot rate est redemande
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert [f["timecode"] for f in data["frames"]] == [91.0, 115.0, 139.0, 295.0, 335.0]
+    assert not (video_dir / "vision_partial.json").exists()
+
+
+def test_batch_failure_fails_the_step_with_its_reason(tmp_path, video_dir):
+    with pytest.raises(llm.TransientLLMError, match="quota du lot 2"):
+        run_vision(
+            tmp_path,
+            [describe_all(), llm.TransientLLMError("quota du lot 2"), describe_all(), describe_all(), describe_all()],
+            batch_size=1, parallel=4,
+        )
+    assert not (video_dir / "vision.json").exists()
 
 
 # --------------------------------------------------------------------------
@@ -339,9 +609,6 @@ def test_rerun_moments_revises_emotion_from_a_striking_description(tmp_path):
     reason="integration Claude : definir CLIPPER_CLAUDE_INTEGRATION=1 (consomme du quota)",
 )
 def test_real_llm_describes_a_real_frame(tmp_path, video_dir):
-    import cv2
-    import numpy as np
-
     from clipper.vision import run
 
     img = np.zeros((360, 640, 3), dtype=np.uint8)

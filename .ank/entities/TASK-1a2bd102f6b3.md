@@ -5,7 +5,7 @@ slug: vision-moins-d-images-candidats-rattrapables-seu
 title: "vision : moins d'images (candidats rattrapables seulement) et images réduites"
 created: 2026-09-25T18:04:58Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/vision.py
   - tests/test_vision.py
@@ -15,8 +15,15 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/311c20c65613@79cfd61
+    tree: scope/6f84952393da
+    criteria: e23c586e5502
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 2
+version: 4
 ---
 
 Essai réel 2026-09-25 : 448 images 1920x1080 (~220 Ko) envoyées pour 9 retenus + 23 rejetés, dont beaucoup ne pouvaient pas remonter. La lecture exacte du score, du min_score et du bonus visuel se fait dans moments.json et rubric.toml (sans importer clipper.moments, ADR-b16b).
