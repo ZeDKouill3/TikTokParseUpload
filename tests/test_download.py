@@ -177,6 +177,43 @@ def test_download_requests_mp4_up_to_1080p(isolated_cwd):
     assert captured_opts["merge_output_format"] == "mp4"
     assert "1080" in captured_opts["format"]
     assert "mp4" in captured_opts["format"]
+    assert captured_opts["js_runtimes"] == {"node": {}}
+
+
+def test_download_passes_configured_js_runtimes_to_ydl_opts(isolated_cwd):
+    from clipper.download import download
+
+    info = _load_fixture("info_dict_full.json")
+    workspace_dir = isolated_cwd / "workspace"
+    captured_opts: dict = {}
+    ydl_factory = _make_fake_ydl(info, captured_opts)
+
+    download(
+        f"https://youtu.be/{info['id']}",
+        workspace_dir=workspace_dir,
+        js_runtimes="deno",
+        ydl_factory=ydl_factory,
+    )
+
+    assert captured_opts["js_runtimes"] == {"deno": {}}
+
+
+def test_download_omits_js_runtimes_when_disabled(isolated_cwd):
+    from clipper.download import download
+
+    info = _load_fixture("info_dict_full.json")
+    workspace_dir = isolated_cwd / "workspace"
+    captured_opts: dict = {}
+    ydl_factory = _make_fake_ydl(info, captured_opts)
+
+    download(
+        f"https://youtu.be/{info['id']}",
+        workspace_dir=workspace_dir,
+        js_runtimes=None,
+        ydl_factory=ydl_factory,
+    )
+
+    assert "js_runtimes" not in captured_opts
 
 
 def test_config_defaults_declares_cookies_options():
@@ -184,6 +221,12 @@ def test_config_defaults_declares_cookies_options():
 
     assert "cookies_file" in CONFIG_DEFAULTS
     assert "cookies_from_browser" in CONFIG_DEFAULTS
+
+
+def test_config_defaults_declares_js_runtimes_option_defaulting_to_node():
+    from clipper.download import CONFIG_DEFAULTS
+
+    assert CONFIG_DEFAULTS["js_runtimes"] == "node"
 
 
 def test_download_passes_cookies_file_to_ydl_opts(isolated_cwd, tmp_path):
@@ -236,4 +279,5 @@ def test_config_section_download_resolves_via_clipper_config(isolated_cwd):
     assert config.section("download") == {
         "cookies_file": "cookies.txt",
         "cookies_from_browser": None,
+        "js_runtimes": "node",
     }

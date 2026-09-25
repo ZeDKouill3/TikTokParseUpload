@@ -10,6 +10,7 @@ import yt_dlp
 CONFIG_DEFAULTS: dict[str, object] = {
     "cookies_file": None,
     "cookies_from_browser": None,
+    "js_runtimes": "node",
 }
 
 # meilleure qualite jusqu'a 1080p, conteneur mp4 (ADR-b16b: sortie normalisee
@@ -74,6 +75,7 @@ def _ydl_opts(
     video_dir: Path,
     cookies_file: str | Path | None,
     cookies_from_browser: str | None,
+    js_runtimes: str | None,
 ) -> dict[str, Any]:
     opts: dict[str, Any] = {
         "format": _FORMAT,
@@ -87,6 +89,10 @@ def _ydl_opts(
         opts["cookiefile"] = str(cookies_file)
     if cookies_from_browser:
         opts["cookiesfrombrowser"] = (cookies_from_browser,)
+    if js_runtimes:
+        # yt-dlp doit resoudre les challenges JS (nsig) pour signer les URLs
+        # des formats video/audio ; sans, YouTube renvoie 403 au telechargement.
+        opts["js_runtimes"] = {js_runtimes: {}}
     return opts
 
 
@@ -96,6 +102,7 @@ def download(
     *,
     cookies_file: str | Path | None = None,
     cookies_from_browser: str | None = None,
+    js_runtimes: str | None = "node",
     ydl_factory: Callable[[dict[str, Any]], Any] = yt_dlp.YoutubeDL,
 ) -> dict[str, Any]:
     """Download a YouTube video and write its metadata (ADR-b16b: a step
@@ -113,7 +120,7 @@ def download(
         return json.loads(meta_file.read_text(encoding="utf-8"))
 
     video_dir.mkdir(parents=True, exist_ok=True)
-    opts = _ydl_opts(video_dir, cookies_file, cookies_from_browser)
+    opts = _ydl_opts(video_dir, cookies_file, cookies_from_browser, js_runtimes)
     with ydl_factory(opts) as ydl:
         info = ydl.extract_info(url, download=True)
 
