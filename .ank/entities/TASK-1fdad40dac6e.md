@@ -5,7 +5,7 @@ slug: tape-audio-courbe-d-nergie-et-pics
 title: "Étape audio : courbe d'énergie et pics"
 created: 2026-09-25T09:39:39Z
 author: claude-plan
-status: open
+status: done
 scope:
   - clipper/audio.py
   - tests/test_audio.py
@@ -15,6 +15,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/f7b6ebd41cc5@615afdc
+    tree: scope/78e2d829e482
+    criteria: 1a2bae03d244
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 2
+version: 4
 ---
