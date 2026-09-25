@@ -999,6 +999,190 @@ def test_rescore_after_vision_keeps_the_jury_trace_and_the_veto(tmp_path, video_
 
 
 # --------------------------------------------------------------------------
+# Exploration (TASK-022d, ADR-1cf0 point 4) : en selection par jury, une part
+# des clips retenus (defaut 10 %) est prise parmi les candidats non retenus
+# ou les notes du jury divergent le plus, marques exploration: true.
+# --------------------------------------------------------------------------
+
+LOW = dict.fromkeys(GOOD, 3)    # 30.0
+MID = dict.fromkeys(GOOD, 5)    # 50.0
+TOP = dict.fromkeys(GOOD, 10)   # 100.0
+
+
+def clip(k, scores=GOOD):
+    """Candidat de 5 phrases (k a k+4, 24.4 s) : moment(5k+0.25, 5k+24.65)."""
+    return moment(sentence_start(k), sentence_end(k + 4), scores=scores)
+
+
+def split(high):
+    """Le juge retention donne ``high``, les autres LOW : mediane LOW (rejete
+    sous min_score), dispersion = score(high) - 30."""
+    return {**dict.fromkeys(JUDGES, LOW), "retention": high}
+
+
+def explored(data):
+    return [m for m in data["moments"] if m.get("exploration") is True]
+
+
+def run_jury(tmp_path, rubric_path, ks, notes, vetoes=None, debate=None, **moments):
+    proposal = {"moments": [clip(k) for k in ks]}
+    return run(
+        tmp_path, rubric_path, with_jury(proposal, jury_notes(notes, vetoes=vetoes, debate=debate)),
+        config=auto_config(tmp_path, rubric_path, **moments), force=True,
+    )
+
+
+def test_exploration_takes_the_rejected_candidate_where_the_jury_disagrees_most(tmp_path, video_dir, rubric_path):
+    # 2 retenus x 0.5 = 1 clip d'exploration ; dispersions : 20 -> 0,
+    # 30 -> 20, 50 -> 36.9, 60 -> 70.
+    notes = {0: GOOD, 10: GOOD, 20: LOW, 30: split(MID), 50: split(GOOD), 60: split(TOP)}
+    run_jury(tmp_path, rubric_path, list(notes), notes, exploration_share=0.5)
+
+    data = read_moments(video_dir)
+    assert [(m["start"], m.get("exploration")) for m in data["moments"]] == [
+        (0.2, None), (50.2, None), (300.2, True),
+    ]
+    [x] = explored(data)
+    assert x["scores"] == LOW and x["final_score"] < 60
+    assert x["jury"]["trace"]["rounds"][0]["judges"]["retention"]["scores"] == TOP
+    assert 300.2 not in [r["start"] for r in data["rejected"]]
+    assert data["exploration"] == {"share": 0.5, "seed": 0, "target": 1, "chosen": 1}
+
+
+def test_exploration_measures_the_dispersion_after_the_debate(tmp_path, video_dir, rubric_path):
+    # 60 divergeait le plus au tour 1 (70) mais le debat a rapproche les
+    # juges (0) ; 50 reste a 36.9.
+    notes = {0: GOOD, 10: GOOD, 50: split(GOOD), 60: split(TOP)}
+    run_jury(tmp_path, rubric_path, list(notes), notes, debate={60: {"retention": LOW}}, exploration_share=0.5)
+
+    [x] = explored(read_moments(video_dir))
+    assert x["start"] == 250.2
+
+
+def test_exploration_never_takes_a_vetoed_candidate(tmp_path, video_dir, rubric_path):
+    notes = {0: GOOD, 10: GOOD, 50: split(GOOD), 60: split(TOP)}
+    run_jury(tmp_path, rubric_path, list(notes), notes, vetoes={60: "droits"}, exploration_share=0.5)
+
+    data = read_moments(video_dir)
+    [x] = explored(data)
+    assert x["start"] == 250.2
+    [vetoed] = [r for r in data["rejected"] if r["start"] == 300.2]
+    assert "veto" in vetoed["reason"]
+
+
+def test_exploration_never_overlaps_a_retained_clip_nor_another_exploration(tmp_path, video_dir, rubric_path):
+    # dispersions : 2 -> 70 (chevauche le retenu 0), 60 -> 70, 62 -> 36.9
+    # (chevauche 60), 50 -> 20. Deux clips d'exploration : 60 puis 50.
+    notes = {0: GOOD, 10: GOOD, 2: split(TOP), 50: split(MID), 60: split(TOP), 62: split(GOOD)}
+    run_jury(tmp_path, rubric_path, list(notes), notes, exploration_share=1.0)
+
+    data = read_moments(video_dir)
+    assert sorted(m["start"] for m in explored(data)) == [250.2, 300.2]
+    rejected = {r["start"] for r in data["rejected"]}
+    assert {10.2, 310.2} <= rejected
+
+
+def test_exploration_ignores_sponsorblock_and_duration_rejections_and_says_when_it_falls_short(
+    tmp_path, video_dir, rubric_path
+):
+    notes = {0: GOOD, 38: split(TOP), 60: split(TOP)}
+    proposal = {"moments": [
+        clip(0),
+        clip(38),                                                  # SponsorBlock sponsor 200-240
+        moment(sentence_start(60), sentence_end(70), scores=GOOD),  # 54.4 s : trop long pour single
+    ]}
+    run(
+        tmp_path, rubric_path, with_jury(proposal, jury_notes(notes)),
+        config=auto_config(tmp_path, rubric_path, exploration_share=1.0),
+    )
+
+    data = read_moments(video_dir)
+    assert explored(data) == []
+    assert spans(data) == [(0.2, 24.7)]
+    assert data["exploration"] == {"share": 1.0, "seed": 0, "target": 1, "chosen": 0}
+
+
+@pytest.mark.parametrize(
+    ("share", "retained", "target"),
+    [(None, 10, 1), (None, 4, 0), (0.25, 2, 1), (0.2, 2, 0), (0.15, 10, 2)],
+)
+def test_exploration_count_is_the_rounded_share_of_retained_clips(tmp_path, video_dir, rubric_path, share, retained, target):
+    good = [0, 5, 10, 15, 20, 25, 30, 35, 48, 53][:retained]
+    disputed = [58, 63, 68, 73, 78, 83, 88, 93]
+    notes = {**dict.fromkeys(good, GOOD), **dict.fromkeys(disputed, split(TOP))}
+    extra = {} if share is None else {"exploration_share": share}
+    run_jury(tmp_path, rubric_path, list(notes), notes, **extra)
+
+    data = read_moments(video_dir)
+    assert len(data["moments"]) == retained + target
+    assert len(explored(data)) == target
+    assert data["exploration"]["share"] == (0.1 if share is None else share)
+    assert data["exploration"]["target"] == target
+
+
+def test_exploration_choice_is_deterministic_for_a_fixed_seed(tmp_path, video_dir, rubric_path):
+    # 50, 60, 70 : meme dispersion (70) ; un seul clip d'exploration.
+    notes = {0: GOOD, 10: GOOD, 50: split(TOP), 60: split(TOP), 70: split(TOP)}
+
+    def chosen(seed):
+        run_jury(tmp_path, rubric_path, list(notes), notes, exploration_share=0.5, exploration_seed=seed)
+        [x] = explored(read_moments(video_dir))
+        return x["start"]
+
+    assert chosen(7) == chosen(7) == chosen(7)
+    assert {chosen(seed) for seed in range(12)} == {250.2, 300.2, 350.2}
+    assert read_moments(video_dir)["exploration"]["seed"] == 11
+
+
+def test_exploration_share_zero_leaves_the_selection_unchanged(tmp_path, video_dir, rubric_path):
+    notes = {0: GOOD, 10: GOOD, 50: split(GOOD), 60: split(TOP)}
+    run_jury(tmp_path, rubric_path, list(notes), notes, exploration_share=0)
+
+    data = read_moments(video_dir)
+    assert "exploration" not in data
+    assert spans(data) == [(0.2, 24.7), (50.2, 74.7)]
+    assert all("exploration" not in m for m in data["moments"] + data["rejected"])
+    assert sorted(r["start"] for r in data["rejected"]) == [250.2, 300.2]
+
+
+def test_single_selection_has_no_exploration(tmp_path, video_dir, rubric_path):
+    run(
+        tmp_path, rubric_path, [{"moments": [clip(0), clip(10), clip(60, scores=LOW)]}],
+        config=make_config(tmp_path, rubric_path, exploration_share=1.0),
+    )
+
+    data = read_moments(video_dir)
+    assert "exploration" not in data
+    assert explored(data) == [] and len(data["moments"]) == 2
+
+
+@pytest.mark.parametrize("share", [-0.1, 1.5, "10%", True])
+def test_invalid_exploration_share_is_refused(tmp_path, video_dir, rubric_path, share):
+    from clipper.moments import MomentsError
+
+    notes = {0: GOOD}
+    with pytest.raises(MomentsError, match="exploration_share"):
+        run_jury(tmp_path, rubric_path, list(notes), notes, exploration_share=share)
+    assert not (video_dir / "moments.json").exists()
+
+
+def test_rescore_after_vision_keeps_the_exploration(tmp_path, video_dir, rubric_path):
+    notes = {0: GOOD, 10: GOOD, 50: split(GOOD), 60: split(TOP)}
+    run_jury(tmp_path, rubric_path, list(notes), notes, exploration_share=0.5)
+    write_vision_after_moments(video_dir, [striking(5.0)])
+
+    fake, _ = rescore(tmp_path, rubric_path, config=auto_config(tmp_path, rubric_path, exploration_share=0.5))
+
+    assert fake.calls == []
+    data = read_moments(video_dir)
+    assert [(m["start"], m.get("exploration")) for m in data["moments"]] == [
+        (0.2, None), (50.2, None), (300.2, True),
+    ]
+    assert data["exploration"] == {"share": 0.5, "seed": 0, "target": 1, "chosen": 1}
+    assert data["rescored"]["changed"][0]["start"] == 0.2
+
+
+# --------------------------------------------------------------------------
 # Integration optionnelle avec le vrai Claude (quota de l'utilisateur) :
 # CLIPPER_CLAUDE_INTEGRATION=1 pytest tests/test_moments.py
 # --------------------------------------------------------------------------

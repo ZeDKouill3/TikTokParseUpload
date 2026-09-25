@@ -15,9 +15,11 @@ Sortie : workspace/<video_id>/moments.json
     {"video_id", "rubric": {"path", "weights", "min_score"}, "chunked",
      "selection": "single" | "jury",
      "jury": {"judges", "seed", "threshold", "quorum", "failed", "debated"},  # jury
+     "exploration": {"share", "seed", "target", "chosen"},   # jury, part > 0
      "moments": [{"id", "start", "end", "duration", "format", "parts",
                   "scores", "bonus", "final_score", "justification",
-                  "hook_text", "jury"}],                     # jury : si jury
+                  "hook_text", "jury", "exploration"}],       # jury : si jury ;
+                                                             # exploration : true
      "rejected": [{"start", "end", "reason", ...}],
      "rescored": {"source", "changed": [{"id", "start", "end", "hook_text",
                                           "before", "after"}]}}   # re-notation
@@ -31,6 +33,18 @@ candidat garde les notes et la justification du proposeur, le score du jury,
 son veto et sa trace (tours, revisions, dissidences). Un veto rejette le
 candidat avec sa raison, sans score final. Juge invalide : l'erreur remonte,
 rien n'est ecrit (ADR-ad2e).
+
+Exploration (ADR-1cf0, point 4), en selection par jury : en plus des retenus,
+``exploration_share`` x leur nombre (arrondi au plus proche) clips sont pris
+parmi les candidats notes non retenus ou le jury hesite le plus, pour
+apprendre ce qu'il sous-estime. Dispersion d'un candidat = ecart entre le
+score le plus haut et le plus bas des juges, chacun a son dernier tour
+(``jury.trace.rounds``) ; egalites departagees par un tirage a graine fixe
+(``exploration_seed``). Jamais un candidat vete ni rejete par la grille
+(SponsorBlock, duree), jamais un chevauchement avec un retenu ou un autre
+clip d'exploration. Ces clips portent ``exploration: true`` ; le bloc
+``exploration`` dit combien etaient vises (``target``) et pris (``chosen``).
+Part 0 : aucune exploration, sortie inchangee.
 
 Re-notation : si moments.json existe et que vision.json est plus recent,
 l'etape (sans ``force``) ne rappelle pas le LLM ; elle recalcule le bonus
@@ -61,6 +75,7 @@ from __future__ import annotations
 
 import json
 import math
+import random
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -83,6 +98,11 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "chunk_overlap_seconds": 300,
     # Pics audio envoyes au LLM (les plus forts).
     "max_audio_peaks": 200,
+    # Selection par jury : part des clips retenus ajoutee en exploration,
+    # prise parmi les candidats ou le jury hesite (ADR-1cf0). 0 : aucune.
+    "exploration_share": 0.1,
+    # Graine du tirage qui departage les candidats de meme dispersion.
+    "exploration_seed": 0,
 }
 
 FORMATS = ("single", "multipart")
@@ -575,24 +595,65 @@ def final_score(scores: dict[str, float], rubric: dict[str, Any], bonus_total: f
     return round(min(100.0, base + bonus_total), 1)
 
 
+def _overlaps(c: dict[str, Any], others: list[dict[str, Any]]) -> dict[str, Any] | None:
+    return next((k for k in others if c["_start"] < k["_end"] and k["_start"] < c["_end"]), None)
+
+
 def _select(
-    candidates: list[dict[str, Any]], rubric: dict[str, Any]
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """(retenus, rejets motives) : rejet sous ``min_score``, puis, entre
-    candidats qui se chevauchent, seul le mieux note reste."""
+    candidates: list[dict[str, Any]], rubric: dict[str, Any], exploration: tuple[float, int] | None = None
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any] | None]:
+    """(retenus, rejets motives, bloc exploration ou None) : rejet sous
+    ``min_score``, puis, entre candidats qui se chevauchent, seul le mieux
+    note reste. Avec ``exploration`` (part, graine), les clips d'exploration
+    suivent les retenus (voir ``_explore``)."""
     kept: list[dict[str, Any]] = []
-    rejected: list[dict[str, Any]] = []
+    rejected: list[tuple[dict[str, Any], str]] = []
     for c in sorted(candidates, key=lambda c: (-c["final_score"], c["_start"])):
-        public = _public(c)
         if c["final_score"] < rubric["min_score"]:
-            rejected.append({**public, "reason": f"score {c['final_score']} < min_score {rubric['min_score']}"})
+            rejected.append((c, f"score {c['final_score']} < min_score {rubric['min_score']}"))
             continue
-        rival = next((k for k in kept if c["_start"] < k["_end"] and k["_start"] < c["_end"]), None)
+        rival = _overlaps(c, kept)
         if rival is not None:
-            rejected.append({**public, "reason": f"chevauche un moment mieux note [{_span(rival['_start'], rival['_end'])}]"})
+            rejected.append((c, f"chevauche un moment mieux note [{_span(rival['_start'], rival['_end'])}]"))
             continue
         kept.append(c)
-    return kept, rejected
+    info = None
+    if exploration is not None:
+        share, seed = exploration
+        target, chosen = _explore([c for c, _ in rejected], kept, share, seed)
+        info = {"share": share, "seed": seed, "target": target, "chosen": len(chosen)}
+        kept += chosen
+    return kept, [{**_public(c), "reason": reason} for c, reason in rejected if not c.get("exploration")], info
+
+
+def _dispersion(c: dict[str, Any]) -> float:
+    """Ecart entre le score le plus haut et le plus bas des juges, chacun a
+    son dernier tour dans la trace du jury."""
+    latest: dict[str, float] = {}
+    for rnd in c["jury"]["trace"]["rounds"]:
+        latest.update({name: j["score"] for name, j in rnd["judges"].items()})
+    return round(max(latest.values()) - min(latest.values()), 1)
+
+
+def _explore(
+    pool: list[dict[str, Any]], kept: list[dict[str, Any]], share: float, seed: int
+) -> tuple[int, list[dict[str, Any]]]:
+    """(nombre vise, clips d'exploration marques) : parmi ``pool`` (candidats
+    notes non retenus), les plus disperses d'abord, egalites departagees par
+    un tirage a graine fixe, sans chevaucher un retenu ni un autre clip
+    d'exploration. Moins de candidats possibles que vise : on prend ce qu'il
+    y a, et ``chosen`` < ``target`` le dit."""
+    target = max(0, math.floor(share * len(kept) + 0.5))
+    rng = random.Random(f"{seed}:exploration")
+    draw = {id(c): rng.random() for c in sorted(pool, key=lambda c: c["_start"])}
+    chosen: list[dict[str, Any]] = []
+    for c in sorted(pool, key=lambda c: (-_dispersion(c), draw[id(c)])):
+        if len(chosen) >= target:
+            break
+        if _overlaps(c, kept + chosen) is None:
+            c["exploration"] = True
+            chosen.append(c)
+    return target, chosen
 
 
 def _rubric_info(rubric_path: Path, rubric: dict[str, Any]) -> dict[str, Any]:
@@ -616,6 +677,7 @@ def _public(c: dict[str, Any]) -> dict[str, Any]:
         "justification": c["justification"],
         "hook_text": c["hook_text"],
         **({"jury": c["jury"]} if "jury" in c else {}),
+        **({"exploration": True} if c.get("exploration") else {}),
     }
 
 
@@ -691,6 +753,17 @@ def _selection(config: Any, settings: dict[str, Any]) -> str:
     return "jury" if config.mode == "auto" else selection
 
 
+def _exploration(settings: dict[str, Any]) -> tuple[float, int] | None:
+    """(part, graine) de l'exploration, None si la part vaut 0 ; un reglage
+    invalide est une MomentsError."""
+    share, seed = settings["exploration_share"], settings["exploration_seed"]
+    if not _number(share) or not 0 <= share <= 1:
+        raise MomentsError(f"[moments] exploration_share invalide : {share!r} (attendu : nombre de 0 a 1)")
+    if not isinstance(seed, int) or isinstance(seed, bool):
+        raise MomentsError(f"[moments] exploration_seed invalide : {seed!r} (attendu : entier)")
+    return (float(share), seed) if share > 0 else None
+
+
 def run(
     video_id: str,
     workspace_dir: str | Path = "workspace",
@@ -721,6 +794,7 @@ def run(
     vision = _read_json(video_dir / "vision.json", optional=True)
     settings = _settings(config)
     selection = _selection(config, settings)
+    exploration = _exploration(settings) if selection == "jury" else None
     rubric_path = Path(settings["rubric_path"])
     rubric = load_rubric(rubric_path)
     examples = list(examples or [])
@@ -781,7 +855,7 @@ def run(
         c["bonus"] = _bonus(c["_start"], c["_end"], meta, audio, vision, rubric)
         c["final_score"] = final_score(c["scores"], rubric, c["bonus"]["total"])
 
-    kept, rejected_scored = _select(candidates, rubric)
+    kept, rejected_scored, exploration_info = _select(candidates, rubric, exploration)
 
     result = {
         "video_id": video_id,
@@ -789,6 +863,7 @@ def run(
         "chunked": chunked,
         "selection": selection,
         **({"jury": jury_info} if jury_info is not None else {}),
+        **({"exploration": exploration_info} if exploration_info is not None else {}),
         "moments": [{"id": n, **_public(c)} for n, c in enumerate(kept)],
         "rejected": rejected + rejected_scored,
     }
@@ -829,8 +904,9 @@ def _rescore(video_dir: Path, out: Path, settings: dict[str, Any]) -> Path:
     bonus visuel, le score final, le filtre min_score et le non-chevauchement.
     Notes par critere, bornes et justifications restent celles enregistrees ;
     les rejets de la grille (SponsorBlock, duree, bornes) sont gardes tels
-    quels. ``rescored.changed`` liste les candidats dont le score ou le sort
-    (retenu ou non) a change."""
+    quels. En selection par jury, l'exploration est refaite sur le meme
+    principe. ``rescored.changed`` liste les candidats dont le score ou le
+    sort (retenu ou non) a change."""
     previous = _read_json(out)
     vision = _read_json(video_dir / "vision.json")
     sents = split_sentences(_read_json(video_dir / "transcript.json"))
@@ -849,7 +925,8 @@ def _rescore(video_dir: Path, out: Path, settings: dict[str, Any]) -> Path:
             c["bonus"] = {**old, "visual": round(visual, 2), "total": round(total, 2)}
         c["final_score"] = final_score(c["scores"], rubric, c["bonus"]["total"])
 
-    kept, rejected_scored = _select(candidates, rubric)
+    exploration = _exploration(settings) if previous.get("selection") == "jury" else None
+    kept, rejected_scored, exploration_info = _select(candidates, rubric, exploration)
     moments_out = [{"id": n, **_public(c)} for n, c in enumerate(kept)]
     ids = {id(c): n for n, c in enumerate(kept)}
     changed = []
@@ -866,8 +943,9 @@ def _rescore(video_dir: Path, out: Path, settings: dict[str, Any]) -> Path:
             })
 
     result = {
-        **previous,
+        **{k: v for k, v in previous.items() if k != "exploration"},
         "rubric": _rubric_info(rubric_path, rubric),
+        **({"exploration": exploration_info} if exploration_info is not None else {}),
         "moments": moments_out,
         "rejected": unscored + rejected_scored,
         "rescored": {"source": "vision.json", "changed": changed},
