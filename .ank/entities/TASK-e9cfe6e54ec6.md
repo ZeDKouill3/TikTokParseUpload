@@ -5,7 +5,7 @@ slug: vision-lots-d-images-en-parall-le-et-reprise-des
 title: "vision : lots d'images en parallèle et reprise des lots déjà décrits"
 created: 2026-09-25T18:01:41Z
 author: nicoc@zedk_ordi
-status: open
+status: closed
 scope:
   - clipper/vision.py
   - tests/test_vision.py
@@ -16,7 +16,7 @@ criteria_by: creator
 verify: [tests]
 method: tdd
 schema: 4
-version: 1
+version: 2
 ---
 
 Essai réel 2026-09-25 (sZi-qJ-5ptA) : 448 images autour de 32 candidats, 56 lots de 8 traités en série, ~1 min par lot, soit ~1 h. Même remède que transcript_fix (TASK-a6d4) : threads, car les appels LLM sont des sous-processus.
