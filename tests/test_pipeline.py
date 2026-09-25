@@ -174,6 +174,18 @@ def answer(request):
         return {"moments": [{"hook_text": "GTA six arrive vraiment.", "start": MOMENT["start"],
                              "end": MOMENT["end"], "format": "single", "part_breaks": [],
                              "justification": "Annonce forte", "scores": scores}]}
+    if usage.startswith("jury_"):
+        # Mode auto : le jury (clipper.jury) note chaque candidat demande,
+        # comme le proposeur, sans veto.
+        item = request.schema["properties"]["candidates"]["items"]["properties"]
+        candidates = []
+        for ref in item["ref"]["enum"]:
+            entry = {"ref": ref, "argument": "« GTA six arrive vraiment. » : accroche nette.",
+                     "scores": {k: 9 for k in item["scores"]["required"]}}
+            if "veto" in item:
+                entry.update(veto=False, veto_reason="")
+            candidates.append(entry)
+        return {"candidates": candidates}
     if usage == "vision":
         n = request.schema["properties"]["frames"]["minItems"]
         return {"frames": [{"index": i, "description": "une mire", "tags": ["mire"], "striking": False}
@@ -269,6 +281,10 @@ def test_auto_runs_every_step_queues_a_transient_error_then_finishes(tmp_path, i
     assert "quota atteint" in state["steps"]["qa"]["reason"]
     for name in PRE_REVIEW + ("captions", "reframe", "subtitles", "render"):
         assert state["steps"][name]["status"] == "done", name
+    # Mode auto : les moments sont choisis par le jury (ADR-ff87).
+    assert {c.usage for c in fake.calls if c.usage.startswith("jury_")} == {
+        "jury_retention", "jury_spectateur", "jury_monteur", "jury_avocat", "jury_conformite",
+    }
     retry_at = datetime.fromisoformat(state["retry_at"])
     assert retry_at >= t0 + timedelta(seconds=600)
     assert pipeline.load_state(VIDEO_ID, config=config) == state
