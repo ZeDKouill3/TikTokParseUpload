@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -36,6 +37,25 @@ RECORDED_CLAUDE_CLI_OK = {
     "total_cost_usd": 0.7325792000000001,
     "permission_denials": [],
     "result": '{"couleur": "rouge"}',
+}
+
+# Forme de la sortie reelle avec --json-schema (Claude Code 2.1.281, releve
+# sur un lot vision de 8 images, ramene ici a COLOR_SCHEMA) : la reponse
+# structuree arrive, deja decodee, dans `structured_output` ; `result` garde
+# le texte. Champs de telemetrie retires.
+RECORDED_CLAUDE_CLI_STRUCTURED = {
+    "type": "result",
+    "subtype": "success",
+    "is_error": False,
+    "api_error_status": None,
+    "num_turns": 2,
+    "stop_reason": "end_turn",
+    "terminal_reason": "completed",
+    "session_id": "4b1f0e6c-0000-0000-0000-000000000000",
+    "permission_denials": [],
+    "result": '{"couleur":"rouge"}',
+    "result_index": 0,
+    "structured_output": {"couleur": "rouge"},
 }
 
 # Meme forme, cas d'erreur quota (is_error + api_error_status 429).
@@ -214,6 +234,50 @@ def test_claude_cli_configured_full_path_is_used_as_is(monkeypatch, tmp_path):
     llm.ask("qa", "p", [], COLOR_SCHEMA, config=make_config(claude_cli={"command": str(exe)}))
 
     assert run.calls[0]["cmd"][0] == str(exe)
+
+
+def test_claude_cli_imposes_request_schema_via_json_schema_option(fake_run):
+    run = fake_run(json.dumps(RECORDED_CLAUDE_CLI_STRUCTURED))
+    llm.ask("vision", "p", [], COLOR_SCHEMA, config=make_config())
+    cmd = run.calls[0]["cmd"]
+    assert json.loads(cmd[cmd.index("--json-schema") + 1]) == COLOR_SCHEMA
+
+
+def test_claude_cli_reads_structured_output_rather_than_result_text(fake_run):
+    # Constat 2026-09-25 (vision) : texte result a structure inventee, cle par
+    # index au lieu du tableau demande ; la reponse structuree fait foi.
+    invented = dict(RECORDED_CLAUDE_CLI_STRUCTURED, result='{"0": {"couleur": "rouge"}}')
+    fake_run(json.dumps(invented))
+    assert llm.ask("vision", "p", [], COLOR_SCHEMA, config=make_config()) == {"couleur": "rouge"}
+
+
+@pytest.mark.parametrize("structured", ["absent", None])
+def test_claude_cli_without_structured_output_falls_back_to_result_text(fake_run, structured):
+    out = dict(RECORDED_CLAUDE_CLI_STRUCTURED, result='{"couleur": "vert"}')
+    if structured == "absent":
+        del out["structured_output"]
+    else:
+        out["structured_output"] = structured
+    fake_run(json.dumps(out))
+    assert llm.ask("vision", "p", [], COLOR_SCHEMA, config=make_config()) == {"couleur": "vert"}
+
+
+def test_claude_cli_invalid_structured_output_is_still_a_schema_error(fake_run):
+    bad = dict(RECORDED_CLAUDE_CLI_STRUCTURED, structured_output={"couleur": 3})
+    fake_run(json.dumps(bad))
+    with pytest.raises(SchemaError):
+        llm.ask("vision", "p", [], COLOR_SCHEMA, config=make_config())
+
+
+def test_claude_cli_schema_too_long_for_command_line_fails_before_running(fake_run):
+    # --json-schema n'accepte que du JSON litteral (ni chemin ni @fichier,
+    # verifie sur 2.1.281) : au-dela de la limite Windows, echec explicite.
+    run = fake_run(json.dumps(RECORDED_CLAUDE_CLI_STRUCTURED))
+    huge = dict(COLOR_SCHEMA, description="x" * 40_000)
+    with pytest.raises(LLMError, match="json-schema") as exc:
+        llm.ask("vision", "p", [], huge, config=make_config())
+    assert not isinstance(exc.value, TransientLLMError)
+    assert run.calls == []
 
 
 def test_claude_cli_accepts_json_wrapped_in_markdown_fence(fake_run):
@@ -534,3 +598,73 @@ def test_use_backend_restores_config_backend_on_exit(fake_run):
     with llm.use_backend(FakeBackend([{"couleur": "bleu"}])):
         pass
     assert llm.ask("qa", "p", [], COLOR_SCHEMA, config=make_config()) == {"couleur": "rouge"}
+
+
+# --- integration reelle (optionnelle) ---------------------------------------
+# CLIPPER_CLAUDE_INTEGRATION=1 pytest tests/test_llm.py -k integration
+
+STRIPES_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "bandes": {
+            "type": "array",
+            "minItems": 3,
+            "maxItems": 3,
+            "items": {"type": "string", "enum": ["rouge", "vert", "bleu"]},
+        },
+    },
+    "required": ["bandes"],
+    "additionalProperties": False,
+}
+
+
+def write_stripes_png(path: Path, width: int = 96, height: int = 32) -> None:
+    """PNG de trois bandes verticales rouge, vert, bleu (gauche a droite),
+    ecrit sans dependance."""
+    import struct
+    import zlib
+
+    colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255)]
+    row = b"\x00" + b"".join(bytes(colors[x * 3 // width]) for x in range(width))
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        body = kind + data
+        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body))
+
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    path.write_bytes(
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", ihdr)
+        + chunk(b"IDAT", zlib.compress(row * height))
+        + chunk(b"IEND", b"")
+    )
+
+
+@pytest.mark.skipif(
+    os.environ.get("CLIPPER_CLAUDE_INTEGRATION") != "1",
+    reason="integration Claude : definir CLIPPER_CLAUDE_INTEGRATION=1 (consomme du quota)",
+)
+def test_integration_real_claude_cli_imposes_array_schema_on_image(monkeypatch, tmp_path):
+    img = tmp_path / "bandes.png"
+    write_stripes_png(img)
+    real_run = subprocess.run
+    outputs: list[str] = []
+
+    def spy(cmd, **kwargs):
+        proc = real_run(cmd, **kwargs)
+        outputs.append(proc.stdout)
+        return proc
+
+    monkeypatch.setattr("clipper.llm.claude_cli.subprocess.run", spy)
+
+    out = llm.ask(
+        "vision",
+        "L'image montre trois bandes verticales de couleur. Donne leurs couleurs de gauche a droite.",
+        [img],
+        STRIPES_SCHEMA,
+        config=make_config(),
+    )
+
+    assert out == {"bandes": ["rouge", "vert", "bleu"]}
+    # La reponse est bien venue du canal structure impose par --json-schema.
+    assert json.loads(outputs[0])["structured_output"] == out
