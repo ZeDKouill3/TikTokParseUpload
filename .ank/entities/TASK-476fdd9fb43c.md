@@ -5,7 +5,7 @@ slug: squelette-clipper-config-workspace-en-cache-devi
 title: "Squelette clipper : config, workspace en cache, device GPU, CLI"
 created: 2026-09-25T09:39:34Z
 author: claude-plan
-status: open
+status: done
 scope:
   - pyproject.toml
   - .gitignore
@@ -26,8 +26,15 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/b77d2c673931@ec791ef
+    tree: scope/a06bb4cb542b
+    criteria: 1dafa541aff4
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---
 
 Fondation de ADR-b16b71007578 et ADR-fb9bcb1e98f5. clipper/pipeline.py n'est ici qu'un registre d'étapes + la logique 'étape faite, on saute' ; l'orchestration complète est une tâche à part. Python 3.11+ : sur le PC de dev, créer un env (miniconda est installé).

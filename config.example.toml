@@ -1,0 +1,12 @@
+# Copier ce fichier vers config.toml puis ajuster.
+
+# review : aucun rendu final sans decision humaine enregistree.
+# auto   : pipeline autonome, file d'attente sur echec transitoire,
+#          le controle qualite (etape qa) remplace la revue humaine.
+mode = "review"
+
+# Racine des dossiers de travail par video (workspace/<video_id>/).
+workspace_dir = "workspace"
+
+# Racine des clips rendus.
+output_dir = "output"
