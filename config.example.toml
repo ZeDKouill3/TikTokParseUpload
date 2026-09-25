@@ -10,3 +10,13 @@ workspace_dir = "workspace"
 
 # Racine des clips rendus.
 output_dir = "output"
+
+# Chaque etape du pipeline (module clipper/x.py) peut declarer son propre
+# dict CONFIG_DEFAULTS pour documenter les cles qu'elle accepte. Une table
+# [x] ici est validee contre ce dict : cle absente de CONFIG_DEFAULTS
+# refusee, section sans module clipper.x ou sans CONFIG_DEFAULTS refusee.
+# Voir CONFIG_DEFAULTS dans le module clipper.x concerne pour la liste des
+# cles disponibles, par exemple :
+#
+# [llm]
+# backend = "claude-cli"

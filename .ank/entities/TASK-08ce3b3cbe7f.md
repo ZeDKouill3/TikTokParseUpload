@@ -5,7 +5,7 @@ slug: config-par-sections-d-clar-es-par-module-pyproje
 title: Config par sections déclarées par module + pyproject prêt pour les étapes
 created: 2026-09-25T10:30:06Z
 author: UP60041549@wl0023729
-status: open
+status: done
 scope:
   - clipper/config.py
   - config.example.toml
@@ -17,8 +17,15 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/0646fdc25957@11098a0
+    tree: scope/0c8b1b99b9de
+    criteria: 9b3b55d234cb
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---
 
 Ajoutée par l'orchestrateur (2026-09-25) : la config du squelette est plate et fermée, donc TASK-1557 (chemin du journal), TASK-4ca0 (cookies) et TASK-e492 (backend par usage) auraient toutes modifié config.py, config.example.toml et pyproject.toml, et n'auraient pas pu tourner en parallèle. Avec cette tâche, chaque étape ne touche que son propre module (CONFIG_DEFAULTS), et les trois tournent en même temps. Décision humaine : tâche préalable plutôt que série.

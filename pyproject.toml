@@ -7,12 +7,15 @@ name = "clipper"
 version = "0.1.0"
 description = "Pipeline de clips verticaux sous-titres a partir de videos YouTube longues"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "yt-dlp",
+    "anthropic",
+]
 
 [project.optional-dependencies]
 test = [
     "pytest>=8",
 ]
 
-[tool.setuptools]
-packages = ["clipper"]
+[tool.setuptools.packages.find]
+include = ["clipper", "clipper.*"]
