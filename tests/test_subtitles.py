@@ -92,7 +92,7 @@ def parse_ass(path: Path) -> dict:
         parts = m.group(1).split(",", 9)
         events.append({
             "layer": parts[0], "start": parts[1], "end": parts[2],
-            "style": parts[3], "text": parts[9],
+            "style": parts[3], "margin_v": parts[7], "text": parts[9],
         })
     return {"info": info, "style": style, "events": events, "raw": text}
 
@@ -244,31 +244,239 @@ def test_invalid_emphasis_answer_is_a_failure_and_writes_nothing(tmp_path, video
 
 
 # --------------------------------------------------------------------------
-# C7 : position verticale parametrable pour eviter une zone donnee (visages)
+# C7 (TASK-29cf) : position par evenement dans une zone sure TikTok, hors
+# visages du plan ou le sous-titre s'affiche, jamais sur l'accroche.
+# --------------------------------------------------------------------------
+
+H = 1920
+SAFE_TOP, SAFE_BOTTOM = 0.20 * H, 0.78 * H  # zone sure par defaut (px)
+
+
+def event_bands(doc: dict) -> list[tuple[float, float]]:
+    """Bande verticale [haut, bas] (px) occupee par chaque evenement : style
+    aligne en bas (Alignment 2), le bas du texte est a PlayResY - MarginV de
+    l'evenement, sur une hauteur text_band_height."""
+    assert doc["style"]["Alignment"] == "2"
+    band = int(CONFIG_DEFAULTS["text_band_height"])
+    bands = []
+    for ev in doc["events"]:
+        margin_v = int(ev["margin_v"]) or int(doc["style"]["MarginV"])
+        bottom = H - margin_v
+        bands.append((bottom - band, bottom))
+    return bands
+
+
+def overlap(a: tuple[float, float], b: tuple[float, float]) -> float:
+    return max(0.0, min(a[1], b[1]) - max(a[0], b[0]))
+
+
+def px(zone: tuple[float, float]) -> tuple[float, float]:
+    return (zone[0] * H, zone[1] * H)
+
+
+def zones(*entries):
+    """[(start, end, [(haut, bas), ...]), ...] -> format avoid_zones."""
+    return [{"start": s, "end": e, "bands": [list(b) for b in bands]} for s, e, bands in entries]
+
+
+def in_lower_third_of_safe_zone(band: tuple[float, float]) -> bool:
+    centre = (band[0] + band[1]) / 2
+    return centre >= SAFE_TOP + 2 * (SAFE_BOTTOM - SAFE_TOP) / 3 and band[1] <= SAFE_BOTTOM
+
+
+def test_without_faces_every_event_sits_in_the_lower_third_of_the_safe_zone(tmp_path, video_dir):
+    with llm.use_backend(FakeBackend([NO_EMPHASIS])):
+        path = run(tmp_path)
+    bands = event_bands(parse_ass(Path(path)))
+    assert len(bands) == 2
+    for b in bands:
+        assert SAFE_TOP <= b[0] and b[1] <= SAFE_BOTTOM
+        assert in_lower_third_of_safe_zone(b)
+
+
+def test_style_keeps_the_right_margin_clear_for_tiktok_icons(tmp_path, video_dir):
+    with llm.use_backend(FakeBackend([NO_EMPHASIS])):
+        path = run(tmp_path)
+    # colonne d'icones TikTok a droite : au moins ~11 % de la largeur (120 px)
+    assert int(parse_ass(Path(path))["style"]["MarginR"]) >= 120
+
+    with llm.use_backend(FakeBackend([NO_EMPHASIS])):
+        path = run(tmp_path, config=make_config(tmp_path, margin_right=210), force=True)
+    assert parse_ass(Path(path))["style"]["MarginR"] == "210"
+
+
+def test_safe_zone_comes_from_config(tmp_path, video_dir):
+    with llm.use_backend(FakeBackend([NO_EMPHASIS])):
+        path = run(tmp_path, config=make_config(tmp_path, safe_zone=[0.30, 0.60]))
+    for b in event_bands(parse_ass(Path(path))):
+        assert 0.30 * H <= b[0] and b[1] <= 0.60 * H
+
+
+def test_face_in_the_lower_part_moves_subtitles_just_above_it_not_to_the_top(tmp_path, video_dir):
+    # constat du clip 00 : visage qui touche le bas -> sous-titres tout en haut,
+    # sous l'interface TikTok. Ils restent dans la zone sure, au-dessus du visage.
+    face = (0.55, 0.80)
+    with llm.use_backend(FakeBackend([NO_EMPHASIS])):
+        path = run(tmp_path, avoid_zones=zones((0.0, 10.0, [face])))
+    for b in event_bands(parse_ass(Path(path))):
+        assert SAFE_TOP <= b[0] and b[1] <= SAFE_BOTTOM
+        assert overlap(b, px(face)) == 0
+        # le plus bas possible au-dessus du visage : a moins d'un pas de lui
+        assert b[1] >= px(face)[0] - 200
+
+
+def test_each_event_takes_the_position_of_the_plan_it_is_shown_in(tmp_path, video_dir):
+    # events : [monde bienvenue sur] 1.1-2.6, [GTA six.] 2.7-4.6
+    face = (0.55, 0.80)
+    avoid = zones((0.0, 2.65, [face]), (2.65, 10.0, []))
+    with llm.use_backend(FakeBackend([NO_EMPHASIS])):
+        path = run(tmp_path, avoid_zones=avoid)
+    first, second = event_bands(parse_ass(Path(path)))
+    assert overlap(first, px(face)) == 0
+    assert in_lower_third_of_safe_zone(second)
+    assert first != second
+
+
+def test_event_spanning_two_plans_avoids_the_faces_of_both(tmp_path, video_dir):
+    upper, lower = (0.20, 0.45), (0.60, 0.80)
+    # [monde bienvenue sur] 1.1-2.6 est a cheval sur les deux plans
+    avoid = zones((0.0, 2.0, [upper]), (2.0, 10.0, [lower]))
+    with llm.use_backend(FakeBackend([NO_EMPHASIS])):
+        path = run(tmp_path, avoid_zones=avoid)
+    first = event_bands(parse_ass(Path(path)))[0]
+    assert overlap(first, px(upper)) == 0 and overlap(first, px(lower)) == 0
+
+
+def test_without_free_position_the_least_covering_one_is_taken_and_logged(tmp_path, video_dir, caplog):
+    # visages de 20 % a 70 % : seule la bande 70-78 % (154 px) est libre, trop
+    # petite pour le texte ; la position la plus basse est la moins recouvrante.
+    face = (0.20, 0.70)
+    with caplog.at_level("WARNING", logger="clipper.subtitles"), \
+            llm.use_backend(FakeBackend([NO_EMPHASIS])):
+        path = run(tmp_path, avoid_zones=zones((0.0, 10.0, [face])))
+    for b in event_bands(parse_ass(Path(path))):
+        assert b[1] == pytest.approx(SAFE_BOTTOM, abs=1)
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert warnings and CLIP_ID in warnings[0].getMessage()
+
+
+def test_free_position_logs_nothing(tmp_path, video_dir, caplog):
+    with caplog.at_level("WARNING", logger="clipper.subtitles"), \
+            llm.use_backend(FakeBackend([NO_EMPHASIS])):
+        run(tmp_path, avoid_zones=zones((0.0, 10.0, [(0.55, 0.80)])))
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+
+def test_hook_band_is_never_covered_even_to_avoid_a_face(tmp_path, video_dir):
+    # zone sure elargie jusqu'en haut par la config : l'accroche (0-12 %, les
+    # 2 premieres secondes du clip) reste interdite, meme si le visage pousse
+    # les sous-titres vers le haut.
+    hook = (0.0, 0.12)
+    face = (0.30, 0.78)
+    config = make_config(tmp_path, safe_zone=[0.0, 0.78])
+    with llm.use_backend(FakeBackend([NO_EMPHASIS])):
+        path = run(tmp_path, config=config, avoid_zones=zones((0.0, 10.0, [face])),
+                   reserved_zones=zones((1.0, 3.0, [hook])))
+    bands = event_bands(parse_ass(Path(path)))
+    for b in bands:
+        assert overlap(b, px(hook)) == 0
+        assert overlap(b, px(face)) == 0
+
+
+def test_hook_band_leaves_no_candidate_is_an_error(tmp_path, video_dir):
+    from clipper.subtitles import SubtitlesError
+
+    config = make_config(tmp_path, safe_zone=[0.0, 0.3])
+    with llm.use_backend(FakeBackend([NO_EMPHASIS])), pytest.raises(SubtitlesError):
+        run(tmp_path, config=config, reserved_zones=zones((1.0, 3.0, [(0.0, 0.3)])))
+
+
+# Cas reels du recadrage (reframe/<clip_id>.json), passes par pipeline.avoid_zones.
+
+
+def reframe_plan(layout, faces, panels, start=0.0, end=10.0):
+    return {"output": {"width": 1080, "height": 1920},
+            "plans": [{"index": 0, "start": start, "end": end, "layout": layout,
+                       "faces": faces, "panels": panels}]}
+
+
+def rect(x, y, w, h, start=0.0, end=10.0):
+    return {"start": start, "end": end, "x": x, "y": y, "w": w, "h": h}
+
+
+def run_with_plan(tmp_path, plan):
+    from clipper.pipeline import avoid_zones
+
+    with llm.use_backend(FakeBackend([NO_EMPHASIS])):
+        path = run(tmp_path, avoid_zones=avoid_zones(plan))
+    return event_bands(parse_ass(Path(path)))
+
+
+def test_split_layout_face_in_camera_panel(tmp_path, video_dir):
+    # webcam en haut (0-768 px), visage y 100..300 sur 400 -> 192..576 px
+    face = {"id": 0, "first": 0.0, "last": 10.0, "box": [800, 100, 1000, 300]}
+    panels = [
+        {"name": "camera", "dest": {"x": 0, "y": 0, "w": 1080, "h": 768}, "rects": [rect(700, 0, 400, 400)]},
+        {"name": "gameplay", "dest": {"x": 0, "y": 768, "w": 1080, "h": 1152}, "rects": [rect(0, 0, 640, 1080)]},
+    ]
+    for b in run_with_plan(tmp_path, reframe_plan("split", [face], panels)):
+        assert overlap(b, (192, 576)) == 0
+        assert in_lower_third_of_safe_zone(b)
+
+
+def test_blur_layout_face_in_main_band(tmp_path, video_dir):
+    # fond flou + image entiere au centre (656..1264 px, echelle 608/1080) ;
+    # visage y 200..700 source -> 768..1051 px.
+    face = {"id": 0, "first": 0.0, "last": 10.0, "box": [700, 200, 1100, 700]}
+    panels = [
+        {"name": "background", "effect": "blur", "dest": {"x": 0, "y": 0, "w": 1080, "h": 1920},
+         "rects": [rect(0, 0, 1920, 1080)]},
+        {"name": "main", "dest": {"x": 0, "y": 656, "w": 1080, "h": 608}, "rects": [rect(0, 0, 1920, 1080)]},
+    ]
+    for b in run_with_plan(tmp_path, reframe_plan("fallback_blur", [face], panels)):
+        assert overlap(b, (768, 1051)) == 0
+        assert in_lower_third_of_safe_zone(b)
+
+
+def test_single_layout_face_low_in_frame(tmp_path, video_dir):
+    # cadre 608x1080 plein ecran (echelle 1920/1080) ; visage y 700..1000
+    # source -> 1244..1778 px : couvre le tiers inferieur de la zone sure.
+    face = {"id": 0, "first": 0.0, "last": 10.0, "box": [700, 700, 900, 1000]}
+    panels = [{"name": "main", "dest": {"x": 0, "y": 0, "w": 1080, "h": 1920}, "rects": [rect(600, 0, 608, 1080)]}]
+    for b in run_with_plan(tmp_path, reframe_plan("single", [face], panels)):
+        assert overlap(b, (1244.4, 1777.8)) == 0
+        assert SAFE_TOP <= b[0] and b[1] <= SAFE_BOTTOM
+
+
+# --------------------------------------------------------------------------
+# C8 (TASK-29cf) : apostrophe ou trait d'union colle rattache au mot precedent
 # --------------------------------------------------------------------------
 
 
-def test_default_position_is_bottom(tmp_path, video_dir):
+def event_tokens(ev: dict) -> list[str]:
+    return [t for t in re.findall(r"\\k\d+(?:\\c[^}]*)?\}([^{]*)", ev["text"]) if t.strip()]
+
+
+def test_glued_apostrophe_and_hyphen_tokens_stay_with_the_previous_word(tmp_path, video_dir):
+    words = [
+        # decoupe par jetons (4 par groupe) du clip 00 : "Donc deja il m" / "'a ..."
+        _word(" Donc", 1.0, 1.1), _word(" déjà", 1.1, 1.2), _word(" il", 1.2, 1.3), _word(" m", 1.3, 1.4),
+        _word("'a", 1.4, 1.5), _word(" menti,", 1.5, 1.8), _word(" il", 1.8, 1.9),
+        _word(" n", 1.9, 2.0), _word("\u2019a", 2.0, 2.1), _word(" pas", 2.1, 2.2),
+        _word(" dit", 2.2, 2.4), _word(" d", 2.4, 2.5), _word("'autrui", 2.5, 2.8),
+        _word(" viens", 2.8, 3.0), _word("-tu", 3.0, 3.2), _word(" vraiment", 3.2, 3.6),
+    ]
+    (video_dir / "transcript.json").write_text(json.dumps(make_transcript(words)), encoding="utf-8")
     with llm.use_backend(FakeBackend([NO_EMPHASIS])):
-        path = run(tmp_path)
-    doc = parse_ass(Path(path))
-    assert doc["style"]["Alignment"] == "2"  # bas, centre
-
-
-def test_avoid_zone_over_default_position_moves_subtitles_to_top(tmp_path, video_dir):
-    # visage detecte sur le tiers bas de l'image (recouvre la position par defaut)
-    with llm.use_backend(FakeBackend([NO_EMPHASIS])):
-        path = run(tmp_path, avoid_zone=(0.75, 1.0))
-    doc = parse_ass(Path(path))
-    assert doc["style"]["Alignment"] == "8"  # haut, centre
-
-
-def test_avoid_zone_not_overlapping_default_position_keeps_bottom(tmp_path, video_dir):
-    # visage en haut de l'image : ne gene pas la position par defaut (bas)
-    with llm.use_backend(FakeBackend([NO_EMPHASIS])):
-        path = run(tmp_path, avoid_zone=(0.0, 0.2))
-    doc = parse_ass(Path(path))
-    assert doc["style"]["Alignment"] == "2"
+        path = run(tmp_path, start=1.0, end=4.0)
+    events = parse_ass(Path(path))["events"]
+    tokens = [event_tokens(ev) for ev in events]
+    assert [t for ev in tokens for t in ev] == [w["word"] for w in words]
+    for ev in tokens:
+        assert not ev[0].startswith(("'", "\u2019", "-"))
+    # un mot avec son elision compte pour un : 4 mots au plus par groupe
+    for ev in tokens:
+        assert len([t for t in ev if not t.startswith(("'", "\u2019", "-"))]) <= 4
 
 
 # --------------------------------------------------------------------------

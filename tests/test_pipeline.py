@@ -550,23 +550,67 @@ def test_cli_unknown_video_status_is_an_error(tmp_path, isolated_cwd, capsys):
 # --------------------------------------------------------------------------
 
 
-def test_avoid_zone_maps_faces_of_the_reframe_plan_to_output_height():
-    from clipper.pipeline import avoid_zone
+def test_avoid_zones_maps_faces_of_each_reframe_plan_to_output_height():
+    from clipper.pipeline import avoid_zones
 
-    def plan(faces, panels):
-        return {"output": {"width": 1080, "height": 1920},
-                "plans": [{"start": 0.0, "end": 10.0, "faces": faces, "panels": panels}]}
+    def plan(faces, panels, start=0.0, end=10.0):
+        return {"start": start, "end": end, "faces": faces, "panels": panels}
 
     face = {"id": 0, "first": 0.0, "last": 10.0, "box": [800, 100, 1000, 300]}
     camera = {"name": "camera", "dest": {"x": 0, "y": 0, "w": 1080, "h": 768},
               "rects": [{"start": 0.0, "end": 10.0, "x": 700, "y": 0, "w": 400, "h": 400}]}
     gameplay = {"name": "gameplay", "dest": {"x": 0, "y": 768, "w": 1080, "h": 1152},
                 "rects": [{"start": 0.0, "end": 10.0, "x": 0, "y": 0, "w": 640, "h": 1080}]}
-    # Visage dans la camera (en haut) : y 100..300 sur 400 -> 192..576 px sur 1920.
-    assert avoid_zone(plan([face], [camera, gameplay])) == pytest.approx((0.1, 0.3))
-    # Aucun visage, ou visage hors de tout panneau : rien a eviter.
-    assert avoid_zone(plan([], [camera, gameplay])) is None
-    assert avoid_zone(plan([{**face, "box": [1500, 900, 1600, 1000]}], [camera, gameplay])) is None
-    # Le fond flou ne compte pas.
     blur = {**camera, "effect": "blur"}
-    assert avoid_zone(plan([face], [blur])) is None
+    later = {**face, "first": 10.0, "last": 20.0}
+    camera_later = {**camera, "rects": [{**camera["rects"][0], "start": 10.0, "end": 20.0}]}
+    reframe_plan = {"output": {"width": 1080, "height": 1920}, "plans": [
+        plan([face], [camera, gameplay]),
+        plan([], [camera_later], 10.0, 20.0),
+        plan([later], [blur], 20.0, 30.0),
+    ]}
+    zones = avoid_zones(reframe_plan)
+    # Une entree par plan, avec ses bornes ; visage dans la camera (en haut) :
+    # y 100..300 sur 400 -> 192..576 px sur 1920.
+    assert [(z["start"], z["end"]) for z in zones] == [(0.0, 10.0), (10.0, 20.0), (20.0, 30.0)]
+    assert [tuple(b) for b in zones[0]["bands"]] == [pytest.approx((0.1, 0.3))]
+    # Aucun visage, ou visage seulement sur le fond flou : rien a eviter.
+    assert zones[1]["bands"] == [] and zones[2]["bands"] == []
+    # Visage hors de tout panneau.
+    outside = {**face, "box": [1500, 900, 1600, 1000]}
+    assert avoid_zones({**reframe_plan, "plans": [plan([outside], [camera, gameplay])]})[0]["bands"] == []
+
+
+def test_avoid_zones_keeps_separate_faces_as_separate_bands():
+    """Deux visages (haut et bas d'un ecran partage) : deux bandes, pas une
+    seule bande du haut du premier au bas du second."""
+    from clipper.pipeline import avoid_zones
+
+    top = {"name": "top", "dest": {"x": 0, "y": 0, "w": 1080, "h": 960},
+           "rects": [{"start": 0.0, "end": 5.0, "x": 0, "y": 0, "w": 1215, "h": 1080}]}
+    bottom = {"name": "bottom", "dest": {"x": 0, "y": 960, "w": 1080, "h": 960},
+              "rects": [{"start": 0.0, "end": 5.0, "x": 1000, "y": 0, "w": 1215, "h": 1080}]}
+    a = {"id": 0, "first": 0.0, "last": 5.0, "box": [100, 108, 300, 324]}      # dans top seulement
+    b = {"id": 1, "first": 0.0, "last": 5.0, "box": [1500, 756, 1700, 972]}    # dans bottom seulement
+    reframe_plan = {"output": {"width": 1080, "height": 1920},
+                    "plans": [{"start": 0.0, "end": 5.0, "faces": [a, b], "panels": [top, bottom]}]}
+    bands = sorted(tuple(x) for x in avoid_zones(reframe_plan)[0]["bands"])
+    # a : 108..324 * 960/1080 -> 96..288 px ; b : 960 + 672..864 -> 1632..1824 px
+    assert bands == [pytest.approx((0.05, 0.15)), pytest.approx((0.85, 0.95))]
+
+
+def test_hook_zones_reserve_the_hook_band_for_the_hook_duration(tmp_path):
+    from clipper.pipeline import hook_zones
+
+    clip = {"id": "00", "start": 683.3, "end": 726.0}
+    [zone] = hook_zones(clip, make_config(tmp_path))
+    # render dessine l'accroche a y=100 px, police 64, les 2 premieres secondes
+    assert (zone["start"], zone["end"]) == pytest.approx((683.3, 685.3))
+    [(top, bottom)] = zone["bands"]
+    assert top * 1920 <= 100 and bottom * 1920 >= 164
+
+    config = make_config(tmp_path, render={"hook_margin_top": 300, "hook_font_size": 80, "hook_seconds": 3.0})
+    [zone] = hook_zones(clip, config)
+    assert zone["end"] == pytest.approx(686.3)
+    [(top, bottom)] = zone["bands"]
+    assert top * 1920 <= 300 and bottom * 1920 >= 380 and bottom * 1920 < 500
