@@ -1,0 +1,19 @@
+{
+  "id": "dQw4w9WgXcQ",
+  "title": "Never Gonna Give You Up",
+  "description": "Rick Astley's official music video.",
+  "duration": 212,
+  "channel": "Rick Astley",
+  "language": "en",
+  "chapters": [
+    {"start_time": 0, "end_time": 43, "title": "Intro"},
+    {"start_time": 43, "end_time": 212, "title": "Song"}
+  ],
+  "heatmap": [
+    {"start_time": 0.0, "end_time": 10.5, "value": 0.4},
+    {"start_time": 10.5, "end_time": 21.0, "value": 0.9}
+  ],
+  "sponsorblock_chapters": [
+    {"start_time": 5.0, "end_time": 15.0, "category": "sponsor"}
+  ]
+}
