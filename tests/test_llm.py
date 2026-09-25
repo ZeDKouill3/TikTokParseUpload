@@ -588,6 +588,15 @@ def test_fake_backend_can_raise_and_compute_responses():
         assert llm.ask("qa", "p", [], COLOR_SCHEMA, config=make_config()) == {"couleur": "qa"}
 
 
+def test_fake_backend_replays_its_last_response_once_exhausted():
+    fake = FakeBackend([{"couleur": "rouge"}, "pas du json"])
+    with llm.use_backend(fake):
+        assert llm.ask("qa", "p", [], COLOR_SCHEMA, config=make_config()) == {"couleur": "rouge"}
+        with pytest.raises(SchemaError, match="non JSON"):
+            llm.ask("qa", "p", [], COLOR_SCHEMA, config=make_config(repair_attempts=2))
+    assert len(fake.calls) == 4
+
+
 def test_fake_backend_exhausted_fails_loudly():
     with llm.use_backend(FakeBackend([])):
         with pytest.raises(AssertionError, match="FakeBackend"):

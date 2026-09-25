@@ -5,7 +5,7 @@ slug: clipper-llm-r-paration-d-une-r-ponse-refus-e-err
 title: "clipper.llm : réparation d'une réponse refusée (erreur renvoyée au modèle), appliquée à captions"
 created: 2026-09-25T18:33:41Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/llm/__init__.py
   - tests/test_llm.py
@@ -26,8 +26,15 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/694ad2245ce7@bb247a7
+    tree: scope/0f11aaf085f4
+    criteria: 05cfefc21bad
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 2
+version: 4
 ---
 
 Les autres étapes à contrôles post-schéma (vision indices, parts, qa...) pourront adopter le même paramètre ensuite ; ne pas les modifier ici (autres tâches en cours sur moments/pipeline/jury).
