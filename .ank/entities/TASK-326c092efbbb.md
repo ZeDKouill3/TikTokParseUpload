@@ -5,7 +5,7 @@ slug: tape-parts-d-coupage-en-part-1-2-3-avec-fins-en
 title: "Étape parts : découpage en Part 1/2/3 avec fins en suspense"
 created: 2026-09-25T09:39:42Z
 author: claude-plan
-status: open
+status: done
 scope:
   - clipper/parts.py
   - tests/test_parts.py
@@ -15,6 +15,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/9920e509846f@c652b97
+    tree: scope/a1eb7c77d962
+    criteria: 17edf9739643
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---
