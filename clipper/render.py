@@ -46,7 +46,7 @@ from typing import Any
 from clipper.gpu import get_device
 
 CONFIG_DEFAULTS: dict[str, object] = {
-    # Plafond d'images/s de sortie ; en-deca, la cadence source est gardee.
+    # Cadence de sortie (SPEC-350f) : imposee, quelle que soit la cadence source.
     "max_fps": 30,
     "crf": 20,
     "x264_preset": "medium",
@@ -262,27 +262,6 @@ def _build_filter_complex(
 # --------------------------------------------------------------------------
 
 
-def _probe_fps(video_path: Path, ffprobe_bin: str) -> float:
-    cmd = [
-        ffprobe_bin, "-v", "error", "-select_streams", "v:0",
-        "-show_entries", "stream=r_frame_rate", "-of", "csv=p=0", str(video_path),
-    ]
-    try:
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    except FileNotFoundError as exc:
-        raise RenderError(f"ffprobe introuvable ({ffprobe_bin})") from exc
-    if proc.returncode != 0:
-        raise RenderError(
-            f"ffprobe a echoue sur {video_path} : {proc.stderr.decode(errors='replace').strip()}"
-        )
-    text = proc.stdout.decode().strip()
-    num, _, den = text.partition("/")
-    try:
-        return float(num) / float(den or 1)
-    except (ValueError, ZeroDivisionError) as exc:
-        raise RenderError(f"fps illisible depuis ffprobe ({text!r})") from exc
-
-
 def _encoder(device_type: str, settings: dict[str, Any]) -> list[str]:
     if device_type == "cuda":
         return ["-c:v", "h264_nvenc", "-preset", str(settings["nvenc_preset"]), "-cq", str(settings["crf"])]
@@ -335,7 +314,6 @@ def render(
     config: Any = None,
     force: bool = False,
     ffmpeg_bin: str = "ffmpeg",
-    ffprobe_bin: str = "ffprobe",
 ) -> Path:
     """Rend le clip ``clip_id`` de ``video_id`` : ecrit
     output/<video_id>/<clip_id>.mp4 et .json (SPEC-350f), renvoie le chemin
@@ -389,8 +367,7 @@ def render(
             reframe_data, clip["start"], clip["end"], ass_path, hook_path, part_path, scratch_dir, settings
         )
 
-        source_fps = _probe_fps(source, ffprobe_bin)
-        target_fps = min(source_fps, float(settings["max_fps"]))
+        target_fps = float(settings["max_fps"])
 
         device = get_device()
 
