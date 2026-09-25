@@ -16,7 +16,15 @@ Sortie : workspace/<video_id>/moments.json
      "moments": [{"id", "start", "end", "duration", "format", "parts",
                   "scores", "bonus", "final_score", "justification",
                   "hook_text"}],
-     "rejected": [{"start", "end", "reason", ...}]}
+     "rejected": [{"start", "end", "reason", ...}],
+     "rescored": {"source", "changed": [{"id", "start", "end", "hook_text",
+                                          "before", "after"}]}}   # re-notation
+
+Re-notation : si moments.json existe et que vision.json est plus recent,
+l'etape (sans ``force``) ne rappelle pas le LLM ; elle recalcule le bonus
+visuel, le score final, ``min_score`` et le non-chevauchement sur les
+candidats deja notes, et liste dans ``rescored.changed`` ceux dont le score
+ou le sort (retenu ou non) a change.
 
 Le LLM ne fait que proposer des bornes et noter chaque critere de 0 a 10 ;
 tout le reste est fait ici, de facon verifiable :
@@ -510,6 +518,14 @@ def _normalize(
     }, None
 
 
+def _visual_bonus(start: float, end: float, vision: dict[str, Any] | None, rubric: dict[str, Any]) -> float:
+    """Bonus des images marquantes : une image ``striking`` dans le moment suffit."""
+    striking = any(
+        f.get("striking") and start <= f["timecode"] <= end for f in (vision or {}).get("frames") or []
+    )
+    return float(rubric["bonus"]["visual"]) if striking else 0.0
+
+
 def _bonus(
     start: float, end: float, meta: dict[str, Any], audio: dict[str, Any], vision: dict[str, Any] | None,
     rubric: dict[str, Any],
@@ -523,10 +539,7 @@ def _bonus(
     replayed = b["replayed"] * (covered / duration if duration > 0 else 0.0)
     n_peaks = sum(1 for p in audio.get("peaks") or [] if start <= p["timecode"] <= end)
     audio_bonus = b["audio_peaks"] * min(1.0, n_peaks / b["audio_peaks_full"]) if b["audio_peaks_full"] > 0 else 0.0
-    striking = any(
-        f.get("striking") and start <= f["timecode"] <= end for f in (vision or {}).get("frames") or []
-    )
-    visual = float(b["visual"]) if striking else 0.0
+    visual = _visual_bonus(start, end, vision, rubric)
     total = min(float(b["max_total"]), replayed + audio_bonus + visual)
     return {
         "replayed": round(replayed, 2),
@@ -543,6 +556,34 @@ def final_score(scores: dict[str, float], rubric: dict[str, Any], bonus_total: f
     total_weight = sum(c["weight"] for c in criteria.values())
     base = sum(scores[name] * c["weight"] for name, c in criteria.items()) / total_weight * 10
     return round(min(100.0, base + bonus_total), 1)
+
+
+def _select(
+    candidates: list[dict[str, Any]], rubric: dict[str, Any]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """(retenus, rejets motives) : rejet sous ``min_score``, puis, entre
+    candidats qui se chevauchent, seul le mieux note reste."""
+    kept: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    for c in sorted(candidates, key=lambda c: (-c["final_score"], c["_start"])):
+        public = _public(c)
+        if c["final_score"] < rubric["min_score"]:
+            rejected.append({**public, "reason": f"score {c['final_score']} < min_score {rubric['min_score']}"})
+            continue
+        rival = next((k for k in kept if c["_start"] < k["_end"] and k["_start"] < c["_end"]), None)
+        if rival is not None:
+            rejected.append({**public, "reason": f"chevauche un moment mieux note [{_span(rival['_start'], rival['_end'])}]"})
+            continue
+        kept.append(c)
+    return kept, rejected
+
+
+def _rubric_info(rubric_path: Path, rubric: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "path": str(rubric_path),
+        "weights": {name: c["weight"] for name, c in rubric["criteria"].items()},
+        "min_score": rubric["min_score"],
+    }
 
 
 def _public(c: dict[str, Any]) -> dict[str, Any]:
@@ -591,10 +632,14 @@ def run(
 ) -> Path:
     """Choisit les moments de la video et ecrit workspace/<video_id>/moments.json,
     dont le chemin est renvoye. Un resultat deja present n'est pas refait,
-    sauf ``force``."""
+    sauf ``force`` ; si vision.json est plus recent que lui, il est seulement
+    re-note, sans appel LLM (voir ``_rescore``)."""
     video_dir = Path(workspace_dir) / video_id
     out = video_dir / "moments.json"
     if out.exists() and not force:
+        vision_path = video_dir / "vision.json"
+        if vision_path.exists() and vision_path.stat().st_mtime_ns > out.stat().st_mtime_ns:
+            return _rescore(video_dir, out, _settings(config))
         return out
 
     meta = _read_json(video_dir / "meta.json")
@@ -657,31 +702,93 @@ def run(
         c["bonus"] = _bonus(c["_start"], c["_end"], meta, audio, vision, rubric)
         c["final_score"] = final_score(c["scores"], rubric, c["bonus"]["total"])
 
-    kept: list[dict[str, Any]] = []
-    for c in sorted(candidates, key=lambda c: (-c["final_score"], c["_start"])):
-        public = _public(c)
-        if c["final_score"] < rubric["min_score"]:
-            rejected.append({**public, "reason": f"score {c['final_score']} < min_score {rubric['min_score']}"})
-            continue
-        rival = next((k for k in kept if c["_start"] < k["_end"] and k["_start"] < c["_end"]), None)
-        if rival is not None:
-            rejected.append({**public, "reason": f"chevauche un moment mieux note [{_span(rival['_start'], rival['_end'])}]"})
-            continue
-        kept.append(c)
+    kept, rejected_scored = _select(candidates, rubric)
 
     result = {
         "video_id": video_id,
-        "rubric": {
-            "path": str(rubric_path),
-            "weights": {name: c["weight"] for name, c in rubric["criteria"].items()},
-            "min_score": rubric["min_score"],
-        },
+        "rubric": _rubric_info(rubric_path, rubric),
         "chunked": chunked,
         "moments": [{"id": n, **_public(c)} for n, c in enumerate(kept)],
-        "rejected": rejected,
+        "rejected": rejected + rejected_scored,
     }
-    video_dir.mkdir(parents=True, exist_ok=True)
+    _write(out, result)
+    return out
+
+
+def _write(out: Path, result: dict[str, Any]) -> None:
+    out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(out)
+
+
+def _restore(entry: dict[str, Any], sents: list[Sentence], retained: bool) -> dict[str, Any]:
+    """Candidat enregistre dans moments.json, avec ses bornes exactes
+    retrouvees sur les phrases de la transcription (les bornes publiques sont
+    arrondies au dixieme et creeraient de faux chevauchements)."""
+    first = _nearest(range(len(sents)), entry["start"], lambda k: sents[k].start)
+    last = _nearest(range(first, len(sents)), entry["end"], lambda k: sents[k].end)
+    if (_floor1(sents[first].start), _ceil1(sents[last].end)) != (entry["start"], entry["end"]):
+        raise MomentsError(
+            f"moment [{entry['start']}-{entry['end']}] de moments.json hors des frontieres de phrase "
+            "de transcript.json : re-notation impossible, relancer moments avec --force"
+        )
+    return {
+        "_start": sents[first].start,
+        "_end": sents[last].end,
+        "_before": {"final_score": entry["final_score"], "retained": retained},
+        **{k: entry[k] for k in ("format", "parts", "scores", "bonus", "final_score", "justification", "hook_text")},
+    }
+
+
+def _rescore(video_dir: Path, out: Path, settings: dict[str, Any]) -> Path:
+    """Re-notation apres vision, sans LLM : sur les candidats deja notes de
+    moments.json (retenus, rejetes pour score ou chevauchement), recalcule le
+    bonus visuel, le score final, le filtre min_score et le non-chevauchement.
+    Notes par critere, bornes et justifications restent celles enregistrees ;
+    les rejets de la grille (SponsorBlock, duree, bornes) sont gardes tels
+    quels. ``rescored.changed`` liste les candidats dont le score ou le sort
+    (retenu ou non) a change."""
+    previous = _read_json(out)
+    vision = _read_json(video_dir / "vision.json")
+    sents = split_sentences(_read_json(video_dir / "transcript.json"))
+    rubric_path = Path(settings["rubric_path"])
+    rubric = load_rubric(rubric_path)
+    b = rubric["bonus"]
+
+    candidates = [_restore(m, sents, True) for m in previous["moments"]]
+    candidates += [_restore(r, sents, False) for r in previous["rejected"] if "final_score" in r]
+    unscored = [r for r in previous["rejected"] if "final_score" not in r]
+    for c in candidates:
+        old = c["bonus"]
+        visual = _visual_bonus(c["_start"], c["_end"], vision, rubric)
+        if visual != old["visual"]:
+            total = min(float(b["max_total"]), old["replayed"] + old["audio_peaks"] + visual)
+            c["bonus"] = {**old, "visual": round(visual, 2), "total": round(total, 2)}
+        c["final_score"] = final_score(c["scores"], rubric, c["bonus"]["total"])
+
+    kept, rejected_scored = _select(candidates, rubric)
+    moments_out = [{"id": n, **_public(c)} for n, c in enumerate(kept)]
+    ids = {id(c): n for n, c in enumerate(kept)}
+    changed = []
+    for c in sorted(candidates, key=lambda c: c["_start"]):
+        after = {"final_score": c["final_score"], "retained": id(c) in ids}
+        if after != c["_before"]:
+            changed.append({
+                "id": ids.get(id(c)),
+                "start": _floor1(c["_start"]),
+                "end": _ceil1(c["_end"]),
+                "hook_text": c["hook_text"],
+                "before": c["_before"],
+                "after": after,
+            })
+
+    result = {
+        **previous,
+        "rubric": _rubric_info(rubric_path, rubric),
+        "moments": moments_out,
+        "rejected": unscored + rejected_scored,
+        "rescored": {"source": "vision.json", "changed": changed},
+    }
+    _write(out, result)
     return out

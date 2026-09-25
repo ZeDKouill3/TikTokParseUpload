@@ -5,7 +5,7 @@ slug: moments-apr-s-vision-re-noter-les-candidats-exis
 title: "moments : après vision, re-noter les candidats existants au lieu de refaire la sélection"
 created: 2026-09-25T18:26:54Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/moments.py
   - clipper/pipeline.py
@@ -17,8 +17,15 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/b2c8f4d2e12e@81e88d8
+    tree: scope/861063c27ac4
+    criteria: 66f753625721
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---
 
 Le bonus visuel est mécanique (rubric.toml [bonus] visual si une image du moment est striking dans vision.json) : aucune raison de redemander le jugement du LLM. Vision a déjà été limitée aux candidats rattrapables (TASK-1a2b).
