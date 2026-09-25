@@ -5,7 +5,7 @@ slug: tape-subtitles-sous-titres-style-capcut-en-ass-m
 title: "Étape subtitles : sous-titres style CapCut en .ass, mots mis en valeur"
 created: 2026-09-25T09:39:43Z
 author: claude-plan
-status: open
+status: done
 scope:
   - clipper/subtitles.py
   - clipper/assets/fonts/**
@@ -16,8 +16,15 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/bdd97b5e0d3a@64437e9
+    tree: scope/fe454f049c01
+    criteria: d6c57ba96034
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 3
+version: 5
 ---
 
 Police libre embarquée (ex. Montserrat ou Poppins ExtraBold, licence OFL).
