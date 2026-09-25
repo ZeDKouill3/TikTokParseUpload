@@ -155,6 +155,26 @@ def new_state(video_id: str, source_url: str, mode: str) -> dict[str, Any]:
     }
 
 
+# Sous Windows, Path.replace leve PermissionError si un autre processus (CLI
+# de progression, interface web) a le fichier destination ouvert en lecture au
+# meme instant : CreateFile ne pose pas FILE_SHARE_DELETE par defaut, et
+# MoveFileExW echoue tant que ce handle est ouvert. La collision est
+# transitoire (le lecteur referme vite), donc on reessaie avant de relever.
+_REPLACE_ATTEMPTS = 5
+_REPLACE_DELAY_S = 0.05
+
+
+def _atomic_replace(tmp: Path, path: Path) -> None:
+    for attempt in range(_REPLACE_ATTEMPTS):
+        try:
+            tmp.replace(path)
+            return
+        except PermissionError:
+            if attempt == _REPLACE_ATTEMPTS - 1:
+                raise
+            time.sleep(_REPLACE_DELAY_S)
+
+
 def save_state(state: dict[str, Any], *, config: Config | None = None) -> Path:
     config = config or load_config()
     path = _video_dir(state["video_id"], config) / STATE_FILE
@@ -162,7 +182,7 @@ def save_state(state: dict[str, Any], *, config: Config | None = None) -> Path:
     state["updated_at"] = _iso(_now())
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    _atomic_replace(tmp, path)
     return path
 
 
@@ -183,7 +203,7 @@ def _read_json(path: Path) -> Any:
 def _write_json(path: Path, data: Any) -> None:
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    _atomic_replace(tmp, path)
 
 
 # --------------------------------------------------------------------------
