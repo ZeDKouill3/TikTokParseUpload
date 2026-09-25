@@ -39,6 +39,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("queue", help="Reprend les videos en file d'attente dont l'heure est venue")
     p.add_argument("--watch", action="store_true", help="Tourne en boucle")
     p.add_argument("--interval", type=float, default=60.0, help="Secondes entre deux passages (--watch)")
+
+    p = sub.add_parser("serve", help="Lance l'interface web locale (FastAPI sur 127.0.0.1)")
+    p.add_argument("--port", type=int, default=None, help="Port d'ecoute (defaut : [web] port de config.toml)")
     return parser
 
 
@@ -85,6 +88,14 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         elif args.command == "status":
             print(json.dumps(pipeline.load_state(args.video_id, config=config), ensure_ascii=False, indent=2))
+            return 0
+        elif args.command == "serve":
+            import uvicorn
+
+            from clipper.web import create_app
+
+            port = args.port if args.port is not None else config.section("web")["port"]
+            uvicorn.run(create_app(config=config), host="127.0.0.1", port=int(port))
             return 0
         else:
             if args.watch:

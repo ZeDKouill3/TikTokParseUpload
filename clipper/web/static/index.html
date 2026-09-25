@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Clipper</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>Clipper</h1>
+  <p class="tagline">Clips verticaux sous-titres, depuis une video YouTube</p>
+</header>
+
+<main>
+  <section id="submit-section">
+    <h2>Nouvelle video</h2>
+    <form id="submit-form">
+      <input type="url" id="submit-url" name="url" placeholder="https://www.youtube.com/watch?v=..." required>
+      <button type="submit">Lancer le traitement</button>
+    </form>
+    <p id="submit-message" class="message" hidden></p>
+  </section>
+
+  <section id="videos-section">
+    <h2>Videos</h2>
+    <ul id="videos-list"></ul>
+  </section>
+
+  <section id="detail-section" hidden>
+    <h2>Detail</h2>
+    <p id="detail-status"></p>
+    <ol id="detail-steps"></ol>
+
+    <div id="moments-block" hidden>
+      <h3>Moments proposes</h3>
+      <p class="hint">Acceptez, refusez ou ajustez le debut/la fin de chaque moment.</p>
+      <ul id="moments-list"></ul>
+      <button id="render-button" type="button">Lancer le rendu</button>
+      <p id="render-message" class="message" hidden></p>
+    </div>
+
+    <div id="clips-block" hidden>
+      <h3>Clips produits</h3>
+      <ul id="clips-list"></ul>
+    </div>
+  </section>
+</main>
+
+<template id="video-item-template">
+  <li class="video-item">
+    <button type="button" class="video-link"></button>
+    <span class="video-status"></span>
+  </li>
+</template>
+
+<template id="moment-item-template">
+  <li class="moment-item">
+    <video controls preload="metadata"></video>
+    <div class="moment-info">
+      <p class="moment-hook"></p>
+      <p class="moment-score">Score : <span class="score-value"></span></p>
+      <p class="moment-justification"></p>
+      <p class="moment-decision"></p>
+      <div class="moment-actions">
+        <button type="button" class="decide-accept">Accepter</button>
+        <button type="button" class="decide-reject">Refuser</button>
+        <details class="adjust-details">
+          <summary>Ajuster</summary>
+          <label>Debut (s) <input type="number" step="0.1" class="adjust-start"></label>
+          <label>Fin (s) <input type="number" step="0.1" class="adjust-end"></label>
+          <button type="button" class="decide-adjust">Valider l'ajustement</button>
+        </details>
+      </div>
+    </div>
+  </li>
+</template>
+
+<template id="clip-item-template">
+  <li class="clip-item">
+    <video controls preload="metadata"></video>
+    <div class="clip-info">
+      <p class="clip-title"></p>
+      <p class="clip-caption"></p>
+      <p class="clip-hashtags"></p>
+      <p class="clip-qa"></p>
+    </div>
+  </li>
+</template>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
