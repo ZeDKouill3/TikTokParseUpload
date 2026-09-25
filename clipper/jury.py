@@ -20,14 +20,19 @@ Deroulement :
 3. Tour 2 (un seul) sur ces candidats : chaque juge relit ses notes et son
    argument, puis les arguments anonymes des autres, et peut reviser.
 4. Agregation : mediane par critere des notes finales de chaque juge, score
-   = moyenne ponderee des medianes x10. Le veto motive d'un juge ``veto``
-   (tour final) rejette le candidat : c'est a l'etape d'en tirer la
-   consequence (ici on ne supprime rien).
+   = moyenne ponderee des medianes x10. Quand le fichier de poids de
+   clipper.jury_calibration existe (``weights_path``, defaut
+   state/jury_weights.json), la mediane par critere est ponderee par le poids
+   de chaque juge (1 pour un juge absent du fichier) ; un juge a veto doit y
+   valoir 1, et un fichier illisible est une JuryError (ADR-1cf0, ADR-ad2e).
+   Le veto motive d'un juge ``veto`` (tour final) rejette le candidat : c'est
+   a l'etape d'en tirer la consequence (ici on ne supprime rien).
 
 Retour (serialisable en JSON, a ecrire dans le JSON de l'etape) :
 
     {"judges": [{"name", "usage", "model", "veto"}], "seed", "threshold",
-     "quorum", "failed": [{"judge", "round", "error"}], "debated": [id],
+     "quorum", "weights": None | {nom: poids},
+     "failed": [{"judge", "round", "error"}], "debated": [id],
      "candidates": [{"id", "scores": {critere: mediane}, "score", "veto":
                      None | {"judge", "reason"}, "debated",
                      "trace": {"rounds": [{"round", "judges": {nom: {"scores",
@@ -71,10 +76,13 @@ c'est [llm] qui decide pour cet usage.
 
 from __future__ import annotations
 
+import json
+import math
 import random
 import statistics
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Any
 
 from clipper import llm
@@ -439,6 +447,46 @@ def _run_round(
 # --------------------------------------------------------------------------
 
 
+def _weights(config: Any, judges: list[dict[str, Any]]) -> dict[str, float] | None:
+    """Poids par juge actif du fichier ecrit par clipper.jury_calibration
+    (lu via sa section de config, sans l'importer), None s'il n'existe pas."""
+    path = Path(config.section("jury_calibration")["weights_path"])
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        loaded = {name: float(entry["weight"]) for name, entry in data["judges"].items()}
+    except (ValueError, KeyError, TypeError, AttributeError) as exc:
+        raise JuryError(f"poids du jury : {path} illisible : {exc}") from exc
+    weights = {j["name"]: loaded.get(j["name"], 1.0) for j in judges}
+    for j in judges:
+        w = weights[j["name"]]
+        if not (math.isfinite(w) and w > 0):
+            raise JuryError(f"poids du jury : {path} : poids invalide pour {j['name']} : {w!r}")
+        if (j["veto"] or j["name"] == "conformite") and w != 1.0:
+            raise JuryError(
+                f"poids du jury : {j['name']} vaut {w} dans {path}, "
+                "le juge conformite (ou a veto) garde le poids 1 (ADR-1cf0)"
+            )
+    return weights
+
+
+def _weighted_median(values: Sequence[tuple[float, float]]) -> float:
+    """Mediane de (valeur, poids) : premiere valeur ou le poids cumule
+    atteint la moitie du total, moyenne avec la suivante si la moitie tombe
+    pile sur la frontiere (egale a statistics.median a poids egaux)."""
+    ordered = sorted(values)
+    half = sum(w for _, w in ordered) / 2
+    cumul = 0.0
+    for n, (value, weight) in enumerate(ordered):
+        cumul += weight
+        if math.isclose(cumul, half):
+            return (value + ordered[n + 1][0]) / 2
+        if cumul > half:
+            return value
+    return ordered[-1][0]
+
+
 def _score(scores: Mapping[str, float], criteria: Mapping[str, Any]) -> float:
     total = sum(c["weight"] for c in criteria.values())
     return round(sum(scores[name] * c["weight"] for name, c in criteria.items()) / total * 10, 1)
@@ -475,6 +523,7 @@ def deliberate(
         config = load_config()
     settings = _deep_merge(CONFIG_DEFAULTS, config.section("jury"))
     judges = _judges(settings)
+    weights = _weights(config, judges)
     _check_candidates(candidates)
     criteria = rubric["criteria"]
     threshold = float(settings["threshold"])
@@ -529,7 +578,13 @@ def deliberate(
     results = []
     for cid in by_id:
         final = {**round1[cid], **round2.get(cid, {})}
-        scores = {name: statistics.median(n["scores"][name] for n in final.values()) for name in criteria}
+        if weights is None:
+            scores = {name: statistics.median(n["scores"][name] for n in final.values()) for name in criteria}
+        else:
+            scores = {
+                name: _weighted_median([(n["scores"][name], weights[j]) for j, n in final.items()])
+                for name in criteria
+            }
         judge_scores = {name: _score(n["scores"], criteria) for name, n in final.items()}
         median = statistics.median(judge_scores.values())
         veto = next(
@@ -569,6 +624,7 @@ def deliberate(
         "seed": seed,
         "threshold": threshold,
         "quorum": quorum,
+        "weights": weights,
         "failed": failed,
         "debated": debated,
         "candidates": results,

@@ -5,7 +5,7 @@ slug: calibration-des-poids-des-juges-partir-des-r-sul
 title: Calibration des poids des juges à partir des résultats réels
 created: 2026-09-25T18:38:17Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/jury.py
   - clipper/jury_calibration.py
@@ -16,8 +16,15 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/787b6b9187d8@286e388
+    tree: scope/f8fc842908cf
+    criteria: 22df58883a19
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---
 
 Met en œuvre le point 2 de ADR-1cf0 (proposé). Jamais l'accord entre juges comme vérité.
