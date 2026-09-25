@@ -2,6 +2,7 @@
 .venv/
 workspace/
 output/
+state/
 *.egg-info/
 __pycache__/
 *.pyc
