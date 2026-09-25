@@ -5,13 +5,17 @@ slug: gpu-d-tection-auto-cuda-cpu-un-seul-mod-le-lourd
 title: "GPU : détection auto CUDA/CPU, un seul modèle lourd en VRAM à la fois"
 created: 2026-09-25T09:35:26Z
 author: claude-plan
-status: proposed
+status: accepted
 scope:
   - clipper/**
 constraint: |
   Le device se résout via clipper.gpu (cuda si disponible, sinon cpu), jamais codé en dur. Une étape qui charge un modèle lourd (whisper, détection de visages, VLM local, LLM local) le libère avant de rendre la main ; deux modèles lourds ne sont jamais chargés en même temps. Tout le pipeline doit tourner sur CPU (lentement) pour les tests.
+ratified: 7439bad46e39
+verified:
+  - by: UP60041549@wl0023729
+    at: 2026-09-25T09:43:52Z
 schema: 4
-version: 1
+version: 2
 ---
 
 ## Contexte
