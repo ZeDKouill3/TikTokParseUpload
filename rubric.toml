@@ -1,0 +1,74 @@
+# Grille de notation des moments (SPEC-53f3), lue par l'etape moments.
+# Modifiable sans toucher au code. Chemin reglable : [moments] rubric_path.
+#
+# Score final 0-100 = moyenne des notes (0-10) ponderee par `weight`, x10,
+# plus un bonus de signaux mesures plafonne a [bonus] max_total.
+# Retenus : tous les moments dont le score final >= min_score, sans plafond ;
+# entre deux moments qui se chevauchent, le mieux note.
+
+min_score = 60
+
+# Mots-cles tendance (critere trend) : a mettre a jour avec l'actualite.
+trend_keywords = [
+    "GTA 6",
+    "GTA VI",
+    "trailer",
+    "date de sortie",
+    "Vice City",
+    "Lucia",
+    "Jason",
+    "Rockstar",
+    "leak",
+]
+
+# Chaque critere : poids dans la moyenne et question posee au LLM.
+[criteria.hook]
+weight = 3
+question = "La 1re phrase du clip arrete-t-elle le scroll (affirmation choc, question, surprise, conflit, revelation) ?"
+
+[criteria.standalone]
+weight = 3
+question = "Le clip est-il comprehensible sans le reste de la video (pas de reference a ce qui precede) ?"
+
+[criteria.payoff]
+weight = 2
+question = "L'arc est-il complet, avec une fin sur punchline ou revelation ? En multi-parties, chaque partie finit-elle sur un suspense ?"
+
+[criteria.emotion]
+weight = 2
+question = "Y a-t-il rire, cri, reaction forte ou debat vif ?"
+
+[criteria.value]
+weight = 2
+question = "Le clip apporte-t-il une info, un leak, un avis tranche, une theorie ou une controverse ?"
+
+[criteria.trend]
+weight = 1
+question = "Le clip touche-t-il les mots-cles tendance listes ?"
+
+# Durees en secondes (regle 3 de la spec).
+[durations]
+# Moment court et percutant : un seul clip.
+single_min = 20
+single_max = 45
+# Histoire longue : parties de part_min a part_max, au moins min_parts.
+part_min = 60
+part_max = 90
+min_parts = 2
+# Marge acceptee apres recalage des bornes sur des frontieres de phrase.
+tolerance = 3
+
+# Bonus des signaux mesures, en points sur 100, plafonne a max_total.
+[bonus]
+max_total = 10
+# x valeur moyenne (0-1) de la courbe YouTube "most replayed" sur le moment.
+replayed = 5
+# x min(1, pics d'energie audio dans le moment / audio_peaks_full).
+audio_peaks = 3
+audio_peaks_full = 3
+# Si une image cle du moment est marquee "striking" par l'etape vision.
+visual = 2
+
+# Regle 2 : segments exclus d'office.
+[exclusions]
+sponsorblock_categories = ["sponsor", "intro", "outro", "selfpromo"]
