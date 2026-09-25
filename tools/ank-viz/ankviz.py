@@ -102,7 +102,7 @@ def parse_ahead_behind(text):
 
 def group_tasks(tasks, edges):
     """en cours / prêtes / bloquées / faites / fermées ; une tâche ouverte est
-    prête quand tous ses bloqueurs sont faits ou fermés."""
+    prête quand tous ses bloqueurs sont faits ou fermés, en cours si elle est claimée."""
     status = {t["id"]: t["status"] for t in tasks}
     blockers = {}
     for t, b in edges:
@@ -110,7 +110,9 @@ def group_tasks(tasks, edges):
     groups = {"in_progress": [], "ready": [], "blocked": [], "done": [], "closed": []}
     for t in tasks:
         s = t["status"]
-        if s == "open":
+        if s == "open" and t.get("claimed_by"):  # ank garde "open" pendant un claim
+            groups["in_progress"].append(t["id"])
+        elif s == "open":
             finished = all(status.get(b) in ("done", "closed") for b in blockers.get(t["id"], []))
             groups["ready" if finished else "blocked"].append(t["id"])
         elif s in groups:

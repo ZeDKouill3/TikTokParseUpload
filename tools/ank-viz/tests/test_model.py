@@ -74,3 +74,13 @@ def test_layout_on_recorded_graph_stays_narrow():
     rows = {n["id"]: n["row"] for n in g["nodes"]}
     for task, blocker in ankviz.parse_edges(text):
         assert rows[blocker] < rows[task]
+
+
+def test_group_tasks_open_task_with_live_claim_is_in_progress():
+    # ank garde status "open" pendant un claim : seul claimed_by le révèle
+    tasks = [task("TASK-aaaa0001", "open", "w-476f"),
+             task("TASK-bbbb0002", "open")]
+    groups = ankviz.group_tasks(tasks, [("TASK-bbbb0002", "TASK-aaaa0001")])
+    assert groups["in_progress"] == ["TASK-aaaa0001"]
+    assert groups["ready"] == []
+    assert groups["blocked"] == ["TASK-bbbb0002"]
