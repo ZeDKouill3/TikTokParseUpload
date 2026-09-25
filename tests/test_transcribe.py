@@ -484,6 +484,109 @@ def test_config_section_is_accepted_by_clipper_config(tmp_path):
 
 
 # --------------------------------------------------------------------------
+# C11 : DLL cuBLAS/cuDNN des paquets pip nvidia rendues trouvables avant de
+# charger faster-whisper quand le device est cuda sous Windows (TASK-f6c8) :
+# ajouter les dossiers bin au PATH du processus, jamais os.add_dll_directory
+# (mesure sur materiel reel : add_dll_directory seul ne suffit pas, voir le
+# journal de la tache).
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def fake_nvidia_bin_dirs(tmp_path):
+    """Simule l'arborescence site-packages/nvidia/*/bin de nvidia-cublas-cu12
+    et nvidia-cudnn-cu12, sans les vraies DLL ni le vrai GPU."""
+    nvidia_dir = tmp_path / "site-packages" / "nvidia"
+    cublas_bin = nvidia_dir / "cublas" / "bin"
+    cudnn_bin = nvidia_dir / "cudnn" / "bin"
+    cublas_bin.mkdir(parents=True)
+    cudnn_bin.mkdir(parents=True)
+    return nvidia_dir, [cublas_bin, cudnn_bin]
+
+
+def _fake_find_spec(nvidia_dir):
+    def find_spec(name):
+        if name != "nvidia":
+            return None
+        return SimpleNamespace(submodule_search_locations=[str(nvidia_dir)])
+
+    return find_spec
+
+
+def test_cuda_dll_dirs_are_prefixed_on_path_before_loading_model_on_windows(
+    tmp_path, video_dir, monkeypatch, fake_nvidia_bin_dirs
+):
+    import clipper.transcribe as t
+
+    nvidia_dir, bin_dirs = fake_nvidia_bin_dirs
+    monkeypatch.setattr(t.sys, "platform", "win32")
+    monkeypatch.setattr(t, "get_device", lambda: Device(type="cuda", compute_type="float16"))
+    monkeypatch.setattr(t, "find_spec", _fake_find_spec(nvidia_dir))
+    monkeypatch.setenv("PATH", r"C:\Windows\System32")
+
+    with llm.use_backend(FakeBackend([VOCAB, NO_FIX])):
+        run(tmp_path, ModelFactory())
+
+    path_parts = os.environ["PATH"].split(os.pathsep)
+    assert str(bin_dirs[0]) in path_parts
+    assert str(bin_dirs[1]) in path_parts
+    assert path_parts.index(str(bin_dirs[0])) < path_parts.index(r"C:\Windows\System32")
+
+
+def test_cuda_dll_dirs_untouched_when_device_is_cpu(
+    tmp_path, video_dir, monkeypatch, fake_nvidia_bin_dirs, cpu
+):
+    import clipper.transcribe as t
+
+    nvidia_dir, bin_dirs = fake_nvidia_bin_dirs
+    monkeypatch.setattr(t.sys, "platform", "win32")
+    monkeypatch.setattr(t, "find_spec", _fake_find_spec(nvidia_dir))
+    monkeypatch.setenv("PATH", r"C:\Windows\System32")
+
+    with llm.use_backend(FakeBackend([VOCAB, NO_FIX])):
+        run(tmp_path, ModelFactory())
+
+    assert os.environ["PATH"] == r"C:\Windows\System32"
+
+
+def test_cuda_dll_dirs_untouched_on_non_windows_platform(
+    tmp_path, video_dir, monkeypatch, fake_nvidia_bin_dirs
+):
+    import clipper.transcribe as t
+
+    nvidia_dir, bin_dirs = fake_nvidia_bin_dirs
+    monkeypatch.setattr(t.sys, "platform", "linux")
+    monkeypatch.setattr(t, "get_device", lambda: Device(type="cuda", compute_type="float16"))
+    monkeypatch.setattr(t, "find_spec", _fake_find_spec(nvidia_dir))
+    monkeypatch.setenv("PATH", "/usr/bin")
+
+    with llm.use_backend(FakeBackend([VOCAB, NO_FIX])):
+        run(tmp_path, ModelFactory())
+
+    assert os.environ["PATH"] == "/usr/bin"
+
+
+def test_missing_nvidia_packages_leaves_path_and_device_untouched(
+    tmp_path, video_dir, monkeypatch
+):
+    """Paquets nvidia absents (find_spec renvoie None) : pas de repli
+    silencieux vers le CPU, le device cuda est toujours transmis tel quel."""
+    import clipper.transcribe as t
+
+    monkeypatch.setattr(t.sys, "platform", "win32")
+    monkeypatch.setattr(t, "get_device", lambda: Device(type="cuda", compute_type="float16"))
+    monkeypatch.setattr(t, "find_spec", lambda name: None)
+    monkeypatch.setenv("PATH", r"C:\Windows\System32")
+
+    factory = ModelFactory()
+    with llm.use_backend(FakeBackend([VOCAB, NO_FIX])):
+        run(tmp_path, factory)
+
+    assert os.environ["PATH"] == r"C:\Windows\System32"
+    assert factory.built == [("small", "cuda", "float16")]
+
+
+# --------------------------------------------------------------------------
 # C10 : integration optionnelle avec le vrai faster-whisper, modele tiny
 # (telecharge au premier lancement) : CLIPPER_WHISPER_INTEGRATION=1 pytest
 # --------------------------------------------------------------------------
