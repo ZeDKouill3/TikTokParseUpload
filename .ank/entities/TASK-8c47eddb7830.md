@@ -5,7 +5,7 @@ slug: cli-progression-annoncer-aussi-une-tape-relanc-e
 title: "CLI progression : annoncer aussi une étape relancée après un échec"
 created: 2026-09-25T17:53:09Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/__main__.py
   - tests/test_cli_progress.py
@@ -15,6 +15,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: diagnose
+proof:
+  - type: test
+    ref: local/73102081bfda@25ad6f0
+    tree: scope/f55e752aa650
+    criteria: 1f7caff6b1ee
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---

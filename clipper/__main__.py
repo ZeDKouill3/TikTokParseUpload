@@ -79,7 +79,14 @@ def _step_elapsed(step: dict) -> float:
     return (datetime.fromisoformat(finished) - datetime.fromisoformat(started)).total_seconds()
 
 
-def _announce_step(name: str, step: dict, seen_running: set, reported_done: set) -> None:
+def _announce_step(name: str, step: dict, seen_running: set, reported_done: set,
+                   stale_snapshot: dict) -> None:
+    baseline_step = stale_snapshot.get(name)
+    if baseline_step is not None:
+        if step == baseline_step:
+            return  # etat identique a celui d'avant l'appel : pas encore reparti
+        del stale_snapshot[name]  # a bouge depuis l'appel : traite normalement desormais
+
     status = step["status"]
     if status == "running":
         if name not in seen_running:
@@ -96,29 +103,40 @@ def _announce_step(name: str, step: dict, seen_running: set, reported_done: set)
             print(f"[{name}] échec : {step.get('reason')}")
 
 
-def _baseline_progress(video_id: str, config, force: bool) -> tuple[set, set]:
+def _baseline_progress(video_id: str, config, force: bool) -> tuple[set, set, dict]:
     """Etapes deja terminees avant cet appel (deja faites, cache) : elles ne
-    tournent pas cette fois-ci et ne doivent pas etre annoncees. --force les
-    relance toutes, donc rien n'est mis de cote."""
+    refont pas de travail visible cette fois-ci et ne doivent pas etre
+    annoncees. --force les relance toutes, donc rien n'est mis de cote.
+
+    Une etape en echec n'est PAS mise de cote : elle repart pour de vrai et
+    doit etre reannoncee ('demarree' puis 'terminee'/'echec'). Mais tant que
+    son etat sur disque n'a pas encore bouge depuis cet instant (une lecture
+    peut survenir juste avant que la relance ne la touche), son ancien statut
+    'failed' ne doit pas etre pris pour une nouvelle annonce : stale_snapshot
+    retient l'etat de depart de chaque etape non 'done' pour le detecter."""
     from clipper import pipeline
 
     if force:
-        return set(), set()
+        return set(), set(), {}
     try:
         state = pipeline.load_state(video_id, config=config)
     except pipeline.PipelineError:
-        return set(), set()
+        return set(), set(), {}
     seen_running: set = set()
     reported_done: set = set()
+    stale_snapshot: dict = {}
     for name in pipeline.STEPS:
-        if state["steps"][name]["status"] in ("done", "failed"):
+        step = state["steps"][name]
+        if step["status"] == "done":
             seen_running.add(name)
             reported_done.add(name)
-    return seen_running, reported_done
+        else:
+            stale_snapshot[name] = dict(step)
+    return seen_running, reported_done, stale_snapshot
 
 
 def _watch_progress(video_id: str, config, stop_event: threading.Event,
-                    seen_running: set, reported_done: set) -> None:
+                    seen_running: set, reported_done: set, stale_snapshot: dict) -> None:
     from clipper import pipeline
 
     while not stop_event.is_set():
@@ -128,7 +146,7 @@ def _watch_progress(video_id: str, config, stop_event: threading.Event,
             stop_event.wait(_PROGRESS_POLL_SECONDS)
             continue
         for name in pipeline.STEPS:
-            _announce_step(name, state["steps"][name], seen_running, reported_done)
+            _announce_step(name, state["steps"][name], seen_running, reported_done, stale_snapshot)
         stop_event.wait(_PROGRESS_POLL_SECONDS)
 
 
@@ -139,10 +157,11 @@ def _run_with_progress(action, video_id: str, config, force: bool) -> dict:
     pipeline.py."""
     from clipper import pipeline
 
-    seen_running, reported_done = _baseline_progress(video_id, config, force)
+    seen_running, reported_done, stale_snapshot = _baseline_progress(video_id, config, force)
     stop_event = threading.Event()
     watcher = threading.Thread(
-        target=_watch_progress, args=(video_id, config, stop_event, seen_running, reported_done),
+        target=_watch_progress,
+        args=(video_id, config, stop_event, seen_running, reported_done, stale_snapshot),
         daemon=True,
     )
     watcher.start()
@@ -154,7 +173,7 @@ def _run_with_progress(action, video_id: str, config, force: bool) -> dict:
     for name in pipeline.STEPS:
         step = state.get("steps", {}).get(name)
         if step is not None:
-            _announce_step(name, step, seen_running, reported_done)
+            _announce_step(name, step, seen_running, reported_done, stale_snapshot)
     return state
 
 

@@ -166,6 +166,48 @@ def test_run_affiche_la_progression_pendant_quune_etape_tourne_encore(monkeypatc
     assert result["code"] == 0
 
 
+def test_run_reannonce_une_etape_relancee_apres_un_echec(monkeypatch, isolated_cwd, capsys):
+    """Constat de la tache : une relance de run apres un echec de vision doit
+    reannoncer vision ('demarree' puis 'terminee'), pas rester muette comme
+    si elle etait deja faite. Les etapes deja 'done' avant l'appel restent
+    silencieuses."""
+    config = _config(isolated_cwd)
+    state = pipeline.new_state(VIDEO_ID, URL, config.mode)
+    for name in ("download", "transcribe", "scenes", "audio", "moments"):
+        state["steps"][name].update(status="done", started_at=_iso(_T0), finished_at=_iso(_T0 + timedelta(seconds=1)))
+    state["steps"]["vision"].update(status="failed", reason="TransientLLMError: quota",
+                                    started_at=_iso(_T0), finished_at=_iso(_T0 + timedelta(seconds=1)))
+    state["status"] = "failed"
+    state["source_url"] = URL
+    pipeline.save_state(state, config=config)
+
+    def fake_run(url, *, config=config, force=False, **_ignored):
+        st = pipeline.load_state(VIDEO_ID, config=config)
+        now = _T0 + timedelta(seconds=10)
+        for name in ("vision", "parts"):
+            step = st["steps"][name]
+            step.update(status="running", started_at=_iso(now), reason=None)
+            pipeline.save_state(st, config=config)
+            now += timedelta(seconds=2)
+            step.update(status="done", finished_at=_iso(now))
+            pipeline.save_state(st, config=config)
+        st.update(status="done", clips=[])
+        pipeline.save_state(st, config=config)
+        return st
+
+    _patch_cli(monkeypatch, config, run=fake_run)
+    from clipper.__main__ import main
+
+    exit_code = main(["run", URL])
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "[vision] démarrée" in out, f"l'etape relancee apres un echec doit etre reannoncee : {out}"
+    assert any(line.startswith("[vision] terminée en") for line in out.splitlines()), out
+    for name in ("download", "transcribe", "scenes", "audio", "moments"):
+        assert f"[{name}]" not in out, f"{name} etait deja fait avant l'appel : ne doit rien afficher"
+
+
 def test_render_affiche_la_progression_sans_reannoncer_les_etapes_deja_faites(monkeypatch, isolated_cwd, capsys):
     config = _config(isolated_cwd)
     state = pipeline.new_state(VIDEO_ID, URL, config.mode)
