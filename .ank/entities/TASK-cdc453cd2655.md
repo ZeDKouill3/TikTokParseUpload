@@ -5,7 +5,7 @@ slug: tape-captions-titre-l-gende-hashtags-texte-d-acc
 title: "Étape captions : titre, légende, hashtags, texte d'accroche"
 created: 2026-09-25T09:39:45Z
 author: claude-plan
-status: open
+status: done
 scope:
   - clipper/captions.py
   - tests/test_captions.py
@@ -15,8 +15,15 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/ed194ba0c109@0ef1305
+    tree: scope/a3d4e4da5977
+    criteria: 011863227f98
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---
 
 Le texte d'accroche doit exister avant le rendu : captions passe avant render.
