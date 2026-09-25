@@ -5,7 +5,7 @@ slug: claude-cli-trouver-claude-sous-windows-raccourci
 title: "claude_cli : trouver claude sous Windows (raccourci npm claude.cmd)"
 created: 2026-09-25T16:52:18Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/llm/claude_cli.py
   - tests/test_llm.py
@@ -15,6 +15,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: diagnose
+proof:
+  - type: test
+    ref: local/20a3e7700b7b@d0bf607
+    tree: scope/ffdb386d2e24
+    criteria: e851e7da1256
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---

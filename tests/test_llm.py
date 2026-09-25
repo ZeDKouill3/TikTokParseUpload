@@ -76,6 +76,11 @@ class FakeRun:
 
 @pytest.fixture
 def fake_run(monkeypatch):
+    # Environnement propre et deterministe : pas de shim npm trouve sur cette
+    # machine de test, donc resolve_command() renvoie la commande telle
+    # quelle (meme comportement qu'avant sa mise en place).
+    monkeypatch.setattr("clipper.llm.claude_cli.shutil.which", lambda command: None)
+
     def _install(stdout, returncode=0, stderr=""):
         run = FakeRun(stdout, returncode, stderr)
         monkeypatch.setattr("clipper.llm.claude_cli.subprocess.run", run)
@@ -160,6 +165,55 @@ def test_claude_cli_without_images_disables_all_tools(fake_run):
     cmd = run.calls[0]["cmd"]
     assert cmd[cmd.index("--tools") + 1] == ""
     assert "--add-dir" not in cmd
+
+
+def test_claude_cli_resolves_npm_cmd_shim_to_its_exe_directly(monkeypatch, tmp_path):
+    # Arborescence npm sous Windows : claude.cmd a cote de
+    # node_modules/@anthropic-ai/claude-code/bin/claude.exe.
+    shim = tmp_path / "claude.cmd"
+    shim.write_text("@rem shim")
+    exe = tmp_path / "node_modules" / "@anthropic-ai" / "claude-code" / "bin" / "claude.exe"
+    exe.parent.mkdir(parents=True)
+    exe.write_bytes(b"")
+
+    monkeypatch.setattr("clipper.llm.claude_cli.shutil.which", lambda command: str(shim))
+    run = FakeRun(json.dumps(RECORDED_CLAUDE_CLI_OK))
+    monkeypatch.setattr("clipper.llm.claude_cli.subprocess.run", run)
+
+    out = llm.ask("qa", "p", [], COLOR_SCHEMA, config=make_config())
+
+    assert out == {"couleur": "rouge"}
+    # L'executable est appele directement (jamais le .cmd, donc jamais cmd.exe,
+    # qui reinterprete l'argv : %VAR% developpe, ^ avale).
+    assert run.calls[0]["cmd"][0] == str(exe)
+
+
+def test_claude_cli_shim_without_sibling_exe_falls_back_to_shim_path(monkeypatch, tmp_path):
+    shim = tmp_path / "claude.cmd"
+    shim.write_text("@rem shim")
+    # Pas de node_modules/@anthropic-ai/claude-code/bin/claude.exe a cote.
+
+    monkeypatch.setattr("clipper.llm.claude_cli.shutil.which", lambda command: str(shim))
+    run = FakeRun(json.dumps(RECORDED_CLAUDE_CLI_OK))
+    monkeypatch.setattr("clipper.llm.claude_cli.subprocess.run", run)
+
+    llm.ask("qa", "p", [], COLOR_SCHEMA, config=make_config())
+
+    assert run.calls[0]["cmd"][0] == str(shim)
+
+
+def test_claude_cli_configured_full_path_is_used_as_is(monkeypatch, tmp_path):
+    exe = tmp_path / "claude.exe"
+    exe.write_bytes(b"")
+
+    # shutil.which sur un chemin complet existant le renvoie tel quel.
+    monkeypatch.setattr("clipper.llm.claude_cli.shutil.which", lambda command: command)
+    run = FakeRun(json.dumps(RECORDED_CLAUDE_CLI_OK))
+    monkeypatch.setattr("clipper.llm.claude_cli.subprocess.run", run)
+
+    llm.ask("qa", "p", [], COLOR_SCHEMA, config=make_config(claude_cli={"command": str(exe)}))
+
+    assert run.calls[0]["cmd"][0] == str(exe)
 
 
 def test_claude_cli_accepts_json_wrapped_in_markdown_fence(fake_run):
