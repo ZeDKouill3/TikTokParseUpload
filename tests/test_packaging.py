@@ -70,3 +70,31 @@ def test_wheel_contains_the_font_assets(tmp_path):
         names = zf.namelist()
     assert "clipper/assets/fonts/Poppins-ExtraBold.ttf" in names
     assert "clipper/assets/fonts/OFL.txt" in names
+
+
+@pytest.mark.skipif(shutil.which("uv") is None, reason="uv absent du PATH")
+def test_wheel_contains_the_web_static_assets(tmp_path):
+    """TASK-4ed9 : une installation non editable (uv pip install .) doit
+    apporter clipper/web/static/index.html, app.js et style.css, en plus des
+    polices deja couvertes. Meme construction isolee que le test des
+    polices : wheel hors ligne dans une copie du paquet, contenu inspecte."""
+    src = tmp_path / "src"
+    shutil.copytree(ROOT / "clipper", src / "clipper")
+    shutil.copy2(PYPROJECT, src / "pyproject.toml")
+
+    out_dir = tmp_path / "dist"
+    result = subprocess.run(
+        ["uv", "build", "--offline", "--wheel", "--out-dir", str(out_dir), str(src)],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+    wheels = list(out_dir.glob("*.whl"))
+    assert wheels, f"aucun wheel produit dans {out_dir}"
+
+    with zipfile.ZipFile(wheels[0]) as zf:
+        names = zf.namelist()
+    assert "clipper/web/static/index.html" in names
+    assert "clipper/web/static/app.js" in names
+    assert "clipper/web/static/style.css" in names
