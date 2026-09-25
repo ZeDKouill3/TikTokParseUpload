@@ -382,7 +382,8 @@ def test_schema_validator_covers_nested_types_ranges_enums(value, ok):
             assert llm.ask("moments", "p", [], schema, config=make_config(backend="fake")) == value
         else:
             with pytest.raises(SchemaError):
-                llm.ask("moments", "p", [], schema, config=make_config(backend="fake"))
+                llm.ask("moments", "p", [], schema,
+                        config=make_config(backend="fake", repair_attempts=0))
 
 
 # --- backend ollama ---------------------------------------------------------
@@ -576,7 +577,7 @@ def test_fake_backend_replays_responses_and_records_calls(tmp_path):
 def test_fake_backend_still_goes_through_schema_validation():
     with llm.use_backend(FakeBackend([{"wrong": 1}])):
         with pytest.raises(SchemaError):
-            llm.ask("qa", "p", [], COLOR_SCHEMA, config=make_config())
+            llm.ask("qa", "p", [], COLOR_SCHEMA, config=make_config(repair_attempts=0))
 
 
 def test_fake_backend_can_raise_and_compute_responses():
@@ -587,10 +588,119 @@ def test_fake_backend_can_raise_and_compute_responses():
         assert llm.ask("qa", "p", [], COLOR_SCHEMA, config=make_config()) == {"couleur": "qa"}
 
 
+def test_fake_backend_replays_its_last_response_once_exhausted():
+    fake = FakeBackend([{"couleur": "rouge"}, "pas du json"])
+    with llm.use_backend(fake):
+        assert llm.ask("qa", "p", [], COLOR_SCHEMA, config=make_config()) == {"couleur": "rouge"}
+        with pytest.raises(SchemaError, match="non JSON"):
+            llm.ask("qa", "p", [], COLOR_SCHEMA, config=make_config(repair_attempts=2))
+    assert len(fake.calls) == 4
+
+
 def test_fake_backend_exhausted_fails_loudly():
     with llm.use_backend(FakeBackend([])):
         with pytest.raises(AssertionError, match="FakeBackend"):
             llm.ask("qa", "p", [], COLOR_SCHEMA, config=make_config())
+
+
+# --- reparation d'une reponse refusee ---------------------------------------
+
+
+def at_most_two_letters(value):
+    if len(value["couleur"]) > 2:
+        raise SchemaError(f"couleur de {len(value['couleur'])} lettres, 2 au plus")
+
+
+def test_repair_attempts_defaults_to_one():
+    assert make_config().section("llm")["repair_attempts"] == 1
+
+
+def test_check_runs_after_schema_and_its_refusal_is_repaired_by_the_same_model():
+    fake = FakeBackend([{"couleur": "rouge"}, {"couleur": "or"}])
+    with llm.use_backend(fake):
+        value = llm.ask("vision", "Quelle couleur ?", [], COLOR_SCHEMA,
+                        config=make_config(usages={"vision": {"model": "strong"}}),
+                        check=at_most_two_letters)
+
+    assert value == {"couleur": "or"}
+    assert len(fake.calls) == 2
+    first, repair = fake.calls
+    assert (repair.usage, repair.model, repair.schema) == (first.usage, first.model, first.schema)
+    assert repair.model == "opus"
+
+
+def test_repair_prompt_carries_original_request_refused_answer_and_exact_error(tmp_path):
+    img = tmp_path / "a.png"
+    fake = FakeBackend([{"couleur": "rouge"}, {"couleur": "or"}])
+    with llm.use_backend(fake):
+        llm.ask("vision", "Quelle couleur ?", [img], COLOR_SCHEMA, config=make_config(),
+                check=at_most_two_letters)
+
+    repair = fake.calls[1]
+    assert fake.calls[0].prompt in repair.prompt
+    assert '{"couleur": "rouge"}' in repair.prompt
+    assert "couleur de 5 lettres, 2 au plus" in repair.prompt
+    assert repair.images == [img]
+
+
+def test_schema_refusal_is_repaired_too_with_the_validator_message():
+    fake = FakeBackend(["pas du json", {"color": "rouge"}, {"couleur": "vert"}])
+    with llm.use_backend(fake):
+        value = llm.ask("qa", "p", [], COLOR_SCHEMA, config=make_config(repair_attempts=2))
+
+    assert value == {"couleur": "vert"}
+    assert "pas du json" in fake.calls[1].prompt
+    assert "reponse LLM non JSON" in fake.calls[1].prompt
+    assert "cle requise manquante 'couleur'" in fake.calls[2].prompt
+
+
+def test_repaired_answer_still_refused_raises_the_last_error():
+    fake = FakeBackend([{"couleur": "rouge"}, {"couleur": "violet"}])
+    with llm.use_backend(fake):
+        with pytest.raises(SchemaError, match="couleur de 6 lettres"):
+            llm.ask("qa", "p", [], COLOR_SCHEMA, config=make_config(), check=at_most_two_letters)
+    assert len(fake.calls) == 2
+
+
+def test_repaired_answer_is_validated_against_the_schema_as_well():
+    fake = FakeBackend([{"couleur": "rouge"}, {"couleur": "or", "extra": 1}])
+    with llm.use_backend(fake):
+        with pytest.raises(SchemaError, match="cle inattendue 'extra'"):
+            llm.ask("qa", "p", [], COLOR_SCHEMA, config=make_config(), check=at_most_two_letters)
+
+
+def test_repair_attempts_zero_keeps_a_single_call():
+    fake = FakeBackend([{"couleur": "rouge"}])
+    with llm.use_backend(fake):
+        with pytest.raises(SchemaError, match="couleur de 5 lettres"):
+            llm.ask("qa", "p", [], COLOR_SCHEMA, config=make_config(repair_attempts=0),
+                    check=at_most_two_letters)
+    assert len(fake.calls) == 1
+
+
+def test_transient_error_is_never_retried_even_during_a_repair():
+    fake = FakeBackend([TransientLLMError("quota")])
+    with llm.use_backend(fake):
+        with pytest.raises(TransientLLMError):
+            llm.ask("qa", "p", [], COLOR_SCHEMA, config=make_config(repair_attempts=3))
+    assert len(fake.calls) == 1
+
+    fake = FakeBackend([{"couleur": "rouge"}, TransientLLMError("surcharge")])
+    with llm.use_backend(fake):
+        with pytest.raises(TransientLLMError, match="surcharge"):
+            llm.ask("qa", "p", [], COLOR_SCHEMA, config=make_config(repair_attempts=3),
+                    check=at_most_two_letters)
+    assert len(fake.calls) == 2
+
+
+def test_check_is_not_called_on_an_answer_the_schema_refused():
+    seen = []
+    fake = FakeBackend([{"wrong": 1}])
+    with llm.use_backend(fake):
+        with pytest.raises(SchemaError):
+            llm.ask("qa", "p", [], COLOR_SCHEMA, config=make_config(repair_attempts=0),
+                    check=seen.append)
+    assert seen == []
 
 
 def test_use_backend_restores_config_backend_on_exit(fake_run):

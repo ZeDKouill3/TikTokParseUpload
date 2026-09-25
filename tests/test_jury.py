@@ -68,14 +68,22 @@ class ScriptedJury:
         self.lock = threading.Lock()
         self.count = defaultdict(int)
         self.prompts = defaultdict(list)  # juge -> [prompt tour 1, prompt tour 2]
+        self.repairs = defaultdict(list)  # juge -> [tour de chaque reparation demandee]
 
     def __call__(self, request):
         judge = request.usage.removeprefix("jury_")
         with self.lock:
-            self.count[judge] += 1
-            rnd = self.count[judge]
-            self.prompts[judge].append(request.prompt)
-        if self.barrier is not None and rnd == 1:
+            # Une reparation (llm.ask renvoie la demande d'origine suivie de
+            # l'erreur) reste dans le tour de la demande qu'elle repare.
+            repaired = [n for n, p in enumerate(self.prompts[judge], 1) if request.prompt.startswith(p + "\n")]
+            if repaired:
+                rnd = repaired[-1]
+                self.repairs[judge].append(rnd)
+            else:
+                self.count[judge] += 1
+                rnd = self.count[judge]
+                self.prompts[judge].append(request.prompt)
+        if self.barrier is not None and rnd == 1 and not repaired:
             self.barrier.wait()
         if (rnd, judge) in self.raw:
             return self.raw[(rnd, judge)]
@@ -413,8 +421,30 @@ def test_only_veto_judges_are_asked_for_a_veto():
 
 def test_invalid_judge_answer_raises_without_quorum():
     script = ScriptedJury({1: uniform({"secret-id-0": 7, "secret-id-1": 5, "secret-id-2": 3})}, raw={(1, "monteur"): "pas du json"})
-    with pytest.raises(llm.SchemaError):
+    with pytest.raises(llm.SchemaError, match="non JSON"):
         run(script)
+    assert script.repairs["monteur"] == [1]  # renvoye une fois au modele, encore invalide
+
+
+def test_judge_answer_repaired_by_the_model_is_kept():
+    script = ScriptedJury({1: uniform({"secret-id-0": 7, "secret-id-1": 5, "secret-id-2": 3})})
+    pending = {"monteur"}
+
+    def invalid_once(request):
+        answer = script(request)
+        judge = request.usage.removeprefix("jury_")
+        if judge in pending:
+            pending.discard(judge)
+            return "pas du json"
+        return answer
+
+    fake = FakeBackend([invalid_once] * 12)
+    with llm.use_backend(fake):
+        result = jury.deliberate(candidates(), RUBRIC, config=make_config(jury_table={"quorum": 4}))
+
+    assert script.repairs["monteur"] == [1]
+    assert result["failed"] == []
+    assert "monteur" in by_id(result)["secret-id-0"]["trace"]["rounds"][0]["judges"]
 
 
 def test_missing_candidate_in_answer_is_invalid():
@@ -439,6 +469,8 @@ def test_quorum_tolerates_invalid_answers_and_traces_them():
     result, _ = run(script, config=make_config(jury_table={"quorum": 4}))
     assert [f["judge"] for f in result["failed"]] == ["monteur"]
     assert result["failed"][0]["round"] == 1
+    assert "non JSON" in result["failed"][0]["error"]
+    assert script.repairs["monteur"] == [1]
     c = by_id(result)["secret-id-0"]
     assert "monteur" not in c["trace"]["rounds"][0]["judges"]
     assert c["scores"] == {"hook": 7, "standalone": 7}

@@ -201,7 +201,7 @@ def test_hashtag_without_hash_prefix_is_a_failure_and_writes_nothing(workspace, 
     write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
 
     with pytest.raises(llm.SchemaError, match="#"):
-        run(workspace, make_config(tmp_path), [answer(hashtags=["sansdiese"])])
+        run(workspace, make_config(tmp_path), [answer(hashtags=["sansdiese"])] * 2)
     assert not (workspace / VIDEO_ID / "captions.json").exists()
 
 
@@ -210,7 +210,7 @@ def test_duplicate_hashtags_case_insensitive_is_a_failure(workspace, tmp_path):
     write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
 
     with pytest.raises(llm.SchemaError, match="double"):
-        run(workspace, make_config(tmp_path), [answer(hashtags=["#Viral", "#viral"])])
+        run(workspace, make_config(tmp_path), [answer(hashtags=["#Viral", "#viral"])] * 2)
     assert not (workspace / VIDEO_ID / "captions.json").exists()
 
 
@@ -220,8 +220,32 @@ def test_hook_text_over_the_word_limit_is_a_failure(workspace, tmp_path):
     nine_words = "un deux trois quatre cinq six sept huit neuf"
 
     with pytest.raises(llm.SchemaError, match="9 mots"):
-        run(workspace, make_config(tmp_path), [answer(hook_text=nine_words)])
+        run(workspace, make_config(tmp_path), [answer(hook_text=nine_words)] * 2)
     assert not (workspace / VIDEO_ID / "captions.json").exists()
+
+
+def test_refused_hook_text_is_sent_back_to_the_llm_with_the_error_and_repaired(workspace, tmp_path):
+    write_moments(workspace, moment(0))
+    write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
+    ten_words = "un deux trois quatre cinq six sept huit neuf dix"
+
+    fake, _ = run(workspace, make_config(tmp_path),
+                  [answer(hook_text=ten_words), answer(hook_text="trois mots courts")])
+
+    assert len(fake.calls) == 2
+    assert f"texte d'accroche de 10 mots, 8 au plus : {ten_words!r}" in fake.calls[1].prompt
+    assert by_id(read_captions(workspace), "00")["hook_text"] == "trois mots courts"
+
+
+def test_refused_hashtags_are_repaired_the_same_way(workspace, tmp_path):
+    write_moments(workspace, moment(0))
+    write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
+
+    fake, _ = run(workspace, make_config(tmp_path),
+                  [answer(hashtags=["#Viral", "#viral"]), answer(hashtags=["#viral", "#drole"])])
+
+    assert "hashtag en double : '#viral'" in fake.calls[1].prompt
+    assert by_id(read_captions(workspace), "00")["hashtags"] == ["#viral", "#drole"]
 
 
 def test_hook_text_exactly_at_the_word_limit_is_accepted(workspace, tmp_path):
@@ -240,7 +264,7 @@ def test_hook_words_max_is_configurable(workspace, tmp_path):
     three_words = "un deux trois"
 
     with pytest.raises(llm.SchemaError, match="2 au plus"):
-        run(workspace, make_config(tmp_path, hook_words_max=2), [answer(hook_text=three_words)])
+        run(workspace, make_config(tmp_path, hook_words_max=2), [answer(hook_text=three_words)] * 2)
 
 
 def test_schema_rejects_a_response_missing_a_required_field(workspace, tmp_path):
@@ -249,7 +273,7 @@ def test_schema_rejects_a_response_missing_a_required_field(workspace, tmp_path)
     bad = {"title": "t", "caption": "c", "hashtags": ["#a"]}  # hook_text manquant
 
     with pytest.raises(llm.SchemaError):
-        run(workspace, make_config(tmp_path), [bad])
+        run(workspace, make_config(tmp_path), [bad, bad])
     assert not (workspace / VIDEO_ID / "captions.json").exists()
 
 

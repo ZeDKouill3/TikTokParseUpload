@@ -14,6 +14,11 @@ Each scripted response is consumed in order and may be:
 - a str: returned as is (the raw text a model would produce);
 - an Exception instance: raised (e.g. TransientLLMError("quota"));
 - a callable taking the LLMRequest: called, its result handled as above.
+
+Once the scripted responses are used up, the last one is served again: a
+test scripting one invalid answer still sees it refused after llm.ask sent
+it back for repair. A FakeBackend scripted with no response at all fails
+on the first call.
 """
 
 from __future__ import annotations
@@ -32,8 +37,8 @@ class FakeBackend:
 
     def complete(self, request: LLMRequest) -> str:
         self.calls.append(request)
-        assert self.responses, f"FakeBackend : plus de reponse scriptee pour {request.usage!r}"
-        response = self.responses.pop(0)
+        assert self.responses, f"FakeBackend : aucune reponse scriptee pour {request.usage!r}"
+        response = self.responses.pop(0) if len(self.responses) > 1 else self.responses[0]
         if callable(response) and not isinstance(response, type):
             response = response(request)
         if isinstance(response, BaseException):
