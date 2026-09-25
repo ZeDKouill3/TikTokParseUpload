@@ -10,6 +10,9 @@ requires-python = ">=3.11"
 dependencies = [
     "yt-dlp",
     "anthropic",
+    "numpy",
+    "scenedetect[opencv]",
+    "faster-whisper",
 ]
 
 [project.optional-dependencies]
