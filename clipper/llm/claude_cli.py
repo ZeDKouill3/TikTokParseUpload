@@ -41,7 +41,9 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import subprocess
+from pathlib import Path
 from typing import Any
 
 from clipper.llm.backend import LLMRequest
@@ -69,6 +71,33 @@ def _is_transient(status: Any, text: str) -> bool:
     return bool(_TRANSIENT_TEXT.search(text))
 
 
+def _npm_shim_exe(shim: Path) -> Path | None:
+    """``shim`` est un lanceur npm ``.cmd``/``.bat`` (Windows) : l'executable
+    qu'il lance (``node_modules/@anthropic-ai/claude-code/bin/claude.exe`` a
+    cote de lui), ou ``None`` si ``shim`` n'en est pas un ou que l'executable
+    n'existe pas a cote."""
+    if shim.suffix.lower() not in (".cmd", ".bat"):
+        return None
+    exe = shim.parent / "node_modules" / "@anthropic-ai" / "claude-code" / "bin" / "claude.exe"
+    return exe if exe.is_file() else None
+
+
+def resolve_command(command: str) -> str:
+    """Argv[0] a utiliser pour ``subprocess.run``. Sous Windows, Claude Code
+    s'installe via npm comme un raccourci ``.cmd`` : ``subprocess.run`` sur un
+    nom sans extension ne le trouve pas (FileNotFoundError, seule ``.exe`` est
+    cherchee), et meme trouve, un ``.cmd``/``.bat`` passe par cmd.exe, qui
+    reinterprete l'argv (``%VAR%`` developpe, ``^`` avale). On resout via
+    ``shutil.which`` et, si le resultat est un tel raccourci, on appelle
+    directement l'executable qu'il lance. Rien trouve : ``command`` est
+    renvoye tel quel (l'erreur 'introuvable' actuelle est conservee)."""
+    found = shutil.which(command)
+    if not found:
+        return command
+    exe = _npm_shim_exe(Path(found))
+    return str(exe) if exe else found
+
+
 def image_prompt(request: LLMRequest) -> str:
     if not request.images:
         return request.prompt
@@ -84,7 +113,7 @@ class ClaudeCLIBackend:
         self.timeout = settings.get("timeout", 900)
 
     def build_command(self, request: LLMRequest) -> list[str]:
-        cmd = [self.command, "-p", "--output-format", "json", "--model", request.model]
+        cmd = [resolve_command(self.command), "-p", "--output-format", "json", "--model", request.model]
         if request.images:
             cmd += ["--tools", "Read", "--allowedTools", "Read"]
             dirs = dict.fromkeys(str(p.resolve().parent) for p in request.images)
