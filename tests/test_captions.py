@@ -258,6 +258,26 @@ def test_hook_text_exactly_at_the_word_limit_is_accepted(workspace, tmp_path):
     assert by_id(read_captions(workspace), "00")["hook_text"] == eight_words
 
 
+def test_hook_text_with_isolated_punctuation_is_counted_by_real_words(workspace, tmp_path):
+    write_moments(workspace, moment(0))
+    write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
+    eight_words_with_colon = "La nouvelle mode : ils se volent entre eux"
+
+    run(workspace, make_config(tmp_path), [answer(hook_text=eight_words_with_colon)])
+
+    assert by_id(read_captions(workspace), "00")["hook_text"] == eight_words_with_colon
+
+
+def test_hook_text_apostrophe_and_hyphen_words_count_as_one_each(workspace, tmp_path):
+    write_moments(workspace, moment(0))
+    write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
+    six_words_various_punctuation = "l'heure du crime ; vraiment ? — peut-être … non !"
+
+    run(workspace, make_config(tmp_path), [answer(hook_text=six_words_various_punctuation)])
+
+    assert by_id(read_captions(workspace), "00")["hook_text"] == six_words_various_punctuation
+
+
 def test_hook_words_max_is_configurable(workspace, tmp_path):
     write_moments(workspace, moment(0))
     write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))

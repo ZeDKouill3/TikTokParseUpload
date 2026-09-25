@@ -168,7 +168,7 @@ def _validate_hashtags(hashtags: list[str]) -> None:
 
 
 def _validate_hook_text(hook_text: str, max_words: int) -> None:
-    n = len(hook_text.split())
+    n = sum(1 for token in hook_text.split() if any(c.isalnum() for c in token))
     if n > max_words:
         raise llm.SchemaError(f"texte d'accroche de {n} mots, {max_words} au plus : {hook_text!r}")
 
