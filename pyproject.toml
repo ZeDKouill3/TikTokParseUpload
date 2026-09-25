@@ -9,6 +9,7 @@ description = "Pipeline de clips verticaux sous-titres a partir de videos YouTub
 requires-python = ">=3.11"
 dependencies = [
     "yt-dlp",
+    "yt-dlp-ejs",
     "anthropic",
     "numpy",
     "scenedetect",
