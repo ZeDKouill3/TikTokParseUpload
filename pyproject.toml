@@ -28,7 +28,7 @@ test = [
 include = ["clipper", "clipper.*"]
 
 [tool.setuptools.package-data]
-clipper = ["assets/**/*"]
+clipper = ["assets/**/*", "web/static/**/*"]
 
 [tool.uv]
 # mediapipe impose opencv-contrib-python ; scenedetect demande opencv-python (meme
