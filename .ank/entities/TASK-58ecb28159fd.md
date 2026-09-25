@@ -5,7 +5,7 @@ slug: download-viter-le-1080p-premium-m3u8-fichier-4-5
 title: "download : éviter le 1080p « premium » m3u8 (fichier 4 à 5 fois plus gros)"
 created: 2026-09-25T16:47:53Z
 author: nicoc@zedk_ordi
-status: open
+status: closed
 scope:
   - clipper/download.py
   - tests/test_download.py
@@ -15,7 +15,7 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 schema: 4
-version: 1
+version: 2
 ---
 
 Constat essai réel 2026-09-25 (sZi-qJ-5ptA, 1 h 52) : le sélecteur actuel a pris le format 616 (1080p premium, m3u8, vp9), soit environ 4 à 5 Go, alors qu'un 1080p standard en ferait environ 1. H.264 est aussi plus simple à décoder pour scenes/reframe et pour NVENC côté render.
