@@ -15,23 +15,28 @@ def isolated_cwd(tmp_path, monkeypatch):
 
 
 @pytest.fixture
-def fake_torch(monkeypatch):
-    """Install a fake ``torch`` module in sys.modules so clipper.gpu can be
-    tested against both CUDA-available and CUDA-unavailable cases without
-    the real (heavy) torch dependency."""
+def fake_ctranslate2(monkeypatch):
+    """Install a fake ``ctranslate2`` module in sys.modules so clipper.gpu
+    can be tested against CUDA-available, CUDA-unavailable and erroring
+    cases without the real (heavy, GPU-requiring) dependency."""
 
-    def _install(cuda_available: bool):
-        module = types.ModuleType("torch")
-        cuda_submodule = types.SimpleNamespace(is_available=lambda: cuda_available)
-        module.cuda = cuda_submodule
-        monkeypatch.setitem(sys.modules, "torch", module)
+    def _install(cuda_device_count=None, raises=None):
+        module = types.ModuleType("ctranslate2")
+
+        def _get_cuda_device_count():
+            if raises is not None:
+                raise raises
+            return cuda_device_count
+
+        module.get_cuda_device_count = _get_cuda_device_count
+        monkeypatch.setitem(sys.modules, "ctranslate2", module)
         return module
 
     return _install
 
 
 @pytest.fixture
-def no_torch(monkeypatch):
-    """Ensure ``import torch`` raises ImportError, simulating an
-    environment where torch isn't installed at all."""
-    monkeypatch.setitem(sys.modules, "torch", None)
+def no_ctranslate2(monkeypatch):
+    """Ensure ``import ctranslate2`` raises ImportError, simulating an
+    environment where ctranslate2 isn't installed at all."""
+    monkeypatch.setitem(sys.modules, "ctranslate2", None)
