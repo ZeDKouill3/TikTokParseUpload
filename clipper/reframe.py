@@ -11,7 +11,7 @@ annotee par plan dans workspace/<video_id>/reframe/<clip_id>/.
      "plans": [{"index", "start", "end", "image", "llm",
                 "layout": facecam_gameplay | single | fallback_blur | split,
                 "reason": pourquoi un repli (null sinon),
-                "faces": [{"id", "first", "last", "box"}],
+                "faces": [{"id", "first", "last", "box", "retained"}],
                 "panels": [{"name", "dest": {x, y, w, h}, "effect"?,
                             "rects": [{"start", "end", "x", "y", "w", "h"}]}]}]}
 
@@ -27,18 +27,24 @@ intervalle de temps) va ou dans l'image de sortie (``dest``) :
 Deroulement :
 1. plans du clip = scenes.json coupe a [start, end] ;
 2. detection locale des visages (``detector`` en config, mediapipe par
-   defaut) sur ``sample_fps`` images par seconde, suivi en pistes
-   numerotees ; le detecteur est ferme avant tout appel LLM (ADR-fb9b : un
-   LLM local ne cohabite jamais avec lui) ;
+   defaut) sur ``sample_fps`` images par seconde, doublons d'une meme image
+   fusionnes (``duplicate_iou``), suivi en pistes numerotees, pistes qui se
+   suivent a la meme place recollees ; le detecteur est ferme avant tout
+   appel LLM (ADR-fb9b : un LLM local ne cohabite jamais avec lui). Un
+   visage est *retenu* s'il est detecte assez souvent dans le plan
+   (``min_face_presence``) et assez grand (``min_face_height``) : seuls les
+   visages retenus (et celui que suit le cadre) sont gardes entiers ;
 3. par plan, une image annotee (visages encadres, ``#id``) est envoyee a
    clipper.llm (usage ``layout``), qui repond facecam_gameplay (avec le
    rectangle de la camera) ou single (avec le visage a suivre) ;
 4. plan de recadrage : position voulue lissee (moyenne glissante puis zone
    morte), puis ramenee dans l'ensemble des positions ou chaque visage
-   retenu est entier dans le cadre et ou aucun autre visage n'est coupe
-   (entier dedans ou entier dehors). Sans position possible a un instant,
-   le plan passe en repli ``split`` (deux visages, si ``fallback = auto``)
-   ou ``fallback_blur``, avec la raison dans ``reason``.
+   suivi est entier dans le cadre et ou aucun autre visage retenu n'est
+   coupe (entier dedans ou entier dehors). Sans position possible a un
+   instant, le plan passe en repli ``split`` (deux visages retenus
+   distincts, si ``fallback = auto`` ; chaque panneau cadre son visage a
+   ``split_face_height``) ou ``fallback_blur``, avec la raison dans
+   ``reason``.
 
 Modele mediapipe : ``model_path`` (defaut
 ~/.cache/clipper/blaze_face_short_range.tflite) ; s'il manque, il est
@@ -85,6 +91,27 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "sample_fps": 5.0,
     # Une piste plus courte est une fausse detection, ignoree.
     "min_track_seconds": 0.5,
+    # Deux detections d'une meme image dont l'IoU atteint ce seuil sont un
+    # seul visage (ex. image entiere et tuile) : la plus sure est gardee. Le
+    # meme seuil recolle deux pistes qui se suivent dans le temps (voir
+    # track_merge_seconds).
+    "duplicate_iou": 0.3,
+    # Deux pistes dont la seconde commence au plus tant de secondes apres la
+    # fin de la premiere, a la meme place (IoU des boites de jonction >=
+    # duplicate_iou), sont un seul visage perdu un moment par le detecteur.
+    "track_merge_seconds": 3.0,
+    # Visage retenu (jamais coupe par le cadre) : reellement detecte sur au
+    # moins cette part des images analysees du plan (une fausse detection
+    # clignote, un vrai visage a l'image est vu presque partout)...
+    "min_face_presence": 0.6,
+    # ... et de hauteur moyenne au moins cette part de la hauteur source.
+    # Les autres pistes restent annotees pour le LLM, mais ne contraignent
+    # pas le cadre.
+    "min_face_height": 0.05,
+    # Ecran partage : part de la hauteur d'un panneau occupee par son visage
+    # (le cadre est agrandi par paliers si l'autre visage retenu serait
+    # coupe, jusqu'au plus grand cadre possible).
+    "split_face_height": 0.35,
     # Marge autour de chaque visage (fraction de sa taille, de chaque cote) :
     # couvre le mouvement entre deux images analysees.
     "face_margin": 0.15,
@@ -177,7 +204,7 @@ def ensure_mediapipe_model(
     return path
 
 
-def _nms(detections: list[Detection], iou_threshold: float = 0.3) -> list[Detection]:
+def _nms(detections: list[Detection], iou_threshold: float) -> list[Detection]:
     kept: list[Detection] = []
     for det in sorted(detections, key=lambda d: d[4], reverse=True):
         if all(_iou(det[:4], k[:4]) < iou_threshold for k in kept):
@@ -220,7 +247,7 @@ class _MediapipeDetector:
                         y0 + min(y1 - y0, bb.origin_y + bb.height),
                         float(score),
                     ))
-        return _nms(found)
+        return found  # doublons image entiere / tuiles : fusionnes par _detect
 
     def close(self) -> None:
         if self._detector is not None:
@@ -371,6 +398,53 @@ def _project(x: float, allowed: Intervals) -> int | None:
     return best
 
 
+def _place_2d(
+    width: int,
+    height: int,
+    w: int,
+    h: int,
+    required: Box | None,
+    others: Sequence[Box],
+    x: float,
+    y: float,
+) -> tuple[int, int] | None:
+    """Position entiere (gauche, haut) d'un cadre ``w`` x ``h`` dans la source,
+    la plus proche de (``x``, ``y``), qui garde ``required`` entier dedans et
+    ne coupe aucun de ``others`` (entier dedans ou entier dehors). Chaque
+    coordonnee de la meilleure position est soit la cible ramenee dans les
+    bornes, soit une limite d'un des visages : ce sont les seules candidates."""
+    xr = [(0, width - w)]
+    yr = [(0, height - h)]
+    if required is not None:
+        xr = _intersect(xr, [(math.ceil(required[2] - w), math.floor(required[0]))])
+        yr = _intersect(yr, [(math.ceil(required[3] - h), math.floor(required[1]))])
+    if not xr or not yr:
+        return None
+    (xlo, xhi), (ylo, yhi) = xr[0], yr[0]
+
+    def candidates(v: float, lo: int, hi: int, edges: Iterable[tuple[float, float]], size: int) -> list[int]:
+        out = {round(v)}
+        for b0, b1 in edges:
+            out.update((math.floor(b0 - size), math.ceil(b1), math.floor(b0), math.ceil(b1 - size)))
+        return sorted({min(max(c, lo), hi) for c in out})
+
+    best: tuple[float, tuple[int, int]] | None = None
+    for cx in candidates(x, xlo, xhi, [(b[0], b[2]) for b in others], w):
+        for cy in candidates(y, ylo, yhi, [(b[1], b[3]) for b in others], h):
+            if any(_cuts((cx, cy, w, h), b) for b in others):
+                continue
+            dist = (cx - x) ** 2 + (cy - y) ** 2
+            if best is None or dist < best[0]:
+                best = (dist, (cx, cy))
+    return best[1] if best else None
+
+
+def _nearest_known(values: list[Any]) -> list[Any]:
+    """Chaque valeur manquante (None) remplacee par la plus proche connue."""
+    known = [i for i, v in enumerate(values) if v is not None]
+    return [v if v is not None else values[min(known, key=lambda k: abs(k - i))] for i, v in enumerate(values)]
+
+
 def _smooth(values: list[float], radius: int, deadzone: float) -> list[float]:
     """Moyenne glissante centree, puis zone morte : le cadre ne bouge que
     si la cible s'eloigne de plus de ``deadzone``."""
@@ -397,6 +471,8 @@ def _smooth(values: list[float], radius: int, deadzone: float) -> list[float]:
 class _Track:
     id: int
     boxes: list[Box | None]  # une boite par image analysee, interpolee dans les trous
+    detected: int = 0  # images ou le visage est reellement detecte (hors interpolation)
+    retained: bool = True  # voir _retain : seul un visage retenu contraint le cadre
 
     def present(self) -> list[int]:
         return [i for i, b in enumerate(self.boxes) if b is not None]
@@ -429,10 +505,32 @@ class _Track:
         return tuple(sum(b[k] for b in boxes) / len(boxes) for k in range(4))  # type: ignore[return-value]
 
 
+def _merge_fragments(raw: list[dict[int, Box]], max_gap: int, iou: float) -> list[dict[int, Box]]:
+    """Recolle les pistes qui se suivent : une piste qui commence au plus
+    ``max_gap`` images apres la fin d'une autre, a la meme place (IoU des
+    boites de jonction >= ``iou``), la prolonge."""
+    merged: list[dict[int, Box]] = []
+    for seen in sorted(raw, key=min):
+        first = min(seen)
+        best: tuple[float, dict[int, Box]] | None = None
+        for track in merged:
+            last = max(track)
+            if last < first and first - last <= max_gap:
+                score = _iou(track[last], seen[first])
+                if score >= iou and (best is None or score > best[0]):
+                    best = (score, track)
+        if best is None:
+            merged.append(dict(seen))
+        else:
+            best[1].update(seen)
+    return merged
+
+
 def _build_tracks(detections: list[list[Box]], fps: float, settings: dict[str, Any]) -> list[_Track]:
     """Associe les detections d'une image a l'autre (plus proche d'abord),
-    comble les trous par interpolation lineaire, ecarte les pistes trop
-    courtes, numerote de gauche a droite."""
+    recolle les pistes qui se suivent a la meme place, comble les trous par
+    interpolation lineaire, ecarte les pistes trop courtes, numerote de
+    gauche a droite."""
     max_gap = max(1, round(fps))  # une seconde sans detection clot la piste
     raw: list[dict[int, Box]] = []
     last_seen: list[int] = []
@@ -462,6 +560,9 @@ def _build_tracks(detections: list[list[Box]], fps: float, settings: dict[str, A
             if d not in used_d:
                 raw.append({i: box})
                 last_seen.append(i)
+    raw = _merge_fragments(
+        raw, round(float(settings["track_merge_seconds"]) * fps), float(settings["duplicate_iou"])
+    )
 
     min_samples = max(1, math.ceil(float(settings["min_track_seconds"]) * fps - 1e-9))
     n = len(detections)
@@ -475,11 +576,23 @@ def _build_tracks(detections: list[list[Box]], fps: float, settings: dict[str, A
             for i in range(a, b + 1):
                 w = (i - a) / (b - a) if b > a else 0.0
                 filled[i] = tuple(seen[a][k] * (1 - w) + seen[b][k] * w for k in range(4))  # type: ignore[assignment]
-        tracks.append(_Track(id=-1, boxes=filled))
+        tracks.append(_Track(id=-1, boxes=filled, detected=len(seen)))
     tracks.sort(key=lambda tr: _center(tr.mean_box())[0])
     for i, track in enumerate(tracks):
         track.id = i
     return tracks
+
+
+def _retain(tracks: list[_Track], samples: int, height: int, settings: dict[str, Any]) -> None:
+    """Marque les visages retenus : detectes sur au moins ``min_face_presence``
+    des images du plan et de hauteur moyenne au moins ``min_face_height`` de
+    la source. Une piste fantome, un visage minuscule ou une fausse detection
+    qui clignote ne contraignent pas le cadre."""
+    presence = float(settings["min_face_presence"])
+    min_h = float(settings["min_face_height"]) * height
+    for tr in tracks:
+        box = tr.mean_box()
+        tr.retained = tr.detected >= presence * samples - 1e-9 and box[3] - box[1] >= min_h
 
 
 # --------------------------------------------------------------------------
@@ -598,23 +711,63 @@ class _Geometry:
 
     def single(self, plan: _Plan, face: int | None) -> list[dict[str, Any]]:
         required = [tr for tr in plan.tracks if tr.id == face]
-        others = [tr for tr in plan.tracks if tr.id != face]
+        others = [tr for tr in plan.tracks if tr.id != face and tr.retained]
         positions = self.follow(plan, self.out_w / self.out_h, required, others)
         return [{"name": "main", "dest": self.dest(0, 0, self.out_w, self.out_h), "rects": _rects(plan, positions)}]
 
     def split(self, plan: _Plan) -> list[dict[str, Any]]:
-        if len(plan.tracks) < 2:
-            raise _Infeasible("moins de deux visages : pas d'ecran partage possible")
-        # Les deux visages les plus presents, puis de gauche a droite.
-        pair = sorted(plan.tracks, key=lambda tr: -len(tr.present()))[:2]
+        retained = [tr for tr in plan.tracks if tr.retained]
+        if len(retained) < 2:
+            raise _Infeasible("moins de deux visages retenus : pas d'ecran partage possible")
+        # Les deux visages retenus les plus detectes, puis de gauche a droite.
+        pair = sorted(retained, key=lambda tr: -tr.detected)[:2]
         pair.sort(key=lambda tr: _center(tr.mean_box())[0])
         half = self.out_h // 2
         panels = []
         for name, track, y, h in (("top", pair[0], 0, half), ("bottom", pair[1], half, self.out_h - half)):
-            others = [tr for tr in plan.tracks if tr is not track]
-            positions = self.follow(plan, self.out_w / h, [track], others)
+            others = [tr for tr in retained if tr is not track]
+            positions = self.frame(plan, self.out_w / h, track, others)
             panels.append({"name": name, "dest": self.dest(0, y, self.out_w, h), "rects": _rects(plan, positions)})
         return panels
+
+    def frame(self, plan: _Plan, aspect: float, track: _Track, others: list[_Track]) -> list[tuple[int, int, int, int]]:
+        """Positions d'un cadre de rapport ``aspect`` a la taille du visage
+        ``track`` (``split_face_height``) et centre sur lui, sans couper
+        ``others`` ; agrandi par paliers de 10 % jusqu'au plus grand cadre
+        possible tant qu'aucune position ne convient."""
+        max_w, max_h = _window(self.width, self.height, aspect)
+        face_h = max(b[3] - b[1] for b in track.boxes if b is not None)
+        h = face_h / float(self.settings["split_face_height"])
+        while True:
+            size = (max_w, max_h) if h >= max_h else (min(max_w, round(h * aspect)), round(h))
+            try:
+                return self._place(plan, *size, track, others)
+            except _Infeasible:
+                if size == (max_w, max_h):
+                    raise
+                h *= 1.1
+
+    def _place(
+        self, plan: _Plan, w: int, h: int, track: _Track, others: list[_Track]
+    ) -> list[tuple[int, int, int, int]]:
+        n = len(plan.times)
+        centers = _nearest_known([_center(b) if b is not None else None for b in track.boxes])
+        radius = max(0, round(float(self.settings["smooth_seconds"]) * self.fps / 2))
+        deadzone = float(self.settings["deadzone"])
+        xs = _smooth([min(max(c[0] - w / 2, 0.0), self.width - w) for c in centers], radius, deadzone * w)
+        ys = _smooth([min(max(c[1] - h / 2, 0.0), self.height - h) for c in centers], radius, deadzone * h)
+        positions = []
+        for i in range(n):
+            req = self.margin(track.span(i)) if track.boxes[i] is not None else None  # type: ignore[arg-type]
+            oth = [self.margin(tr.span(i)) for tr in others if tr.boxes[i] is not None]  # type: ignore[arg-type]
+            pos = _place_2d(self.width, self.height, w, h, req, oth, xs[i], ys[i])
+            if pos is None:
+                raise _Infeasible(
+                    f"a {plan.times[i]:.2f}s, aucun cadre {w}x{h} ne garde entier le visage "
+                    f"#{track.id} sans couper un autre visage"
+                )
+            positions.append((pos[0], pos[1], w, h))
+        return positions
 
     def facecam(self, plan: _Plan, camera: dict[str, float]) -> list[dict[str, Any]]:
         cam_h = round(self.out_h * float(self.settings["facecam_height_ratio"]))
@@ -624,8 +777,9 @@ class _Geometry:
             (camera["x"] + camera["w"]) * self.width,
             (camera["y"] + camera["h"]) * self.height,
         )
-        inside = [tr for tr in plan.tracks if _contains_point(zone, _center(tr.mean_box()))]
-        outside = [tr for tr in plan.tracks if tr not in inside]
+        retained = [tr for tr in plan.tracks if tr.retained]
+        inside = [tr for tr in retained if _contains_point(zone, _center(tr.mean_box()))]
+        outside = [tr for tr in retained if tr not in inside]
         needed = [zone] + [self.margin(tr.span(i)) for tr in inside for i in tr.present()]
         x0 = min(b[0] for b in needed)
         y0 = min(b[1] for b in needed)
@@ -646,7 +800,7 @@ class _Geometry:
         y = min(max(math.floor(cy - h / 2), 0), self.height - h)
         rect = (x, y, w, h)
         for i in range(len(plan.times)):
-            for tr in plan.tracks:
+            for tr in retained:
                 if tr.boxes[i] is None:
                     continue
                 box = self.margin(tr.span(i))
@@ -656,7 +810,7 @@ class _Geometry:
 
         game_h = self.out_h - cam_h
         positions = self.follow(
-            plan, self.out_w / game_h, [], plan.tracks, desired_center=(self.width / 2, self.height / 2)
+            plan, self.out_w / game_h, [], retained, desired_center=(self.width / 2, self.height / 2)
         )
         return [
             {"name": "camera", "dest": self.dest(0, 0, self.out_w, cam_h), "rects": camera_rects},
@@ -793,6 +947,7 @@ def _detect(
     owner = {t: plan for plan in plans for t in plan.times}
     times = sorted(owner)
     min_conf = float(settings["min_confidence"])
+    dup_iou = float(settings["duplicate_iou"])
     max_w = int(settings["annotated_max_width"])
     size: tuple[int, int] | None = None
     detector = factory(settings, get_device())
@@ -801,7 +956,8 @@ def _detect(
             plan = owner[t]
             height, width = frame.shape[:2]
             size = size or (width, height)
-            boxes = [tuple(float(v) for v in d[:4]) for d in detector.detect(frame) if d[4] >= min_conf]
+            found = [tuple(float(v) for v in d[:5]) for d in detector.detect(frame) if d[4] >= min_conf]
+            boxes = [d[:4] for d in _nms(found, dup_iou)]  # type: ignore[arg-type]
             plan.detections.append(boxes)  # type: ignore[arg-type]
             mid = (plan.start + plan.end) / 2
             rank = (len(boxes), -abs(t - mid))
@@ -865,6 +1021,7 @@ def reframe(
     geometry = _Geometry(width, height, settings)
     for plan in plans:
         plan.tracks = _build_tracks(plan.detections, fps, settings)
+        _retain(plan.tracks, len(plan.times), height, settings)
 
     results = []
     for plan in plans:
@@ -905,6 +1062,7 @@ def reframe(
                     "first": plan.times[tr.present()[0]],
                     "last": plan.times[tr.present()[-1]],
                     "box": [round(v, 1) for v in tr.mean_box()],
+                    "retained": tr.retained,
                 }
                 for tr in plan.tracks
             ],

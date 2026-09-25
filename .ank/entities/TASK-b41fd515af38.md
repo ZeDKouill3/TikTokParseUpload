@@ -5,7 +5,7 @@ slug: reframe-fusionner-les-d-tections-en-double-et-ne
 title: "reframe : fusionner les détections en double et ne protéger que les visages retenus"
 created: 2026-09-25T19:31:56Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/reframe.py
   - tests/test_reframe.py
@@ -15,6 +15,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: diagnose
+proof:
+  - type: test
+    ref: local/032e9a16a892@2c9612b
+    tree: scope/40d50bdc9f81
+    criteria: a07da8c26a92
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---
