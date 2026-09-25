@@ -5,7 +5,7 @@ slug: journal-des-r-sultats-par-clip-v-rit-terrain-du
 title: Journal des résultats par clip (vérité terrain du jury)
 created: 2026-09-25T18:38:16Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/outcomes.py
   - tests/test_outcomes.py
@@ -15,8 +15,15 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/9f4a15342a4f@b49cf18
+    tree: scope/0be5a6af0c2a
+    criteria: 069eca37283c
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---
 
 Met en œuvre le point 1 de ADR-1cf0 (proposé).
