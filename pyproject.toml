@@ -11,8 +11,9 @@ dependencies = [
     "yt-dlp",
     "anthropic",
     "numpy",
-    "scenedetect[opencv]",
+    "scenedetect",
     "faster-whisper",
+    "mediapipe",
 ]
 
 [project.optional-dependencies]
@@ -22,3 +23,10 @@ test = [
 
 [tool.setuptools.packages.find]
 include = ["clipper", "clipper.*"]
+
+[tool.uv]
+# mediapipe impose opencv-contrib-python ; scenedetect demande opencv-python (meme
+# module cv2, ecrase l'autre selon l'ordre d'install). On ecarte opencv-python pour
+# garder un seul paquet OpenCV installe : opencv-contrib-python, sur-ensemble de
+# opencv-python, satisfait cv2 pour scenedetect comme pour mediapipe.
+override-dependencies = ["opencv-python; sys_platform == 'never'"]
