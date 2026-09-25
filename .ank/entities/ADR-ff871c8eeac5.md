@@ -5,13 +5,17 @@ slug: jury-de-juges-ia-pour-les-d-cisions-de-jugement
 title: Jury de juges IA pour les décisions de jugement du mode auto
 created: 2026-09-25T18:31:29Z
 author: nicoc@zedk_ordi
-status: proposed
+status: accepted
 scope:
   - clipper/**
 constraint: |
   En mode auto, une décision de jugement qui remplace l'humain (d'abord la sélection des moments) passe par clipper.jury : au moins 3 juges indépendants aux perspectives et prompts distincts notent à l'aveugle sur la grille, candidats anonymisés et mélangés ; un tour de débat ciblé sur les seuls désaccords ; agrégation par médiane, déterministe ; veto motivé du juge conformité ; notes, arguments, révisions et dissidences journalisés dans le JSON de l'étape. Une réponse de juge invalide est un échec (ADR-ad2e), sauf quorum explicitement configuré. La composition du jury est un réglage de config.
+ratified: 2cab51e6639b
+verified:
+  - by: nicoc@zedk_ordi
+    at: 2026-09-25T18:41:49Z
 schema: 4
-version: 1
+version: 2
 ---
 
 ## Contexte
