@@ -74,3 +74,19 @@ def test_criteria_are_cached_while_the_corpus_hash_is_unchanged():
     c.refresh()
     assert first == 19
     assert [a for a in run.calls if a[:2] == ["ank", "show"]] == []
+
+
+def test_quick_pass_publishes_everything_but_criteria_without_ank_show():
+    run = Replay()
+    state = ankviz.Collector(run).refresh(criteria=False)
+    assert [a for a in run.calls if a[:2] == ["ank", "show"]] == []
+    assert state["criteria_loading"] is True
+    assert len(state["tasks"]) == 19
+    assert all(t["criterion"] is None for t in state["tasks"])
+    assert state["groups"]["in_progress"] == ["TASK-7aca619df8f4"]
+    assert len(state["branches"]) == 3
+
+
+def test_full_pass_reports_criteria_loaded():
+    state = ankviz.Collector(Replay()).refresh()
+    assert state["criteria_loading"] is False

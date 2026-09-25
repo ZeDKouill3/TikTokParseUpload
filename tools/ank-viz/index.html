@@ -203,7 +203,7 @@ function renderBoard(state) {
           <span class="title">${esc(t.title)}</span>
           ${key === "blocked" && waits.length ? `<span class="meta mono waits">attend ${waits.map((w) => esc(w.replace(/^([A-Z]+-[0-9a-f]{4}).*/, "$1"))).join(", ")}</span>` : ""}
         </summary>
-        <div class="crit"><span class="crit-label">Critère · <span class="mono">${esc(t.id)}</span></span>${esc(t.criterion || "(aucun critère)")}</div>
+        <div class="crit"><span class="crit-label">Critère · <span class="mono">${esc(t.id)}</span></span>${t.criterion === null ? '<span class="faint">chargement des critères…</span>' : esc(t.criterion || "(aucun critère)")}</div>
       </details>`;
     }).join("");
     return `<div class="col">
@@ -342,9 +342,9 @@ async function tick() {
     const text = await res.text();
     const state = JSON.parse(text);
     if (state.loading) {
-      $("h-time").textContent = "première collecte…";
+      $("h-time").textContent = "première collecte (quelques secondes)…";
     } else {
-      $("h-time").textContent = `collecté ${state.collected_at.slice(11)} (${state.collect_seconds} s)`;
+      $("h-time").textContent = `collecté ${state.collected_at.slice(11)} (${state.collect_seconds} s)` + (state.criteria_loading ? ", critères en cours…" : "");
       const key = text.replace(/"collected_at":\s*"[^"]*",\s*"collect_seconds":\s*[\d.]+/, "");
       if (key !== lastJson) {
         lastJson = key;

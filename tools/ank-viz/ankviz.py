@@ -207,7 +207,8 @@ class Collector:
                     self._criteria[i] = parse_criterion(text)
         return self._criteria
 
-    def refresh(self):
+    def refresh(self, criteria=True):
+        """criteria=False : passe rapide, sans aucun `ank show`."""
         with ThreadPoolExecutor(3) as pool:
             find_text, graph_text, status_text = pool.map(self.run, [
                 ["ank", "find", "", "--json"], ["ank", "graph", "--json"], ["ank", "status", "--json"]])
@@ -215,9 +216,9 @@ class Collector:
         edges = parse_edges(graph_text)
         status = parse_status(status_text)
         tasks = [e for e in entities if e["kind"] == "task"]
-        criteria = self._criteria_for(parse_corpus(find_text), [t["id"] for t in tasks])
+        known = self._criteria_for(parse_corpus(find_text), [t["id"] for t in tasks]) if criteria else {}
         for t in tasks:
-            t["criterion"] = criteria.get(t["id"], "")
+            t["criterion"] = known.get(t["id"], "") if criteria else None
             t["blocked_by"] = [b for x, b in edges if x == t["id"]]
 
         base = status["default_branch"]
@@ -239,4 +240,5 @@ class Collector:
             "documents": [e for e in entities if e["kind"] in ("adr", "spec")],
             "graph": layout_graph([t["id"] for t in tasks], edges),
             "branches": branches,
+            "criteria_loading": not criteria,
         }

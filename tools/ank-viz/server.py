@@ -51,12 +51,28 @@ def make_server(host, port, snapshot):
     return ThreadingHTTPServer((host, port), Handler)
 
 
+def native_ank(path):
+    """Le ank.exe natif derrière le shim npm (ank.CMD -> node -> binaire) :
+    ~1,5 s de gagnées par appel. Sans binaire trouvé, le chemin reste tel quel."""
+    shim = Path(path)
+    if shim.suffix.lower() not in (".cmd", ".ps1", ""):
+        return path
+    pkgs = shim.parent / "node_modules" / "@haksolot" / "ank" / "node_modules" / "@haksolot"
+    for exe in sorted(pkgs.glob("ank-*/bin/ank.exe")) + sorted(pkgs.glob("ank-*/bin/ank")):
+        if exe.is_file():
+            return str(exe)
+    return path
+
+
 def make_runner(cwd):
     resolved = {}
 
     def run(argv):
         # sous Windows, ank est un ank.CMD (npm) que subprocess ne trouve pas seul
-        exe = resolved.setdefault(argv[0], shutil.which(argv[0]) or argv[0])
+        if argv[0] not in resolved:
+            found = shutil.which(argv[0]) or argv[0]
+            resolved[argv[0]] = native_ank(found) if argv[0] == "ank" else found
+        exe = resolved[argv[0]]
         proc = subprocess.run([exe] + list(argv[1:]), cwd=str(cwd), capture_output=True)
         if proc.returncode != 0:
             raise RuntimeError("%s: %s" % (" ".join(argv[:3]), proc.stderr.decode("utf-8", "replace").strip()))
@@ -72,10 +88,11 @@ class Poller:
         self.state = {"loading": True}
 
     def loop(self):
+        quick = True  # première passe sans critères : la page s'affiche en quelques secondes
         while True:
             started = time.time()
             try:
-                state = self.collector.refresh()
+                state = self.collector.refresh(criteria=not quick)
                 state["error"] = None
             except Exception as exc:  # l'erreur s'affiche dans la page, le serveur continue
                 with self.lock:
@@ -86,6 +103,9 @@ class Poller:
             state["interval"] = self.interval
             with self.lock:
                 self.state = state
+            if quick:
+                quick = False
+                continue
             time.sleep(self.interval)
 
     def snapshot(self):

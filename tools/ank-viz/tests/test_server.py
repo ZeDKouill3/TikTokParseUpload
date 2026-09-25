@@ -51,3 +51,19 @@ def test_unknown_path_is_404():
     finally:
         httpd.shutdown()
     assert code == 404
+
+
+def test_npm_shim_is_bypassed_for_the_native_binary(tmp_path):
+    shim = tmp_path / "ank.CMD"
+    shim.write_text("@echo off")
+    native = tmp_path / "node_modules" / "@haksolot" / "ank" / "node_modules" / "@haksolot" / "ank-win32-x64" / "bin" / "ank.exe"
+    native.parent.mkdir(parents=True)
+    native.write_bytes(b"")
+    assert server.native_ank(str(shim)) == str(native)
+
+
+def test_without_native_binary_the_shim_is_kept(tmp_path):
+    shim = tmp_path / "ank.CMD"
+    shim.write_text("@echo off")
+    assert server.native_ank(str(shim)) == str(shim)
+    assert server.native_ank("/usr/local/bin/ank") == "/usr/local/bin/ank"
