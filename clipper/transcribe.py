@@ -28,8 +28,11 @@ from __future__ import annotations
 
 import gc
 import json
+import os
 import subprocess
+import sys
 from collections.abc import Callable
+from importlib.util import find_spec
 from pathlib import Path
 from typing import Any
 
@@ -86,6 +89,43 @@ def _whisper_model(name: str, device: str, compute_type: str) -> Any:
     return WhisperModel(name, device=device, compute_type=compute_type)
 
 
+def _cuda_dll_dirs() -> list[Path]:
+    """Dossiers bin des paquets pip nvidia (nvidia-cublas-cu12,
+    nvidia-cudnn-cu12...) installes dans l'environnement courant, absents si
+    ces paquets ne sont pas installes."""
+    spec = find_spec("nvidia")
+    if spec is None or not spec.submodule_search_locations:
+        return []
+    dirs = []
+    for base in spec.submodule_search_locations:
+        for bin_dir in Path(base).glob("*/bin"):
+            if bin_dir.is_dir():
+                dirs.append(bin_dir)
+    return dirs
+
+
+def _make_cuda_dlls_discoverable() -> None:
+    """Sous Windows, CTranslate2 (utilise par faster-whisper) resout cuBLAS
+    et cuDNN via le PATH du processus, pas via os.add_dll_directory (mesure :
+    TASK-f6c8, add_dll_directory seul laisse 'cublas64_12.dll is not found or
+    cannot be loaded'). Sans reglage manuel du PATH par l'utilisateur, il
+    faut donc y prefixer les dossiers bin des paquets pip nvidia avant de
+    charger le modele. Si ces paquets sont absents, le PATH n'est pas touche
+    et l'echec de CTranslate2 remonte normalement (ADR-ad2e : pas de repli
+    silencieux)."""
+    if sys.platform != "win32":
+        return
+    dirs = [str(d) for d in _cuda_dll_dirs()]
+    if not dirs:
+        return
+    current = os.environ.get("PATH", "")
+    existing = current.split(os.pathsep) if current else []
+    missing = [d for d in dirs if d not in existing]
+    if not missing:
+        return
+    os.environ["PATH"] = os.pathsep.join(missing + existing)
+
+
 def _settings(config: Any) -> dict[str, Any]:
     if config is None:
         from clipper.config import load_config
@@ -136,6 +176,8 @@ def _run_whisper(
         options["initial_prompt"] = ", ".join(vocab)
         options["hotwords"] = " ".join(vocab)
 
+    if device.type == "cuda":
+        _make_cuda_dlls_discoverable()
     model = model_factory(settings["model"], device.type, device.compute_type)
     try:
         raw_segments, info = model.transcribe(str(audio_path), **options)
