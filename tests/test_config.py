@@ -149,6 +149,28 @@ def test_config_rejects_unknown_key_in_section(isolated_cwd, monkeypatch):
         load_config(isolated_cwd / "config.toml")
 
 
+def test_config_names_missing_dependency_when_module_import_fails(isolated_cwd, monkeypatch, tmp_path):
+    import clipper
+    from clipper.config import ConfigError, load_config
+
+    module_dir = tmp_path / "broken_module_src"
+    module_dir.mkdir()
+    (module_dir / "broken_dep_step.py").write_text(
+        "import totally_missing_dependency_xyz_abc\n"
+        "CONFIG_DEFAULTS = {}\n"
+    )
+    monkeypatch.setattr(clipper, "__path__", clipper.__path__ + [str(module_dir)])
+    (isolated_cwd / "config.toml").write_text('[broken_dep_step]\nfoo = 1\n')
+
+    with pytest.raises(ConfigError) as exc_info:
+        load_config(isolated_cwd / "config.toml")
+
+    message = str(exc_info.value)
+    assert "totally_missing_dependency_xyz_abc" in message
+    assert "clipper.broken_dep_step" in message
+    assert "pas de module" not in message
+
+
 def test_config_rejects_section_without_matching_module(isolated_cwd):
     from clipper.config import ConfigError, load_config
 

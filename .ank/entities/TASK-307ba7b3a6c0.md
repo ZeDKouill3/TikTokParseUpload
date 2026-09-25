@@ -5,7 +5,7 @@ slug: clipper-config-ne-plus-dire-pas-de-module-quand
 title: "clipper.config : ne plus dire 'pas de module' quand c'est une dépendance du module qui manque"
 created: 2026-09-25T13:40:10Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/config.py
   - tests/test_config.py
@@ -15,6 +15,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: diagnose
+proof:
+  - type: test
+    ref: local/617d556f50ab@c652b97
+    tree: scope/d88f55a026c8
+    criteria: 9d86486cac8c
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---

@@ -25,9 +25,15 @@ def _section_defaults(name: str) -> dict[str, object]:
     that declares a CONFIG_DEFAULTS dict can be configured through a [name]
     table in config.toml.
     """
+    target = f"clipper.{name}"
     try:
-        module = importlib.import_module(f"clipper.{name}")
+        module = importlib.import_module(target)
     except ImportError as exc:
+        if exc.name is not None and exc.name != target:
+            raise ConfigError(
+                f"section [{name}] : clipper.{name} ne peut pas etre importe, "
+                f"dependance manquante : {exc.name}"
+            ) from exc
         raise ConfigError(f"section [{name}] : pas de module clipper.{name}") from exc
 
     defaults = getattr(module, "CONFIG_DEFAULTS", None)
