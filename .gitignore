@@ -3,6 +3,7 @@
 workspace/
 output/
 state/
+config.toml
 *.egg-info/
 __pycache__/
 *.pyc
