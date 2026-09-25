@@ -5,13 +5,17 @@ slug: apprentissage-du-jury-partir-des-erreurs-sans-un
 title: Apprentissage du jury à partir des erreurs, sans uniformisation
 created: 2026-09-25T18:38:15Z
 author: nicoc@zedk_ordi
-status: proposed
+status: accepted
 scope:
   - clipper/**
 constraint: |
   Le jury n'apprend que de signaux réels (qa, décisions humaines, statistiques de plateforme), jamais de l'accord entre juges. L'ajustement automatique porte sur des poids de juges bornés (défaut 0,5 à 1,5), calculés sur un minimum de clips ; toute retouche de prompt est proposée par lot, versionnée, et adoptée seulement si elle fait mieux en rejeu sur des candidats passés au résultat connu, sans rapprocher deux perspectives. Une part d'exploration configurée est réservée aux candidats incertains. Le juge conformité et son veto ne sont jamais recalibrés sur l'audience.
+ratified: e82137d83ec7
+verified:
+  - by: nicoc@zedk_ordi
+    at: 2026-09-25T18:41:54Z
 schema: 4
-version: 1
+version: 2
 ---
 
 ## Contexte
