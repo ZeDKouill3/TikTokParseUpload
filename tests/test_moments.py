@@ -444,6 +444,231 @@ def test_existing_result_is_not_recomputed_unless_forced(tmp_path, video_dir, ru
 
 
 # --------------------------------------------------------------------------
+# Re-notation apres vision (TASK-e493) : moments.json present et vision.json
+# plus recent -> bonus visuel, score final, min_score et chevauchement
+# recalcules sur les candidats enregistres, sans aucun appel LLM.
+# --------------------------------------------------------------------------
+
+
+def _llm_forbidden(request):
+    raise AssertionError(f"appel LLM {request.usage!r} pendant la re-notation")
+
+
+def write_vision_after_moments(video_dir, frames):
+    path = video_dir / "vision.json"
+    path.write_text(json.dumps({"frames": frames}), encoding="utf-8")
+    later = (video_dir / "moments.json").stat().st_mtime_ns + 5_000_000_000
+    os.utime(path, ns=(later, later))
+
+
+def rescore(tmp_path, rubric_path, **kwargs):
+    """Relance l'etape avec un FakeBackend qui echoue s'il est appele."""
+    return run(tmp_path, rubric_path, [_llm_forbidden] * 5, **kwargs)
+
+
+def striking(timecode):
+    return {"timecode": timecode, "description": "explosion", "striking": True}
+
+
+def scored(data):
+    """Candidats notes (retenus, et rejetes pour score ou chevauchement), par debut."""
+    notes = data["moments"] + [r for r in data["rejected"] if "final_score" in r]
+    return sorted(notes, key=lambda m: m["start"])
+
+
+def test_rescore_after_vision_makes_no_llm_call(tmp_path, video_dir, rubric_path):
+    run(tmp_path, rubric_path, [{"moments": [moment(10.25, 44.65, scores=WEAK), moment(100.25, 134.65)]}])
+    write_vision_after_moments(video_dir, [striking(20.0)])
+
+    fake, path = rescore(tmp_path, rubric_path)
+
+    assert fake.calls == []
+    assert path == video_dir / "moments.json"
+    assert "rescored" in read_moments(video_dir)
+
+
+def test_rescore_keeps_criterion_notes_bounds_and_justifications(tmp_path, video_dir, rubric_path):
+    run(
+        tmp_path,
+        rubric_path,
+        [{"moments": [
+            moment(10.25, 44.65, scores=WEAK, hook="faible", why="un peu mou"),
+            moment(100.25, 134.65, why="tres bon"),
+            moment(250.25, 369.65, fmt="multipart", breaks=[309.65], why="arc complet"),
+        ]}],
+    )
+    before = scored(read_moments(video_dir))
+    write_vision_after_moments(video_dir, [striking(20.0), striking(110.0), striking(300.0)])
+
+    rescore(tmp_path, rubric_path)
+
+    after = scored(read_moments(video_dir))
+    keys = ("start", "end", "duration", "format", "parts", "scores", "justification", "hook_text")
+    assert len(after) == 3
+    assert [{k: m[k] for k in keys} for m in after] == [{k: m[k] for k in keys} for m in before]
+
+
+def test_rescore_adds_the_visual_bonus_and_recomputes_the_final_score(tmp_path, video_dir, rubric_path):
+    # 100.25 -> 134.65, aucun signal : 66.9 ; image marquante : +2 -> 68.9
+    run(tmp_path, rubric_path, [{"moments": [moment(100.25, 134.65)]}])
+    write_vision_after_moments(video_dir, [striking(110.0)])
+
+    rescore(tmp_path, rubric_path)
+
+    [m] = read_moments(video_dir)["moments"]
+    assert m["bonus"] == {"replayed": 0.0, "audio_peaks": 0.0, "visual": 2.0, "total": 2.0}
+    assert m["final_score"] == 68.9
+
+
+def test_rescore_keeps_the_measured_bonus_and_caps_the_total(tmp_path, video_dir, rubric_path):
+    # 300.25 -> 334.65 : heatmap 4.35 + audio 1.5 = 5.85 -> 66.9 + 5.85 = 72.8 ;
+    # + image marquante 2 -> 7.85, plafonne a 6 -> 72.9
+    run(tmp_path, rubric_path, [{"moments": [moment(300.25, 334.65)]}])
+    assert read_moments(video_dir)["moments"][0]["final_score"] == 72.8
+    write_vision_after_moments(video_dir, [striking(312.0)])
+
+    rescore(tmp_path, rubric_path)
+
+    [m] = read_moments(video_dir)["moments"]
+    assert m["bonus"] == {"replayed": 4.35, "audio_peaks": 1.5, "visual": 2.0, "total": 6.0}
+    assert m["final_score"] == 72.9
+
+
+def test_rescore_promotes_a_moment_rejected_for_score_and_says_what_changed(tmp_path, video_dir, rubric_path):
+    # WEAK = 59.2 < 60 ; avec l'image marquante : 61.2, retenu.
+    run(tmp_path, rubric_path, [{"moments": [moment(10.25, 44.65, scores=WEAK), moment(100.25, 134.65)]}])
+    assert spans(read_moments(video_dir)) == [(100.2, 134.7)]
+    write_vision_after_moments(video_dir, [striking(20.0)])
+
+    rescore(tmp_path, rubric_path)
+
+    data = read_moments(video_dir)
+    assert sorted(spans(data)) == [(10.2, 44.7), (100.2, 134.7)]
+    assert not [r for r in data["rejected"] if "min_score" in r["reason"]]
+    promoted = next(m for m in data["moments"] if m["start"] == 10.2)
+    assert promoted["final_score"] == 61.2
+    assert data["rescored"]["changed"] == [{
+        "id": promoted["id"],
+        "start": 10.2,
+        "end": 44.7,
+        "hook_text": promoted["hook_text"],
+        "before": {"final_score": 59.2, "retained": False},
+        "after": {"final_score": 61.2, "retained": True},
+    }]
+
+
+def test_rescore_without_striking_frame_in_a_moment_changes_nothing(tmp_path, video_dir, rubric_path):
+    run(tmp_path, rubric_path, [{"moments": [moment(10.25, 44.65, scores=WEAK), moment(100.25, 134.65)]}])
+    first = read_moments(video_dir)
+    write_vision_after_moments(video_dir, [striking(80.0), {"timecode": 20.0, "description": "decor", "striking": False}])
+
+    rescore(tmp_path, rubric_path)
+
+    data = read_moments(video_dir)
+    assert data["rescored"]["changed"] == []
+    assert data["moments"] == first["moments"]
+    assert data["rejected"] == first["rejected"]
+
+
+def test_rescore_recomputes_the_overlap_between_candidates(tmp_path, video_dir, rubric_path):
+    # meme note : le premier garde la place, le second est rejete pour
+    # chevauchement ; une image marquante dans le second seul le fait passer
+    # devant (68.9 contre 66.9).
+    run(tmp_path, rubric_path, [{"moments": [moment(10.25, 44.65), moment(30.25, 64.65)]}])
+    assert spans(read_moments(video_dir)) == [(10.2, 44.7)]
+    write_vision_after_moments(video_dir, [striking(60.0)])
+
+    rescore(tmp_path, rubric_path)
+
+    data = read_moments(video_dir)
+    assert spans(data) == [(30.2, 64.7)]
+    [overlap] = [r for r in data["rejected"] if "chevauche" in r["reason"]]
+    assert (overlap["start"], overlap["final_score"]) == (10.2, 66.9)
+    assert {(c["start"], c["before"]["retained"], c["after"]["retained"]) for c in data["rescored"]["changed"]} == {
+        (10.2, True, False), (30.2, False, True),
+    }
+
+
+def test_rescore_leaves_rubric_rejections_untouched(tmp_path, video_dir, rubric_path):
+    run(
+        tmp_path,
+        rubric_path,
+        [{"moments": [
+            moment(190.25, 224.65),     # sponsor
+            moment(10.25, 19.65),       # trop court
+            moment(100.25, 134.65),
+        ]}],
+    )
+    first = [r for r in read_moments(video_dir)["rejected"] if "final_score" not in r]
+    assert len(first) == 2
+    write_vision_after_moments(video_dir, [striking(15.0), striking(200.0)])
+
+    rescore(tmp_path, rubric_path)
+
+    assert [r for r in read_moments(video_dir)["rejected"] if "final_score" not in r] == first
+
+
+def test_rescore_uses_exact_bounds_so_adjacent_moments_do_not_overlap(tmp_path, video_dir, rubric_path):
+    # phrases presque collees (0.02 s d'ecart) : la fin d'un moment arrondie
+    # au dixieme superieur depasse le debut du suivant arrondi au dixieme
+    # inferieur ; seules les bornes exactes disent qu'ils ne se chevauchent pas.
+    transcript = make_transcript()
+    for k, seg in enumerate(transcript["segments"]):
+        for w in seg["words"]:
+            w["start"] -= 0.58 * k
+            w["end"] -= 0.58 * k
+        seg["start"], seg["end"] = seg["words"][0]["start"], seg["words"][-1]["end"]
+    (video_dir / "transcript.json").write_text(json.dumps(transcript), encoding="utf-8")
+    segs = transcript["segments"]
+    run(tmp_path, rubric_path, [{"moments": [
+        moment(segs[2]["start"], segs[8]["end"]), moment(segs[9]["start"], segs[15]["end"]),
+    ]}])
+    (a_start, a_end), (b_start, b_end) = sorted(spans(read_moments(video_dir)))
+    assert a_end > b_start, "le cas teste suppose des bornes publiques qui se recouvrent"
+    write_vision_after_moments(video_dir, [striking(segs[3]["start"])])
+
+    rescore(tmp_path, rubric_path)
+
+    assert sorted(spans(read_moments(video_dir))) == [(a_start, a_end), (b_start, b_end)]
+
+
+def test_rescore_refuses_bounds_that_are_not_sentence_boundaries(tmp_path, video_dir, rubric_path):
+    from clipper.moments import MomentsError
+
+    run(tmp_path, rubric_path, [{"moments": [moment(100.25, 134.65)]}])
+    data = read_moments(video_dir)
+    data["moments"][0]["start"] = 102.0
+    (video_dir / "moments.json").write_text(json.dumps(data), encoding="utf-8")
+    write_vision_after_moments(video_dir, [striking(110.0)])
+
+    with pytest.raises(MomentsError, match="102.0"):
+        rescore(tmp_path, rubric_path)
+
+
+def test_older_vision_file_does_not_trigger_a_rescore(tmp_path, video_dir, rubric_path):
+    (video_dir / "vision.json").write_text(json.dumps({"frames": [striking(110.0)]}), encoding="utf-8")
+    run(tmp_path, rubric_path, [{"moments": [moment(100.25, 134.65)]}])
+    before = (video_dir / "moments.json").read_bytes()
+
+    fake, _ = rescore(tmp_path, rubric_path)
+
+    assert fake.calls == []
+    assert (video_dir / "moments.json").read_bytes() == before
+
+
+def test_forced_run_after_vision_asks_the_llm_again(tmp_path, video_dir, rubric_path):
+    run(tmp_path, rubric_path, [{"moments": [moment(100.25, 134.65)]}])
+    write_vision_after_moments(video_dir, [striking(110.0)])
+
+    fake, _ = run(tmp_path, rubric_path, [{"moments": [moment(10.25, 44.65)]}], force=True)
+
+    assert [c.usage for c in fake.calls] == ["moments"]
+    data = read_moments(video_dir)
+    assert spans(data) == [(10.2, 44.7)]
+    assert "rescored" not in data
+
+
+# --------------------------------------------------------------------------
 # Transcription trop longue : tranches avec recouvrement puis comparaison
 # --------------------------------------------------------------------------
 

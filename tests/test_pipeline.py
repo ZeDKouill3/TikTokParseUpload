@@ -460,24 +460,33 @@ def test_step_state_is_running_while_the_step_works(tmp_path, isolated_cwd, sour
 
 
 @no_ffmpeg
-def test_moments_gets_feedback_examples_and_is_rerun_after_vision(tmp_path, isolated_cwd, source_video):
+def test_moments_gets_feedback_examples_and_is_rescored_after_vision_without_llm(tmp_path, isolated_cwd,
+                                                                                source_video):
     from clipper import feedback, pipeline
 
     config = make_config(tmp_path, mode="review")
     feedback.record("zzzzzzzzzzz", {"start": 1.0, "end": 30.0}, "accepted", "Exemple passe tres distinctif",
                     path=tmp_path / "state" / "feedback.jsonl")
 
-    fake = backend()
-    with llm.use_backend(fake):
-        pipeline.run(URL, config=config, step_options=step_options(source_video))
+    def no_moments_after_vision(request):
+        if request.usage == "moments" and any(c.usage == "vision" for c in fake.calls):
+            raise AssertionError("moments redemande au LLM apres vision")
+        return answer(request)
 
+    fake = FakeBackend([no_moments_after_vision] * 500)
+    with llm.use_backend(fake):
+        state = pipeline.run(URL, config=config, step_options=step_options(source_video))
+
+    assert state["status"] == "awaiting_review", state["reason"]
     usages = [c.usage for c in fake.calls]
-    first_moments, vision_call = usages.index("moments"), usages.index("vision")
-    assert first_moments < vision_call
-    assert "moments" in usages[vision_call:], "moments non relance apres vision"
-    moments_prompts = [c.prompt for c in fake.calls if c.usage == "moments"]
-    assert all("Exemple passe tres distinctif" in p for p in moments_prompts)
-    assert "une mire" in moments_prompts[-1]
+    assert usages.count("moments") == 1
+    assert usages.index("moments") < usages.index("vision")
+    [moments_prompt] = [c.prompt for c in fake.calls if c.usage == "moments"]
+    assert "Exemple passe tres distinctif" in moments_prompt
+    video_dir = tmp_path / "workspace" / VIDEO_ID
+    data = json.loads((video_dir / "moments.json").read_text(encoding="utf-8"))
+    assert "rescored" in data, "moments non re-note apres vision"
+    assert (video_dir / "moments.json").stat().st_mtime_ns >= (video_dir / "vision.json").stat().st_mtime_ns
 
 
 # --------------------------------------------------------------------------
