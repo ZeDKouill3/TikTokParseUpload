@@ -26,8 +26,10 @@ Sortie : workspace/<video_id>/captions.json
 Pour chaque clip, l'IA recoit le texte prononce dans la partie, l'accroche
 et la justification du moment, et rend titre, legende, hashtags (chacun
 commencant par #, sans doublon) et texte d'accroche (8 mots au plus, valeur
-par defaut) dans la langue de la video ; ces regles sont revalidees ici, une
-reponse qui les enfreint est traitee comme une reponse invalide. Reponse
+par defaut) dans la langue de la video ; ces regles sont revalidees ici et
+passees a llm.ask comme controle : une reponse qui les enfreint est renvoyee
+au modele avec l'erreur pour correction ([llm] repair_attempts), puis traitee
+comme une reponse invalide si elle les enfreint encore. Reponse
 invalide ou Claude indisponible : l'erreur remonte, rien n'est ecrit, aucune
 legende de secours n'est inventee (ADR-ad2e).
 """
@@ -171,6 +173,17 @@ def _validate_hook_text(hook_text: str, max_words: int) -> None:
         raise llm.SchemaError(f"texte d'accroche de {n} mots, {max_words} au plus : {hook_text!r}")
 
 
+def _check_answer(max_words: int):
+    """Controle passe a llm.ask : ce qui le refuse est renvoye au modele
+    pour correction, comme une reponse hors schema."""
+
+    def check(answer: dict[str, Any]) -> None:
+        _validate_hashtags(answer["hashtags"])
+        _validate_hook_text(answer["hook_text"], max_words)
+
+    return check
+
+
 # --------------------------------------------------------------------------
 # Etape
 # --------------------------------------------------------------------------
@@ -221,7 +234,7 @@ def run(
     video_title = meta.get("title") or ""
     moments_by_id = {m["id"]: m for m in moments_data["moments"]}
     schema = response_schema(settings)
-    max_words = int(settings["hook_words_max"])
+    check = _check_answer(int(settings["hook_words_max"]))
 
     clips: list[dict[str, Any]] = []
     for moment in parts_data["moments"]:
@@ -231,9 +244,7 @@ def run(
         for part in moment["parts"]:
             text = _part_text(transcript, part["start"], part["end"])
             prompt = _prompt(language, video_title, source, part, moment["parts_total"], text, settings)
-            answer = llm.ask("captions", prompt, [], schema, config=config)
-            _validate_hashtags(answer["hashtags"])
-            _validate_hook_text(answer["hook_text"], max_words)
+            answer = llm.ask("captions", prompt, [], schema, config=config, check=check)
             clips.append({
                 "id": _clip_id(moment["id"], part["part"], moment["parts_total"]),
                 "moment_id": moment["id"],

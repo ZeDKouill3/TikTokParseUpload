@@ -18,7 +18,7 @@ criteria_by: creator
 verify: [tests]
 method: tdd
 schema: 4
-version: 1
+version: 3
 ---
 
 Les autres étapes à contrôles post-schéma (vision indices, parts, qa...) pourront adopter le même paramètre ensuite ; ne pas les modifier ici (autres tâches en cours sur moments/pipeline/jury).

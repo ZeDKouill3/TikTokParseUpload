@@ -9,6 +9,15 @@ pour cet usage, ajoute au prompt la consigne de repondre en JSON conforme a
 SchemaError, quota/reseau/surcharge leve TransientLLMError, le reste
 LLMError. Seuls du texte et des images fixes (fichiers) sont envoyes.
 
+``check`` (facultatif) controle ce que le schema ne sait pas exprimer
+(nombre de mots, doublons...) : appele sur la reponse deja conforme au
+schema, il leve SchemaError pour la refuser. Une reponse refusee (JSON
+invalide, schema ou ``check``) est renvoyee au meme modele avec la demande
+d'origine et le message d'erreur exact, ``repair_attempts`` fois au plus ;
+si la reponse reparee est encore refusee, la derniere SchemaError remonte
+(aucune valeur de secours). Une erreur transitoire n'est jamais re-essayee
+ici.
+
 Backends : ``claude-cli`` (defaut, voir clipper.llm.claude_cli pour la facon
 dont ``claude -p`` recoit les images), ``claude-api``, ``ollama``. Pour les
 tests des autres etapes : ``clipper.llm.fake.FakeBackend`` et
@@ -18,6 +27,7 @@ Configuration (fusionnee en profondeur avec CONFIG_DEFAULTS) :
 
     [llm]
     backend = "claude-cli"
+    repair_attempts = 1          # 0 : une reponse refusee echoue tout de suite
 
     [llm.usages.moments]         # par usage : backend et/ou modele
     model = "strong"             # un niveau (strong|fast) ou un nom de modele
@@ -37,6 +47,7 @@ from __future__ import annotations
 import contextlib
 import json
 from collections.abc import Callable, Iterator, Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -62,6 +73,9 @@ DEFAULT_TIER = "fast"
 
 CONFIG_DEFAULTS: dict[str, object] = {
     "backend": "claude-cli",
+    # Nombre de fois ou une reponse refusee (schema ou check) est renvoyee au
+    # modele avec l'erreur pour qu'il la corrige.
+    "repair_attempts": 1,
     # Modele fort pour le jugement lourd (moments, coupes), rapide ailleurs.
     "usages": {
         "moments": {"model": "strong"},
@@ -136,6 +150,25 @@ def _with_schema_instruction(prompt: str, schema: dict[str, Any]) -> str:
     )
 
 
+def _with_repair_instruction(prompt: str, refused: str, error: SchemaError) -> str:
+    return (
+        f"{prompt}\n\n"
+        "## Ta reponse precedente a ete refusee\n"
+        f"Reponse refusee :\n{refused}\n\n"
+        f"Erreur : {error}\n\n"
+        "Corrige-la : renvoie la reponse complete, conforme au schema et sans "
+        "cette erreur, uniquement le JSON."
+    )
+
+
+def _accept(text: str, schema: dict[str, Any], check: Callable[[Any], None] | None) -> Any:
+    value = parse_json(text)
+    validate(value, schema)
+    if check is not None:
+        check(value)
+    return value
+
+
 def ask(
     usage: str,
     prompt: str,
@@ -143,11 +176,18 @@ def ask(
     schema: dict[str, Any],
     *,
     config: Any = None,
+    check: Callable[[Any], None] | None = None,
 ) -> Any:
     """Ask the model configured for ``usage`` and return its JSON answer,
-    validated against ``schema``. ``config`` defaults to load_config()."""
+    validated against ``schema`` then by ``check`` (which raises SchemaError
+    to refuse it). A refused answer is sent back to the same model with the
+    error, ``[llm] repair_attempts`` times at most. ``config`` defaults to
+    load_config()."""
     settings = _settings(config)
     name, model, backend_settings = _resolve(usage, settings)
+    attempts = int(settings["repair_attempts"])
+    if attempts < 0:
+        raise LLMError(f"[llm] repair_attempts doit etre >= 0, recu {attempts}")
     backend = _override if _override is not None else _BACKENDS[name][1](backend_settings)
     request = LLMRequest(
         usage=usage,
@@ -156,9 +196,15 @@ def ask(
         images=[Path(p) for p in images],
         schema=schema,
     )
-    value = parse_json(backend.complete(request))
-    validate(value, schema)
-    return value
+    text = backend.complete(request)
+    for _ in range(attempts):
+        try:
+            return _accept(text, schema, check)
+        except SchemaError as error:
+            text = backend.complete(
+                replace(request, prompt=_with_repair_instruction(request.prompt, text, error))
+            )
+    return _accept(text, schema, check)
 
 
 @contextlib.contextmanager
