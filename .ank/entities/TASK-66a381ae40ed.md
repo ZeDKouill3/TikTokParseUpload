@@ -5,7 +5,7 @@ slug: orchestration-pipeline-cli-de-bout-en-bout-modes
 title: Orchestration pipeline + CLI de bout en bout, modes review/auto, file d'attente
 created: 2026-09-25T09:39:48Z
 author: claude-plan
-status: open
+status: done
 scope:
   - clipper/pipeline.py
   - clipper/__main__.py
@@ -16,8 +16,15 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/702504420d3b@002ea72
+    tree: scope/fe82ba1d426f
+    criteria: f96218a534cb
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---
 
 Reprend clipper/pipeline.py posé par la tâche squelette.
