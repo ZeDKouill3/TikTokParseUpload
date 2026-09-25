@@ -4,6 +4,7 @@ Commande construite :
 
     claude -p --output-format json --model <modele> --tools <Read|"">
            [--allowedTools Read --add-dir <dossier image>...]
+           [--json-schema <schema JSON compact>]
            --system-prompt <court> --setting-sources "" --no-session-persistence
 
 Le prompt passe par stdin, pas par argv : une transcription de 2-3 h depasse
@@ -29,10 +30,21 @@ de contexte mis en cache par appel sinon) et ``--setting-sources ""`` ignore
 CLAUDE.md, hooks et reglages de l'utilisateur : le quota est partage avec ses
 sessions Claude Code (ADR-b1c1).
 
+Schema. Donne seulement dans le prompt, il n'est qu'une consigne : essai
+reel du 2026-09-25 (etape vision, 8 images) -> images bien decrites mais
+``{"0": {...}, ...}`` au lieu de ``{"frames": [...]}``. ``--json-schema``
+l'impose au CLI (sortie structuree). Il n'accepte que du JSON litteral (ni
+chemin ni ``@fichier``, verifie sur 2.1.281) : le schema passe donc par argv,
+en JSON compact, et une ligne de commande qui depasserait la limite Windows
+est un echec explicite plutot qu'un envoi sans schema.
+
 Sortie (--output-format json) : un objet unique ``{"type": "result",
 "subtype": "success", "is_error": bool, "api_error_status": int|null,
-"result": "<texte de la reponse>", "num_turns", "session_id",
-"total_cost_usd", ...}``. Une erreur API (quota, surcharge) arrive avec
+"result": "<texte de la reponse>", "structured_output": <objet>|absent,
+"num_turns", "session_id", "total_cost_usd", ...}``. Avec --json-schema, la
+reponse deja decodee est dans ``structured_output`` et fait foi ; ``result``
+(texte) ne sert que si elle est absente. Dans les deux cas clipper.llm la
+valide contre le schema. Une erreur API (quota, surcharge) arrive avec
 ``is_error: true``, le message dans ``result`` et le code HTTP dans
 ``api_error_status``, et un code de sortie non nul.
 """
@@ -54,6 +66,9 @@ SYSTEM_PROMPT = (
     "le JSON demande, sans texte autour. Utilise l'outil Read seulement pour "
     "regarder les images dont le chemin est donne."
 )
+
+# CreateProcess refuse une ligne de commande de plus de 32 767 caracteres.
+MAX_COMMAND_LINE = 32_000
 
 _TRANSIENT_STATUS = {408, 429}
 _TRANSIENT_TEXT = re.compile(
@@ -121,6 +136,8 @@ class ClaudeCLIBackend:
                 cmd += ["--add-dir", d]
         else:
             cmd += ["--tools", ""]
+        if request.schema:
+            cmd += ["--json-schema", json.dumps(request.schema, ensure_ascii=False, separators=(",", ":"))]
         cmd += [
             "--system-prompt", SYSTEM_PROMPT,
             "--setting-sources", "",
@@ -130,6 +147,12 @@ class ClaudeCLIBackend:
 
     def complete(self, request: LLMRequest) -> str:
         cmd = self.build_command(request)
+        length = len(subprocess.list2cmdline(cmd))
+        if length > MAX_COMMAND_LINE:
+            raise LLMError(
+                f"claude -p : ligne de commande de {length} caracteres (limite {MAX_COMMAND_LINE}), "
+                "schema --json-schema trop long pour argv"
+            )
         try:
             proc = subprocess.run(
                 cmd,
@@ -147,7 +170,9 @@ class ClaudeCLIBackend:
 
 
 def parse_output(stdout: str, returncode: int = 0, stderr: str = "") -> str:
-    """Extract the answer text from ``claude -p --output-format json``."""
+    """Extract the answer from ``claude -p --output-format json`` : the
+    structured output (re-encoded as JSON text) when present, else the
+    ``result`` text."""
     try:
         data = json.loads(stdout)
     except json.JSONDecodeError:
@@ -166,6 +191,9 @@ def parse_output(stdout: str, returncode: int = 0, stderr: str = "") -> str:
         if _is_transient(status, str(result or "")):
             raise TransientLLMError(message)
         raise LLMError(message)
+    structured = data.get("structured_output")
+    if structured is not None:
+        return json.dumps(structured, ensure_ascii=False)
     if not isinstance(result, str):
         raise LLMError(f"claude -p : pas de champ 'result' texte dans {sorted(data)}")
     return result
