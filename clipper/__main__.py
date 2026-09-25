@@ -4,8 +4,12 @@ import argparse
 import json
 import logging
 import sys
+import threading
+from datetime import datetime
 
 from clipper.config import ConfigError, load_config
+
+_PROGRESS_POLL_SECONDS = 0.1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -68,19 +72,112 @@ def _report(state: dict) -> None:
     print(line)
 
 
+def _step_elapsed(step: dict) -> float:
+    started, finished = step.get("started_at"), step.get("finished_at")
+    if not started or not finished:
+        return 0.0
+    return (datetime.fromisoformat(finished) - datetime.fromisoformat(started)).total_seconds()
+
+
+def _announce_step(name: str, step: dict, seen_running: set, reported_done: set) -> None:
+    status = step["status"]
+    if status == "running":
+        if name not in seen_running:
+            seen_running.add(name)
+            print(f"[{name}] démarrée")
+    elif status in ("done", "failed") and name not in reported_done:
+        if name not in seen_running:
+            seen_running.add(name)
+            print(f"[{name}] démarrée")
+        reported_done.add(name)
+        if status == "done":
+            print(f"[{name}] terminée en {_step_elapsed(step):.1f} s")
+        else:
+            print(f"[{name}] échec : {step.get('reason')}")
+
+
+def _baseline_progress(video_id: str, config, force: bool) -> tuple[set, set]:
+    """Etapes deja terminees avant cet appel (deja faites, cache) : elles ne
+    tournent pas cette fois-ci et ne doivent pas etre annoncees. --force les
+    relance toutes, donc rien n'est mis de cote."""
+    from clipper import pipeline
+
+    if force:
+        return set(), set()
+    try:
+        state = pipeline.load_state(video_id, config=config)
+    except pipeline.PipelineError:
+        return set(), set()
+    seen_running: set = set()
+    reported_done: set = set()
+    for name in pipeline.STEPS:
+        if state["steps"][name]["status"] in ("done", "failed"):
+            seen_running.add(name)
+            reported_done.add(name)
+    return seen_running, reported_done
+
+
+def _watch_progress(video_id: str, config, stop_event: threading.Event,
+                    seen_running: set, reported_done: set) -> None:
+    from clipper import pipeline
+
+    while not stop_event.is_set():
+        try:
+            state = pipeline.load_state(video_id, config=config)
+        except pipeline.PipelineError:
+            stop_event.wait(_PROGRESS_POLL_SECONDS)
+            continue
+        for name in pipeline.STEPS:
+            _announce_step(name, state["steps"][name], seen_running, reported_done)
+        stop_event.wait(_PROGRESS_POLL_SECONDS)
+
+
+def _run_with_progress(action, video_id: str, config, force: bool) -> dict:
+    """Execute ``action`` (pipeline.run ou pipeline.render) en affichant la
+    progression au fil de l'eau, lue depuis l'etat expose par
+    clipper.pipeline (pipeline.json), sans toucher aux etapes ni a
+    pipeline.py."""
+    from clipper import pipeline
+
+    seen_running, reported_done = _baseline_progress(video_id, config, force)
+    stop_event = threading.Event()
+    watcher = threading.Thread(
+        target=_watch_progress, args=(video_id, config, stop_event, seen_running, reported_done),
+        daemon=True,
+    )
+    watcher.start()
+    try:
+        state = action()
+    finally:
+        stop_event.set()
+        watcher.join(timeout=2.0)
+    for name in pipeline.STEPS:
+        step = state.get("steps", {}).get(name)
+        if step is not None:
+            _announce_step(name, step, seen_running, reported_done)
+    return state
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING,
                         format="%(asctime)s %(levelname)s %(message)s")
 
-    from clipper import pipeline
+    from clipper import download, pipeline
 
     try:
         config = load_config(args.config)
         if args.command == "run":
-            state = pipeline.run(args.url, config=config, force=args.force)
+            video_id = download.extract_video_id(args.url)
+            state = _run_with_progress(
+                lambda: pipeline.run(args.url, config=config, force=args.force),
+                video_id, config, args.force,
+            )
         elif args.command == "render":
-            state = pipeline.render(args.video_id, config=config, force=args.force)
+            state = _run_with_progress(
+                lambda: pipeline.render(args.video_id, config=config, force=args.force),
+                args.video_id, config, args.force,
+            )
         elif args.command == "decide":
             pipeline.decide(args.video_id, args.moment_id, args.decision, start=args.start, end=args.end,
                             comment=args.comment, config=config)
@@ -105,7 +202,7 @@ def main(argv: list[str] | None = None) -> int:
             for state in states:
                 _report(state)
             return max((_exit_code(s) for s in states), default=0)
-    except (pipeline.PipelineError, ConfigError) as exc:
+    except (pipeline.PipelineError, ConfigError, download.DownloadError) as exc:
         print(f"erreur : {exc}", file=sys.stderr)
         return 1
 
