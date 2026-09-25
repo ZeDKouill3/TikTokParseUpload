@@ -1,0 +1,365 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ank viz</title>
+<style>
+:root {
+  --bg: #0e0f11;
+  --panel: #15171a;
+  --raise: #1b1e22;
+  --line: rgba(255,255,255,0.07);
+  --line-strong: rgba(255,255,255,0.13);
+  --text: #e6e7e9;
+  --dim: #9a9ea6;
+  --faint: #6b7079;
+  --accent: #7aa2ff;
+  --progress: #7aa2ff;
+  --ready: #5fd08a;
+  --blocked: #e0a650;
+  --done: #a38bf0;
+  --closed: #6b7079;
+  --danger: #f07178;
+  --mono: ui-monospace, "Cascadia Code", "JetBrains Mono", Consolas, monospace;
+  --sans: "Segoe UI Variable", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --r: 6px;
+  --ease: cubic-bezier(0.23, 1, 0.32, 1);
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--text); }
+body { font: 13px/1.5 var(--sans); -webkit-font-smoothing: antialiased; }
+.mono { font-family: var(--mono); font-size: 12px; }
+.dim { color: var(--dim); }
+.faint { color: var(--faint); }
+
+header {
+  position: sticky; top: 0; z-index: 5;
+  display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  padding: 12px 24px; background: rgba(14,15,17,0.92);
+  backdrop-filter: blur(8px); border-bottom: 1px solid var(--line);
+}
+header h1 { margin: 0; font-size: 14px; font-weight: 600; letter-spacing: 0.02em; }
+.chip {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 4px 8px; border: 1px solid var(--line-strong); border-radius: var(--r);
+  color: var(--dim); white-space: nowrap;
+}
+.chip b { color: var(--text); font-weight: 500; }
+.pulse { width: 8px; height: 8px; border-radius: 50%; background: var(--ready); transition: opacity 300ms ease; }
+.pulse.busy { opacity: 0.35; }
+.spacer { flex: 1; }
+.err {
+  margin: 16px 24px 0; padding: 8px 12px; border: 1px solid rgba(240,113,120,0.4);
+  border-radius: var(--r); color: var(--danger); background: rgba(240,113,120,0.06);
+}
+.err:empty { display: none; }
+
+main { max-width: 1400px; margin: 0 auto; padding: 24px; display: grid; gap: 48px; }
+section h2 {
+  margin: 0 0 12px; font-size: 11px; font-weight: 600; text-transform: uppercase;
+  letter-spacing: 0.08em; color: var(--dim);
+  display: flex; align-items: baseline; gap: 8px;
+}
+section h2 .n { color: var(--faint); font-weight: 500; }
+
+/* Tâches */
+.board { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; align-items: start; }
+@media (max-width: 1100px) { .board { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 640px) { .board { grid-template-columns: 1fr; } main, header { padding-left: 16px; padding-right: 16px; } }
+.col { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r); min-width: 0; }
+.col-head {
+  display: flex; align-items: center; gap: 8px; padding: 8px 12px;
+  border-bottom: 1px solid var(--line); font-weight: 600; font-size: 12px;
+}
+.dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.col-head .n { margin-left: auto; color: var(--faint); font-weight: 500; font-family: var(--mono); }
+.col-body { padding: 4px; }
+.empty { padding: 12px; color: var(--faint); }
+.task { border-radius: 4px; }
+.task > summary {
+  list-style: none; cursor: pointer; padding: 8px; border-radius: 4px;
+  display: grid; gap: 4px;
+}
+.task > summary::-webkit-details-marker { display: none; }
+@media (hover: hover) and (pointer: fine) { .task > summary:hover { background: var(--raise); } }
+.task[open] > summary { background: var(--raise); }
+.task .meta { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; color: var(--faint); }
+.task .title { color: var(--text); line-height: 1.35; }
+.task .who { color: var(--progress); }
+.task .waits { color: var(--blocked); }
+.crit {
+  margin: 4px 8px 8px; padding: 8px 12px; border-left: 2px solid var(--line-strong);
+  color: var(--dim); white-space: pre-wrap; line-height: 1.55; max-width: 65ch;
+}
+.crit-label { display: block; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--faint); margin-bottom: 4px; }
+.task.flash > summary { box-shadow: inset 0 0 0 1px var(--accent); }
+
+/* Graphe */
+.graph { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r); padding: 12px 0; overflow-x: auto; }
+.grow { display: flex; align-items: center; height: 28px; padding-right: 16px; cursor: pointer; white-space: nowrap; }
+@media (hover: hover) and (pointer: fine) { .grow:hover { background: var(--raise); } }
+.grow.hl { background: rgba(122,162,255,0.08); }
+.grow .gid { width: 88px; flex: none; color: var(--faint); }
+.grow .gt { overflow: hidden; text-overflow: ellipsis; }
+.pill {
+  flex: none; margin-right: 12px; padding: 0 8px; border-radius: 10px; font-size: 11px; line-height: 18px;
+  border: 1px solid currentColor; opacity: 0.9;
+}
+.graph-wrap { position: relative; min-width: max-content; }
+.graph-wrap svg { position: absolute; left: 0; top: 0; pointer-events: none; }
+.graph-wrap svg path { transition: opacity 150ms ease; }
+.graph-wrap.focus svg path:not(.hl), .graph-wrap.focus svg circle:not(.hl) { opacity: 0.18; }
+
+/* Tableaux */
+table { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--line); border-radius: var(--r); overflow: hidden; }
+th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: var(--faint); background: var(--raise); }
+tr:last-child td { border-bottom: 0; }
+.ahead { color: var(--ready); }
+.behind { color: var(--blocked); }
+.zero { color: var(--faint); }
+.tag { display: inline-block; padding: 0 8px; border-radius: 4px; font-size: 11px; line-height: 18px; background: var(--raise); color: var(--dim); }
+.tag.remote { color: var(--done); }
+a.tlink { color: var(--accent); text-decoration: none; cursor: pointer; }
+a.tlink:hover { text-decoration: underline; }
+.subject { color: var(--dim); max-width: 48ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.table-wrap { overflow-x: auto; }
+
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>ank viz</h1>
+  <span class="chip">branche <b id="h-branch">…</b></span>
+  <span class="chip">identité <b id="h-id">…</b></span>
+  <span class="chip">claim <b id="h-claim">…</b></span>
+  <span class="spacer"></span>
+  <span class="chip"><span class="pulse busy" id="h-pulse"></span><span id="h-time">collecte en cours…</span></span>
+</header>
+<div class="err" id="err"></div>
+<main>
+  <section>
+    <h2>Tâches <span class="n" id="n-tasks"></span></h2>
+    <div class="board" id="board"></div>
+  </section>
+  <section>
+    <h2>Dépendances <span class="n">bloqueur au-dessus, ce qu'il débloque en dessous</span></h2>
+    <div class="graph"><div class="graph-wrap" id="graph"></div></div>
+  </section>
+  <section>
+    <h2>Branches <span class="n" id="n-branches"></span></h2>
+    <div class="table-wrap"><table id="branches"></table></div>
+  </section>
+  <section>
+    <h2>Décisions et spécifications <span class="n" id="n-docs"></span></h2>
+    <div class="table-wrap"><table id="docs"></table></div>
+  </section>
+</main>
+<script>
+const GROUPS = [
+  ["in_progress", "En cours", "var(--progress)"],
+  ["ready", "À faire, prêtes", "var(--ready)"],
+  ["blocked", "À faire, bloquées", "var(--blocked)"],
+  ["done", "Faites", "var(--done)"],
+  ["closed", "Fermées", "var(--closed)"],
+];
+const LANE_COLORS = ["#7aa2ff", "#5fd08a", "#e0a650", "#a38bf0", "#4fc6d0", "#f07178", "#c3d06a", "#e38fd0"];
+const ROW = 28, LANE = 16, PAD = 16;
+const openTasks = new Set();
+let lastJson = "";
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+function groupOf(state) {
+  const g = {};
+  for (const [key] of GROUPS) for (const id of state.groups[key] || []) g[id] = key;
+  return g;
+}
+
+function relTime(iso) {
+  if (!iso) return "";
+  const s = (Date.now() - new Date(iso).getTime()) / 1000;
+  if (s < 60) return "à l'instant";
+  if (s < 3600) return `il y a ${Math.round(s / 60)} min`;
+  if (s < 86400) return `il y a ${Math.round(s / 3600)} h`;
+  return `il y a ${Math.round(s / 86400)} j`;
+}
+
+function renderBoard(state) {
+  const byId = Object.fromEntries(state.tasks.map((t) => [t.id, t]));
+  const status = Object.fromEntries(state.tasks.map((t) => [t.id, t.status]));
+  $("n-tasks").textContent = state.tasks.length;
+  $("board").innerHTML = GROUPS.map(([key, label, color]) => {
+    const ids = state.groups[key] || [];
+    const items = ids.map((id) => {
+      const t = byId[id];
+      const waits = (t.blocked_by || []).filter((b) => !["done", "closed"].includes(status[b]));
+      return `<details class="task" data-id="${esc(t.id)}" ${openTasks.has(t.id) ? "open" : ""}>
+        <summary>
+          <span class="meta mono"><span>${esc(t.short)}</span>${t.claimed_by ? `<span class="who">● ${esc(t.claimed_by)}</span>` : ""}</span>
+          <span class="title">${esc(t.title)}</span>
+          ${key === "blocked" && waits.length ? `<span class="meta mono waits">attend ${waits.map((w) => esc(w.replace(/^([A-Z]+-[0-9a-f]{4}).*/, "$1"))).join(", ")}</span>` : ""}
+        </summary>
+        <div class="crit"><span class="crit-label">Critère · <span class="mono">${esc(t.id)}</span></span>${t.criterion === null ? '<span class="faint">chargement des critères…</span>' : esc(t.criterion || "(aucun critère)")}</div>
+      </details>`;
+    }).join("");
+    return `<div class="col">
+      <div class="col-head"><span class="dot" style="background:${color}"></span>${label}<span class="n">${ids.length}</span></div>
+      <div class="col-body">${items || '<div class="empty">rien</div>'}</div>
+    </div>`;
+  }).join("");
+  for (const d of document.querySelectorAll(".task")) {
+    d.addEventListener("toggle", () => (d.open ? openTasks.add(d.dataset.id) : openTasks.delete(d.dataset.id)));
+  }
+}
+
+function renderGraph(state) {
+  const g = state.graph, groups = groupOf(state);
+  const byId = Object.fromEntries(state.tasks.map((t) => [t.id, t]));
+  const pos = Object.fromEntries(g.nodes.map((n) => [n.id, n]));
+  const gutter = PAD * 2 + Math.max(1, g.lanes) * LANE;
+  const x = (lane) => PAD + lane * LANE + LANE / 2;
+  const y = (row) => row * ROW + ROW / 2;
+  const color = (lane) => LANE_COLORS[lane % LANE_COLORS.length];
+
+  const paths = g.edges.map((e) => {
+    const a = pos[e.from], b = pos[e.to];
+    const x1 = x(a.lane), y1 = y(a.row), xl = x(e.lane), x2 = x(b.lane), y2 = y(b.row);
+    let d;
+    if (b.row === a.row + 1) {
+      d = `M${x1},${y1} C${x1},${y1 + ROW / 2} ${x2},${y2 - ROW / 2} ${x2},${y2}`;
+    } else {
+      d = `M${x1},${y1}`;
+      d += xl === x1 ? ` L${xl},${y1 + ROW}` : ` C${x1},${y1 + ROW / 2} ${xl},${y1 + ROW / 2} ${xl},${y1 + ROW}`;
+      d += ` L${xl},${y2 - ROW}`;
+      d += xl === x2 ? ` L${x2},${y2}` : ` C${xl},${y2 - ROW / 2} ${x2},${y2 - ROW / 2} ${x2},${y2}`;
+    }
+    return `<path d="${d}" data-a="${esc(e.from)}" data-b="${esc(e.to)}" fill="none" stroke="${color(e.lane)}" stroke-width="2" stroke-linecap="round"/>`;
+  }).join("");
+  const dots = g.nodes.map((n) => {
+    const grp = GROUPS.find(([k]) => k === groups[n.id]);
+    const fill = grp ? grp[2] : "var(--dim)";
+    return `<circle data-a="${esc(n.id)}" cx="${x(n.lane)}" cy="${y(n.row)}" r="5" fill="${fill}" stroke="var(--panel)" stroke-width="2"/>`;
+  }).join("");
+
+  const rows = g.nodes.map((n) => {
+    const t = byId[n.id], grp = GROUPS.find(([k]) => k === groups[n.id]) || ["", "", "var(--dim)"];
+    return `<div class="grow" data-id="${esc(n.id)}" style="padding-left:${gutter}px">
+      <span class="gid mono">${esc(t.short)}</span>
+      <span class="pill" style="color:${grp[2]}">${esc(grp[1].replace("À faire, ", ""))}</span>
+      <span class="gt">${esc(t.title)}</span>
+    </div>`;
+  }).join("");
+
+  const h = g.nodes.length * ROW;
+  $("graph").innerHTML = `<svg width="${gutter}" height="${h}" viewBox="0 0 ${gutter} ${h}">${paths}${dots}</svg>${rows}`;
+
+  const wrap = $("graph");
+  for (const row of wrap.querySelectorAll(".grow")) {
+    const id = row.dataset.id;
+    row.addEventListener("mouseenter", () => {
+      wrap.classList.add("focus");
+      const related = new Set([id]);
+      for (const p of wrap.querySelectorAll("path")) {
+        const on = p.dataset.a === id || p.dataset.b === id;
+        p.classList.toggle("hl", on);
+        if (on) { related.add(p.dataset.a); related.add(p.dataset.b); }
+      }
+      for (const c of wrap.querySelectorAll("circle")) c.classList.toggle("hl", related.has(c.dataset.a));
+      for (const r of wrap.querySelectorAll(".grow")) r.classList.toggle("hl", related.has(r.dataset.id) && r !== row);
+    });
+    row.addEventListener("mouseleave", () => {
+      wrap.classList.remove("focus");
+      for (const el of wrap.querySelectorAll(".hl")) el.classList.remove("hl");
+    });
+    row.addEventListener("click", () => revealTask(id));
+  }
+}
+
+function revealTask(id) {
+  const d = document.querySelector(`.task[data-id="${CSS.escape(id)}"]`);
+  if (!d) return;
+  d.open = true;
+  openTasks.add(id);
+  d.scrollIntoView({ behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "center" });
+  d.classList.add("flash");
+  setTimeout(() => d.classList.remove("flash"), 1200);
+}
+
+function count(n, cls) {
+  if (n === null || n === undefined) return '<span class="zero">?</span>';
+  return n === 0 ? '<span class="zero">0</span>' : `<span class="${cls}">${n}</span>`;
+}
+
+function renderBranches(state) {
+  const byId = Object.fromEntries(state.tasks.map((t) => [t.id, t]));
+  const current = state.status && state.status.branch;
+  const rows = [...state.branches].sort((a, b) => (a.remote - b.remote) || (b.date || "").localeCompare(a.date || ""));
+  $("n-branches").textContent = rows.length;
+  $("branches").innerHTML = `<tr><th>Branche</th><th>Dernier commit</th><th>Quand</th><th title="par rapport à ${esc(state.default_branch)}">↑ avance</th><th>↓ retard</th><th>Tâche</th></tr>` +
+    rows.map((b) => {
+      const t = b.task && byId[b.task];
+      return `<tr>
+        <td><span class="mono">${esc(b.name)}</span> ${b.remote ? '<span class="tag remote">distante</span>' : '<span class="tag">locale</span>'}${b.name === current ? ' <span class="tag" style="color:var(--accent)">HEAD</span>' : ""}</td>
+        <td><div class="subject"><span class="mono faint">${esc(b.sha)}</span> ${esc(b.subject)}</div><div class="faint">${esc(b.author)}</div></td>
+        <td class="dim" title="${esc(b.date)}">${relTime(b.date)}</td>
+        <td class="mono">${count(b.ahead, "ahead")}</td>
+        <td class="mono">${count(b.behind, "behind")}</td>
+        <td>${t ? `<a class="tlink mono" data-id="${esc(t.id)}">${esc(t.short)}</a> <span class="dim">${esc(t.title)}</span>` : '<span class="faint">·</span>'}</td>
+      </tr>`;
+    }).join("");
+  for (const a of $("branches").querySelectorAll("a.tlink")) a.addEventListener("click", () => revealTask(a.dataset.id));
+}
+
+function renderDocs(state) {
+  const docs = [...state.documents].sort((a, b) => a.kind.localeCompare(b.kind) || a.title.localeCompare(b.title));
+  $("n-docs").textContent = docs.length;
+  const tone = { accepted: "var(--ready)", proposed: "var(--blocked)", superseded: "var(--closed)", rejected: "var(--danger)" };
+  $("docs").innerHTML = `<tr><th>Type</th><th>Id</th><th>Titre</th><th>Statut</th></tr>` +
+    docs.map((d) => `<tr>
+      <td><span class="tag">${d.kind === "adr" ? "ADR" : "spec"}</span></td>
+      <td class="mono faint">${esc(d.short)}</td>
+      <td>${esc(d.title)}</td>
+      <td><span class="pill" style="color:${tone[d.status] || "var(--dim)"}">${esc(d.status)}</span></td>
+    </tr>`).join("");
+}
+
+function renderHeader(state) {
+  const st = state.status || {};
+  $("h-branch").textContent = st.branch || "?";
+  $("h-id").textContent = st.identity || "?";
+  $("h-claim").textContent = st.claim ? st.claim.slice(0, 9) : "aucun";
+  $("err").textContent = state.error ? `Dernière collecte en échec : ${state.error}` : "";
+}
+
+async function tick() {
+  $("h-pulse").classList.add("busy");
+  try {
+    const res = await fetch("/api/state", { cache: "no-store" });
+    const text = await res.text();
+    const state = JSON.parse(text);
+    if (state.loading) {
+      $("h-time").textContent = "première collecte (quelques secondes)…";
+    } else {
+      $("h-time").textContent = `collecté ${state.collected_at.slice(11)} (${state.collect_seconds} s)` + (state.criteria_loading ? ", critères en cours…" : "");
+      const key = text.replace(/"collected_at":\s*"[^"]*",\s*"collect_seconds":\s*[\d.]+/, "");
+      if (key !== lastJson) {
+        lastJson = key;
+        renderHeader(state);
+        if (state.tasks) { renderBoard(state); renderGraph(state); renderBranches(state); renderDocs(state); }
+      }
+      $("h-pulse").classList.remove("busy");
+    }
+  } catch (e) {
+    $("err").textContent = "Serveur injoignable, nouvelle tentative…";
+  }
+}
+
+tick();
+setInterval(tick, 3000);
+</script>
+</body>
+</html>

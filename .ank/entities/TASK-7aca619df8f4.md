@@ -5,7 +5,7 @@ slug: visualiseur-ank-serveur-html-local-t-ches-graphe
 title: "Visualiseur ank : serveur HTML local (tâches, graphe de dépendances, branches git)"
 created: 2026-09-25T09:39:33Z
 author: claude-plan
-status: open
+status: done
 scope:
   - tools/ank-viz/**
 blocked_by: []
@@ -14,8 +14,15 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/99b1b78ce2e1@ec791ef
+    tree: scope/7bce2aa08e33
+    criteria: 486d2c69d317
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---
 
 Demandé par l'utilisateur pour suivre l'avancement. Outil de dev, hors du paquet clipper. ank a déjà 'ank tui' mais l'utilisateur veut une page web. Respecter la règle ank : .ank/ est opaque, passer par ank find/show/graph/status --json.
