@@ -557,6 +557,131 @@ def test_two_faces_that_cannot_share_a_frame_fall_back_to_split(tmp_path, video_
         assert r["w"] / r["h"] == pytest.approx(1080 / 960, rel=0.01)
 
 
+# --------------------------------------------------------------------------
+# Doublons, pistes fragmentees et visages retenus. Donnees synthetiques
+# reprenant un essai reel (source 1920x1080, 5 images/s) : le detecteur
+# plein cadre + tuiles rend deux boites quasi identiques par visage, une
+# fausse detection (torse) clignote sous le visage avec des trous de plus
+# d'une seconde, et une piste fantome dure 0,4 s (3 images).
+# --------------------------------------------------------------------------
+
+
+def test_duplicate_detections_within_a_frame_are_one_face(tmp_path, video_dir):
+    face, dup = (1100, 300, 1300, 500), (1090, 310, 1290, 510)  # IoU ~0.82
+    out, _, _ = run(tmp_path, static(face, dup), [single(0)])
+    plan = load(out)["plans"][0]
+    assert len(plan["faces"]) == 1
+    assert plan["layout"] == "single"
+
+
+def test_duplicate_iou_threshold_is_configurable(tmp_path, video_dir):
+    face, dup = (1100, 300, 1300, 500), (1090, 310, 1290, 510)
+    out, _, _ = run(tmp_path, static(face, dup), [single(0)], duplicate_iou=0.9)
+    assert len(load(out)["plans"][0]["faces"]) == 2
+
+
+def test_track_fragments_following_each_other_in_space_are_one_face(tmp_path, video_dir):
+    # Meme visage, perdu 1,8 s (plus que le trou tolere par le suivi).
+    box = (1100, 300, 1300, 500)
+    out, _, _ = run(tmp_path, lambda t: [] if 11.0 < t < 12.6 else [box], [single(0)])
+    [face] = load(out)["plans"][0]["faces"]
+    assert face["first"] == pytest.approx(10.1)
+    assert face["last"] == pytest.approx(13.9)
+
+
+def test_flickering_false_detection_under_the_face_is_not_protected(tmp_path, video_dir):
+    # Essai reel, plan 0 : visage detecte sur toutes les images (en double),
+    # torse detecte sur 8 images sur 20 en deux salves separees de 1,8 s ;
+    # le torse, plus large que le cadre une fois ajoute au visage, rendait
+    # le suivi impossible (split avec deux fois le plan entier).
+    face, dup = (520, 160, 820, 460), (505, 175, 800, 470)
+    torso = (330, 450, 850, 990)
+
+    def boxes(t):
+        flicker = 10.4 < t < 11.0 or 12.6 < t < 13.6
+        return [face, dup] + ([torso] if flicker else [])
+
+    # Numerotes de gauche a droite : #0 = torse, #1 = visage.
+    out, _, _ = run(tmp_path, boxes, [single(1)])
+    plan = load(out)["plans"][0]
+    assert plan["layout"] == "single", plan["reason"]
+    assert len(plan["faces"]) == 2  # visage (doublon fusionne) + torse (salves fusionnees)
+    assert {f["id"]: f["retained"] for f in plan["faces"]} == {0: False, 1: True}
+    assert plan["faces"][1]["box"][1] < 300  # le visage, pas le torse
+    for r in rects(plan):
+        assert (r["w"], r["h"]) == (CROP_W, 1080)
+        for t in times_in(r):
+            assert contains(r, face)
+
+
+def test_ghost_track_of_0_4_s_is_not_protected(tmp_path, video_dir):
+    # Essai reel, plan 4 : une piste de 3 images (0,4 s) passe le filtre
+    # min_track_seconds et, inevitable, bloquait le suivi du visage.
+    face, ghost = (1100, 300, 1300, 500), (750, 600, 1100, 950)
+    out, _, _ = run(tmp_path, lambda t: [face, ghost] if 12.0 < t < 12.6 else [face], [single(1)])
+    plan = load(out)["plans"][0]
+    assert plan["layout"] == "single", plan["reason"]
+    faces = {f["id"]: f for f in plan["faces"]}
+    assert faces[1]["retained"] and not faces[0]["retained"]
+    assert faces[0]["last"] - faces[0]["first"] == pytest.approx(0.4)
+    for r in rects(plan):
+        assert contains(r, face)
+
+
+def test_small_face_is_not_protected(tmp_path, video_dir):
+    # Un visage de 30 px (2,8 % de la hauteur) au bord du cadre centre : il
+    # ne deplace plus le cadre.
+    face, tiny = (1100, 300, 1300, 500), (1500, 300, 1530, 330)
+    out, _, _ = run(tmp_path, static(face, tiny), [single(0)])
+    plan = load(out)["plans"][0]
+    [r] = rects(plan)
+    assert (r["x"], r["w"]) == (896, CROP_W)
+    assert [f["retained"] for f in plan["faces"]] == [True, False]
+
+
+def test_retention_thresholds_are_configurable(tmp_path, video_dir):
+    face, tiny = (1100, 300, 1300, 500), (1500, 300, 1530, 330)
+    out, _, _ = run(tmp_path, static(face, tiny), [single(0)], min_face_height=0.02)
+    assert [f["retained"] for f in load(out)["plans"][0]["faces"]] == [True, True]
+
+    box = (1100, 300, 1300, 500)
+    out, _, _ = run(tmp_path, lambda t: [box] if t < 11.0 else [], [single(0)], force=True,
+                    min_face_presence=0.1)
+    assert [f["retained"] for f in load(out)["plans"][0]["faces"]] == [True]
+
+
+def test_split_is_never_made_of_one_face_and_its_duplicate(tmp_path, video_dir):
+    # Visage trop large pour le cadre, detecte en double : un seul visage
+    # retenu, donc pas d'ecran partage (il y mettrait deux fois la meme
+    # personne) mais le fond flou.
+    face, dup = (500, 100, 1300, 1000), (510, 110, 1290, 990)
+    out, _, _ = run(tmp_path, static(face, dup), [single(0)])
+    plan = load(out)["plans"][0]
+    assert plan["layout"] == "fallback_blur"
+    assert "split impossible" in plan["reason"]
+
+
+def test_split_panels_each_frame_their_own_face(tmp_path, video_dir):
+    # Deux visages distincts retenus que nul cadre 9:16 pleine hauteur ne
+    # garde entiers : chaque panneau est cadre sur son visage, a sa taille
+    # (split_face_height), et n'y met pas l'autre quand c'est possible.
+    a, b = (300, 20, 450, 170), (350, 600, 1000, 1060)
+    out, _, _ = run(tmp_path, static(a, b), [single(0)])
+    plan = load(out)["plans"][0]
+    assert plan["layout"] == "split"
+    panels = {p["name"]: p for p in plan["panels"]}
+    [top] = panels["top"]["rects"]
+    [bottom] = panels["bottom"]["rects"]
+    assert contains(top, a)
+    assert not cuts(top, b) and not contains(top, b)  # b entierement dehors
+    assert top["h"] < H  # zoome sur son visage
+    assert (a[3] - a[1]) / top["h"] == pytest.approx(0.35, abs=0.01)
+    assert contains(bottom, b) and not cuts(bottom, a)
+    for r in (top, bottom):
+        assert r["w"] / r["h"] == pytest.approx(1080 / 960, rel=0.01)
+        assert r["x"] >= 0 and r["y"] >= 0 and r["x"] + r["w"] <= W and r["y"] + r["h"] <= H
+
+
 def test_fallback_blur_is_used_when_configured(tmp_path, video_dir):
     a, b = (100, 300, 300, 500), (350, 250, 800, 700)
     out, _, _ = run(tmp_path, static(a, b), [single(0)], fallback="blur")
