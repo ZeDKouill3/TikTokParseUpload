@@ -346,17 +346,27 @@ class _Run:
 
 def avoid_zones(plan: dict[str, Any]) -> list[dict[str, Any]]:
     """Bandes verticales [haut, bas] (fraction de la hauteur de sortie)
-    couvertes par les visages, plan par plan d'un plan de recadrage
-    (reframe/<clip_id>.json) : ``[{"start", "end", "bands"}]``, temps en
-    secondes de la video. Chaque visage visible dans un panneau donne sa
-    propre bande (deux visages eloignes ne bloquent pas l'espace entre eux) ;
-    le fond flou ne compte pas. Les sous-titres ne recouvrent pas ces bandes
-    (SPEC-350f)."""
+    couvertes par les visages retenus (``retained: true``) du plan de
+    recadrage (reframe/<clip_id>.json) : ``[{"start", "end", "bands"}]``,
+    temps en secondes de la video. Un visage detecte mais non retenu (main,
+    sac, torse, ecran...) ne bloque pas de place. Chaque visage retenu
+    visible dans un panneau donne sa propre bande (deux visages eloignes ne
+    bloquent pas l'espace entre eux) ; le fond flou ne compte pas. Les
+    sous-titres ne recouvrent pas ces bandes (SPEC-350f). Un visage sans
+    champ ``retained`` (ancien format de reframe) est une erreur explicite :
+    jamais une supposition silencieuse (ADR-ad2e)."""
     out_h = float(plan["output"]["height"])
     zones = []
     for p in plan["plans"]:
         bands: list[list[float]] = []
         for face in p["faces"]:
+            if "retained" not in face:
+                raise PipelineError(
+                    f"visage {face.get('id')!r} sans champ 'retained' dans le plan de recadrage "
+                    "(ancien format) : relancer reframe --force"
+                )
+            if not face["retained"]:
+                continue
             x0, y0, x1, y1 = face["box"]
             for panel in p["panels"]:
                 if panel.get("effect") == "blur":
