@@ -210,6 +210,12 @@ def _ceil1(x: float) -> float:
     return math.ceil(x * 10 - 1e-6) / 10
 
 
+def _round2(x: float) -> float:
+    """Borne publiee (SPEC-1557 regle 5) : centieme superieur, jamais en
+    dessous de ``x`` (un connecteur retire ne recule jamais dedans)."""
+    return math.ceil(x * 100 - 1e-6) / 100
+
+
 def _span(start: float, end: float) -> str:
     return f"{_floor1(start):.1f}-{_ceil1(end):.1f}"
 
@@ -761,8 +767,8 @@ def _rubric_info(rubric_path: Path, rubric: dict[str, Any]) -> dict[str, Any]:
 
 def _public(c: dict[str, Any]) -> dict[str, Any]:
     return {
-        "start": _floor1(c["_start"]),
-        "end": _ceil1(c["_end"]),
+        "start": _round2(c["_start"]),
+        "end": _round2(c["_end"]),
         "duration": round(c["_end"] - c["_start"], 1),
         "format": c["format"],
         "parts": c["parts"],
@@ -810,8 +816,8 @@ def _judge(
             continue
         # Sans final_score : la re-notation apres vision ne le reprend pas.
         vetoed.append({
-            "start": _floor1(c["_start"]),
-            "end": _ceil1(c["_end"]),
+            "start": _round2(c["_start"]),
+            "end": _round2(c["_end"]),
             "reason": f"veto du juge {verdict['veto']['judge']} : {verdict['veto']['reason']}",
             "format": c["format"],
             "hook_text": c["hook_text"],
@@ -982,13 +988,13 @@ def _restore(
     arrondies au dixieme et creeraient de faux chevauchements). Le debut est
     celui de sa premiere phrase ou, connecteurs de tete retires, du mot qui
     les suit."""
-    first = max((k for k in range(len(sents)) if _floor1(sents[k].start) <= entry["start"]), default=0)
+    first = max((k for k in range(len(sents)) if sents[k].start <= entry["start"] + 1e-6), default=0)
     last = _nearest(range(first, len(sents)), entry["end"], lambda k: sents[k].end)
     start = sents[first].start
     found, k = _leading_connectors([w for _, w in sents[first].words], connectors)
-    if found and k < len(sents[first].words) and _floor1(sents[first].words[k][0]) == entry["start"]:
+    if found and k < len(sents[first].words) and _round2(sents[first].words[k][0]) == entry["start"]:
         start = sents[first].words[k][0]
-    if (_floor1(start), _ceil1(sents[last].end)) != (entry["start"], entry["end"]):
+    if (_round2(start), _round2(sents[last].end)) != (entry["start"], entry["end"]):
         raise MomentsError(
             f"moment [{entry['start']}-{entry['end']}] de moments.json hors des frontieres de phrase "
             "de transcript.json : re-notation impossible, relancer moments avec --force"
@@ -1040,8 +1046,8 @@ def _rescore(video_dir: Path, out: Path, settings: dict[str, Any]) -> Path:
         if after != c["_before"]:
             changed.append({
                 "id": ids.get(id(c)),
-                "start": _floor1(c["_start"]),
-                "end": _ceil1(c["_end"]),
+                "start": _round2(c["_start"]),
+                "end": _round2(c["_end"]),
                 "hook_text": c["hook_text"],
                 "before": c["_before"],
                 "after": after,

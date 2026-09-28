@@ -293,7 +293,7 @@ def test_writes_moments_json_with_spec_fields(tmp_path, video_dir, rubric_path):
     data = read_moments(video_dir)
     assert data["video_id"] == VIDEO_ID
     [m] = data["moments"]
-    assert (m["start"], m["end"]) == (10.2, 44.7)
+    assert (m["start"], m["end"]) == (10.25, 44.65)
     assert m["scores"] == GOOD
     assert m["final_score"] == 66.9
     assert m["justification"] == "Revelation sur la date"
@@ -354,7 +354,7 @@ def test_sponsorblock_segments_are_excluded(tmp_path, video_dir, rubric_path):
     )
 
     data = read_moments(video_dir)
-    assert sorted(spans(data)) == [(10.2, 44.7), (395.2, 429.7)]
+    assert sorted(spans(data)) == [(10.25, 44.65), (395.25, 429.65)]
     assert any("sponsor" in r["reason"] for r in data["rejected"])
 
 
@@ -363,7 +363,7 @@ def test_bounds_are_snapped_to_sentence_boundaries(tmp_path, video_dir, rubric_p
     # 43.1 est dans la phrase 8 (40.25-44.65) : fin la plus proche 44.65
     run(tmp_path, rubric_path, [{"moments": [moment(11.7, 43.1)]}])
 
-    assert spans(read_moments(video_dir)) == [(10.2, 44.7)]
+    assert spans(read_moments(video_dir)) == [(10.25, 44.65)]
 
 
 def test_sentence_boundaries_come_from_punctuation_inside_a_segment(tmp_path, video_dir, rubric_path):
@@ -376,7 +376,7 @@ def test_sentence_boundaries_come_from_punctuation_inside_a_segment(tmp_path, vi
     run(tmp_path, rubric_path, [{"moments": [moment(12.2, 44.65)]}])
 
     [m] = read_moments(video_dir)["moments"]
-    assert m["start"] == 12.9
+    assert m["start"] == 12.95
     assert m["hook_text"] == "mot2_3 mot2_4."
 
 
@@ -394,7 +394,7 @@ def test_overlapping_moments_keep_the_best_scored(tmp_path, video_dir, rubric_pa
     )
 
     data = read_moments(video_dir)
-    assert sorted(spans(data)) == [(30.2, 64.7), (150.2, 184.7)]
+    assert sorted(spans(data)) == [(30.25, 64.65), (150.25, 184.65)]
     assert sum("chevauche" in r["reason"] for r in data["rejected"]) == 2
 
 
@@ -406,7 +406,7 @@ def test_moments_under_min_score_are_dropped(tmp_path, video_dir, rubric_path):
     )
 
     data = read_moments(video_dir)
-    assert spans(data) == [(100.2, 134.7)]
+    assert spans(data) == [(100.25, 134.65)]
     [rejected] = data["rejected"]
     assert rejected["final_score"] == 59.2 and "min_score" in rejected["reason"]
 
@@ -431,7 +431,7 @@ def test_duration_outside_the_rubric_bounds_is_rejected(tmp_path, video_dir, rub
     )
 
     data = read_moments(video_dir)
-    assert spans(data) == [(400.2, 434.7)]
+    assert spans(data) == [(400.25, 434.65)]
     assert sum("duree" in r["reason"] for r in data["rejected"]) == 3
 
 
@@ -558,20 +558,20 @@ def test_rescore_keeps_the_measured_bonus_and_caps_the_total(tmp_path, video_dir
 def test_rescore_promotes_a_moment_rejected_for_score_and_says_what_changed(tmp_path, video_dir, rubric_path):
     # WEAK = 59.2 < 60 ; avec l'image marquante : 61.2, retenu.
     run(tmp_path, rubric_path, [{"moments": [moment(10.25, 44.65, scores=WEAK), moment(100.25, 134.65)]}])
-    assert spans(read_moments(video_dir)) == [(100.2, 134.7)]
+    assert spans(read_moments(video_dir)) == [(100.25, 134.65)]
     write_vision_after_moments(video_dir, [striking(20.0)])
 
     rescore(tmp_path, rubric_path)
 
     data = read_moments(video_dir)
-    assert sorted(spans(data)) == [(10.2, 44.7), (100.2, 134.7)]
+    assert sorted(spans(data)) == [(10.25, 44.65), (100.25, 134.65)]
     assert not [r for r in data["rejected"] if "min_score" in r["reason"]]
-    promoted = next(m for m in data["moments"] if m["start"] == 10.2)
+    promoted = next(m for m in data["moments"] if m["start"] == 10.25)
     assert promoted["final_score"] == 61.2
     assert data["rescored"]["changed"] == [{
         "id": promoted["id"],
-        "start": 10.2,
-        "end": 44.7,
+        "start": 10.25,
+        "end": 44.65,
         "hook_text": promoted["hook_text"],
         "before": {"final_score": 59.2, "retained": False},
         "after": {"final_score": 61.2, "retained": True},
@@ -596,17 +596,17 @@ def test_rescore_recomputes_the_overlap_between_candidates(tmp_path, video_dir, 
     # chevauchement ; une image marquante dans le second seul le fait passer
     # devant (68.9 contre 66.9).
     run(tmp_path, rubric_path, [{"moments": [moment(10.25, 44.65), moment(30.25, 64.65)]}])
-    assert spans(read_moments(video_dir)) == [(10.2, 44.7)]
+    assert spans(read_moments(video_dir)) == [(10.25, 44.65)]
     write_vision_after_moments(video_dir, [striking(60.0)])
 
     rescore(tmp_path, rubric_path)
 
     data = read_moments(video_dir)
-    assert spans(data) == [(30.2, 64.7)]
+    assert spans(data) == [(30.25, 64.65)]
     [overlap] = [r for r in data["rejected"] if "chevauche" in r["reason"]]
-    assert (overlap["start"], overlap["final_score"]) == (10.2, 66.9)
+    assert (overlap["start"], overlap["final_score"]) == (10.25, 66.9)
     assert {(c["start"], c["before"]["retained"], c["after"]["retained"]) for c in data["rescored"]["changed"]} == {
-        (10.2, True, False), (30.2, False, True),
+        (10.25, True, False), (30.25, False, True),
     }
 
 
@@ -630,9 +630,11 @@ def test_rescore_leaves_rubric_rejections_untouched(tmp_path, video_dir, rubric_
 
 
 def test_rescore_uses_exact_bounds_so_adjacent_moments_do_not_overlap(tmp_path, video_dir, rubric_path):
-    # phrases presque collees (0.02 s d'ecart) : la fin d'un moment arrondie
-    # au dixieme superieur depasse le debut du suivant arrondi au dixieme
-    # inferieur ; seules les bornes exactes disent qu'ils ne se chevauchent pas.
+    # phrases presque collees (0.02 s d'ecart entre bornes publiees, au
+    # centieme pres, regle 5) : la fin d'un moment et le debut du suivant
+    # sont si proches qu'une re-derivation approximative (au lieu des bornes
+    # exactes que _restore relit depuis transcript.json) risquerait de les
+    # faire se chevaucher.
     transcript = make_transcript()
     for k, seg in enumerate(transcript["segments"]):
         for w in seg["words"]:
@@ -645,7 +647,7 @@ def test_rescore_uses_exact_bounds_so_adjacent_moments_do_not_overlap(tmp_path, 
         moment(segs[2]["start"], segs[8]["end"]), moment(segs[9]["start"], segs[15]["end"]),
     ]}])
     (a_start, a_end), (b_start, b_end) = sorted(spans(read_moments(video_dir)))
-    assert a_end > b_start, "le cas teste suppose des bornes publiques qui se recouvrent"
+    assert 0 < b_start - a_end < 0.05, "le cas teste suppose des bornes publiques presque collees"
     write_vision_after_moments(video_dir, [striking(segs[3]["start"])])
 
     rescore(tmp_path, rubric_path)
@@ -685,7 +687,7 @@ def test_forced_run_after_vision_asks_the_llm_again(tmp_path, video_dir, rubric_
 
     assert [c.usage for c in fake.calls] == ["moments"]
     data = read_moments(video_dir)
-    assert spans(data) == [(10.2, 44.7)]
+    assert spans(data) == [(10.25, 44.65)]
     assert "rescored" not in data
 
 
@@ -729,7 +731,7 @@ def test_long_transcript_goes_in_overlapping_chunks_then_a_comparison_round(tmp_
     # les notes retenues sont celles du tour final, pas celles des tranches
     data = read_moments(video_dir)
     by_start = sorted(data["moments"], key=lambda m: m["start"])
-    assert [(m["start"], m["scores"]) for m in by_start] == [(10.2, GOOD), (450.2, WEAK)]
+    assert [(m["start"], m["scores"]) for m in by_start] == [(10.25, GOOD), (450.25, WEAK)]
     assert by_start[0]["final_score"] == 66.9
     assert data["chunked"] is True
 
@@ -830,9 +832,9 @@ def test_auto_mode_has_the_jury_rate_the_proposed_candidates(tmp_path, video_dir
     data = read_moments(video_dir)
     assert data["selection"] == "jury"
     [m] = data["moments"]
-    assert (m["start"], m["scores"], m["final_score"]) == (10.2, GOOD, 66.9)
+    assert (m["start"], m["scores"], m["final_score"]) == (10.25, GOOD, 66.9)
     [low] = [r for r in data["rejected"] if "min_score" in r["reason"]]
-    assert (low["start"], low["final_score"]) == (100.2, 59.2)
+    assert (low["start"], low["final_score"]) == (100.25, 59.2)
 
 
 def test_jury_median_replaces_the_proposer_notes(tmp_path, video_dir, rubric_path):
@@ -866,12 +868,12 @@ def test_jury_notes_keep_bonus_min_score_and_overlap_rules(tmp_path, video_dir, 
     )
 
     data = read_moments(video_dir)
-    assert sorted(spans(data)) == [(30.2, 64.7), (300.2, 334.7)]
-    bonus = next(m for m in data["moments"] if m["start"] == 300.2)
+    assert sorted(spans(data)) == [(30.25, 64.65), (300.25, 334.65)]
+    bonus = next(m for m in data["moments"] if m["start"] == 300.25)
     assert bonus["bonus"] == {"replayed": 4.35, "audio_peaks": 1.5, "visual": 0.0, "total": 5.85}
     assert bonus["final_score"] == 65.1
     [overlap] = [r for r in data["rejected"] if "chevauche" in r["reason"]]
-    assert (overlap["start"], overlap["final_score"]) == (10.2, 66.9)
+    assert (overlap["start"], overlap["final_score"]) == (10.25, 66.9)
 
 
 def test_jury_veto_rejects_the_candidate_with_its_reason(tmp_path, video_dir, rubric_path):
@@ -883,8 +885,8 @@ def test_jury_veto_rejects_the_candidate_with_its_reason(tmp_path, video_dir, ru
     )
 
     data = read_moments(video_dir)
-    assert spans(data) == [(10.2, 44.7)]
-    [vetoed] = [r for r in data["rejected"] if r["start"] == 100.2]
+    assert spans(data) == [(10.25, 44.65)]
+    [vetoed] = [r for r in data["rejected"] if r["start"] == 100.25]
     assert "veto" in vetoed["reason"] and "conformite" in vetoed["reason"] and reason in vetoed["reason"]
     assert vetoed["jury"]["veto"] == {"judge": "conformite", "reason": reason}
     # pas de score final : la re-notation apres vision ne peut pas le reprendre
@@ -997,7 +999,7 @@ def test_long_transcript_with_the_jury_skips_the_comparison_round(tmp_path, vide
     data = read_moments(video_dir)
     assert data["chunked"] is True
     by_start = sorted(data["moments"], key=lambda m: m["start"])
-    assert [(m["start"], m["scores"]) for m in by_start] == [(10.2, GOOD), (450.2, WEAK)]
+    assert [(m["start"], m["scores"]) for m in by_start] == [(10.25, GOOD), (450.25, WEAK)]
 
 
 def test_rescore_after_vision_keeps_the_jury_trace_and_the_veto(tmp_path, video_dir, rubric_path):
@@ -1012,9 +1014,9 @@ def test_rescore_after_vision_keeps_the_jury_trace_and_the_veto(tmp_path, video_
     assert fake.calls == []
     data = read_moments(video_dir)
     [m] = data["moments"]
-    assert (m["start"], m["final_score"]) == (10.2, 68.9)
+    assert (m["start"], m["final_score"]) == (10.25, 68.9)
     assert m["jury"] == trace
-    [vetoed] = [r for r in data["rejected"] if r["start"] == 100.2]
+    [vetoed] = [r for r in data["rejected"] if r["start"] == 100.25]
     assert "veto" in vetoed["reason"]
 
 
@@ -1060,12 +1062,12 @@ def test_exploration_takes_the_rejected_candidate_where_the_jury_disagrees_most(
 
     data = read_moments(video_dir)
     assert [(m["start"], m.get("exploration")) for m in data["moments"]] == [
-        (0.2, None), (50.2, None), (300.2, True),
+        (0.25, None), (50.25, None), (300.25, True),
     ]
     [x] = explored(data)
     assert x["scores"] == LOW and x["final_score"] < 60
     assert x["jury"]["trace"]["rounds"][0]["judges"]["retention"]["scores"] == TOP
-    assert 300.2 not in [r["start"] for r in data["rejected"]]
+    assert 300.25 not in [r["start"] for r in data["rejected"]]
     assert data["exploration"] == {"share": 0.5, "seed": 0, "target": 1, "chosen": 1}
 
 
@@ -1076,7 +1078,7 @@ def test_exploration_measures_the_dispersion_after_the_debate(tmp_path, video_di
     run_jury(tmp_path, rubric_path, list(notes), notes, debate={60: {"retention": LOW}}, exploration_share=0.5)
 
     [x] = explored(read_moments(video_dir))
-    assert x["start"] == 250.2
+    assert x["start"] == 250.25
 
 
 def test_exploration_never_takes_a_vetoed_candidate(tmp_path, video_dir, rubric_path):
@@ -1085,8 +1087,8 @@ def test_exploration_never_takes_a_vetoed_candidate(tmp_path, video_dir, rubric_
 
     data = read_moments(video_dir)
     [x] = explored(data)
-    assert x["start"] == 250.2
-    [vetoed] = [r for r in data["rejected"] if r["start"] == 300.2]
+    assert x["start"] == 250.25
+    [vetoed] = [r for r in data["rejected"] if r["start"] == 300.25]
     assert "veto" in vetoed["reason"]
 
 
@@ -1097,9 +1099,9 @@ def test_exploration_never_overlaps_a_retained_clip_nor_another_exploration(tmp_
     run_jury(tmp_path, rubric_path, list(notes), notes, exploration_share=1.0)
 
     data = read_moments(video_dir)
-    assert sorted(m["start"] for m in explored(data)) == [250.2, 300.2]
+    assert sorted(m["start"] for m in explored(data)) == [250.25, 300.25]
     rejected = {r["start"] for r in data["rejected"]}
-    assert {10.2, 310.2} <= rejected
+    assert {10.25, 310.25} <= rejected
 
 
 def test_exploration_ignores_sponsorblock_and_duration_rejections_and_says_when_it_falls_short(
@@ -1118,7 +1120,7 @@ def test_exploration_ignores_sponsorblock_and_duration_rejections_and_says_when_
 
     data = read_moments(video_dir)
     assert explored(data) == []
-    assert spans(data) == [(0.2, 24.7)]
+    assert spans(data) == [(0.25, 24.65)]
     assert data["exploration"] == {"share": 1.0, "seed": 0, "target": 1, "chosen": 0}
 
 
@@ -1150,7 +1152,7 @@ def test_exploration_choice_is_deterministic_for_a_fixed_seed(tmp_path, video_di
         return x["start"]
 
     assert chosen(7) == chosen(7) == chosen(7)
-    assert {chosen(seed) for seed in range(12)} == {250.2, 300.2, 350.2}
+    assert {chosen(seed) for seed in range(12)} == {250.25, 300.25, 350.25}
     assert read_moments(video_dir)["exploration"]["seed"] == 11
 
 
@@ -1160,9 +1162,9 @@ def test_exploration_share_zero_leaves_the_selection_unchanged(tmp_path, video_d
 
     data = read_moments(video_dir)
     assert "exploration" not in data
-    assert spans(data) == [(0.2, 24.7), (50.2, 74.7)]
+    assert spans(data) == [(0.25, 24.65), (50.25, 74.65)]
     assert all("exploration" not in m for m in data["moments"] + data["rejected"])
-    assert sorted(r["start"] for r in data["rejected"]) == [250.2, 300.2]
+    assert sorted(r["start"] for r in data["rejected"]) == [250.25, 300.25]
 
 
 def test_single_selection_has_no_exploration(tmp_path, video_dir, rubric_path):
@@ -1196,10 +1198,10 @@ def test_rescore_after_vision_keeps_the_exploration(tmp_path, video_dir, rubric_
     assert fake.calls == []
     data = read_moments(video_dir)
     assert [(m["start"], m.get("exploration")) for m in data["moments"]] == [
-        (0.2, None), (50.2, None), (300.2, True),
+        (0.25, None), (50.25, None), (300.25, True),
     ]
     assert data["exploration"] == {"share": 0.5, "seed": 0, "target": 1, "chosen": 1}
-    assert data["rescored"]["changed"][0]["start"] == 0.2
+    assert data["rescored"]["changed"][0]["start"] == 0.25
 
 
 # --------------------------------------------------------------------------
@@ -1233,6 +1235,11 @@ def floor1(x):
     return math.floor(x * 10 + 1e-6) / 10
 
 
+def round2(x):
+    """Borne publiee (SPEC-1557 regle 5, TASK-3c0a) : centieme superieur."""
+    return math.ceil(x * 100 - 1e-6) / 100
+
+
 def test_leading_connector_is_cut_and_the_clip_starts_on_the_next_word(tmp_path, video_dir, rubric_path):
     starts = set_sentence(video_dir, 3, "Mais qui est vraiment X ?")
 
@@ -1240,7 +1247,7 @@ def test_leading_connector_is_cut_and_the_clip_starts_on_the_next_word(tmp_path,
 
     data = read_moments(video_dir)
     [m] = data["moments"]
-    assert (m["start"], m["end"]) == (floor1(starts[1]), 44.7)
+    assert (m["start"], m["end"]) == (round2(starts[1]), 44.65)
     assert m["hook_text"] == "qui est vraiment X ?"
     assert m["duration"] == round(44.65 - starts[1], 1)
     assert data["rejected"] == []
@@ -1252,7 +1259,7 @@ def test_several_leading_connectors_are_all_cut(tmp_path, video_dir, rubric_path
     run(tmp_path, rubric_path, [{"moments": [moment(15.25, 44.65)]}])
 
     [m] = read_moments(video_dir)["moments"]
-    assert m["start"] == floor1(starts[4])
+    assert m["start"] == round2(starts[4])
     assert m["hook_text"] == "on part."
 
 
@@ -1263,7 +1270,7 @@ def test_sentence_made_only_of_connectors_is_rejected_with_its_reason(tmp_path, 
     run(tmp_path, rubric_path, [{"moments": [moment(15.25, 44.65), moment(100.25, 134.65)]}])
 
     data = read_moments(video_dir)
-    assert spans(data) == [(100.2, 134.7)]
+    assert spans(data) == [(100.25, 134.65)]
     [rejected] = data["rejected"]
     assert rejected["start"] == 15.2
     assert "connecteur" in rejected["reason"]
@@ -1292,7 +1299,7 @@ def test_connector_in_the_middle_of_a_sentence_is_ignored(tmp_path, video_dir, r
     run(tmp_path, rubric_path, [{"moments": [moment(15.25, 44.65), moment(100.25, 134.65), moment(250.25, 284.65)]}])
 
     data = read_moments(video_dir)
-    assert sorted(spans(data)) == [(15.2, 44.7), (100.2, 134.7), (250.2, 284.7)]
+    assert sorted(spans(data)) == [(15.25, 44.65), (100.25, 134.65), (250.25, 284.65)]
     assert sorted(m["hook_text"] for m in data["moments"]) == [
         "Etienne, mais pourquoi donc ?", "Maison close et fermee depuis.", "mot3_0 donc on part maintenant.",
     ]
@@ -1320,7 +1327,7 @@ def test_connectors_are_found_whatever_the_case_and_punctuation(tmp_path, video_
     run(tmp_path, rubric_path, [{"moments": [moment(15.25, 44.65)]}])
 
     [m] = read_moments(video_dir)["moments"]
-    assert m["start"] == floor1(starts[first_kept])
+    assert m["start"] == round2(starts[first_kept])
     assert m["hook_text"] == " ".join(text.split()[first_kept:])
 
 
@@ -1330,7 +1337,7 @@ def test_multipart_first_part_starts_after_the_connector(tmp_path, video_dir, ru
     run(tmp_path, rubric_path, [{"moments": [moment(250.25, 389.65, fmt="multipart", breaks=[320.3])]}])
 
     [m] = read_moments(video_dir)["moments"]
-    assert m["start"] == floor1(starts[2])
+    assert m["start"] == round2(starts[2])
     assert [(p["start"], p["end"]) for p in m["parts"]] == [(floor1(starts[2]), 319.7), (320.2, 389.7)]
 
 
@@ -1347,7 +1354,7 @@ def test_connector_list_is_a_setting(tmp_path, video_dir, rubric_path):
     run(tmp_path, rubric_path, [{"moments": [moment(15.25, 44.65), moment(100.25, 134.65)]}], config=config)
 
     # "donc" n'est plus dans la liste, "bref" y est
-    assert sorted(spans(read_moments(video_dir))) == [(15.2, 44.7), (floor1(starts[1]), 134.7)]
+    assert sorted(spans(read_moments(video_dir))) == [(15.25, 44.65), (round2(starts[1]), 134.65)]
 
 
 @pytest.mark.parametrize("value", ["donc", [""], ["donc", 3], None])
@@ -1391,7 +1398,7 @@ def test_jury_judges_the_text_without_the_connector(tmp_path, video_dir, rubric_
     assert not any("Donc" in c.prompt for c in jury_calls)
     assert all(f"[{floor1(starts[1]):.1f}-44.7]" in c.prompt for c in jury_calls)
     [m] = read_moments(video_dir)["moments"]
-    assert (m["start"], m["hook_text"]) == (floor1(starts[1]), "mot3_0 mot3_2 mot3_3 mot3_4.")
+    assert (m["start"], m["hook_text"]) == (round2(starts[1]), "mot3_0 mot3_2 mot3_3 mot3_4.")
 
 
 def test_comparison_round_sees_the_text_without_the_connector(tmp_path, video_dir, rubric_path):
@@ -1422,8 +1429,71 @@ def test_rescore_keeps_a_moment_whose_connector_was_cut(tmp_path, video_dir, rub
 
     assert fake.calls == []
     [m] = read_moments(video_dir)["moments"]
-    assert (m["start"], m["hook_text"], m["final_score"]) == (floor1(starts[1]), "qui est vraiment X ?", 68.9)
+    assert (m["start"], m["hook_text"], m["final_score"]) == (round2(starts[1]), "qui est vraiment X ?", 68.9)
     assert m["duration"] == round(44.65 - starts[1], 1)
+
+
+# --------------------------------------------------------------------------
+# TASK-3c0a : un connecteur retire colle au mot suivant (aucun silence entre
+# les deux, comme "Donc" 2428.38-2428.54 puis "est" a 2428.54 sur sZi-qJ-5ptA)
+# ne doit jamais laisser la fin du connecteur dans le clip publie : la borne
+# de debut est au centieme (SPEC-1557 regle 5) et ne recule jamais dans le
+# mot retire.
+# --------------------------------------------------------------------------
+
+
+def set_touching_words(video_dir, k, words):
+    """Reecrit la phrase k de transcript.json avec des mots colles bout a
+    bout (fin d'un mot = debut du suivant, comme un connecteur sans silence
+    avant le mot qui le suit) : ``words`` est [(texte, debut, fin), ...]."""
+    transcript = json.loads((video_dir / "transcript.json").read_text(encoding="utf-8"))
+    seg = transcript["segments"][k]
+    seg["words"] = [{"word": " " + w, "start": s, "end": e, "probability": 0.9} for w, s, e in words]
+    seg["start"], seg["end"] = words[0][1], words[-1][2]
+    seg["text"] = " " + " ".join(w for w, _, _ in words)
+    (video_dir / "transcript.json").write_text(json.dumps(transcript, ensure_ascii=False), encoding="utf-8")
+
+
+def test_connector_touching_the_next_word_never_recedes_into_it(tmp_path, video_dir, rubric_path):
+    # "Donc" colle a "est" (aucun silence entre les deux, comme sur
+    # sZi-qJ-5ptA) : un arrondi qui reculerait (dixieme, ou centieme
+    # inferieur) publierait un debut a l'interieur du connecteur retire.
+    set_touching_words(video_dir, 3, [
+        ("Donc", 15.30, 15.46), ("est", 15.46, 15.62), ("ce", 15.62, 15.70),
+        ("vraiment", 15.70, 16.00), ("normal?", 16.00, 16.40),
+    ])
+
+    run(tmp_path, rubric_path, [{"moments": [moment(15.25, 44.65)]}])
+
+    [m] = read_moments(video_dir)["moments"]
+    assert m["start"] == 15.46
+    assert m["start"] >= 15.46, "ne doit jamais reculer dans la fin du connecteur retire (15.46)"
+    assert m["hook_text"] == "est ce vraiment normal?"
+    assert read_moments(video_dir)["rejected"] == []
+
+
+def test_rescore_of_a_touching_connector_moment_raises_no_error(tmp_path, video_dir, rubric_path):
+    # _restore doit retrouver au centieme, sans erreur, la borne publiee
+    # d'un moment dont le connecteur colle au mot suivant : la re-notation
+    # (bonus visuel, score) est attendue, mais jamais une MomentsError ni un
+    # changement de bornes.
+    set_touching_words(video_dir, 3, [
+        ("Donc", 15.30, 15.46), ("est", 15.46, 15.62), ("ce", 15.62, 15.70),
+        ("vraiment", 15.70, 16.00), ("normal?", 16.00, 16.40),
+    ])
+    run(tmp_path, rubric_path, [{"moments": [moment(15.25, 44.65)]}])
+    before = read_moments(video_dir)
+    write_vision_after_moments(video_dir, [striking(20.0)])
+
+    fake, _ = rescore(tmp_path, rubric_path)
+
+    assert fake.calls == []
+    after = read_moments(video_dir)
+    [m] = after["moments"]
+    assert (m["start"], m["end"], m["hook_text"]) == (15.46, 44.65, "est ce vraiment normal?")
+    [before_m] = before["moments"]
+    assert (before_m["start"], before_m["end"]) == (m["start"], m["end"])
+    assert m["final_score"] == 68.9  # bonus visuel applique par la re-notation
 
 
 # --------------------------------------------------------------------------
@@ -1541,7 +1611,7 @@ def test_single_of_50_s_is_rejected_and_of_90_s_kept(tmp_path, long_video, spec_
     run(tmp_path, spec_rubric, [{"moments": [span_of(60, 69), span_of(100, 117)]}])  # 49.4 s, 89.4 s
 
     data = read_moments(long_video)
-    assert spans(data) == [(500.2, 589.7)]
+    assert spans(data) == [(500.25, 589.65)]
     [r] = data["rejected"]
     assert r["start"] == 300.2 and "duree 49.4 s hors bornes single (60-120 s)" in r["reason"]
 
@@ -1550,7 +1620,7 @@ def test_multipart_of_10_min_is_kept(tmp_path, long_video, spec_rubric):
     run(tmp_path, spec_rubric, [{"moments": [span_of(60, 179, fmt="multipart")]}])  # 599.4 s
 
     [m] = read_moments(long_video)["moments"]
-    assert (m["start"], m["end"], m["format"]) == (300.2, 899.7, "multipart")
+    assert (m["start"], m["end"], m["format"]) == (300.25, 899.65, "multipart")
 
 
 @pytest.mark.parametrize(("last", "duration"), [(419, "1799.4"), (79, "99.4")])
@@ -1573,9 +1643,9 @@ def test_single_inside_a_retained_passage_is_rejected_even_better_scored(tmp_pat
     ]}])
 
     data = read_moments(long_video)
-    assert [(m["start"], m["format"]) for m in data["moments"]] == [(300.2, "multipart")]
+    assert [(m["start"], m["format"]) for m in data["moments"]] == [(300.25, "multipart")]
     [r] = data["rejected"]
-    assert (r["start"], r["final_score"]) == (500.2, 66.9)
+    assert (r["start"], r["final_score"]) == (500.25, 66.9)
     assert "chevauche un passage en serie retenu [300.2-899.7]" in r["reason"]
 
 
@@ -1587,9 +1657,9 @@ def test_passage_under_min_score_leaves_the_single(tmp_path, long_video, spec_ru
     ]}])
 
     data = read_moments(long_video)
-    assert spans(data) == [(500.2, 589.7)]
+    assert spans(data) == [(500.25, 589.65)]
     [r] = data["rejected"]
-    assert r["start"] == 300.2 and "min_score" in r["reason"]
+    assert r["start"] == 300.25 and "min_score" in r["reason"]
 
 
 def test_two_overlapping_passages_keep_the_best_scored(tmp_path, long_video, spec_rubric):
@@ -1599,7 +1669,7 @@ def test_two_overlapping_passages_keep_the_best_scored(tmp_path, long_video, spe
     ]}])
 
     data = read_moments(long_video)
-    assert spans(data) == [(750.2, 1349.7)]
+    assert spans(data) == [(750.25, 1349.65)]
     [r] = data["rejected"]
     assert "chevauche un moment mieux note [750.2-1349.7]" in r["reason"]
 
