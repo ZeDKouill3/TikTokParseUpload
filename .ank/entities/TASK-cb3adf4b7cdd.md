@@ -5,7 +5,7 @@ slug: captions-m-me-titre-de-publication-pour-toutes-l
 title: "captions : même titre de publication pour toutes les parties, suffixé « (Partie N) »"
 created: 2026-09-28T19:02:48Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/captions.py
   - tests/test_captions.py
@@ -15,6 +15,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/58e1bb7749ce@01c9ff2
+    tree: scope/c48d3e40c230
+    criteria: ff8360522fc4
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---

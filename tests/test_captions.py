@@ -95,8 +95,10 @@ def make_config(tmp_path, **captions_overrides):
 
 def answer(title="Titre choc", caption="Une legende qui donne envie.", hashtags=("#un", "#deux"),
            hook_text="quatre mots pour accrocher", screen_title="Info choc \U0001F525",
-           include_screen_title=True):
-    result = {"title": title, "caption": caption, "hashtags": list(hashtags), "hook_text": hook_text}
+           include_screen_title=True, include_title=True):
+    result = {"caption": caption, "hashtags": list(hashtags), "hook_text": hook_text}
+    if include_title:
+        result["title"] = title
     if include_screen_title:
         result["screen_title"] = screen_title
     return result
@@ -151,12 +153,12 @@ def test_multipart_moment_produces_one_clip_per_part_with_context(workspace, tmp
 
     fake, _ = run(
         workspace, make_config(tmp_path),
-        [answer(title="Partie 1"), answer(title="Partie 2", include_screen_title=False)],
+        [answer(title="Grosse histoire"), answer(include_title=False, include_screen_title=False)],
     )
 
     data = read_captions(workspace)
     assert [c["id"] for c in data["clips"]] == ["00-p1", "00-p2"]
-    assert [c["title"] for c in data["clips"]] == ["Partie 1", "Partie 2"]
+    assert [c["title"] for c in data["clips"]] == ["Grosse histoire (Partie 1)", "Grosse histoire (Partie 2)"]
     assert all(c["parts_total"] == 2 for c in data["clips"])
     assert [c["part"] for c in data["clips"]] == [1, 2]
     assert len(fake.calls) == 2
@@ -496,9 +498,9 @@ def test_multipart_screen_title_is_requested_only_once_and_shared_across_parts(w
     fake, _ = run(
         workspace, make_config(tmp_path),
         [
-            answer(title="Partie 1", screen_title="Info choc \U0001F525"),
-            answer(title="Partie 2", include_screen_title=False),
-            answer(title="Partie 3", include_screen_title=False),
+            answer(title="Grosse histoire", screen_title="Info choc \U0001F525"),
+            answer(include_title=False, include_screen_title=False),
+            answer(include_title=False, include_screen_title=False),
         ],
     )
 
@@ -520,8 +522,8 @@ def test_multipart_only_the_first_calls_schema_requires_screen_title(workspace, 
         workspace, make_config(tmp_path),
         [
             answer(screen_title="Info choc \U0001F525"),
-            answer(include_screen_title=False),
-            answer(include_screen_title=False),
+            answer(include_title=False, include_screen_title=False),
+            answer(include_title=False, include_screen_title=False),
         ],
     )
 
@@ -544,7 +546,7 @@ def test_multipart_later_parts_prompt_cites_the_chosen_screen_title_as_context(w
         workspace, make_config(tmp_path),
         [
             answer(screen_title="Info choc \U0001F525"),
-            answer(include_screen_title=False),
+            answer(include_title=False, include_screen_title=False),
         ],
     )
 
@@ -561,3 +563,111 @@ def test_multipart_first_part_failing_writes_nothing(workspace, tmp_path):
     with pytest.raises(llm.TransientLLMError):
         run(workspace, make_config(tmp_path), [llm.TransientLLMError("quota"), answer()])
     assert not (workspace / VIDEO_ID / "captions.json").exists()
+
+
+# --------------------------------------------------------------------------
+# title unique par moment multipart, suffixe " (Partie N)" (TASK-cb3a)
+# --------------------------------------------------------------------------
+
+
+def test_multipart_title_is_requested_once_and_every_part_gets_the_suffix(workspace, tmp_path):
+    write_moments(workspace, moment(0, justification="histoire en 3 actes"))
+    write_parts(
+        workspace,
+        parts_record(0, "multipart", 3, [
+            part(1, 0.0, 1.0), part(2, 5.0, 6.0), part(3, 7.0, 8.0),
+        ]),
+    )
+
+    fake, _ = run(
+        workspace, make_config(tmp_path),
+        [
+            answer(title="Grosse histoire"),
+            answer(include_title=False, include_screen_title=False),
+            answer(include_title=False, include_screen_title=False),
+        ],
+    )
+
+    data = read_captions(workspace)
+    assert [c["title"] for c in data["clips"]] == [
+        "Grosse histoire (Partie 1)", "Grosse histoire (Partie 2)", "Grosse histoire (Partie 3)",
+    ]
+    assert len(fake.calls) == 3
+
+
+def test_multipart_only_the_first_call_schema_requires_title(workspace, tmp_path):
+    write_moments(workspace, moment(0))
+    write_parts(
+        workspace,
+        parts_record(0, "multipart", 3, [
+            part(1, 0.0, 1.0), part(2, 5.0, 6.0), part(3, 7.0, 8.0),
+        ]),
+    )
+
+    fake, _ = run(
+        workspace, make_config(tmp_path),
+        [
+            answer(),
+            answer(include_title=False, include_screen_title=False),
+            answer(include_title=False, include_screen_title=False),
+        ],
+    )
+
+    assert "title" in fake.calls[0].schema["properties"]
+    assert "title" in fake.calls[0].schema["required"]
+    assert "title" not in fake.calls[1].schema["properties"]
+    assert "title" not in fake.calls[1].schema["required"]
+    assert "title" not in fake.calls[2].schema["properties"]
+    assert "title" not in fake.calls[2].schema["required"]
+
+
+def test_multipart_later_parts_prompt_cites_the_chosen_title_as_context(workspace, tmp_path):
+    write_moments(workspace, moment(0))
+    write_parts(
+        workspace,
+        parts_record(0, "multipart", 2, [part(1, 0.0, 1.0), part(2, 5.0, 6.0)]),
+    )
+
+    fake, _ = run(
+        workspace, make_config(tmp_path),
+        [
+            answer(title="Grosse histoire"),
+            answer(include_title=False, include_screen_title=False),
+        ],
+    )
+
+    assert "Grosse histoire" in fake.calls[1].prompt
+
+
+def test_single_clip_title_has_no_suffix(workspace, tmp_path):
+    write_moments(workspace, moment(0))
+    write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
+
+    run(workspace, make_config(tmp_path), [answer(title="Titre unique")])
+
+    assert by_id(read_captions(workspace), "00")["title"] == "Titre unique"
+
+
+def test_multipart_title_max_chars_requested_accounts_for_the_longest_partie_suffix(workspace, tmp_path):
+    write_moments(workspace, moment(0))
+    write_parts(
+        workspace,
+        parts_record(0, "multipart", 3, [
+            part(1, 0.0, 1.0), part(2, 5.0, 6.0), part(3, 7.0, 8.0),
+        ]),
+    )
+    base_title = "123456789"  # 9 caracteres ; " (Partie 3)" = 11 -> total 20 = title_max_chars
+
+    fake, _ = run(
+        workspace, make_config(tmp_path, title_max_chars=20),
+        [
+            answer(title=base_title),
+            answer(include_title=False, include_screen_title=False),
+            answer(include_title=False, include_screen_title=False),
+        ],
+    )
+
+    assert fake.calls[0].schema["properties"]["title"]["maxLength"] == 9
+    data = read_captions(workspace)
+    assert data["clips"][0]["title"] == "123456789 (Partie 1)"
+    assert all(len(c["title"]) <= 20 for c in data["clips"])
