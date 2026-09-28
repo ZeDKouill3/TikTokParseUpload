@@ -55,7 +55,12 @@ ou le sort (retenu ou non) a change.
 Le LLM ne fait que proposer des bornes et noter chaque critere de 0 a 10 ;
 tout le reste est fait ici, de facon verifiable :
 1. bornes recalees sur les frontieres de phrase les plus proches (debut du
-   premier mot, fin du dernier : ni mot coupe ni silence en bord) ;
+   premier mot, fin du dernier : ni mot coupe ni silence en bord) ; si la
+   premiere phrase s'ouvre sur des connecteurs qui supposent la phrase
+   d'avant (``leading_connectors`` : donc, mais, du coup...), ils sont
+   retires : le clip commence au mot qui suit et ``hook_text`` sans eux.
+   Phrase reduite a ses connecteurs, ou duree hors bornes apres retrait :
+   rejet motive. Fait avant le jury, qui note donc les bornes finales ;
 2. rejet des moments qui chevauchent un segment SponsorBlock exclu ou dont
    la duree sort des bornes de la grille ;
 3. score final = moyenne ponderee des notes x10 + bonus plafonne des signaux
@@ -76,6 +81,7 @@ from __future__ import annotations
 import json
 import math
 import random
+import re
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -103,6 +109,15 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "exploration_share": 0.1,
     # Graine du tirage qui departage les candidats de meme dispersion.
     "exploration_seed": 0,
+    # Connecteurs de tete qui supposent la phrase d'avant : en tete de la
+    # premiere phrase d'un candidat, ils sont retires et le clip commence au
+    # mot qui suit (casse et ponctuation ignorees ; locutions de plusieurs
+    # mots comprises). [] : regle desactivee.
+    "leading_connectors": [
+        "donc", "mais", "et", "alors", "du coup", "en fait", "parce que", "sauf que",
+        "par contre", "puis", "ensuite", "pourtant", "sinon", "car", "en plus",
+        "d'ailleurs", "bon ben", "c'est pour ça que",
+    ],
 }
 
 FORMATS = ("single", "multipart")
@@ -177,6 +192,8 @@ class Sentence:
     start: float
     end: float
     text: str
+    # (debut, texte) de chaque mot ; vide si whisper n'a pas horodate les mots.
+    words: tuple[tuple[float, str], ...] = ()
 
 
 def _floor1(x: float) -> float:
@@ -203,7 +220,7 @@ def split_sentences(transcript: dict[str, Any]) -> list[Sentence]:
     def flush(words: list[dict[str, Any]]) -> None:
         text = "".join(w["word"] for w in words).strip()
         if text:
-            out.append(Sentence(words[0]["start"], words[-1]["end"], text))
+            out.append(Sentence(words[0]["start"], words[-1]["end"], text, tuple((w["start"], w["word"]) for w in words)))
 
     for seg in transcript.get("segments", []):
         words = seg.get("words") or []
@@ -220,6 +237,42 @@ def split_sentences(transcript: dict[str, Any]) -> list[Sentence]:
         if current:
             flush(current)
     return out
+
+
+def _token(word: str) -> str:
+    """Un mot compare aux connecteurs : minuscules, apostrophe droite, sans
+    ponctuation autour."""
+    return re.sub(r"^[\W_]+|[\W_]+$", "", word.casefold().replace("’", "'"))
+
+
+Connectors = list[tuple[str, tuple[str, ...]]]
+
+
+def _connectors(settings: dict[str, Any]) -> Connectors:
+    """(connecteur, ses mots) de ``leading_connectors``, locutions les plus
+    longues d'abord ; un reglage invalide est une MomentsError."""
+    value = settings["leading_connectors"]
+    if not isinstance(value, list) or not all(isinstance(c, str) and c.split() for c in value):
+        raise MomentsError(
+            f"[moments] leading_connectors invalide : {value!r} (attendu : liste de connecteurs non vides)"
+        )
+    words = {tuple(_token(w) for w in c.split()) for c in value}
+    return sorted(((" ".join(w), w) for w in words), key=lambda c: (-len(c[1]), c[0]))
+
+
+def _leading_connectors(words: list[str], connectors: Connectors) -> tuple[list[str], int]:
+    """(connecteurs de tete trouves, indice du premier mot qui les suit) ;
+    la ponctuation seule entre eux est sautee. ([], 0) sans connecteur."""
+    tokens = [_token(w) for w in words]
+    found: list[str] = []
+    i = 0
+    while True:
+        k = next((k for k in range(i, len(tokens)) if tokens[k]), len(tokens))
+        match = next((c for c in connectors if tuple(tokens[k : k + len(c[1])]) == c[1]), None)
+        if match is None:
+            return found, (k if found else 0)
+        found.append(match[0])
+        i = k + len(match[1])
 
 
 def _line(s: Sentence) -> str:
@@ -467,10 +520,16 @@ def _moments_prompt(context: str, rubric: dict[str, Any], lines: list[str], part
     )
 
 
+def _text(c: dict[str, Any], sents: list[Sentence]) -> str:
+    """Texte d'un candidat tel que le clip le dira : sa premiere phrase
+    commence a ``hook_text`` (connecteurs de tete retires)."""
+    return " ".join([c["hook_text"], *(s.text for s in sents[c["_first"] + 1 : c["_last"] + 1])])
+
+
 def _comparison_prompt(context: str, rubric: dict[str, Any], candidates: list[dict[str, Any]], sents: list[Sentence]) -> str:
     blocks = []
     for n, c in enumerate(candidates):
-        text = " ".join(s.text for s in sents[c["_first"] : c["_last"] + 1])
+        text = _text(c, sents)
         blocks.append(f"### id {n} [{_span(c['_start'], c['_end'])}] {c['format']}\n{text}")
     return (
         _ROLE
@@ -496,7 +555,8 @@ def _nearest(indices: range, target: float, key) -> int:
 
 
 def _normalize(
-    raw: dict[str, Any], sents: list[Sentence], rubric: dict[str, Any], excluded: list[dict[str, Any]]
+    raw: dict[str, Any], sents: list[Sentence], rubric: dict[str, Any], excluded: list[dict[str, Any]],
+    connectors: Connectors,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     """(candidat recale, None) ou (None, rejet motive)."""
 
@@ -512,6 +572,17 @@ def _normalize(
     first = _nearest(range(len(sents)), raw["start"], lambda k: sents[k].start)
     last = _nearest(range(first, len(sents)), raw["end"], lambda k: sents[k].end)
     start, end = sents[first].start, sents[last].end
+    hook_text, cut = sents[first].text, ""
+    words = sents[first].words
+    found, k = _leading_connectors([w for _, w in words] or sents[first].text.split(), connectors)
+    if found:
+        cut = " + ".join(f"« {c} »" for c in found)
+        if not words:
+            return reject(f"commence sur le connecteur {cut}, sans horodatage des mots pour le retirer", start, end)
+        if k >= len(words):
+            return reject(f"premiere phrase reduite au connecteur {cut}", start, end)
+        start, hook_text = words[k][0], "".join(w for _, w in words[k:]).strip()
+        cut = f" apres retrait du connecteur {cut}"
 
     for seg in excluded:
         if start < seg["end_time"] and seg["start_time"] < end:
@@ -531,7 +602,7 @@ def _normalize(
         low, high = d["min_parts"] * d["part_min"] - tol, math.inf
         bounds = f">= {d['min_parts'] * d['part_min']} s"
     if not low <= duration <= high:
-        return reject(f"duree {duration:.1f} s hors bornes {raw['format']} ({bounds})", start, end)
+        return reject(f"duree {duration:.1f} s hors bornes {raw['format']} ({bounds}){cut}", start, end)
 
     parts: list[dict[str, float]] = []
     if raw["format"] == "multipart" and raw["part_breaks"] and last > first:
@@ -541,6 +612,7 @@ def _normalize(
             {"start": _floor1(sents[a + 1].start), "end": _ceil1(sents[b].end)}
             for a, b in zip(bounds_idx, bounds_idx[1:])
         ]
+        parts[0]["start"] = _floor1(start)
 
     return {
         "_first": first,
@@ -551,7 +623,7 @@ def _normalize(
         "parts": parts,
         "scores": raw["scores"],
         "justification": raw["justification"],
-        "hook_text": sents[first].text,
+        "hook_text": hook_text,
     }, None
 
 
@@ -696,7 +768,7 @@ def _judge(
     items = [
         {
             "id": f"m{n}",
-            "text": " ".join(s.text for s in sents[c["_first"] : c["_last"] + 1]),
+            "text": _text(c, sents),
             "context": f"[{_span(c['_start'], c['_end'])}] s, {c['format']}",
         }
         for n, c in enumerate(candidates)
@@ -795,6 +867,7 @@ def run(
     settings = _settings(config)
     selection = _selection(config, settings)
     exploration = _exploration(settings) if selection == "jury" else None
+    connectors = _connectors(settings)
     rubric_path = Path(settings["rubric_path"])
     rubric = load_rubric(rubric_path)
     examples = list(examples or [])
@@ -822,7 +895,7 @@ def run(
     rejected: list[dict[str, Any]] = []
     seen: set[tuple[int, int]] = set()
     for raw in raws:
-        candidate, rejection = _normalize(raw, sents, rubric, excluded)
+        candidate, rejection = _normalize(raw, sents, rubric, excluded, connectors)
         if rejection is not None:
             rejected.append(rejection)
         elif (candidate["_first"], candidate["_last"]) not in seen:
@@ -878,19 +951,27 @@ def _write(out: Path, result: dict[str, Any]) -> None:
     tmp.replace(out)
 
 
-def _restore(entry: dict[str, Any], sents: list[Sentence], retained: bool) -> dict[str, Any]:
+def _restore(
+    entry: dict[str, Any], sents: list[Sentence], retained: bool, connectors: Connectors
+) -> dict[str, Any]:
     """Candidat enregistre dans moments.json, avec ses bornes exactes
     retrouvees sur les phrases de la transcription (les bornes publiques sont
-    arrondies au dixieme et creeraient de faux chevauchements)."""
-    first = _nearest(range(len(sents)), entry["start"], lambda k: sents[k].start)
+    arrondies au dixieme et creeraient de faux chevauchements). Le debut est
+    celui de sa premiere phrase ou, connecteurs de tete retires, du mot qui
+    les suit."""
+    first = max((k for k in range(len(sents)) if _floor1(sents[k].start) <= entry["start"]), default=0)
     last = _nearest(range(first, len(sents)), entry["end"], lambda k: sents[k].end)
-    if (_floor1(sents[first].start), _ceil1(sents[last].end)) != (entry["start"], entry["end"]):
+    start = sents[first].start
+    found, k = _leading_connectors([w for _, w in sents[first].words], connectors)
+    if found and k < len(sents[first].words) and _floor1(sents[first].words[k][0]) == entry["start"]:
+        start = sents[first].words[k][0]
+    if (_floor1(start), _ceil1(sents[last].end)) != (entry["start"], entry["end"]):
         raise MomentsError(
             f"moment [{entry['start']}-{entry['end']}] de moments.json hors des frontieres de phrase "
             "de transcript.json : re-notation impossible, relancer moments avec --force"
         )
     return {
-        "_start": sents[first].start,
+        "_start": start,
         "_end": sents[last].end,
         "_before": {"final_score": entry["final_score"], "retained": retained},
         **{k: entry[k] for k in ("format", "parts", "scores", "bonus", "final_score", "justification", "hook_text")},
@@ -910,12 +991,13 @@ def _rescore(video_dir: Path, out: Path, settings: dict[str, Any]) -> Path:
     previous = _read_json(out)
     vision = _read_json(video_dir / "vision.json")
     sents = split_sentences(_read_json(video_dir / "transcript.json"))
+    connectors = _connectors(settings)
     rubric_path = Path(settings["rubric_path"])
     rubric = load_rubric(rubric_path)
     b = rubric["bonus"]
 
-    candidates = [_restore(m, sents, True) for m in previous["moments"]]
-    candidates += [_restore(r, sents, False) for r in previous["rejected"] if "final_score" in r]
+    candidates = [_restore(m, sents, True, connectors) for m in previous["moments"]]
+    candidates += [_restore(r, sents, False, connectors) for r in previous["rejected"] if "final_score" in r]
     unscored = [r for r in previous["rejected"] if "final_score" not in r]
     for c in candidates:
         old = c["bonus"]
