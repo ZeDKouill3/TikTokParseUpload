@@ -83,6 +83,74 @@ def write_black_clip(output_dir, *, black_seconds, segment_seconds=1.0, clip_id=
     return d / f"{clip_id}.json"
 
 
+LETTERBOX_RECT = {"x": 0, "y": 440, "w": 1080, "h": 790}
+
+
+def make_letterbox_mp4(path, *, black_seconds, segment_seconds=1.0, size="1080x1920", video_rect=LETTERBOX_RECT):
+    """Video synthetique letterbox : fond blanc (encadre du titre d'ecran
+    compris) sur tout le cadre, avec un rectangle rouge/noir/rouge dessine
+    dans ``video_rect`` seulement -> le noir n'occupe qu'une fraction du
+    cadre entier (la part blanche domine), seul un blackdetect restreint a
+    ``video_rect`` peut le voir."""
+    total = round(segment_seconds * 2 + black_seconds, 3)
+    x, y, w, h = video_rect["x"], video_rect["y"], video_rect["w"], video_rect["h"]
+
+    def seg(color, dur):
+        return f"color=c=white:s={size}:r=30:d={dur},drawbox=x={x}:y={y}:w={w}:h={h}:color={color}:t=fill"
+
+    args = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-f", "lavfi", "-i", seg("red", segment_seconds),
+        "-f", "lavfi", "-i", seg("black", black_seconds),
+        "-f", "lavfi", "-i", seg("red", segment_seconds),
+        "-f", "lavfi", "-i", f"sine=frequency=440:sample_rate=48000:duration={total}",
+        "-filter_complex", "[0:v][1:v][2:v]concat=n=3:v=1:a=0[v]",
+        "-map", "[v]", "-map", "3:a",
+        "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-t", str(total),
+        "-c:a", "aac", "-ar", "48000", str(path),
+    ]
+    subprocess.run(args, check=True)
+    return total
+
+
+def write_letterbox_clip(
+    output_dir, *, black_seconds, segment_seconds=1.0, clip_id=CLIP_ID, size="1080x1920", video_rect=LETTERBOX_RECT,
+):
+    d = output_dir / VIDEO_ID
+    total = make_letterbox_mp4(
+        d / f"{clip_id}.mp4", black_seconds=black_seconds, segment_seconds=segment_seconds,
+        size=size, video_rect=video_rect,
+    )
+    (d / f"{clip_id}.json").write_text(
+        json.dumps(clip_json(
+            duration=total, clip_id=clip_id, layout="letterbox", video_rect=video_rect,
+            screen_title="Il ouvre la porte",
+        )),
+        encoding="utf-8",
+    )
+    return d / f"{clip_id}.json"
+
+
+def write_clip_letterbox(
+    output_dir, clip_id=CLIP_ID, *, video_rect=LETTERBOX_RECT,
+    screen_title="Il ouvre la porte, regarde bien", hook_text="ignore-moi", **mp4_kwargs
+):
+    """Clip letterbox sans video specifique (aucun controle blackdetect
+    teste ici) : sert aux tests de prompt/schema envoyes a l'IA."""
+    d = output_dir / VIDEO_ID
+    colors = mp4_kwargs.get("colors", ("red",))
+    duration = mp4_kwargs.get("seg", 1.5) * len(colors)
+    make_mp4(d / f"{clip_id}.mp4", **mp4_kwargs)
+    (d / f"{clip_id}.json").write_text(
+        json.dumps(clip_json(
+            duration=duration, clip_id=clip_id, layout="letterbox", video_rect=video_rect,
+            screen_title=screen_title, hook_text=hook_text,
+        )),
+        encoding="utf-8",
+    )
+    return d / f"{clip_id}.json"
+
+
 def clip_json(duration=3.0, **overrides):
     """Le sidecar tel que l'ecrit clipper/render.py (SPEC-350f)."""
     data = {
@@ -410,3 +478,64 @@ def test_ffmpeg_failure_on_black_detection_raises_no_fallback_verdict(tmp_path, 
         with pytest.raises(qa.QAError):
             run(tmp_path, workspace, output, ffmpeg_bin="ffmpeg-binaire-absent")
     assert path.read_text(encoding="utf-8") == before
+
+
+# --------------------------------------------------------------------------
+# TASK-2fc8 : controles adaptes au format letterbox (SPEC-6127)
+# --------------------------------------------------------------------------
+
+
+def test_letterbox_schema_excludes_face_cut_and_subtitle_on_face(tmp_path, dirs):
+    workspace, output = dirs
+    write_clip_letterbox(output)
+    fake = FakeBackend([no_issue])
+    with llm.use_backend(fake):
+        run(tmp_path, workspace, output)
+    enum = fake.calls[0].schema["properties"]["issues"]["items"]["properties"]["type"]["enum"]
+    assert set(enum) == {"starts_mid_sentence", "weak_hook"}
+
+
+def test_letterbox_prompt_uses_screen_title_not_hook_and_describes_format(tmp_path, dirs):
+    workspace, output = dirs
+    write_clip_letterbox(output, screen_title="Alerte ceci va vous surprendre", hook_text="ignore-moi")
+    fake = FakeBackend([no_issue])
+    with llm.use_backend(fake):
+        run(tmp_path, workspace, output)
+    prompt = fake.calls[0].prompt
+    assert "Alerte ceci va vous surprendre" in prompt
+    assert "ignore-moi" not in prompt
+    assert "encadre blanc" in prompt
+    assert "video" in prompt.lower()
+    assert "sous-titres" in prompt
+
+
+def test_letterbox_without_video_rect_raises(tmp_path, dirs):
+    workspace, output = dirs
+    path = write_clip(output)  # layout "single" par defaut, sans video_rect
+    data = read(path)
+    data["layout"] = "letterbox"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    before = path.read_text(encoding="utf-8")
+    with llm.use_backend(FakeBackend([])):
+        with pytest.raises(qa.QAError):
+            run(tmp_path, workspace, output)
+    assert path.read_text(encoding="utf-8") == before
+
+
+def test_letterbox_black_screen_measured_on_video_rect_only(tmp_path, dirs):
+    workspace, output = dirs
+    path = write_letterbox_clip(output, black_seconds=1.5)
+    with llm.use_backend(FakeBackend([no_issue])):
+        run(tmp_path, workspace, output)
+    assert local_types(path) == {"black_screen"}
+    assert read(path)["qa"]["status"] == "rejected"
+    assert read(path)["ready"] is False
+
+
+def test_letterbox_short_black_in_video_rect_is_not_rejected(tmp_path, dirs):
+    workspace, output = dirs
+    path = write_letterbox_clip(output, black_seconds=0.4)
+    with llm.use_backend(FakeBackend([no_issue])):
+        run(tmp_path, workspace, output)
+    assert "black_screen" not in local_types(path)
+    assert read(path)["qa"]["status"] == "passed"

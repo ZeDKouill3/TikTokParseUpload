@@ -1,4 +1,4 @@
-"""Etape qa : controle qualite de chaque clip rendu (SPEC-350f), avis de
+"""Etape qa : controle qualite de chaque clip rendu (SPEC-6127), avis de
 clipper.llm (usage ``qa``) complete de verifications mecaniques locales.
 
 Entrees : output/<video_id>/<clip_id>.mp4 et output/<video_id>/<clip_id>.json
@@ -10,17 +10,23 @@ Pour chaque clip :
   apres chaque changement de plan, detecte par ecart d'histogramme HSV entre
   images successives), ecrites en JPEG sous workspace/<video_id>/qa/<clip_id>/ ;
 - l'IA recoit ces images (jamais la video ni l'audio - ADR-b1c1), le texte
-  d'accroche et la transcription du clip (champ ``transcript`` du JSON), et
+  d'accroche (ou, en letterbox, le titre d'ecran ``screen_title``, affiche en
+  permanence) et la transcription du clip (champ ``transcript`` du JSON), et
   liste les defauts parmi : visage coupe (face_cut), sous-titre sur un visage
   (subtitle_on_face), debut en milieu de phrase (starts_mid_sentence),
-  accroche faible (weak_hook) ;
+  accroche faible (weak_hook). En letterbox (``layout`` = "letterbox" dans le
+  JSON), face_cut et subtitle_on_face ne sont plus demandes : le zoom fixe
+  rogne volontairement les bords et les sous-titres sont hors de l'image ;
 - verifications locales par ffprobe/ffmpeg : duree reelle vs ``duration`` du
   JSON, resolution attendue (1080x1920), silence initial superieur au seuil
   (1 s par defaut ; pas de piste audio = silence), ecran noir (black_screen)
-  detecte par ffmpeg blackdetect sur le mp4 rendu : rejete seulement si une
-  plage noire dure au moins ``black_min_seconds`` (1 s par defaut ; seuils
-  de pixel ``black_pixel_threshold`` et de part d'image noire
-  ``black_picture_ratio`` aussi reglables).
+  detecte par ffmpeg blackdetect sur le mp4 rendu (en letterbox, mesure
+  seulement sur ``video_rect`` : l'encadre blanc du titre d'ecran empecherait
+  sinon toute detection) : rejete seulement si une plage noire dure au moins
+  ``black_min_seconds`` (1 s par defaut ; seuils de pixel
+  ``black_pixel_threshold`` et de part d'image noire ``black_picture_ratio``
+  aussi reglables). Un clip letterbox sans ``video_rect`` est une erreur
+  explicite (render l'ecrit toujours en letterbox).
 
 Sortie : le JSON du clip est mis a jour en place :
 
@@ -86,6 +92,11 @@ DEFECTS: dict[str, str] = {
     "starts_mid_sentence": "le clip commence au milieu d'une phrase",
     "weak_hook": "l'accroche (texte affiche et premiers mots) ne donne pas envie de rester",
 }
+
+# En letterbox, le zoom fixe rogne volontairement les bords et les
+# sous-titres sont hors de l'image (bande floue du bas) : ces deux defauts
+# ne sont plus demandes a l'IA (SPEC-6127).
+_LETTERBOX_EXCLUDED_DEFECTS = {"face_cut", "subtitle_on_face"}
 
 _CHECKED = ("passed", "rejected")
 
@@ -154,17 +165,25 @@ _BLACKDETECT_RE = re.compile(
 )
 
 
-def _black_segments(mp4: Path, settings: dict[str, Any], ffmpeg_bin: str) -> list[dict[str, Any]]:
+def _black_segments(
+    mp4: Path, settings: dict[str, Any], ffmpeg_bin: str, crop: tuple[int, int, int, int] | None = None,
+) -> list[dict[str, Any]]:
     """Plages noires du mp4 rendu (ffmpeg blackdetect), au moins
     ``black_min_seconds`` chacune ; une transition de montage courte dans la
-    source ne doit pas en produire."""
+    source ne doit pas en produire. En letterbox, ``crop`` restreint la
+    mesure a ``video_rect`` (x, y, w, h) : sinon l'encadre blanc du titre
+    d'ecran empeche toute detection (SPEC-6127)."""
+    vf = (
+        f"blackdetect=d={float(settings['black_min_seconds'])}"
+        f":pic_th={float(settings['black_picture_ratio'])}"
+        f":pix_th={float(settings['black_pixel_threshold'])}"
+    )
+    if crop is not None:
+        x, y, w, h = crop
+        vf = f"crop={w}:{h}:{x}:{y}," + vf
     cmd = [
         ffmpeg_bin, "-v", "info", "-i", str(mp4),
-        "-vf", (
-            f"blackdetect=d={float(settings['black_min_seconds'])}"
-            f":pic_th={float(settings['black_picture_ratio'])}"
-            f":pix_th={float(settings['black_pixel_threshold'])}"
-        ),
+        "-vf", vf,
         "-an", "-f", "null", "-",
     ]
     try:
@@ -184,7 +203,29 @@ def _black_segments(mp4: Path, settings: dict[str, Any], ffmpeg_bin: str) -> lis
     ]
 
 
-def _local_issues(mp4: Path, clip: dict[str, Any], settings: dict[str, Any], ffmpeg_bin: str, ffprobe_bin: str) -> list[dict[str, Any]]:
+def _video_rect(clip: dict[str, Any]) -> tuple[int, int, int, int] | None:
+    """``video_rect`` (panneau main, pixels de sortie) pour un clip letterbox,
+    ou ``None`` hors letterbox. Un clip letterbox sans ``video_rect`` valide
+    est une erreur explicite (render l'ecrit toujours en letterbox -
+    SPEC-6127) : jamais mesurer l'ecran noir sur l'image entiere, l'encadre
+    blanc du titre d'ecran empecherait toute detection."""
+    if clip.get("layout") != "letterbox":
+        return None
+    rect = clip.get("video_rect")
+    if not isinstance(rect, dict) or not {"x", "y", "w", "h"} <= set(rect):
+        raise QAError(
+            f"clip {clip.get('clip_id')} en layout letterbox sans video_rect valide : relancer render --force"
+        )
+    try:
+        return tuple(int(rect[k]) for k in ("x", "y", "w", "h"))
+    except (TypeError, ValueError) as exc:
+        raise QAError(f"clip {clip.get('clip_id')} : video_rect invalide {rect!r}") from exc
+
+
+def _local_issues(
+    mp4: Path, clip: dict[str, Any], settings: dict[str, Any], ffmpeg_bin: str, ffprobe_bin: str,
+    crop: tuple[int, int, int, int] | None = None,
+) -> list[dict[str, Any]]:
     info = _probe(mp4, ffprobe_bin)
     streams = info.get("streams", [])
     issues: list[dict[str, Any]] = []
@@ -209,7 +250,7 @@ def _local_issues(mp4: Path, clip: dict[str, Any], settings: dict[str, Any], ffm
             "source": "local",
         })
 
-    issues += _black_segments(mp4, settings, ffmpeg_bin)
+    issues += _black_segments(mp4, settings, ffmpeg_bin, crop=crop)
 
     max_silence = float(settings["max_leading_silence"])
     if not any(s.get("codec_type") == "audio" for s in streams):
@@ -331,9 +372,12 @@ def _extract_frames(mp4: Path, dest: Path, settings: dict[str, Any]) -> list[tup
 # --------------------------------------------------------------------------
 
 
-def response_schema() -> dict[str, Any]:
+def response_schema(letterbox: bool = False) -> dict[str, Any]:
     """Ce que le LLM renvoie pour un clip : la liste de ses defauts (vide si
-    le clip est bon)."""
+    le clip est bon). En letterbox, face_cut et subtitle_on_face sont hors
+    enum : le zoom fixe rogne volontairement les bords et les sous-titres
+    sont hors de l'image (SPEC-6127)."""
+    defect_types = [d for d in DEFECTS if not (letterbox and d in _LETTERBOX_EXCLUDED_DEFECTS)]
     return {
         "type": "object",
         "properties": {
@@ -342,7 +386,7 @@ def response_schema() -> dict[str, Any]:
                 "items": {
                     "type": "object",
                     "properties": {
-                        "type": {"type": "string", "enum": list(DEFECTS)},
+                        "type": {"type": "string", "enum": defect_types},
                         "detail": {
                             "type": "string", "minLength": 1,
                             "description": "Ce qui est vu, et sur quelle image.",
@@ -359,20 +403,34 @@ def response_schema() -> dict[str, Any]:
     }
 
 
-def _prompt(clip: dict[str, Any], frames: list[tuple[Path, float, list[str]]]) -> str:
-    defects = "\n".join(f"- {key} : {text}" for key, text in DEFECTS.items())
+def _prompt(clip: dict[str, Any], frames: list[tuple[Path, float, list[str]]], letterbox: bool = False) -> str:
+    defect_keys = [d for d in DEFECTS if not (letterbox and d in _LETTERBOX_EXCLUDED_DEFECTS)]
+    defects = "\n".join(f"- {key} : {DEFECTS[key]}" for key in defect_keys)
     images = "\n".join(
         f"Image {k} : t={t:.2f} s ({', '.join(labels)})" for k, (_, t, labels) in enumerate(frames, 1)
     )
+    if letterbox:
+        format_line = (
+            "## Format\n"
+            "Clip letterbox : titre d'ecran sur encadre blanc en haut, video zoomee au centre "
+            "(fond flou de la video autour), sous-titres dans la bande du bas. Le zoom rogne "
+            "volontairement les bords et les sous-titres sont hors de l'image : normal, ne "
+            "pas le signaler.\n\n"
+        )
+        hook_line = f"Titre d'ecran affiche en permanence (accroche) : {clip.get('screen_title', '')}\n"
+    else:
+        format_line = ""
+        hook_line = f"Texte d'accroche affiche les 2 premieres secondes : {clip.get('hook_text', '')}\n"
     return (
         "Tu fais le controle qualite d'un clip vertical TikTok deja rendu, avant publication.\n"
         "Tu vois des images fixes extraites du clip et sa transcription ; signale uniquement "
         "les defauts reellement visibles ou lisibles, parmi :\n"
         f"{defects}\n\n"
         "Un clip sans defaut rend une liste vide. En cas de doute franc, signale le defaut.\n\n"
+        f"{format_line}"
         "## Clip\n"
         f"Duree : {float(clip['duration']):.1f} s ; langue : {clip.get('language') or '?'}\n"
-        f"Texte d'accroche affiche les 2 premieres secondes : {clip.get('hook_text', '')}\n"
+        f"{hook_line}"
         f"Titre : {clip.get('title', '')}\n\n"
         "## Images jointes, dans cet ordre\n"
         f"{images}\n\n"
@@ -412,13 +470,18 @@ def check_clip(
     """Controle un clip rendu et reecrit son JSON avec ``qa`` et ``ready`` ;
     renvoie le champ ``qa``."""
     clip = json.loads(json_path.read_text(encoding="utf-8"))
+    letterbox = clip.get("layout") == "letterbox"
+    crop = _video_rect(clip)
     mp4 = json_path.with_suffix(".mp4")
     if not mp4.exists():
         raise QAError(f"video du clip absente : {mp4}")
 
-    issues = _local_issues(mp4, clip, settings, ffmpeg_bin, ffprobe_bin)
+    issues = _local_issues(mp4, clip, settings, ffmpeg_bin, ffprobe_bin, crop=crop)
     frames = _extract_frames(mp4, frames_dir, settings)
-    answer = llm.ask("qa", _prompt(clip, frames), [p for p, _, _ in frames], response_schema(), config=config)
+    answer = llm.ask(
+        "qa", _prompt(clip, frames, letterbox=letterbox), [p for p, _, _ in frames],
+        response_schema(letterbox=letterbox), config=config,
+    )
     issues = [{**issue, "source": "llm"} for issue in answer["issues"]] + issues
 
     status = "rejected" if issues else "passed"
