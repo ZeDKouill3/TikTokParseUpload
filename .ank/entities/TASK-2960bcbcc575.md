@@ -5,7 +5,7 @@ slug: qa-cran-noir-mesur-localement-un-fondu-court-de
 title: "qa : écran noir mesuré localement, un fondu court de la source n'est pas un rejet"
 created: 2026-09-28T17:14:44Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/qa.py
   - tests/test_qa.py
@@ -15,6 +15,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/93bd0449499d@b3a2c74
+    tree: scope/571ce9acc3a3
+    criteria: 6bbaf23dde62
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---

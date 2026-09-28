@@ -53,6 +53,36 @@ def make_mp4(path, *, colors=("red",), seg=1.5, size="1080x1920", silence=0.0, a
     return path
 
 
+def make_mp4_with_black(path, *, black_seconds, segment_seconds=1.0, size="1080x1920"):
+    """Video synthetique : un plan rouge, une plage noire de ``black_seconds``,
+    un plan rouge, avec audio continu (pas de silence)."""
+    total = round(segment_seconds * 2 + black_seconds, 3)
+    args = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-f", "lavfi", "-i", f"color=c=red:s={size}:r=30:d={segment_seconds}",
+        "-f", "lavfi", "-i", f"color=c=black:s={size}:r=30:d={black_seconds}",
+        "-f", "lavfi", "-i", f"color=c=red:s={size}:r=30:d={segment_seconds}",
+        "-f", "lavfi", "-i", f"sine=frequency=440:sample_rate=48000:duration={total}",
+        "-filter_complex", "[0:v][1:v][2:v]concat=n=3:v=1:a=0[v]",
+        "-map", "[v]", "-map", "3:a",
+        "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-t", str(total),
+        "-c:a", "aac", "-ar", "48000", str(path),
+    ]
+    subprocess.run(args, check=True)
+    return total
+
+
+def write_black_clip(output_dir, *, black_seconds, segment_seconds=1.0, clip_id=CLIP_ID, size="1080x1920"):
+    d = output_dir / VIDEO_ID
+    total = make_mp4_with_black(
+        d / f"{clip_id}.mp4", black_seconds=black_seconds, segment_seconds=segment_seconds, size=size,
+    )
+    (d / f"{clip_id}.json").write_text(
+        json.dumps(clip_json(duration=total, clip_id=clip_id)), encoding="utf-8"
+    )
+    return d / f"{clip_id}.json"
+
+
 def clip_json(duration=3.0, **overrides):
     """Le sidecar tel que l'ecrit clipper/render.py (SPEC-350f)."""
     data = {
@@ -146,14 +176,15 @@ def test_prompt_carries_clip_transcript_and_hook(tmp_path, dirs):
     assert "Il ouvre la porte" in fake.calls[0].prompt
 
 
-def test_schema_asks_for_the_five_defects(tmp_path, dirs):
+def test_schema_asks_for_the_four_defects_black_screen_excluded(tmp_path, dirs):
     workspace, output = dirs
     write_clip(output)
     fake = FakeBackend([no_issue])
     with llm.use_backend(fake):
         run(tmp_path, workspace, output)
     enum = fake.calls[0].schema["properties"]["issues"]["items"]["properties"]["type"]["enum"]
-    assert set(enum) == {"face_cut", "subtitle_on_face", "starts_mid_sentence", "weak_hook", "black_screen"}
+    assert set(enum) == {"face_cut", "subtitle_on_face", "starts_mid_sentence", "weak_hook"}
+    assert "black_screen" not in qa.DEFECTS
 
 
 # --------------------------------------------------------------------------
@@ -200,7 +231,7 @@ def test_every_rendered_clip_of_the_video_is_checked(tmp_path, dirs):
     workspace, output = dirs
     a = write_clip(output, clip_id="01")
     b = write_clip(output, clip_id="02-p1")
-    bad = {"issues": [{"type": "black_screen", "detail": "noir"}]}
+    bad = {"issues": [{"type": "weak_hook", "detail": "accroche plate"}]}
     with llm.use_backend(FakeBackend([no_issue, bad])):
         run(tmp_path, workspace, output)
     assert read(a)["qa"]["status"] == "passed"
@@ -326,3 +357,56 @@ def test_local_thresholds_come_from_config(tmp_path, dirs):
     with llm.use_backend(FakeBackend([no_issue])):
         qa.run(VIDEO_ID, workspace, output, config=config(tmp_path, max_leading_silence=2.0))
     assert read(path)["qa"]["status"] == "passed"
+
+
+# --------------------------------------------------------------------------
+# TASK-2960 : ecran noir mesure localement (ffmpeg blackdetect), un fondu
+# court de la source n'est pas un rejet
+# --------------------------------------------------------------------------
+
+
+def test_short_black_fade_under_threshold_is_not_rejected(tmp_path, dirs):
+    workspace, output = dirs
+    path = write_black_clip(output, black_seconds=0.4)
+    with llm.use_backend(FakeBackend([no_issue])):
+        run(tmp_path, workspace, output)
+    assert "black_screen" not in local_types(path)
+    assert read(path)["qa"]["status"] == "passed"
+
+
+def test_black_segment_over_threshold_is_rejected_locally(tmp_path, dirs):
+    workspace, output = dirs
+    path = write_black_clip(output, black_seconds=1.5)
+    with llm.use_backend(FakeBackend([no_issue])):
+        run(tmp_path, workspace, output)
+    assert local_types(path) == {"black_screen"}
+    assert read(path)["qa"]["status"] == "rejected"
+    assert read(path)["ready"] is False
+
+
+def test_clip_without_black_frames_has_no_black_screen_issue(tmp_path, dirs):
+    workspace, output = dirs
+    path = write_clip(output, colors=("red", "blue"), seg=1.0)
+    with llm.use_backend(FakeBackend([no_issue])):
+        run(tmp_path, workspace, output)
+    assert "black_screen" not in local_types(path)
+    assert read(path)["qa"]["status"] == "passed"
+
+
+def test_black_min_seconds_is_configurable(tmp_path, dirs):
+    workspace, output = dirs
+    path = write_black_clip(output, black_seconds=1.5)
+    with llm.use_backend(FakeBackend([no_issue])):
+        qa.run(VIDEO_ID, workspace, output, config=config(tmp_path, black_min_seconds=2.0))
+    assert "black_screen" not in local_types(path)
+    assert read(path)["qa"]["status"] == "passed"
+
+
+def test_ffmpeg_failure_on_black_detection_raises_no_fallback_verdict(tmp_path, dirs):
+    workspace, output = dirs
+    path = write_clip(output)
+    before = path.read_text(encoding="utf-8")
+    with llm.use_backend(FakeBackend([no_issue])):
+        with pytest.raises(qa.QAError):
+            run(tmp_path, workspace, output, ffmpeg_bin="ffmpeg-binaire-absent")
+    assert path.read_text(encoding="utf-8") == before

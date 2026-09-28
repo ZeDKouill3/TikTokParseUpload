@@ -13,10 +13,14 @@ Pour chaque clip :
   d'accroche et la transcription du clip (champ ``transcript`` du JSON), et
   liste les defauts parmi : visage coupe (face_cut), sous-titre sur un visage
   (subtitle_on_face), debut en milieu de phrase (starts_mid_sentence),
-  accroche faible (weak_hook), ecran noir (black_screen) ;
+  accroche faible (weak_hook) ;
 - verifications locales par ffprobe/ffmpeg : duree reelle vs ``duration`` du
   JSON, resolution attendue (1080x1920), silence initial superieur au seuil
-  (1 s par defaut ; pas de piste audio = silence).
+  (1 s par defaut ; pas de piste audio = silence), ecran noir (black_screen)
+  detecte par ffmpeg blackdetect sur le mp4 rendu : rejete seulement si une
+  plage noire dure au moins ``black_min_seconds`` (1 s par defaut ; seuils
+  de pixel ``black_pixel_threshold`` et de part d'image noire
+  ``black_picture_ratio`` aussi reglables).
 
 Sortie : le JSON du clip est mis a jour en place :
 
@@ -35,6 +39,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -65,6 +70,14 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "max_shot_frames": 10,
     "frame_width": 540,
     "jpeg_quality": 85,
+    # Duree minimale (s) d'une plage noire (ffmpeg blackdetect) pour rejeter
+    # le clip ; un fondu court de la source ne doit pas suffire.
+    "black_min_seconds": 1.0,
+    # Luminance (0-1) sous laquelle un pixel compte comme noir (blackdetect pix_th).
+    "black_pixel_threshold": 0.10,
+    # Part de pixels noirs (0-1) au-dela de laquelle une image compte comme
+    # noire (blackdetect pic_th).
+    "black_picture_ratio": 0.98,
 }
 
 DEFECTS: dict[str, str] = {
@@ -72,7 +85,6 @@ DEFECTS: dict[str, str] = {
     "subtitle_on_face": "un sous-titre ou un texte incruste recouvre un visage",
     "starts_mid_sentence": "le clip commence au milieu d'une phrase",
     "weak_hook": "l'accroche (texte affiche et premiers mots) ne donne pas envie de rester",
-    "black_screen": "une image est noire ou vide",
 }
 
 _CHECKED = ("passed", "rejected")
@@ -137,6 +149,41 @@ def _leading_silence(mp4: Path, settings: dict[str, Any], ffmpeg_bin: str) -> fl
     return len(samples) / rate
 
 
+_BLACKDETECT_RE = re.compile(
+    r"black_start:(?P<start>[\d.]+) black_end:(?P<end>[\d.]+) black_duration:(?P<duration>[\d.]+)"
+)
+
+
+def _black_segments(mp4: Path, settings: dict[str, Any], ffmpeg_bin: str) -> list[dict[str, Any]]:
+    """Plages noires du mp4 rendu (ffmpeg blackdetect), au moins
+    ``black_min_seconds`` chacune ; une transition de montage courte dans la
+    source ne doit pas en produire."""
+    cmd = [
+        ffmpeg_bin, "-v", "info", "-i", str(mp4),
+        "-vf", (
+            f"blackdetect=d={float(settings['black_min_seconds'])}"
+            f":pic_th={float(settings['black_picture_ratio'])}"
+            f":pix_th={float(settings['black_pixel_threshold'])}"
+        ),
+        "-an", "-f", "null", "-",
+    ]
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except FileNotFoundError as exc:
+        raise QAError(f"ffmpeg introuvable ({ffmpeg_bin})") from exc
+    if proc.returncode != 0:
+        raise QAError(f"ffmpeg a echoue sur {mp4} : {proc.stderr.decode(errors='replace').strip()}")
+    stderr = proc.stderr.decode(errors="replace")
+    return [
+        {
+            "type": "black_screen",
+            "detail": f"ecran noir de {float(m['duration']):.2f} s a partir de {float(m['start']):.2f} s",
+            "source": "local",
+        }
+        for m in _BLACKDETECT_RE.finditer(stderr)
+    ]
+
+
 def _local_issues(mp4: Path, clip: dict[str, Any], settings: dict[str, Any], ffmpeg_bin: str, ffprobe_bin: str) -> list[dict[str, Any]]:
     info = _probe(mp4, ffprobe_bin)
     streams = info.get("streams", [])
@@ -161,6 +208,8 @@ def _local_issues(mp4: Path, clip: dict[str, Any], settings: dict[str, Any], ffm
             "detail": f"duree reelle {actual:.2f} s, {expected:.2f} s annoncee dans le JSON",
             "source": "local",
         })
+
+    issues += _black_segments(mp4, settings, ffmpeg_bin)
 
     max_silence = float(settings["max_leading_silence"])
     if not any(s.get("codec_type") == "audio" for s in streams):
