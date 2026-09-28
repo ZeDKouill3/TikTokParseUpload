@@ -673,10 +673,13 @@ def test_letterbox_plan_gives_its_subtitles_text_zone_to_subtitles(tmp_path):
     assert ass.startswith("; format: letterbox")
     events = [line.split(",", 9) for line in ass.splitlines() if line.startswith("Dialogue:")]
     assert events
+    from clipper.subtitles import CONFIG_DEFAULTS as SUBTITLES_DEFAULTS
+
+    offset = SUBTITLES_DEFAULTS["letterbox_offset_y"]
     for ev in events:
-        # MarginL = x0, MarginR = 1080 - x1, MarginV = y0 (+ pas pour une 2e ligne)
+        # MarginL = x0, MarginR = 1080 - x1, MarginV = y0 + letterbox_offset_y (+ pas pour une 2e ligne)
         assert (int(ev[5]), int(ev[6])) == (200, 1080 - 880)
-        assert int(ev[7]) in (1300, 1300 + 78)
+        assert int(ev[7]) in (1300 + offset, 1300 + offset + 78)
 
 
 @pytest.mark.parametrize("text_zones", [None, {"title": {"x0": 150, "y0": 160, "x1": 930, "y1": 424}}])

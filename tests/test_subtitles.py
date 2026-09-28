@@ -649,7 +649,8 @@ def test_letterbox_two_lines_at_default_size_are_two_dialogues_in_the_default_zo
         assert (ev["margin_l"], ev["margin_r"]) == (150, 1080 - 930)
         assert "\\fs" not in ev["text"]
         assert_ink_in_zone(ev, 120, ZONE)
-    assert [ev["margin_v"] for ev in events] == [1246, 1246 + STEP_68]
+    offset = CONFIG_DEFAULTS["letterbox_offset_y"]
+    assert [ev["margin_v"] for ev in events] == [1246 + offset, 1246 + offset + STEP_68]
 
 
 def test_letterbox_second_line_karaoke_counts_from_the_group_start(tmp_path, video_dir):
@@ -735,6 +736,41 @@ def test_existing_ass_of_another_format_is_not_reused_silently(tmp_path, video_d
     # ...mais pas hors letterbox
     with llm.use_backend(FakeBackend([])), pytest.raises(SubtitlesError, match="--force"):
         run(tmp_path)
+
+
+def test_letterbox_offset_y_default_is_28():
+    assert CONFIG_DEFAULTS["letterbox_offset_y"] == 28
+
+
+def test_letterbox_default_offset_keeps_two_lines_with_commas_and_descenders_at_default_size(tmp_path, video_dir):
+    # virgules (va, quoi, oui) et jambages (garde, quoi -> q, pense -> p) :
+    # le cas le plus expose a un debordement bas cause par le decalage.
+    words = [_word(" ça", 0.0, 0.3), _word(" va,", 0.3, 0.6), _word(" quoi,", 0.6, 0.9),
+             _word(" je", 0.9, 1.0), _word(" pense", 1.0, 1.3), _word(" que", 1.3, 1.4),
+             _word(" oui,", 1.4, 1.8)]
+    path = run_letterbox(tmp_path, video_dir, words=words)
+    events = lb_events(path)
+    assert len(events) == 2
+    assert all("\\fs" not in ev["text"] for ev in events)
+    for ev in events:
+        assert_ink_in_zone(ev, 120, ZONE)
+
+
+def test_letterbox_negative_offset_is_an_explicit_error(tmp_path, video_dir):
+    from clipper.subtitles import SubtitlesError
+
+    with pytest.raises(SubtitlesError):
+        run_letterbox(tmp_path, video_dir, config=make_config(tmp_path, letterbox_offset_y=-1))
+    assert not (tmp_path / "workspace" / VIDEO_ID / "subtitles" / f"{CLIP_ID}.ass").exists()
+
+
+def test_letterbox_offset_at_or_beyond_the_zone_height_is_an_explicit_error(tmp_path, video_dir):
+    from clipper.subtitles import SubtitlesError
+
+    zone_h = ZONE["y1"] - ZONE["y0"]
+    with pytest.raises(SubtitlesError):
+        run_letterbox(tmp_path, video_dir, config=make_config(tmp_path, letterbox_offset_y=zone_h))
+    assert not (tmp_path / "workspace" / VIDEO_ID / "subtitles" / f"{CLIP_ID}.ass").exists()
 
 
 def test_letterbox_config_section_is_accepted_by_clipper_config(tmp_path):

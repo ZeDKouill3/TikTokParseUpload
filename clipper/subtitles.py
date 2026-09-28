@@ -29,7 +29,7 @@ courts, puis un mot seul est reduit par paliers ; s'il ne tient toujours pas,
 c'est une erreur. Chaque ligne est un evenement Dialogue distinct (jamais de
 \\N : libass avance chaque \\N de Fontsize, soit win ascent + descent, sans
 interligne reglable), aligne en haut au centre (\\an8), place a
-``MarginV = y0 + i x pas``. Le .ass letterbox commence par
+``MarginV = y0 + letterbox_offset_y + i x pas``. Le .ass letterbox commence par
 ``; format: letterbox``.
 """
 
@@ -90,6 +90,9 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "letterbox_line_height": 1.15,
     "letterbox_outline": 7,
     "letterbox_max_words_per_group": 8,
+    # Decalage (px) entre le haut de la zone subtitles et la premiere ligne
+    # (TASK-ea6e : les sous-titres etaient trop colles a la video sans lui).
+    "letterbox_offset_y": 28,
 }
 
 EMPHASIS_PROMPT = (
@@ -400,10 +403,17 @@ class _Box:
     entre x0 et x1, ligne i en haut a y0 + i x pas, ligne de base a
     round(em x usWinAscent / unitsPerEm) sous ce haut."""
 
-    def __init__(self, zone: dict[str, int], settings: dict[str, Any]):
+    def __init__(self, zone: dict[str, int], settings: dict[str, Any], where: str = ""):
         self.zone = zone
         self.outline = int(settings["letterbox_outline"])
         self.line_height = float(settings["letterbox_line_height"])
+        self.offset = int(settings["letterbox_offset_y"])
+        zone_h = zone["y1"] - zone["y0"]
+        if not (0 <= self.offset < zone_h):
+            raise SubtitlesError(
+                f"{where} : letterbox_offset_y doit etre dans [0, {zone_h}[ (hauteur de la zone), "
+                f"recu {self.offset}"
+            )
         self.upm, self.ascent, _ = _font_metrics(str(FONT_FILE))
 
     def step(self, size: int) -> int:
@@ -416,7 +426,7 @@ class _Box:
         for i, text in enumerate(lines):
             left, top, right, bottom = font.getbbox(text, anchor="ls")
             x = x0 + (x1 - x0 - font.getlength(text)) / 2
-            baseline = y0 + i * self.step(size) + round(size * self.ascent / self.upm)
+            baseline = y0 + self.offset + i * self.step(size) + round(size * self.ascent / self.upm)
             if x + left - o < x0 or x + right + o > x1:
                 return False
             if baseline + top - o < y0 or baseline + bottom + o > y1:
@@ -487,7 +497,7 @@ def _render_letterbox(
     zone: dict[str, int],
     where: str,
 ) -> str:
-    box = _Box(zone, settings)
+    box = _Box(zone, settings, where)
     size = int(settings["letterbox_font_size"])
     upper = bool(settings["letterbox_uppercase"])
     index = {id(w): i for i, w in enumerate(words)}
@@ -516,7 +526,7 @@ def _render_letterbox(
                 # chevauche un autre du meme layer (detection de collisions)
                 events.append(
                     f"Dialogue: {i},{start},{end},Default,,{zone['x0']},{margin_r},"
-                    f"{zone['y0'] + i * box.step(em)},,{{\\q2\\an8{fs}}}{''.join(runs)}"
+                    f"{zone['y0'] + box.offset + i * box.step(em)},,{{\\q2\\an8{fs}}}{''.join(runs)}"
                 )
 
     style = (
