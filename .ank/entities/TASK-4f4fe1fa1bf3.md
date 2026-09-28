@@ -5,7 +5,7 @@ slug: parts-parties-de-60-120-s-qui-se-suivent-chacune
 title: "parts : parties de 60-120 s qui se suivent, chacune reprend ~3 s de la précédente"
 created: 2026-09-28T20:09:26Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/parts.py
   - tests/test_parts.py
@@ -15,6 +15,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/b92e7c119167@21b9cc5
+    tree: scope/ee9571ff04c3
+    criteria: ce11b2baae3f
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 2
+version: 4
 ---
