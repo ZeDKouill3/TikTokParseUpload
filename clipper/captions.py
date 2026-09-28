@@ -1,5 +1,5 @@
 """Etape captions : titre, legende, hashtags et texte d'accroche par clip
-(SPEC-350f), demandes a clipper.llm (usage ``captions``) dans la langue de
+(SPEC-6127), demandes a clipper.llm (usage ``captions``) dans la langue de
 la video.
 
 Entrees (workspace/<video_id>/) :
@@ -21,7 +21,7 @@ Sortie : workspace/<video_id>/captions.json
                 "hook_text", "screen_title"}]}
 
 ``id`` = ``<moment_id>`` sur 2 chiffres (clip unique) ou
-``<moment_id>-p<part>`` (multipart), ex. ``03-p2`` (SPEC-350f).
+``<moment_id>-p<part>`` (multipart), ex. ``03-p2`` (SPEC-6127).
 
 Pour chaque clip, l'IA recoit le texte prononce dans la partie, l'accroche
 et la justification du moment, et rend titre, legende, hashtags (chacun

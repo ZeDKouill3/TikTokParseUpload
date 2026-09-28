@@ -202,7 +202,7 @@ def test_no_kept_moment_writes_empty_clips_without_calling_the_llm(workspace, tm
 
 
 # --------------------------------------------------------------------------
-# Validation de la reponse (SPEC-350f) : longueurs, hashtags, doublons
+# Validation de la reponse (SPEC-6127) : longueurs, hashtags, doublons
 # --------------------------------------------------------------------------
 
 

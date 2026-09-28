@@ -112,7 +112,7 @@ class QAError(Exception):
 
 def is_ready(clip: dict[str, Any]) -> bool:
     """Un clip n'est pret a publier que s'il a passe le controle qualite
-    (SPEC-350f : un clip rejete ne l'est jamais, quel que soit ``ready``)."""
+    (SPEC-6127 : un clip rejete ne l'est jamais, quel que soit ``ready``)."""
     return clip.get("qa", {}).get("status") == "passed" and clip.get("ready") is True
 
 

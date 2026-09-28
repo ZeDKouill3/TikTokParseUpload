@@ -152,7 +152,7 @@ def write_clip_letterbox(
 
 
 def clip_json(duration=3.0, **overrides):
-    """Le sidecar tel que l'ecrit clipper/render.py (SPEC-350f)."""
+    """Le sidecar tel que l'ecrit clipper/render.py (SPEC-6127)."""
     data = {
         "video_id": VIDEO_ID, "source_url": f"https://www.youtube.com/watch?v={VIDEO_ID}",
         "source_title": "Une video", "clip_id": CLIP_ID, "part": 1, "parts_total": 1,
