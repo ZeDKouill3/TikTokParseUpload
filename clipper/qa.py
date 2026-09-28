@@ -12,10 +12,12 @@ Pour chaque clip :
 - l'IA recoit ces images (jamais la video ni l'audio - ADR-b1c1), le texte
   d'accroche (ou, en letterbox, le titre d'ecran ``screen_title``, affiche en
   permanence) et la transcription du clip (champ ``transcript`` du JSON), et
-  liste les defauts parmi : visage coupe (face_cut), sous-titre sur un visage
-  (subtitle_on_face), debut en milieu de phrase (starts_mid_sentence),
-  accroche faible (weak_hook). En letterbox (``layout`` = "letterbox" dans le
-  JSON), face_cut et subtitle_on_face ne sont plus demandes : le zoom fixe
+  liste les defauts parmi : clip incomprehensible sans ce qui le precede
+  dans la video (incomprehensible, seul defaut bloquant), visage coupe
+  (face_cut), sous-titre sur un visage (subtitle_on_face), debut en milieu de
+  phrase (starts_mid_sentence), accroche faible (weak_hook) ; ces quatre-la
+  ne sont que des avertissements. En letterbox (``layout`` = "letterbox" dans
+  le JSON), face_cut et subtitle_on_face ne sont plus demandes : le zoom fixe
   rogne volontairement les bords et les sous-titres sont hors de l'image ;
   partie 2+ d'une serie (``part`` >= 2 dans le JSON), starts_mid_sentence
   n'est plus demande : la reprise d'environ 3 s de la partie precedente est
@@ -25,8 +27,9 @@ Pour chaque clip :
   (1 s par defaut ; pas de piste audio = silence), ecran noir (black_screen)
   detecte par ffmpeg blackdetect sur le mp4 rendu (en letterbox, mesure
   seulement sur ``video_rect`` : l'encadre blanc du titre d'ecran empecherait
-  sinon toute detection) : rejete seulement si une plage noire dure au moins
-  ``black_min_seconds`` (1 s par defaut ; seuils de pixel
+  sinon toute detection) : signale si une plage noire dure au moins
+  ``black_min_seconds`` (1 s par defaut), bloquant seulement a partir de
+  ``black_block_seconds`` (3 s par defaut) ; seuils de pixel
   ``black_pixel_threshold`` et de part d'image noire ``black_picture_ratio``
   aussi reglables). Un clip letterbox sans ``video_rect`` est une erreur
   explicite (render l'ecrit toujours en letterbox).
@@ -34,10 +37,17 @@ Pour chaque clip :
 Sortie : le JSON du clip est mis a jour en place :
 
     "qa": {"status": "passed" | "rejected",
-           "issues": [{"type", "detail", "source": "llm" | "local"}]},
+           "issues": [{"type", "detail", "source": "llm" | "local",
+                       "severity": "blocking" | "warning"}]},
     "ready": true | false
 
-``rejected`` des qu'il y a un defaut, d'ou qu'il vienne ; ``ready`` n'est
+Un clip rejete casse toute sa serie (les parties se suivent) : ``rejected``
+seulement s'il y a au moins un defaut ``blocking`` (clip incomprehensible, ou
+techniquement casse : duree, resolution, silence initial, ecran noir long) ;
+les ``warning`` restent dans ``issues`` et le clip reste pret. Apres le
+controle de toutes les parties d'une serie (clip_id ``<moment>-p<part>``,
+SPEC-6127), chaque autre partie d'une serie dont une partie est rejetee
+recoit un avertissement ``series_part_rejected`` qui la nomme. ``ready`` n'est
 vrai que pour un clip ``passed`` (voir ``is_ready``, a utiliser par tout
 consommateur). Reponse invalide ou Claude indisponible : l'erreur remonte et
 le JSON n'est pas touche, aucun verdict de secours (ADR-ad2e). Un clip deja
@@ -79,9 +89,13 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "max_shot_frames": 10,
     "frame_width": 540,
     "jpeg_quality": 85,
-    # Duree minimale (s) d'une plage noire (ffmpeg blackdetect) pour rejeter
-    # le clip ; un fondu court de la source ne doit pas suffire.
+    # Duree minimale (s) d'une plage noire (ffmpeg blackdetect) pour la
+    # signaler (avertissement) ; un fondu court de la source ne doit pas suffire.
     "black_min_seconds": 1.0,
+    # Duree (s) a partir de laquelle une plage noire rejette le clip ; entre
+    # black_min_seconds et ce seuil, ce n'est qu'un avertissement (une
+    # transition de documentaire ne doit pas casser une serie).
+    "black_block_seconds": 3.0,
     # Luminance (0-1) sous laquelle un pixel compte comme noir (blackdetect pix_th).
     "black_pixel_threshold": 0.10,
     # Part de pixels noirs (0-1) au-dela de laquelle une image compte comme
@@ -90,11 +104,23 @@ CONFIG_DEFAULTS: dict[str, object] = {
 }
 
 DEFECTS: dict[str, str] = {
+    "incomprehensible": (
+        "sans ce qui precede dans la video, le spectateur ne comprend pas de qui ou de quoi "
+        "il s'agit, ou l'histoire du clip ne se suit pas"
+    ),
     "face_cut": "un visage est coupe par le bord du cadre",
     "subtitle_on_face": "un sous-titre ou un texte incruste recouvre un visage",
     "starts_mid_sentence": "le clip commence au milieu d'une phrase",
     "weak_hook": "l'accroche (texte affiche et premiers mots) ne donne pas envie de rester",
 }
+
+# Seul un clip incomprehensible est rejete par l'IA : les autres defauts
+# signales sont des avertissements (un clip rejete casse toute sa serie).
+_BLOCKING_DEFECTS = {"incomprehensible"}
+
+BLOCKING, WARNING = "blocking", "warning"
+
+SERIES_PART_REJECTED = "series_part_rejected"
 
 # En letterbox, le zoom fixe rogne volontairement les bords et les
 # sous-titres sont hors de l'image (bande floue du bas) : ces deux defauts
@@ -189,7 +215,8 @@ def _black_segments(
 ) -> list[dict[str, Any]]:
     """Plages noires du mp4 rendu (ffmpeg blackdetect), au moins
     ``black_min_seconds`` chacune ; une transition de montage courte dans la
-    source ne doit pas en produire. En letterbox, ``crop`` restreint la
+    source ne doit pas en produire. Bloquante a partir de
+    ``black_block_seconds``, avertissement en dessous. En letterbox, ``crop`` restreint la
     mesure a ``video_rect`` (x, y, w, h) : sinon l'encadre blanc du titre
     d'ecran empeche toute detection (SPEC-6127)."""
     vf = (
@@ -212,11 +239,13 @@ def _black_segments(
     if proc.returncode != 0:
         raise QAError(f"ffmpeg a echoue sur {mp4} : {proc.stderr.decode(errors='replace').strip()}")
     stderr = proc.stderr.decode(errors="replace")
+    block = float(settings["black_block_seconds"])
     return [
         {
             "type": "black_screen",
             "detail": f"ecran noir de {float(m['duration']):.2f} s a partir de {float(m['start']):.2f} s",
             "source": "local",
+            "severity": BLOCKING if float(m["duration"]) >= block else WARNING,
         }
         for m in _BLACKDETECT_RE.finditer(stderr)
     ]
@@ -252,12 +281,14 @@ def _local_issues(
     video = next((s for s in streams if s.get("codec_type") == "video"), None)
     want_w, want_h = int(settings["expected_width"]), int(settings["expected_height"])
     if video is None:
-        issues.append({"type": "resolution", "detail": "aucune piste video", "source": "local"})
+        issues.append({"type": "resolution", "detail": "aucune piste video", "source": "local",
+                       "severity": BLOCKING})
     elif (video.get("width"), video.get("height")) != (want_w, want_h):
         issues.append({
             "type": "resolution",
             "detail": f"{video.get('width')}x{video.get('height')} au lieu de {want_w}x{want_h}",
             "source": "local",
+            "severity": BLOCKING,
         })
 
     actual = float(info.get("format", {}).get("duration", 0.0))
@@ -267,13 +298,15 @@ def _local_issues(
             "type": "duration",
             "detail": f"duree reelle {actual:.2f} s, {expected:.2f} s annoncee dans le JSON",
             "source": "local",
+            "severity": BLOCKING,
         })
 
     issues += _black_segments(mp4, settings, ffmpeg_bin, crop=crop)
 
     max_silence = float(settings["max_leading_silence"])
     if not any(s.get("codec_type") == "audio" for s in streams):
-        issues.append({"type": "leading_silence", "detail": "aucune piste audio", "source": "local"})
+        issues.append({"type": "leading_silence", "detail": "aucune piste audio", "source": "local",
+                       "severity": BLOCKING})
     else:
         silence = _leading_silence(mp4, settings, ffmpeg_bin)
         if silence > max_silence:
@@ -281,6 +314,7 @@ def _local_issues(
                 "type": "leading_silence",
                 "detail": f"{silence:.2f} s de silence au debut (max {max_silence:.2f} s)",
                 "source": "local",
+                "severity": BLOCKING,
             })
     return issues
 
@@ -450,7 +484,9 @@ def _prompt(clip: dict[str, Any], frames: list[tuple[Path, float, list[str]]], l
             f"## Serie\n"
             f"Ce clip est la partie {part} d'une serie de {int(clip.get('parts_total', part))} parties qui "
             "se suivent. Il reprend volontairement les quelques dernieres secondes de la partie precedente "
-            "(recouvrement voulu, SPEC-1557) : ne pas le signaler comme un debut en milieu de phrase.\n\n"
+            "(recouvrement voulu, SPEC-1557) : ne pas le signaler comme un debut en milieu de phrase. "
+            "Le spectateur a vu les parties precedentes : ce qui y a ete presente (personnes, contexte) "
+            "peut etre suppose connu, le clip n'est pas incomprehensible pour ca.\n\n"
         )
     else:
         series_line = ""
@@ -459,7 +495,10 @@ def _prompt(clip: dict[str, Any], frames: list[tuple[Path, float, list[str]]], l
         "Tu vois des images fixes extraites du clip et sa transcription ; signale uniquement "
         "les defauts reellement visibles ou lisibles, parmi :\n"
         f"{defects}\n\n"
-        "Un clip sans defaut rend une liste vide. En cas de doute franc, signale le defaut.\n\n"
+        "Un clip sans defaut rend une liste vide.\n"
+        "Seul incomprehensible est bloquant : le clip est alors rejete, et avec lui toute sa serie. "
+        "Ne le signale que si c'est net. Les autres defauts ne sont que des avertissements "
+        "(le clip reste publiable) : en cas de doute franc, signale-les.\n\n"
         f"{format_line}"
         f"{series_line}"
         "## Clip\n"
@@ -516,13 +555,51 @@ def check_clip(
         "qa", _prompt(clip, frames, letterbox=letterbox), [p for p, _, _ in frames],
         response_schema(letterbox=letterbox, part=int(clip.get("part", 1))), config=config,
     )
-    issues = [{**issue, "source": "llm"} for issue in answer["issues"]] + issues
+    issues = [
+        {**issue, "source": "llm", "severity": BLOCKING if issue["type"] in _BLOCKING_DEFECTS else WARNING}
+        for issue in answer["issues"]
+    ] + issues
 
-    status = "rejected" if issues else "passed"
+    status = "rejected" if any(i["severity"] == BLOCKING for i in issues) else "passed"
     clip["qa"] = {"status": status, "issues": issues}
     clip["ready"] = status == "passed"
     _write_json(json_path, clip)
     return clip["qa"]
+
+
+_PART_ID_RE = re.compile(r"^(?P<moment>.+)-p(?P<part>\d+)$")
+
+
+def _warn_series(clips: list[Path]) -> None:
+    """Une partie rejetee casse sa serie : chaque autre partie controlee du
+    meme moment (clip_id ``<moment>-p<part>``, SPEC-6127) recoit un
+    avertissement ``series_part_rejected`` par partie rejetee, qui la nomme.
+    Recalcule a chaque passage (les anciens avertissements sont retires),
+    donc jamais duplique ; le statut des autres parties ne change pas."""
+    series: dict[str, list[tuple[Path, dict[str, Any]]]] = {}
+    for json_path in clips:
+        match = _PART_ID_RE.match(json_path.stem)
+        if match is None:
+            continue
+        clip = json.loads(json_path.read_text(encoding="utf-8"))
+        if clip.get("qa", {}).get("status") in _CHECKED:
+            series.setdefault(match["moment"], []).append((json_path, clip))
+    for parts in series.values():
+        rejected = [path.stem for path, clip in parts if clip["qa"]["status"] == "rejected"]
+        for json_path, clip in parts:
+            kept = [i for i in clip["qa"]["issues"] if i["type"] != SERIES_PART_REJECTED]
+            warnings = [
+                {
+                    "type": SERIES_PART_REJECTED,
+                    "detail": f"la partie {other} de la serie est rejetee",
+                    "source": "local",
+                    "severity": WARNING,
+                }
+                for other in rejected if other != json_path.stem
+            ]
+            if kept + warnings != clip["qa"]["issues"]:
+                clip["qa"]["issues"] = kept + warnings
+                _write_json(json_path, clip)
 
 
 def run(
@@ -537,7 +614,8 @@ def run(
 ) -> Path:
     """Controle chaque clip rendu de output/<video_id>/ et met a jour son
     JSON ; renvoie ce dossier. Un clip deja controle n'est pas refait, sauf
-    ``force``."""
+    ``force``. Une fois toutes les parties controlees, une partie rejetee
+    est signalee aux autres parties de sa serie (avertissement)."""
     out_dir = Path(output_dir) / video_id
     clips = sorted(out_dir.glob("*.json")) if out_dir.is_dir() else []
     if not clips:
@@ -552,4 +630,5 @@ def run(
             json_path, frames_root / json_path.stem, settings,
             config=config, ffmpeg_bin=ffmpeg_bin, ffprobe_bin=ffprobe_bin,
         )
+    _warn_series(clips)
     return out_dir
