@@ -554,3 +554,237 @@ def test_config_section_is_accepted_by_clipper_config(tmp_path):
     assert section["font_size"] == 110
     assert section["max_words_per_group"] == 3
     assert section["min_words_per_group"] == 2
+
+
+# --------------------------------------------------------------------------
+# TASK-a62e (SPEC-6127) : format letterbox, sous-titres dans la zone
+# text_zones.subtitles du plan de recadrage (bande floue sous l'image).
+# --------------------------------------------------------------------------
+
+FONT_FILE = Path(__file__).resolve().parent.parent / "clipper" / "assets" / "fonts" / "Poppins-ExtraBold.ttf"
+ZONE = {"x0": 150, "y0": 1246, "x1": 930, "y1": 1448}  # zone subtitles par defaut (contrat commun)
+# Poppins ExtraBold : usWinAscent 1135, usWinDescent 627, unitsPerEm 1000.
+STEP_68 = 78        # round(1.15 * 68)
+OUTLINE = 7         # letterbox_outline (maquette)
+
+
+def mock_words():
+    # « il n'a pas fait de garde à vue » : 8 mots, un seul groupe (maquette)
+    return [
+        _word(" il", 0.0, 0.2), _word(" n", 0.2, 0.3), _word("'a", 0.3, 0.4), _word(" pas", 0.4, 0.7),
+        _word(" fait", 0.7, 1.0), _word(" de", 1.0, 1.2), _word(" garde", 1.2, 1.6),
+        _word(" à", 1.6, 1.7), _word(" vue", 1.7, 2.1),
+    ]
+
+
+def write_words(video_dir, words):
+    (video_dir / "transcript.json").write_text(json.dumps(make_transcript(words)), encoding="utf-8")
+
+
+def run_letterbox(tmp_path, video_dir, words=None, zone=None, config=None, **kwargs):
+    write_words(video_dir, words or mock_words())
+    with llm.use_backend(FakeBackend([NO_EMPHASIS])):
+        return Path(run(tmp_path, config=config, start=0.0, end=10.0,
+                        text_zone=dict(zone or ZONE), **kwargs))
+
+
+def lb_events(path: Path) -> list[dict]:
+    events = []
+    for m in re.finditer(r"^Dialogue:\s*(.+)$", path.read_text(encoding="utf-8"), re.MULTILINE):
+        p = m.group(1).split(",", 9)
+        events.append({"start": p[1], "end": p[2], "margin_l": int(p[5]), "margin_r": int(p[6]),
+                       "margin_v": int(p[7]), "text": p[9]})
+    return events
+
+
+def line_text(ev: dict) -> str:
+    return re.sub(r"\{[^}]*\}", "", ev["text"])
+
+
+def font_size_em(ev: dict, style_size: int) -> float:
+    """Taille em d'une ligne : \\fs de l'evenement (unites libass) ou celle du
+    style, ramenee en em (win ascent + descent = 1,762 em)."""
+    m = re.search(r"\\fs(\d+)", ev["text"])
+    return (int(m.group(1)) if m else style_size) / 1.762
+
+
+def assert_ink_in_zone(ev: dict, style_size: int, zone: dict) -> None:
+    """Encre de la ligne (Pillow, contour compris) placee comme libass :
+    centree entre MarginL et 1080 - MarginR, ligne de base a MarginV +
+    ascent Windows ; elle tient dans la zone."""
+    from PIL import ImageFont
+
+    em = font_size_em(ev, style_size)
+    font = ImageFont.truetype(str(FONT_FILE), round(em))
+    text = line_text(ev)
+    left, top, right, bottom = font.getbbox(text, anchor="ls")
+    width = zone["x1"] - zone["x0"]
+    x = zone["x0"] + (width - font.getlength(text)) / 2
+    baseline = ev["margin_v"] + round(em * 1135 / 1000)
+    assert x + left - OUTLINE >= zone["x0"] and x + right + OUTLINE <= zone["x1"], text
+    assert baseline + top - OUTLINE >= zone["y0"] and baseline + bottom + OUTLINE <= zone["y1"], text
+
+
+def test_letterbox_ass_starts_with_a_format_comment_and_uses_libass_font_size(tmp_path, video_dir):
+    path = run_letterbox(tmp_path, video_dir)
+    text = path.read_text(encoding="utf-8")
+    assert text.splitlines()[0] == "; format: letterbox"
+    doc = parse_ass(path)
+    # 68 px d'em -> round(68 * 1762 / 1000) = 120 en unites libass
+    assert doc["style"]["Fontsize"] == "120"
+    assert doc["style"]["Alignment"] == "8"
+    assert doc["info"] == {"PlayResX": "1080", "PlayResY": "1920"}
+
+
+def test_letterbox_two_lines_at_default_size_are_two_dialogues_in_the_default_zone(tmp_path, video_dir):
+    path = run_letterbox(tmp_path, video_dir)
+    raw = path.read_text(encoding="utf-8")
+    assert "\\N" not in raw
+    events = lb_events(path)
+    assert [line_text(ev).strip() for ev in events] == ["IL N'A PAS FAIT", "DE GARDE À VUE"]
+    first, second = events
+    assert (first["start"], first["end"]) == (second["start"], second["end"])
+    for ev in events:
+        assert ev["text"].startswith("{\\q2\\an8}")
+        assert (ev["margin_l"], ev["margin_r"]) == (150, 1080 - 930)
+        assert "\\fs" not in ev["text"]
+        assert_ink_in_zone(ev, 120, ZONE)
+    assert [ev["margin_v"] for ev in events] == [1246, 1246 + STEP_68]
+
+
+def test_letterbox_second_line_karaoke_counts_from_the_group_start(tmp_path, video_dir):
+    path = run_letterbox(tmp_path, video_dir)
+    first, second = lb_events(path)
+    ks = [int(k) for k in re.findall(r"\\k(\d+)", second["text"])]
+    # « de » commence a 1.0 s, le groupe a 0.0 s : 100 cs d'attente d'abord
+    assert ks[0] == 100
+    assert sum(ks) == 210  # fin de « vue » a 2.1 s
+    assert sum(int(k) for k in re.findall(r"\\k(\d+)", first["text"])) == 100
+
+
+def test_letterbox_uppercase_comes_from_config(tmp_path, video_dir):
+    path = run_letterbox(tmp_path, video_dir, config=make_config(tmp_path, letterbox_uppercase=False))
+    assert [line_text(ev).strip() for ev in lb_events(path)] == ["il n'a pas fait", "de garde à vue"]
+
+
+def test_letterbox_very_long_word_is_cut_or_reduced_and_stays_in_the_zone(tmp_path, video_dir):
+    words = [_word(" c", 0.0, 0.1), _word("'est", 0.1, 0.3),
+             _word(" anticonstitutionnellement", 0.3, 1.5), _word(" vrai", 1.5, 1.9)]
+    path = run_letterbox(tmp_path, video_dir, words=words)
+    events = lb_events(path)
+    texts = [line_text(ev).strip() for ev in events]
+    assert "ANTICONSTITUTIONNELLEMENT" in texts
+    assert " ".join(texts) == "C'EST ANTICONSTITUTIONNELLEMENT VRAI"
+    for ev in events:
+        assert_ink_in_zone(ev, 120, ZONE)
+    long_line = events[texts.index("ANTICONSTITUTIONNELLEMENT")]
+    fs = re.search(r"\\fs(\d+)", long_line["text"])
+    assert fs and int(fs.group(1)) < 120
+    # les mots courts gardent la taille par defaut
+    assert all("\\fs" not in ev["text"] for ev in events if ev is not long_line)
+
+
+def test_letterbox_reduced_size_survives_an_emphasis_reset(tmp_path, video_dir):
+    words = [_word(" anticonstitutionnellement", 0.0, 1.0), _word(" vrai", 1.0, 1.4)]
+    write_words(video_dir, words)
+    with llm.use_backend(FakeBackend([{"indices": [0]}])):
+        path = Path(run(tmp_path, start=0.0, end=10.0, text_zone=dict(ZONE)))
+    long_line = next(ev for ev in lb_events(path) if "ANTI" in ev["text"])
+    size = re.search(r"\\fs(\d+)", long_line["text"]).group(1)
+    # apres le mot d'emphase, \r remet le style : la taille reduite est redonnee
+    assert f"{{\\r\\fs{size}}}" in long_line["text"]
+
+
+def test_letterbox_word_that_cannot_fit_is_an_error(tmp_path, video_dir):
+    from clipper.subtitles import SubtitlesError
+
+    words = [_word(" " + "w" * 60, 0.0, 1.0), _word(" ok", 1.0, 1.2)]
+    with pytest.raises(SubtitlesError, match="W" * 60):
+        run_letterbox(tmp_path, video_dir, words=words)
+    assert not (tmp_path / "workspace" / VIDEO_ID / "subtitles" / f"{CLIP_ID}.ass").exists()
+
+
+@pytest.mark.parametrize("zone", [
+    {"x0": 150, "y0": 1246, "x1": 930},                      # cle absente
+    {"x0": 930, "y0": 1246, "x1": 150, "y1": 1448},          # x0 >= x1
+    {"x0": 150, "y0": 1448, "x1": 930, "y1": 1246},          # y0 >= y1
+    {"x0": 150, "y0": 1246, "x1": 1200, "y1": 1448},         # hors de 1080x1920
+    {"x0": 150.5, "y0": 1246, "x1": 930, "y1": 1448},        # pas un entier
+    {"x0": 150, "y0": 1246, "x1": 930, "y1": 1296},          # pas la place d'une ligne
+])
+def test_letterbox_absent_or_incoherent_zone_is_an_error(tmp_path, video_dir, zone):
+    from clipper.subtitles import SubtitlesError
+
+    with pytest.raises(SubtitlesError):
+        run_letterbox(tmp_path, video_dir, zone=zone)
+    assert not (tmp_path / "workspace" / VIDEO_ID / "subtitles" / f"{CLIP_ID}.ass").exists()
+
+
+def test_existing_ass_of_another_format_is_not_reused_silently(tmp_path, video_dir):
+    from clipper.subtitles import SubtitlesError
+
+    with llm.use_backend(FakeBackend([NO_EMPHASIS])):
+        run(tmp_path)  # format recadre
+    with pytest.raises(SubtitlesError, match="--force"):
+        run_letterbox(tmp_path, video_dir)
+    path = run_letterbox(tmp_path, video_dir, force=True)
+    assert path.read_text(encoding="utf-8").startswith("; format: letterbox")
+    # le .ass letterbox est reutilise tel quel en letterbox...
+    with llm.use_backend(FakeBackend([])):
+        assert Path(run(tmp_path, start=0.0, end=10.0, text_zone=dict(ZONE))) == path
+    # ...mais pas hors letterbox
+    with llm.use_backend(FakeBackend([])), pytest.raises(SubtitlesError, match="--force"):
+        run(tmp_path)
+
+
+def test_letterbox_config_section_is_accepted_by_clipper_config(tmp_path):
+    from clipper.config import load_config
+
+    (tmp_path / "config.toml").write_text(
+        "[subtitles]\nletterbox_font_size = 60\nletterbox_uppercase = false\n", encoding="utf-8"
+    )
+    section = load_config(tmp_path / "config.toml").section("subtitles")
+    assert section["letterbox_font_size"] == 60
+    assert section["letterbox_uppercase"] is False
+    assert section["letterbox_line_height"] == 1.15
+    assert "letterbox_min_font_size" in section
+
+
+# Preuve par rendu reel : ffmpeg + libass incrustent le .ass letterbox.
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg absent du PATH")
+def test_real_libass_render_keeps_all_ink_in_the_zone_with_the_line_step(tmp_path, video_dir):
+    from PIL import Image
+
+    # jambages et virgules (Ç, virgules, Q) ; aucun accent au-dessus des
+    # capitales, pour que le haut d'encre de chaque ligne soit celui des capitales
+    words = [_word(" ça", 0.0, 0.3), _word(" va,", 0.3, 0.6), _word(" quoi,", 0.6, 0.9),
+             _word(" je", 0.9, 1.0), _word(" pense", 1.0, 1.3), _word(" que", 1.3, 1.4),
+             _word(" oui,", 1.4, 1.8)]
+    ass = run_letterbox(tmp_path, video_dir, words=words)
+    assert len(lb_events(ass)) == 2
+
+    fonts = ass.parent / "fonts"
+    fonts.mkdir()
+    shutil.copyfile(FONT_FILE, fonts / FONT_FILE.name)
+    frame = ass.parent / "frame.png"
+    # cwd = dossier du .ass : chemins relatifs, pas de ':' de lecteur a echapper
+    subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=black:size=1080x1920:rate=30:duration=1",
+         "-vf", f"ass={ass.name}:fontsdir=fonts", "-frames:v", "1", frame.name],
+        cwd=ass.parent, check=True,
+    )
+    img = Image.open(frame).convert("L")
+    w, h = img.size
+    pixels = img.load()
+    ink = [(x, y) for y in range(h) for x in range(w) if pixels[x, y] > 128]
+    assert ink, "aucun texte incruste"
+    xs = [x for x, _ in ink]
+    ys = sorted({y for _, y in ink})
+    assert ZONE["x0"] <= min(xs) and max(xs) <= ZONE["x1"]
+    assert ZONE["y0"] <= ys[0] and ys[-1] <= ZONE["y1"]
+    # deux blocs de lignes d'encre separes : l'ecart entre leurs hauts = le pas
+    runs = [ys[0]] + [b for a, b in zip(ys, ys[1:]) if b != a + 1]
+    assert len(runs) == 2, runs
+    assert abs((runs[1] - runs[0]) - STEP_68) <= 4

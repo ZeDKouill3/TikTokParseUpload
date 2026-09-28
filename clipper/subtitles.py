@@ -20,10 +20,22 @@ dans le tiers inferieur de la zone : la premiere qui ne recouvre aucune bande
 a eviter des plans ou il s'affiche. Sans position libre, la moins recouvrante
 est prise et journalisee. Une bande interdite n'est jamais recouverte ; si
 elle ne laisse aucune position, c'est une erreur.
+
+Format letterbox (SPEC-6127) : l'appelant donne a la place ``text_zone``, la
+zone ``{"x0", "y0", "x1", "y1"}`` (pixels de sortie) ou poser le texte, sous
+l'image. Chaque groupe est mesure avec Pillow dans la vraie police (contour
+compris) : trop large, il est coupe en deux lignes, puis en groupes plus
+courts, puis un mot seul est reduit par paliers ; s'il ne tient toujours pas,
+c'est une erreur. Chaque ligne est un evenement Dialogue distinct (jamais de
+\\N : libass avance chaque \\N de Fontsize, soit win ascent + descent, sans
+interligne reglable), aligne en haut au centre (\\an8), place a
+``MarginV = y0 + i x pas``. Le .ass letterbox commence par
+``; format: letterbox``.
 """
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import math
@@ -34,6 +46,10 @@ from clipper import llm
 
 PLAY_RES_X = 1080
 PLAY_RES_Y = 1920
+
+FONT_FILE = Path(__file__).resolve().parent / "assets" / "fonts" / "Poppins-ExtraBold.ttf"
+LETTERBOX_HEADER = "; format: letterbox"
+_ZONE_KEYS = ("x0", "y0", "x1", "y1")
 
 log = logging.getLogger(__name__)
 
@@ -62,6 +78,18 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "outline_color": "&H00000000&",   # noir
     "emphasis_color": "&H0000A5FF&",  # orange : mots d'emphase
     "emphasis": True,
+    # Format letterbox (SPEC-6127, maquette validee) : texte dans la zone
+    # text_zones.subtitles du plan de recadrage.
+    "letterbox_uppercase": True,
+    # Tailles en pixels d'em (comme Pillow) ; le .ass recoit la taille libass
+    # (em x (usWinAscent + usWinDescent) / unitsPerEm).
+    "letterbox_font_size": 68,
+    "letterbox_min_font_size": 40,
+    "letterbox_font_step": 4,
+    # Pas entre deux lignes d'un groupe, en em.
+    "letterbox_line_height": 1.15,
+    "letterbox_outline": 7,
+    "letterbox_max_words_per_group": 8,
 }
 
 EMPHASIS_PROMPT = (
@@ -229,13 +257,17 @@ def _position(
     return best
 
 
-def _karaoke_run(word: dict[str, Any], prev_end: float, emphasized: bool, settings: dict[str, Any]) -> str:
+def _karaoke_run(word: dict[str, Any], prev_end: float, emphasized: bool, settings: dict[str, Any],
+                 text: str | None = None, reset: str = "{\\r}") -> str:
+    """Un mot en karaoke. ``text`` remplace le texte du mot (majuscules,
+    espace de tete retire) ; ``reset`` suit un mot d'emphase (retour au style,
+    plus les surcharges de la ligne a garder)."""
     gap_cs = round(max(0.0, word["start"] - prev_end) * 100)
     dur_cs = max(1, round((word["end"] - word["start"]) * 100))
-    text = word["word"]
+    text = word["word"] if text is None else text
     prefix = f"{{\\k{gap_cs}}}" if gap_cs > 0 else ""
     if emphasized:
-        return f"{prefix}{{\\k{dur_cs}\\c{settings['emphasis_color']}}}{text}{{\\r}}"
+        return f"{prefix}{{\\k{dur_cs}\\c{settings['emphasis_color']}}}{text}{reset}"
     return f"{prefix}{{\\k{dur_cs}}}{text}"
 
 
@@ -295,9 +327,13 @@ def _render_ass(
         margin_r=settings["margin_right"],
         margin_v=PLAY_RES_Y - candidates[0][1],
     )
+    return _ass_document(style, events)
 
+
+def _ass_document(style: str, events: list[str], header: str = "") -> str:
     return (
-        "[Script Info]\n"
+        header
+        + "[Script Info]\n"
         "ScriptType: v4.00+\n"
         f"PlayResX: {PLAY_RES_X}\n"
         f"PlayResY: {PLAY_RES_Y}\n"
@@ -315,6 +351,196 @@ def _render_ass(
     )
 
 
+# --------------------------------------------------------------------------
+# Format letterbox
+# --------------------------------------------------------------------------
+
+
+def _check_zone(zone: Any, where: str) -> dict[str, int]:
+    """Zone {"x0", "y0", "x1", "y1"} en pixels entiers de la sortie 1080x1920,
+    non vide ; sinon erreur explicite."""
+    if not isinstance(zone, dict) or any(k not in zone for k in _ZONE_KEYS):
+        raise SubtitlesError(f"{where} : zone de sous-titres absente ou incomplete {zone!r} "
+                             f"(attendu {{{', '.join(_ZONE_KEYS)}}})")
+    if any(not isinstance(zone[k], int) or isinstance(zone[k], bool) for k in _ZONE_KEYS):
+        raise SubtitlesError(f"{where} : zone de sous-titres non entiere {zone!r}")
+    x0, y0, x1, y1 = (zone[k] for k in _ZONE_KEYS)
+    if not (0 <= x0 < x1 <= PLAY_RES_X and 0 <= y0 < y1 <= PLAY_RES_Y):
+        raise SubtitlesError(f"{where} : zone de sous-titres incoherente {zone!r} "
+                             f"(0 <= x0 < x1 <= {PLAY_RES_X}, 0 <= y0 < y1 <= {PLAY_RES_Y})")
+    return {k: zone[k] for k in _ZONE_KEYS}
+
+
+@functools.lru_cache(maxsize=None)
+def _font_metrics(path: str) -> tuple[int, int, int]:
+    """(unitsPerEm, usWinAscent, usWinDescent) de la police : libass
+    dimensionne la police (Fontsize) sur win ascent + descent."""
+    from fontTools.ttLib import TTFont
+
+    font = TTFont(path, lazy=True)
+    os2 = font["OS/2"]
+    return font["head"].unitsPerEm, os2.usWinAscent, os2.usWinDescent
+
+
+@functools.lru_cache(maxsize=None)
+def _pil_font(path: str, size: int) -> Any:
+    from PIL import ImageFont
+
+    return ImageFont.truetype(path, size)
+
+
+def libass_font_size(size: int, font_file: Path = FONT_FILE) -> int:
+    """Fontsize du .ass pour une taille de ``size`` pixels d'em."""
+    upm, ascent, descent = _font_metrics(str(font_file))
+    return round(size * (ascent + descent) / upm)
+
+
+class _Box:
+    """Mesure du texte dans la zone, comme libass le dessine : ligne centree
+    entre x0 et x1, ligne i en haut a y0 + i x pas, ligne de base a
+    round(em x usWinAscent / unitsPerEm) sous ce haut."""
+
+    def __init__(self, zone: dict[str, int], settings: dict[str, Any]):
+        self.zone = zone
+        self.outline = int(settings["letterbox_outline"])
+        self.line_height = float(settings["letterbox_line_height"])
+        self.upm, self.ascent, _ = _font_metrics(str(FONT_FILE))
+
+    def step(self, size: int) -> int:
+        return round(self.line_height * size)
+
+    def fits(self, lines: list[str], size: int) -> bool:
+        font = _pil_font(str(FONT_FILE), size)
+        x0, y0, x1, y1 = (self.zone[k] for k in _ZONE_KEYS)
+        o = self.outline
+        for i, text in enumerate(lines):
+            left, top, right, bottom = font.getbbox(text, anchor="ls")
+            x = x0 + (x1 - x0 - font.getlength(text)) / 2
+            baseline = y0 + i * self.step(size) + round(size * self.ascent / self.upm)
+            if x + left - o < x0 or x + right + o > x1:
+                return False
+            if baseline + top - o < y0 or baseline + bottom + o > y1:
+                return False
+        return True
+
+
+def _unit_text(unit: list[dict[str, Any]], upper: bool) -> str:
+    text = "".join(w["word"] for w in unit)
+    return text.upper() if upper else text
+
+
+def _line_text(units: list[list[dict[str, Any]]], upper: bool) -> str:
+    return "".join(_unit_text(u, upper) for u in units).strip()
+
+
+def _layout(units: list[list[dict[str, Any]]], size: int, box: _Box,
+            upper: bool) -> list[list[list[dict[str, Any]]]] | None:
+    """Une ligne si elle tient, sinon la coupe en deux lignes la plus
+    equilibree qui tient ; None si aucune."""
+    if box.fits([_line_text(units, upper)], size):
+        return [units]
+    font = _pil_font(str(FONT_FILE), size)
+    best, best_width = None, math.inf
+    for k in range(1, len(units)):
+        lines = [_line_text(units[:k], upper), _line_text(units[k:], upper)]
+        width = max(font.getlength(t) for t in lines)
+        if width < best_width and box.fits(lines, size):
+            best, best_width = [units[:k], units[k:]], width
+    return best
+
+
+def _sizes_below(size: int, settings: dict[str, Any]) -> list[int]:
+    low = int(settings["letterbox_min_font_size"])
+    sizes = list(range(size - int(settings["letterbox_font_step"]), low - 1,
+                       -int(settings["letterbox_font_step"])))
+    if low < size and (not sizes or sizes[-1] != low):
+        sizes.append(low)
+    return sizes
+
+
+def _place(units: list[list[dict[str, Any]]], size: int, box: _Box, settings: dict[str, Any],
+           where: str) -> list[tuple[list[list[list[dict[str, Any]]]], int]]:
+    """Groupe -> [(lignes, taille em), ...] : une ou deux lignes a la taille
+    donnee, sinon deux groupes plus courts, sinon (mot seul) taille reduite
+    par paliers ; un mot seul qui ne tient pas est une erreur."""
+    upper = bool(settings["letterbox_uppercase"])
+    lines = _layout(units, size, box, upper)
+    if lines:
+        return [(lines, size)]
+    if len(units) > 1:
+        half = (len(units) + 1) // 2
+        return _place(units[:half], size, box, settings, where) + _place(units[half:], size, box, settings, where)
+    for smaller in _sizes_below(size, settings):
+        if box.fits([_line_text(units, upper)], smaller):
+            return [([units], smaller)]
+    raise SubtitlesError(
+        f"{where} : le mot {_line_text(units, upper)!r} ne tient pas dans la zone de sous-titres "
+        f"{box.zone}, meme a letterbox_min_font_size = {settings['letterbox_min_font_size']}"
+    )
+
+
+def _render_letterbox(
+    words: list[dict[str, Any]],
+    clip_start: float,
+    settings: dict[str, Any],
+    emphasis: set[int],
+    zone: dict[str, int],
+    where: str,
+) -> str:
+    box = _Box(zone, settings)
+    size = int(settings["letterbox_font_size"])
+    upper = bool(settings["letterbox_uppercase"])
+    index = {id(w): i for i, w in enumerate(words)}
+    margin_r = PLAY_RES_X - zone["x1"]
+
+    events = []
+    for group in _group_words(words, int(settings["min_words_per_group"]),
+                              int(settings["letterbox_max_words_per_group"])):
+        for lines, em in _place(_units(group), size, box, settings, where):
+            first = lines[0][0][0]
+            last = lines[-1][-1][-1]
+            start = _format_timestamp(first["start"] - clip_start)
+            end = _format_timestamp(last["end"] - clip_start)
+            fs = "" if em == size else f"\\fs{libass_font_size(em)}"
+            for i, line in enumerate(lines):
+                # karaoke compte depuis le debut du groupe affiche
+                prev_end = first["start"]
+                runs = []
+                for j, w in enumerate(word for unit in line for word in unit):
+                    text = w["word"].upper() if upper else w["word"]
+                    runs.append(_karaoke_run(w, prev_end, index[id(w)] in emphasis, settings,
+                                             text=text.lstrip() if j == 0 else text,
+                                             reset=f"{{\\r{fs}}}"))
+                    prev_end = w["end"]
+                # layer = rang de la ligne : libass decale un evenement qui en
+                # chevauche un autre du meme layer (detection de collisions)
+                events.append(
+                    f"Dialogue: {i},{start},{end},Default,,{zone['x0']},{margin_r},"
+                    f"{zone['y0'] + i * box.step(em)},,{{\\q2\\an8{fs}}}{''.join(runs)}"
+                )
+
+    style = (
+        "Style: Default,{font},{size},{primary},{secondary},{outline_color},&H00000000,"
+        "0,0,0,0,100,100,0,0,1,{outline},0,8,{margin_l},{margin_r},{margin_v},1"
+    ).format(
+        font=settings["font_name"],
+        size=libass_font_size(size),
+        primary=settings["primary_color"],
+        secondary=settings["secondary_color"],
+        outline_color=settings["outline_color"],
+        outline=box.outline,
+        margin_l=zone["x0"],
+        margin_r=margin_r,
+        margin_v=zone["y0"],
+    )
+    return _ass_document(style, events, header=LETTERBOX_HEADER + "\n")
+
+
+def _is_letterbox_file(path: Path) -> bool:
+    with path.open(encoding="utf-8") as f:
+        return f.readline().rstrip("\r\n") == LETTERBOX_HEADER
+
+
 def generate(
     video_id: str,
     clip_id: str,
@@ -326,14 +552,28 @@ def generate(
     force: bool = False,
     avoid_zones: list[dict[str, Any]] | None = None,
     reserved_zones: list[dict[str, Any]] | None = None,
+    text_zone: dict[str, int] | None = None,
 ) -> Path:
     """Genere workspace/<video_id>/subtitles/<clip_id>.ass pour [start, end]
     et renvoie ce chemin. Un .ass deja present n'est pas refait (ADR-b16b),
-    sauf ``force``. ``avoid_zones`` (visages) et ``reserved_zones``
-    (accroche) : voir la docstring du module."""
+    sauf ``force`` ; s'il est d'un autre format que celui demande, c'est une
+    erreur. ``avoid_zones`` (visages) et ``reserved_zones`` (accroche), ou
+    ``text_zone`` (format letterbox) : voir la docstring du module."""
+    where = f"{video_id}/{clip_id}"
+    letterbox = text_zone is not None
+    if letterbox:
+        if avoid_zones or reserved_zones:
+            raise SubtitlesError(f"{where} : text_zone (letterbox) exclut avoid_zones et reserved_zones")
+        text_zone = _check_zone(text_zone, where)
+
     video_dir = Path(workspace_dir) / video_id
     out = video_dir / "subtitles" / f"{clip_id}.ass"
     if out.exists() and not force:
+        if _is_letterbox_file(out) != letterbox:
+            found, wanted = ("letterbox", "recadre") if not letterbox else ("recadre", "letterbox")
+            raise SubtitlesError(
+                f"{out} est au format {found}, format {wanted} demande : relancer avec --force"
+            )
         return out
 
     transcript_file = video_dir / "transcript.json"
@@ -346,8 +586,11 @@ def generate(
 
     emphasis = _ask_emphasis(words, config) if settings["emphasis"] else set()
 
-    ass_text = _render_ass(words, start, settings, emphasis, avoid_zones or [],
-                           reserved_zones or [], f"{video_id}/{clip_id}")
+    if letterbox:
+        ass_text = _render_letterbox(words, start, settings, emphasis, text_zone, where)
+    else:
+        ass_text = _render_ass(words, start, settings, emphasis, avoid_zones or [],
+                               reserved_zones or [], where)
 
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_suffix(".ass.tmp")

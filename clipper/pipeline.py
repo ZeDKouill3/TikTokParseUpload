@@ -18,7 +18,8 @@ Enchainement, par video (``STEPS``, dans l'ordre d'execution) :
 - ``reframe`` passe avant ``subtitles`` : les bandes a ne pas recouvrir
   (``avoid_zones``) se deduisent plan par plan des visages du plan de
   recadrage, et la bande de l'accroche (``hook_zones``) des reglages de
-  render ;
+  render ; en format letterbox (``layout = "letterbox"`` a la racine du plan),
+  subtitles recoit a la place la zone ``text_zones.subtitles`` du plan ;
 - un clip n'est pret que si ``qa.is_ready`` le dit.
 
 Modes (``mode`` de config.toml, ADR-ad2e) :
@@ -329,9 +330,12 @@ class _Run:
     def subtitles(self) -> None:
         for clip in self.clips():
             plan = _read_json(self.dir / "reframe" / f"{clip['id']}.json")
+            if plan.get("layout") == "letterbox":
+                zones = {"text_zone": subtitles_zone(plan, clip["id"])}
+            else:
+                zones = {"avoid_zones": avoid_zones(plan), "reserved_zones": hook_zones(clip, self.config)}
             subtitles.generate(self.video_id, clip["id"], clip["start"], clip["end"], self.ws,
-                               config=self.config, force=self.force, avoid_zones=avoid_zones(plan),
-                               reserved_zones=hook_zones(clip, self.config), **self.opts("subtitles"))
+                               config=self.config, force=self.force, **zones, **self.opts("subtitles"))
 
     def render(self) -> None:
         for clip in self.clips():
@@ -342,6 +346,19 @@ class _Run:
         if not self.clips():
             return
         qa.run(self.video_id, self.ws, self.out, config=self.config, force=self.force, **self.opts("qa"))
+
+
+def subtitles_zone(plan: dict[str, Any], clip_id: str) -> dict[str, Any]:
+    """Zone des sous-titres d'un plan de recadrage letterbox (SPEC-6127) :
+    ``text_zones.subtitles`` a la racine du plan. Absente : erreur explicite
+    (subtitles verifie ensuite sa coherence)."""
+    text_zones = plan.get("text_zones")
+    if not isinstance(text_zones, dict) or "subtitles" not in text_zones:
+        raise PipelineError(
+            f"plan de recadrage letterbox du clip {clip_id} sans text_zones.subtitles : "
+            "relancer reframe --force"
+        )
+    return text_zones["subtitles"]
 
 
 def avoid_zones(plan: dict[str, Any]) -> list[dict[str, Any]]:
