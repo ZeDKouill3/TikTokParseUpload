@@ -18,7 +18,9 @@ Sortie : output/<video_id>/<clip_id>.mp4 et output/<video_id>/<clip_id>.json
 conformes a SPEC-6127. Le champ ``qa`` part a ``{"status": "skipped",
 "issues": []}`` : l'etape qa (SPEC-6127) le remplace apres coup.
 
-ffmpeg construit chaque clip plan par plan : trim du plan sur la source,
+ffmpeg construit chaque clip plan par plan : l'entree source est
+positionnee sur le debut du clip (-ss/-t avant -i, jamais decodee depuis 0),
+trim du plan relatif a ce point,
 canevas noir 1080x1920 (ou la taille de sortie de reframe), un panneau par
 ``crop`` (positions figees par intervalle, une expression ``if(lt(t,...))``
 quand elles varient) eventuellement flou (fond, ``fallback_blur``) puis
@@ -551,11 +553,15 @@ def _panel_filters(
     return lines, f"{label}s", dest
 
 
-def _plan_filters(plan: dict[str, Any], index: int, out_w: int, out_h: int, settings: dict[str, Any]) -> tuple[list[str], str]:
+def _plan_filters(plan: dict[str, Any], index: int, out_w: int, out_h: int, settings: dict[str, Any],
+                  source_offset: float = 0.0) -> tuple[list[str], str]:
+    """Filtres d'un plan ; ``source_offset`` est le point ou l'entree source
+    a ete positionnee (``-ss``) : le trim s'exprime relativement a lui."""
     label = f"p{index}"
     duration = plan["end"] - plan["start"]
+    start, end = plan["start"] - source_offset, plan["end"] - source_offset
     lines = [
-        f"[0:v]trim=start={plan['start']:.6f}:end={plan['end']:.6f},setpts=PTS-STARTPTS[{label}base]"
+        f"[0:v]trim=start={start:.6f}:end={end:.6f},setpts=PTS-STARTPTS[{label}base]"
     ]
     panels = plan["panels"]
     n = len(panels)
@@ -587,11 +593,14 @@ def _build_filter_complex(
     settings: dict[str, Any],
     *,
     title_input: int | None = None,
+    source_offset: float = 0.0,
 ) -> tuple[str, str]:
     """Graphe ffmpeg du clip. En letterbox (``layout`` = letterbox a la racine
     de reframe_data), ``title_input`` est l'index de l'entree ffmpeg du PNG
     de titre, incruste en haut-gauche de la zone title pour tout le clip ;
-    pas d'accroche ; « Partie N » (``part_path``) centre dans la zone part."""
+    pas d'accroche ; « Partie N » (``part_path``) centre dans la zone part.
+    ``source_offset`` : point (s) ou l'entree source est positionnee par
+    ``-ss`` ; trim et atrim sont relatifs a lui."""
     letterbox = reframe_data.get("layout") == "letterbox"
     out_w = reframe_data["output"]["width"]
     out_h = reframe_data["output"]["height"]
@@ -599,7 +608,7 @@ def _build_filter_complex(
     lines: list[str] = []
     plan_labels: list[str] = []
     for i, plan in enumerate(reframe_data["plans"]):
-        plan_lines, final_label = _plan_filters(plan, i, out_w, out_h, settings)
+        plan_lines, final_label = _plan_filters(plan, i, out_w, out_h, settings, source_offset)
         lines.extend(plan_lines)
         plan_labels.append(final_label)
 
@@ -635,7 +644,7 @@ def _build_filter_complex(
                 f"x={px0}+({px1 - px0}-text_w)/2:y={baseline}:y_align=baseline[vpart]"
             )
             cur = "vpart"
-        lines.append(_audio_filter(clip_start, clip_end, settings))
+        lines.append(_audio_filter(clip_start - source_offset, clip_end - source_offset, settings))
         return ";".join(lines), cur
 
     if hook_path is None:
@@ -658,7 +667,7 @@ def _build_filter_complex(
         )
         cur = "vpart"
 
-    lines.append(_audio_filter(clip_start, clip_end, settings))
+    lines.append(_audio_filter(clip_start - source_offset, clip_end - source_offset, settings))
     return ";".join(lines), cur
 
 
@@ -691,9 +700,19 @@ def _run_ffmpeg(
     scratch_dir: Path,
     out_path: Path,
     extra_inputs: tuple[Path, ...] = (),
+    seek: float = 0.0,
+    seek_duration: float | None = None,
 ) -> None:
+    """``seek``/``seek_duration`` positionnent l'entree source (-ss/-t avant
+    son -i) : ffmpeg saute directement au clip au lieu de decoder la source
+    depuis 0 ; les entrees supplementaires (PNG du titre) ne sont pas
+    decalees."""
+    source_seek = ["-ss", f"{seek:.6f}"] if seek > 0 else []
+    if seek_duration is not None:
+        source_seek += ["-t", f"{seek_duration:.6f}"]
     cmd = [
         ffmpeg_bin, "-y", "-loglevel", "error",
+        *source_seek,
         "-i", str(source.resolve()),
         *(arg for extra in extra_inputs for arg in ("-i", str(extra.resolve()))),
         "-filter_complex", filter_complex,
@@ -812,9 +831,13 @@ def render(
                 part_path = scratch_dir / "part.txt"
                 part_path.write_text(f"Part {clip['part']}/{clip['parts_total']}", encoding="utf-8")
 
+        # Positionnement sur le debut du clip (ou du premier plan, s'il
+        # commence un peu avant) : jamais decoder la source depuis 0.
+        seek = max(0.0, min([clip["start"]] + [p["start"] for p in reframe_data["plans"]]))
+        seek_end = max([clip["end"]] + [p["end"] for p in reframe_data["plans"]])
         filter_complex, vout_label = _build_filter_complex(
             reframe_data, clip["start"], clip["end"], ass_path, hook_path, part_path, scratch_dir, settings,
-            title_input=1 if letterbox else None,
+            title_input=1 if letterbox else None, source_offset=seek,
         )
 
         target_fps = float(settings["max_fps"])
@@ -825,7 +848,7 @@ def render(
         out_dir.mkdir(parents=True, exist_ok=True)
         _run_ffmpeg(
             ffmpeg_bin, source, filter_complex, vout_label, target_fps, device.type, settings, scratch_dir, tmp_out,
-            extra_inputs,
+            extra_inputs, seek=seek, seek_duration=seek_end - seek,
         )
         tmp_out.replace(mp4_out)
     finally:
