@@ -539,3 +539,93 @@ def test_letterbox_short_black_in_video_rect_is_not_rejected(tmp_path, dirs):
         run(tmp_path, workspace, output)
     assert "black_screen" not in local_types(path)
     assert read(path)["qa"]["status"] == "passed"
+
+
+# --------------------------------------------------------------------------
+# TASK-4b1b : partie 2+ d'une serie, la reprise de ~3 s n'est pas un defaut
+# (SPEC-1557 regle 3 : le recouvrement entre parties est voulu)
+# --------------------------------------------------------------------------
+
+
+def write_clip_part(output_dir, *, part, parts_total, clip_id=CLIP_ID, **mp4_kwargs):
+    d = output_dir / VIDEO_ID
+    colors = mp4_kwargs.get("colors", ("red",))
+    duration = mp4_kwargs.get("seg", 1.5) * len(colors)
+    make_mp4(d / f"{clip_id}.mp4", **mp4_kwargs)
+    (d / f"{clip_id}.json").write_text(
+        json.dumps(clip_json(duration=duration, clip_id=clip_id, part=part, parts_total=parts_total)),
+        encoding="utf-8",
+    )
+    return d / f"{clip_id}.json"
+
+
+def write_clip_letterbox_part(
+    output_dir, *, part, parts_total, clip_id=CLIP_ID, video_rect=LETTERBOX_RECT,
+    screen_title="La suite de l'histoire", hook_text="ignore-moi", **mp4_kwargs
+):
+    d = output_dir / VIDEO_ID
+    colors = mp4_kwargs.get("colors", ("red",))
+    duration = mp4_kwargs.get("seg", 1.5) * len(colors)
+    make_mp4(d / f"{clip_id}.mp4", **mp4_kwargs)
+    (d / f"{clip_id}.json").write_text(
+        json.dumps(clip_json(
+            duration=duration, clip_id=clip_id, layout="letterbox", video_rect=video_rect,
+            screen_title=screen_title, hook_text=hook_text, part=part, parts_total=parts_total,
+        )),
+        encoding="utf-8",
+    )
+    return d / f"{clip_id}.json"
+
+
+def test_series_part_schema_excludes_starts_mid_sentence(tmp_path, dirs):
+    workspace, output = dirs
+    write_clip_part(output, part=2, parts_total=3)
+    fake = FakeBackend([no_issue])
+    with llm.use_backend(fake):
+        run(tmp_path, workspace, output)
+    enum = fake.calls[0].schema["properties"]["issues"]["items"]["properties"]["type"]["enum"]
+    assert "starts_mid_sentence" not in enum
+    assert set(enum) == {"face_cut", "subtitle_on_face", "weak_hook"}
+
+
+def test_series_part_prompt_mentions_continuation_and_drops_defect_from_list(tmp_path, dirs):
+    workspace, output = dirs
+    write_clip_part(output, part=2, parts_total=3)
+    fake = FakeBackend([no_issue])
+    with llm.use_backend(fake):
+        run(tmp_path, workspace, output)
+    prompt = fake.calls[0].prompt
+    assert "partie 2" in prompt.lower()
+    assert "serie" in prompt.lower() or "série" in prompt.lower()
+    assert "starts_mid_sentence" not in prompt
+
+
+def test_first_part_of_series_still_asks_starts_mid_sentence(tmp_path, dirs):
+    workspace, output = dirs
+    write_clip_part(output, part=1, parts_total=3)
+    fake = FakeBackend([no_issue])
+    with llm.use_backend(fake):
+        run(tmp_path, workspace, output)
+    enum = fake.calls[0].schema["properties"]["issues"]["items"]["properties"]["type"]["enum"]
+    assert "starts_mid_sentence" in enum
+    assert "partie" not in fake.calls[0].prompt.lower()
+
+
+def test_single_clip_still_asks_starts_mid_sentence(tmp_path, dirs):
+    workspace, output = dirs
+    write_clip(output)  # part=1, parts_total=1 par defaut (clip_json)
+    fake = FakeBackend([no_issue])
+    with llm.use_backend(fake):
+        run(tmp_path, workspace, output)
+    enum = fake.calls[0].schema["properties"]["issues"]["items"]["properties"]["type"]["enum"]
+    assert "starts_mid_sentence" in enum
+
+
+def test_letterbox_series_part_excludes_all_three(tmp_path, dirs):
+    workspace, output = dirs
+    write_clip_letterbox_part(output, part=2, parts_total=2)
+    fake = FakeBackend([no_issue])
+    with llm.use_backend(fake):
+        run(tmp_path, workspace, output)
+    enum = fake.calls[0].schema["properties"]["issues"]["items"]["properties"]["type"]["enum"]
+    assert set(enum) == {"weak_hook"}
