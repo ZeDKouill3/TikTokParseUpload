@@ -1183,6 +1183,230 @@ def test_rescore_after_vision_keeps_the_exploration(tmp_path, video_dir, rubric_
 
 
 # --------------------------------------------------------------------------
+# Connecteurs de tete (TASK-3170) : essai reel sZi-qJ-5ptA, clips rejetes par
+# qa en starts_mid_sentence ("Donc deja il m'a menti...", "Mais quand on
+# fait un zoom..."). Reculer d'une phrase mettrait la mise en contexte en
+# tete (SPEC-53f3 regle 1) : on retire les connecteurs, le clip commence au
+# premier mot qui suit, une seule fois dans _normalize (avant le jury).
+# --------------------------------------------------------------------------
+
+
+def set_sentence(video_dir, k, text):
+    """Reecrit la phrase k de transcript.json avec les mots de ``text``,
+    repartis de sentence_start(k) a sentence_end(k) ; renvoie le debut de
+    chaque mot."""
+    transcript = json.loads((video_dir / "transcript.json").read_text(encoding="utf-8"))
+    words = text.split()
+    step = (sentence_end(k) - sentence_start(k)) / len(words)
+    starts = [sentence_start(k) + i * step for i in range(len(words))]
+    seg = transcript["segments"][k]
+    seg["words"] = [
+        {"word": " " + w, "start": s, "end": s + step - 0.1, "probability": 0.9} for w, s in zip(words, starts)
+    ]
+    seg["words"][-1]["end"] = sentence_end(k)
+    seg["text"] = " " + text
+    (video_dir / "transcript.json").write_text(json.dumps(transcript, ensure_ascii=False), encoding="utf-8")
+    return starts
+
+
+def floor1(x):
+    return math.floor(x * 10 + 1e-6) / 10
+
+
+def test_leading_connector_is_cut_and_the_clip_starts_on_the_next_word(tmp_path, video_dir, rubric_path):
+    starts = set_sentence(video_dir, 3, "Mais qui est vraiment X ?")
+
+    run(tmp_path, rubric_path, [{"moments": [moment(15.25, 44.65)]}])
+
+    data = read_moments(video_dir)
+    [m] = data["moments"]
+    assert (m["start"], m["end"]) == (floor1(starts[1]), 44.7)
+    assert m["hook_text"] == "qui est vraiment X ?"
+    assert m["duration"] == round(44.65 - starts[1], 1)
+    assert data["rejected"] == []
+
+
+def test_several_leading_connectors_are_all_cut(tmp_path, video_dir, rubric_path):
+    starts = set_sentence(video_dir, 3, "Du coup, en fait on part.")
+
+    run(tmp_path, rubric_path, [{"moments": [moment(15.25, 44.65)]}])
+
+    [m] = read_moments(video_dir)["moments"]
+    assert m["start"] == floor1(starts[4])
+    assert m["hook_text"] == "on part."
+
+
+@pytest.mark.parametrize("text", ["Donc.", "Mais, du coup...", "« Et donc ? »"])
+def test_sentence_made_only_of_connectors_is_rejected_with_its_reason(tmp_path, video_dir, rubric_path, text):
+    set_sentence(video_dir, 3, text)
+
+    run(tmp_path, rubric_path, [{"moments": [moment(15.25, 44.65), moment(100.25, 134.65)]}])
+
+    data = read_moments(video_dir)
+    assert spans(data) == [(100.2, 134.7)]
+    [rejected] = data["rejected"]
+    assert rejected["start"] == 15.2
+    assert "connecteur" in rejected["reason"]
+    assert "final_score" not in rejected
+
+
+def test_duration_out_of_bounds_after_the_cut_is_rejected_with_its_reason(tmp_path, video_dir, rubric_path):
+    # phrases 3..6 : 15.25 -> 34.65 (19.4 s, dans 20-45 a 3 s pres) ; sans
+    # "Alors du coup en fait" il reste 15.7 s < 17
+    starts = set_sentence(video_dir, 3, "Alors du coup en fait voila.")
+    assert 34.65 - starts[5] < 17
+
+    run(tmp_path, rubric_path, [{"moments": [moment(15.25, 34.65)]}])
+
+    data = read_moments(video_dir)
+    assert data["moments"] == []
+    [rejected] = data["rejected"]
+    assert "duree" in rejected["reason"] and "connecteur" in rejected["reason"]
+
+
+def test_connector_in_the_middle_of_a_sentence_is_ignored(tmp_path, video_dir, rubric_path):
+    set_sentence(video_dir, 3, "mot3_0 donc on part maintenant.")
+    set_sentence(video_dir, 20, "Maison close et fermee depuis.")
+    set_sentence(video_dir, 50, "Etienne, mais pourquoi donc ?")
+
+    run(tmp_path, rubric_path, [{"moments": [moment(15.25, 44.65), moment(100.25, 134.65), moment(250.25, 284.65)]}])
+
+    data = read_moments(video_dir)
+    assert sorted(spans(data)) == [(15.2, 44.7), (100.2, 134.7), (250.2, 284.7)]
+    assert sorted(m["hook_text"] for m in data["moments"]) == [
+        "Etienne, mais pourquoi donc ?", "Maison close et fermee depuis.", "mot3_0 donc on part maintenant.",
+    ]
+
+
+@pytest.mark.parametrize(
+    "text, first_kept",
+    [
+        ("DONC on part tout de suite.", 1),
+        ("Mais, on part tout de suite.", 1),
+        ("«Mais on part tout de suite.", 1),
+        ("« Mais on part tout de suite.", 2),
+        ("- Et on part tout de suite.", 2),
+        ("…et on part tout de suite.", 1),
+        ("EN FAIT, on part tout de suite.", 2),
+        ("Parce que on part tout de suite.", 2),
+        ("Sauf que on part tout de suite.", 2),
+        ("Par contre, on part tout de suite.", 2),
+        ("Alors, on part tout de suite !", 1),
+    ],
+)
+def test_connectors_are_found_whatever_the_case_and_punctuation(tmp_path, video_dir, rubric_path, text, first_kept):
+    starts = set_sentence(video_dir, 3, text)
+
+    run(tmp_path, rubric_path, [{"moments": [moment(15.25, 44.65)]}])
+
+    [m] = read_moments(video_dir)["moments"]
+    assert m["start"] == floor1(starts[first_kept])
+    assert m["hook_text"] == " ".join(text.split()[first_kept:])
+
+
+def test_multipart_first_part_starts_after_the_connector(tmp_path, video_dir, rubric_path):
+    starts = set_sentence(video_dir, 50, "Du coup on decortique le trailer.")
+
+    run(tmp_path, rubric_path, [{"moments": [moment(250.25, 389.65, fmt="multipart", breaks=[320.3])]}])
+
+    [m] = read_moments(video_dir)["moments"]
+    assert m["start"] == floor1(starts[2])
+    assert [(p["start"], p["end"]) for p in m["parts"]] == [(floor1(starts[2]), 319.7), (320.2, 389.7)]
+
+
+def test_connector_list_is_a_setting(tmp_path, video_dir, rubric_path):
+    from clipper.moments import CONFIG_DEFAULTS
+
+    assert {"donc", "mais", "et", "alors", "du coup", "en fait", "parce que", "sauf que", "par contre"} <= set(
+        CONFIG_DEFAULTS["leading_connectors"]
+    )
+    set_sentence(video_dir, 3, "Donc on part tout de suite.")
+    starts = set_sentence(video_dir, 20, "Bref, on part tout de suite.")
+    config = make_config(tmp_path, rubric_path, leading_connectors=["Bref"])
+
+    run(tmp_path, rubric_path, [{"moments": [moment(15.25, 44.65), moment(100.25, 134.65)]}], config=config)
+
+    # "donc" n'est plus dans la liste, "bref" y est
+    assert sorted(spans(read_moments(video_dir))) == [(15.2, 44.7), (floor1(starts[1]), 134.7)]
+
+
+@pytest.mark.parametrize("value", ["donc", [""], ["donc", 3], None])
+def test_invalid_connector_list_is_refused(tmp_path, video_dir, rubric_path, value):
+    from clipper.moments import MomentsError
+
+    with pytest.raises(MomentsError, match="leading_connectors"):
+        run(
+            tmp_path, rubric_path, [{"moments": [moment(15.25, 44.65)]}],
+            config=make_config(tmp_path, rubric_path, leading_connectors=value),
+        )
+    assert not (video_dir / "moments.json").exists()
+
+
+def test_sentence_without_word_timings_opening_on_a_connector_is_rejected(tmp_path, video_dir, rubric_path):
+    transcript = make_transcript()
+    seg = transcript["segments"][3]
+    seg["words"], seg["text"] = [], " Donc on part tout de suite."
+    (video_dir / "transcript.json").write_text(json.dumps(transcript), encoding="utf-8")
+
+    run(tmp_path, rubric_path, [{"moments": [moment(15.25, 44.65)]}])
+
+    data = read_moments(video_dir)
+    assert data["moments"] == []
+    [rejected] = data["rejected"]
+    assert "connecteur" in rejected["reason"] and "horodatage" in rejected["reason"]
+
+
+def test_jury_judges_the_text_without_the_connector(tmp_path, video_dir, rubric_path):
+    starts = set_sentence(video_dir, 3, "Donc mot3_0 mot3_2 mot3_3 mot3_4.")
+    proposal = {"moments": [moment(15.25, 44.65)]}
+
+    fake, _ = run(
+        tmp_path, rubric_path, with_jury(proposal, jury_notes({3: GOOD})),
+        config=auto_config(tmp_path, rubric_path),
+    )
+
+    jury_calls = [c for c in fake.calls if c.usage.startswith("jury_")]
+    assert len(jury_calls) == 5
+    assert all("Texte : « mot3_0 mot3_2 mot3_3 mot3_4. mot4_0 " in c.prompt for c in jury_calls)
+    assert not any("Donc" in c.prompt for c in jury_calls)
+    assert all(f"[{floor1(starts[1]):.1f}-44.7]" in c.prompt for c in jury_calls)
+    [m] = read_moments(video_dir)["moments"]
+    assert (m["start"], m["hook_text"]) == (floor1(starts[1]), "mot3_0 mot3_2 mot3_3 mot3_4.")
+
+
+def test_comparison_round_sees_the_text_without_the_connector(tmp_path, video_dir, rubric_path):
+    set_sentence(video_dir, 90, "Mais mot90_1 mot90_2 mot90_3 mot90_4.")
+    config = make_config(tmp_path, rubric_path, max_transcript_chars=2000, chunk_chars=2000, chunk_overlap_seconds=30)
+    seen = []
+
+    def llm_answer(request):
+        if "## Candidats" in request.prompt:
+            seen.append(request.prompt)
+            return {"moments": [{"id": 0, "justification": "ok", "scores": GOOD}]}
+        if "[450.2-454.7]" in request.prompt:
+            return {"moments": [moment(450.25, 484.65)]}
+        return {"moments": []}
+
+    run(tmp_path, rubric_path, [llm_answer] * 10, config=config)
+
+    [prompt] = seen
+    assert "mot90_1 mot90_2" in prompt and "Mais" not in prompt.split("## Candidats")[1]
+
+
+def test_rescore_keeps_a_moment_whose_connector_was_cut(tmp_path, video_dir, rubric_path):
+    starts = set_sentence(video_dir, 3, "Mais qui est vraiment X ?")
+    run(tmp_path, rubric_path, [{"moments": [moment(15.25, 44.65)]}])
+    write_vision_after_moments(video_dir, [striking(20.0)])
+
+    fake, _ = rescore(tmp_path, rubric_path)
+
+    assert fake.calls == []
+    [m] = read_moments(video_dir)["moments"]
+    assert (m["start"], m["hook_text"], m["final_score"]) == (floor1(starts[1]), "qui est vraiment X ?", 68.9)
+    assert m["duration"] == round(44.65 - starts[1], 1)
+
+
+# --------------------------------------------------------------------------
 # Integration optionnelle avec le vrai Claude (quota de l'utilisateur) :
 # CLIPPER_CLAUDE_INTEGRATION=1 pytest tests/test_moments.py
 # --------------------------------------------------------------------------
