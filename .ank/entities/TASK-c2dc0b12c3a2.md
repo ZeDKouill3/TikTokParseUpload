@@ -5,7 +5,7 @@ slug: render-fond-flou-rapide-r-duire-flouter-agrandir
 title: "render : fond flou rapide (réduire, flouter, agrandir)"
 created: 2026-09-25T19:51:10Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/render.py
   - tests/test_render.py
@@ -15,6 +15,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/2f5971ccaf61@b1dd25b
+    tree: scope/8cf941921f98
+    criteria: dbd9b5a4d598
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 1
+version: 4
 ---

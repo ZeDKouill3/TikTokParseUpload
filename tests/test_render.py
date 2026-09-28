@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -248,6 +249,122 @@ def test_render_converts_a_25fps_source_to_30fps_output(tmp_path, video_dir, syn
         stdout=subprocess.PIPE, check=True,
     )
     assert proc.stdout.decode().strip() == "30/1"
+
+
+def _reframe_json_full_frame_blur(duration):
+    """Un seul plan, un seul panneau fond flou couvrant tout le cadre de
+    sortie : maximise la part du boxblur dans le cout du rendu, pour que le
+    ratio avant/apres reste mesurable sur une video courte."""
+    plan = {
+        "index": 0, "start": 0.0, "end": duration, "image": "x", "llm": {}, "layout": "fallback_blur",
+        "reason": "aucun cadre ne garde les visages entiers", "faces": [],
+        "panels": [
+            {"name": "background", "effect": "blur", "dest": {"x": 0, "y": 0, "w": OUT_W, "h": OUT_H},
+             "rects": [{"start": 0.0, "end": duration, "x": 0, "y": 0, "w": SRC_W, "h": SRC_H}]},
+        ],
+    }
+    return {
+        "video_id": VIDEO_ID, "clip_id": CLIP_ID, "start": 0.0, "end": duration,
+        "source": {"width": SRC_W, "height": SRC_H}, "output": {"width": OUT_W, "height": OUT_H},
+        "layout": "fallback_blur", "plans": [plan],
+    }
+
+
+def test_render_writes_conforming_output_when_a_panel_uses_fallback_blur(tmp_path, cpu_device):
+    """Structure du graphe ffmpeg pour fallback_blur (sans mesure de temps,
+    instable sous charge - voir le test optionnel CLIPPER_BENCH ci-dessous) :
+    _build_filter_complex reduit avant boxblur puis agrandit vers dest, et le
+    label de sortie chaine correctement jusqu'a l'accroche/sous-titres."""
+    from clipper.render import CONFIG_DEFAULTS, _build_filter_complex
+
+    duration = 2.5
+    reframe_data = _reframe_json_full_frame_blur(duration)
+    hook_path = tmp_path / "hook.txt"
+    hook_path.write_text("x", encoding="utf-8")
+    ass_path = tmp_path / "sub.ass"
+    ass_path.write_text(ASS_TEXT, encoding="utf-8")
+
+    filt, label = _build_filter_complex(
+        reframe_data, 0.0, duration, ass_path, hook_path, None, tmp_path, CONFIG_DEFAULTS
+    )
+
+    factor = CONFIG_DEFAULTS["blur_downscale"]
+    assert f"scale=iw/{factor}:ih/{factor}" in filt
+    assert filt.index(f"scale=iw/{factor}:ih/{factor}") < filt.index("boxblur")
+    assert filt.index("boxblur") < filt.rindex(f"scale={OUT_W}:{OUT_H}")
+    assert label == "vhook"
+
+
+# --------------------------------------------------------------------------
+# Vitesse (mesure de temps reelle, instable sous charge machine) : optionnel,
+# saute par defaut, active par CLIPPER_BENCH=1 (consigne orchestrateur
+# 2026-09-28 : pas d'assertion de temps reel dans la suite par defaut).
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(
+    os.environ.get("CLIPPER_BENCH") != "1",
+    reason="mesure de vitesse reelle, instable sous charge : definir CLIPPER_BENCH=1",
+)
+@no_ffmpeg
+@no_ffprobe
+def test_render_fallback_blur_is_at_least_3x_faster_than_full_resolution_blur(tmp_path, cpu_device):
+    """Constat essai reel 2026-09-25 : ~1200s CPU pour 40s de clip en
+    fallback_blur, contre ~45s sans flou, a cause du boxblur plein cadre
+    1080x1920. blur_downscale=1 (pas de reduction) rejoue ce cout ; le
+    reglage par defaut doit rendre au moins 3 fois plus vite, a parametres
+    egaux par ailleurs. Mesure en ratio (jamais un temps absolu), meilleur de
+    plusieurs essais (le pire cas est un pic de charge de la machine, jamais
+    un rendu plus rapide que sa vraie duree), pour rester robuste."""
+    import time
+
+    from clipper.render import render
+
+    duration = 8.0
+    d = tmp_path / "workspace" / VIDEO_ID
+    d.mkdir(parents=True)
+    (d / "captions.json").write_text(
+        json.dumps(_captions_json(start=0.0, end=duration, duration=duration)), encoding="utf-8"
+    )
+    (d / "moments.json").write_text(json.dumps(_moments_json()), encoding="utf-8")
+    (d / "transcript.json").write_text(json.dumps(_transcript_json()), encoding="utf-8")
+    (d / "meta.json").write_text(json.dumps(_meta_json()), encoding="utf-8")
+    (d / "reframe").mkdir()
+    (d / "reframe" / f"{CLIP_ID}.json").write_text(
+        json.dumps(_reframe_json_full_frame_blur(duration)), encoding="utf-8"
+    )
+    (d / "subtitles").mkdir()
+    (d / "subtitles" / f"{CLIP_ID}.ass").write_text(ASS_TEXT, encoding="utf-8")
+    video = d / f"{VIDEO_ID}.mp4"
+    subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error",
+         "-f", "lavfi", "-i", f"testsrc=size={SRC_W}x{SRC_H}:rate=25:duration={duration}",
+         "-f", "lavfi", "-i", f"sine=frequency=440:sample_rate=44100:duration={duration}",
+         "-ac", "2", "-shortest", str(video)],
+        check=True,
+    )
+
+    repeats = 3
+    baseline_times = []
+    fast_times = []
+    for i in range(repeats):
+        start = time.perf_counter()
+        render(
+            VIDEO_ID, CLIP_ID, workspace_dir=d.parent, output_dir=tmp_path / f"output_baseline{i}",
+            config=make_config(blur_downscale=1),
+        )
+        baseline_times.append(time.perf_counter() - start)
+
+        start = time.perf_counter()
+        render(
+            VIDEO_ID, CLIP_ID, workspace_dir=d.parent, output_dir=tmp_path / f"output_fast{i}",
+            config=make_config(),
+        )
+        fast_times.append(time.perf_counter() - start)
+
+    # min() plutot que la moyenne : un pic de charge ne peut que ralentir un
+    # essai, jamais l'accelerer, donc le minimum approxime le cout reel.
+    assert min(fast_times) * 3 <= min(baseline_times)
 
 
 @no_ffmpeg
@@ -568,6 +685,40 @@ def test_panel_filters_has_no_boxblur_without_effect(tmp_path):
     }
     lines, _scaled, _dest = _panel_filters(panel, "base", 1.0, "lbl", CONFIG_DEFAULTS)
     assert not any("boxblur" in line for line in lines)
+
+
+def test_panel_filters_downscales_before_boxblur_then_upscales_to_dest(tmp_path):
+    """Constat essai reel 2026-09-25 : le boxblur plein cadre est le cout
+    dominant du fallback_blur. Le flou est calcule a resolution reduite
+    (facteur CONFIG_DEFAULTS['blur_downscale']) puis la sortie est remise a
+    la taille de dest, pour un flou beaucoup moins couteux sans changer la
+    taille finale du panneau."""
+    from clipper.render import CONFIG_DEFAULTS, _panel_filters
+
+    panel = {
+        "name": "background", "effect": "blur", "dest": {"x": 0, "y": 0, "w": OUT_W, "h": OUT_H},
+        "rects": [{"start": 1.0, "end": 3.5, "x": 0, "y": 0, "w": SRC_W, "h": SRC_H}],
+    }
+    lines, scaled_label, dest = _panel_filters(panel, "base", 1.0, "lbl", CONFIG_DEFAULTS)
+
+    factor = CONFIG_DEFAULTS["blur_downscale"]
+    reduce_idx = next(i for i, line in enumerate(lines) if f"scale=iw/{factor}:ih/{factor}" in line)
+    blur_idx = next(i for i, line in enumerate(lines) if "boxblur" in line)
+    final_idx = next(i for i, line in enumerate(lines) if f"scale={dest['w']}:{dest['h']}" in line)
+    assert reduce_idx < blur_idx < final_idx
+    assert scaled_label.endswith("s")
+
+
+def test_panel_filters_blur_downscale_factor_is_configurable(tmp_path):
+    from clipper.render import CONFIG_DEFAULTS, _panel_filters
+
+    panel = {
+        "name": "background", "effect": "blur", "dest": {"x": 0, "y": 0, "w": OUT_W, "h": OUT_H},
+        "rects": [{"start": 1.0, "end": 3.5, "x": 0, "y": 0, "w": SRC_W, "h": SRC_H}],
+    }
+    settings = {**CONFIG_DEFAULTS, "blur_downscale": 2}
+    lines, _scaled, _dest = _panel_filters(panel, "base", 1.0, "lbl", settings)
+    assert any("scale=iw/2:ih/2" in line for line in lines)
 
 
 def test_plan_filters_splits_source_once_per_panel(tmp_path):

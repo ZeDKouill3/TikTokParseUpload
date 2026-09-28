@@ -64,6 +64,11 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "part_margin": 40,
     "blur_radius": 20,
     "blur_power": 2,
+    # Le fond flou (fallback_blur) est calcule sur une image reduite d'un
+    # facteur blur_downscale puis remis a la taille de dest : boxblur sur
+    # 1080x1920 en plein cadre est le cout dominant d'un rendu fallback_blur
+    # (constat essai reel 2026-09-25, ~1200s CPU pour 40s de clip).
+    "blur_downscale": 4,
     # Ecart tolere (s) entre les bornes de captions.json et celles du plan
     # reframe : au-dela, les entrees sont jugees incoherentes.
     "start_end_tolerance": 0.15,
@@ -165,6 +170,9 @@ def _panel_filters(
     lines = [f"[{base_ref}]crop=w='{w}':h='{h}':x='{x}':y='{y}'[{label}c]"]
     cur = f"{label}c"
     if panel.get("effect") == "blur":
+        factor = settings["blur_downscale"]
+        lines.append(f"[{cur}]scale=iw/{factor}:ih/{factor}[{label}r]")
+        cur = f"{label}r"
         lines.append(f"[{cur}]boxblur={settings['blur_radius']}:{settings['blur_power']}[{label}b]")
         cur = f"{label}b"
     dest = panel["dest"]
