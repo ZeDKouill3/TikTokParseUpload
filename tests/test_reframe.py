@@ -77,11 +77,15 @@ def static(*boxes):
 
 
 def make_config(tmp_path, **reframe):
+    # Le format par defaut de CONFIG_DEFAULTS est devenu "letterbox" (SPEC-6127) ;
+    # ces tests exercent le format "crop" (code actuel, inchange), sauf demande
+    # explicite d'un autre format.
+    reframe.setdefault("format", "crop")
     return Config(
         mode="review",
         workspace_dir=tmp_path / "workspace",
         output_dir=tmp_path / "output",
-        _sections={"reframe": reframe} if reframe else {},
+        _sections={"reframe": reframe},
     )
 
 
@@ -987,3 +991,126 @@ def test_real_mediapipe_detector_runs_on_cpu():
         assert detector.detect(np.zeros((H, W, 3), dtype=np.uint8)) == []
     finally:
         detector.close()
+
+
+# --------------------------------------------------------------------------
+# Format letterbox (SPEC-6127) : zoom fixe, fond flou, aucun visage suivi,
+# aucun appel LLM.
+# --------------------------------------------------------------------------
+
+
+def letterbox_plan(data):
+    [plan] = data["plans"]
+    return plan
+
+
+def letterbox_panels(plan):
+    return {p["name"]: p for p in plan["panels"]}
+
+
+def test_letterbox_default_geometry_for_a_1920x1080_source(tmp_path, video_dir):
+    out, factory, fake = run(tmp_path, static(), [], format="letterbox")
+
+    data = load(out)
+    assert data["video_id"] == VIDEO_ID
+    assert data["clip_id"] == "01"
+    assert (data["start"], data["end"]) == (10.0, 14.0)
+    assert data["source"] == {"width": W, "height": H}
+    assert data["output"] == {"width": 1080, "height": 1920}
+    assert data["layout"] == "letterbox"
+    assert data["format"] == "letterbox"
+    assert data["text_zones"] == {
+        "title": {"x0": 150, "y0": 160, "x1": 930, "y1": 424},
+        "subtitles": {"x0": 150, "y0": 1246, "x1": 930, "y1": 1448},
+        "part": {"x0": 150, "y0": 1464, "x1": 930, "y1": 1520},
+    }
+
+    plan = letterbox_plan(data)
+    assert plan["index"] == 0
+    assert (plan["start"], plan["end"]) == (10.0, 14.0)
+    assert plan["image"] is None
+    assert plan["llm"] is None
+    assert plan["layout"] == "letterbox"
+    assert plan["reason"] is None
+    assert plan["faces"] == []
+    assert [p["name"] for p in plan["panels"]] == ["background", "main"]
+
+    panels = letterbox_panels(plan)
+    assert panels["background"]["effect"] == "blur"
+    assert panels["background"]["dest"] == {"x": 0, "y": 0, "w": 1080, "h": 1920}
+    [bg] = panels["background"]["rects"]
+    assert (bg["start"], bg["end"], bg["x"], bg["y"], bg["w"], bg["h"]) == (10.0, 14.0, 0, 0, W, H)
+
+    assert panels["main"]["dest"] == {"x": 0, "y": 440, "w": 1080, "h": 790}
+    [main] = panels["main"]["rects"]
+    assert (main["start"], main["end"], main["x"], main["y"], main["w"], main["h"]) == (10.0, 14.0, 222, 0, 1476, 1080)
+
+    # Aucune detection de visage, aucun detecteur construit, aucun appel LLM.
+    assert factory.built == []
+    assert fake.calls == []
+
+
+def test_letterbox_window_for_a_1280x720_source(tmp_path, video_dir):
+    out, _, _ = run(tmp_path, static(), [], format="letterbox", video=FakeVideo(width=1280, height=720))
+
+    plan = letterbox_plan(load(out))
+    panels = letterbox_panels(plan)
+    assert panels["main"]["dest"] == {"x": 0, "y": 440, "w": 1080, "h": 790}
+    [main] = panels["main"]["rects"]
+    assert (main["x"], main["y"], main["w"], main["h"]) == (148, 0, 984, 720)
+
+
+def test_letterbox_zones_that_do_not_fit_are_an_error(tmp_path, video_dir):
+    from clipper.reframe import ReframeError
+
+    with pytest.raises(ReframeError):
+        run(tmp_path, static(), [], format="letterbox", video=FakeVideo(width=1440, height=1080))
+
+
+def test_letterbox_zoom_below_one_is_an_error(tmp_path, video_dir):
+    from clipper.reframe import ReframeError
+
+    with pytest.raises(ReframeError, match="zoom"):
+        run(tmp_path, static(), [], format="letterbox", letterbox_zoom=0.9)
+
+
+def test_unknown_reframe_format_is_an_error(tmp_path, video_dir):
+    from clipper.reframe import ReframeError
+
+    with pytest.raises(ReframeError, match="vertical"):
+        run(tmp_path, static(), [], format="vertical")
+
+
+def test_letterbox_does_not_require_scenes_json(tmp_path, video_dir):
+    (video_dir / "scenes.json").unlink()
+    out, _, _ = run(tmp_path, static(), [], format="letterbox")
+    assert load(out)["layout"] == "letterbox"
+
+
+def test_existing_crop_plan_with_letterbox_config_is_an_error_without_force(tmp_path, video_dir):
+    from clipper.reframe import ReframeError
+
+    out, _, _ = run(tmp_path, static((1100, 300, 1300, 500)), [single(0)])  # format="crop" (par defaut du test)
+    assert "format" not in load(out)  # ancien format crop : pas de champ "format"
+
+    with pytest.raises(ReframeError, match="crop"):
+        run(tmp_path, static(), [], format="letterbox")
+
+    out2, factory, fake = run(tmp_path, static(), [], format="letterbox", force=True)
+    assert out2 == out
+    assert load(out2)["format"] == "letterbox"
+    assert factory.built == [] and fake.calls == []
+
+
+def test_existing_letterbox_plan_with_crop_config_is_an_error_without_force(tmp_path, video_dir):
+    from clipper.reframe import ReframeError
+
+    out, _, _ = run(tmp_path, static(), [], format="letterbox")
+
+    with pytest.raises(ReframeError, match="letterbox"):
+        run(tmp_path, static((1100, 300, 1300, 500)), [single(0)], format="crop")
+
+    out2, _, fake = run(tmp_path, static((1100, 300, 1300, 500)), [single(0)], format="crop", force=True)
+    assert out2 == out
+    assert len(fake.calls) == 1
+    assert "format" not in load(out2)

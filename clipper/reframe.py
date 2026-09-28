@@ -1,5 +1,12 @@
-"""Etape reframe : cadrage 9:16 plein ecran d'un clip, mise en page par plan,
-visages jamais coupes.
+"""Etape reframe : cadrage 9:16 plein ecran d'un clip (SPEC-6127).
+
+Deux mises en page (``format`` en config) :
+- ``letterbox`` (defaut) : zoom fixe centre, fond flou, aucun visage suivi,
+  aucun appel LLM ; voir plus bas.
+- ``crop`` : suivi de visage par plan, mise en page par plan, visages jamais
+  coupes (option figee, sans nouveau developpement).
+
+Le reste de ce docstring decrit le format crop.
 
 Entrees : workspace/<video_id>/<video_id>.mp4 et scenes.json (etape scenes).
 Sortie  : workspace/<video_id>/reframe/<clip_id>.json, plus une image
@@ -85,6 +92,23 @@ from clipper.gpu import Device, get_device
 log = logging.getLogger(__name__)
 
 CONFIG_DEFAULTS: dict[str, object] = {
+    # Mise en page : "letterbox" (zoom fixe, sans visage suivi, defaut) ou
+    # "crop" (suivi de visage, option figee, voir le reste de ce module).
+    "format": "letterbox",
+    # Zoom fixe du format letterbox : fenetre centrale de largeur
+    # source_w / letterbox_zoom, pleine hauteur. Pensees pour une source 16:9.
+    "letterbox_zoom": 1.3,
+    # Ordonnee (sortie) ou commence le panneau video du format letterbox.
+    "letterbox_top": 440,
+    # Zone sure TikTok (sortie 1080x1920) : aucun texte hors de ces bornes.
+    "safe_top": 160,
+    "safe_bottom": 1520,
+    "safe_left": 150,
+    "safe_right": 930,
+    # Ecart minimal entre un bloc de texte et le panneau video.
+    "text_gap": 16,
+    # Hauteur de la bande "Partie N" en bas de la zone sure.
+    "part_height": 56,
     # Detecteur de visages local (seul "mediapipe" est fourni).
     "detector": "mediapipe",
     # Modele .tflite de mediapipe ; "" = ~/.cache/clipper/blaze_face_short_range.tflite.
@@ -165,6 +189,7 @@ CONFIG_DEFAULTS: dict[str, object] = {
 
 LAYOUTS = ("facecam_gameplay", "single")
 _FALLBACKS = ("auto", "blur")
+_FORMATS = ("letterbox", "crop")
 
 LAYOUT_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -923,6 +948,132 @@ def _contains_point(box: Box, point: tuple[float, float]) -> bool:
 
 
 # --------------------------------------------------------------------------
+# Format letterbox (SPEC-6127) : zoom fixe, sans visage suivi, aucun LLM.
+# --------------------------------------------------------------------------
+
+
+def _rects_overlap(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> bool:
+    ax0, ay0, ax1, ay1 = a
+    bx0, by0, bx1, by1 = b
+    return ax0 < bx1 and bx0 < ax1 and ay0 < by1 and by0 < ay1
+
+
+def _letterbox_geometry(source_w: int, source_h: int, settings: dict[str, Any]) -> dict[str, Any]:
+    """Fenetre source zoomee et centree, plein cadre a partir de
+    ``letterbox_top`` ; zones de texte deduites, validees dans les bornes de
+    sortie et sans chevaucher le panneau video."""
+    zoom = float(settings["letterbox_zoom"])
+    if zoom < 1:
+        raise ReframeError(f"[reframe] letterbox_zoom invalide {zoom!r} (attendu >= 1)")
+
+    out_w = int(settings["output_width"])
+    out_h = int(settings["output_height"])
+    letterbox_top = int(settings["letterbox_top"])
+
+    w = round(source_w / zoom)
+    if w % 2:
+        w -= 1
+    x = (source_w - w) // 2
+    h = round(source_h * out_w / w)
+    if h % 2:
+        h -= 1
+
+    main_rect = (0, letterbox_top, out_w, letterbox_top + h)
+
+    safe_left = int(settings["safe_left"])
+    safe_right = int(settings["safe_right"])
+    safe_top = int(settings["safe_top"])
+    safe_bottom = int(settings["safe_bottom"])
+    text_gap = int(settings["text_gap"])
+    part_height = int(settings["part_height"])
+
+    zones = {
+        "title": (safe_left, safe_top, safe_right, letterbox_top - text_gap),
+        "subtitles": (safe_left, letterbox_top + h + text_gap, safe_right, safe_bottom - part_height - text_gap),
+        "part": (safe_left, safe_bottom - part_height, safe_right, safe_bottom),
+    }
+    for name, (x0, y0, x1, y1) in zones.items():
+        if x1 <= x0 or y1 <= y0:
+            raise ReframeError(
+                f"[reframe] zone {name} vide ou inversee pour une source {source_w}x{source_h} : "
+                f"({x0},{y0})-({x1},{y1})"
+            )
+        if x0 < 0 or y0 < 0 or x1 > out_w or y1 > out_h:
+            raise ReframeError(
+                f"[reframe] zone {name} hors de {out_w}x{out_h} pour une source {source_w}x{source_h} : "
+                f"({x0},{y0})-({x1},{y1})"
+            )
+        if _rects_overlap(main_rect, (x0, y0, x1, y1)):
+            raise ReframeError(
+                f"[reframe] zone {name} chevauche le panneau video pour une source {source_w}x{source_h} : "
+                f"({x0},{y0})-({x1},{y1})"
+            )
+
+    return {"x": x, "w": w, "h": h, "out_w": out_w, "out_h": out_h, "letterbox_top": letterbox_top, "zones": zones}
+
+
+def _reframe_letterbox(
+    video_id: str,
+    clip_id: str,
+    start: float,
+    end: float,
+    out: Path,
+    video: Path,
+    settings: dict[str, Any],
+    frame_source: Callable[[Path, Sequence[float]], Iterable[tuple[float, np.ndarray]]],
+) -> Path:
+    [(_, frame)] = list(frame_source(video, [start]))
+    source_h, source_w = frame.shape[:2]
+    geometry = _letterbox_geometry(source_w, source_h, settings)
+    x, w, h = geometry["x"], geometry["w"], geometry["h"]
+    out_w, out_h, letterbox_top = geometry["out_w"], geometry["out_h"], geometry["letterbox_top"]
+
+    panels = [
+        {
+            "name": "background",
+            "effect": "blur",
+            "dest": {"x": 0, "y": 0, "w": out_w, "h": out_h},
+            "rects": [{"start": start, "end": end, "x": 0, "y": 0, "w": source_w, "h": source_h}],
+        },
+        {
+            "name": "main",
+            "dest": {"x": 0, "y": letterbox_top, "w": out_w, "h": h},
+            "rects": [{"start": start, "end": end, "x": x, "y": 0, "w": w, "h": source_h}],
+        },
+    ]
+    plan = {
+        "index": 0,
+        "start": start,
+        "end": end,
+        "image": None,
+        "llm": None,
+        "layout": "letterbox",
+        "reason": None,
+        "faces": [],
+        "panels": panels,
+    }
+    data = {
+        "video_id": video_id,
+        "clip_id": clip_id,
+        "start": start,
+        "end": end,
+        "source": {"width": source_w, "height": source_h},
+        "output": {"width": out_w, "height": out_h},
+        "layout": "letterbox",
+        "format": "letterbox",
+        "text_zones": {
+            name: {"x0": x0, "y0": y0, "x1": x1, "y1": y1} for name, (x0, y0, x1, y1) in geometry["zones"].items()
+        },
+        "plans": [plan],
+    }
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(out)
+    return out
+
+
+# --------------------------------------------------------------------------
 # Appel LLM
 # --------------------------------------------------------------------------
 
@@ -1020,6 +1171,8 @@ def _settings(config: Any) -> dict[str, Any]:
 
         config = load_config()
     settings = {**CONFIG_DEFAULTS, **config.section("reframe")}
+    if settings["format"] not in _FORMATS:
+        raise ReframeError(f"[reframe] format inconnu {settings['format']!r} (attendu : {' | '.join(_FORMATS)})")
     if not all(isinstance(m, (int, float)) and m >= 0 for m in settings["fit_margins"]):
         raise ReframeError(f"[reframe] fit_margins invalide {settings['fit_margins']!r} (liste de marges >= 0)")
     if settings["fallback"] not in _FALLBACKS:
@@ -1121,19 +1274,29 @@ def reframe(
     video_dir = Path(workspace_dir) / video_id
     out_dir = video_dir / "reframe"
     out = out_dir / f"{clip_id}.json"
+    settings = _settings(config)
     if out.exists() and not force:
+        existing_format = json.loads(out.read_text(encoding="utf-8")).get("format", "crop")
+        if existing_format != settings["format"]:
+            raise ReframeError(
+                f"reframe/{clip_id}.json existant au format {existing_format!r}, config [reframe] "
+                f"demande {settings['format']!r} : --force pour le recalculer"
+            )
         return out
 
-    settings = _settings(config)
+    video = video_dir / f"{video_id}.mp4"
+    if not video.exists():
+        raise ReframeError(f"video absente : {video}")
+
+    if settings["format"] == "letterbox":
+        return _reframe_letterbox(video_id, clip_id, start, end, out, video, settings, frame_source)
+
     if detector_factory is None:
         if settings["detector"] not in _DETECTORS:
             raise ReframeError(
                 f"[reframe] detecteur inconnu {settings['detector']!r} (attendu : {' | '.join(_DETECTORS)})"
             )
         detector_factory = _DETECTORS[settings["detector"]]
-    video = video_dir / f"{video_id}.mp4"
-    if not video.exists():
-        raise ReframeError(f"video absente : {video}")
     fps = float(settings["sample_fps"])
     plans = _plans(video_dir / "scenes.json", start, end, fps, float(settings["min_plan_seconds"]))
 
