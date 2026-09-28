@@ -31,20 +31,31 @@ Deroulement :
    fusionnes (``duplicate_iou``), suivi en pistes numerotees, pistes qui se
    suivent a la meme place recollees ; le detecteur est ferme avant tout
    appel LLM (ADR-fb9b : un LLM local ne cohabite jamais avec lui). Un
-   visage est *retenu* s'il est detecte assez souvent dans le plan
-   (``min_face_presence``) et assez grand (``min_face_height``) : seuls les
-   visages retenus (et celui que suit le cadre) sont gardes entiers ;
-3. par plan, une image annotee (visages encadres, ``#id``) est envoyee a
-   clipper.llm (usage ``layout``), qui repond facecam_gameplay (avec le
-   rectangle de la camera) ou single (avec le visage a suivre) ;
+   visage est *retenu* s'il est detecte assez souvent sur la duree de sa
+   piste (``min_face_presence``, de sa premiere a sa derniere detection :
+   un visage qui entre a mi-plan compte), assez longtemps
+   (``min_face_seconds``) et assez grand (``min_face_height``) : seuls les
+   visages retenus sont gardes entiers ;
+3. par plan, une image annotee (visages encadres, ``#id``, retenus ou non)
+   est envoyee a clipper.llm (usage ``layout``), qui repond
+   facecam_gameplay (avec le rectangle de la camera) ou single (avec le
+   visage retenu a suivre, ou null), et peut designer dans ``ignore`` des
+   detections qui ne sont pas des visages (main, objet) : elles ne sont
+   plus retenues ni protegees ;
 4. plan de recadrage : position voulue lissee (moyenne glissante puis zone
    morte), puis ramenee dans l'ensemble des positions ou chaque visage
    suivi est entier dans le cadre et ou aucun autre visage retenu n'est
-   coupe (entier dedans ou entier dehors). Sans position possible a un
-   instant, le plan passe en repli ``split`` (deux visages retenus
-   distincts, si ``fallback = auto`` ; chaque panneau cadre son visage a
-   ``split_face_height``) ou ``fallback_blur``, avec la raison dans
-   ``reason``.
+   coupe (entier dedans ou entier dehors). En single, si le visage suivi
+   ne tient pas, paliers documentes dans CONFIG_DEFAULTS (``fit_margins``
+   puis boite instantanee), jamais de visage rogne. Sans position possible
+   a un instant (dernier palier compris), le plan passe en repli ``split``
+   (deux visages retenus distincts, plan d'au moins ``split_min_seconds``,
+   si ``fallback = auto`` ; chaque panneau cadre son visage a
+   ``split_face_height``) ou ``fallback_blur``, avec la raison (et le
+   dernier palier essaye) dans ``reason``.
+
+Les plans de moins de ``min_plan_seconds`` (coupe de scene parasite, bord
+du clip) sont fusionnes au plan voisin avant l'appel LLM.
 
 Modele mediapipe : ``model_path`` (defaut
 ~/.cache/clipper/blaze_face_short_range.tflite) ; s'il manque, il est
@@ -101,9 +112,13 @@ CONFIG_DEFAULTS: dict[str, object] = {
     # duplicate_iou), sont un seul visage perdu un moment par le detecteur.
     "track_merge_seconds": 3.0,
     # Visage retenu (jamais coupe par le cadre) : reellement detecte sur au
-    # moins cette part des images analysees du plan (une fausse detection
-    # clignote, un vrai visage a l'image est vu presque partout)...
+    # moins cette part des images analysees de sa piste, de sa premiere a sa
+    # derniere detection (une fausse detection clignote, un vrai visage a
+    # l'image est vu presque partout, meme s'il entre a mi-plan)...
     "min_face_presence": 0.6,
+    # ... sur une piste d'au moins cette duree (une piste fantome de
+    # quelques images n'est pas un visage)...
+    "min_face_seconds": 1.0,
     # ... et de hauteur moyenne au moins cette part de la hauteur source.
     # Les autres pistes restent annotees pour le LLM, mais ne contraignent
     # pas le cadre.
@@ -112,9 +127,25 @@ CONFIG_DEFAULTS: dict[str, object] = {
     # (le cadre est agrandi par paliers si l'autre visage retenu serait
     # coupe, jusqu'au plus grand cadre possible).
     "split_face_height": 0.35,
+    # Un ecran partage n'est jamais choisi pour un plan plus court : en
+    # dessous, repli fallback_blur (un split de 1 s clignote a l'ecran).
+    "split_min_seconds": 3.0,
+    # Plan plus court (coupe de scene parasite, bord du clip) : fusionne au
+    # plan voisin avant l'appel LLM.
+    "min_plan_seconds": 0.5,
     # Marge autour de chaque visage (fraction de sa taille, de chaque cote) :
     # couvre le mouvement entre deux images analysees.
     "face_margin": 0.15,
+    # Paliers du cadrage single quand le visage suivi (gros plan, camera
+    # portee) ne tient pas dans le cadre, essayes dans l'ordre a chaque image
+    # analysee avant tout repli ; le visage suivi n'est jamais rogne et les
+    # autres visages retenus gardent toujours face_margin et leur zone
+    # balayee (jamais coupes) :
+    # 1. marges reduites, dans l'ordre (celles < face_margin), sur la zone
+    #    balayee par le visage suivi ;
+    # 2. puis boite instantanee du visage suivi (marge 0) au lieu de sa zone
+    #    balayee.
+    "fit_margins": [0.1, 0.05, 0.0],
     # Fenetre de la moyenne glissante du suivi.
     "smooth_seconds": 1.0,
     # Zone morte du suivi, fraction de la largeur du cadre.
@@ -146,6 +177,9 @@ LAYOUT_SCHEMA: dict[str, Any] = {
             "additionalProperties": False,
         },
         "face": {"type": ["integer", "null"]},
+        # Detections qui ne sont pas des visages (main, objet) : ni retenues
+        # ni protegees. Facultatif : absent = aucune.
+        "ignore": {"type": "array", "items": {"type": "integer"}},
         "reason": {"type": "string"},
     },
     "required": ["layout", "camera", "face", "reason"],
@@ -583,16 +617,24 @@ def _build_tracks(detections: list[list[Box]], fps: float, settings: dict[str, A
     return tracks
 
 
-def _retain(tracks: list[_Track], samples: int, height: int, settings: dict[str, Any]) -> None:
+def _retain(tracks: list[_Track], fps: float, height: int, settings: dict[str, Any]) -> None:
     """Marque les visages retenus : detectes sur au moins ``min_face_presence``
-    des images du plan et de hauteur moyenne au moins ``min_face_height`` de
-    la source. Une piste fantome, un visage minuscule ou une fausse detection
-    qui clignote ne contraignent pas le cadre."""
+    des images de leur piste (de la premiere a la derniere detection, un
+    visage qui entre a mi-plan compte), piste d'au moins ``min_face_seconds``
+    et hauteur moyenne d'au moins ``min_face_height`` de la source. Une piste
+    fantome, un visage minuscule ou une fausse detection qui clignote ne
+    contraignent pas le cadre."""
     presence = float(settings["min_face_presence"])
+    min_samples = float(settings["min_face_seconds"]) * fps
     min_h = float(settings["min_face_height"]) * height
     for tr in tracks:
         box = tr.mean_box()
-        tr.retained = tr.detected >= presence * samples - 1e-9 and box[3] - box[1] >= min_h
+        span = len(tr.present())
+        tr.retained = (
+            span >= min_samples - 1e-9
+            and tr.detected >= presence * span - 1e-9
+            and box[3] - box[1] >= min_h
+        )
 
 
 # --------------------------------------------------------------------------
@@ -638,6 +680,10 @@ def _rects(plan: _Plan, positions: list[tuple[int, int, int, int]]) -> list[dict
     return out
 
 
+# Palier de cadrage : nom, boites a garder entieres a l'image i.
+_Tier = tuple[str, Callable[[int], list[Box]]]
+
+
 class _Geometry:
     def __init__(self, width: int, height: int, settings: dict[str, Any]):
         self.width = width
@@ -657,9 +703,12 @@ class _Geometry:
         required: list[_Track],
         others: list[_Track],
         desired_center: tuple[float, float] | None = None,
+        tiers: list[_Tier] | None = None,
     ) -> list[tuple[int, int, int, int]]:
         """Positions d'un cadre de rapport ``aspect`` qui suit les visages
-        ``required`` (entiers dedans) sans couper ``others``."""
+        ``required`` (entiers dedans) sans couper ``others``. Avec ``tiers``,
+        les boites gardees entieres sont, image par image, celles du premier
+        palier qui laisse une position."""
         ww, wh = _window(self.width, self.height, aspect)
         axis = 0 if ww < self.width else 1
         extent, win = (self.width, ww) if axis == 0 else (self.height, wh)
@@ -686,25 +735,67 @@ class _Geometry:
         radius = max(0, round(float(self.settings["smooth_seconds"]) * self.fps / 2))
         smoothed = _smooth(lefts, radius, float(self.settings["deadzone"]) * win)
 
+        if tiers is None:
+            tiers = [("", lambda i: [self.margin(tr.span(i)) for tr in required if tr.boxes[i] is not None])]
         positions = []
+        reached = 0
         for i in range(n):
-            req = [self.margin(tr.span(i)) for tr in required if tr.boxes[i] is not None]
             oth = [self.margin(tr.span(i)) for tr in others if tr.boxes[i] is not None]
-            allowed = _allowed(
-                extent,
-                win,
-                [(b[axis], b[axis + 2]) for b in req],
-                [(b[axis], b[axis + 2]) for b in oth],
-            )
-            pos = _project(smoothed[i], allowed)
+            pos = None
+            for k, (_, boxes_at) in enumerate(tiers):
+                req = boxes_at(i)
+                allowed = _allowed(
+                    extent,
+                    win,
+                    [(b[axis], b[axis + 2]) for b in req],
+                    [(b[axis], b[axis + 2]) for b in oth],
+                )
+                pos = _project(smoothed[i], allowed)
+                if pos is not None:
+                    reached = max(reached, k)
+                    break
             if pos is None:
                 faces = ", ".join(f"#{tr.id}" for tr in required) or "aucun"
+                if tiers[-1][0]:
+                    what = f"ne cadre le visage suivi {faces} sans couper" if required else "n'evite de couper"
+                    raise _Infeasible(
+                        f"a {plan.times[i]:.2f}s, aucun cadre {ww}x{wh} {what} un autre visage retenu "
+                        f"(dernier palier : {tiers[-1][0]})"
+                    )
                 raise _Infeasible(
                     f"a {plan.times[i]:.2f}s, aucun cadre {ww}x{wh} ne garde entier(s) le(s) "
                     f"visage(s) {faces} sans couper un autre visage"
                 )
             positions.append((pos, 0, win, wh) if axis == 0 else (0, pos, ww, win))
+        if reached:
+            log.info("plan %d : cadre au palier %r", plan.index, tiers[reached][0])
         return positions
+
+    def tiers(self, track: _Track | None) -> list[_Tier]:
+        """Paliers du cadrage single pour le visage suivi ``track`` (voir
+        CONFIG_DEFAULTS), du plus confortable au plus degrade."""
+        if track is None:
+            return [("aucun visage suivi", lambda i: [])]
+
+        def box(i: int) -> list[Box]:
+            b = track.boxes[i]
+            return [] if b is None else [b]
+
+        def swept(margin: float) -> Callable[[int], list[Box]]:
+            def at(i: int) -> list[Box]:
+                if track.boxes[i] is None:
+                    return []
+                return [_with_margin(track.span(i), margin, self.width, self.height)]  # type: ignore[arg-type]
+
+            return at
+
+        face_margin = float(self.settings["face_margin"])
+        margins = [face_margin] + sorted(
+            {float(m) for m in self.settings["fit_margins"] if float(m) < face_margin}, reverse=True
+        )
+        out: list[_Tier] = [(f"marge {m:g} sur la zone balayee", swept(m)) for m in margins]
+        out.append(("boite instantanee (marge 0)", box))
+        return out
 
     def dest(self, x: int, y: int, w: int, h: int) -> dict[str, int]:
         return {"x": x, "y": y, "w": w, "h": h}
@@ -712,7 +803,8 @@ class _Geometry:
     def single(self, plan: _Plan, face: int | None) -> list[dict[str, Any]]:
         required = [tr for tr in plan.tracks if tr.id == face]
         others = [tr for tr in plan.tracks if tr.id != face and tr.retained]
-        positions = self.follow(plan, self.out_w / self.out_h, required, others)
+        tiers = self.tiers(required[0] if required else None)
+        positions = self.follow(plan, self.out_w / self.out_h, required, others, tiers=tiers)
         return [{"name": "main", "dest": self.dest(0, 0, self.out_w, self.out_h), "rects": _rects(plan, positions)}]
 
     def split(self, plan: _Plan) -> list[dict[str, Any]]:
@@ -860,12 +952,13 @@ def _annotate(plan: _Plan, path: Path, quality: int) -> None:
 def _prompt(plan: _Plan, width: int, height: int) -> str:
     if plan.tracks:
         faces = "\n".join(
-            "- #{id} : environ x={x:.2f}, y={y:.2f} (normalise), present {p}/{n} images".format(
+            "- #{id} : environ x={x:.2f}, y={y:.2f} (normalise), present {p}/{n} images, {r}".format(
                 id=tr.id,
                 x=_center(tr.mean_box())[0] / width,
                 y=_center(tr.mean_box())[1] / height,
                 p=len(tr.present()),
                 n=len(plan.times),
+                r="retenu" if tr.retained else "non retenu (trop petit, trop bref ou intermittent)",
             )
             for tr in plan.tracks
         )
@@ -879,9 +972,13 @@ def _prompt(plan: _Plan, width: int, height: int) -> str:
         "- facecam_gameplay : une webcam (facecam) incrustee par-dessus un jeu, un ecran "
         "partage ou une autre video. camera = rectangle de la webcam en coordonnees "
         "normalisees (x, y, w, h entre 0 et 1, origine en haut a gauche) ; face = null.\n"
-        "- single : un plan filme classique. face = numero du visage a suivre (la personne "
-        "qui parle ou le sujet principal), null s'il n'y a aucun visage ; camera = null.\n"
-        "reason : une phrase de justification."
+        "- single : un plan filme classique. face = numero d'un visage retenu a suivre (la "
+        "personne qui parle ou le sujet principal), null s'il n'y a aucun visage retenu ; "
+        "camera = null. Un visage non retenu ne peut pas etre suivi.\n"
+        "ignore : numeros des detections qui ne sont pas des visages (main, objet, "
+        "motif...) ; elles ne seront pas protegees par le cadrage. [] si toutes sont des "
+        "visages.\n"
+        "reason : une phrase de justification (dire ce que sont les detections ignorees)."
     )
 
 
@@ -896,12 +993,20 @@ def _check_answer(answer: dict[str, Any], plan: _Plan) -> None:
             raise llm.SchemaError(f"rectangle camera vide : {camera}")
         if camera["x"] + camera["w"] > 1 + 1e-6 or camera["y"] + camera["h"] > 1 + 1e-6:
             raise llm.SchemaError(f"rectangle camera hors de l'image : {camera}")
-    else:
+    ids = [tr.id for tr in plan.tracks]
+    ignore = answer.get("ignore", [])
+    unknown = [i for i in ignore if i not in ids]
+    if unknown:
+        raise llm.SchemaError(f"ignore : visage(s) {unknown} inconnu(s) (visages du plan : {ids})")
+    if answer["layout"] != "facecam_gameplay":
         face = answer["face"]
-        if face is not None and face not in {tr.id for tr in plan.tracks}:
-            raise llm.SchemaError(
-                f"visage #{face} inconnu (visages du plan : {[tr.id for tr in plan.tracks]})"
-            )
+        if face is not None and face not in ids:
+            raise llm.SchemaError(f"visage #{face} inconnu (visages du plan : {ids})")
+        if face in ignore:
+            raise llm.SchemaError(f"visage #{face} a la fois suivi et ignore")
+        retained = [tr.id for tr in plan.tracks if tr.retained]
+        if face is not None and face not in retained:
+            raise llm.SchemaError(f"visage #{face} non retenu : seul un visage retenu {retained} peut etre suivi")
 
 
 # --------------------------------------------------------------------------
@@ -915,23 +1020,38 @@ def _settings(config: Any) -> dict[str, Any]:
 
         config = load_config()
     settings = {**CONFIG_DEFAULTS, **config.section("reframe")}
+    if not all(isinstance(m, (int, float)) and m >= 0 for m in settings["fit_margins"]):
+        raise ReframeError(f"[reframe] fit_margins invalide {settings['fit_margins']!r} (liste de marges >= 0)")
     if settings["fallback"] not in _FALLBACKS:
         raise ReframeError(f"[reframe] fallback invalide {settings['fallback']!r} (attendu : {' | '.join(_FALLBACKS)})")
     return settings
 
 
-def _plans(scenes_file: Path, start: float, end: float, fps: float) -> list[_Plan]:
+def _plans(scenes_file: Path, start: float, end: float, fps: float, min_seconds: float) -> list[_Plan]:
+    """Plans du clip : scenes.json coupe a [start, end], chaque plan de moins
+    de ``min_seconds`` fusionne au plan precedent (au suivant s'il est le
+    premier)."""
     if not scenes_file.exists():
         raise ReframeError(f"scenes.json absent : {scenes_file}")
     scenes = json.loads(scenes_file.read_text(encoding="utf-8"))["scenes"]
-    plans = []
+    spans: list[list[float]] = []
     for scene in scenes:
         s, e = max(start, scene["start"]), min(end, scene["end"])
         if e - s > 1e-3:
-            plans.append(_Plan(index=len(plans), start=s, end=e, times=_sample_times(s, e, fps)))
-    if not plans:
+            spans.append([s, e])
+    if not spans:
         raise ReframeError(f"aucun plan de scenes.json ne recouvre le clip [{start}, {end}]")
-    return plans
+    while len(spans) > 1:
+        short = [i for i, (s, e) in enumerate(spans) if e - s < min_seconds]
+        if not short:
+            break
+        i = short[0]
+        if i == 0:
+            spans[1][0] = spans[0][0]
+        else:
+            spans[i - 1][1] = spans[i][1]
+        del spans[i]
+    return [_Plan(index=k, start=s, end=e, times=_sample_times(s, e, fps)) for k, (s, e) in enumerate(spans)]
 
 
 def _detect(
@@ -1015,13 +1135,13 @@ def reframe(
     if not video.exists():
         raise ReframeError(f"video absente : {video}")
     fps = float(settings["sample_fps"])
-    plans = _plans(video_dir / "scenes.json", start, end, fps)
+    plans = _plans(video_dir / "scenes.json", start, end, fps, float(settings["min_plan_seconds"]))
 
     width, height = _detect(plans, video, settings, detector_factory, frame_source)
     geometry = _Geometry(width, height, settings)
     for plan in plans:
         plan.tracks = _build_tracks(plan.detections, fps, settings)
-        _retain(plan.tracks, len(plan.times), height, settings)
+        _retain(plan.tracks, fps, height, settings)
 
     results = []
     for plan in plans:
@@ -1029,6 +1149,9 @@ def reframe(
         _annotate(plan, image, int(settings["jpeg_quality"]))
         answer = llm.ask("layout", _prompt(plan, width, height), [image], LAYOUT_SCHEMA, config=config)
         _check_answer(answer, plan)
+        for tr in plan.tracks:
+            if tr.id in answer.get("ignore", []):
+                tr.retained = False
 
         layout, reason = answer["layout"], None
         try:
@@ -1040,7 +1163,12 @@ def reframe(
             reason = str(exc)
             panels = None
             if settings["fallback"] == "auto":
+                split_min = float(settings["split_min_seconds"])
                 try:
+                    if plan.end - plan.start < split_min:
+                        raise _Infeasible(
+                            f"plan de {plan.end - plan.start:.2f}s, moins que split_min_seconds ({split_min:g}s)"
+                        )
                     panels, layout = geometry.split(plan), "split"
                 except _Infeasible as exc2:
                     reason = f"{reason} ; split impossible : {exc2}"
