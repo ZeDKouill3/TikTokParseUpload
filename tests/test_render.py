@@ -45,6 +45,7 @@ def _captions_json(**overrides):
         "caption": "Une legende qui donne envie",
         "hashtags": ["#gta6", "#trailer"],
         "hook_text": "Attends de voir ca",
+        "screen_title": "Il m'a menti en garde à vue",
     }
     clip.update(overrides)
     return {"video_id": VIDEO_ID, "clips": [clip]}
@@ -751,3 +752,381 @@ def test_config_defaults_declares_expected_settings():
 
     for key in ("max_fps", "crf", "loudnorm_i", "hook_seconds", "blur_radius"):
         assert key in CONFIG_DEFAULTS
+
+
+# --------------------------------------------------------------------------
+# Format letterbox (SPEC-6127, TASK-b7f4) : titre d'ecran sur encadre blanc,
+# « Partie N » dessous, pas d'accroche de 2 s, sidecar avec video_rect.
+# --------------------------------------------------------------------------
+
+TITLE_ZONE = {"x0": 150, "y0": 160, "x1": 930, "y1": 424}
+SUBTITLES_ZONE = {"x0": 150, "y0": 1246, "x1": 930, "y1": 1448}
+PART_ZONE = {"x0": 150, "y0": 1464, "x1": 930, "y1": 1520}
+VIDEO_RECT = {"x": 0, "y": 440, "w": 1080, "h": 790}
+
+
+def _reframe_json_letterbox():
+    """Plan letterbox tel que l'ecrit reframe (contrat commun SPEC-6127, valeurs
+    par defaut pour une source 1920x1080)."""
+    panels = [
+        _panel("background", 0, 0, SRC_W, SRC_H, {"x": 0, "y": 0, "w": OUT_W, "h": OUT_H}, effect="blur"),
+        _panel("main", 222, 0, 1476, SRC_H, dict(VIDEO_RECT)),
+    ]
+    plan = {
+        "index": 0, "start": 1.0, "end": 3.5, "image": None, "llm": None, "layout": "letterbox",
+        "reason": None, "faces": [], "panels": panels,
+    }
+    return {
+        "video_id": VIDEO_ID, "clip_id": CLIP_ID, "start": 1.0, "end": 3.5,
+        "source": {"width": SRC_W, "height": SRC_H}, "output": {"width": OUT_W, "height": OUT_H},
+        "layout": "letterbox", "format": "letterbox",
+        "text_zones": {"title": dict(TITLE_ZONE), "subtitles": dict(SUBTITLES_ZONE), "part": dict(PART_ZONE)},
+        "plans": [plan],
+    }
+
+
+def _emoji_font_available():
+    from clipper.render import CONFIG_DEFAULTS, RenderError, resolve_emoji_font
+
+    try:
+        resolve_emoji_font(CONFIG_DEFAULTS)
+    except RenderError:
+        return False
+    return True
+
+
+no_emoji_font = pytest.mark.skipif(not _emoji_font_available(), reason="police emoji couleur absente")
+
+
+def _assert_box_inside(box, zone):
+    x0, y0, x1, y1 = box
+    assert zone["x0"] <= x0 < x1 <= zone["x1"], (box, zone)
+    assert zone["y0"] <= y0 < y1 <= zone["y1"], (box, zone)
+
+
+@pytest.fixture
+def letterbox_dir(video_dir):
+    (video_dir / "reframe" / f"{CLIP_ID}.json").write_text(json.dumps(_reframe_json_letterbox()), encoding="utf-8")
+    return video_dir
+
+
+@pytest.fixture
+def fake_ffmpeg(monkeypatch):
+    """Remplace l'execution de ffmpeg : note la commande et le contenu du
+    dossier de travail, ecrit un mp4 factice, pour verifier entrees et sidecar
+    sans encoder."""
+    calls = []
+
+    def run(cmd, cwd, out_path):
+        calls.append({"cmd": list(cmd), "scratch": sorted(p.name for p in Path(cwd).iterdir())})
+        Path(out_path).write_bytes(b"mp4")
+
+    monkeypatch.setattr("clipper.render._exec_ffmpeg", run)
+    return calls
+
+
+# --- (1) titre : mise en page mesuree avec la vraie police ---------------------
+
+
+def test_short_title_fits_on_one_line_centered_at_the_bottom_of_the_title_zone():
+    from clipper.render import CONFIG_DEFAULTS, layout_title
+
+    lay = layout_title("Il m'a menti", TITLE_ZONE, CONFIG_DEFAULTS)
+
+    assert lay.lines == ["Il m'a menti"]
+    assert lay.font_size == CONFIG_DEFAULTS["title_font_size"]
+    _assert_box_inside(lay.box, TITLE_ZONE)
+    x0, _y0, x1, y1 = lay.box
+    assert y1 == TITLE_ZONE["y1"]
+    assert abs((x0 + x1) / 2 - (TITLE_ZONE["x0"] + TITLE_ZONE["x1"]) / 2) <= 1
+
+
+def test_six_long_words_wrap_on_two_lines_and_the_box_stays_in_the_zone():
+    from clipper.render import CONFIG_DEFAULTS, layout_title
+
+    title = "Pourquoi personne ne comprend vraiment cette histoire"
+    lay = layout_title(title, TITLE_ZONE, CONFIG_DEFAULTS)
+
+    assert len(lay.lines) == 2
+    assert " ".join(lay.lines) == title
+    _assert_box_inside(lay.box, TITLE_ZONE)
+    assert lay.font_size >= CONFIG_DEFAULTS["title_font_size_min"]
+
+
+def test_title_that_cannot_fit_at_minimum_size_is_an_explicit_error():
+    from clipper.render import CONFIG_DEFAULTS, RenderError, layout_title
+
+    title = " ".join(["Anticonstitutionnellement"] * 6)
+    with pytest.raises(RenderError, match="titre"):
+        layout_title(title, TITLE_ZONE, CONFIG_DEFAULTS)
+
+
+def test_title_size_steps_down_until_the_box_fits():
+    from clipper.render import CONFIG_DEFAULTS, layout_title
+
+    zone = {"x0": 290, "y0": 160, "x1": 790, "y1": 424}  # 500 px de large
+    lay = layout_title("Il m'a menti en garde à vue", zone, CONFIG_DEFAULTS)
+
+    assert lay.font_size < CONFIG_DEFAULTS["title_font_size"]
+    _assert_box_inside(lay.box, zone)
+
+
+def test_title_character_missing_from_poppins_is_an_explicit_error():
+    from clipper.render import CONFIG_DEFAULTS, RenderError, layout_title
+
+    with pytest.raises(RenderError, match="Poppins"):
+        layout_title("Titre 漢字", TITLE_ZONE, CONFIG_DEFAULTS)
+
+
+def test_title_is_split_into_text_and_emoji_segments_by_unicode_class():
+    from clipper.render import split_segments
+
+    assert split_segments("garde à vue 🚨") == [("text", "garde à vue "), ("emoji", "🚨")]
+    assert split_segments("Je t'❤️ fort") == [("text", "Je t'"), ("emoji", "❤️"), ("text", " fort")]
+    assert split_segments("Bravo 👍🏽!") == [("text", "Bravo "), ("emoji", "👍🏽"), ("text", "!")]
+
+
+def test_missing_emoji_font_is_an_explicit_error(tmp_path):
+    from clipper.render import CONFIG_DEFAULTS, RenderError, layout_title
+
+    settings = {**CONFIG_DEFAULTS, "emoji_font": str(tmp_path / "absente.ttf")}
+    with pytest.raises(RenderError, match="police emoji"):
+        layout_title("Il m'a menti 🚨", TITLE_ZONE, settings)
+
+
+@no_emoji_font
+def test_title_png_is_transparent_with_a_colored_emoji_where_the_layout_puts_it(tmp_path):
+    from PIL import Image
+
+    from clipper.render import CONFIG_DEFAULTS, title_png
+
+    png = tmp_path / "title.png"
+    lay = title_png("Il m'a menti en garde à vue 🚨", TITLE_ZONE, CONFIG_DEFAULTS, png)
+
+    img = Image.open(png)
+    assert img.mode == "RGBA"
+    assert img.size == (TITLE_ZONE["x1"] - TITLE_ZONE["x0"], TITLE_ZONE["y1"] - TITLE_ZONE["y0"])
+    assert img.getpixel((0, 0))[3] == 0  # hors encadre : transparent
+    assert len(lay.emoji_boxes) == 1
+    _assert_box_inside(lay.emoji_boxes[0], TITLE_ZONE)
+
+    def colored(px):
+        r, g, b, a = px
+        return a > 200 and max(r, g, b) - min(r, g, b) > 80
+
+    ox, oy = TITLE_ZONE["x0"], TITLE_ZONE["y0"]
+    ex0, ey0, ex1, ey1 = (v - o for v, o in zip(lay.emoji_boxes[0], (ox, oy, ox, oy)))
+    inside = outside = 0
+    for y in range(img.height):
+        for x in range(img.width):
+            if colored(img.getpixel((x, y))):
+                if ex0 <= x < ex1 and ey0 <= y < ey1:
+                    inside += 1
+                else:
+                    outside += 1
+    assert inside > 50
+    assert outside == 0  # texte noir sur blanc : aucune couleur hors de l'emoji
+    # encadre blanc opaque au bord gauche, a mi-hauteur
+    bx0, by0, _bx1, by1 = lay.box
+    assert img.getpixel((bx0 - ox + 4, (by0 + by1) // 2 - oy)) == (255, 255, 255, 255)
+
+
+def test_resolve_emoji_font_uses_the_configured_path_when_it_exists(tmp_path):
+    from clipper.render import CONFIG_DEFAULTS, resolve_emoji_font
+
+    font = tmp_path / "emoji.ttf"
+    font.write_bytes(b"x")
+    assert resolve_emoji_font({**CONFIG_DEFAULTS, "emoji_font": str(font)}) == font
+
+
+# --- filtre ffmpeg en letterbox --------------------------------------------------
+
+
+def _letterbox_filter(tmp_path, video_dir, part_path=None):
+    from clipper.render import CONFIG_DEFAULTS, _build_filter_complex
+
+    ass_path = video_dir / "subtitles" / f"{CLIP_ID}.ass"
+    return _build_filter_complex(
+        _reframe_json_letterbox(), 1.0, 3.5, ass_path, None, part_path, tmp_path, CONFIG_DEFAULTS,
+        title_input=1,
+    )
+
+
+def test_letterbox_filter_overlays_the_title_png_on_the_title_zone_without_hook(tmp_path, video_dir):
+    filt, label = _letterbox_filter(tmp_path, video_dir)
+
+    overlay = next(f for f in filt.split(";") if "[1:v]overlay" in f)
+    assert f"[1:v]overlay=x={TITLE_ZONE['x0']}:y={TITLE_ZONE['y0']}" in overlay
+    assert "enable=" not in overlay  # tout le clip
+    assert "drawtext" not in filt  # ni accroche, ni Partie (clip unique)
+    assert "lt(t," not in filt
+    assert overlay.endswith(f"[{label}]")
+
+
+def test_letterbox_filter_centers_partie_in_the_part_zone_when_multipart(tmp_path, video_dir):
+    part_path = tmp_path / "part.txt"
+    part_path.write_text("Partie 2", encoding="utf-8")
+
+    filt, label = _letterbox_filter(tmp_path, video_dir, part_path=part_path)
+
+    part = next(f for f in filt.split(";") if "part.txt" in f)
+    assert "drawtext=textfile='part.txt'" in part
+    assert f"x={PART_ZONE['x0']}+({PART_ZONE['x1'] - PART_ZONE['x0']}-text_w)/2" in part
+    assert "y_align=baseline" in part
+    assert "enable=" not in part  # tout le clip
+    assert filt.index("[1:v]overlay") < filt.index("part.txt")
+    assert part.endswith(f"[{label}]")
+    assert sum("drawtext" in f for f in filt.split(";")) == 1  # pas d'accroche
+
+
+# --- render en letterbox : entrees, sidecar ------------------------------------
+
+
+def test_letterbox_render_passes_the_title_png_as_second_input_and_writes_video_rect(
+    tmp_path, letterbox_dir, fake_ffmpeg, cpu_device
+):
+    from clipper.render import render
+
+    (letterbox_dir / f"{VIDEO_ID}.mp4").write_bytes(b"")
+    render(VIDEO_ID, CLIP_ID, workspace_dir=letterbox_dir.parent, output_dir=tmp_path / "output",
+           config=make_config())
+
+    cmd = fake_ffmpeg[0]["cmd"]
+    inputs = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-i"]
+    assert len(inputs) == 2
+    assert inputs[1].endswith("title.png")
+    assert "title.png" in fake_ffmpeg[0]["scratch"]
+    assert "hook.txt" not in fake_ffmpeg[0]["scratch"]
+    assert "part.txt" not in fake_ffmpeg[0]["scratch"]
+
+    data = json.loads((tmp_path / "output" / VIDEO_ID / f"{CLIP_ID}.json").read_text(encoding="utf-8"))
+    assert data["layout"] == "letterbox"
+    assert data["video_rect"] == VIDEO_RECT
+    assert data["screen_title"] == "Il m'a menti en garde à vue"
+
+
+def test_letterbox_render_writes_partie_n_when_multipart(tmp_path, letterbox_dir, fake_ffmpeg, cpu_device):
+    from clipper.render import render
+
+    (letterbox_dir / f"{VIDEO_ID}.mp4").write_bytes(b"")
+    (letterbox_dir / "captions.json").write_text(
+        json.dumps(_captions_json(part=2, parts_total=3)), encoding="utf-8")
+
+    render(VIDEO_ID, CLIP_ID, workspace_dir=letterbox_dir.parent, output_dir=tmp_path / "output",
+           config=make_config())
+
+    assert "part.txt" in fake_ffmpeg[0]["scratch"]
+    filt = fake_ffmpeg[0]["cmd"][fake_ffmpeg[0]["cmd"].index("-filter_complex") + 1]
+    assert "drawtext=textfile='part.txt'" in filt
+
+
+def test_letterbox_partie_text_is_partie_n(tmp_path, letterbox_dir, monkeypatch, cpu_device):
+    from clipper.render import render
+
+    (letterbox_dir / f"{VIDEO_ID}.mp4").write_bytes(b"")
+    (letterbox_dir / "captions.json").write_text(
+        json.dumps(_captions_json(part=2, parts_total=3)), encoding="utf-8")
+    seen = []
+
+    def run(cmd, cwd, out_path):
+        seen.append((Path(cwd) / "part.txt").read_text(encoding="utf-8"))
+        Path(out_path).write_bytes(b"mp4")
+
+    monkeypatch.setattr("clipper.render._exec_ffmpeg", run)
+    render(VIDEO_ID, CLIP_ID, workspace_dir=letterbox_dir.parent, output_dir=tmp_path / "output",
+           config=make_config())
+
+    assert seen == ["Partie 2"]
+
+
+def test_letterbox_partie_too_big_for_its_zone_is_an_explicit_error(tmp_path, letterbox_dir, fake_ffmpeg, cpu_device):
+    from clipper.render import RenderError, render
+
+    (letterbox_dir / f"{VIDEO_ID}.mp4").write_bytes(b"")
+    (letterbox_dir / "captions.json").write_text(
+        json.dumps(_captions_json(part=2, parts_total=3)), encoding="utf-8")
+    with pytest.raises(RenderError, match="Partie"):
+        render(VIDEO_ID, CLIP_ID, workspace_dir=letterbox_dir.parent, output_dir=tmp_path / "output",
+               config=make_config(part_font_size=120))
+    assert fake_ffmpeg == []
+
+
+def test_letterbox_without_text_zones_asks_to_rerun_reframe(tmp_path, letterbox_dir, fake_ffmpeg):
+    from clipper.render import RenderError, render
+
+    (letterbox_dir / f"{VIDEO_ID}.mp4").write_bytes(b"")
+    reframe = _reframe_json_letterbox()
+    del reframe["text_zones"]
+    (letterbox_dir / "reframe" / f"{CLIP_ID}.json").write_text(json.dumps(reframe), encoding="utf-8")
+    with pytest.raises(RenderError, match="reframe"):
+        render(VIDEO_ID, CLIP_ID, workspace_dir=letterbox_dir.parent, output_dir=tmp_path / "output",
+               config=make_config())
+    assert fake_ffmpeg == []
+
+
+@pytest.mark.parametrize("fixture", ["video_dir", "letterbox_dir"])
+def test_missing_screen_title_asks_to_rerun_captions_force(tmp_path, fixture, request, fake_ffmpeg):
+    from clipper.render import RenderError, render
+
+    d = request.getfixturevalue(fixture)
+    (d / f"{VIDEO_ID}.mp4").write_bytes(b"")
+    captions = _captions_json()
+    del captions["clips"][0]["screen_title"]
+    (d / "captions.json").write_text(json.dumps(captions), encoding="utf-8")
+    with pytest.raises(RenderError, match="captions --force"):
+        render(VIDEO_ID, CLIP_ID, workspace_dir=d.parent, output_dir=tmp_path / "output", config=make_config())
+    assert fake_ffmpeg == []
+
+
+def test_crop_sidecar_also_carries_screen_title(tmp_path, video_dir, fake_ffmpeg, cpu_device):
+    from clipper.render import render
+
+    (video_dir / f"{VIDEO_ID}.mp4").write_bytes(b"")
+    render(VIDEO_ID, CLIP_ID, workspace_dir=video_dir.parent, output_dir=tmp_path / "output", config=make_config())
+
+    data = json.loads((tmp_path / "output" / VIDEO_ID / f"{CLIP_ID}.json").read_text(encoding="utf-8"))
+    assert data["screen_title"] == "Il m'a menti en garde à vue"
+    assert data["layout"] == "single"
+    assert "video_rect" not in data
+    cmd = fake_ffmpeg[0]["cmd"]
+    assert cmd.count("-i") == 1  # hors letterbox : rendu inchange, pas de PNG de titre
+    assert "hook.txt" in fake_ffmpeg[0]["scratch"]
+
+
+# --- rendu ffmpeg reel d'un plan letterbox synthetique ---------------------------
+
+
+@no_ffmpeg
+@no_ffprobe
+def test_render_letterbox_real_ffmpeg_draws_the_white_title_box_and_partie(
+    tmp_path, letterbox_dir, synthetic_source, cpu_device
+):
+    from PIL import Image
+
+    from clipper.render import CONFIG_DEFAULTS, layout_title, render
+
+    (letterbox_dir / "captions.json").write_text(
+        json.dumps(_captions_json(part=1, parts_total=2)), encoding="utf-8")
+    out = render(VIDEO_ID, CLIP_ID, workspace_dir=letterbox_dir.parent, output_dir=tmp_path / "output",
+                 config=make_config(x264_preset="ultrafast"))
+
+    probe = _ffprobe_json(out)
+    streams = {s["codec_type"]: s for s in probe["streams"]}
+    assert (streams["video"]["width"], streams["video"]["height"]) == (OUT_W, OUT_H)
+    assert float(probe["format"]["duration"]) == pytest.approx(2.5, abs=0.1)
+
+    lay = layout_title("Il m'a menti en garde à vue", TITLE_ZONE, CONFIG_DEFAULTS)
+    bx0, by0, _bx1, by1 = lay.box
+    for t in (0.2, 2.3):  # debut et fin du clip : titre et Partie tout du long
+        frame = tmp_path / f"frame_{t}.png"
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-ss", str(t), "-i", str(out),
+                        "-frames:v", "1", str(frame)], check=True)
+        img = Image.open(frame).convert("RGB")
+        r, g, b = img.getpixel((bx0 + 6, (by0 + by1) // 2))
+        assert min(r, g, b) > 225, (t, (r, g, b))  # bord de l'encadre blanc
+        # Partie : du blanc (texte) dans la zone part
+        white = sum(
+            1 for y in range(PART_ZONE["y0"], PART_ZONE["y1"]) for x in range(PART_ZONE["x0"], PART_ZONE["x1"], 2)
+            if min(img.getpixel((x, y))) > 235
+        )
+        assert white > 30, t

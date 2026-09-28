@@ -17,6 +17,9 @@ dependencies = [
     "mediapipe",
     "fastapi",
     "uvicorn",
+    # render : titre d'ecran letterbox rasterise (Pillow) et couverture des polices (fonttools).
+    "pillow",
+    "fonttools",
 ]
 
 [project.optional-dependencies]
