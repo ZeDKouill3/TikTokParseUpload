@@ -5,15 +5,19 @@ slug: grille-de-notation-des-moments-clips-60-120-s-s
 title: Grille de notation des moments (clips 60-120 s, séries de parties qui se suivent)
 created: 2026-09-28T20:08:17Z
 author: nicoc@zedk_ordi
-status: proposed
+status: accepted
 scope:
   - clipper/moments.py
   - clipper/parts.py
   - rubric.toml
 references: [ADR-b1c17749b528]
 supersedes: SPEC-53f3d22d6314
+ratified: 863560765df6
+verified:
+  - by: nicoc@zedk_ordi
+    at: 2026-09-28T20:13:28Z
 schema: 4
-version: 1
+version: 2
 ---
 
 ## Objet
