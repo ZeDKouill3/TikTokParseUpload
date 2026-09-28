@@ -524,6 +524,7 @@ single_max = 45
 part_min = 60
 part_max = 90
 min_parts = 2
+max_parts = 12
 tolerance = 3
 
 [bonus]

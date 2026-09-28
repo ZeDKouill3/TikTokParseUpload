@@ -46,6 +46,7 @@ single_max = 45
 part_min = 60
 part_max = 90
 min_parts = 2
+max_parts = 12
 tolerance = 3
 
 [bonus]
@@ -181,7 +182,7 @@ def spans(data):
 
 
 # --------------------------------------------------------------------------
-# rubric.toml du depot : conforme a SPEC-53f3
+# rubric.toml du depot : conforme a SPEC-1557
 # --------------------------------------------------------------------------
 
 
@@ -195,11 +196,30 @@ def test_repo_rubric_matches_the_spec():
     assert all(c["question"].strip() for c in rubric["criteria"].values())
     assert rubric["min_score"] == 60
     d = rubric["durations"]
-    assert (d["single_min"], d["single_max"], d["part_min"], d["part_max"], d["min_parts"]) == (20, 45, 60, 90, 2)
+    assert (
+        d["single_min"], d["single_max"], d["part_min"], d["part_max"], d["min_parts"], d["max_parts"], d["tolerance"]
+    ) == (60, 120, 60, 120, 2, 12, 3)
     for keyword in ("GTA 6", "trailer", "date de sortie", "Vice City", "Lucia"):
         assert keyword in rubric["trend_keywords"]
     assert set(rubric["exclusions"]["sponsorblock_categories"]) == {"sponsor", "intro", "outro", "selfpromo"}
     assert {"max_total", "replayed", "audio_peaks", "visual"} <= set(rubric["bonus"])
+
+
+def test_rubric_without_max_parts_is_refused(tmp_path):
+    from clipper.moments import MomentsError, load_rubric
+
+    p = tmp_path / "rubric.toml"
+    p.write_text(TEST_RUBRIC.replace("max_parts = 12\n", ""), encoding="utf-8")
+    with pytest.raises(MomentsError, match=r"\[durations\] max_parts manquant"):
+        load_rubric(p)
+
+
+def test_moments_cites_spec_1557():
+    import clipper.moments
+
+    assert "SPEC-1557" in clipper.moments.__doc__ and "SPEC-53f3" not in clipper.moments.__doc__
+    header = (REPO / "rubric.toml").read_text(encoding="utf-8").split("\n", 1)[0]
+    assert "SPEC-1557" in header
 
 
 def test_rubric_missing_a_weight_is_refused(tmp_path):
@@ -1186,7 +1206,7 @@ def test_rescore_after_vision_keeps_the_exploration(tmp_path, video_dir, rubric_
 # Connecteurs de tete (TASK-3170) : essai reel sZi-qJ-5ptA, clips rejetes par
 # qa en starts_mid_sentence ("Donc deja il m'a menti...", "Mais quand on
 # fait un zoom..."). Reculer d'une phrase mettrait la mise en contexte en
-# tete (SPEC-53f3 regle 1) : on retire les connecteurs, le clip commence au
+# tete (SPEC-1557 regle 1) : on retire les connecteurs, le clip commence au
 # premier mot qui suit, une seule fois dans _normalize (avant le jury).
 # --------------------------------------------------------------------------
 
@@ -1453,3 +1473,147 @@ def test_real_claude_answers_the_schema_and_bounds_land_on_sentences(tmp_path, v
     ends = {math.ceil(s["end"] * 10 - 1e-6) / 10 for s in segments}
     for m in data["moments"] + [r for r in data["rejected"] if "final_score" in r]:
         assert m["start"] in starts and m["end"] in ends
+
+
+# --------------------------------------------------------------------------
+# Clips de 60-120 s et longs passages en series (TASK-7758, SPEC-1557
+# regles 3 et 4), sur la grille de la spec et une video de 2150 s (430
+# phrases ; le sponsor exclu 200-240 est evite en partant de la phrase 60).
+# --------------------------------------------------------------------------
+
+SPEC_DURATIONS = """[durations]
+single_min = 60
+single_max = 120
+part_min = 60
+part_max = 120
+min_parts = 2
+max_parts = 12
+tolerance = 3
+"""
+SPEC_RUBRIC = re.sub(r"\[durations\]\n(?:[a-z_]+ = \d+\n)+", SPEC_DURATIONS, TEST_RUBRIC)
+
+
+@pytest.fixture
+def spec_rubric(tmp_path):
+    p = tmp_path / "spec_rubric.toml"
+    p.write_text(SPEC_RUBRIC, encoding="utf-8")
+    return p
+
+
+@pytest.fixture
+def long_video(video_dir):
+    (video_dir / "transcript.json").write_text(json.dumps(make_transcript(430)), encoding="utf-8")
+    return video_dir
+
+
+def span_of(first, last, **kwargs):
+    """Candidat des phrases first a last : 5 x (last - first) + 4.4 s."""
+    return moment(sentence_start(first), sentence_end(last), **kwargs)
+
+
+def test_spec_rubric_replaces_the_durations():
+    assert "single_max = 120" in SPEC_RUBRIC and "single_max = 45" not in SPEC_RUBRIC
+
+
+def test_prompt_describes_single_and_series_with_the_rubric_bounds(tmp_path, video_dir, spec_rubric):
+    fake, _ = run(tmp_path, spec_rubric, [{"moments": []}])
+    prompt = fake.calls[0].prompt
+    assert "single" in prompt and "histoire complete de 60 a 120 s" in prompt
+    assert "une affaire entiere, typiquement 5 a 15 min, au plus 12 x 120 = 1440 s" in prompt
+    assert "serie de 2 a 12 parties de 60 a 120 s qui se suivent" in prompt
+    assert "suspense" in prompt and "etape parts" in prompt
+
+
+def test_prompt_bounds_are_read_from_the_rubric(tmp_path, video_dir, spec_rubric):
+    spec_rubric.write_text(
+        SPEC_RUBRIC.replace("single_min = 60", "single_min = 55").replace("max_parts = 12", "max_parts = 7")
+        .replace("part_max = 120", "part_max = 110"),
+        encoding="utf-8",
+    )
+    fake, _ = run(tmp_path, spec_rubric, [{"moments": []}])
+    prompt = fake.calls[0].prompt
+    assert "histoire complete de 55 a 120 s" in prompt
+    assert "au plus 7 x 110 = 770 s" in prompt
+    assert "serie de 2 a 7 parties de 60 a 110 s" in prompt
+
+
+def test_single_of_50_s_is_rejected_and_of_90_s_kept(tmp_path, long_video, spec_rubric):
+    run(tmp_path, spec_rubric, [{"moments": [span_of(60, 69), span_of(100, 117)]}])  # 49.4 s, 89.4 s
+
+    data = read_moments(long_video)
+    assert spans(data) == [(500.2, 589.7)]
+    [r] = data["rejected"]
+    assert r["start"] == 300.2 and "duree 49.4 s hors bornes single (60-120 s)" in r["reason"]
+
+
+def test_multipart_of_10_min_is_kept(tmp_path, long_video, spec_rubric):
+    run(tmp_path, spec_rubric, [{"moments": [span_of(60, 179, fmt="multipart")]}])  # 599.4 s
+
+    [m] = read_moments(long_video)["moments"]
+    assert (m["start"], m["end"], m["format"]) == (300.2, 899.7, "multipart")
+
+
+@pytest.mark.parametrize(("last", "duration"), [(419, "1799.4"), (79, "99.4")])
+def test_multipart_outside_min_parts_x_part_min_and_max_parts_x_part_max_is_rejected(
+    tmp_path, long_video, spec_rubric, last, duration
+):
+    run(tmp_path, spec_rubric, [{"moments": [span_of(60, last, fmt="multipart")]}])  # 30 min, 100 s
+
+    data = read_moments(long_video)
+    assert data["moments"] == []
+    [r] = data["rejected"]
+    assert f"duree {duration} s hors bornes multipart (120-1440 s)" in r["reason"]
+
+
+def test_single_inside_a_retained_passage_is_rejected_even_better_scored(tmp_path, long_video, spec_rubric):
+    # passage 60 (BORDER, 60.0) et clip unique 100 (GOOD, 66.9) inclus dedans
+    run(tmp_path, spec_rubric, [{"moments": [
+        span_of(60, 179, fmt="multipart", scores=BORDER),
+        span_of(100, 117, scores=GOOD),
+    ]}])
+
+    data = read_moments(long_video)
+    assert [(m["start"], m["format"]) for m in data["moments"]] == [(300.2, "multipart")]
+    [r] = data["rejected"]
+    assert (r["start"], r["final_score"]) == (500.2, 66.9)
+    assert "chevauche un passage en serie retenu [300.2-899.7]" in r["reason"]
+
+
+def test_passage_under_min_score_leaves_the_single(tmp_path, long_video, spec_rubric):
+    # LOW : 30.0 plus au plus 10 de bonus, sous min_score
+    run(tmp_path, spec_rubric, [{"moments": [
+        span_of(60, 179, fmt="multipart", scores=LOW),
+        span_of(100, 117, scores=GOOD),
+    ]}])
+
+    data = read_moments(long_video)
+    assert spans(data) == [(500.2, 589.7)]
+    [r] = data["rejected"]
+    assert r["start"] == 300.2 and "min_score" in r["reason"]
+
+
+def test_two_overlapping_passages_keep_the_best_scored(tmp_path, long_video, spec_rubric):
+    run(tmp_path, spec_rubric, [{"moments": [
+        span_of(60, 179, fmt="multipart", scores=BORDER),
+        span_of(150, 269, fmt="multipart", scores=GOOD),
+    ]}])
+
+    data = read_moments(long_video)
+    assert spans(data) == [(750.2, 1349.7)]
+    [r] = data["rejected"]
+    assert "chevauche un moment mieux note [750.2-1349.7]" in r["reason"]
+
+
+def test_exploration_never_brings_back_a_single_overlapping_a_retained_passage(tmp_path, long_video, spec_rubric):
+    # le jury hesite fort sur le clip unique 100 (dispersion 70) : seul
+    # candidat possible pour l'exploration, il chevauche le passage retenu.
+    proposal = {"moments": [span_of(60, 179, fmt="multipart"), span_of(100, 117)]}
+    run(
+        tmp_path, spec_rubric, with_jury(proposal, jury_notes({60: GOOD, 100: split(TOP)})),
+        config=auto_config(tmp_path, spec_rubric, exploration_share=1.0),
+    )
+
+    data = read_moments(long_video)
+    assert [m["format"] for m in data["moments"]] == ["multipart"]
+    assert explored(data) == []
+    assert data["exploration"]["chosen"] == 0
