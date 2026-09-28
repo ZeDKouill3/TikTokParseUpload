@@ -75,6 +75,17 @@ section h2 .n { color: var(--faint); font-weight: 500; }
 .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
 .col-head .n { margin-left: auto; color: var(--faint); font-weight: 500; font-family: var(--mono); }
 .col-body { padding: 4px; }
+
+/* Accordeon : colonnes et sections repliables d'un clic */
+[data-fold-toggle] { cursor: pointer; user-select: none; }
+[data-fold-toggle]:focus-visible { outline: 1px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+.chev { width: 10px; height: 10px; flex: none; color: var(--faint); transition: transform 200ms var(--ease); }
+.folded > [data-fold-toggle] .chev { transform: rotate(-90deg); }
+.fold-wrap { display: grid; grid-template-rows: 1fr; transition: grid-template-rows 220ms var(--ease); }
+.folded > .fold-wrap { grid-template-rows: 0fr; }
+.fold-inner { overflow: hidden; min-height: 0; }
+.col.folded > .col-head { border-bottom-color: transparent; }
+@media (hover: hover) and (pointer: fine) { .col-head[data-fold-toggle]:hover { background: var(--raise); } section h2[data-fold-toggle]:hover { color: var(--text); } }
 .empty { padding: 12px; color: var(--faint); }
 .task { border-radius: 4px; }
 .task > summary {
@@ -140,21 +151,21 @@ a.tlink:hover { text-decoration: underline; }
 </header>
 <div class="err" id="err"></div>
 <main>
-  <section>
-    <h2>Tâches <span class="n" id="n-tasks"></span></h2>
-    <div class="board" id="board"></div>
+  <section data-fold="sec:tasks">
+    <h2 data-fold-toggle role="button" tabindex="0" aria-expanded="true"><svg class="chev" viewBox="0 0 10 10" aria-hidden="true"><path d="M2 3.5 5 6.5 8 3.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>Tâches <span class="n" id="n-tasks"></span></h2>
+    <div class="fold-wrap"><div class="fold-inner"><div class="board" id="board"></div></div></div>
   </section>
-  <section>
-    <h2>Dépendances <span class="n">bloqueur au-dessus, ce qu'il débloque en dessous</span></h2>
-    <div class="graph"><div class="graph-wrap" id="graph"></div></div>
+  <section data-fold="sec:graph">
+    <h2 data-fold-toggle role="button" tabindex="0" aria-expanded="true"><svg class="chev" viewBox="0 0 10 10" aria-hidden="true"><path d="M2 3.5 5 6.5 8 3.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>Dépendances <span class="n">bloqueur au-dessus, ce qu'il débloque en dessous</span></h2>
+    <div class="fold-wrap"><div class="fold-inner"><div class="graph"><div class="graph-wrap" id="graph"></div></div></div></div>
   </section>
-  <section>
-    <h2>Branches <span class="n" id="n-branches"></span></h2>
-    <div class="table-wrap"><table id="branches"></table></div>
+  <section data-fold="sec:branches">
+    <h2 data-fold-toggle role="button" tabindex="0" aria-expanded="true"><svg class="chev" viewBox="0 0 10 10" aria-hidden="true"><path d="M2 3.5 5 6.5 8 3.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>Branches <span class="n" id="n-branches"></span></h2>
+    <div class="fold-wrap"><div class="fold-inner"><div class="table-wrap"><table id="branches"></table></div></div></div>
   </section>
-  <section>
-    <h2>Décisions et spécifications <span class="n" id="n-docs"></span></h2>
-    <div class="table-wrap"><table id="docs"></table></div>
+  <section data-fold="sec:docs">
+    <h2 data-fold-toggle role="button" tabindex="0" aria-expanded="true"><svg class="chev" viewBox="0 0 10 10" aria-hidden="true"><path d="M2 3.5 5 6.5 8 3.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>Décisions et spécifications <span class="n" id="n-docs"></span></h2>
+    <div class="fold-wrap"><div class="fold-inner"><div class="table-wrap"><table id="docs"></table></div></div></div>
   </section>
 </main>
 <script>
@@ -168,6 +179,40 @@ const GROUPS = [
 const LANE_COLORS = ["#7aa2ff", "#5fd08a", "#e0a650", "#a38bf0", "#4fc6d0", "#f07178", "#c3d06a", "#e38fd0"];
 const ROW = 28, LANE = 16, PAD = 16;
 const openTasks = new Set();
+const CHEV = '<svg class="chev" viewBox="0 0 10 10" aria-hidden="true"><path d="M2 3.5 5 6.5 8 3.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+// Etat replie des colonnes et sections, garde dans localStorage si possible.
+const FOLD_KEY = "ankviz.folded";
+const folded = (() => {
+  try {
+    const saved = localStorage.getItem(FOLD_KEY);
+    if (saved !== null) return new Set(JSON.parse(saved));
+  } catch (e) { /* stockage indisponible : etat par defaut */ }
+  return new Set(["col:done", "col:closed"]);
+})();
+function saveFolded() {
+  try { localStorage.setItem(FOLD_KEY, JSON.stringify([...folded])); } catch (e) { /* sans stockage */ }
+}
+function applyFold(box) {
+  const on = folded.has(box.dataset.fold);
+  box.classList.toggle("folded", on);
+  const head = box.querySelector(":scope > [data-fold-toggle]");
+  if (head) head.setAttribute("aria-expanded", String(!on));
+}
+function toggleFold(head) {
+  const box = head.closest("[data-fold]");
+  const k = box.dataset.fold;
+  folded.has(k) ? folded.delete(k) : folded.add(k);
+  saveFolded();
+  applyFold(box);
+}
+document.addEventListener("click", (e) => {
+  const head = e.target.closest("[data-fold-toggle]");
+  if (head) toggleFold(head);
+});
+document.addEventListener("keydown", (e) => {
+  const head = e.target.closest && e.target.closest("[data-fold-toggle]");
+  if (head && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); toggleFold(head); }
+});
 let lastJson = "";
 
 const $ = (id) => document.getElementById(id);
@@ -206,9 +251,11 @@ function renderBoard(state) {
         <div class="crit"><span class="crit-label">Critère · <span class="mono">${esc(t.id)}</span></span>${t.criterion === null ? '<span class="faint">chargement des critères…</span>' : esc(t.criterion || "(aucun critère)")}</div>
       </details>`;
     }).join("");
-    return `<div class="col">
-      <div class="col-head"><span class="dot" style="background:${color}"></span>${label}<span class="n">${ids.length}</span></div>
-      <div class="col-body">${items || '<div class="empty">rien</div>'}</div>
+    const k = `col:${key}`;
+    const on = folded.has(k);
+    return `<div class="col${on ? " folded" : ""}" data-fold="${k}">
+      <div class="col-head" data-fold-toggle role="button" tabindex="0" aria-expanded="${!on}">${CHEV}<span class="dot" style="background:${color}"></span>${label}<span class="n">${ids.length}</span></div>
+      <div class="fold-wrap"><div class="fold-inner"><div class="col-body">${items || '<div class="empty">rien</div>'}</div></div></div>
     </div>`;
   }).join("");
   for (const d of document.querySelectorAll(".task")) {
@@ -358,6 +405,7 @@ async function tick() {
   }
 }
 
+document.querySelectorAll("section[data-fold]").forEach(applyFold);
 tick();
 setInterval(tick, 3000);
 </script>
