@@ -227,6 +227,12 @@ def _prompt(
             "plus) affiche dans un encadre blanc au-dessus de la video, pendant tout le clip ; "
             "exactement un emoji simple (pas de sequence composee, pas de drapeau)."
         )
+    rules.append(
+        "Comptage des mots pour hook_text et screen_title : tout groupe separe par des espaces "
+        "qui contient une lettre ou un chiffre compte pour un mot ('à', '3', « n'ai », "
+        "« l'égorger » comptent chacun pour 1 mot) ; l'emoji et la ponctuation isolee ne "
+        "comptent pas."
+    )
     rules_text = "".join(f"{i}. {rule}\n" for i, rule in enumerate(rules, start=1))
 
     title_context = ""
@@ -274,14 +280,27 @@ def _validate_hashtags(hashtags: list[str]) -> None:
         seen.add(key)
 
 
+def _counted_words(text: str) -> list[str]:
+    """Groupes separes par des espaces qui comptent pour un mot chacun
+    (contiennent au moins une lettre ou un chiffre) : l'emoji et la
+    ponctuation isolee sont exclus."""
+    return [token for token in text.split() if any(c.isalnum() for c in token)]
+
+
 def _count_words(text: str) -> int:
-    return sum(1 for token in text.split() if any(c.isalnum() for c in token))
+    return len(_counted_words(text))
+
+
+def _numbered_words(text: str) -> str:
+    return ", ".join(f"{i}. {word}" for i, word in enumerate(_counted_words(text), start=1))
 
 
 def _validate_hook_text(hook_text: str, max_words: int) -> None:
     n = _count_words(hook_text)
     if n > max_words:
-        raise llm.SchemaError(f"texte d'accroche de {n} mots, {max_words} au plus : {hook_text!r}")
+        raise llm.SchemaError(
+            f"texte d'accroche de {n} mots, {max_words} au plus : {_numbered_words(hook_text)}"
+        )
 
 
 def _validate_screen_title_emoji(screen_title: str) -> None:
@@ -318,7 +337,9 @@ def _validate_screen_title_emoji(screen_title: str) -> None:
 def _validate_screen_title(screen_title: str, max_words: int) -> None:
     n = _count_words(screen_title)
     if n > max_words:
-        raise llm.SchemaError(f"titre d'ecran de {n} mots, {max_words} au plus : {screen_title!r}")
+        raise llm.SchemaError(
+            f"titre d'ecran de {n} mots, {max_words} au plus : {_numbered_words(screen_title)}"
+        )
     _validate_screen_title_emoji(screen_title)
 
 
@@ -388,6 +409,7 @@ def run(
     moments_by_id = {m["id"]: m for m in moments_data["moments"]}
     hook_words_max = int(settings["hook_words_max"])
     screen_title_words_max = int(settings["screen_title_words_max"])
+    log_path = video_dir / "llm_refusals.jsonl"
 
     clips: list[dict[str, Any]] = []
     for moment in parts_data["moments"]:
@@ -415,7 +437,7 @@ def run(
             text = _part_text(transcript, part["start"], part["end"])
             prompt = _prompt(language, video_title, source, part, parts_total, text, settings,
                               screen_title=screen_title, title=title)
-            answer = llm.ask("captions", prompt, [], schema, config=config, check=check)
+            answer = llm.ask("captions", prompt, [], schema, config=config, check=check, log_path=log_path)
             if request_screen_title:
                 screen_title = answer["screen_title"]
             if request_title:

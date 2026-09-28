@@ -243,7 +243,8 @@ def test_refused_hook_text_is_sent_back_to_the_llm_with_the_error_and_repaired(w
                   [answer(hook_text=ten_words), answer(hook_text="trois mots courts")])
 
     assert len(fake.calls) == 2
-    assert f"texte d'accroche de 10 mots, 8 au plus : {ten_words!r}" in fake.calls[1].prompt
+    assert "texte d'accroche de 10 mots, 8 au plus" in fake.calls[1].prompt
+    assert "1. un" in fake.calls[1].prompt and "10. dix" in fake.calls[1].prompt
     assert by_id(read_captions(workspace), "00")["hook_text"] == "trois mots courts"
 
 
@@ -646,6 +647,61 @@ def test_single_clip_title_has_no_suffix(workspace, tmp_path):
     run(workspace, make_config(tmp_path), [answer(title="Titre unique")])
 
     assert by_id(read_captions(workspace), "00")["title"] == "Titre unique"
+
+
+def test_prompt_states_the_exact_word_counting_rule_with_examples(workspace, tmp_path):
+    write_moments(workspace, moment(0))
+    write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
+
+    fake, _ = run(workspace, make_config(tmp_path), [answer()])
+
+    prompt = fake.calls[0].prompt
+    assert "à" in prompt and "n'ai" in prompt and "l'égorger" in prompt
+    assert "hook_text" in prompt and "screen_title" in prompt
+    assert "ne comptent pas" in prompt
+
+
+def test_hook_text_schema_error_lists_the_counted_words_numbered(workspace, tmp_path):
+    write_moments(workspace, moment(0))
+    write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
+    nine_words = "un deux trois quatre cinq six sept huit neuf"
+
+    with pytest.raises(llm.SchemaError) as exc_info:
+        run(workspace, make_config(tmp_path), [answer(hook_text=nine_words)] * 2)
+
+    message = str(exc_info.value)
+    for i, word in enumerate(nine_words.split(), start=1):
+        assert f"{i}. {word}" in message
+
+
+def test_screen_title_schema_error_lists_the_counted_words_numbered(workspace, tmp_path):
+    write_moments(workspace, moment(0))
+    write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
+    seven_words = "un deux trois quatre cinq six sept \U0001F525"
+
+    with pytest.raises(llm.SchemaError) as exc_info:
+        run(workspace, make_config(tmp_path), [answer(screen_title=seven_words)] * 2)
+
+    message = str(exc_info.value)
+    for i, word in enumerate(["un", "deux", "trois", "quatre", "cinq", "six", "sept"], start=1):
+        assert f"{i}. {word}" in message
+
+
+def test_refused_answer_is_logged_to_llm_refusals_jsonl_and_repaired(workspace, tmp_path):
+    write_moments(workspace, moment(0))
+    write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
+    nine_words = "un deux trois quatre cinq six sept huit neuf"
+    eight_words = "un deux trois quatre cinq six sept huit"
+
+    run(workspace, make_config(tmp_path), [answer(hook_text=nine_words), answer(hook_text=eight_words)])
+
+    log_path = workspace / VIDEO_ID / "llm_refusals.jsonl"
+    assert log_path.exists()
+    lines = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    assert lines[0]["usage"] == "captions"
+    assert "9 mots" in lines[0]["error"]
+    assert lines[-1].get("accepted") is True
+    assert by_id(read_captions(workspace), "00")["hook_text"] == eight_words
 
 
 def test_multipart_title_max_chars_requested_accounts_for_the_longest_partie_suffix(workspace, tmp_path):
