@@ -244,14 +244,14 @@ def test_prompt_carries_clip_transcript_and_hook(tmp_path, dirs):
     assert "Il ouvre la porte" in fake.calls[0].prompt
 
 
-def test_schema_asks_for_the_four_defects_black_screen_excluded(tmp_path, dirs):
+def test_schema_asks_for_the_five_defects_black_screen_excluded(tmp_path, dirs):
     workspace, output = dirs
     write_clip(output)
     fake = FakeBackend([no_issue])
     with llm.use_backend(fake):
         run(tmp_path, workspace, output)
     enum = fake.calls[0].schema["properties"]["issues"]["items"]["properties"]["type"]["enum"]
-    assert set(enum) == {"face_cut", "subtitle_on_face", "starts_mid_sentence", "weak_hook"}
+    assert set(enum) == {"incomprehensible", "face_cut", "subtitle_on_face", "starts_mid_sentence", "weak_hook"}
     assert "black_screen" not in qa.DEFECTS
 
 
@@ -274,17 +274,18 @@ def test_clean_clip_is_passed_and_ready(tmp_path, dirs):
     assert data["title"] == "Titre" and data["transcript"] == TRANSCRIPT
 
 
-def test_llm_defect_rejects_clip_and_it_is_never_ready(tmp_path, dirs):
+def test_llm_blocking_defect_rejects_clip_and_it_is_never_ready(tmp_path, dirs):
     workspace, output = dirs
     path = write_clip(output)
-    answer = {"issues": [{"type": "face_cut", "detail": "le visage sort du cadre a droite"}]}
+    answer = {"issues": [{"type": "incomprehensible", "detail": "on ne sait pas de qui il parle"}]}
     with llm.use_backend(FakeBackend([answer])):
         run(tmp_path, workspace, output)
     data = read(path)
     assert data["qa"]["status"] == "rejected"
-    assert data["qa"]["issues"] == [
-        {"type": "face_cut", "detail": "le visage sort du cadre a droite", "source": "llm"}
-    ]
+    assert data["qa"]["issues"] == [{
+        "type": "incomprehensible", "detail": "on ne sait pas de qui il parle",
+        "source": "llm", "severity": "blocking",
+    }]
     assert data["ready"] is False
     assert qa.is_ready(data) is False
 
@@ -298,8 +299,8 @@ def test_is_ready_false_for_rejected_even_if_ready_flag_forged():
 def test_every_rendered_clip_of_the_video_is_checked(tmp_path, dirs):
     workspace, output = dirs
     a = write_clip(output, clip_id="01")
-    b = write_clip(output, clip_id="02-p1")
-    bad = {"issues": [{"type": "weak_hook", "detail": "accroche plate"}]}
+    b = write_clip(output, clip_id="02")
+    bad = {"issues": [{"type": "incomprehensible", "detail": "histoire decousue"}]}
     with llm.use_backend(FakeBackend([no_issue, bad])):
         run(tmp_path, workspace, output)
     assert read(a)["qa"]["status"] == "passed"
@@ -334,7 +335,7 @@ def test_already_checked_clip_is_not_rechecked_unless_force(tmp_path, dirs):
     with llm.use_backend(FakeBackend([])) as fake:
         run(tmp_path, workspace, output)
     assert fake.calls == []
-    bad = {"issues": [{"type": "weak_hook", "detail": "plat"}]}
+    bad = {"issues": [{"type": "incomprehensible", "detail": "decousu"}]}
     with llm.use_backend(FakeBackend([bad])):
         run(tmp_path, workspace, output, force=True)
     assert read(path)["qa"]["status"] == "rejected"
@@ -442,14 +443,15 @@ def test_short_black_fade_under_threshold_is_not_rejected(tmp_path, dirs):
     assert read(path)["qa"]["status"] == "passed"
 
 
-def test_black_segment_over_threshold_is_rejected_locally(tmp_path, dirs):
+def test_black_segment_over_threshold_is_reported_locally(tmp_path, dirs):
     workspace, output = dirs
     path = write_black_clip(output, black_seconds=1.5)
     with llm.use_backend(FakeBackend([no_issue])):
         run(tmp_path, workspace, output)
     assert local_types(path) == {"black_screen"}
-    assert read(path)["qa"]["status"] == "rejected"
-    assert read(path)["ready"] is False
+    # sous black_block_seconds (3 s) : avertissement, le clip reste pret (TASK-4eb4)
+    assert read(path)["qa"]["status"] == "passed"
+    assert read(path)["ready"] is True
 
 
 def test_clip_without_black_frames_has_no_black_screen_issue(tmp_path, dirs):
@@ -492,7 +494,7 @@ def test_letterbox_schema_excludes_face_cut_and_subtitle_on_face(tmp_path, dirs)
     with llm.use_backend(fake):
         run(tmp_path, workspace, output)
     enum = fake.calls[0].schema["properties"]["issues"]["items"]["properties"]["type"]["enum"]
-    assert set(enum) == {"starts_mid_sentence", "weak_hook"}
+    assert set(enum) == {"incomprehensible", "starts_mid_sentence", "weak_hook"}
 
 
 def test_letterbox_prompt_uses_screen_title_not_hook_and_describes_format(tmp_path, dirs):
@@ -524,7 +526,7 @@ def test_letterbox_without_video_rect_raises(tmp_path, dirs):
 
 def test_letterbox_black_screen_measured_on_video_rect_only(tmp_path, dirs):
     workspace, output = dirs
-    path = write_letterbox_clip(output, black_seconds=1.5)
+    path = write_letterbox_clip(output, black_seconds=3.5)
     with llm.use_backend(FakeBackend([no_issue])):
         run(tmp_path, workspace, output)
     assert local_types(path) == {"black_screen"}
@@ -585,7 +587,7 @@ def test_series_part_schema_excludes_starts_mid_sentence(tmp_path, dirs):
         run(tmp_path, workspace, output)
     enum = fake.calls[0].schema["properties"]["issues"]["items"]["properties"]["type"]["enum"]
     assert "starts_mid_sentence" not in enum
-    assert set(enum) == {"face_cut", "subtitle_on_face", "weak_hook"}
+    assert set(enum) == {"incomprehensible", "face_cut", "subtitle_on_face", "weak_hook"}
 
 
 def test_series_part_prompt_mentions_continuation_and_drops_defect_from_list(tmp_path, dirs):
@@ -628,4 +630,164 @@ def test_letterbox_series_part_excludes_all_three(tmp_path, dirs):
     with llm.use_backend(fake):
         run(tmp_path, workspace, output)
     enum = fake.calls[0].schema["properties"]["issues"]["items"]["properties"]["type"]["enum"]
-    assert set(enum) == {"weak_hook"}
+    assert set(enum) == {"incomprehensible", "weak_hook"}
+
+
+# --------------------------------------------------------------------------
+# TASK-4eb4 : rejeter seulement un clip incomprehensible ou casse ; le reste
+# devient un avertissement (severity = blocking | warning)
+# --------------------------------------------------------------------------
+
+
+def issues_by_type(path):
+    return {i["type"]: i for i in read(path)["qa"]["issues"]}
+
+
+def test_starts_mid_sentence_alone_passes_with_warning(tmp_path, dirs):
+    workspace, output = dirs
+    path = write_clip(output)
+    answer = {"issues": [{"type": "starts_mid_sentence", "detail": "commence par 'et donc'"}]}
+    with llm.use_backend(FakeBackend([answer])):
+        run(tmp_path, workspace, output)
+    data = read(path)
+    assert data["qa"]["status"] == "passed"
+    assert data["qa"]["issues"] == [{
+        "type": "starts_mid_sentence", "detail": "commence par 'et donc'",
+        "source": "llm", "severity": "warning",
+    }]
+    assert data["ready"] is True
+    assert qa.is_ready(data) is True
+
+
+@pytest.mark.parametrize("defect", ["weak_hook", "face_cut", "subtitle_on_face"])
+def test_other_llm_defects_are_warnings(tmp_path, dirs, defect):
+    workspace, output = dirs
+    path = write_clip(output)
+    with llm.use_backend(FakeBackend([{"issues": [{"type": defect, "detail": "vu image 1"}]}])):
+        run(tmp_path, workspace, output)
+    assert read(path)["qa"]["status"] == "passed"
+    assert issues_by_type(path)[defect]["severity"] == "warning"
+
+
+def test_incomprehensible_rejects(tmp_path, dirs):
+    workspace, output = dirs
+    path = write_clip(output)
+    answer = {"issues": [{"type": "incomprehensible", "detail": "on ne sait pas qui est 'il'"}]}
+    with llm.use_backend(FakeBackend([answer])):
+        run(tmp_path, workspace, output)
+    data = read(path)
+    assert data["qa"]["status"] == "rejected"
+    assert data["qa"]["issues"] == [{
+        "type": "incomprehensible", "detail": "on ne sait pas qui est 'il'",
+        "source": "llm", "severity": "blocking",
+    }]
+    assert data["ready"] is False
+
+
+def test_incomprehensible_is_asked_in_every_format(tmp_path, dirs):
+    workspace, output = dirs
+    write_clip_letterbox_part(output, part=2, parts_total=3)
+    fake = FakeBackend([no_issue])
+    with llm.use_backend(fake):
+        run(tmp_path, workspace, output)
+    enum = fake.calls[0].schema["properties"]["issues"]["items"]["properties"]["type"]["enum"]
+    assert "incomprehensible" in enum
+
+
+def test_prompt_says_only_incomprehensible_blocks_and_later_parts_may_assume_previous(tmp_path, dirs):
+    workspace, output = dirs
+    write_clip_part(output, part=2, parts_total=3)
+    fake = FakeBackend([no_issue])
+    with llm.use_backend(fake):
+        run(tmp_path, workspace, output)
+    prompt = fake.calls[0].prompt
+    assert "incomprehensible" in prompt
+    assert "seul" in prompt.lower() and "bloquant" in prompt.lower()
+    assert "parties precedentes" in prompt.lower()
+
+
+def test_short_black_1_2s_passes_with_warning(tmp_path, dirs):
+    workspace, output = dirs
+    path = write_black_clip(output, black_seconds=1.2)
+    with llm.use_backend(FakeBackend([no_issue])):
+        run(tmp_path, workspace, output)
+    data = read(path)
+    assert data["qa"]["status"] == "passed"
+    assert issues_by_type(path)["black_screen"]["severity"] == "warning"
+    assert data["ready"] is True
+
+
+def test_long_black_4s_rejects(tmp_path, dirs):
+    workspace, output = dirs
+    path = write_black_clip(output, black_seconds=4.0)
+    with llm.use_backend(FakeBackend([no_issue])):
+        run(tmp_path, workspace, output)
+    assert read(path)["qa"]["status"] == "rejected"
+    assert issues_by_type(path)["black_screen"]["severity"] == "blocking"
+
+
+def test_black_block_seconds_is_configurable(tmp_path, dirs):
+    workspace, output = dirs
+    path = write_black_clip(output, black_seconds=1.5)
+    with llm.use_backend(FakeBackend([no_issue])):
+        qa.run(VIDEO_ID, workspace, output, config=config(tmp_path, black_block_seconds=1.2))
+    assert read(path)["qa"]["status"] == "rejected"
+    assert qa.CONFIG_DEFAULTS["black_block_seconds"] == 3.0
+
+
+def test_wrong_resolution_is_blocking(tmp_path, dirs):
+    workspace, output = dirs
+    path = write_clip(output, size="720x1280")
+    with llm.use_backend(FakeBackend([no_issue])):
+        run(tmp_path, workspace, output)
+    assert read(path)["qa"]["status"] == "rejected"
+    assert issues_by_type(path)["resolution"]["severity"] == "blocking"
+
+
+def test_duration_and_leading_silence_are_blocking(tmp_path, dirs):
+    workspace, output = dirs
+    path = write_clip(output, audio=False)
+    data = read(path)
+    data["duration"] = 30.0
+    path.write_text(json.dumps(data), encoding="utf-8")
+    with llm.use_backend(FakeBackend([no_issue])):
+        run(tmp_path, workspace, output)
+    found = issues_by_type(path)
+    assert found["duration"]["severity"] == "blocking"
+    assert found["leading_silence"]["severity"] == "blocking"
+    assert read(path)["qa"]["status"] == "rejected"
+
+
+def test_rejected_part_of_series_warns_the_other_parts(tmp_path, dirs):
+    workspace, output = dirs
+    p1 = write_clip_part(output, part=1, parts_total=3, clip_id="03-p1")
+    p2 = write_clip_part(output, part=2, parts_total=3, clip_id="03-p2")
+    p3 = write_clip_part(output, part=3, parts_total=3, clip_id="03-p3")
+    solo = write_clip(output, clip_id="04")
+    bad = {"issues": [{"type": "incomprehensible", "detail": "l'histoire ne se suit pas"}]}
+    with llm.use_backend(FakeBackend([no_issue, bad, no_issue, no_issue])):
+        run(tmp_path, workspace, output)
+    assert read(p2)["qa"]["status"] == "rejected"
+    assert [i["type"] for i in read(p2)["qa"]["issues"]] == ["incomprehensible"]
+    for path in (p1, p3):
+        data = read(path)
+        assert data["qa"]["status"] == "passed"
+        assert data["ready"] is True
+        series = [i for i in data["qa"]["issues"] if i["type"] == "series_part_rejected"]
+        assert len(series) == 1
+        assert series[0]["severity"] == "warning"
+        assert "03-p2" in series[0]["detail"]
+    assert read(solo)["qa"]["issues"] == []
+
+
+def test_series_warning_is_not_duplicated_on_rerun(tmp_path, dirs):
+    workspace, output = dirs
+    p1 = write_clip_part(output, part=1, parts_total=2, clip_id="03-p1")
+    write_clip_part(output, part=2, parts_total=2, clip_id="03-p2")
+    bad = {"issues": [{"type": "incomprehensible", "detail": "flou"}]}
+    with llm.use_backend(FakeBackend([no_issue, bad])):
+        run(tmp_path, workspace, output)
+    with llm.use_backend(FakeBackend([])):
+        run(tmp_path, workspace, output)
+    types = [i["type"] for i in read(p1)["qa"]["issues"]]
+    assert types == ["series_part_rejected"]
