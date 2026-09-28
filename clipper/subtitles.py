@@ -57,6 +57,12 @@ log = logging.getLogger(__name__)
 # inversion) : " m" + "'a", " viens" + "-tu".
 _GLUED_PREFIXES = ("'", "\u2019", "-")
 
+# Un mot dont le debut precede le debut du clip de plus que cette tolerance
+# n'est jamais sous-titre (SPEC-1557 regle 5 : une borne de clip peut arrondir
+# de quelques centiemes au-dessus du mot qu'elle garde, mais un mot entier
+# d'avant le clip, comme un connecteur retire, ne doit jamais s'afficher).
+_WORD_START_TOLERANCE = 0.05
+
 CONFIG_DEFAULTS: dict[str, object] = {
     "font_name": "Poppins ExtraBold",
     "font_size": 96,
@@ -134,7 +140,7 @@ def _words_in_interval(transcript: dict[str, Any], start: float, end: float) -> 
     words: list[dict[str, Any]] = []
     for seg in transcript.get("segments", []):
         for w in seg.get("words", []):
-            if w["start"] < end and w["end"] > start:
+            if w["start"] < end and w["end"] > start and w["start"] >= start - _WORD_START_TOLERANCE:
                 words.append(w)
     words.sort(key=lambda w: w["start"])
     return words

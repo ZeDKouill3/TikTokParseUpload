@@ -162,6 +162,52 @@ def test_timecodes_are_relative_to_clip_start(tmp_path, video_dir):
 
 
 # --------------------------------------------------------------------------
+# TASK-3c0a (SPEC-1557 regle 5) : un mot dont le debut precede le debut du
+# clip de plus de 0.05 s n'est jamais sous-titre (ex. reel : le connecteur
+# "Donc" colle au mot suivant "est", clip 03/05 de sZi-qJ-5ptA affichait
+# "DONC EST-CE NORMAL").
+# --------------------------------------------------------------------------
+
+
+def straddling_words(gap):
+    """"Donc" chevauche la borne de debut du clip (commence ``gap`` s avant
+    elle, finit apres) comme le ferait un connecteur mal arrondi (borne
+    reculee dans le mot retire) ; "est" suit, entierement dans le clip."""
+    return [
+        _word(" Donc", 15.46 - gap, 15.62),
+        _word(" est", 15.62, 15.78),
+        _word(" normal?", 15.78, 16.10),
+    ]
+
+
+def test_word_straddling_the_clip_start_by_more_than_the_tolerance_is_not_subtitled(tmp_path, video_dir):
+    # "Donc" commence 0.15 s avant le debut du clip (> 0.05 s, SPEC-1557
+    # regle 5) : meme s'il deborde dedans (finit a 15.62 > 15.46), il ne
+    # doit jamais s'afficher, comme sur le clip 03/05 de sZi-qJ-5ptA ou une
+    # borne mal arrondie laissait entendre/afficher la fin de "Donc".
+    (video_dir / "transcript.json").write_text(json.dumps(make_transcript(straddling_words(0.15))), encoding="utf-8")
+    with llm.use_backend(FakeBackend([NO_EMPHASIS])):
+        path = run(tmp_path, start=15.46, end=16.10)
+    doc = parse_ass(Path(path))
+    text = "".join(ev["text"] for ev in doc["events"])
+    assert "Donc" not in text
+    first_word = re.search(r"\\k\d+(?:\\c[^}]*)?\}([^{]*)", doc["events"][0]["text"]).group(1).strip()
+    assert first_word == "est"
+
+
+def test_word_straddling_the_clip_start_within_the_tolerance_is_still_subtitled(tmp_path, video_dir):
+    # "Donc" ne commence que 0.04 s avant le debut du clip (< 0.05 s) : la
+    # tolerance couvre l'arrondi au centieme des bornes publiees (SPEC-1557
+    # regle 5), il reste sous-titre.
+    (video_dir / "transcript.json").write_text(json.dumps(make_transcript(straddling_words(0.04))), encoding="utf-8")
+    with llm.use_backend(FakeBackend([NO_EMPHASIS])):
+        path = run(tmp_path, start=15.46, end=16.10)
+    doc = parse_ass(Path(path))
+    text = "".join(ev["text"] for ev in doc["events"])
+    assert "Donc" in text
+
+
+# --------------------------------------------------------------------------
 # C3 : karaoke, mot courant surligne (tags \k par mot, duree = fin-debut)
 # --------------------------------------------------------------------------
 

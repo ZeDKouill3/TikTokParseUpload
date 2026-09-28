@@ -5,7 +5,7 @@ slug: un-clip-ne-fait-entendre-ni-n-affiche-le-connect
 title: "un clip ne fait entendre ni n'affiche le connecteur retiré (Donc...) : borne de début arrondie vers le bas"
 created: 2026-09-28T20:09:38Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/moments.py
   - tests/test_moments.py
@@ -17,6 +17,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: diagnose
+proof:
+  - type: test
+    ref: local/208bf12ca97e@21b9cc5
+    tree: scope/08c55d44493c
+    criteria: 99b2853ad385
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 3
+version: 5
 ---
