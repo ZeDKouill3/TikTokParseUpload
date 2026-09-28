@@ -192,7 +192,7 @@ def answer(request):
                            for i in range(n)]}
     if usage == "captions":
         return {"title": "GTA 6 arrive", "caption": "Il arrive vraiment", "hashtags": ["#gta6"],
-                "hook_text": "GTA 6 arrive"}
+                "hook_text": "GTA 6 arrive", "screen_title": "GTA 6 confirme \U0001F525"}
     if usage == "emphasis":
         return {"indices": []}
     if usage == "layout":
