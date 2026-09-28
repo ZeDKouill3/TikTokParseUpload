@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import gc
 import json
+import logging
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -49,6 +51,14 @@ def default_segments():
     ]
 
 
+class FakeHfTokenizer:
+    """Imite tokenizers.Tokenizer (attribut hf_tokenizer de WhisperModel) :
+    un token par mot et par signe de ponctuation."""
+
+    def encode(self, text, add_special_tokens=True):
+        return SimpleNamespace(ids=[hash(t) % 50000 for t in re.findall(r"\w+|[^\w\s]", text)])
+
+
 class FakeWhisperModel:
     def __init__(self, name, device, compute_type, segments, language="fr"):
         self.name = name
@@ -57,6 +67,7 @@ class FakeWhisperModel:
         self._segments = segments
         self._language = language
         self.transcribe_calls = []
+        self.hf_tokenizer = FakeHfTokenizer()
 
     def transcribe(self, audio, **kwargs):
         self.transcribe_calls.append((audio, kwargs))
@@ -351,6 +362,171 @@ def test_vocab_disabled_explicitly_in_config_skips_the_call(tmp_path, video_dir,
     assert [c.usage for c in fake.calls] == ["transcript_fix"]
     assert not factory.kwargs_seen.get("initial_prompt")
     assert not factory.kwargs_seen.get("hotwords")
+
+
+# --------------------------------------------------------------------------
+# TASK-b20f : le prompt passe a whisper ne depasse jamais la fenetre du
+# decodeur (448 positions), quelle que soit la taille du vocabulaire.
+# Defaut constate sur ivl0nxa3C7o : vocabulaire de 58 entrees, hotwords 317
+# tokens et initial_prompt 374 tokens, que faster-whisper 1.2.1 tronque
+# chacun a 223 : 1 (sot_prev) + 223 + 223 + 3 (sot_sequence) = 450 > 448,
+# RuntimeError "No position encodings are defined for positions >= 448".
+# --------------------------------------------------------------------------
+
+WHISPER_POSITIONS = 448
+
+
+def whisper_prompt_length(kwargs, previous_tokens):
+    """Longueur du prompt que faster-whisper 1.2.1 (WhisperModel.get_prompt)
+    construit pour une fenetre : [sot_prev] + hotwords (tronques a 223) +
+    previous_tokens (223 derniers) + sot_sequence (sot, langue, tache)."""
+    half = WHISPER_POSITIONS // 2
+    hotwords = kwargs.get("hotwords")
+    length = 0
+    if previous_tokens or hotwords:
+        length += 1
+        if hotwords:
+            length += min(len(FakeHfTokenizer().encode(" " + hotwords.strip()).ids), half - 1)
+        length += min(previous_tokens, half - 1)
+    return length + 3
+
+
+class WindowCheckingFactory(ModelFactory):
+    """Modele factice qui echoue comme le vrai decodeur Whisper quand le
+    prompt d'une fenetre ne laisse plus de position pour generer : premiere
+    fenetre conditionnee par initial_prompt, suivantes par le texte deja
+    transcrit (223 tokens sur une longue video)."""
+
+    def __call__(self, name, device, compute_type):
+        model = super().__call__(name, device, compute_type)
+        inner = model.transcribe
+        factory = self
+
+        def transcribe(audio, **kwargs):
+            initial = kwargs.get("initial_prompt")
+            first = len(FakeHfTokenizer().encode(" " + initial.strip()).ids) if initial else 0
+            factory.prompt_lengths = [
+                whisper_prompt_length(kwargs, first),
+                whisper_prompt_length(kwargs, WHISPER_POSITIONS // 2 - 1),
+            ]
+            for length in factory.prompt_lengths:
+                if length >= WHISPER_POSITIONS:
+                    raise RuntimeError(
+                        "No position encodings are defined for positions >= 448, "
+                        f"but got position {WHISPER_POSITIONS}"
+                    )
+            return inner(audio, **kwargs)
+
+        model.transcribe = transcribe
+        return model
+
+
+def credits_vocab(n):
+    """Un vocabulaire comme celui d'ivl0nxa3C7o : n noms propres de credits."""
+    return {"words": [f"Prenom{i} NOM{i}-COMPOSE{i}" for i in range(n)]}
+
+
+def test_long_vocab_never_overflows_the_whisper_decoder_window(tmp_path, video_dir, cpu):
+    factory = WindowCheckingFactory()
+    with llm.use_backend(FakeBackend([credits_vocab(58), NO_FIX])):
+        run(tmp_path, factory)
+    assert read_transcript(video_dir)["segments"]
+
+
+@pytest.mark.parametrize("n", [0, 1, 20, 58, 100])
+def test_prompt_fits_the_window_with_room_to_generate_whatever_the_vocab_size(tmp_path, video_dir, cpu, n):
+    from clipper.transcribe import CONFIG_DEFAULTS
+
+    factory = WindowCheckingFactory()
+    with llm.use_backend(FakeBackend([credits_vocab(n), NO_FIX])):
+        run(tmp_path, factory)
+    tokenizer = FakeHfTokenizer()
+    for key in ("initial_prompt", "hotwords"):
+        text = factory.kwargs_seen.get(key) or ""
+        assert len(tokenizer.encode(" " + text.strip()).ids) <= CONFIG_DEFAULTS["vocab_max_tokens"]
+    # au moins une centaine de positions restent pour la transcription
+    assert max(factory.prompt_lengths) <= WHISPER_POSITIONS - 100
+
+
+def test_vocab_max_tokens_comes_from_config(tmp_path, video_dir, cpu):
+    factory = WindowCheckingFactory()
+    with llm.use_backend(FakeBackend([credits_vocab(58), NO_FIX])):
+        run(tmp_path, factory, config=make_config(tmp_path, vocab_max_tokens=10))
+    hotwords = factory.kwargs_seen["hotwords"]
+    assert len(FakeHfTokenizer().encode(" " + hotwords).ids) <= 10
+    assert hotwords == "Prenom0 NOM0-COMPOSE0 Prenom1 NOM1-COMPOSE1"
+    assert factory.kwargs_seen["initial_prompt"] == "Prenom0 NOM0-COMPOSE0, Prenom1 NOM1-COMPOSE1"
+
+
+def test_shortened_vocab_is_logged_with_the_dropped_entries(tmp_path, video_dir, cpu, caplog):
+    factory = WindowCheckingFactory()
+    with caplog.at_level(logging.WARNING, logger="clipper.transcribe"):
+        with llm.use_backend(FakeBackend([credits_vocab(58), NO_FIX])):
+            run(tmp_path, factory, config=make_config(tmp_path, vocab_max_tokens=10))
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    message = warnings[0]
+    assert "vocab_max_tokens" in message and "10" in message
+    # les entrees ecartees sont nommees
+    assert "Prenom2 NOM2-COMPOSE2" in message and "Prenom57 NOM57-COMPOSE57" in message
+
+
+def test_short_vocab_is_passed_whole_without_warning(tmp_path, video_dir, cpu, caplog):
+    factory = WindowCheckingFactory()
+    with caplog.at_level(logging.WARNING, logger="clipper.transcribe"):
+        with llm.use_backend(FakeBackend([VOCAB, NO_FIX])):
+            run(tmp_path, factory)
+    assert factory.kwargs_seen["hotwords"] == "Rockstar Vice City Lucia Jason"
+    assert factory.kwargs_seen["initial_prompt"] == "Rockstar, Vice City, Lucia, Jason"
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_model_without_tokenizer_bounds_the_prompt_by_utf8_bytes_and_says_so(
+    tmp_path, video_dir, cpu, caplog
+):
+    """Whisper tokenise en BPE sur les octets : un token couvre au moins un
+    octet, donc le nombre d'octets UTF-8 majore le nombre de tokens. Un
+    modele qui n'expose pas hf_tokenizer reste borne, et c'est journalise."""
+    class NoTokenizerFactory(WindowCheckingFactory):
+        def __call__(self, name, device, compute_type):
+            model = super().__call__(name, device, compute_type)
+            del model.hf_tokenizer
+            return model
+
+    factory = NoTokenizerFactory()
+    with caplog.at_level(logging.WARNING, logger="clipper.transcribe"):
+        with llm.use_backend(FakeBackend([{"words": ["Éric", "Zoé Lefèvre", "Anaïs"]}, NO_FIX])):
+            run(tmp_path, factory, config=make_config(tmp_path, vocab_max_tokens=18))
+    # " Éric, Zoé Lefèvre" = 21 octets > 18 ; " Éric Zoé Lefèvre" = 20 > 18
+    assert factory.kwargs_seen["hotwords"] == "Éric"
+    assert factory.kwargs_seen["initial_prompt"] == "Éric"
+    messages = " ".join(r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
+    assert "hf_tokenizer" in messages
+    assert "Zoé Lefèvre" in messages and "Anaïs" in messages
+
+
+def test_full_vocab_is_kept_in_transcript_and_for_the_correction(tmp_path, video_dir, cpu):
+    """Seul le prompt de whisper est borne : la correction par clipper.llm et
+    transcript.json gardent tout le vocabulaire."""
+    vocab = credits_vocab(58)
+    fake = FakeBackend([vocab, NO_FIX])
+    with llm.use_backend(fake):
+        run(tmp_path, WindowCheckingFactory())
+    assert read_transcript(video_dir)["vocab"] == vocab["words"]
+    assert "Prenom57 NOM57-COMPOSE57" in fake.calls[1].prompt
+
+
+@pytest.mark.parametrize("bound", [0, 121, 400])
+def test_vocab_max_tokens_outside_the_window_is_refused_before_loading_the_model(
+    tmp_path, video_dir, cpu, bound
+):
+    from clipper.transcribe import TranscribeError
+
+    factory = WindowCheckingFactory()
+    with llm.use_backend(FakeBackend([VOCAB, NO_FIX])), pytest.raises(TranscribeError, match="vocab_max_tokens"):
+        run(tmp_path, factory, config=make_config(tmp_path, vocab_max_tokens=bound))
+    assert factory.built == []
+    assert not (video_dir / "transcript.json").exists()
 
 
 # --------------------------------------------------------------------------

@@ -5,7 +5,7 @@ slug: transcribe-faster-whisper-plante-no-position-enc
 title: "transcribe : faster-whisper plante « No position encodings ... >= 448 » sur ivl0nxa3C7o"
 created: 2026-09-28T23:18:31Z
 author: orch-main
-status: open
+status: done
 scope:
   - clipper/transcribe.py
   - tests/test_transcribe.py
@@ -15,6 +15,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/1d058f9bdbfa@31c031a
+    tree: scope/2062d45e1b79
+    criteria: a9f03bababf0
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 2
+version: 4
 ---

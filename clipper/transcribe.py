@@ -13,7 +13,9 @@ transcript_raw.json, garde avant la correction)
 Deroulement :
 1. usage ``vocab`` : noms propres tires du titre et de la description,
    passes a whisper en initial_prompt et hotwords (avant de charger le
-   modele : jamais un LLM local et whisper en meme temps, ADR-fb9b) ;
+   modele : jamais un LLM local et whisper en meme temps, ADR-fb9b),
+   raccourcis a ``vocab_max_tokens`` tokens pour tenir dans la fenetre du
+   decodeur (journalise ; transcript.json et la correction gardent tout) ;
 2. extraction de l'audio (ffmpeg, wav 16 kHz mono), transcription, puis
    liberation du modele ; le resultat brut est ecrit dans
    transcript_raw.json avant la correction ;
@@ -35,6 +37,7 @@ from __future__ import annotations
 
 import gc
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -56,6 +59,13 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "vad_filter": True,
     # Vocabulaire de noms propres demande a clipper.llm (usage vocab).
     "vocab": True,
+    # Tokens maximum du vocabulaire passe a whisper (initial_prompt et
+    # hotwords) : au-dela, les dernieres entrees sont ecartees et c'est
+    # journalise. Le decodeur a 448 positions, que faster-whisper remplit
+    # avec 1 + hotwords + 223 tokens de contexte + 4 speciaux : la borne est
+    # refusee au-dela de _VOCAB_TOKENS_CEILING (100 positions laissees a la
+    # transcription de chaque fenetre).
+    "vocab_max_tokens": 100,
     # Correction des mots par clipper.llm (usage transcript_fix).
     "transcript_fix": True,
     # Nombre de mots vises par tranche de correction (une tranche ne coupe
@@ -65,6 +75,21 @@ CONFIG_DEFAULTS: dict[str, object] = {
     # clipper.llm en sous-processus, pas de cout CPU Python).
     "fix_parallel": 4,
 }
+
+log = logging.getLogger(__name__)
+
+# Fenetre du decodeur Whisper et prompt construit par faster-whisper
+# (WhisperModel.get_prompt, 1.2.1) : [sot_prev] + hotwords (tronques a 223) +
+# texte precedent (initial_prompt puis transcription deja faite, 223 derniers
+# tokens) + sot, langue, tache (+ no_timestamps). Sans borne, un vocabulaire
+# long donne 1 + 223 + 223 + 3 = 450 > 448 (TASK-b20f).
+_WHISPER_POSITIONS = 448
+_WHISPER_CONTEXT_TOKENS = _WHISPER_POSITIONS // 2 - 1
+_WHISPER_SPECIAL_TOKENS = 5
+_MIN_GENERATION_TOKENS = 100
+_VOCAB_TOKENS_CEILING = (
+    _WHISPER_POSITIONS - _WHISPER_SPECIAL_TOKENS - _WHISPER_CONTEXT_TOKENS - _MIN_GENERATION_TOKENS
+)
 
 VOCAB_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -170,6 +195,48 @@ def _free_memory() -> None:
         torch.cuda.empty_cache()
 
 
+def _check_vocab_max_tokens(settings: dict[str, Any]) -> None:
+    bound = settings["vocab_max_tokens"]
+    if not isinstance(bound, int) or isinstance(bound, bool) or not 1 <= bound <= _VOCAB_TOKENS_CEILING:
+        raise TranscribeError(
+            f"[transcribe] vocab_max_tokens = {bound!r} : attendu un entier entre 1 et "
+            f"{_VOCAB_TOKENS_CEILING} (fenetre de {_WHISPER_POSITIONS} positions du decodeur "
+            f"Whisper, dont {_WHISPER_CONTEXT_TOKENS} de contexte et {_MIN_GENERATION_TOKENS} "
+            "gardees pour la transcription) ; pour ne pas passer de vocabulaire : vocab = false"
+        )
+
+
+def _whisper_vocab(model: Any, vocab: list[str], max_tokens: int) -> list[str]:
+    """Plus longue tete du vocabulaire (entrees entieres, dans l'ordre) dont
+    initial_prompt et hotwords tiennent chacun dans ``max_tokens`` tokens du
+    tokenizer du modele, comptes comme faster-whisper les encode. Un modele
+    sans ``hf_tokenizer`` (WhisperModel en a toujours un) est borne par le
+    nombre d'octets UTF-8, qui majore les tokens d'un BPE sur octets ; c'est
+    journalise. Les entrees ecartees sont journalisees (ADR-ad2e)."""
+    hf_tokenizer = getattr(model, "hf_tokenizer", None)
+
+    def tokens(text: str) -> int:
+        if hf_tokenizer is None:
+            return len((" " + text).encode("utf-8"))
+        return len(hf_tokenizer.encode(" " + text, add_special_tokens=False).ids)
+
+    if vocab and hf_tokenizer is None:
+        log.warning(
+            "modele whisper sans hf_tokenizer : tokens du vocabulaire majores par ses octets UTF-8"
+        )
+
+    kept = len(vocab)
+    while kept and max(tokens(", ".join(vocab[:kept])), tokens(" ".join(vocab[:kept]))) > max_tokens:
+        kept -= 1
+    if kept < len(vocab):
+        log.warning(
+            "vocabulaire whisper raccourci a %d/%d entrees (vocab_max_tokens = %d, fenetre du "
+            "decodeur) ; ecartees : %s",
+            kept, len(vocab), max_tokens, ", ".join(vocab[kept:]),
+        )
+    return vocab[:kept]
+
+
 def _run_whisper(
     model_factory: Callable[[str, str, str], Any],
     audio_path: Path,
@@ -183,14 +250,14 @@ def _run_whisper(
         "vad_filter": settings["vad_filter"],
         "language": settings["language"],
     }
-    if vocab:
-        options["initial_prompt"] = ", ".join(vocab)
-        options["hotwords"] = " ".join(vocab)
-
     if device.type == "cuda":
         _make_cuda_dlls_discoverable()
     model = model_factory(settings["model"], device.type, device.compute_type)
     try:
+        prompt_vocab = _whisper_vocab(model, vocab, int(settings["vocab_max_tokens"]))
+        if prompt_vocab:
+            options["initial_prompt"] = ", ".join(prompt_vocab)
+            options["hotwords"] = " ".join(prompt_vocab)
         raw_segments, info = model.transcribe(str(audio_path), **options)
         segments = [_segment_dict(seg) for seg in raw_segments]
         header = {
@@ -318,6 +385,7 @@ def transcribe(
         return out
 
     settings = _settings(config)
+    _check_vocab_max_tokens(settings)
     raw_path = video_dir / "transcript_raw.json"
 
     if raw_path.exists() and not force:
