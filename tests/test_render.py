@@ -1195,3 +1195,97 @@ def test_render_letterbox_real_ffmpeg_draws_the_white_title_box_and_partie(
             if min(img.getpixel((x, y))) > 235
         )
         assert white > 30, t
+
+
+# --------------------------------------------------------------------------
+# TASK-032d : ffmpeg se positionne sur le debut du clip (-ss avant -i) au lieu
+# de decoder la source depuis 0 ; trim/atrim relatifs a ce point.
+# --------------------------------------------------------------------------
+
+
+def _source_input_index(cmd):
+    return next(i for i, a in enumerate(cmd) if a == "-i" and not cmd[i + 1].endswith(".png"))
+
+
+def test_render_seeks_the_source_input_before_decoding(tmp_path, letterbox_dir, fake_ffmpeg, cpu_device):
+    from clipper.render import render
+
+    (letterbox_dir / f"{VIDEO_ID}.mp4").write_bytes(b"")
+    render(VIDEO_ID, CLIP_ID, workspace_dir=letterbox_dir.parent, output_dir=tmp_path / "output",
+           config=make_config())
+
+    cmd = fake_ffmpeg[0]["cmd"]
+    src = _source_input_index(cmd)
+    before_src = cmd[:src]
+    assert "-ss" in before_src and "-t" in before_src
+    assert float(before_src[before_src.index("-ss") + 1]) == pytest.approx(1.0)
+    assert float(before_src[before_src.index("-t") + 1]) == pytest.approx(2.5)
+    # le PNG du titre n'est pas decale
+    png = next(i for i, a in enumerate(cmd) if a == "-i" and cmd[i + 1].endswith("title.png"))
+    assert "-ss" not in cmd[src + 2:png]
+
+
+def test_render_trims_relative_to_the_seek_point(tmp_path, letterbox_dir, fake_ffmpeg, cpu_device):
+    from clipper.render import render
+
+    (letterbox_dir / f"{VIDEO_ID}.mp4").write_bytes(b"")
+    render(VIDEO_ID, CLIP_ID, workspace_dir=letterbox_dir.parent, output_dir=tmp_path / "output",
+           config=make_config())
+
+    cmd = fake_ffmpeg[0]["cmd"]
+    graph = cmd[cmd.index("-filter_complex") + 1]
+    assert "[0:v]trim=start=0.000000:end=2.500000" in graph
+    assert "[0:a]atrim=start=0.000000:end=2.500000" in graph
+    assert "start=1.000000" not in graph
+
+
+def _timed_color_source(path, duration):
+    """Source 1920x1080 rouge avant 9 s, bleue de 9 a 11 s, verte apres."""
+    subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error",
+         "-f", "lavfi", "-i",
+         f"color=c=red:s={SRC_W}x{SRC_H}:r=25:d=9,format=yuv420p[a];"
+         f"color=c=blue:s={SRC_W}x{SRC_H}:r=25:d=2,format=yuv420p[b];"
+         f"color=c=green:s={SRC_W}x{SRC_H}:r=25:d={duration - 11},format=yuv420p[c];"
+         "[a][b][c]concat=n=3:v=1:a=0",
+         "-f", "lavfi", "-i", f"sine=frequency=440:sample_rate=44100:duration={duration}",
+         "-ac", "2", "-shortest", str(path)],
+        check=True,
+    )
+
+
+def _frame_center_rgb(mp4, t):
+    proc = subprocess.run(
+        ["ffmpeg", "-v", "error", "-ss", str(t), "-i", str(mp4), "-frames:v", "1",
+         "-vf", "crop=2:2:539:1189", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+        stdout=subprocess.PIPE, check=True,
+    )
+    return tuple(proc.stdout[:3])
+
+
+@no_ffmpeg
+@no_ffprobe
+def test_real_render_of_a_clip_far_into_the_source_shows_the_right_frames(tmp_path, video_dir, cpu_device):
+    from clipper.render import render
+
+    _timed_color_source(video_dir / f"{VIDEO_ID}.mp4", 14)
+    (video_dir / "captions.json").write_text(
+        json.dumps(_captions_json(start=9.0, end=11.0, duration=2.0)), encoding="utf-8")
+    moments = _moments_json()
+    moments["moments"][0].update(start=9.0, end=11.0, duration=2.0)
+    (video_dir / "moments.json").write_text(json.dumps(moments), encoding="utf-8")
+    reframe = _reframe_json_single_plan()
+    reframe.update(start=9.0, end=11.0)
+    reframe["plans"][0].update(start=9.0, end=11.0)
+    for panel in reframe["plans"][0]["panels"]:
+        for rect in panel["rects"]:
+            rect.update(start=9.0, end=11.0)
+    (video_dir / "reframe" / f"{CLIP_ID}.json").write_text(json.dumps(reframe), encoding="utf-8")
+
+    out = render(VIDEO_ID, CLIP_ID, workspace_dir=video_dir.parent, output_dir=tmp_path / "output",
+                 config=make_config())
+
+    assert float(_ffprobe_json(out)["format"]["duration"]) == pytest.approx(2.0, abs=0.1)
+    for t in (0.0, 1.0, 1.9):
+        r, g, b = _frame_center_rgb(out, t)
+        assert b > 200 and r < 60 and g < 60, f"image a t={t} : {(r, g, b)} (bleu attendu)"
