@@ -556,7 +556,7 @@ def test_avoid_zones_maps_faces_of_each_reframe_plan_to_output_height():
     def plan(faces, panels, start=0.0, end=10.0):
         return {"start": start, "end": end, "faces": faces, "panels": panels}
 
-    face = {"id": 0, "first": 0.0, "last": 10.0, "box": [800, 100, 1000, 300]}
+    face = {"id": 0, "first": 0.0, "last": 10.0, "box": [800, 100, 1000, 300], "retained": True}
     camera = {"name": "camera", "dest": {"x": 0, "y": 0, "w": 1080, "h": 768},
               "rects": [{"start": 0.0, "end": 10.0, "x": 700, "y": 0, "w": 400, "h": 400}]}
     gameplay = {"name": "gameplay", "dest": {"x": 0, "y": 768, "w": 1080, "h": 1152},
@@ -590,13 +590,42 @@ def test_avoid_zones_keeps_separate_faces_as_separate_bands():
            "rects": [{"start": 0.0, "end": 5.0, "x": 0, "y": 0, "w": 1215, "h": 1080}]}
     bottom = {"name": "bottom", "dest": {"x": 0, "y": 960, "w": 1080, "h": 960},
               "rects": [{"start": 0.0, "end": 5.0, "x": 1000, "y": 0, "w": 1215, "h": 1080}]}
-    a = {"id": 0, "first": 0.0, "last": 5.0, "box": [100, 108, 300, 324]}      # dans top seulement
-    b = {"id": 1, "first": 0.0, "last": 5.0, "box": [1500, 756, 1700, 972]}    # dans bottom seulement
+    a = {"id": 0, "first": 0.0, "last": 5.0, "box": [100, 108, 300, 324], "retained": True}    # dans top seulement
+    b = {"id": 1, "first": 0.0, "last": 5.0, "box": [1500, 756, 1700, 972], "retained": True}  # dans bottom seulement
     reframe_plan = {"output": {"width": 1080, "height": 1920},
                     "plans": [{"start": 0.0, "end": 5.0, "faces": [a, b], "panels": [top, bottom]}]}
     bands = sorted(tuple(x) for x in avoid_zones(reframe_plan)[0]["bands"])
     # a : 108..324 * 960/1080 -> 96..288 px ; b : 960 + 672..864 -> 1632..1824 px
     assert bands == [pytest.approx((0.05, 0.15)), pytest.approx((0.85, 0.95))]
+
+
+def test_avoid_zones_ignores_faces_not_retained_by_the_reframe_plan():
+    """Un visage detecte mais non retenu (retained: False - main, sac, torse,
+    ecran) ne doit pas bloquer de place pour les sous-titres."""
+    from clipper.pipeline import avoid_zones
+
+    camera = {"name": "camera", "dest": {"x": 0, "y": 0, "w": 1080, "h": 768},
+              "rects": [{"start": 0.0, "end": 10.0, "x": 700, "y": 0, "w": 400, "h": 400}]}
+    not_retained = {"id": 0, "first": 0.0, "last": 10.0, "box": [800, 100, 1000, 300], "retained": False}
+    reframe_plan = {"output": {"width": 1080, "height": 1920}, "plans": [
+        {"start": 0.0, "end": 10.0, "faces": [not_retained], "panels": [camera]},
+    ]}
+    assert avoid_zones(reframe_plan)[0]["bands"] == []
+
+
+def test_avoid_zones_raises_on_a_face_without_a_retained_field():
+    """Plan de recadrage d'ancien format (sans 'retained') : erreur explicite,
+    jamais une supposition silencieuse (ADR-ad2e)."""
+    from clipper.pipeline import PipelineError, avoid_zones
+
+    camera = {"name": "camera", "dest": {"x": 0, "y": 0, "w": 1080, "h": 768},
+              "rects": [{"start": 0.0, "end": 10.0, "x": 700, "y": 0, "w": 400, "h": 400}]}
+    face = {"id": 0, "first": 0.0, "last": 10.0, "box": [800, 100, 1000, 300]}
+    reframe_plan = {"output": {"width": 1080, "height": 1920}, "plans": [
+        {"start": 0.0, "end": 10.0, "faces": [face], "panels": [camera]},
+    ]}
+    with pytest.raises(PipelineError, match="retained"):
+        avoid_zones(reframe_plan)
 
 
 def test_hook_zones_reserve_the_hook_band_for_the_hook_duration(tmp_path):

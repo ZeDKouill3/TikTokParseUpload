@@ -414,7 +414,7 @@ def run_with_plan(tmp_path, plan):
 
 def test_split_layout_face_in_camera_panel(tmp_path, video_dir):
     # webcam en haut (0-768 px), visage y 100..300 sur 400 -> 192..576 px
-    face = {"id": 0, "first": 0.0, "last": 10.0, "box": [800, 100, 1000, 300]}
+    face = {"id": 0, "first": 0.0, "last": 10.0, "box": [800, 100, 1000, 300], "retained": True}
     panels = [
         {"name": "camera", "dest": {"x": 0, "y": 0, "w": 1080, "h": 768}, "rects": [rect(700, 0, 400, 400)]},
         {"name": "gameplay", "dest": {"x": 0, "y": 768, "w": 1080, "h": 1152}, "rects": [rect(0, 0, 640, 1080)]},
@@ -427,7 +427,7 @@ def test_split_layout_face_in_camera_panel(tmp_path, video_dir):
 def test_blur_layout_face_in_main_band(tmp_path, video_dir):
     # fond flou + image entiere au centre (656..1264 px, echelle 608/1080) ;
     # visage y 200..700 source -> 768..1051 px.
-    face = {"id": 0, "first": 0.0, "last": 10.0, "box": [700, 200, 1100, 700]}
+    face = {"id": 0, "first": 0.0, "last": 10.0, "box": [700, 200, 1100, 700], "retained": True}
     panels = [
         {"name": "background", "effect": "blur", "dest": {"x": 0, "y": 0, "w": 1080, "h": 1920},
          "rects": [rect(0, 0, 1920, 1080)]},
@@ -441,7 +441,7 @@ def test_blur_layout_face_in_main_band(tmp_path, video_dir):
 def test_single_layout_face_low_in_frame(tmp_path, video_dir):
     # cadre 608x1080 plein ecran (echelle 1920/1080) ; visage y 700..1000
     # source -> 1244..1778 px : couvre le tiers inferieur de la zone sure.
-    face = {"id": 0, "first": 0.0, "last": 10.0, "box": [700, 700, 900, 1000]}
+    face = {"id": 0, "first": 0.0, "last": 10.0, "box": [700, 700, 900, 1000], "retained": True}
     panels = [{"name": "main", "dest": {"x": 0, "y": 0, "w": 1080, "h": 1920}, "rects": [rect(600, 0, 608, 1080)]}]
     for b in run_with_plan(tmp_path, reframe_plan("single", [face], panels)):
         assert overlap(b, (1244.4, 1777.8)) == 0
