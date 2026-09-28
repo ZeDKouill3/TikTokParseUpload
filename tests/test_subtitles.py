@@ -832,6 +832,100 @@ def test_letterbox_config_section_is_accepted_by_clipper_config(tmp_path):
     assert "letterbox_min_font_size" in section
 
 
+# --------------------------------------------------------------------------
+# TASK-4826 (SPEC-6127) : une ponctuation isolee (" ?", " !", " :", " ;",
+# " »", sans lettre ni chiffre) reste collee au mot d'avant, jamais en debut
+# de ligne ni de Dialogue ; omise si elle est le tout premier mot du clip.
+# Defaut constate sur sZi-qJ-5ptA : "? JE L'AI PRIS ET" / "? TU M'AS ACCUSE".
+# --------------------------------------------------------------------------
+
+
+def is_isolated_punct(token: str) -> bool:
+    stripped = token.strip()
+    return bool(stripped) and not any(c.isalnum() for c in stripped)
+
+
+def punct_words(mark):
+    """4 mots reels, la ponctuation isolee collee au 4e, puis 3 mots reels :
+    8 unites au total. Avec l'ancien decoupage (la ponctuation compte pour
+    une unite a part entiere), cela tombe pile sur une frontiere de groupe
+    de 4 et la ponctuation devient le premier mot du 2e groupe -- bug reel."""
+    words = [_word(f" mot{i}", i * 0.5, i * 0.5 + 0.3) for i in range(1, 5)]
+    words.append(_word(f" {mark}", words[-1]["end"] + 0.05, words[-1]["end"] + 0.15))
+    start = words[-1]["end"]
+    words += [_word(f" suite{i}", start + i * 0.5, start + i * 0.5 + 0.3) for i in range(1, 4)]
+    return words
+
+
+@pytest.mark.parametrize("mark", ["?", "!", ":", ";", "»"])
+def test_isolated_punctuation_never_starts_a_group_and_stays_glued_to_the_previous_word(
+    tmp_path, video_dir, mark
+):
+    words = punct_words(mark)
+    (video_dir / "transcript.json").write_text(json.dumps(make_transcript(words)), encoding="utf-8")
+    with llm.use_backend(FakeBackend([NO_EMPHASIS])):
+        path = run(tmp_path, start=words[0]["start"], end=words[-1]["end"] + 1.0)
+    doc = parse_ass(Path(path))
+    found = False
+    for ev in doc["events"]:
+        tokens = event_tokens(ev)
+        assert not is_isolated_punct(tokens[0])
+        for i, t in enumerate(tokens):
+            if is_isolated_punct(t):
+                found = True
+                assert i > 0
+                assert tokens[i - 1] == " mot4"
+    assert found
+
+
+@pytest.mark.parametrize("mark", ["?", "!", ":"])
+def test_isolated_punctuation_as_the_very_first_word_of_the_clip_is_omitted(tmp_path, video_dir, mark):
+    words = [_word(f" {mark}", 1.0, 1.1)] + [
+        _word(f" mot{i}", 1.1 + i * 0.3, 1.1 + i * 0.3 + 0.2) for i in range(1, 4)
+    ]
+    (video_dir / "transcript.json").write_text(json.dumps(make_transcript(words)), encoding="utf-8")
+    with llm.use_backend(FakeBackend([NO_EMPHASIS])):
+        path = run(tmp_path, start=1.0, end=words[-1]["end"] + 0.5)
+    doc = parse_ass(Path(path))
+    all_tokens = [t for ev in doc["events"] for t in event_tokens(ev)]
+    assert not any(mark in t for t in all_tokens)
+    assert all_tokens[0] == " mot1"
+
+
+def test_word_and_isolated_question_mark_form_a_single_unit_with_a_space(tmp_path, video_dir):
+    words = [_word(" accusé", 0.0, 0.4), _word(" ?", 0.4, 0.5)]
+    path = run_letterbox(tmp_path, video_dir, words=words)
+    events = lb_events(path)
+    assert len(events) == 1
+    assert line_text(events[0]).strip() == "ACCUSÉ ?"
+
+
+def punct_words_letterbox(mark):
+    """8 mots reels, la ponctuation isolee collee au 8e, puis 7 mots reels :
+    sous l'ancien decoupage, la frontiere de groupe (letterbox_max_words_
+    per_group = 8) tombe pile sur la ponctuation, qui ouvre le 2e groupe
+    (donc sa propre ligne/Dialogue) -- bug reel (sZi-qJ-5ptA)."""
+    words = [_word(f" mot{i}", i * 0.3, i * 0.3 + 0.2) for i in range(1, 9)]
+    words.append(_word(f" {mark}", words[-1]["end"] + 0.05, words[-1]["end"] + 0.15))
+    start = words[-1]["end"]
+    words += [_word(f" suite{i}", start + i * 0.3, start + i * 0.3 + 0.2) for i in range(1, 8)]
+    return words
+
+
+@pytest.mark.parametrize("mark", ["?", "!", ":"])
+def test_letterbox_isolated_punctuation_never_starts_a_line_and_stays_with_the_previous_word(
+    tmp_path, video_dir, mark
+):
+    words = punct_words_letterbox(mark)
+    path = run_letterbox(tmp_path, video_dir, words=words)
+    events = lb_events(path)
+    full_text = " ".join(line_text(ev).strip() for ev in events)
+    for ev in events:
+        text = line_text(ev).strip()
+        assert text and not text.startswith((mark,))
+    assert f"MOT8 {mark}" in full_text
+
+
 # Preuve par rendu reel : ffmpeg + libass incrustent le .ass letterbox.
 
 

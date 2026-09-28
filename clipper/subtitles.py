@@ -57,6 +57,12 @@ log = logging.getLogger(__name__)
 # inversion) : " m" + "'a", " viens" + "-tu".
 _GLUED_PREFIXES = ("'", "\u2019", "-")
 
+# Ponctuation isolee (TASK-4826) : faster-whisper rend parfois une
+# ponctuation francaise precedee d'une espace comme un mot separe sans
+# lettre ni chiffre (" ?", " !", " :", " ;", " \u00bb", "\u2026"). Espace devant, selon
+# l'usage francais ; aucune (collee directement) pour le reste, dont "\u2026".
+_PUNCT_SPACE_BEFORE = {"?": " ", "!": " ", ":": " ", ";": " ", "\u00bb": " "}
+
 # Un mot dont le debut precede le debut du clip de plus que cette tolerance
 # n'est jamais sous-titre (SPEC-1557 regle 5 : une borne de clip peut arrondir
 # de quelques centiemes au-dessus du mot qu'elle garde, mais un mot entier
@@ -155,12 +161,31 @@ def _ask_emphasis(words: list[dict[str, Any]], config: Any) -> set[int]:
     return set(answer["indices"])
 
 
+def _is_isolated_punct(text: str) -> bool:
+    """Vrai si ``text`` n'a ni lettre ni chiffre (une ponctuation isolee,
+    TASK-4826) : ' ?', ' !', ' :', ' ;', ' »', '…'..."""
+    stripped = text.strip()
+    return bool(stripped) and not any(c.isalnum() for c in stripped)
+
+
 def _units(words: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
     """Mots au sens du regroupement : un jeton qui commence par une apostrophe
-    ou un trait d'union colle ("'a", "-tu") reste avec le mot precedent."""
+    ou un trait d'union colle ("'a", "-tu") reste avec le mot precedent, de
+    meme qu'une ponctuation isolee (" ?", " !", " :", " ;", " »", TASK-4826),
+    qui rejoint l'unite du mot d'avant (jamais la sienne propre : elle ne
+    peut donc jamais ouvrir un groupe, une ligne ni un Dialogue) et est omise
+    si rien ne la precede dans le clip. Mutation en place (pas de copie) :
+    l'identite du dict reste stable pour l'indexation par id() de l'emphase
+    en aval (_render_letterbox)."""
     units: list[list[dict[str, Any]]] = []
     for w in words:
-        if units and w["word"].startswith(_GLUED_PREFIXES):
+        if _is_isolated_punct(w["word"]):
+            if not units:
+                continue
+            stripped = w["word"].strip()
+            w["word"] = _PUNCT_SPACE_BEFORE.get(stripped, "") + stripped
+            units[-1].append(w)
+        elif units and w["word"].startswith(_GLUED_PREFIXES):
             units[-1].append(w)
         else:
             units.append([w])
@@ -284,7 +309,7 @@ def _dialogue_line(
     group: list[dict[str, Any]],
     clip_start: float,
     emphasis: set[int],
-    offset: int,
+    index: dict[int, int],
     settings: dict[str, Any],
     margin_v: int,
 ) -> str:
@@ -292,8 +317,8 @@ def _dialogue_line(
     end = group[-1]["end"] - clip_start
     prev_end = group[0]["start"]
     runs = []
-    for i, w in enumerate(group):
-        runs.append(_karaoke_run(w, prev_end, (offset + i) in emphasis, settings))
+    for w in group:
+        runs.append(_karaoke_run(w, prev_end, index[id(w)] in emphasis, settings))
         prev_end = w["end"]
     text = "".join(runs)
     return (
@@ -313,14 +338,13 @@ def _render_ass(
 ) -> str:
     candidates = _candidates(settings)
     groups = _group_words(words, int(settings["min_words_per_group"]), int(settings["max_words_per_group"]))
+    index = {id(w): i for i, w in enumerate(words)}
 
     events = []
-    offset = 0
     for group in groups:
         _, bottom = _position(group[0]["start"], group[-1]["end"], candidates,
                               avoid_zones, reserved_zones, where)
-        events.append(_dialogue_line(group, clip_start, emphasis, offset, settings, PLAY_RES_Y - bottom))
-        offset += len(group)
+        events.append(_dialogue_line(group, clip_start, emphasis, index, settings, PLAY_RES_Y - bottom))
 
     style = (
         "Style: Default,{font},{size},{primary},{secondary},{outline_color},&H00000000,"
