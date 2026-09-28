@@ -236,7 +236,7 @@ def test_render_writes_1080x1920_h264_aac_mp4_matching_clip_duration(tmp_path, v
 @no_ffmpeg
 @no_ffprobe
 def test_render_converts_a_25fps_source_to_30fps_output(tmp_path, video_dir, synthetic_source, cpu_device):
-    """SPEC-350f exige 30 i/s en sortie ; la source synthetique est a 25 i/s
+    """SPEC-6127 exige 30 i/s en sortie ; la source synthetique est a 25 i/s
     (constat de l'essai reel du 2026-09-25) : render doit convertir, pas
     garder la cadence source."""
     from clipper.render import render
@@ -389,7 +389,7 @@ def test_render_applies_facecam_gameplay_then_fallback_blur_panels(tmp_path, vid
 
 
 # --------------------------------------------------------------------------
-# JSON de sortie (SPEC-350f)
+# JSON de sortie (SPEC-6127)
 # --------------------------------------------------------------------------
 
 

@@ -55,8 +55,10 @@ jamais lancé en CI ni par défaut en local.
   échec remonte, est journalisé, ou met la vidéo en attente.
 - **ADR-09ad** — interface web (`clipper/web/`) : page statique servie par
   FastAPI, aucune logique de traitement vidéo/audio/LLM dedans.
-- **SPEC-350f** — contrat de sortie d'un clip (`output/<video_id>/<clip_id>.mp4`
-  + `.json` sidecar, champs obligatoires).
+- **SPEC-6127** — contrat de sortie d'un clip (`output/<video_id>/<clip_id>.mp4`
+  + `.json` sidecar, champs obligatoires), format letterbox par défaut (zoom
+  fixe, titre d'écran en haut, sous-titres dans la bande floue du bas) ; le
+  format crop (suivi de visage) reste une option figée. Remplace SPEC-350f.
 - **SPEC-53f3** — grille de notation des moments (`rubric.toml`), critères et
   règles de sélection.
 

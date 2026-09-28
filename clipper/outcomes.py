@@ -2,7 +2,7 @@
 
 Bibliotheque, pas une etape : n'importe aucune etape (ADR-b16b). Chaque
 resultat journalise est relie a la trace du jury par ``video_id``,
-``clip_id`` et ``moment_id`` (voir clipper.jury et SPEC-350f) :
+``clip_id`` et ``moment_id`` (voir clipper.jury et SPEC-6127) :
 
     from clipper import outcomes
     outcomes.record(

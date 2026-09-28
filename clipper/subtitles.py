@@ -8,7 +8,7 @@ au debut du clip (start devient 0).
 
 Cette etape ne detecte aucun visage : l'appelant (clipper.pipeline) lui
 donne, d'apres le plan de recadrage, les bandes a eviter plan par plan
-(``avoid_zones`` : visages, SPEC-350f) et les bandes interdites
+(``avoid_zones`` : visages, SPEC-6127) et les bandes interdites
 (``reserved_zones`` : l'accroche dessinee par render), au format
 ``[{"start", "end", "bands": [[haut, bas], ...]}]`` (temps en secondes de la
 video, bandes en fraction 0..1 de la hauteur d'image).

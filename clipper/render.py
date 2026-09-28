@@ -1,4 +1,4 @@
-"""Etape render : assemble le clip final par ffmpeg (SPEC-350f).
+"""Etape render : assemble le clip final par ffmpeg (SPEC-6127).
 
 Entrees (workspace/<video_id>/, lues en JSON/.ass, jamais en important les
 autres etapes - ADR-b16b) :
@@ -10,13 +10,13 @@ autres etapes - ADR-b16b) :
 - reframe/<clip_id>.json (reframe) : le plan de recadrage (plans, panneaux,
   rectangles source par intervalle de temps, layout) ;
 - subtitles/<clip_id>.ass (subtitles) : les sous-titres deja positionnes
-  (SPEC-350f : jamais sur un visage, decide par l'etape subtitles) ;
+  (SPEC-6127 : jamais sur un visage, decide par l'etape subtitles) ;
 - transcript.json (transcribe) : le texte prononce dans le clip ;
 - meta.json (download), facultatif : titre de la video source.
 
 Sortie : output/<video_id>/<clip_id>.mp4 et output/<video_id>/<clip_id>.json
-conformes a SPEC-350f. Le champ ``qa`` part a ``{"status": "skipped",
-"issues": []}`` : l'etape qa (SPEC-350f) le remplace apres coup.
+conformes a SPEC-6127. Le champ ``qa`` part a ``{"status": "skipped",
+"issues": []}`` : l'etape qa (SPEC-6127) le remplace apres coup.
 
 ffmpeg construit chaque clip plan par plan : trim du plan sur la source,
 canevas noir 1080x1920 (ou la taille de sortie de reframe), un panneau par
@@ -78,7 +78,7 @@ from PIL import Image, ImageDraw, ImageFont
 from clipper.gpu import get_device
 
 CONFIG_DEFAULTS: dict[str, object] = {
-    # Cadence de sortie (SPEC-350f) : imposee, quelle que soit la cadence source.
+    # Cadence de sortie (SPEC-6127) : imposee, quelle que soit la cadence source.
     "max_fps": 30,
     "crf": 20,
     "x264_preset": "medium",
@@ -726,7 +726,7 @@ def render(
     ffmpeg_bin: str = "ffmpeg",
 ) -> Path:
     """Rend le clip ``clip_id`` de ``video_id`` : ecrit
-    output/<video_id>/<clip_id>.mp4 et .json (SPEC-350f), renvoie le chemin
+    output/<video_id>/<clip_id>.mp4 et .json (SPEC-6127), renvoie le chemin
     du .mp4. Une paire deja presente n'est pas refaite, sauf ``force``."""
     video_dir = Path(workspace_dir) / video_id
     out_dir = Path(output_dir) / video_id

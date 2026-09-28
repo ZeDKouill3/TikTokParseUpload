@@ -369,7 +369,7 @@ def avoid_zones(plan: dict[str, Any]) -> list[dict[str, Any]]:
     sac, torse, ecran...) ne bloque pas de place. Chaque visage retenu
     visible dans un panneau donne sa propre bande (deux visages eloignes ne
     bloquent pas l'espace entre eux) ; le fond flou ne compte pas. Les
-    sous-titres ne recouvrent pas ces bandes (SPEC-350f). Un visage sans
+    sous-titres ne recouvrent pas ces bandes (SPEC-6127). Un visage sans
     champ ``retained`` (ancien format de reframe) est une erreur explicite :
     jamais une supposition silencieuse (ADR-ad2e)."""
     out_h = float(plan["output"]["height"])

@@ -243,7 +243,7 @@ def assert_valid_clip(json_path):
 
     clip = json.loads(json_path.read_text(encoding="utf-8"))
     missing = [f for f in SPEC_FIELDS if f not in clip]
-    assert not missing, f"champs SPEC-350f manquants : {missing}"
+    assert not missing, f"champs SPEC-6127 manquants : {missing}"
     assert clip["video_id"] == VIDEO_ID
     assert clip["qa"]["status"] == "passed"
     assert qa.is_ready(clip)
@@ -546,7 +546,7 @@ def test_cli_unknown_video_status_is_an_error(tmp_path, isolated_cwd, capsys):
 
 
 # --------------------------------------------------------------------------
-# SPEC-350f : la bande des visages, deduite du recadrage, est donnee a subtitles.
+# SPEC-6127 : la bande des visages, deduite du recadrage, est donnee a subtitles.
 # --------------------------------------------------------------------------
 
 

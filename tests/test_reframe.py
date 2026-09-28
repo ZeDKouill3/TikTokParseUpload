@@ -822,7 +822,7 @@ def test_close_up_keeps_the_largest_margin_that_fits(tmp_path, video_dir):
 
 def test_face_wider_than_the_frame_is_never_cropped(tmp_path, video_dir):
     # 625 px pour un cadre de 608 : aucun palier ne le garde entier, repli
-    # (SPEC-350f : aucun visage coupe) ; la raison nomme le dernier palier.
+    # (SPEC-6127 : aucun visage coupe) ; la raison nomme le dernier palier.
     out, _, _ = run(tmp_path, static((455, 300, 1080, 925)), [single(0)])
     plan = load(out)["plans"][0]
     assert plan["layout"] == "fallback_blur"
