@@ -18,6 +18,13 @@ si la reponse reparee est encore refusee, la derniere SchemaError remonte
 (aucune valeur de secours). Une erreur transitoire n'est jamais re-essayee
 ici.
 
+``log_path`` (facultatif) journalise les reponses refusees : chaque refus
+(JSON invalide, schema ou ``check``) ajoute une ligne JSON a ce fichier
+(horodatage, usage, modele, numero de tentative, texte brut refuse, erreur
+exacte) ; si une correction finit acceptee, une derniere ligne
+``accepted: true`` l'enregistre. Sans ``log_path``, rien n'est ecrit, et une
+reponse acceptee du premier coup n'est jamais journalisee.
+
 Backends : ``claude-cli`` (defaut, voir clipper.llm.claude_cli pour la facon
 dont ``claude -p`` recoit les images), ``claude-api``, ``ollama``. Pour les
 tests des autres etapes : ``clipper.llm.fake.FakeBackend`` et
@@ -48,6 +55,7 @@ import contextlib
 import json
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -169,6 +177,11 @@ def _accept(text: str, schema: dict[str, Any], check: Callable[[Any], None] | No
     return value
 
 
+def _log_line(log_path: Path, entry: dict[str, Any]) -> None:
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
 def ask(
     usage: str,
     prompt: str,
@@ -177,12 +190,17 @@ def ask(
     *,
     config: Any = None,
     check: Callable[[Any], None] | None = None,
+    log_path: Path | None = None,
 ) -> Any:
     """Ask the model configured for ``usage`` and return its JSON answer,
     validated against ``schema`` then by ``check`` (which raises SchemaError
     to refuse it). A refused answer is sent back to the same model with the
     error, ``[llm] repair_attempts`` times at most. ``config`` defaults to
-    load_config()."""
+    load_config(). When ``log_path`` is given, every refused answer appends a
+    JSON line to it (timestamp, usage, model, attempt number, raw refused
+    text, exact error), and an answer accepted after repair adds a final
+    ``accepted: true`` line; an answer accepted on the first try is never
+    logged."""
     settings = _settings(config)
     name, model, backend_settings = _resolve(usage, settings)
     attempts = int(settings["repair_attempts"])
@@ -197,14 +215,35 @@ def ask(
         schema=schema,
     )
     text = backend.complete(request)
-    for _ in range(attempts):
+    for attempt in range(attempts + 1):
         try:
-            return _accept(text, schema, check)
+            value = _accept(text, schema, check)
         except SchemaError as error:
+            if log_path is not None:
+                _log_line(log_path, {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "usage": usage,
+                    "model": model,
+                    "attempt": attempt,
+                    "response": text,
+                    "error": str(error),
+                })
+            if attempt == attempts:
+                raise
             text = backend.complete(
                 replace(request, prompt=_with_repair_instruction(request.prompt, text, error))
             )
-    return _accept(text, schema, check)
+            continue
+        if log_path is not None and attempt > 0:
+            _log_line(log_path, {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "usage": usage,
+                "model": model,
+                "attempt": attempt,
+                "accepted": True,
+                "response": value,
+            })
+        return value
 
 
 @contextlib.contextmanager
