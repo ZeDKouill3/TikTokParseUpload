@@ -837,8 +837,47 @@ def test_short_title_fits_on_one_line_centered_at_the_bottom_of_the_title_zone()
     assert lay.font_size == CONFIG_DEFAULTS["title_font_size"]
     _assert_box_inside(lay.box, TITLE_ZONE)
     x0, _y0, x1, y1 = lay.box
-    assert y1 == TITLE_ZONE["y1"]
+    assert y1 == TITLE_ZONE["y1"] - CONFIG_DEFAULTS["title_lift"]
     assert abs((x0 + x1) / 2 - (TITLE_ZONE["x0"] + TITLE_ZONE["x1"]) / 2) <= 1
+
+
+def test_title_lift_default_is_40():
+    from clipper.render import CONFIG_DEFAULTS
+
+    assert CONFIG_DEFAULTS["title_lift"] == 40
+
+
+def test_title_lift_reduces_the_effective_zone_height_forcing_a_smaller_font_size():
+    from clipper.render import CONFIG_DEFAULTS, layout_title
+
+    # A 64 px, l'encadre d'une ligne fait 112 px de haut (80 + 2x16) : cette
+    # zone n'en offre que 111 une fois title_lift (40) deduit de ses 151 px.
+    zone = {"x0": 150, "y0": 0, "x1": 930, "y1": 151}
+    lay = layout_title("Il m'a menti", zone, CONFIG_DEFAULTS)
+
+    assert lay.font_size < CONFIG_DEFAULTS["title_font_size"]
+    _assert_box_inside(lay.box, zone)
+    _x0, _y0, _x1, y1 = lay.box
+    assert y1 == zone["y1"] - CONFIG_DEFAULTS["title_lift"]
+
+
+def test_title_lift_can_turn_a_title_that_would_fit_into_a_render_error():
+    from clipper.render import CONFIG_DEFAULTS, RenderError, layout_title
+
+    # A la taille minimale (36 px), l'encadre d'une ligne fait 77 px de haut
+    # (45 + 2x16) : sans title_lift, 116 px de zone suffiraient largement ;
+    # avec title_lift (40), il n'en reste que 76.
+    zone = {"x0": 150, "y0": 0, "x1": 930, "y1": 116}
+    with pytest.raises(RenderError, match="titre"):
+        layout_title("Il m'a menti", zone, CONFIG_DEFAULTS)
+
+
+def test_negative_title_lift_is_an_explicit_error():
+    from clipper.render import CONFIG_DEFAULTS, RenderError, layout_title
+
+    settings = {**CONFIG_DEFAULTS, "title_lift": -1}
+    with pytest.raises(RenderError, match="title_lift"):
+        layout_title("Il m'a menti", TITLE_ZONE, settings)
 
 
 def test_six_long_words_wrap_on_two_lines_and_the_box_stays_in_the_zone():

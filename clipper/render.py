@@ -37,7 +37,8 @@ reframe/<clip_id>.json) : render lit ``text_zones`` (zones title/subtitles/
 part en pixels de sortie, calculees par reframe) et
 - dessine ``screen_title`` (captions.json) pendant tout le clip : texte noir
   Poppins ExtraBold et emoji en couleur sur un encadre blanc a coins
-  arrondis, centre dans la zone title et colle en bas de celle-ci. Le texte
+  arrondis, centre dans la zone title, son bas a ``title_lift`` px du bas de
+  celle-ci. Le texte
   est coupe en segments texte / emoji par classe Unicode
   (Extended_Pictographic), passe a la ligne (2 lignes au plus) puis baisse
   de taille par paliers jusqu'a ce que l'encadre tienne ; sinon RenderError
@@ -117,6 +118,9 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "title_pad_x": 28,
     "title_pad_y": 16,
     "title_radius": 22,
+    # Ecart (px de sortie) entre le bas de l'encadre du titre et le bas de sa
+    # zone (TASK-ea6e : trop colle a la video sans lui).
+    "title_lift": 40,
     # Police emoji couleur : "" = resolue par plateforme (resolve_emoji_font).
     "emoji_font": "",
     # Taille de rasterisation des emojis, reduits ensuite : NotoColorEmoji
@@ -382,8 +386,12 @@ def layout_title(text: str, zone: dict[str, Any], settings: dict[str, Any]) -> T
         emoji_font = str(resolve_emoji_font(settings))
     raster_size = int(settings["emoji_raster_size"])
 
+    title_lift = int(settings["title_lift"])
+    if title_lift < 0:
+        raise RenderError(f"title_lift doit etre >= 0, recu {title_lift} (reglage [render] title_lift)")
+
     zx0, zy0, zx1, zy1 = _zone(zone)
-    zone_w, zone_h = zx1 - zx0, zy1 - zy0
+    zone_w, zone_h = zx1 - zx0, zy1 - zy0 - title_lift
     pad_x, pad_y = int(settings["title_pad_x"]), int(settings["title_pad_y"])
 
     for size in _font_sizes(settings):
@@ -428,7 +436,7 @@ def layout_title(text: str, zone: dict[str, Any], settings: dict[str, Any]) -> T
             if box_w > zone_w or box_h > zone_h:
                 continue
             bx0 = zx0 + (zone_w - box_w) // 2
-            by0 = zy1 - box_h
+            by0 = zy1 - title_lift - box_h
             cap = -font.getbbox("H", anchor="ls")[1]
             layout = TitleLayout(
                 font_size=size,
