@@ -710,6 +710,62 @@ def test_use_backend_restores_config_backend_on_exit(fake_run):
     assert llm.ask("qa", "p", [], COLOR_SCHEMA, config=make_config()) == {"couleur": "rouge"}
 
 
+# --- journal des refus (log_path) --------------------------------------------
+
+
+def test_log_path_records_refusal_then_acceptance(tmp_path):
+    log_path = tmp_path / "refus.jsonl"
+    fake = FakeBackend([{"couleur": "rouge"}, {"couleur": "or"}])
+    with llm.use_backend(fake):
+        value = llm.ask(
+            "vision", "Quelle couleur ?", [], COLOR_SCHEMA,
+            config=make_config(), check=at_most_two_letters, log_path=log_path,
+        )
+
+    assert value == {"couleur": "or"}
+    lines = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    assert len(lines) == 2
+    refusal, acceptance = lines
+    assert refusal["usage"] == "vision"
+    assert refusal["model"] == fake.calls[0].model
+    assert refusal["attempt"] == 0
+    assert refusal["response"] == '{"couleur": "rouge"}'
+    assert refusal["error"] == "couleur de 5 lettres, 2 au plus"
+    assert "accepted" not in refusal
+    assert "T" in refusal["timestamp"]
+    assert acceptance["accepted"] is True
+    assert acceptance["response"] == {"couleur": "or"}
+    assert acceptance["attempt"] == 1
+    assert acceptance["usage"] == "vision"
+
+
+def test_log_path_records_a_refusal_line_per_attempt_then_raises(tmp_path):
+    log_path = tmp_path / "refus.jsonl"
+    fake = FakeBackend([{"couleur": "rouge"}, {"couleur": "violet"}])
+    with llm.use_backend(fake):
+        with pytest.raises(SchemaError, match="couleur de 6 lettres"):
+            llm.ask(
+                "qa", "p", [], COLOR_SCHEMA, config=make_config(),
+                check=at_most_two_letters, log_path=log_path,
+            )
+
+    lines = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    # repair_attempts par defaut = 1 -> 1 + 1 lignes de refus, aucune acceptation.
+    assert [line["attempt"] for line in lines] == [0, 1]
+    assert all("accepted" not in line for line in lines)
+    assert lines[1]["error"] == "couleur de 6 lettres, 2 au plus"
+
+
+def test_log_path_file_not_created_when_first_answer_is_accepted(tmp_path):
+    log_path = tmp_path / "refus.jsonl"
+    fake = FakeBackend([{"couleur": "rouge"}])
+    with llm.use_backend(fake):
+        value = llm.ask("qa", "p", [], COLOR_SCHEMA, config=make_config(), log_path=log_path)
+
+    assert value == {"couleur": "rouge"}
+    assert not log_path.exists()
+
+
 # --- integration reelle (optionnelle) ---------------------------------------
 # CLIPPER_CLAUDE_INTEGRATION=1 pytest tests/test_llm.py -k integration
 
