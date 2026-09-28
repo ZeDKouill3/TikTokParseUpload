@@ -5,7 +5,7 @@ slug: sous-titres-dans-le-bas-de-l-image-en-format-let
 title: "sous-titres : dans le bas de l'image en format letterbox"
 created: 2026-09-28T17:26:40Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/subtitles.py
   - tests/test_subtitles.py
@@ -17,6 +17,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/cf3916695181@6a644a4
+    tree: scope/8841b81e0816
+    criteria: 722c3729a42d
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 4
+version: 10
 ---
