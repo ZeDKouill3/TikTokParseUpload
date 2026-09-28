@@ -5,7 +5,7 @@ slug: qa-partie-2-d-une-s-rie-la-reprise-de-3-s-n-est
 title: "qa : partie 2+ d'une série, la reprise de ~3 s n'est pas un début en milieu de phrase"
 created: 2026-09-28T20:09:26Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/qa.py
   - tests/test_qa.py
@@ -15,6 +15,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/7c1343ffd09a@79afe08
+    tree: scope/b6da8d6f273c
+    criteria: 532d987b9193
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 2
+version: 6
 ---

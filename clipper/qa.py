@@ -17,6 +17,9 @@ Pour chaque clip :
   accroche faible (weak_hook). En letterbox (``layout`` = "letterbox" dans le
   JSON), face_cut et subtitle_on_face ne sont plus demandes : le zoom fixe
   rogne volontairement les bords et les sous-titres sont hors de l'image ;
+  partie 2+ d'une serie (``part`` >= 2 dans le JSON), starts_mid_sentence
+  n'est plus demande : la reprise d'environ 3 s de la partie precedente est
+  voulue (SPEC-1557 regle 3) ;
 - verifications locales par ffprobe/ffmpeg : duree reelle vs ``duration`` du
   JSON, resolution attendue (1080x1920), silence initial superieur au seuil
   (1 s par defaut ; pas de piste audio = silence), ecran noir (black_screen)
@@ -97,6 +100,22 @@ DEFECTS: dict[str, str] = {
 # sous-titres sont hors de l'image (bande floue du bas) : ces deux defauts
 # ne sont plus demandes a l'IA (SPEC-6127).
 _LETTERBOX_EXCLUDED_DEFECTS = {"face_cut", "subtitle_on_face"}
+
+# Partie 2+ d'une serie : la reprise d'environ 3 s de la fin de la partie
+# precedente est voulue, ce n'est pas un debut en milieu de phrase
+# (SPEC-1557 regle 3). Seule la partie 1 (ou un clip unique) commence
+# vraiment sur l'accroche.
+_SERIES_EXCLUDED_DEFECTS = {"starts_mid_sentence"}
+
+
+def _excluded_defects(letterbox: bool, part: int) -> set[str]:
+    excluded = set()
+    if letterbox:
+        excluded |= _LETTERBOX_EXCLUDED_DEFECTS
+    if part >= 2:
+        excluded |= _SERIES_EXCLUDED_DEFECTS
+    return excluded
+
 
 _CHECKED = ("passed", "rejected")
 
@@ -372,12 +391,15 @@ def _extract_frames(mp4: Path, dest: Path, settings: dict[str, Any]) -> list[tup
 # --------------------------------------------------------------------------
 
 
-def response_schema(letterbox: bool = False) -> dict[str, Any]:
+def response_schema(letterbox: bool = False, part: int = 1) -> dict[str, Any]:
     """Ce que le LLM renvoie pour un clip : la liste de ses defauts (vide si
     le clip est bon). En letterbox, face_cut et subtitle_on_face sont hors
     enum : le zoom fixe rogne volontairement les bords et les sous-titres
-    sont hors de l'image (SPEC-6127)."""
-    defect_types = [d for d in DEFECTS if not (letterbox and d in _LETTERBOX_EXCLUDED_DEFECTS)]
+    sont hors de l'image (SPEC-6127). Partie 2+ d'une serie (``part``) :
+    starts_mid_sentence est hors enum, la reprise de la partie precedente
+    est voulue (SPEC-1557)."""
+    excluded = _excluded_defects(letterbox, part)
+    defect_types = [d for d in DEFECTS if d not in excluded]
     return {
         "type": "object",
         "properties": {
@@ -404,7 +426,9 @@ def response_schema(letterbox: bool = False) -> dict[str, Any]:
 
 
 def _prompt(clip: dict[str, Any], frames: list[tuple[Path, float, list[str]]], letterbox: bool = False) -> str:
-    defect_keys = [d for d in DEFECTS if not (letterbox and d in _LETTERBOX_EXCLUDED_DEFECTS)]
+    part = int(clip.get("part", 1))
+    excluded = _excluded_defects(letterbox, part)
+    defect_keys = [d for d in DEFECTS if d not in excluded]
     defects = "\n".join(f"- {key} : {DEFECTS[key]}" for key in defect_keys)
     images = "\n".join(
         f"Image {k} : t={t:.2f} s ({', '.join(labels)})" for k, (_, t, labels) in enumerate(frames, 1)
@@ -421,6 +445,15 @@ def _prompt(clip: dict[str, Any], frames: list[tuple[Path, float, list[str]]], l
     else:
         format_line = ""
         hook_line = f"Texte d'accroche affiche les 2 premieres secondes : {clip.get('hook_text', '')}\n"
+    if part >= 2:
+        series_line = (
+            f"## Serie\n"
+            f"Ce clip est la partie {part} d'une serie de {int(clip.get('parts_total', part))} parties qui "
+            "se suivent. Il reprend volontairement les quelques dernieres secondes de la partie precedente "
+            "(recouvrement voulu, SPEC-1557) : ne pas le signaler comme un debut en milieu de phrase.\n\n"
+        )
+    else:
+        series_line = ""
     return (
         "Tu fais le controle qualite d'un clip vertical TikTok deja rendu, avant publication.\n"
         "Tu vois des images fixes extraites du clip et sa transcription ; signale uniquement "
@@ -428,6 +461,7 @@ def _prompt(clip: dict[str, Any], frames: list[tuple[Path, float, list[str]]], l
         f"{defects}\n\n"
         "Un clip sans defaut rend une liste vide. En cas de doute franc, signale le defaut.\n\n"
         f"{format_line}"
+        f"{series_line}"
         "## Clip\n"
         f"Duree : {float(clip['duration']):.1f} s ; langue : {clip.get('language') or '?'}\n"
         f"{hook_line}"
@@ -480,7 +514,7 @@ def check_clip(
     frames = _extract_frames(mp4, frames_dir, settings)
     answer = llm.ask(
         "qa", _prompt(clip, frames, letterbox=letterbox), [p for p, _, _ in frames],
-        response_schema(letterbox=letterbox), config=config,
+        response_schema(letterbox=letterbox, part=int(clip.get("part", 1))), config=config,
     )
     issues = [{**issue, "source": "llm"} for issue in answer["issues"]] + issues
 
