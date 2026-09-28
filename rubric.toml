@@ -1,10 +1,11 @@
-# Grille de notation des moments (SPEC-53f3), lue par l'etape moments.
+# Grille de notation des moments (SPEC-1557), lue par l'etape moments.
 # Modifiable sans toucher au code. Chemin reglable : [moments] rubric_path.
 #
 # Score final 0-100 = moyenne des notes (0-10) ponderee par `weight`, x10,
 # plus un bonus de signaux mesures plafonne a [bonus] max_total.
 # Retenus : tous les moments dont le score final >= min_score, sans plafond ;
-# entre deux moments qui se chevauchent, le mieux note.
+# entre un passage en serie (multipart) et un clip unique qui se chevauchent,
+# le passage ; entre deux moments du meme format, le mieux note.
 
 min_score = 60
 
@@ -48,13 +49,15 @@ question = "Le clip touche-t-il les mots-cles tendance listes ?"
 
 # Durees en secondes (regle 3 de la spec).
 [durations]
-# Moment court et percutant : un seul clip.
-single_min = 20
-single_max = 45
-# Histoire longue : parties de part_min a part_max, au moins min_parts.
+# Histoire complete qui tient en un clip unique.
+single_min = 60
+single_max = 120
+# Long passage fort (une affaire entiere, typiquement 5 a 15 min) : serie de
+# min_parts a max_parts parties de part_min a part_max qui se suivent.
 part_min = 60
-part_max = 90
+part_max = 120
 min_parts = 2
+max_parts = 12
 # Marge acceptee apres recalage des bornes sur des frontieres de phrase.
 tolerance = 3
 

@@ -1,5 +1,5 @@
 """Etape moments : choix des meilleurs moments d'une video longue par
-clipper.llm (usage ``moments``), selon la grille de SPEC-53f3 (rubric.toml).
+clipper.llm (usage ``moments``), selon la grille de SPEC-1557 (rubric.toml).
 
 Entrees (workspace/<video_id>/) :
 - meta.json (download) : titre, chapitres, heatmap, segments SponsorBlock ;
@@ -62,11 +62,17 @@ tout le reste est fait ici, de facon verifiable :
    Phrase reduite a ses connecteurs, ou duree hors bornes apres retrait :
    rejet motive. Fait avant le jury, qui note donc les bornes finales ;
 2. rejet des moments qui chevauchent un segment SponsorBlock exclu ou dont
-   la duree sort des bornes de la grille ;
+   la duree sort des bornes de la grille (regle 3) : single de
+   ``single_min`` a ``single_max`` s, multipart (passage publie en serie par
+   l'etape parts) de ``min_parts`` x ``part_min`` a ``max_parts`` x
+   ``part_max`` s, a ``tolerance`` pres ;
 3. score final = moyenne ponderee des notes x10 + bonus plafonne des signaux
    mesures (most replayed, pics audio, images marquantes) ;
-4. rejet sous ``min_score``, puis, entre moments qui se chevauchent, seul le
-   mieux note reste. Aucun plafond sur le nombre de moments.
+4. rejet sous ``min_score``, puis non-chevauchement (regle 4) : un passage
+   multipart qui atteint ``min_score`` passe avant tout clip single qui le
+   chevauche, meme mieux note (le contenu du single y figure deja) ; entre
+   deux candidats du meme format, le mieux note reste. Aucun plafond sur le
+   nombre de moments.
 
 Transcription trop longue pour un appel (``max_transcript_chars``) : tranches
 avec recouvrement, puis un tour de comparaison final qui re-note ensemble
@@ -93,7 +99,7 @@ CONFIG_DEFAULTS: dict[str, object] = {
     # Qui note les candidats du proposeur : "single" (le proposeur seul) ou
     # "jury" (clipper.jury, ADR-ff87). En mode auto, le jury note toujours.
     "selection": "single",
-    # Grille de notation (SPEC-53f3), relative au dossier courant.
+    # Grille de notation (SPEC-1557), relative au dossier courant.
     "rubric_path": "rubric.toml",
     # Au-dela, la transcription part en tranches (environ 4 caracteres par
     # token : 400 000 caracteres ~ 100k tokens).
@@ -134,7 +140,7 @@ class MomentsError(Exception):
 # Grille
 # --------------------------------------------------------------------------
 
-_DURATION_KEYS = ("single_min", "single_max", "part_min", "part_max", "min_parts", "tolerance")
+_DURATION_KEYS = ("single_min", "single_max", "part_min", "part_max", "min_parts", "max_parts", "tolerance")
 _BONUS_KEYS = ("max_total", "replayed", "audio_peaks", "audio_peaks_full", "visual")
 
 
@@ -391,8 +397,14 @@ def comparison_schema(rubric: dict[str, Any], n: int) -> dict[str, Any]:
     }
 
 
+def _num(x: float) -> str:
+    """Un nombre de la grille tel qu'ecrit dans rubric.toml (60, pas 60.0)."""
+    return f"{x:g}"
+
+
 def _grid_text(rubric: dict[str, Any]) -> str:
-    d = rubric["durations"]
+    d = {k: _num(v) for k, v in rubric["durations"].items() if _number(v)}
+    longest = _num(rubric["durations"]["max_parts"] * rubric["durations"]["part_max"])
     criteria = "\n".join(f"- {name} : {c['question']}" for name, c in rubric["criteria"].items())
     keywords = ", ".join(rubric["trend_keywords"]) or "(aucun)"
     return (
@@ -407,12 +419,15 @@ def _grid_text(rubric: dict[str, Any]) -> str:
         "1. Le clip commence sur l'accroche (la phrase qui arrete le scroll), jamais sur la mise "
         "en contexte. start = debut d'une ligne de la transcription, end = fin d'une ligne : "
         "reprends les timecodes des lignes tels quels.\n"
-        f"2. format \"single\" : moment court et percutant de {d['single_min']} a {d['single_max']} s.\n"
-        f"   format \"multipart\" : histoire longue en {d['min_parts']} parties ou plus de "
-        f"{d['part_min']} a {d['part_max']} s chacune (au moins {d['min_parts'] * d['part_min']} s "
-        "au total) ; part_breaks = les instants de coupe (fin d'une ligne), chaque partie finissant "
-        "sur un suspense et la suivante repartant sur une accroche.\n"
-        "   Une duree hors de ces bornes est rejetee.\n"
+        f"2. format \"single\" : une histoire complete de {d['single_min']} a {d['single_max']} s, "
+        "publiee en un seul clip.\n"
+        "   format \"multipart\" : un long passage fort (une affaire entiere, typiquement 5 a 15 min, "
+        f"au plus {d['max_parts']} x {d['part_max']} = {longest} s) publie en serie de "
+        f"{d['min_parts']} a {d['max_parts']} parties de {d['part_min']} a {d['part_max']} s qui se "
+        "suivent, chacune finissant sur un suspense ; le decoupage final est fait par l'etape parts, "
+        "part_breaks = les instants de coupe que tu suggeres (fin d'une ligne).\n"
+        "   Une duree hors de ces bornes est rejetee. Un passage multipart qui atteint la note "
+        "minimale passe avant les clips single qu'il contient.\n"
         "3. Aucun moment ne chevauche un segment SponsorBlock marque EXCLU.\n"
         "4. Pas de long silence au debut ni a la fin.\n"
         "5. Deux moments ne se recouvrent pas : entre deux decoupes concurrentes, garde la meilleure.\n"
@@ -597,10 +612,11 @@ def _normalize(
     duration = end - start
     if raw["format"] == "single":
         low, high = d["single_min"] - tol, d["single_max"] + tol
-        bounds = f"{d['single_min']}-{d['single_max']} s"
+        bounds = f"{_num(d['single_min'])}-{_num(d['single_max'])} s"
     else:
-        low, high = d["min_parts"] * d["part_min"] - tol, math.inf
-        bounds = f">= {d['min_parts'] * d['part_min']} s"
+        shortest, longest = d["min_parts"] * d["part_min"], d["max_parts"] * d["part_max"]
+        low, high = shortest - tol, longest + tol
+        bounds = f"{_num(shortest)}-{_num(longest)} s"
     if not low <= duration <= high:
         return reject(f"duree {duration:.1f} s hors bornes {raw['format']} ({bounds}){cut}", start, end)
 
@@ -675,18 +691,25 @@ def _select(
     candidates: list[dict[str, Any]], rubric: dict[str, Any], exploration: tuple[float, int] | None = None
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any] | None]:
     """(retenus, rejets motives, bloc exploration ou None) : rejet sous
-    ``min_score``, puis, entre candidats qui se chevauchent, seul le mieux
-    note reste. Avec ``exploration`` (part, graine), les clips d'exploration
-    suivent les retenus (voir ``_explore``)."""
+    ``min_score``, puis non-chevauchement (SPEC-1557 regle 4) : les passages
+    multipart d'abord, si bien qu'un single qui chevauche un passage retenu
+    est rejete meme mieux note ; entre deux candidats du meme format, le
+    mieux note reste. Avec ``exploration`` (part, graine), les clips
+    d'exploration suivent les retenus (voir ``_explore``), jamais sur un
+    retenu."""
     kept: list[dict[str, Any]] = []
     rejected: list[tuple[dict[str, Any], str]] = []
-    for c in sorted(candidates, key=lambda c: (-c["final_score"], c["_start"])):
+    for c in sorted(candidates, key=lambda c: (c["format"] != "multipart", -c["final_score"], c["_start"])):
         if c["final_score"] < rubric["min_score"]:
             rejected.append((c, f"score {c['final_score']} < min_score {rubric['min_score']}"))
             continue
         rival = _overlaps(c, kept)
         if rival is not None:
-            rejected.append((c, f"chevauche un moment mieux note [{_span(rival['_start'], rival['_end'])}]"))
+            span = _span(rival["_start"], rival["_end"])
+            if rival["format"] == c["format"]:
+                rejected.append((c, f"chevauche un moment mieux note [{span}]"))
+            else:
+                rejected.append((c, f"chevauche un passage en serie retenu [{span}], prioritaire sur un clip unique"))
             continue
         kept.append(c)
     info = None

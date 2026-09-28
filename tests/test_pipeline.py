@@ -25,7 +25,7 @@ from clipper.llm.fake import FakeBackend
 ROOT = Path(__file__).resolve().parent.parent
 VIDEO_ID = "abcdefghijk"
 URL = f"https://www.youtube.com/watch?v={VIDEO_ID}"
-DURATION = 30
+DURATION = 80
 
 no_ffmpeg = pytest.mark.skipif(
     shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
@@ -82,7 +82,7 @@ def fake_ydl(source: Path):
 
 
 def _segments():
-    """Une phrase de 4 mots toutes les 2 s, de 0 a 30 s."""
+    """Une phrase de 4 mots toutes les 2 s, de 0 a DURATION s."""
     segments = []
     for i in range(DURATION // 2):
         t = 2.0 * i
@@ -160,7 +160,7 @@ def step_options(source, whisper=None):
 # Faux LLM : une reponse valide par usage.
 # --------------------------------------------------------------------------
 
-MOMENT = {"start": 2.0, "end": 26.0}
+MOMENT = {"start": 2.0, "end": 72.0}  # 70 s : clip unique (60-120 s, SPEC-1557)
 
 
 def answer(request):
@@ -354,11 +354,11 @@ def test_review_stops_for_decisions_then_render_resumes(tmp_path, isolated_cwd, 
     assert clip_files(tmp_path) == ([], [])
 
     # Decision humaine journalisee via feedback, bornes ajustees.
-    pipeline.decide(VIDEO_ID, 0, "adjusted", start=4.0, end=26.0, comment="debut plus net", config=config)
+    pipeline.decide(VIDEO_ID, 0, "adjusted", start=4.0, end=72.0, comment="debut plus net", config=config)
     journal = (tmp_path / "state" / "feedback.jsonl").read_text(encoding="utf-8").splitlines()
     entry = json.loads(journal[-1])
     assert entry["video_id"] == VIDEO_ID and entry["decision"] == "adjusted"
-    assert entry["moment"]["start"] == 4.0 and entry["moment"]["end"] == 26.0
+    assert entry["moment"]["start"] == 4.0 and entry["moment"]["end"] == 72.0
     assert entry["commentaire"] == "debut plus net"
     assert "GTA six arrive" in entry["texte_moment"]
 
@@ -371,7 +371,7 @@ def test_review_stops_for_decisions_then_render_resumes(tmp_path, isolated_cwd, 
     assert len(jsons) == 1
     clip = assert_valid_clip(jsons[0])
     assert clip["start"] == pytest.approx(4.0, abs=0.2)
-    assert clip["end"] == pytest.approx(26.0, abs=0.2)
+    assert clip["end"] == pytest.approx(72.0, abs=0.2)
 
     # Relancer run sur la video terminee ne la remet pas en revue.
     with llm.use_backend(FakeBackend([])):
