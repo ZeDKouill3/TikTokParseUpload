@@ -39,6 +39,15 @@ Un moment multipart garde le meme screen_title dans toutes ses parties :
 il est demande a l'IA une seule fois, avec la partie 1 (schema et prompt) ;
 les parties suivantes ne le redemandent pas (le prompt cite celui deja
 choisi comme contexte) et captions le recopie tel quel.
+
+Le titre de publication (``title``, poste sur TikTok, distinct de
+``screen_title``) suit la meme mecanique : le titre de base est demande a
+l'IA une seule fois, avec la partie 1 ; les parties suivantes ne le
+redemandent pas (le prompt cite celui deja choisi comme contexte). Chaque
+clip recoit ``title`` = titre de base + " (Partie N)" (la partie 1 aussi) ;
+pour un clip unique (parts_total = 1), aucun suffixe. La longueur maximale
+demandee a l'IA pour le titre de base tient compte du suffixe le plus long
+du moment, pour que le title final respecte title_max_chars.
 """
 
 from __future__ import annotations
@@ -125,15 +134,14 @@ def _part_text(transcript: dict[str, Any], start: float, end: float) -> str:
 # --------------------------------------------------------------------------
 
 
-def response_schema(settings: dict[str, Any], *, include_screen_title: bool = True) -> dict[str, Any]:
+def response_schema(
+    settings: dict[str, Any], *, include_screen_title: bool = True, include_title: bool = True
+) -> dict[str, Any]:
     """Ce que le LLM renvoie pour un clip. ``include_screen_title`` est faux
     pour les parties d'un moment multipart apres la premiere : le titre
-    d'ecran n'est alors plus redemande (recopie de la partie 1)."""
+    d'ecran n'est alors plus redemande (recopie de la partie 1).
+    ``include_title`` suit la meme regle pour le titre de publication."""
     properties: dict[str, Any] = {
-        "title": {
-            "type": "string", "minLength": 1, "maxLength": int(settings["title_max_chars"]),
-            "description": "Titre accrocheur du clip, dans la langue de la video.",
-        },
         "caption": {
             "type": "string", "minLength": 1, "maxLength": int(settings["caption_max_chars"]),
             "description": "Legende publiee sous le clip, dans la langue de la video.",
@@ -156,7 +164,13 @@ def response_schema(settings: dict[str, Any], *, include_screen_title: bool = Tr
             ),
         },
     }
-    required = ["title", "caption", "hashtags", "hook_text"]
+    required = ["caption", "hashtags", "hook_text"]
+    if include_title:
+        properties["title"] = {
+            "type": "string", "minLength": 1, "maxLength": int(settings["title_max_chars"]),
+            "description": "Titre accrocheur du clip, dans la langue de la video.",
+        }
+        required.append("title")
     if include_screen_title:
         properties["screen_title"] = {
             "type": "string", "minLength": 1, "maxLength": 60,
@@ -185,6 +199,7 @@ def _prompt(
     settings: dict[str, Any],
     *,
     screen_title: str | None = None,
+    title: str | None = None,
 ) -> str:
     context = ""
     if parts_total > 1:
@@ -193,15 +208,36 @@ def _prompt(
             "la legende peut le mentionner, mais l'accroche doit donner envie sans avoir vu les "
             "parties precedentes.\n"
         )
+
+    rules = [f"Reponds entierement dans la langue de la video ({language or 'celle de la transcription'})."]
+    if title is None:
+        rules.append("title : court, accrocheur, sans hashtag ni exces d'emoji.")
+    rules.append("caption : la legende publiee sous le clip, qui donne envie de regarder en entier.")
+    rules.append(
+        "hashtags : chacun commence par #, jamais deux fois le meme, pertinents pour ce clip precis "
+        f"(pas de generique inutile), {int(settings['hashtags_max'])} au plus."
+    )
+    rules.append(
+        f"hook_text : le texte affiche a l'ecran des le debut, {int(settings['hook_words_max'])} mots "
+        "au plus, qui arrete le scroll."
+    )
     if screen_title is None:
-        screen_title_rule = (
-            f"6. screen_title : titre de 5-6 mots au plus ({int(settings['screen_title_words_max'])} "
-            "au plus) affiche dans un encadre blanc au-dessus de la video, pendant tout le clip ; "
-            "exactement un emoji simple (pas de sequence composee, pas de drapeau).\n"
+        rules.append(
+            f"screen_title : titre de 5-6 mots au plus ({int(settings['screen_title_words_max'])} au "
+            "plus) affiche dans un encadre blanc au-dessus de la video, pendant tout le clip ; "
+            "exactement un emoji simple (pas de sequence composee, pas de drapeau)."
         )
+    rules_text = "".join(f"{i}. {rule}\n" for i, rule in enumerate(rules, start=1))
+
+    title_context = ""
+    if title is not None:
+        title_context = (
+            f"\nTitre deja choisi pour ce moment, le meme dans toutes ses parties (ne pas le "
+            f"redemander) : {title}\n"
+        )
+    if screen_title is None:
         screen_title_context = ""
     else:
-        screen_title_rule = ""
         screen_title_context = (
             f"\nTitre d'ecran deja choisi pour ce moment, le meme dans toutes ses parties (ne pas "
             f"le redemander) : {screen_title}\n"
@@ -209,15 +245,9 @@ def _prompt(
     return (
         "Tu ecris les metadonnees d'un clip vertical TikTok tire d'une video plus longue.\n\n"
         "## Regles\n"
-        f"1. Reponds entierement dans la langue de la video ({language or 'celle de la transcription'}).\n"
-        "2. title : court, accrocheur, sans hashtag ni exces d'emoji.\n"
-        "3. caption : la legende publiee sous le clip, qui donne envie de regarder en entier.\n"
-        "4. hashtags : chacun commence par #, jamais deux fois le meme, pertinents pour ce clip "
-        f"precis (pas de generique inutile), {int(settings['hashtags_max'])} au plus.\n"
-        f"5. hook_text : le texte affiche a l'ecran des le debut, {int(settings['hook_words_max'])} "
-        "mots au plus, qui arrete le scroll.\n"
-        f"{screen_title_rule}"
+        f"{rules_text}"
         f"{context}"
+        f"{title_context}"
         f"{screen_title_context}\n"
         "## Contexte\n"
         f"Video source : {video_title or '(sans titre)'}\n"
@@ -365,27 +395,42 @@ def run(
         if source is None:
             raise CaptionsError(f"moment {moment['id']} de parts.json absent de moments.json")
         screen_title: str | None = None
+        title: str | None = None
+        parts_total = moment["parts_total"]
         for part in moment["parts"]:
             request_screen_title = screen_title is None
-            schema = response_schema(settings, include_screen_title=request_screen_title)
+            request_title = title is None
+            schema_settings = settings
+            if request_title and parts_total > 1:
+                suffix_len = len(f" (Partie {parts_total})")
+                schema_settings = {
+                    **settings,
+                    "title_max_chars": max(1, int(settings["title_max_chars"]) - suffix_len),
+                }
+            schema = response_schema(
+                schema_settings, include_screen_title=request_screen_title, include_title=request_title
+            )
             check = _check_answer(hook_words_max, screen_title_words_max,
                                    require_screen_title=request_screen_title)
             text = _part_text(transcript, part["start"], part["end"])
-            prompt = _prompt(language, video_title, source, part, moment["parts_total"], text, settings,
-                              screen_title=screen_title)
+            prompt = _prompt(language, video_title, source, part, parts_total, text, settings,
+                              screen_title=screen_title, title=title)
             answer = llm.ask("captions", prompt, [], schema, config=config, check=check)
             if request_screen_title:
                 screen_title = answer["screen_title"]
+            if request_title:
+                title = answer["title"]
+            final_title = title if parts_total == 1 else f"{title} (Partie {part['part']})"
             clips.append({
-                "id": _clip_id(moment["id"], part["part"], moment["parts_total"]),
+                "id": _clip_id(moment["id"], part["part"], parts_total),
                 "moment_id": moment["id"],
                 "part": part["part"],
-                "parts_total": moment["parts_total"],
+                "parts_total": parts_total,
                 "start": part["start"],
                 "end": part["end"],
                 "duration": part["duration"],
                 "language": language,
-                "title": answer["title"],
+                "title": final_title,
                 "caption": answer["caption"],
                 "hashtags": answer["hashtags"],
                 "hook_text": answer["hook_text"],
