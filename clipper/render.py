@@ -111,6 +111,9 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "title_font_size_step": 4,
     "title_line_height": 1.25,  # interligne, en em
     "title_emoji_scale": 0.9,  # hauteur de l'emoji, en em
+    # Espace ajoute entre un segment texte et un emoji qui se suivent, en em
+    # (compte dans la largeur mesuree de l'encadre).
+    "title_emoji_gap": 0.25,
     "title_pad_x": 28,
     "title_pad_y": 16,
     "title_radius": 22,
@@ -399,8 +402,13 @@ def layout_title(text: str, zone: dict[str, Any], settings: dict[str, Any]) -> T
                 segs.extend(word_segs)
             return segs
 
+        gap = round(size * float(settings["title_emoji_gap"]))
+
+        def transitions(segs: list[tuple[str, str]]) -> int:
+            return sum(1 for (k1, _), (k2, _) in zip(segs, segs[1:]) if k1 != k2)
+
         def width(segs: list[tuple[str, str]]) -> float:
-            return sum(font.getlength(s) if kind == "text" else emoji_w(s) for kind, s in segs)
+            return sum(font.getlength(s) if kind == "text" else emoji_w(s) for kind, s in segs) + gap * transitions(segs)
 
         def span_width(a: int, b: int) -> float:
             return width(line_segments(segments_by_word[a:b]))
@@ -430,7 +438,9 @@ def layout_title(text: str, zone: dict[str, Any], settings: dict[str, Any]) -> T
             for i, segs in enumerate(segs_per_line):
                 baseline = by0 + pad_y + i * line_h + round((line_h + cap) / 2)
                 x = bx0 + (box_w - widths[i]) / 2
-                for kind, seg in segs:
+                for j, (kind, seg) in enumerate(segs):
+                    if j and segs[j - 1][0] != kind:
+                        x += gap
                     if kind == "text":
                         layout.items.append(("text", seg, round(x), baseline))
                         x += font.getlength(seg)

@@ -931,6 +931,32 @@ def test_title_png_is_transparent_with_a_colored_emoji_where_the_layout_puts_it(
     assert img.getpixel((bx0 - ox + 4, (by0 + by1) // 2 - oy)) == (255, 255, 255, 255)
 
 
+@no_emoji_font
+def test_title_emoji_gap_separates_text_and_emoji_and_counts_in_the_box_width():
+    from PIL import ImageFont
+
+    from clipper.render import CONFIG_DEFAULTS, FONT_FILE, layout_title
+
+    assert CONFIG_DEFAULTS["title_emoji_gap"] == 0.25
+    title = "Il m'a menti 🚨"  # une ligne : l'emoji compte dans la largeur de l'encadre
+    lay = layout_title(title, TITLE_ZONE, CONFIG_DEFAULTS)
+    assert len(lay.lines) == 1
+    flush = layout_title(title, TITLE_ZONE, {**CONFIG_DEFAULTS, "title_emoji_gap": 0})
+    assert lay.font_size == flush.font_size == 64
+    font = ImageFont.truetype(str(FONT_FILE), 64)
+
+    def gap(layout):
+        i = next(k for k, item in enumerate(layout.items) if item[0] == "emoji")
+        _kind, text, x, _y = layout.items[i - 1]
+        return layout.items[i][2] - (x + font.getlength(text))
+
+    assert gap(lay) == pytest.approx(16, abs=1)  # 0,25 em a 64 px
+    assert gap(flush) == pytest.approx(0, abs=1)
+    # l'ecart est compte dans la largeur de l'encadre, qui tient toujours dans la zone
+    assert (lay.box[2] - lay.box[0]) - (flush.box[2] - flush.box[0]) == pytest.approx(16, abs=1)
+    _assert_box_inside(lay.box, TITLE_ZONE)
+
+
 def test_resolve_emoji_font_uses_the_configured_path_when_it_exists(tmp_path):
     from clipper.render import CONFIG_DEFAULTS, resolve_emoji_font
 
