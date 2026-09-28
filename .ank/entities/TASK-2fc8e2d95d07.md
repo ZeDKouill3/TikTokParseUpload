@@ -5,7 +5,7 @@ slug: qa-contr-les-adapt-s-au-format-letterbox-titre-n
 title: "qa : contrôles adaptés au format letterbox (titre, noir mesuré dans l'image)"
 created: 2026-09-28T17:58:32Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/qa.py
   - tests/test_qa.py
@@ -15,6 +15,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/bff77a294dcd@6433ab8
+    tree: scope/e3fe27ea0a2e
+    criteria: a6b629924607
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---
