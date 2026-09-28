@@ -94,9 +94,12 @@ def make_config(tmp_path, **captions_overrides):
 
 
 def answer(title="Titre choc", caption="Une legende qui donne envie.", hashtags=("#un", "#deux"),
-           hook_text="quatre mots pour accrocher", screen_title="Info choc \U0001F525"):
-    return {"title": title, "caption": caption, "hashtags": list(hashtags), "hook_text": hook_text,
-            "screen_title": screen_title}
+           hook_text="quatre mots pour accrocher", screen_title="Info choc \U0001F525",
+           include_screen_title=True):
+    result = {"title": title, "caption": caption, "hashtags": list(hashtags), "hook_text": hook_text}
+    if include_screen_title:
+        result["screen_title"] = screen_title
+    return result
 
 
 def run(workspace, config, responses, **kwargs):
@@ -146,7 +149,10 @@ def test_multipart_moment_produces_one_clip_per_part_with_context(workspace, tmp
         workspace, parts_record(0, "multipart", 2, [part(1, 0.0, 3.9, suspense="a suivre"), part(2, 5.0, 8.9)])
     )
 
-    fake, _ = run(workspace, make_config(tmp_path), [answer(title="Partie 1"), answer(title="Partie 2")])
+    fake, _ = run(
+        workspace, make_config(tmp_path),
+        [answer(title="Partie 1"), answer(title="Partie 2", include_screen_title=False)],
+    )
 
     data = read_captions(workspace)
     assert [c["id"] for c in data["clips"]] == ["00-p1", "00-p2"]
@@ -471,3 +477,87 @@ def test_screen_title_words_max_is_configurable(workspace, tmp_path):
 
     with pytest.raises(llm.SchemaError, match="2 au plus"):
         run(workspace, make_config(tmp_path, screen_title_words_max=2), [answer(screen_title=three_words)] * 2)
+
+
+# --------------------------------------------------------------------------
+# screen_title unique par moment multipart (TASK-4078, SPEC-6127)
+# --------------------------------------------------------------------------
+
+
+def test_multipart_screen_title_is_requested_only_once_and_shared_across_parts(workspace, tmp_path):
+    write_moments(workspace, moment(0, justification="histoire en 3 actes"))
+    write_parts(
+        workspace,
+        parts_record(0, "multipart", 3, [
+            part(1, 0.0, 1.0), part(2, 5.0, 6.0), part(3, 7.0, 8.0),
+        ]),
+    )
+
+    fake, _ = run(
+        workspace, make_config(tmp_path),
+        [
+            answer(title="Partie 1", screen_title="Info choc \U0001F525"),
+            answer(title="Partie 2", include_screen_title=False),
+            answer(title="Partie 3", include_screen_title=False),
+        ],
+    )
+
+    data = read_captions(workspace)
+    assert [c["screen_title"] for c in data["clips"]] == ["Info choc \U0001F525"] * 3
+    assert len(fake.calls) == 3
+
+
+def test_multipart_only_the_first_calls_schema_requires_screen_title(workspace, tmp_path):
+    write_moments(workspace, moment(0))
+    write_parts(
+        workspace,
+        parts_record(0, "multipart", 3, [
+            part(1, 0.0, 1.0), part(2, 5.0, 6.0), part(3, 7.0, 8.0),
+        ]),
+    )
+
+    fake, _ = run(
+        workspace, make_config(tmp_path),
+        [
+            answer(screen_title="Info choc \U0001F525"),
+            answer(include_screen_title=False),
+            answer(include_screen_title=False),
+        ],
+    )
+
+    assert "screen_title" in fake.calls[0].schema["properties"]
+    assert "screen_title" in fake.calls[0].schema["required"]
+    assert "screen_title" not in fake.calls[1].schema["properties"]
+    assert "screen_title" not in fake.calls[1].schema["required"]
+    assert "screen_title" not in fake.calls[2].schema["properties"]
+    assert "screen_title" not in fake.calls[2].schema["required"]
+
+
+def test_multipart_later_parts_prompt_cites_the_chosen_screen_title_as_context(workspace, tmp_path):
+    write_moments(workspace, moment(0))
+    write_parts(
+        workspace,
+        parts_record(0, "multipart", 2, [part(1, 0.0, 1.0), part(2, 5.0, 6.0)]),
+    )
+
+    fake, _ = run(
+        workspace, make_config(tmp_path),
+        [
+            answer(screen_title="Info choc \U0001F525"),
+            answer(include_screen_title=False),
+        ],
+    )
+
+    assert "Info choc \U0001F525" in fake.calls[1].prompt
+
+
+def test_multipart_first_part_failing_writes_nothing(workspace, tmp_path):
+    write_moments(workspace, moment(0))
+    write_parts(
+        workspace,
+        parts_record(0, "multipart", 2, [part(1, 0.0, 1.0), part(2, 5.0, 6.0)]),
+    )
+
+    with pytest.raises(llm.TransientLLMError):
+        run(workspace, make_config(tmp_path), [llm.TransientLLMError("quota"), answer()])
+    assert not (workspace / VIDEO_ID / "captions.json").exists()
