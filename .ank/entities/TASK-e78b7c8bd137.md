@@ -5,7 +5,7 @@ slug: reframe-format-letterbox-image-horizontale-zoom
 title: "reframe : format letterbox (image horizontale zoomée sur fond flou), sans appel LLM"
 created: 2026-09-28T17:26:11Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/reframe.py
   - tests/test_reframe.py
@@ -16,6 +16,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/1b8a94d443c4@e14c6f5
+    tree: scope/14367cc0d003
+    criteria: b5326a6f731d
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 3
+version: 5
 ---

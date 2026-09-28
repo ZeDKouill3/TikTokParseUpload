@@ -18,20 +18,22 @@ Sortie : workspace/<video_id>/captions.json
     {"video_id",
      "clips": [{"id", "moment_id", "part", "parts_total", "start", "end",
                 "duration", "language", "title", "caption", "hashtags",
-                "hook_text"}]}
+                "hook_text", "screen_title"}]}
 
 ``id`` = ``<moment_id>`` sur 2 chiffres (clip unique) ou
 ``<moment_id>-p<part>`` (multipart), ex. ``03-p2`` (SPEC-350f).
 
 Pour chaque clip, l'IA recoit le texte prononce dans la partie, l'accroche
 et la justification du moment, et rend titre, legende, hashtags (chacun
-commencant par #, sans doublon) et texte d'accroche (8 mots au plus, valeur
-par defaut) dans la langue de la video ; ces regles sont revalidees ici et
-passees a llm.ask comme controle : une reponse qui les enfreint est renvoyee
-au modele avec l'erreur pour correction ([llm] repair_attempts), puis traitee
-comme une reponse invalide si elle les enfreint encore. Reponse
-invalide ou Claude indisponible : l'erreur remonte, rien n'est ecrit, aucune
-legende de secours n'est inventee (ADR-ad2e).
+commencant par #, sans doublon), texte d'accroche (8 mots au plus, valeur
+par defaut) et titre d'ecran ``screen_title`` (SPEC-6127, format letterbox :
+6 mots au plus, valeur par defaut, et exactement un emoji simple) dans la
+langue de la video ; ces regles sont revalidees ici et passees a llm.ask
+comme controle : une reponse qui les enfreint est renvoyee au modele avec
+l'erreur pour correction ([llm] repair_attempts), puis traitee comme une
+reponse invalide si elle les enfreint encore. Reponse invalide ou Claude
+indisponible : l'erreur remonte, rien n'est ecrit, aucune legende de secours
+n'est inventee (ADR-ad2e).
 """
 
 from __future__ import annotations
@@ -47,10 +49,49 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "caption_max_chars": 300,
     "hashtags_max": 8,
     "hook_words_max": 8,
+    "screen_title_words_max": 6,
 }
 
 _EDGE = 0.1
 _EPS = 1e-6
+
+# --------------------------------------------------------------------------
+# screen_title : un seul emoji Extended_Pictographic (SPEC-6127).
+# --------------------------------------------------------------------------
+
+_ZWJ = "‍"
+_VS16 = "️"
+_SKIN_TONE_MODIFIERS = range(0x1F3FB, 0x1F400)
+_REGIONAL_INDICATORS = range(0x1F1E6, 0x1F200)
+
+# Approximation des plages Extended_Pictographic d'Unicode : les blocs
+# d'emojis usuels, hors indicateurs regionaux (drapeaux, geres a part).
+_PICTOGRAPHIC_RANGES = (
+    (0x203C, 0x203C), (0x2049, 0x2049),
+    (0x2122, 0x2122), (0x2139, 0x2139),
+    (0x2194, 0x2199), (0x21A9, 0x21AA),
+    (0x231A, 0x231B), (0x2328, 0x2328),
+    (0x23CF, 0x23CF), (0x23E9, 0x23F3), (0x23F8, 0x23FA),
+    (0x24C2, 0x24C2),
+    (0x25AA, 0x25AB), (0x25B6, 0x25B6), (0x25C0, 0x25C0), (0x25FB, 0x25FE),
+    (0x2600, 0x27BF),
+    (0x2934, 0x2935),
+    (0x2B05, 0x2B07), (0x2B1B, 0x2B1C), (0x2B50, 0x2B50), (0x2B55, 0x2B55),
+    (0x3030, 0x3030), (0x303D, 0x303D),
+    (0x3297, 0x3297), (0x3299, 0x3299),
+    (0x1F000, 0x1F0FF),
+    (0x1F200, 0x1F2FF),
+    (0x1F300, 0x1F5FF),
+    (0x1F600, 0x1F64F),
+    (0x1F680, 0x1F6FF),
+    (0x1F700, 0x1F8FF),
+    (0x1F900, 0x1F9FF),
+    (0x1FA00, 0x1FAFF),
+)
+
+
+def _is_pictographic(codepoint: int) -> bool:
+    return any(lo <= codepoint <= hi for lo, hi in _PICTOGRAPHIC_RANGES)
 
 
 class CaptionsError(Exception):
@@ -109,8 +150,16 @@ def response_schema(settings: dict[str, Any]) -> dict[str, Any]:
                     f"{settings['hook_words_max']} mots au plus."
                 ),
             },
+            "screen_title": {
+                "type": "string", "minLength": 1, "maxLength": 60,
+                "description": (
+                    "Titre d'ecran affiche en haut, sur un encadre blanc, pendant tout le "
+                    f"clip : {settings['screen_title_words_max']} mots au plus (l'emoji ne "
+                    "compte pas) et exactement un emoji simple."
+                ),
+            },
         },
-        "required": ["title", "caption", "hashtags", "hook_text"],
+        "required": ["title", "caption", "hashtags", "hook_text", "screen_title"],
         "additionalProperties": False,
     }
 
@@ -141,6 +190,9 @@ def _prompt(
         f"precis (pas de generique inutile), {int(settings['hashtags_max'])} au plus.\n"
         f"5. hook_text : le texte affiche a l'ecran des le debut, {int(settings['hook_words_max'])} "
         "mots au plus, qui arrete le scroll.\n"
+        f"6. screen_title : titre de 5-6 mots au plus ({int(settings['screen_title_words_max'])} "
+        "au plus) affiche dans un encadre blanc au-dessus de la video, pendant tout le clip ; "
+        "exactement un emoji simple (pas de sequence composee, pas de drapeau).\n"
         f"{context}\n"
         "## Contexte\n"
         f"Video source : {video_title or '(sans titre)'}\n"
@@ -167,19 +219,62 @@ def _validate_hashtags(hashtags: list[str]) -> None:
         seen.add(key)
 
 
+def _count_words(text: str) -> int:
+    return sum(1 for token in text.split() if any(c.isalnum() for c in token))
+
+
 def _validate_hook_text(hook_text: str, max_words: int) -> None:
-    n = sum(1 for token in hook_text.split() if any(c.isalnum() for c in token))
+    n = _count_words(hook_text)
     if n > max_words:
         raise llm.SchemaError(f"texte d'accroche de {n} mots, {max_words} au plus : {hook_text!r}")
 
 
-def _check_answer(max_words: int):
+def _validate_screen_title_emoji(screen_title: str) -> None:
+    """Exactement un emoji Extended_Pictographic, avec au plus un VS16 et un
+    modificateur de teint ; sequence ZWJ et drapeau refuses (SPEC-6127)."""
+    codepoints = [ord(c) for c in screen_title]
+    n = len(codepoints)
+    emoji_count = 0
+    i = 0
+    while i < n:
+        cp = codepoints[i]
+        if cp in _REGIONAL_INDICATORS and i + 1 < n and codepoints[i + 1] in _REGIONAL_INDICATORS:
+            raise llm.SchemaError(f"emoji de type drapeau refuse dans screen_title : {screen_title!r}")
+        if _is_pictographic(cp):
+            j = i + 1
+            if j < n and codepoints[j] == ord(_VS16):
+                j += 1
+            if j < n and codepoints[j] in _SKIN_TONE_MODIFIERS:
+                j += 1
+            if j < n and codepoints[j] == ord(_ZWJ):
+                raise llm.SchemaError(
+                    f"emoji compose (sequence ZWJ) refuse dans screen_title : {screen_title!r}"
+                )
+            emoji_count += 1
+            i = j
+            continue
+        i += 1
+    if emoji_count != 1:
+        raise llm.SchemaError(
+            f"screen_title doit contenir exactement un emoji, {emoji_count} trouve(s) : {screen_title!r}"
+        )
+
+
+def _validate_screen_title(screen_title: str, max_words: int) -> None:
+    n = _count_words(screen_title)
+    if n > max_words:
+        raise llm.SchemaError(f"titre d'ecran de {n} mots, {max_words} au plus : {screen_title!r}")
+    _validate_screen_title_emoji(screen_title)
+
+
+def _check_answer(hook_words_max: int, screen_title_words_max: int):
     """Controle passe a llm.ask : ce qui le refuse est renvoye au modele
     pour correction, comme une reponse hors schema."""
 
     def check(answer: dict[str, Any]) -> None:
         _validate_hashtags(answer["hashtags"])
-        _validate_hook_text(answer["hook_text"], max_words)
+        _validate_hook_text(answer["hook_text"], hook_words_max)
+        _validate_screen_title(answer["screen_title"], screen_title_words_max)
 
     return check
 
@@ -234,7 +329,7 @@ def run(
     video_title = meta.get("title") or ""
     moments_by_id = {m["id"]: m for m in moments_data["moments"]}
     schema = response_schema(settings)
-    check = _check_answer(int(settings["hook_words_max"]))
+    check = _check_answer(int(settings["hook_words_max"]), int(settings["screen_title_words_max"]))
 
     clips: list[dict[str, Any]] = []
     for moment in parts_data["moments"]:
@@ -258,6 +353,7 @@ def run(
                 "caption": answer["caption"],
                 "hashtags": answer["hashtags"],
                 "hook_text": answer["hook_text"],
+                "screen_title": answer["screen_title"],
             })
 
     result = {"video_id": video_id, "clips": clips}

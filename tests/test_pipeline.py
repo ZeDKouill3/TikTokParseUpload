@@ -192,7 +192,7 @@ def answer(request):
                            for i in range(n)]}
     if usage == "captions":
         return {"title": "GTA 6 arrive", "caption": "Il arrive vraiment", "hashtags": ["#gta6"],
-                "hook_text": "GTA 6 arrive"}
+                "hook_text": "GTA 6 arrive", "screen_title": "GTA 6 confirme \U0001F525"}
     if usage == "emphasis":
         return {"indices": []}
     if usage == "layout":
@@ -626,6 +626,67 @@ def test_avoid_zones_raises_on_a_face_without_a_retained_field():
     ]}
     with pytest.raises(PipelineError, match="retained"):
         avoid_zones(reframe_plan)
+
+
+# --------------------------------------------------------------------------
+# SPEC-6127 (TASK-a62e) : en letterbox, subtitles recoit text_zones.subtitles
+# de la racine du plan de recadrage.
+# --------------------------------------------------------------------------
+
+
+def letterbox_workspace(tmp_path, text_zones):
+    """captions.json, transcript.json et reframe/00.json (plan letterbox du
+    contrat commun) pour un clip 00 de 0 a 4 s."""
+    d = tmp_path / "workspace" / VIDEO_ID
+    (d / "reframe").mkdir(parents=True)
+    words = [{"word": f" {w}", "start": 0.5 * k, "end": 0.5 * (k + 1), "probability": 0.9}
+             for k, w in enumerate(["GTA", "six", "arrive", "vraiment."])]
+    (d / "transcript.json").write_text(json.dumps({"video_id": VIDEO_ID, "language": "fr", "segments": [
+        {"id": 0, "start": 0.0, "end": 2.0, "text": "", "words": words}]}), encoding="utf-8")
+    (d / "captions.json").write_text(json.dumps({"clips": [{"id": "00", "start": 0.0, "end": 4.0}]}),
+                                     encoding="utf-8")
+    plan = {"layout": "letterbox", "format": "letterbox", "output": {"width": 1080, "height": 1920},
+            "plans": [{"index": 0, "start": 0.0, "end": 4.0, "image": None, "llm": None,
+                       "layout": "letterbox", "reason": None, "faces": [], "panels": []}]}
+    if text_zones is not None:
+        plan["text_zones"] = text_zones
+    (d / "reframe" / "00.json").write_text(json.dumps(plan), encoding="utf-8")
+    return d
+
+
+def run_subtitles_step(tmp_path):
+    from clipper import pipeline
+
+    config = Config(mode="auto", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output")
+    run = pipeline._Run(pipeline.new_state(VIDEO_ID, URL, "auto"), config, False, None)
+    with llm.use_backend(FakeBackend([{"indices": []}])):
+        run.subtitles()
+
+
+def test_letterbox_plan_gives_its_subtitles_text_zone_to_subtitles(tmp_path):
+    zone = {"x0": 200, "y0": 1300, "x1": 880, "y1": 1500}
+    d = letterbox_workspace(tmp_path, {"title": {"x0": 150, "y0": 160, "x1": 930, "y1": 424},
+                                       "subtitles": zone,
+                                       "part": {"x0": 150, "y0": 1464, "x1": 930, "y1": 1520}})
+    run_subtitles_step(tmp_path)
+    ass = (d / "subtitles" / "00.ass").read_text(encoding="utf-8")
+    assert ass.startswith("; format: letterbox")
+    events = [line.split(",", 9) for line in ass.splitlines() if line.startswith("Dialogue:")]
+    assert events
+    for ev in events:
+        # MarginL = x0, MarginR = 1080 - x1, MarginV = y0 (+ pas pour une 2e ligne)
+        assert (int(ev[5]), int(ev[6])) == (200, 1080 - 880)
+        assert int(ev[7]) in (1300, 1300 + 78)
+
+
+@pytest.mark.parametrize("text_zones", [None, {"title": {"x0": 150, "y0": 160, "x1": 930, "y1": 424}}])
+def test_letterbox_plan_without_a_subtitles_zone_is_an_error(tmp_path, text_zones):
+    from clipper.pipeline import PipelineError
+
+    d = letterbox_workspace(tmp_path, text_zones)
+    with pytest.raises(PipelineError, match="text_zones"):
+        run_subtitles_step(tmp_path)
+    assert not (d / "subtitles" / "00.ass").exists()
 
 
 def test_hook_zones_reserve_the_hook_band_for_the_hook_duration(tmp_path):

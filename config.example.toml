@@ -20,3 +20,7 @@ output_dir = "output"
 #
 # [llm]
 # backend = "claude-cli"
+#
+# [reframe]
+# format = "letterbox"    # letterbox (zoom fixe, defaut) | crop (option figee)
+# letterbox_zoom = 1.3     # fenetre centrale de largeur source_w / zoom
