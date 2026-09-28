@@ -11,12 +11,12 @@ scope:
   - tests/test_subtitles.py
   - clipper/pipeline.py
   - tests/test_pipeline.py
-blocked_by: [TASK-73aca6107f11]
+blocked_by: []
 done_criteria: |
-  SPEC-6127 : en format letterbox (plan de recadrage layout letterbox), pipeline passe à subtitles la bande verticale du panneau main (haut, bas en fraction de la hauteur de sortie, lue dans reframe/<clip_id>.json) ; subtitles place alors chaque groupe de mots le plus bas possible dans cette bande (marge letterbox_bottom_margin px au-dessus du bas de l'image, CONFIG_DEFAULTS) en évitant les visages retenus comme aujourd'hui, jamais dans les bandes floues, avec une taille de police letterbox_font_size (CONFIG_DEFAULTS, 64 par défaut) au lieu de font_size ; si aucune position de la bande n'évite les visages, le moins recouvrant est pris et c'est journalisé comme aujourd'hui ; hors letterbox, comportement inchangé ; bande absente ou incohérente (hors [0,1], haut >= bas) = erreur explicite. Tests : bande letterbox -> positions toutes dans la bande, au plus bas ; visage retenu en bas de la bande -> texte remonté dans la bande ; taille de police letterbox ; format crop inchangé ; pipeline transmet la bande du panneau main ; toute la suite pytest reste verte.
+  SPEC-6127 : en format letterbox (plan de recadrage layout letterbox), pipeline passe à subtitles la zone text_zones.subtitles du plan ({x0,y0,x1,y1} en pixels de sortie, écrite par reframe) au lieu des zones de visages et d'accroche ; subtitles place alors chaque groupe de mots dans cette zone : centré horizontalement sur (x0+x1)/2, bloc de texte en haut de la zone, taille letterbox_font_size (CONFIG_DEFAULTS, 68 par défaut) ; chaque groupe est mesuré avec la vraie police (Pillow + clipper/assets/fonts/Poppins-ExtraBold.ttf, contour compris) : s'il est plus large que x1-x0 il est coupé en deux lignes, puis en groupes plus courts, puis la taille est réduite par paliers jusqu'à letterbox_min_font_size ; si un mot seul ne tient toujours pas, erreur explicite ; la hauteur du bloc (2 lignes au plus) doit tenir dans y1-y0, sinon erreur explicite ; jamais de texte hors de la zone, ni dans l'image vidéo ni dans la zone sûre TikTok ; hors letterbox, comportement inchangé ; zone absente ou incohérente = erreur explicite. Tests : groupes normaux dans la zone ; mot très long -> ligne coupée ou taille réduite, toujours dans la zone ; mot impossible -> erreur ; positions/tailles écrites dans le .ass vérifiées contre la zone ; format crop inchangé ; pipeline transmet la zone du plan ; toute la suite pytest reste verte.
 criteria_by: creator
 verify: [tests]
 method: tdd
 schema: 4
-version: 1
+version: 2
 ---
