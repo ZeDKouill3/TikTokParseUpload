@@ -5,7 +5,7 @@ slug: ank-viz-colonnes-et-sections-repliables-d-un-cli
 title: "ank-viz : colonnes et sections repliables d'un clic (accordéon)"
 created: 2026-09-28T20:00:43Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - tools/ank-viz/index.html
 blocked_by: []
@@ -14,6 +14,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/75bc3e017c06@6ebc9f4
+    tree: scope/f1e31585b7ac
+    criteria: 0aa922307bf7
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---
