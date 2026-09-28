@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 
@@ -100,8 +101,11 @@ def write_scenes(video_dir, scenes):
     )
 
 
-def single(face):
-    return {"layout": "single", "camera": None, "face": face, "reason": "r"}
+def single(face, ignore=None):
+    answer = {"layout": "single", "camera": None, "face": face, "reason": "r"}
+    if ignore is not None:
+        answer["ignore"] = list(ignore)
+    return answer
 
 
 def facecam(x, y, w, h):
@@ -703,6 +707,242 @@ def test_clip_layout_is_the_one_covering_most_of_the_clip(tmp_path, video_dir):
     data = load(out)
     assert [p["layout"] for p in data["plans"]] == ["facecam_gameplay", "single"]
     assert data["layout"] == "single"
+
+
+# --------------------------------------------------------------------------
+# Gros plans et causes de repli de l'essai reel sZi-qJ-5ptA (1920x1080,
+# 5 images/s). Detections mediapipe relevees image par image et rejouees :
+# les visages suivis tenaient dans 608 px mais pas avec la marge sur la zone
+# balayee (camera portee).
+# --------------------------------------------------------------------------
+
+# Clip 06, plan 2 : un seul visage, retenu, 430 a 490 px, camera qui bouge
+# (180 px en 0,6 s au debut) ; zone balayee + marge 0.15 jusqu'a 722 px.
+REAL_06_2 = [
+    [(353, 405, 779, 831)], [(360, 316, 819, 774)], [(402, 295, 884, 777)],
+    [(541, 313, 988, 760)], [(556, 304, 1009, 757)], [(535, 301, 993, 759)],
+    [(525, 301, 982, 758)], [(510, 306, 967, 763)], [(514, 327, 943, 756)],
+    [(475, 288, 912, 725), (720, 426, 1000, 706)], [(451, 305, 917, 771)],
+    [(468, 295, 917, 744), (720, 410, 981, 671)], [(493, 314, 949, 770)],
+    [(502, 315, 948, 761)], [(512, 337, 953, 778)], [(485, 310, 936, 761)],
+    [(481, 405, 916, 840)], [(465, 300, 931, 766)], [(467, 405, 901, 839)],
+    [(436, 308, 910, 781)], [(411, 291, 904, 784)], [(408, 302, 885, 779)],
+    [(410, 309, 899, 798)],
+]
+
+# Clip 00, plan 1, de 696,73 a 699,35 s : visage retenu de 480 a 550 px qui
+# traverse l'image (520 px en 2 s), zone balayee + marge jusqu'a 787 px ;
+# fausses detections a gauche sur les 3 dernieres images.
+REAL_00_1 = [
+    [(548, 86, 1032, 570)], [(543, 123, 1043, 623)], [(606, 132, 1095, 621)],
+    [(624, 133, 1147, 656)], [(722, 138, 1240, 656)], [(771, 127, 1317, 673)],
+    [(800, 83, 1332, 615)], [(837, 133, 1338, 634)], [(859, 141, 1362, 644)],
+    [(889, 120, 1397, 628)], [(985, 152, 1413, 580)],
+    [(1050, 120, 1493, 563), (176, 288, 469, 581)],
+    [(1074, 175, 1470, 571), (61, 405, 641, 985)],
+    [(1081, 172, 1441, 532), (320, 409, 635, 724)],
+]
+
+
+def replay(frames, start=10.0):
+    """Detections image par image, une image analysee toutes les 0,2 s a
+    partir de ``start`` (sample_fps = 5) ; renvoie aussi la fin du plan."""
+
+    def boxes(t):
+        return list(frames[round((t - start - 0.1) / 0.2)])
+
+    return boxes, start + 0.2 * len(frames)
+
+
+def analysed_times(start, end, fps=5.0):
+    count = int((end - start) * fps + 1e-9)
+    return [start + (k + 0.5) * (end - start) / count for k in range(count)]
+
+
+def rect_at(rs, t):
+    [r] = [r for r in rs if r["start"] <= t < r["end"]]
+    return r
+
+
+def assert_single_keeps_face_whole(plan, face_at, start, end):
+    """single, sans repli, et le visage suivi entier dans le cadre a chaque
+    image analysee."""
+    assert plan["layout"] == "single", plan["reason"]
+    assert plan["reason"] is None
+    rs = rects(plan)
+    assert_covers(rs, start, end)
+    for t in analysed_times(start, end):
+        box = face_at(t)
+        if box is not None:
+            r = rect_at(rs, t)
+            assert (r["w"], r["h"]) == (CROP_W, 1080)
+            assert contains(r, box), (t, r, box)
+
+
+# (1) Visage suivi retenu : marge reduite puis boite instantanee, jamais rogne.
+
+
+@pytest.mark.parametrize("frames", [REAL_06_2, REAL_00_1], ids=["06-2", "00-1"])
+def test_real_close_up_with_moving_camera_is_framed_single(tmp_path, video_dir, frames):
+    boxes, end = replay(frames)
+    out, _, _ = run(tmp_path, boxes, [single(None)], start=10.0, end=end)
+    [face] = [f for f in load(out)["plans"][0]["faces"] if f["retained"]]
+    out, _, _ = run(tmp_path, boxes, [single(face["id"])], start=10.0, end=end, force=True)
+    # Le visage suivi : la boite la plus haute de chaque image (les fausses
+    # detections sont dessous).
+    topmost = lambda t: min(boxes(t), key=lambda b: b[1])  # noqa: E731
+    assert_single_keeps_face_whole(load(out)["plans"][0], topmost, 10.0, end)
+
+
+def test_close_up_of_486_px_with_camera_moving_is_framed_single(tmp_path, video_dir):
+    # Clip 10, plan 3 : visage de 486 px ; la camera oscille de +-60 px, la
+    # zone balayee + marge 0.15 depasse le cadre de 608 px.
+    def face(t):
+        x = 777 + 60 * math.sin(math.pi * (t - 10.0))
+        return (x, 112, x + 486, 601)
+
+    out, _, _ = run(tmp_path, lambda t: [face(t)], [single(0)])
+    assert_single_keeps_face_whole(load(out)["plans"][0], face, 10.0, 14.0)
+
+
+def test_close_up_keeps_the_largest_margin_that_fits(tmp_path, video_dir):
+    # Visage immobile de 486 px : 632 px avec la marge 0.15, il tient avec
+    # une marge reduite, gardee aussi grande que possible (0.1).
+    face = (777, 112, 1263, 601)
+    out, _, _ = run(tmp_path, static(face), [single(0)])
+    plan = load(out)["plans"][0]
+    assert_single_keeps_face_whole(plan, lambda t: face, 10.0, 14.0)
+    [r] = rects(plan)
+    assert r["x"] <= 777 - 0.1 * 486 and r["x"] + r["w"] >= 1263 + 0.1 * 486
+
+
+def test_face_wider_than_the_frame_is_never_cropped(tmp_path, video_dir):
+    # 625 px pour un cadre de 608 : aucun palier ne le garde entier, repli
+    # (SPEC-350f : aucun visage coupe) ; la raison nomme le dernier palier.
+    out, _, _ = run(tmp_path, static((455, 300, 1080, 925)), [single(0)])
+    plan = load(out)["plans"][0]
+    assert plan["layout"] == "fallback_blur"
+    assert "dernier palier : boite instantanee" in plan["reason"]
+
+
+def test_other_retained_face_is_never_cut_by_a_degraded_frame(tmp_path, video_dir):
+    # Gros plan de 600 px (boite instantanee seulement) et un visage retenu
+    # juste a droite : le cadre garde le gros plan et laisse l'autre entier
+    # dehors, marge 0.15 comprise.
+    a, b = (500, 240, 1100, 840), (1130, 300, 1330, 500)
+    out, _, _ = run(tmp_path, static(a, b), [single(0)])
+    plan = load(out)["plans"][0]
+    assert plan["layout"] == "single", plan["reason"]
+    assert [f["retained"] for f in plan["faces"]] == [True, True]
+    for r in rects(plan):
+        assert contains(r, a)
+        assert not cuts(r, (1130 - 30, 300 - 30, 1330 + 30, 500 + 30))
+
+
+def test_two_retained_faces_inevitably_cut_fall_back_to_blur(tmp_path, video_dir):
+    # Gros plan de 600 px chevauche par un autre visage retenu : aucun
+    # palier ne cadre l'un sans couper l'autre, ni l'ecran partage.
+    a, b = (300, 200, 900, 800), (850, 250, 1600, 850)
+    out, _, _ = run(tmp_path, static(a, b), [single(0)])
+    plan = load(out)["plans"][0]
+    assert [f["retained"] for f in plan["faces"]] == [True, True]
+    assert plan["layout"] == "fallback_blur"
+    assert "dernier palier : boite instantanee" in plan["reason"]
+    assert "split impossible" in plan["reason"]
+
+
+# (2) Le LLM ne suit qu'un visage retenu.
+
+
+def test_prompt_says_which_faces_are_retained(tmp_path, video_dir):
+    face, tiny = (1100, 300, 1300, 500), (1500, 300, 1530, 330)
+    _, _, fake = run(tmp_path, static(face, tiny), [single(0)])
+    prompt = fake.calls[0].prompt
+    [line0] = [line for line in prompt.splitlines() if line.startswith("- #0 ")]
+    [line1] = [line for line in prompt.splitlines() if line.startswith("- #1 ")]
+    assert "non retenu" not in line0 and "retenu" in line0
+    assert "non retenu" in line1
+
+
+def test_llm_choosing_a_face_not_retained_is_a_schema_error(tmp_path, video_dir):
+    # #1 : visage de 30 px, non retenu ; le suivre est une reponse invalide.
+    face, tiny = (1100, 300, 1300, 500), (1500, 300, 1530, 330)
+    with pytest.raises(llm.SchemaError, match="#1"):
+        run(tmp_path, static(face, tiny), [single(1)])
+    assert not (video_dir / "reframe" / "01.json").exists()
+
+
+# (3) Faux positifs designes par le LLM (main, objet) : ni retenus ni proteges.
+
+
+def test_ignored_detection_no_longer_constrains_the_frame(tmp_path, video_dir):
+    # Une main retenue (#0) a gauche du visage (#1), a cheval sur le cadre
+    # centre sur lui : sans ignore, le cadre se decale pour la garder
+    # entiere ; avec ignore, il est centre sur le visage.
+    hand, face = (700, 600, 900, 800), (1000, 300, 1200, 500)
+    out, _, _ = run(tmp_path, static(hand, face), [single(1)])
+    [r] = rects(load(out)["plans"][0])
+    assert r["x"] != 796
+
+    out, _, _ = run(tmp_path, static(hand, face), [single(1, ignore=[0])], force=True)
+    plan = load(out)["plans"][0]
+    assert plan["layout"] == "single"
+    assert {f["id"]: f["retained"] for f in plan["faces"]} == {0: False, 1: True}
+    [r] = rects(plan)
+    assert (r["x"], r["w"]) == (796, CROP_W)
+
+
+def test_ignore_must_name_detected_faces_and_never_the_followed_one(tmp_path, video_dir):
+    face = (1100, 300, 1300, 500)
+    with pytest.raises(llm.SchemaError):
+        run(tmp_path, static(face), [single(0, ignore=[5])])
+    with pytest.raises(llm.SchemaError):
+        run(tmp_path, static(face), [single(0, ignore=[0])])
+
+
+# (4) Presence mesuree sur la duree de la piste.
+
+
+def test_face_entering_mid_plan_is_retained(tmp_path, video_dir):
+    # Visage vu de 12 a 14 s sur un plan de 10 a 14 s : moitie du plan, mais
+    # toute la duree de sa piste.
+    late = (500, 300, 700, 500)
+    out, _, _ = run(tmp_path, lambda t: [late] if t > 12.0 else [], [single(0)])
+    [face] = load(out)["plans"][0]["faces"]
+    assert face["retained"]
+
+
+# Splits trop courts et plans parasites.
+
+
+def test_split_shorter_than_split_min_seconds_falls_back_to_blur(tmp_path, video_dir):
+    a, b = (100, 300, 300, 500), (350, 250, 800, 700)
+    out, _, _ = run(tmp_path, static(a, b), [single(0)], start=10.0, end=11.0)
+    plan = load(out)["plans"][0]
+    assert [f["retained"] for f in plan["faces"]] == [True, True]
+    assert plan["layout"] == "fallback_blur"
+    assert "split_min_seconds" in plan["reason"]
+
+    # Configurable : 1 s suffit a un split si split_min_seconds le permet.
+    out, _, _ = run(tmp_path, static(a, b), [single(0)], start=10.0, end=11.0, force=True,
+                    split_min_seconds=1.0)
+    assert load(out)["plans"][0]["layout"] == "split"
+
+
+def test_plan_shorter_than_min_plan_seconds_is_merged_into_its_neighbour(tmp_path, video_dir):
+    write_scenes(video_dir, [(0.0, 12.0), (12.0, 12.08), (12.08, 30.0)])
+    out, _, fake = run(tmp_path, static((1100, 300, 1300, 500)), [single(0)] * 2, start=10.0, end=14.0)
+    data = load(out)
+    assert [(p["start"], p["end"]) for p in data["plans"]] == [(10.0, 12.08), (12.08, 14.0)]
+    assert [p["index"] for p in data["plans"]] == [0, 1]
+    assert len(fake.calls) == 2
+
+
+def test_clip_edge_sliver_is_merged_into_the_next_plan(tmp_path, video_dir):
+    write_scenes(video_dir, [(0.0, 10.1), (10.1, 30.0)])
+    out, _, fake = run(tmp_path, static((1100, 300, 1300, 500)), [single(0)], start=10.0, end=14.0)
+    assert [(p["start"], p["end"]) for p in load(out)["plans"]] == [(10.0, 14.0)]
+    assert len(fake.calls) == 1
 
 
 # --------------------------------------------------------------------------
