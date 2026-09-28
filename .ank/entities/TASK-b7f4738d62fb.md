@@ -5,7 +5,7 @@ slug: render-titre-d-cran-avec-emoji-en-couleur-au-des
 title: "render : titre d'écran avec emoji en couleur au-dessus de l'image, « Partie N » dessous (letterbox)"
 created: 2026-09-28T17:26:39Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/render.py
   - tests/test_render.py
@@ -16,6 +16,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/80cdb0adf901@3424603
+    tree: scope/b38a44129706
+    criteria: 833968b6b56e
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 3
+version: 7
 ---
