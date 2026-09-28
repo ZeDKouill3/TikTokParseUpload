@@ -1,5 +1,6 @@
 """Etape parts : decoupage de chaque moment retenu en clip unique ou en
-Part 1/2/.../N finissant chacune sur un suspense (SPEC-53f3, regle 3).
+Partie 1/2/.../N qui se suivent, chacune finissant sur un suspense et
+reprenant la fin de la precedente (SPEC-1557, regle 3).
 
 Entrees (workspace/<video_id>/) :
 - moments.json (moments) : ``moments[].id, start, end, format, parts,
@@ -13,18 +14,27 @@ Sortie : workspace/<video_id>/parts.json
      "moments": [{"id", "start", "end", "duration", "format",
                   "parts_total", "proposed_cuts",
                   "parts": [{"part", "start", "end", "duration",
-                             "hook_text", "suspense"}]}],
+                             "overlap", "hook_text", "suspense"}]}],
      "rejected": [{"id", "start", "end", "duration", "reason"}]}
 
 Decision, bornes de [durations] dans rubric.toml, ``tolerance`` comprise
 (la marge de recalage sur des frontieres de phrase) :
 - duree dans single_min..single_max : clip unique, sans appel au LLM ;
-- sinon N parties de part_min..part_max, N >= min_parts : clipper.llm
-  (usage ``parts``) choisit les N-1 coupes, la ou une partie finit sur un
-  suspense ; chaque coupe est recalee sur la fin de phrase la plus proche
-  qui laisse toutes les parties dans les bornes (une coupe en fin de phrase
-  n'est jamais dans un mot) ; la partie suivante commence a cette coupe,
-  donc les parties couvrent le moment sans trou ni chevauchement ;
+- sinon N parties de part_min..part_max, reprise comprise, N entre
+  min_parts et max_parts : clipper.llm (usage ``parts``) choisit les N-1
+  coupes, la ou une partie finit sur un suspense ; chaque coupe cut_k est
+  recalee sur la fin de phrase la plus proche qui laisse toutes les parties,
+  reprise comprise, dans les bornes (une coupe en fin de phrase n'est jamais
+  dans un mot) ;
+- la partie k+1 reprend avant cut_k (``resume_point``) : au debut de phrase
+  de [cut_k - part_overlap_max, cut_k - part_overlap_min] le plus proche de
+  cut_k - part_overlap_seconds ; a defaut, au debut de mot le plus proche
+  dans cette fenetre ; a defaut, au dernier debut de mot avant cut_k
+  (reprise courte) ; a defaut, au premier mot apres cut_k (reprise nulle,
+  journalisee). Jamais au milieu d'un mot ni sur un silence de tete. La
+  partie 1 commence au debut du moment, la derniere finit a sa fin ;
+  ``overlap`` donne les secondes reprises (0 pour la partie 1) et
+  ``hook_text`` le texte a partir du debut de la partie ;
 - aucun N possible, ou aucune suite de fins de phrase qui tienne les
   bornes : le moment va dans ``rejected`` avec la raison, jamais de
   decoupage de secours (ADR-ad2e).
@@ -36,6 +46,7 @@ ecrit.
 from __future__ import annotations
 
 import json
+import logging
 import math
 import tomllib
 from dataclasses import dataclass
@@ -44,13 +55,23 @@ from typing import Any
 
 from clipper import llm
 
+log = logging.getLogger(__name__)
+
 CONFIG_DEFAULTS: dict[str, object] = {
-    # Grille (SPEC-53f3) dont [durations] fixe les bornes, relative au
+    # Grille (SPEC-1557) dont [durations] fixe les bornes, relative au
     # dossier courant ; la meme que [moments] rubric_path.
     "rubric_path": "rubric.toml",
+    # Reprise (SPEC-1557, regle 3) : la partie k+1 recommence environ
+    # part_overlap_seconds s avant la fin de la partie k, de preference sur
+    # un debut de phrase situe entre part_overlap_min et part_overlap_max s
+    # avant la coupe.
+    "part_overlap_seconds": 3,
+    "part_overlap_min": 1,
+    "part_overlap_max": 8,
 }
 
-_DURATION_KEYS = ("single_min", "single_max", "part_min", "part_max", "min_parts", "tolerance")
+_DURATION_KEYS = ("single_min", "single_max", "part_min", "part_max", "min_parts", "max_parts", "tolerance")
+_OVERLAP_KEYS = ("part_overlap_seconds", "part_overlap_min", "part_overlap_max")
 _SENTENCE_END = (".", "!", "?", "…")
 # Un moment est arrondi au dixieme (floor/ceil) autour de ses phrases.
 _EDGE = 0.1
@@ -58,11 +79,11 @@ _EPS = 1e-6
 
 
 class PartsError(Exception):
-    """Entree manquante ou grille (rubric.toml) invalide."""
+    """Entree manquante, grille (rubric.toml) ou reglages invalides."""
 
 
 # --------------------------------------------------------------------------
-# Grille
+# Grille et reglages
 # --------------------------------------------------------------------------
 
 
@@ -86,7 +107,34 @@ def load_durations(path: str | Path) -> dict[str, float]:
             raise PartsError(f"{path} : [durations] {key} manquant ou invalide")
     if durations["part_min"] - durations["tolerance"] <= 0:
         raise PartsError(f"{path} : [durations] part_min doit depasser tolerance")
+    if durations["max_parts"] < durations["min_parts"]:
+        raise PartsError(f"{path} : [durations] max_parts doit valoir au moins min_parts")
     return {key: durations[key] for key in _DURATION_KEYS}
+
+
+@dataclass(frozen=True)
+class Overlap:
+    """Reprise d'une partie sur la precedente, en secondes."""
+
+    seconds: float
+    min: float
+    max: float
+
+
+def overlap_settings(settings: dict[str, Any], d: dict[str, float]) -> Overlap:
+    """Reglages part_overlap_* ; incoherents : PartsError qui les nomme."""
+    values = []
+    for key in _OVERLAP_KEYS:
+        value = settings[key]
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
+            raise PartsError(f"[parts] {key} doit etre un nombre >= 0, recu {value!r}")
+        values.append(float(value))
+    ov = Overlap(*values)
+    if not ov.min <= ov.seconds <= ov.max:
+        raise PartsError("[parts] il faut part_overlap_min <= part_overlap_seconds <= part_overlap_max")
+    if ov.seconds >= d["part_min"] - d["tolerance"]:
+        raise PartsError("[parts] part_overlap_seconds doit rester sous part_min - tolerance")
+    return ov
 
 
 # --------------------------------------------------------------------------
@@ -95,10 +143,21 @@ def load_durations(path: str | Path) -> dict[str, float]:
 
 
 @dataclass(frozen=True)
-class Sentence:
+class Word:
     start: float
     end: float
     text: str
+
+
+@dataclass(frozen=True)
+class Sentence:
+    """Une phrase et ses mots horodates (transcript.json) ; un segment sans
+    mots horodates en a un seul, qui le couvre."""
+
+    start: float
+    end: float
+    text: str
+    words: tuple[Word, ...]
 
 
 def _ends_sentence(word: str) -> bool:
@@ -113,13 +172,15 @@ def split_sentences(transcript: dict[str, Any]) -> list[Sentence]:
     def flush(words: list[dict[str, Any]]) -> None:
         text = "".join(w["word"] for w in words).strip()
         if text:
-            out.append(Sentence(words[0]["start"], words[-1]["end"], text))
+            timed = tuple(Word(w["start"], w["end"], w["word"]) for w in words)
+            out.append(Sentence(words[0]["start"], words[-1]["end"], text, timed))
 
     for seg in transcript.get("segments", []):
         words = seg.get("words") or []
         if not words:
-            if seg.get("text", "").strip():
-                out.append(Sentence(seg["start"], seg["end"], seg["text"].strip()))
+            text = seg.get("text", "").strip()
+            if text:
+                out.append(Sentence(seg["start"], seg["end"], text, (Word(seg["start"], seg["end"], text),)))
             continue
         current: list[dict[str, Any]] = []
         for word in words:
@@ -141,21 +202,84 @@ def _inside(sents: list[Sentence], start: float, end: float) -> list[Sentence]:
 # --------------------------------------------------------------------------
 
 
-def part_count_range(duration: float, d: dict[str, float]) -> tuple[int, int]:
-    """Nombres de parties (min, max) qui peuvent tenir ``duration`` ;
+def part_count_range(duration: float, d: dict[str, float], overlap: float = 0.0) -> tuple[int, int]:
+    """Nombres de parties (min, max) qui peuvent tenir ``duration`` quand
+    chaque partie reprend ``overlap`` s de la precedente : N parties durent
+    ensemble duration + (N - 1) x overlap ; bornes min_parts..max_parts ;
     min > max si aucun."""
     low, high = d["part_min"] - d["tolerance"], d["part_max"] + d["tolerance"]
-    return max(int(d["min_parts"]), math.ceil(duration / high - _EPS)), math.floor(duration / low + _EPS)
+    span = duration - overlap
+    return (
+        max(int(d["min_parts"]), math.ceil(span / (high - overlap) - _EPS)),
+        min(int(d["max_parts"]), math.floor(span / (low - overlap) + _EPS)),
+    )
+
+
+@dataclass(frozen=True)
+class Resume:
+    """Debut de la partie qui suit une coupe ; ``how`` : phrase, mot,
+    courte ou nulle (le repli qui l'a donne)."""
+
+    start: float
+    overlap: float
+    hook_text: str
+    how: str
+
+
+def resume_point(cut: float, sents: list[Sentence], lower: float, upper: float, ov: Overlap) -> Resume | None:
+    """Ou commence la partie qui suit une coupe en ``cut`` (fin de phrase),
+    parmi les mots qui commencent dans ]lower, upper[ :
+    1. le debut de phrase de [cut - ov.max, cut - ov.min] le plus proche de
+       cut - ov.seconds ;
+    2. sinon le debut de mot le plus proche de cut - ov.seconds dans cette
+       fenetre ;
+    3. sinon le dernier debut de mot de ]cut - ov.min, cut[ (reprise courte) ;
+    4. sinon le premier mot apres cut (reprise nulle).
+    None s'il n'y a aucun mot apres la coupe."""
+    target, lo, hi = cut - ov.seconds, cut - ov.max, cut - ov.min
+    # (debut du mot, phrase, rang du mot dans la phrase)
+    words = [(w.start, s, i) for s in sents for i, w in enumerate(s.words) if lower + _EPS < w.start < upper - _EPS]
+
+    def resume(point: tuple[float, Sentence, int], how: str) -> Resume:
+        start, sent, i = point
+        hook = "".join(w.text for w in sent.words[i:]).strip()
+        return Resume(start, max(0.0, round(cut - start, 2)), hook, how)
+
+    def closest(points: list[tuple[float, Sentence, int]]) -> tuple[float, Sentence, int] | None:
+        return min(points, key=lambda p: (abs(p[0] - target), -p[0]), default=None)
+
+    in_window = [p for p in words if lo - _EPS <= p[0] <= hi + _EPS]
+    best = closest([p for p in in_window if p[2] == 0])
+    if best is not None:
+        return resume(best, "phrase")
+    best = closest(in_window)
+    if best is not None:
+        return resume(best, "mot")
+    short = [p for p in words if hi + _EPS < p[0] < cut - _EPS]
+    if short:
+        return resume(max(short, key=lambda p: p[0]), "courte")
+    after = [p for p in words if p[0] >= cut - _EPS]
+    if after:
+        return resume(min(after, key=lambda p: p[0]), "nulle")
+    return None
 
 
 def snap_cuts(
-    start: float, end: float, candidates: list[float], proposed: list[float], low: float, high: float
+    start: float,
+    end: float,
+    candidates: list[float],
+    resumes: list[float | None],
+    proposed: list[float],
+    low: float,
+    high: float,
 ) -> list[float] | None:
     """Choisit len(proposed) coupes parmi ``candidates`` (fins de phrase,
     croissantes) telles que chaque partie dure entre ``low`` et ``high``, au
-    plus pres des coupes proposees (somme des ecarts minimale) ; None si
-    aucune suite ne tient les bornes."""
-    fits = lambda a, b: low - _EPS <= b - a <= high + _EPS  # noqa: E731
+    plus pres des coupes proposees (somme des ecarts minimale) ; la partie
+    qui suit la coupe candidates[i] commence en resumes[i], reprise comprise
+    (None : pas de suite possible). None si aucune suite ne tient les
+    bornes."""
+    fits = lambda a, b: a is not None and low - _EPS <= b - a <= high + _EPS  # noqa: E731
     m = len(candidates)
     # cost[i], prev[j][i] : meilleure suite dont la j-ieme coupe est candidates[i].
     cost = [abs(c - proposed[0]) if fits(start, c) else math.inf for c in candidates]
@@ -164,13 +288,13 @@ def snap_cuts(
         new, back = [math.inf] * m, [-1] * m
         for i, c in enumerate(candidates):
             for k in range(i):
-                if cost[k] < new[i] and fits(candidates[k], c):
+                if cost[k] < new[i] and fits(resumes[k], c):
                     new[i], back[i] = cost[k], k
             new[i] += abs(c - p)
         cost = new
         prev.append(back)
     best = min(
-        (i for i in range(m) if cost[i] < math.inf and fits(candidates[i], end)),
+        (i for i in range(m) if cost[i] < math.inf and fits(resumes[i], end)),
         key=lambda i: (cost[i], i),
         default=None,
     )
@@ -218,7 +342,9 @@ def _fmt(x: float) -> str:
     return f"{x:.2f}".rstrip("0").rstrip(".")
 
 
-def _prompt(moment: dict[str, Any], sents: list[Sentence], d: dict[str, float], n_range: tuple[int, int]) -> str:
+def _prompt(
+    moment: dict[str, Any], sents: list[Sentence], d: dict[str, float], n_range: tuple[int, int], ov: Overlap
+) -> str:
     lines = "\n".join(f"[{_fmt(s.start)}-{_fmt(s.end)}] {s.text}" for s in sents)
     hint = ""
     if moment.get("parts"):
@@ -227,16 +353,18 @@ def _prompt(moment: dict[str, Any], sents: list[Sentence], d: dict[str, float], 
     n_text = f"{n_range[0]}" if n_range[0] == n_range[1] else f"{n_range[0]} a {n_range[1]}"
     return (
         "Tu decoupes un moment d'une video longue en plusieurs parties pour TikTok "
-        "(Part 1, Part 2, ...), publiees separement.\n\n"
+        "(Partie 1, Partie 2, ...), publiees separement. Les parties se suivent : chaque partie "
+        f"reprend environ {_fmt(ov.seconds)} s de la precedente (la Partie N recommence sur la fin de "
+        "la Partie N-1, de preference sur sa derniere phrase, pour raccrocher le spectateur).\n\n"
         "## Regles\n"
-        f"1. {n_text} parties, chacune de {_fmt(d['part_min'])} a {_fmt(d['part_max'])} s : "
+        f"1. {n_text} parties, chacune de {_fmt(d['part_min'])} a {_fmt(d['part_max'])} s reprise comprise : "
         f"renvoie {n_range[0] - 1 if n_range[0] == n_range[1] else f'{n_range[0] - 1} a {n_range[1] - 1}'} coupe(s).\n"
         "2. Une coupe est la fin d'une ligne de la transcription : reprends son timecode de fin tel quel.\n"
         "3. Chaque partie sauf la derniere finit sur un suspense : question laissee ouverte, revelation "
         "imminente, conflit au sommet, phrase qui appelle la suite. Jamais au milieu d'une explication "
         "qui retombe, jamais apres la chute.\n"
-        "4. La partie suivante repart sur une accroche : sa premiere ligne doit donner envie sans avoir "
-        "vu la partie precedente.\n"
+        "4. La partie suivante repart sur une accroche : ses premieres lignes, reprise comprise, doivent "
+        "donner envie sans avoir vu la partie precedente.\n"
         "5. La derniere partie garde la chute du moment.\n\n"
         "## Moment\n"
         f"De {_fmt(moment['start'])} a {_fmt(moment['end'])} s ({_fmt(moment['end'] - moment['start'])} s).\n"
@@ -248,20 +376,20 @@ def _prompt(moment: dict[str, Any], sents: list[Sentence], d: dict[str, float], 
     )
 
 
-def _part(n: int, start: float, end: float, sents: list[Sentence], suspense: str | None) -> dict[str, Any]:
-    first = next(s for s in sents if s.start >= start - _EDGE - _EPS)
+def _part(n: int, start: float, end: float, overlap: float, hook_text: str, suspense: str | None) -> dict[str, Any]:
     return {
         "part": n,
         "start": start,
         "end": end,
         "duration": round(end - start, 2),
-        "hook_text": first.text,
+        "overlap": overlap,
+        "hook_text": hook_text,
         "suspense": suspense,
     }
 
 
 def _split(
-    moment: dict[str, Any], sents: list[Sentence], d: dict[str, float], config: Any
+    moment: dict[str, Any], sents: list[Sentence], d: dict[str, float], ov: Overlap, config: Any
 ) -> tuple[dict[str, Any] | None, str | None]:
     """(decoupage, None) ou (None, raison du rejet)."""
     start, end = moment["start"], moment["end"]
@@ -274,31 +402,48 @@ def _split(
 
     if d["single_min"] - tol - _EPS <= duration <= d["single_max"] + tol + _EPS:
         return {**record, "format": "single", "parts_total": 1, "proposed_cuts": [],
-                "parts": [_part(1, start, end, inside, None)]}, None
+                "parts": [_part(1, start, end, 0, inside[0].text, None)]}, None
 
-    n_range = part_count_range(duration, d)
+    n_range = part_count_range(duration, d, ov.seconds)
     if n_range[0] > n_range[1]:
         return None, (
             f"duree {duration:.1f} s : ni clip unique ({_fmt(d['single_min'])}-{_fmt(d['single_max'])} s) "
-            f"ni {int(d['min_parts'])}+ parties de {_fmt(d['part_min'])}-{_fmt(d['part_max'])} s "
-            f"(tolerance {_fmt(tol)} s)"
+            f"ni {int(d['min_parts'])} a {int(d['max_parts'])} parties de "
+            f"{_fmt(d['part_min'])}-{_fmt(d['part_max'])} s (tolerance {_fmt(tol)} s, "
+            f"reprise de {_fmt(ov.seconds)} s comprise)"
         )
 
-    answer = llm.ask("parts", _prompt(moment, inside, d, n_range), [], response_schema(start, end, n_range),
+    answer = llm.ask("parts", _prompt(moment, inside, d, n_range, ov), [], response_schema(start, end, n_range),
                      config=config)
     proposals = sorted(answer["cuts"], key=lambda c: c["at"])
     candidates = [s.end for s in inside[:-1] if start + _EPS < s.end < end - _EPS]
+    resumes = [resume_point(c, inside, start, end, ov) for c in candidates]
     cut_times = snap_cuts(
-        start, end, candidates, [c["at"] for c in proposals], d["part_min"] - tol, d["part_max"] + tol
+        start, end, candidates, [r.start if r else None for r in resumes],
+        [c["at"] for c in proposals], d["part_min"] - tol, d["part_max"] + tol,
     )
     if cut_times is None:
         return None, (
             f"aucune suite de fins de phrase ne donne {len(proposals) + 1} parties de "
-            f"{_fmt(d['part_min'])}-{_fmt(d['part_max'])} s (tolerance {_fmt(tol)} s)"
+            f"{_fmt(d['part_min'])}-{_fmt(d['part_max'])} s (tolerance {_fmt(tol)} s, reprise comprise)"
         )
-    edges = [start, *cut_times, end]
+    resume_at = dict(zip(candidates, resumes))
+    heads = [(start, 0, inside[0].text)]
+    for n, cut in enumerate(cut_times, 2):
+        r = resume_at[cut]
+        if r.how == "nulle":
+            log.warning(
+                "moment %s : partie %d en reprise nulle, aucun debut de mot dans les %s s avant la coupe %s ; "
+                "elle commence au premier mot apres, en %s",
+                moment["id"], n, _fmt(ov.max), _fmt(cut), _fmt(r.start),
+            )
+        heads.append((r.start, r.overlap, r.hook_text))
+    ends = [*cut_times, end]
     suspense = [c["suspense"] for c in proposals] + [None]
-    parts = [_part(n, a, b, inside, suspense[n - 1]) for n, (a, b) in enumerate(zip(edges, edges[1:]), 1)]
+    parts = [
+        _part(n, a, b, overlap, hook, suspense[n - 1])
+        for n, ((a, overlap, hook), b) in enumerate(zip(heads, ends), 1)
+    ]
     return {**record, "format": "multipart", "parts_total": len(parts),
             "proposed_cuts": [c["at"] for c in proposals], "parts": parts}, None
 
@@ -342,12 +487,13 @@ def run(
     settings = _settings(config)
     rubric_path = Path(settings["rubric_path"])
     durations = load_durations(rubric_path)
+    overlap = overlap_settings(settings, durations)
     sents = split_sentences(transcript)
 
     kept: list[dict[str, Any]] = []
     rejected: list[dict[str, Any]] = []
     for moment in moments["moments"]:
-        split, reason = _split(moment, sents, durations, config)
+        split, reason = _split(moment, sents, durations, overlap, config)
         if split is None:
             rejected.append({"id": moment["id"], "start": moment["start"], "end": moment["end"],
                              "duration": round(moment["end"] - moment["start"], 2), "reason": reason})
