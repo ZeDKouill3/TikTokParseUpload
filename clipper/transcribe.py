@@ -12,10 +12,10 @@ transcript_raw.json, garde avant la correction)
 
 Deroulement :
 1. usage ``vocab`` : noms propres tires du titre et de la description,
-   passes a whisper en initial_prompt et hotwords (avant de charger le
-   modele : jamais un LLM local et whisper en meme temps, ADR-fb9b),
-   raccourcis a ``vocab_max_tokens`` tokens pour tenir dans la fenetre du
-   decodeur (journalise ; transcript.json et la correction gardent tout) ;
+   passes a whisper en initial_prompt (avant de charger le modele : jamais
+   un LLM local et whisper en meme temps, ADR-fb9b), raccourcis a
+   ``vocab_max_tokens`` tokens pour tenir dans la fenetre du decodeur
+   (journalise ; transcript.json et la correction gardent tout) ;
 2. extraction de l'audio (ffmpeg, wav 16 kHz mono), transcription, puis
    liberation du modele ; le resultat brut est ecrit dans
    transcript_raw.json avant la correction ;
@@ -59,12 +59,12 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "vad_filter": True,
     # Vocabulaire de noms propres demande a clipper.llm (usage vocab).
     "vocab": True,
-    # Tokens maximum du vocabulaire passe a whisper (initial_prompt et
-    # hotwords) : au-dela, les dernieres entrees sont ecartees et c'est
-    # journalise. Le decodeur a 448 positions, que faster-whisper remplit
-    # avec 1 + hotwords + 223 tokens de contexte + 4 speciaux : la borne est
-    # refusee au-dela de _VOCAB_TOKENS_CEILING (100 positions laissees a la
-    # transcription de chaque fenetre).
+    # Tokens maximum du vocabulaire passe a whisper en initial_prompt :
+    # au-dela, les dernieres entrees sont ecartees et c'est journalise. Le
+    # decodeur a 448 positions, que faster-whisper remplit avec 1 (sot_prev)
+    # + 223 tokens de contexte (initial_prompt) + tokens speciaux : la borne
+    # est refusee au-dela de _VOCAB_TOKENS_CEILING (100 positions laissees a
+    # la transcription de chaque fenetre).
     "vocab_max_tokens": 100,
     # Correction des mots par clipper.llm (usage transcript_fix).
     "transcript_fix": True,
@@ -79,10 +79,11 @@ CONFIG_DEFAULTS: dict[str, object] = {
 log = logging.getLogger(__name__)
 
 # Fenetre du decodeur Whisper et prompt construit par faster-whisper
-# (WhisperModel.get_prompt, 1.2.1) : [sot_prev] + hotwords (tronques a 223) +
-# texte precedent (initial_prompt puis transcription deja faite, 223 derniers
-# tokens) + sot, langue, tache (+ no_timestamps). Sans borne, un vocabulaire
-# long donne 1 + 223 + 223 + 3 = 450 > 448 (TASK-b20f).
+# (WhisperModel.get_prompt, 1.2.1) : [sot_prev] + texte precedent
+# (initial_prompt puis transcription deja faite, 223 derniers tokens) +
+# sot, langue, tache (+ no_timestamps). TASK-b20f (avant le retrait de
+# hotwords, TASK-913b) : sans borne, un vocabulaire long donnait 1 + 223
+# (hotwords) + 223 (initial_prompt) + 3 = 450 > 448.
 _WHISPER_POSITIONS = 448
 _WHISPER_CONTEXT_TOKENS = _WHISPER_POSITIONS // 2 - 1
 _WHISPER_SPECIAL_TOKENS = 5
@@ -208,11 +209,11 @@ def _check_vocab_max_tokens(settings: dict[str, Any]) -> None:
 
 def _whisper_vocab(model: Any, vocab: list[str], max_tokens: int) -> list[str]:
     """Plus longue tete du vocabulaire (entrees entieres, dans l'ordre) dont
-    initial_prompt et hotwords tiennent chacun dans ``max_tokens`` tokens du
-    tokenizer du modele, comptes comme faster-whisper les encode. Un modele
-    sans ``hf_tokenizer`` (WhisperModel en a toujours un) est borne par le
-    nombre d'octets UTF-8, qui majore les tokens d'un BPE sur octets ; c'est
-    journalise. Les entrees ecartees sont journalisees (ADR-ad2e)."""
+    initial_prompt tient dans ``max_tokens`` tokens du tokenizer du modele,
+    comptes comme faster-whisper les encode. Un modele sans ``hf_tokenizer``
+    (WhisperModel en a toujours un) est borne par le nombre d'octets UTF-8,
+    qui majore les tokens d'un BPE sur octets ; c'est journalise. Les
+    entrees ecartees sont journalisees (ADR-ad2e)."""
     hf_tokenizer = getattr(model, "hf_tokenizer", None)
 
     def tokens(text: str) -> int:
@@ -226,7 +227,7 @@ def _whisper_vocab(model: Any, vocab: list[str], max_tokens: int) -> list[str]:
         )
 
     kept = len(vocab)
-    while kept and max(tokens(", ".join(vocab[:kept])), tokens(" ".join(vocab[:kept]))) > max_tokens:
+    while kept and tokens(", ".join(vocab[:kept])) > max_tokens:
         kept -= 1
     if kept < len(vocab):
         log.warning(
@@ -257,7 +258,6 @@ def _run_whisper(
         prompt_vocab = _whisper_vocab(model, vocab, int(settings["vocab_max_tokens"]))
         if prompt_vocab:
             options["initial_prompt"] = ", ".join(prompt_vocab)
-            options["hotwords"] = " ".join(prompt_vocab)
         raw_segments, info = model.transcribe(str(audio_path), **options)
         segments = [_segment_dict(seg) for seg in raw_segments]
         header = {
