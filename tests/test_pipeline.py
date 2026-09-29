@@ -418,6 +418,64 @@ def test_review_rejected_moment_is_never_rendered(tmp_path, isolated_cwd, source
     assert fake.calls == []
 
 
+@no_ffmpeg
+def test_zero_kept_moments_ends_done_with_an_explicit_reason(tmp_path, isolated_cwd, source_video, capsys):
+    """TASK-b2c1 : moments ne retient aucun candidat (score < min_score) ->
+    le pipeline va jusqu'au bout (0 clip, rien a rendre) et l'etat dit
+    pourquoi (ADR-ad2e), pas juste status=done sans explication."""
+    from clipper import pipeline
+
+    config = make_config(tmp_path, mode="review")
+    opts = step_options(source_video)
+
+    def low_score_moment(request):
+        scores = {k: 1 for k in ("hook", "standalone", "payoff", "emotion", "value", "trend")}
+        return {"moments": [{"hook_text": "GTA six arrive vraiment.", "start": MOMENT["start"],
+                             "end": MOMENT["end"], "format": "single", "part_breaks": [],
+                             "justification": "Faible", "scores": scores}]}
+
+    with llm.use_backend(backend(("moments", low_score_moment))):
+        state = pipeline.run(URL, config=config, step_options=opts)
+    assert state["status"] == "awaiting_review"
+    assert state["awaiting"] == []  # aucun moment retenu : rien a decider
+
+    with llm.use_backend(backend()):
+        state = pipeline.render(VIDEO_ID, config=config, step_options=opts)
+
+    assert state["status"] == "done"
+    assert state["clips"] == []
+    assert clip_files(tmp_path) == ([], [])
+
+    moments_data = json.loads((tmp_path / "workspace" / VIDEO_ID / "moments.json").read_text(encoding="utf-8"))
+    scored = [m for m in moments_data["rejected"] if "final_score" in m]
+    assert len(scored) == 1
+    min_score = moments_data["rubric"]["min_score"]
+    best = max(m["final_score"] for m in scored)
+    assert min_score == 60
+    assert best < min_score
+
+    reason = state["reason"]
+    assert reason is not None
+    assert str(len(scored)) in reason
+    assert str(best) in reason
+    assert str(min_score) in reason
+    assert "0 clip" in reason
+    assert pipeline.load_state(VIDEO_ID, config=config)["reason"] == reason
+
+    from clipper.__main__ import main
+
+    (isolated_cwd / "config.toml").write_text(
+        f'workspace_dir = "{(tmp_path / "workspace").as_posix()}"\n'
+        f'output_dir = "{(tmp_path / "output").as_posix()}"\n'
+        f'mode = "review"\n',
+        encoding="utf-8",
+    )
+    capsys.readouterr()
+    assert main(["status", VIDEO_ID]) == 0
+    cli_state = json.loads(capsys.readouterr().out)
+    assert cli_state["reason"] == reason
+
+
 def test_decide_refuses_an_unknown_moment_or_decision(tmp_path, isolated_cwd):
     from clipper import pipeline
 
