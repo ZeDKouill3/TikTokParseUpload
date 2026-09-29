@@ -1246,7 +1246,9 @@ def test_stable_facecam_on_90_percent_of_keyframes_gives_a_fixed_rectangle(tmp_p
     assert len(factory.built) == 1
     assert isinstance(factory.built[0][1], Device)
     assert factory.detectors[0].closed
-    assert factory.detectors[0].frames == 20
+    # 5 appels par image cle : l'image entiere puis les 4 coins agrandis
+    # (TASK-c7e682a88189, petites facecams).
+    assert factory.detectors[0].frames == 20 * 5
 
 
 def test_facecam_on_50_percent_of_keyframes_is_a_motivated_absence(tmp_path, video_dir):
@@ -1282,6 +1284,86 @@ def test_stable_face_whose_zone_exceeds_a_quarter_of_the_image_is_not_a_facecam(
     data = load(detect(tmp_path)[0])
     assert data["facecam"] is None
     assert "quart" in data["reason"]
+
+
+# --------------------------------------------------------------------------
+# Petites facecams en coin (TASK-c7e682a88189) : trop reduites dans l'image
+# entiere, vues dans une vignette de coin agrandie (coordonnees ramenees a
+# l'image source).
+# --------------------------------------------------------------------------
+
+
+class RelativeSizeFaceDetector:
+    """Detecteur factice : un rectangle blanc n'est vu que s'il occupe au
+    moins ``min_ratio`` de la largeur de l'image recue -- simule un visage
+    trop petit pour etre vu dans l'image entiere, mais assez grand une fois
+    une vignette de coin agrandie."""
+
+    def __init__(self, min_ratio):
+        self.min_ratio = min_ratio
+        self.closed = False
+        self.frames = 0
+
+    def detect(self, frame):
+        assert not self.closed, "detecteur utilise apres close()"
+        self.frames += 1
+        h, w = frame.shape[:2]
+        x, y, bw, bh = cv2.boundingRect((frame[:, :, 0] > 128).astype(np.uint8))
+        if not bw or not bh or bw < self.min_ratio * w:
+            return []
+        return [(float(x), float(y), float(x + bw), float(y + bh), 0.9)]
+
+    def close(self):
+        self.closed = True
+
+
+class RelativeSizeDetectorFactory:
+    def __init__(self, min_ratio):
+        self.min_ratio = min_ratio
+        self.built: list[tuple[dict, Device]] = []
+        self.detectors: list[RelativeSizeFaceDetector] = []
+
+    def __call__(self, settings, device):
+        self.built.append((settings, device))
+        detector = RelativeSizeFaceDetector(self.min_ratio)
+        self.detectors.append(detector)
+        return detector
+
+
+def test_small_facecam_only_visible_in_an_enlarged_corner_vignette_gives_a_top_right_facecam(tmp_path, video_dir):
+    # Visage 160x160 en haut a droite d'une image 1920x1080 (8,3 % de la
+    # largeur) : sous le seuil du detecteur factice sur l'image entiere, mais
+    # au-dessus une fois la vignette de coin (facecam_corner_size = 30 %)
+    # agrandie (facecam_corner_zoom = 2).
+    small_face = (1700, 60, 1860, 220)
+    write_keyframes(video_dir, pattern(20, 20, box=small_face))
+    factory = RelativeSizeDetectorFactory(min_ratio=0.12)
+
+    path, factory = detect(tmp_path, factory=factory)
+
+    data = load(path)
+    assert data["reason"] is None
+    rect = data["facecam"]
+    assert rect is not None
+    assert rect["x"] > W / 2  # en haut a droite de l'image source
+    assert rect["y"] < H / 2
+    assert contains(rect, small_face)
+    assert factory.detectors[0].closed
+
+
+def test_face_too_small_even_in_corner_vignettes_keeps_the_reason(tmp_path, video_dir):
+    # Meme visage, mais un detecteur si exigeant qu'il ne le voit ni dans
+    # l'image entiere ni dans une vignette de coin agrandie : la raison
+    # d'absence reste celle d'avant (aucun repli silencieux, ADR-ad2e).
+    small_face = (1700, 60, 1860, 220)
+    write_keyframes(video_dir, pattern(20, 20, box=small_face))
+    factory = RelativeSizeDetectorFactory(min_ratio=0.95)
+
+    path, factory = detect(tmp_path, factory=factory)
+
+    data = load(path)
+    assert data["facecam"] is None
+    assert "aucun visage detecte" in data["reason"]
 
 
 def test_facecam_detection_is_cached_per_video(tmp_path, video_dir):
