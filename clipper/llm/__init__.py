@@ -243,6 +243,7 @@ def ask(
     check: Callable[[Any], None] | None = None,
     log_path: Path | None = None,
     usage_log_path: Path | None = None,
+    cache_prefix: str | None = None,
 ) -> Any:
     """Ask the model configured for ``usage`` and return its JSON answer,
     validated against ``schema`` then by ``check`` (which raises SchemaError
@@ -258,13 +259,18 @@ def ask(
     over every backend call this ask() made, including repairs ; null for a
     field no call reported), duration_s (wall time summed over those calls).
     Without ``usage_log_path``, the default set by an enclosing ``usage_log()``
-    block (if any) is used instead; with neither, nothing is written."""
+    block (if any) is used instead; with neither, nothing is written.
+    ``cache_prefix``, when given, must be a prefix of ``prompt`` (else
+    LLMError, ADR-ad2e) shared with other calls: forwarded to the backend as
+    LLMRequest.cache_prefix, for it to mark as its own cacheable block."""
     effective_usage_log_path = usage_log_path if usage_log_path is not None else _usage_log_path
     settings = _settings(config)
     name, model, backend_settings = _resolve(usage, settings)
     attempts = int(settings["repair_attempts"])
     if attempts < 0:
         raise LLMError(f"[llm] repair_attempts doit etre >= 0, recu {attempts}")
+    if cache_prefix is not None and not prompt.startswith(cache_prefix):
+        raise LLMError("cache_prefix n'est pas un prefixe de prompt")
     backend = _override if _override is not None else _BACKENDS[name][1](backend_settings)
     request = LLMRequest(
         usage=usage,
@@ -272,6 +278,7 @@ def ask(
         prompt=_with_schema_instruction(prompt, schema),
         images=[Path(p) for p in images],
         schema=schema,
+        cache_prefix=cache_prefix,
     )
     totals: dict[str, float | int | None] = dict.fromkeys(_USAGE_FIELDS)
     duration_total = 0.0
