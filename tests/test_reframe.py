@@ -1287,6 +1287,94 @@ def test_stable_face_whose_zone_exceeds_a_quarter_of_the_image_is_not_a_facecam(
 
 
 # --------------------------------------------------------------------------
+# Bords reels de l'incrustation (TASK-6404) : le rectangle facecam est cale
+# sur le cadre reel de l'incrustation (bords nets, constants sur la plupart
+# des images cles) autour du visage stable, pas sur le seul visage.
+# --------------------------------------------------------------------------
+
+# Incrustation typique (SMYVmdpRMow) : panneau ~526x296 en haut a gauche
+# d'un 1920x1080, visage d'environ 130x150 dedans avec une bonne marge.
+PANEL = (100, 30, 626, 326)
+
+
+def write_panel_keyframes(
+    video_dir, panel, faces, *, panel_color=90, scenes=((0.0, 100.0),), width=W, height=H, seed=0
+):
+    """Images cles synthetiques : panneau ``panel`` (x0, y0, x1, y1) gris fixe
+    (incrustation, bords nets et constants) contenant un visage blanc plus
+    petit et legerement mobile (voir ``pattern``), sur un fond BRUITE qui
+    varie a chaque image cle (mais reproductible, ``seed``) -- verifie que
+    les bords de l'incrustation sont trouves parce qu'ils sont constants
+    d'une image a l'autre, pas parce que le fond serait simplement uniforme.
+    ``panel_color`` reste sous le seuil (128) du detecteur factice : seul le
+    visage blanc est detecte comme visage."""
+    rng = np.random.default_rng(seed)
+    frames_dir = video_dir / "frames"
+    frames_dir.mkdir(exist_ok=True)
+    px0, py0, px1, py1 = panel
+    frames = []
+    for k, (t, box) in enumerate(faces):
+        image = rng.integers(0, 40, size=(height, width, 3), dtype=np.uint8)
+        image[py0:py1, px0:px1] = panel_color
+        if box is not None:
+            x0, y0, x1, y1 = box
+            image[y0:y1, x0:x1] = 255
+        name = f"scene0000_{k:03d}.bmp"
+        (frames_dir / name).write_bytes(cv2.imencode(".bmp", image)[1].tobytes())
+        frames.append({"path": f"frames/{name}", "timecode": t, "scene": 0})
+    (video_dir / "scenes.json").write_text(
+        json.dumps({"scenes": [{"start": s, "end": e} for s, e in scenes], "frames": frames}),
+        encoding="utf-8",
+    )
+
+
+def test_incrustation_edges_used_when_present_cover_the_panel(tmp_path, video_dir):
+    write_panel_keyframes(video_dir, PANEL, pattern(20, 20))
+    data = load(detect(tmp_path)[0])
+
+    assert data["reason"] is None
+    assert data["edge_reason"] is None  # bords trouves, pas de repli
+    rect = data["facecam"]
+    px0, py0, px1, py1 = PANEL
+    # couvre l'incrustation entiere, a quelques px pres
+    assert contains(rect, PANEL, eps=3)
+    # largeur (axe non etire par la mise au format du panneau camera) calee
+    # sur les bords reels du panneau, pas sur une valeur bien plus grande
+    assert abs(rect["x"] - px0) <= 3
+    assert abs((rect["x"] + rect["w"]) - px1) <= 3
+    assert rect["w"] / rect["h"] == pytest.approx(1080 / 768, rel=0.02)
+
+
+def test_incrustation_edges_missing_falls_back_to_face_rect_with_logged_reason(tmp_path, video_dir, caplog):
+    # meme fixture que les tests de facecam "simples" : aucune incrustation
+    # dessinee autour du visage, donc aucun bord net a trouver.
+    write_keyframes(video_dir, pattern(20, 18))
+    with caplog.at_level("INFO", logger="clipper.reframe"):
+        data = load(detect(tmp_path)[0])
+
+    assert data["reason"] is None  # le facecam existe quand meme (repli)
+    assert data["edge_reason"]  # mais la raison du repli est journalisee
+    assert data["edge_reason"] in caplog.text
+    rect = data["facecam"]
+    # repli identique a l'ancien calcul : rectangle centre sur le visage,
+    # au format du panneau camera, visage entier dedans.
+    assert contains(rect, CAM_FACE)
+    assert rect["w"] / rect["h"] == pytest.approx(1080 / 768, rel=0.02)
+
+
+def test_incrustation_edges_are_excluded_from_the_game_window(tmp_path, video_dir):
+    write_panel_keyframes(video_dir, PANEL, pattern(20, 20))
+    data = load(run_stream(tmp_path)[0])
+
+    facecam = data["facecam"]
+    px0, py0, px1, py1 = PANEL
+    # le rectangle facecam couvre le panneau reel, pas juste le visage
+    assert contains(facecam, PANEL, eps=3)
+    [g] = rects(data["plans"][0], "gameplay")
+    assert g["x"] >= facecam["x"] + facecam["w"] or g["y"] >= facecam["y"] + facecam["h"]
+
+
+# --------------------------------------------------------------------------
 # Petites facecams en coin (TASK-c7e682a88189) : trop reduites dans l'image
 # entiere, vues dans une vignette de coin agrandie (coordonnees ramenees a
 # l'image source).
