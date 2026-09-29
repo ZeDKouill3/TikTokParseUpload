@@ -438,3 +438,25 @@ def test_cli_serve_port_is_configurable(tmp_path, isolated_cwd, monkeypatch):
 
     assert calls[0][1]["host"] == "127.0.0.1"
     assert calls[0][1]["port"] == 9001
+
+
+def test_logo_is_served_as_standalone_svg(tmp_path, isolated_cwd):
+    resp = client(tmp_path).get("/static/logo.svg")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("image/svg+xml")
+    import xml.etree.ElementTree as ET
+
+    root = ET.fromstring(resp.text)
+    assert root.tag.endswith("svg")
+    assert root.get("viewBox")
+    # autonome : aucune ressource ni police externe
+    assert "href" not in resp.text and "font" not in resp.text
+
+
+def test_index_declares_logo_as_icon_and_shows_it_in_header(tmp_path, isolated_cwd):
+    html = client(tmp_path).get("/").text
+    assert '<link rel="icon" type="image/svg+xml" href="/static/logo.svg">' in html
+    header = html[html.index("<header>"):html.index("</header>")]
+    assert 'src="/static/logo.svg"' in header
+    assert 'alt=""' in header
+    assert "Clipper" in header
