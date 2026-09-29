@@ -48,10 +48,19 @@ clip recoit ``title`` = titre de base + " (Partie N)" (la partie 1 aussi) ;
 pour un clip unique (parts_total = 1), aucun suffixe. La longueur maximale
 demandee a l'IA pour le titre de base tient compte du suffixe le plus long
 du moment, pour que le title final respecte title_max_chars.
+
+Les moments sont independants et traites en parallele, au plus ``parallel``
+a la fois (CONFIG_DEFAULTS, defaut 4 ; 1 = sequentiel) ; a l'interieur d'un
+moment, ses parties restent traitees dans l'ordre, sequentiellement (la
+partie 1 fixe title et screen_title, repris par les suivantes). La sortie
+(ordre des clips) est celle de parts.json (moments, puis parties), quel que
+soit l'ordre d'arrivee des reponses. ``parallel`` < 1 est refuse avec une
+erreur explicite.
 """
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 from pathlib import Path
 from typing import Any
@@ -64,6 +73,9 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "hashtags_max": 8,
     "hook_words_max": 8,
     "screen_title_words_max": 6,
+    # Nombre de moments traites en parallele (leurs parties restant
+    # sequentielles entre elles) ; 1 = sequentiel, comme avant.
+    "parallel": 4,
 }
 
 _EDGE = 0.1
@@ -384,6 +396,74 @@ def _clip_id(moment_id: int, part: int, parts_total: int) -> str:
     return base if parts_total == 1 else f"{base}-p{part}"
 
 
+def parallel_workers(settings: dict[str, Any]) -> int:
+    """Nombre de moments traites en parallele ; < 1 : CaptionsError qui le nomme."""
+    value = settings["parallel"]
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise CaptionsError(f"[captions] parallel doit etre un entier >= 1, recu {value!r}")
+    return value
+
+
+def _process_moment(
+    moment: dict[str, Any],
+    source: dict[str, Any],
+    transcript: dict[str, Any],
+    language: str,
+    video_title: str,
+    settings: dict[str, Any],
+    hook_words_max: int,
+    screen_title_words_max: int,
+    config: Any,
+    log_path: Path,
+) -> list[dict[str, Any]]:
+    """Clips d'un moment, ses parties traitees dans l'ordre, sequentiellement
+    (la partie 1 fixe title et screen_title, repris par les suivantes)."""
+    screen_title: str | None = None
+    title: str | None = None
+    parts_total = moment["parts_total"]
+    clips: list[dict[str, Any]] = []
+    for part in moment["parts"]:
+        request_screen_title = screen_title is None
+        request_title = title is None
+        schema_settings = settings
+        if request_title and parts_total > 1:
+            suffix_len = len(f" (Partie {parts_total})")
+            schema_settings = {
+                **settings,
+                "title_max_chars": max(1, int(settings["title_max_chars"]) - suffix_len),
+            }
+        schema = response_schema(
+            schema_settings, include_screen_title=request_screen_title, include_title=request_title
+        )
+        check = _check_answer(hook_words_max, screen_title_words_max,
+                               require_screen_title=request_screen_title)
+        text = _part_text(transcript, part["start"], part["end"])
+        prompt = _prompt(language, video_title, source, part, parts_total, text, settings,
+                          screen_title=screen_title, title=title)
+        answer = llm.ask("captions", prompt, [], schema, config=config, check=check, log_path=log_path)
+        if request_screen_title:
+            screen_title = answer["screen_title"]
+        if request_title:
+            title = answer["title"]
+        final_title = title if parts_total == 1 else f"{title} (Partie {part['part']})"
+        clips.append({
+            "id": _clip_id(moment["id"], part["part"], parts_total),
+            "moment_id": moment["id"],
+            "part": part["part"],
+            "parts_total": parts_total,
+            "start": part["start"],
+            "end": part["end"],
+            "duration": part["duration"],
+            "language": language,
+            "title": final_title,
+            "caption": answer["caption"],
+            "hashtags": answer["hashtags"],
+            "hook_text": answer["hook_text"],
+            "screen_title": screen_title,
+        })
+    return clips
+
+
 def run(
     video_id: str,
     workspace_dir: str | Path = "workspace",
@@ -393,7 +473,10 @@ def run(
 ) -> Path:
     """Ecrit titre, legende, hashtags et texte d'accroche de chaque clip de
     parts.json dans workspace/<video_id>/captions.json, dont le chemin est
-    renvoye. Un resultat deja present n'est pas refait, sauf ``force``."""
+    renvoye. Un resultat deja present n'est pas refait, sauf ``force``. Les
+    moments sont traites en parallele ([captions] parallel, defaut 4), leurs
+    parties restant sequentielles entre elles ; l'echec d'un moment fait
+    remonter l'erreur sans rien ecrire."""
     video_dir = Path(workspace_dir) / video_id
     out = video_dir / "captions.json"
     if out.exists() and not force:
@@ -404,6 +487,7 @@ def run(
     transcript = _read_json(video_dir / "transcript.json")
     meta = _read_json(video_dir / "meta.json", optional=True) or {}
     settings = _settings(config)
+    workers = parallel_workers(settings)
     language = transcript.get("language") or ""
     video_title = meta.get("title") or ""
     moments_by_id = {m["id"]: m for m in moments_data["moments"]}
@@ -411,53 +495,24 @@ def run(
     screen_title_words_max = int(settings["screen_title_words_max"])
     log_path = video_dir / "llm_refusals.jsonl"
 
-    clips: list[dict[str, Any]] = []
+    pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
     for moment in parts_data["moments"]:
         source = moments_by_id.get(moment["id"])
         if source is None:
             raise CaptionsError(f"moment {moment['id']} de parts.json absent de moments.json")
-        screen_title: str | None = None
-        title: str | None = None
-        parts_total = moment["parts_total"]
-        for part in moment["parts"]:
-            request_screen_title = screen_title is None
-            request_title = title is None
-            schema_settings = settings
-            if request_title and parts_total > 1:
-                suffix_len = len(f" (Partie {parts_total})")
-                schema_settings = {
-                    **settings,
-                    "title_max_chars": max(1, int(settings["title_max_chars"]) - suffix_len),
-                }
-            schema = response_schema(
-                schema_settings, include_screen_title=request_screen_title, include_title=request_title
-            )
-            check = _check_answer(hook_words_max, screen_title_words_max,
-                                   require_screen_title=request_screen_title)
-            text = _part_text(transcript, part["start"], part["end"])
-            prompt = _prompt(language, video_title, source, part, parts_total, text, settings,
-                              screen_title=screen_title, title=title)
-            answer = llm.ask("captions", prompt, [], schema, config=config, check=check, log_path=log_path)
-            if request_screen_title:
-                screen_title = answer["screen_title"]
-            if request_title:
-                title = answer["title"]
-            final_title = title if parts_total == 1 else f"{title} (Partie {part['part']})"
-            clips.append({
-                "id": _clip_id(moment["id"], part["part"], parts_total),
-                "moment_id": moment["id"],
-                "part": part["part"],
-                "parts_total": parts_total,
-                "start": part["start"],
-                "end": part["end"],
-                "duration": part["duration"],
-                "language": language,
-                "title": final_title,
-                "caption": answer["caption"],
-                "hashtags": answer["hashtags"],
-                "hook_text": answer["hook_text"],
-                "screen_title": screen_title,
-            })
+        pairs.append((moment, source))
+
+    def process(pair: tuple[dict[str, Any], dict[str, Any]]) -> list[dict[str, Any]]:
+        moment, source = pair
+        return _process_moment(
+            moment, source, transcript, language, video_title, settings,
+            hook_words_max, screen_title_words_max, config, log_path,
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        grouped = list(executor.map(process, pairs))
+
+    clips = [clip for group in grouped for clip in group]
 
     result = {"video_id": video_id, "clips": clips}
     video_dir.mkdir(parents=True, exist_ok=True)

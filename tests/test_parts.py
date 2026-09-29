@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import logging
 import random
+import threading
+import time
 
 import pytest
 
@@ -126,7 +128,7 @@ def write_transcript(workspace, transcript):
     (workspace / VIDEO_ID / "transcript.json").write_text(json.dumps(transcript), encoding="utf-8")
 
 
-def make_config(tmp_path, single_min=20, single_max=45, part_min=60, part_max=90, max_parts=12):
+def make_config(tmp_path, single_min=20, single_max=45, part_min=60, part_max=90, max_parts=12, parallel=None):
     rubric = tmp_path / "rubric.toml"
     rubric.write_text(
         TEST_RUBRIC.format(
@@ -134,11 +136,14 @@ def make_config(tmp_path, single_min=20, single_max=45, part_min=60, part_max=90
         ),
         encoding="utf-8",
     )
+    section: dict[str, object] = {"rubric_path": str(rubric)}
+    if parallel is not None:
+        section["parallel"] = parallel
     return Config(
         mode="review",
         workspace_dir=tmp_path / "workspace",
         output_dir=tmp_path / "output",
-        _sections={"parts": {"rubric_path": str(rubric)}},
+        _sections={"parts": section},
     )
 
 
@@ -548,3 +553,130 @@ def test_default_rubric_path_is_the_repo_rubric():
     from clipper.parts import CONFIG_DEFAULTS
 
     assert CONFIG_DEFAULTS["rubric_path"] == "rubric.toml"
+
+
+# --------------------------------------------------------------------------
+# Parallelisation des moments (TASK-ed18)
+# --------------------------------------------------------------------------
+
+
+class ConcurrencyBackend:
+    """Backend de test qui journalise le chevauchement des appels concurrents
+    et sert toujours la meme reponse (``response``, un dict JSON-able) ;
+    ``delays`` donne le temps de pause (s) du n-ieme appel a demarrer (le
+    dernier de la liste sert pour les appels suivants), sinon 0.05 s fixe."""
+
+    def __init__(self, response, delays=None):
+        self.response = response
+        self.delays = list(delays) if delays is not None else None
+        self.lock = threading.Lock()
+        self.active = 0
+        self.max_active = 0
+        self.calls: list[Any] = []
+
+    def complete(self, request):
+        with self.lock:
+            index = len(self.calls)
+            self.calls.append(request)
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        if self.delays:
+            delay = self.delays[min(index, len(self.delays) - 1)]
+        else:
+            delay = 0.05
+        time.sleep(delay)
+        with self.lock:
+            self.active -= 1
+        return json.dumps(self.response)
+
+
+class FailOnceBackend:
+    """Backend de test qui echoue exactement au n-ieme appel a atteindre le
+    verrou (``fail_after``, 1-indexe), quel que soit le moment concerne."""
+
+    def __init__(self, response, fail_after):
+        self.response = response
+        self.fail_after = fail_after
+        self.lock = threading.Lock()
+        self.count = 0
+
+    def complete(self, request):
+        with self.lock:
+            self.count += 1
+            should_fail = self.count == self.fail_after
+        if should_fail:
+            raise llm.TransientLLMError("quota")
+        return json.dumps(self.response)
+
+
+def run_with_backend(workspace, config, backend, **kwargs):
+    from clipper.parts import run as run_parts
+
+    with llm.use_backend(backend):
+        path = run_parts(VIDEO_ID, workspace, config=config, **kwargs)
+    return path
+
+
+def test_parallel_default_is_4():
+    from clipper.parts import CONFIG_DEFAULTS
+
+    assert CONFIG_DEFAULTS["parallel"] == 4
+
+
+def test_parallel_below_1_is_refused(workspace, tmp_path):
+    from clipper.parts import PartsError
+
+    write_moments(workspace, SHORT)
+    with pytest.raises(PartsError, match="parallel"):
+        run(workspace, make_config(tmp_path, parallel=0), [])
+
+
+def test_moments_overlap_when_parallel_is_4(workspace, tmp_path):
+    moments = [moment(40 + i, 100.2, 319.7, "multipart") for i in range(4)]
+    write_moments(workspace, *moments)
+    backend = ConcurrencyBackend(cuts(173.0, 247.3))
+
+    run_with_backend(workspace, make_config(tmp_path, parallel=4), backend)
+
+    assert len(backend.calls) == 4
+    assert backend.max_active >= 2
+
+
+def test_moments_never_overlap_when_parallel_is_1(workspace, tmp_path):
+    moments = [moment(30 + i, 100.2, 319.7, "multipart") for i in range(4)]
+    write_moments(workspace, *moments)
+    backend = ConcurrencyBackend(cuts(173.0, 247.3))
+
+    run_with_backend(workspace, make_config(tmp_path, parallel=1), backend)
+
+    assert len(backend.calls) == 4
+    assert backend.max_active == 1
+
+
+def test_output_is_identical_between_parallel_1_and_4_even_out_of_order(workspace, tmp_path):
+    ids = [50, 51, 52, 53]
+    moments = [moment(i, 100.2, 319.7, "multipart") for i in ids]
+    write_moments(workspace, *moments)
+
+    backend_seq = ConcurrencyBackend(cuts(173.0, 247.3))
+    run_with_backend(workspace, make_config(tmp_path, parallel=1), backend_seq)
+    sequential = read_parts(workspace)
+
+    # Le premier appel a demarrer est le plus lent, le dernier le plus
+    # rapide : les reponses arrivent dans le desordre.
+    backend_par = ConcurrencyBackend(cuts(173.0, 247.3), delays=[0.2, 0.15, 0.1, 0.05])
+    run_with_backend(workspace, make_config(tmp_path, parallel=4), backend_par, force=True)
+    parallel = read_parts(workspace)
+
+    assert sequential == parallel
+    assert [m["id"] for m in parallel["moments"]] == ids
+
+
+def test_a_failing_moment_propagates_and_writes_nothing_in_parallel(workspace, tmp_path):
+    moments = [moment(60 + i, 100.2, 319.7, "multipart") for i in range(4)]
+    write_moments(workspace, *moments)
+    backend = FailOnceBackend(cuts(173.0, 247.3), fail_after=2)
+
+    with pytest.raises(llm.TransientLLMError):
+        run_with_backend(workspace, make_config(tmp_path, parallel=4), backend)
+    assert not (workspace / VIDEO_ID / "parts.json").exists()

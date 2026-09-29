@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 
 import pytest
 
@@ -381,6 +383,7 @@ def test_default_config_values():
     assert CONFIG_DEFAULTS["title_max_chars"] == 100
     assert CONFIG_DEFAULTS["caption_max_chars"] == 300
     assert CONFIG_DEFAULTS["screen_title_words_max"] == 6
+    assert CONFIG_DEFAULTS["parallel"] == 4
 
 
 # --------------------------------------------------------------------------
@@ -727,3 +730,184 @@ def test_multipart_title_max_chars_requested_accounts_for_the_longest_partie_suf
     data = read_captions(workspace)
     assert data["clips"][0]["title"] == "123456789 (Partie 1)"
     assert all(len(c["title"]) <= 20 for c in data["clips"])
+
+
+# --------------------------------------------------------------------------
+# Parallelisation des moments (TASK-ed18)
+# --------------------------------------------------------------------------
+
+
+class ConcurrencyBackend:
+    """Backend de test qui journalise le chevauchement des appels concurrents
+    et sert toujours la meme reponse (``response``, un dict JSON-able) ;
+    ``delays`` donne le temps de pause (s) du n-ieme appel a demarrer (le
+    dernier de la liste sert pour les appels suivants), sinon 0.05 s fixe."""
+
+    def __init__(self, response, delays=None):
+        self.response = response
+        self.delays = list(delays) if delays is not None else None
+        self.lock = threading.Lock()
+        self.active = 0
+        self.max_active = 0
+        self.calls: list = []
+
+    def complete(self, request):
+        with self.lock:
+            index = len(self.calls)
+            self.calls.append(request)
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        if self.delays:
+            delay = self.delays[min(index, len(self.delays) - 1)]
+        else:
+            delay = 0.05
+        time.sleep(delay)
+        with self.lock:
+            self.active -= 1
+        return json.dumps(self.response)
+
+
+class FailOnceBackend:
+    """Backend de test qui echoue exactement au n-ieme appel a atteindre le
+    verrou (``fail_after``, 1-indexe), quel que soit le moment concerne."""
+
+    def __init__(self, response, fail_after):
+        self.response = response
+        self.fail_after = fail_after
+        self.lock = threading.Lock()
+        self.count = 0
+
+    def complete(self, request):
+        with self.lock:
+            self.count += 1
+            should_fail = self.count == self.fail_after
+        if should_fail:
+            raise llm.TransientLLMError("quota")
+        return json.dumps(self.response)
+
+
+class MomentAwareBackend:
+    """Backend de test qui suit le chevauchement des appels par moment (les
+    ``markers``, une chaine distinctive par moment cherchee dans le prompt) :
+    ``max_active`` par marqueur doit rester a 1 (parties sequentielles), meme
+    si plusieurs moments tournent en parallele. La reponse est adaptee au
+    schema demande (title/screen_title requis ou non selon la partie)."""
+
+    def __init__(self, markers):
+        self.markers = list(markers)
+        self.lock = threading.Lock()
+        self.active: dict[str, int] = {}
+        self.max_active: dict[str, int] = {}
+        self.calls: list = []
+
+    def _marker(self, prompt):
+        found = [m for m in self.markers if m in prompt]
+        assert len(found) == 1, f"marqueur de moment introuvable ou ambigu dans le prompt : {found}"
+        return found[0]
+
+    def complete(self, request):
+        key = self._marker(request.prompt)
+        with self.lock:
+            self.calls.append(request)
+            self.active[key] = self.active.get(key, 0) + 1
+            self.max_active[key] = max(self.max_active.get(key, 0), self.active[key])
+        time.sleep(0.05)
+        with self.lock:
+            self.active[key] -= 1
+        include_title = "title" in request.schema["properties"]
+        include_screen_title = "screen_title" in request.schema["properties"]
+        return json.dumps(answer(include_title=include_title, include_screen_title=include_screen_title))
+
+
+def run_with_backend(workspace, config, backend, **kwargs):
+    from clipper.captions import run as run_captions
+
+    with llm.use_backend(backend):
+        path = run_captions(VIDEO_ID, workspace, config=config, **kwargs)
+    return path
+
+
+def test_parallel_below_1_is_refused(workspace, tmp_path):
+    from clipper.captions import CaptionsError
+
+    write_moments(workspace, moment(0))
+    write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
+
+    with pytest.raises(CaptionsError, match="parallel"):
+        run(workspace, make_config(tmp_path, parallel=0), [])
+
+
+def test_moments_overlap_when_parallel_is_4(workspace, tmp_path):
+    ids = [10, 11, 12, 13]
+    write_moments(workspace, *(moment(i) for i in ids))
+    write_parts(workspace, *(parts_record(i, "single", 1, [part(1, 0.0, 3.9)]) for i in ids))
+    backend = ConcurrencyBackend(answer())
+
+    run_with_backend(workspace, make_config(tmp_path, parallel=4), backend)
+
+    assert len(backend.calls) == 4
+    assert backend.max_active >= 2
+
+
+def test_moments_never_overlap_when_parallel_is_1(workspace, tmp_path):
+    ids = [20, 21, 22, 23]
+    write_moments(workspace, *(moment(i) for i in ids))
+    write_parts(workspace, *(parts_record(i, "single", 1, [part(1, 0.0, 3.9)]) for i in ids))
+    backend = ConcurrencyBackend(answer())
+
+    run_with_backend(workspace, make_config(tmp_path, parallel=1), backend)
+
+    assert len(backend.calls) == 4
+    assert backend.max_active == 1
+
+
+def test_parts_of_the_same_moment_never_overlap_and_keep_order_even_with_parallel_moments(workspace, tmp_path):
+    write_moments(
+        workspace,
+        moment(0, justification="histoire 0"),
+        moment(1, justification="histoire 1"),
+    )
+    write_parts(
+        workspace,
+        parts_record(0, "multipart", 2, [part(1, 0.0, 3.9), part(2, 5.0, 8.9)]),
+        parts_record(1, "multipart", 2, [part(1, 0.0, 3.9), part(2, 5.0, 8.9)]),
+    )
+    backend = MomentAwareBackend(["histoire 0", "histoire 1"])
+
+    run_with_backend(workspace, make_config(tmp_path, parallel=4), backend)
+
+    assert len(backend.calls) == 4
+    assert backend.max_active["histoire 0"] == 1
+    assert backend.max_active["histoire 1"] == 1
+    data = read_captions(workspace)
+    assert [c["id"] for c in data["clips"]] == ["00-p1", "00-p2", "01-p1", "01-p2"]
+
+
+def test_output_is_identical_between_parallel_1_and_4_even_out_of_order(workspace, tmp_path):
+    ids = [30, 31, 32, 33]
+    write_moments(workspace, *(moment(i) for i in ids))
+    write_parts(workspace, *(parts_record(i, "single", 1, [part(1, 0.0, 3.9)]) for i in ids))
+
+    backend_seq = ConcurrencyBackend(answer())
+    run_with_backend(workspace, make_config(tmp_path, parallel=1), backend_seq)
+    sequential = read_captions(workspace)
+
+    # Le premier appel a demarrer est le plus lent, le dernier le plus
+    # rapide : les reponses arrivent dans le desordre.
+    backend_par = ConcurrencyBackend(answer(), delays=[0.2, 0.15, 0.1, 0.05])
+    run_with_backend(workspace, make_config(tmp_path, parallel=4), backend_par, force=True)
+    parallel = read_captions(workspace)
+
+    assert sequential == parallel
+    assert [c["id"] for c in parallel["clips"]] == ["30", "31", "32", "33"]
+
+
+def test_a_failing_moment_propagates_and_writes_nothing_in_parallel(workspace, tmp_path):
+    ids = [40, 41, 42, 43]
+    write_moments(workspace, *(moment(i) for i in ids))
+    write_parts(workspace, *(parts_record(i, "single", 1, [part(1, 0.0, 3.9)]) for i in ids))
+    backend = FailOnceBackend(answer(), fail_after=2)
+
+    with pytest.raises(llm.TransientLLMError):
+        run_with_backend(workspace, make_config(tmp_path, parallel=4), backend)
+    assert not (workspace / VIDEO_ID / "captions.json").exists()
