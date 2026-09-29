@@ -21,7 +21,7 @@ Pour chaque clip :
   rogne volontairement les bords et les sous-titres sont hors de l'image ;
   partie 2+ d'une serie (``part`` >= 2 dans le JSON), starts_mid_sentence
   n'est plus demande : la reprise d'environ 3 s de la partie precedente est
-  voulue (SPEC-1557 regle 3) ;
+  voulue (SPEC-0eec regle 3) ;
 - verifications locales par ffprobe/ffmpeg : duree reelle vs ``duration`` du
   JSON, resolution attendue (1080x1920), silence initial superieur au seuil
   (1 s par defaut ; pas de piste audio = silence), ecran noir (black_screen)
@@ -139,7 +139,7 @@ _LETTERBOX_EXCLUDED_DEFECTS = {"face_cut", "subtitle_on_face"}
 
 # Partie 2+ d'une serie : la reprise d'environ 3 s de la fin de la partie
 # precedente est voulue, ce n'est pas un debut en milieu de phrase
-# (SPEC-1557 regle 3). Seule la partie 1 (ou un clip unique) commence
+# (SPEC-0eec regle 3). Seule la partie 1 (ou un clip unique) commence
 # vraiment sur l'accroche.
 _SERIES_EXCLUDED_DEFECTS = {"starts_mid_sentence"}
 
@@ -468,7 +468,7 @@ def response_schema(letterbox: bool = False, part: int = 1) -> dict[str, Any]:
     enum : le zoom fixe rogne volontairement les bords et les sous-titres
     sont hors de l'image (SPEC-6127). Partie 2+ d'une serie (``part``) :
     starts_mid_sentence est hors enum, la reprise de la partie precedente
-    est voulue (SPEC-1557)."""
+    est voulue (SPEC-0eec)."""
     excluded = _excluded_defects(letterbox, part)
     defect_types = [d for d in DEFECTS if d not in excluded]
     return {
@@ -528,7 +528,7 @@ def _prompt(clip: dict[str, Any], frames: list[tuple[Path, float, list[str]]], l
             f"## Serie\n"
             f"Ce clip est la partie {part} d'une serie de {int(clip.get('parts_total', part))} parties qui "
             "se suivent. Il reprend volontairement les quelques dernieres secondes de la partie precedente "
-            "(recouvrement voulu, SPEC-1557) : ne pas le signaler comme un debut en milieu de phrase. "
+            "(recouvrement voulu, SPEC-0eec) : ne pas le signaler comme un debut en milieu de phrase. "
             "Le spectateur a vu les parties precedentes : ce qui y a ete presente (personnes, contexte) "
             "peut etre suppose connu, le clip n'est pas incomprehensible pour ca.\n\n"
         )

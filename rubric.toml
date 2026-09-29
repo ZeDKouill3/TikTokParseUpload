@@ -1,13 +1,22 @@
-# Grille de notation des moments (SPEC-1557), lue par l'etape moments.
-# Modifiable sans toucher au code. Chemin reglable : [moments] rubric_path.
+# Grille de notation des moments (SPEC-0eec, remplace SPEC-1557), lue par
+# l'etape moments. Modifiable sans toucher au code. Chemin reglable :
+# [moments] rubric_path.
 #
-# Score final 0-100 = moyenne des notes (0-10) ponderee par `weight`, x10,
-# plus un bonus de signaux mesures plafonne a [bonus] max_total.
-# Retenus : tous les moments dont le score final >= min_score, sans plafond ;
-# entre un passage en serie (multipart) et un clip unique qui se chevauchent,
-# le passage ; entre deux moments du meme format, le mieux note.
+# Score final 0-100 = moyenne des notes (0-10) ponderee par `weight` (un
+# critere a weight = 0 est note mais hors moyenne), x10, plus un bonus de
+# signaux mesures plafonne a [bonus] max_total.
+# Retenus : les moments dont le score final >= min_score, avec un plafond
+# souple : au plus max_moments_per_hour moments par heure de video source
+# (plafond = arrondi superieur de max_moments_per_hour x duree en heures, au
+# moins 1), pris par score decroissant ; un moment dont le score atteint
+# always_keep_score est toujours retenu, meme au-dela du plafond, et compte
+# dans le plafond. Entre un passage en serie (multipart) et un clip unique
+# qui se chevauchent, le passage ; entre deux moments du meme format, le
+# mieux note.
 
 min_score = 60
+max_moments_per_hour = 6
+always_keep_score = 70
 
 # Mots-cles tendance (critere trend) : a mettre a jour avec l'actualite.
 trend_keywords = [
@@ -44,7 +53,7 @@ weight = 2
 question = "Le clip apporte-t-il une info, un leak, un avis tranche, une theorie ou une controverse ?"
 
 [criteria.trend]
-weight = 1
+weight = 0
 question = "Le clip touche-t-il les mots-cles tendance listes ?"
 
 # Durees en secondes (regle 3 de la spec).

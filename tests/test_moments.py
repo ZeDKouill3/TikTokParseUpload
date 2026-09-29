@@ -17,8 +17,13 @@ VIDEO_ID = "abcdefghijk"
 
 # Grille de test figee : les tests de calcul ne dependent pas des reglages
 # que l'utilisateur peut changer dans le rubric.toml du depot.
+# max_moments_per_hour et always_keep_score sont volontairement tres larges
+# ici : les tests generaux (video de 500 s) ne portent pas sur le plafond,
+# qui a ses propres tests plus bas avec CAP_RUBRIC.
 TEST_RUBRIC = """
 min_score = 60
+max_moments_per_hour = 1000
+always_keep_score = 1000
 trend_keywords = ["GTA 6", "Vice City"]
 
 [criteria.hook]
@@ -182,7 +187,7 @@ def spans(data):
 
 
 # --------------------------------------------------------------------------
-# rubric.toml du depot : conforme a SPEC-1557
+# rubric.toml du depot : conforme a SPEC-0eec
 # --------------------------------------------------------------------------
 
 
@@ -191,10 +196,13 @@ def test_repo_rubric_matches_the_spec():
 
     rubric = load_rubric(REPO / "rubric.toml")
     assert {name: c["weight"] for name, c in rubric["criteria"].items()} == {
-        "hook": 3, "standalone": 3, "payoff": 2, "emotion": 2, "value": 2, "trend": 1,
+        "hook": 3, "standalone": 3, "payoff": 2, "emotion": 2, "value": 2, "trend": 0,
     }
+    assert sum(c["weight"] for c in rubric["criteria"].values()) > 0
     assert all(c["question"].strip() for c in rubric["criteria"].values())
     assert rubric["min_score"] == 60
+    assert rubric["max_moments_per_hour"] == 6
+    assert rubric["always_keep_score"] == 70
     d = rubric["durations"]
     assert (
         d["single_min"], d["single_max"], d["part_min"], d["part_max"], d["min_parts"], d["max_parts"], d["tolerance"]
@@ -214,12 +222,34 @@ def test_rubric_without_max_parts_is_refused(tmp_path):
         load_rubric(p)
 
 
-def test_moments_cites_spec_1557():
+@pytest.mark.parametrize("key", ["max_moments_per_hour", "always_keep_score"])
+def test_rubric_without_a_cap_setting_is_refused(tmp_path, key):
+    from clipper.moments import MomentsError, load_rubric
+
+    p = tmp_path / "rubric.toml"
+    p.write_text(re.sub(rf"^{key} = .*\n", "", TEST_RUBRIC, flags=re.MULTILINE), encoding="utf-8")
+    with pytest.raises(MomentsError, match=key):
+        load_rubric(p)
+
+
+@pytest.mark.parametrize("key", ["max_moments_per_hour", "always_keep_score"])
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_rubric_with_a_non_positive_cap_setting_is_refused(tmp_path, key, value):
+    from clipper.moments import MomentsError, load_rubric
+
+    p = tmp_path / "rubric.toml"
+    p.write_text(re.sub(rf"^{key} = .*$", f"{key} = {value}", TEST_RUBRIC, flags=re.MULTILINE), encoding="utf-8")
+    with pytest.raises(MomentsError, match=key):
+        load_rubric(p)
+
+
+def test_moments_cites_spec_0eec():
     import clipper.moments
 
-    assert "SPEC-1557" in clipper.moments.__doc__ and "SPEC-53f3" not in clipper.moments.__doc__
+    assert "SPEC-0eec" in clipper.moments.__doc__
+    assert "SPEC-1557" not in clipper.moments.__doc__ and "SPEC-53f3" not in clipper.moments.__doc__
     header = (REPO / "rubric.toml").read_text(encoding="utf-8").split("\n", 1)[0]
-    assert "SPEC-1557" in header
+    assert "SPEC-0eec" in header
 
 
 def test_rubric_missing_a_weight_is_refused(tmp_path):
@@ -321,6 +351,23 @@ def test_final_score_is_weighted_mean_of_criterion_notes(tmp_path, video_dir, ru
 
     scores = sorted(m["final_score"] for m in read_moments(video_dir)["moments"])
     assert scores == [60.0, 66.9]
+
+
+def test_zero_weight_criterion_is_scored_but_excluded_from_the_mean():
+    # SPEC-0eec : trend a poids 0 dans le rubric.toml du depot. Le critere est
+    # note (present dans "scores") mais ne compte pas dans la moyenne : le
+    # score final ne bouge pas, quelle que soit sa note.
+    from clipper.moments import final_score
+
+    rubric = {"criteria": {
+        "hook": {"weight": 3, "question": "?"},
+        "standalone": {"weight": 3, "question": "?"},
+        "trend": {"weight": 0, "question": "?"},
+    }}
+    without_trend = final_score({"hook": 8, "standalone": 6, "trend": 0}, rubric)
+    with_a_high_trend = final_score({"hook": 8, "standalone": 6, "trend": 10}, rubric)
+
+    assert without_trend == with_a_high_trend == round((8 * 3 + 6 * 3) / 6 * 10, 1)
 
 
 def test_measured_signals_add_a_capped_bonus(tmp_path, video_dir, rubric_path):
@@ -1687,3 +1734,139 @@ def test_exploration_never_brings_back_a_single_overlapping_a_retained_passage(t
     assert [m["format"] for m in data["moments"]] == ["multipart"]
     assert explored(data) == []
     assert data["exploration"]["chosen"] == 0
+
+
+# --------------------------------------------------------------------------
+# TASK-7ae6 (SPEC-0eec regle 4, remplace SPEC-1557) : plafond souple du
+# nombre de moments par heure de video source (duree lue dans meta.json),
+# applique apres min_score et le non-chevauchement, par score decroissant ;
+# un moment a always_keep_score ou plus est toujours retenu, meme au-dela du
+# plafond, et compte dedans. Meme regle a la re-notation ; l'exploration peut
+# piocher parmi les moments ecartes par le plafond.
+# --------------------------------------------------------------------------
+
+CAP_RUBRIC = re.sub(r"max_moments_per_hour = \d+", "max_moments_per_hour = 6", TEST_RUBRIC)
+CAP_RUBRIC = re.sub(r"always_keep_score = \d+", "always_keep_score = 70", CAP_RUBRIC)
+
+
+@pytest.fixture
+def cap_rubric(tmp_path):
+    p = tmp_path / "cap_rubric.toml"
+    p.write_text(CAP_RUBRIC, encoding="utf-8")
+    return p
+
+
+def write_flat_signals(video_dir, duration):
+    """meta.json et audio.json sans heatmap, SponsorBlock ni pic audio : le
+    bonus reste toujours nul, pour un controle exact du score final dans les
+    tests du plafond."""
+    meta = {**META, "duration": duration, "heatmap": [], "sponsorblock_segments": [], "chapters": []}
+    (video_dir / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    (video_dir / "audio.json").write_text(
+        json.dumps({"window_seconds": 1.0, "energy_db": [], "peaks": []}), encoding="utf-8"
+    )
+
+
+def cap_score(value, trend, payoff=0, emotion=0):
+    """Notes sur la grille de CAP_RUBRIC (poids hook 3, standalone 3, payoff
+    2, emotion 2, value 2, trend 1) : hook et standalone fixes a 10, pour un
+    score final (sans bonus, cf. ``write_flat_signals``) uniquement fonction
+    de payoff/emotion/value/trend."""
+    return {"hook": 10, "standalone": 10, "payoff": payoff, "emotion": emotion, "value": value, "trend": trend}
+
+
+def spaced_candidates(n, scores):
+    """n moments d'environ 34.4 s, espaces de 40 s (jamais chevauchants)."""
+    return [moment(sentence_start(8 * i), sentence_end(8 * i + 6), scores=s) for i, s in zip(range(n), scores)]
+
+
+def test_cap_keeps_the_best_scored_moments_and_rejects_the_rest_for_the_plafond(tmp_path, video_dir, cap_rubric):
+    # video de 1 h, plafond = ceil(6 x 1) = 6 : 9 candidats non chevauchants,
+    # 1 nettement au-dessus des autres et 8 entre 60.0 et 65.4 -> 6 retenus
+    # (le plus haut compris), 3 rejetes pour le plafond.
+    write_flat_signals(video_dir, 3600.0)
+    others = [cap_score(9, t) for t in range(8)]
+    top = cap_score(10, 10, payoff=5, emotion=5)
+    run(tmp_path, cap_rubric, [{"moments": spaced_candidates(9, [top, *others])}])
+
+    data = read_moments(video_dir)
+    assert len(data["moments"]) == 6
+    kept_scores = sorted((m["final_score"] for m in data["moments"]), reverse=True)
+    assert kept_scores[0] == 84.6
+    capped = [r for r in data["rejected"] if "plafond" in r["reason"]]
+    assert len(capped) == 3
+    assert all(r["final_score"] < kept_scores[-1] for r in capped)
+
+
+def test_cap_still_keeps_every_moment_at_or_above_always_keep_score(tmp_path, video_dir, cap_rubric):
+    # 8 candidats a 70 ou plus (always_keep_score) : tous retenus meme si le
+    # plafond de la video (1 h -> 6) est depasse.
+    write_flat_signals(video_dir, 3600.0)
+    scores = [cap_score(v, 0, payoff=10, emotion=10) for v in range(8)]
+    run(tmp_path, cap_rubric, [{"moments": spaced_candidates(8, scores)}])
+
+    data = read_moments(video_dir)
+    assert len(data["moments"]) == 8
+    assert all(m["final_score"] >= 70 for m in data["moments"])
+    assert not [r for r in data["rejected"] if "plafond" in r["reason"]]
+
+
+def test_cap_is_the_hourly_rate_times_the_video_duration_in_hours(tmp_path, video_dir, cap_rubric):
+    # video de 1 h 40 (6000 s) : plafond = ceil(6 x 100/60) = 10 -> sur 11
+    # candidats sous always_keep_score, 10 retenus, 1 rejete pour le plafond.
+    write_flat_signals(video_dir, 6000.0)
+    scores = [cap_score(9, t) for t in range(10)] + [cap_score(9, 0)]
+    run(tmp_path, cap_rubric, [{"moments": spaced_candidates(11, scores)}])
+
+    data = read_moments(video_dir)
+    assert len(data["moments"]) == 10
+    assert len([r for r in data["rejected"] if "plafond" in r["reason"]]) == 1
+
+
+def test_missing_video_duration_in_meta_is_an_error(tmp_path, video_dir, cap_rubric):
+    from clipper.moments import MomentsError
+
+    meta = {k: v for k, v in META.items() if k != "duration"}
+    (video_dir / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+
+    with pytest.raises(MomentsError, match="duration"):
+        run(tmp_path, cap_rubric, [{"moments": [moment(10.25, 44.65)]}])
+    assert not (video_dir / "moments.json").exists()
+
+
+def test_rescore_reapplies_the_plafond_after_a_score_change(tmp_path, video_dir, cap_rubric):
+    write_flat_signals(video_dir, 3600.0)
+    scores = [cap_score(9, t) for t in range(7)]
+    run(tmp_path, cap_rubric, [{"moments": spaced_candidates(7, scores)}])
+    data = read_moments(video_dir)
+    assert len(data["moments"]) == 6
+    lowest = next(r for r in data["rejected"] if "plafond" in r["reason"])
+    assert lowest["final_score"] == 60.0
+    write_vision_after_moments(video_dir, [striking((lowest["start"] + lowest["end"]) / 2)])
+
+    fake, _ = rescore(tmp_path, cap_rubric)
+
+    assert fake.calls == []
+    after = read_moments(video_dir)
+    assert len(after["moments"]) == 6
+    assert lowest["start"] in [m["start"] for m in after["moments"]]
+    newly_capped = [r for r in after["rejected"] if "plafond" in r["reason"]]
+    assert len(newly_capped) == 1 and newly_capped[0]["start"] != lowest["start"]
+
+
+def test_exploration_can_pick_a_moment_rejected_for_the_plafond(tmp_path, video_dir, cap_rubric):
+    # video de 10 min : plafond = ceil(6 x 1/6) = 1, seul le meilleur des 2
+    # candidats est retenu directement ; l'autre, ecarte par le plafond, est
+    # repris par l'exploration (SPEC-0eec regle 4).
+    (video_dir / "meta.json").write_text(json.dumps({**META, "duration": 600.0}), encoding="utf-8")
+    proposal = {"moments": [clip(0), clip(10)]}
+    run(
+        tmp_path, cap_rubric, with_jury(proposal, jury_notes({0: TOP, 10: GOOD})),
+        config=auto_config(tmp_path, cap_rubric, exploration_share=1.0),
+    )
+
+    data = read_moments(video_dir)
+    by_start = sorted(data["moments"], key=lambda m: m["start"])
+    assert [(m["start"], m.get("exploration")) for m in by_start] == [(0.25, None), (50.25, True)]
+    assert not [r for r in data["rejected"] if r["start"] == 50.25]
+    assert data["exploration"] == {"share": 1.0, "seed": 0, "target": 1, "chosen": 1}
