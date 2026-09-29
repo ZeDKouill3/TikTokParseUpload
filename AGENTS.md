@@ -94,3 +94,10 @@ jamais lancé en CI ni par défaut en local.
   premier `run` plus lent, et il faut le réseau une fois.
 - `ank done` doit avoir `.venv\Scripts` en tête du PATH pour trouver `ank`
   et les outils de test qu'il lance (voir *Règles ank* ci-dessus).
+
+## Orchestration (session orchestrateur)
+
+Avant d'orchestrer des workers, lire `research/BONNES-PRATIQUES.md`
+(local, ignoré par git : `E:\ClaudeRandom\TiktokParseUpload\research\BONNES-PRATIQUES.md`) :
+délégation aux workers herdr (sonnet par défaut), quota Max, RAM du PC,
+rangement, tests réels. Un worker dans `.worktrees/` n'a pas besoin de ce fichier.
