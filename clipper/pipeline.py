@@ -18,8 +18,11 @@ Enchainement, par video (``STEPS``, dans l'ordre d'execution) :
 - ``reframe`` passe avant ``subtitles`` : les bandes a ne pas recouvrir
   (``avoid_zones``) se deduisent plan par plan des visages du plan de
   recadrage, et la bande de l'accroche (``hook_zones``) des reglages de
-  render ; en format letterbox (``layout = "letterbox"`` a la racine du plan),
-  subtitles recoit a la place la zone ``text_zones.subtitles`` du plan ;
+  render ; en format letterbox ou stream (``layout = "letterbox"`` ou
+  ``"stream"`` a la racine du plan), subtitles recoit a la place la zone
+  ``text_zones.subtitles`` du plan ;
+- avec ``[reframe] layout = "stream_auto"`` (SPEC-3a88), la facecam est
+  detectee une fois par video (``reframe.detect_facecam``) avant les clips ;
 - ``subtitles`` genere jusqu'a ``parallel`` clips a la fois ([subtitles] de
   config.toml ; 1 = un clip apres l'autre), sans modele en VRAM ; reframe
   et render traitent leurs clips un par un ;
@@ -327,13 +330,18 @@ class _Run:
         captions.run(self.video_id, self.ws, config=self.config, force=self.force, **self.opts("captions"))
 
     def reframe(self) -> None:
+        opts = self.opts("reframe")
+        if self.config.section("reframe")["layout"] == "stream_auto":
+            # Facecam detectee une fois pour toute la video (SPEC-3a88), avant les clips.
+            reframe.detect_facecam(self.video_id, self.ws, config=self.config, force=self.force,
+                                   detector_factory=opts.get("detector_factory"))
         for clip in self.clips():
             reframe.reframe(self.video_id, clip["id"], clip["start"], clip["end"], self.ws,
-                            config=self.config, force=self.force, **self.opts("reframe"))
+                            config=self.config, force=self.force, **opts)
 
     def _subtitles_clip(self, clip: dict[str, Any]) -> None:
         plan = _read_json(self.dir / "reframe" / f"{clip['id']}.json")
-        if plan.get("layout") == "letterbox":
+        if plan.get("layout") in ("letterbox", "stream"):
             zones = {"text_zone": subtitles_zone(plan, clip["id"])}
         else:
             zones = {"avoid_zones": avoid_zones(plan), "reserved_zones": hook_zones(clip, self.config)}
@@ -367,7 +375,8 @@ class _Run:
 
 
 def subtitles_zone(plan: dict[str, Any], clip_id: str) -> dict[str, Any]:
-    """Zone des sous-titres d'un plan de recadrage letterbox (SPEC-6127) :
+    """Zone des sous-titres d'un plan de recadrage letterbox (SPEC-6127) ou
+    stream (SPEC-3a88) :
     ``text_zones.subtitles`` a la racine du plan. Absente : erreur explicite
     (subtitles verifie ensuite sa coherence)."""
     text_zones = plan.get("text_zones")

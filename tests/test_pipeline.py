@@ -692,6 +692,50 @@ def test_letterbox_plan_without_a_subtitles_zone_is_an_error(tmp_path, text_zone
     assert not (d / "subtitles" / "00.ass").exists()
 
 
+def test_stream_plan_gives_its_subtitles_text_zone_to_subtitles(tmp_path):
+    # SPEC-3a88 (TASK-9e0c) : un plan stream passe sa zone sous-titres comme letterbox
+    zone = {"x0": 150, "y0": 1224, "x1": 930, "y1": 1448}
+    d = letterbox_workspace(tmp_path, {"title": {"x0": 150, "y0": 160, "x1": 930, "y1": 424},
+                                       "subtitles": zone,
+                                       "part": {"x0": 150, "y0": 1464, "x1": 930, "y1": 1520}})
+    plan = json.loads((d / "reframe" / "00.json").read_text(encoding="utf-8"))
+    plan["layout"] = plan["plans"][0]["layout"] = "stream"
+    (d / "reframe" / "00.json").write_text(json.dumps(plan), encoding="utf-8")
+    run_subtitles_step(tmp_path)
+    ass = (d / "subtitles" / "00.ass").read_text(encoding="utf-8")
+    assert ass.startswith("; format: letterbox")
+    events = [line.split(",", 9) for line in ass.splitlines() if line.startswith("Dialogue:")]
+    assert events
+    from clipper.subtitles import CONFIG_DEFAULTS as SUBTITLES_DEFAULTS
+
+    offset = SUBTITLES_DEFAULTS["letterbox_offset_y"]
+    for ev in events:
+        assert (int(ev[5]), int(ev[6])) == (150, 1080 - 930)
+        assert int(ev[7]) in (1224 + offset, 1224 + offset + 78)
+
+
+def test_reframe_step_detects_the_facecam_once_per_video_in_stream_auto(tmp_path, monkeypatch):
+    from clipper import pipeline, reframe
+
+    d = tmp_path / "workspace" / VIDEO_ID
+    d.mkdir(parents=True)
+    (d / "captions.json").write_text(json.dumps({"clips": [
+        {"id": "00", "start": 0.0, "end": 4.0}, {"id": "01", "start": 4.0, "end": 8.0}]}), encoding="utf-8")
+    calls = []
+    monkeypatch.setattr(reframe, "detect_facecam", lambda *a, **k: calls.append(("facecam", a, k)))
+    monkeypatch.setattr(reframe, "reframe", lambda *a, **k: calls.append(("clip", a[1], k["force"])))
+
+    for layout, expected in (("letterbox", 0), ("stream_auto", 1)):
+        calls.clear()
+        config = Config(mode="auto", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output",
+                        _sections={"reframe": {"layout": layout}})
+        run = pipeline._Run(pipeline.new_state(VIDEO_ID, URL, "auto"), config, True, None)
+        run.reframe()
+        assert [c[0] for c in calls] == ["facecam"] * expected + ["clip", "clip"]
+        if expected:
+            assert calls[0][1][0] == VIDEO_ID and calls[0][2]["force"] is True
+
+
 def test_hook_zones_reserve_the_hook_band_for_the_hook_duration(tmp_path):
     from clipper.pipeline import hook_zones
 

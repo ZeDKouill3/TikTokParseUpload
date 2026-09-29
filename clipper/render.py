@@ -52,6 +52,14 @@ part en pixels de sortie, calculees par reframe) et
   en em comme Pillow, mesuree avec la vraie police, sinon RenderError) ;
 - ecrit ``video_rect`` (le panneau main en pixels de sortie) dans le JSON.
 
+Format stream (SPEC-3a88, ``layout = "stream"`` a la racine du plan) : meme
+traitement du texte que letterbox (titre d'ecran dans ``text_zones.title``,
+au-dessus de la camera ; « Partie N » dans la zone part ; sous-titres deja
+places par subtitles dans la zone du jeu), panneaux ``camera`` (facecam
+agrandie en haut) et ``gameplay`` (jeu en bas) rendus comme tout panneau.
+Le JSON porte ``camera_rect`` (panneau camera) et ``video_rect`` (panneau
+gameplay), en pixels de sortie.
+
 Police emoji (``emoji_font``, vide = resolue par plateforme, voir
 resolve_emoji_font) : Windows ``C:/Windows/Fonts/seguiemj.ttf`` ; Linux
 ``NotoColorEmoji.ttf`` (paquet fonts-noto-color-emoji), police bitmap qui ne
@@ -147,6 +155,8 @@ EMOJI_FONT_CANDIDATES: dict[str, tuple[str, ...]] = {
 }
 
 _QA_DEFAULT: dict[str, Any] = {"status": "skipped", "issues": []}
+# Mises en page a titre d'ecran permanent et zones de texte fixes (text_zones).
+_TEXT_LAYOUTS = ("letterbox", "stream")
 _EDGE = 0.1
 _EPS = 1e-6
 
@@ -601,7 +611,7 @@ def _build_filter_complex(
     pas d'accroche ; « Partie N » (``part_path``) centre dans la zone part.
     ``source_offset`` : point (s) ou l'entree source est positionnee par
     ``-ss`` ; trim et atrim sont relatifs a lui."""
-    letterbox = reframe_data.get("layout") == "letterbox"
+    letterbox = reframe_data.get("layout") in _TEXT_LAYOUTS
     out_w = reframe_data["output"]["width"]
     out_h = reframe_data["output"]["height"]
 
@@ -796,19 +806,28 @@ def render(
             f"screen_title absent de captions.json pour {clip_id} : relancer captions --force"
         )
 
-    letterbox = reframe_data.get("layout") == "letterbox"
-    video_rect: dict[str, int] | None = None
+    layout = reframe_data.get("layout")
+    letterbox = layout in _TEXT_LAYOUTS
+    rects: dict[str, dict[str, int]] = {}
     if letterbox:
         zones = reframe_data.get("text_zones")
         if not isinstance(zones, dict) or not {"title", "subtitles", "part"} <= set(zones):
             raise RenderError(
-                f"reframe/{clip_id}.json est en letterbox sans text_zones (title, subtitles, part) : "
+                f"reframe/{clip_id}.json est en {layout} sans text_zones (title, subtitles, part) : "
                 "relancer reframe --force"
             )
-        main = [p for p in reframe_data["plans"][0]["panels"] if p.get("name") == "main"]
-        if not main:
-            raise RenderError(f"reframe/{clip_id}.json est en letterbox sans panneau main : relancer reframe --force")
-        video_rect = {k: int(main[0]["dest"][k]) for k in ("x", "y", "w", "h")}
+        # champ du sidecar -> panneau (pixels de sortie), pour la qa
+        wanted = (
+            {"video_rect": "main"} if layout == "letterbox"
+            else {"camera_rect": "camera", "video_rect": "gameplay"}
+        )
+        for key, name in wanted.items():
+            panel = [p for p in reframe_data["plans"][0]["panels"] if p.get("name") == name]
+            if not panel:
+                raise RenderError(
+                    f"reframe/{clip_id}.json est en {layout} sans panneau {name} : relancer reframe --force"
+                )
+            rects[key] = {k: int(panel[0]["dest"][k]) for k in ("x", "y", "w", "h")}
 
     scratch_dir = video_dir / "render" / clip_id
     scratch_dir.mkdir(parents=True, exist_ok=True)
@@ -817,7 +836,8 @@ def render(
         part_path: Path | None = None
         extra_inputs: tuple[Path, ...] = ()
         if letterbox:
-            # Titre d'ecran pendant tout le clip, pas d'accroche de 2 s (SPEC-6127).
+            # Titre d'ecran pendant tout le clip, pas d'accroche de 2 s (SPEC-6127,
+            # letterbox comme stream).
             png = scratch_dir / "title.png"
             title_png(screen_title, reframe_data["text_zones"]["title"], settings, png)
             extra_inputs = (png,)
@@ -879,8 +899,7 @@ def render(
         "qa": dict(_QA_DEFAULT),
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
-    if video_rect is not None:
-        data["video_rect"] = video_rect  # le panneau main, pour la qa (SPEC-6127)
+    data.update(rects)  # panneaux video en pixels de sortie, pour la qa (SPEC-6127, SPEC-3a88)
     tmp_json = json_out.with_suffix(".json.tmp")
     tmp_json.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp_json.replace(json_out)

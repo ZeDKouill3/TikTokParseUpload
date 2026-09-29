@@ -916,3 +916,87 @@ def test_clip_llm_failure_raises_but_other_clips_are_written_and_no_series_warni
     # rejet de p1 bien que p1 soit bien rejete.
     assert "series_part_rejected" not in [i["type"] for i in read(p3)["qa"]["issues"]]
     assert read(p2)["qa"]["status"] == "skipped"
+
+
+# --------------------------------------------------------------------------
+# TASK-9e0c : clip stream (SPEC-3a88) : facecam agrandie en haut
+# (camera_rect), jeu en bas (video_rect), titre d'ecran permanent.
+# --------------------------------------------------------------------------
+
+STREAM_CAMERA_RECT = {"x": 0, "y": 440, "w": 1080, "h": 768}
+STREAM_GAME_RECT = {"x": 0, "y": 1208, "w": 1080, "h": 712}
+
+
+def write_stream_clip(output_dir, *, black_seconds=0.4, clip_id=CLIP_ID, **overrides):
+    """Clip stream synthetique : fond blanc (titre d'ecran), camera rouge (noire
+    ``black_seconds`` au milieu), jeu vert dessine en dessous."""
+    d = output_dir / VIDEO_ID
+    total = make_letterbox_mp4(d / f"{clip_id}.mp4", black_seconds=black_seconds, video_rect=STREAM_CAMERA_RECT)
+    tmp = d / "cam.mp4"
+    g = STREAM_GAME_RECT
+    (d / f"{clip_id}.mp4").rename(tmp)
+    subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error", "-i", str(tmp),
+         "-vf", f"drawbox=x={g['x']}:y={g['y']}:w={g['w']}:h={g['h']}:color=green:t=fill",
+         "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "copy",
+         str(d / f"{clip_id}.mp4")],
+        check=True,
+    )
+    tmp.unlink()
+    data = clip_json(
+        duration=total, clip_id=clip_id, layout="stream", camera_rect=dict(STREAM_CAMERA_RECT),
+        video_rect=dict(STREAM_GAME_RECT), screen_title="Il ouvre la porte", hook_text="ignore-moi",
+    )
+    data.update(overrides)
+    (d / f"{clip_id}.json").write_text(json.dumps(data), encoding="utf-8")
+    return d / f"{clip_id}.json"
+
+
+def test_valid_stream_clip_passes(tmp_path, dirs):
+    workspace, output = dirs
+    path = write_stream_clip(output)
+    with llm.use_backend(FakeBackend([no_issue])):
+        run(tmp_path, workspace, output)
+    data = read(path)
+    assert data["qa"] == {"status": "passed", "issues": []}
+    assert qa.is_ready(data)
+
+
+def test_stream_prompt_describes_the_format_uses_screen_title_and_keeps_face_defects(tmp_path, dirs):
+    workspace, output = dirs
+    write_stream_clip(output)
+    fake = FakeBackend([no_issue])
+    with llm.use_backend(fake):
+        run(tmp_path, workspace, output)
+    prompt = fake.calls[0].prompt
+    assert "Il ouvre la porte" in prompt
+    assert "ignore-moi" not in prompt
+    assert "facecam" in prompt
+    enum = fake.calls[0].schema["properties"]["issues"]["items"]["properties"]["type"]["enum"]
+    # le visage est a l'image en stream : visage coupe et sous-titre dessus restent demandes
+    assert set(enum) == set(qa.DEFECTS)
+
+
+def test_stream_black_screen_measured_on_the_camera_panel(tmp_path, dirs):
+    workspace, output = dirs
+    path = write_stream_clip(output, black_seconds=3.5)
+    with llm.use_backend(FakeBackend([no_issue])):
+        run(tmp_path, workspace, output)
+    assert local_types(path) == {"black_screen"}
+    assert read(path)["qa"]["status"] == "rejected"
+
+
+@pytest.mark.parametrize("overrides", [
+    {"camera_rect": None},
+    {"video_rect": None},
+    {"camera_rect": {"x": 0, "y": 440, "w": 1080, "h": 900}},  # recouvre le jeu
+    {"video_rect": {"x": 0, "y": 1208, "w": 1080, "h": 800}},  # deborde du 1080x1920
+])
+def test_stream_with_missing_or_inconsistent_rects_raises(tmp_path, dirs, overrides):
+    workspace, output = dirs
+    path = write_stream_clip(output, **overrides)
+    before = path.read_text(encoding="utf-8")
+    with llm.use_backend(FakeBackend([])):
+        with pytest.raises(qa.QAError, match="stream"):
+            run(tmp_path, workspace, output)
+    assert path.read_text(encoding="utf-8") == before
