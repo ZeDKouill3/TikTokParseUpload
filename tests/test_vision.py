@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -13,6 +14,7 @@ import pytest
 from clipper import llm
 from clipper.config import Config
 from clipper.llm.fake import FakeBackend
+from clipper.vision import LABEL_HEIGHT
 
 VIDEO_ID = "abcdefghijk"
 
@@ -44,6 +46,26 @@ def seed_scenes(video_dir, timecodes=TIMECODES, width=FRAME_WIDTH, height=FRAME_
     (video_dir / "scenes.json").write_text(
         json.dumps({"scenes": [{"start": 0.0, "end": 500.0}], "frames": frames}), encoding="utf-8"
     )
+
+
+def seed_colored_scenes(video_dir, timecodes=TIMECODES, width=FRAME_WIDTH, height=FRAME_HEIGHT):
+    """Comme seed_scenes, mais chaque image (ordre croissant de timecode) a
+    une couleur unie distincte : sert a verifier par pixel que la planche
+    contient bien chaque image selectionnee, dans l'ordre. Renvoie
+    {timecode: couleur}."""
+    (video_dir / "frames").mkdir(exist_ok=True)
+    frames = []
+    colors = {}
+    for n, t in enumerate(sorted(timecodes)):
+        color = (20 + 15 * n, 60 + 15 * n, 90 + 15 * n)  # reste < 256 (jusqu'a n=9)
+        img = np.full((height, width, 3), color, dtype=np.uint8)
+        cv2.imwrite(str(video_dir / frame_name(t)), img)
+        frames.append({"path": frame_name(t), "timecode": t, "scene": n})
+        colors[t] = color
+    (video_dir / "scenes.json").write_text(
+        json.dumps({"scenes": [{"start": 0.0, "end": 500.0}], "frames": frames}), encoding="utf-8"
+    )
+    return colors
 
 
 def seed_rubric(tmp_path, visual=2, max_total=6):
@@ -99,29 +121,23 @@ def make_config(tmp_path, **sections):
     )
 
 
-def strip_index(name):
-    """Un nom de fichier redimensionne porte un prefixe d'index (00000_...) :
-    l'original s'en deduit."""
-    return name.split("_", 1)[1]
-
-
 def describe_all(striking_at=(), tags=("plan large",), record=None):
     """Reponse fake : decrit chaque image du lot, marquante si son timecode
-    (lu dans le prompt) est dans ``striking_at``. Si ``record`` est fourni,
-    y ajoute la taille (largeur, hauteur) de chaque image recue : le fichier
-    temporaire redimensionne est supprime des la fin de l'etape, donc lire sa
+    (lu dans le prompt, la planche etant un fichier image le prompt reste la
+    seule source lisible par le test) est dans ``striking_at``. Si ``record``
+    est fourni, y ajoute la taille (largeur, hauteur) de la planche recue :
+    le fichier temporaire est supprime des la fin de l'etape, donc lire sa
     taille doit se faire pendant l'appel."""
 
     def answer(request):
         if record is not None:
-            for p in request.images:
-                record.append(image_size(p))
+            record.append(image_size(request.images[0]))
         frames = []
-        for n, _ in enumerate(request.images):
-            t = float(request.prompt.split(f"Image {n} : ")[1].split(" s")[0])
+        for index_str, t_str in re.findall(r"Image (\d+) : ([\d.]+) s", request.prompt):
+            t = float(t_str)
             frames.append(
                 {
-                    "index": n,
+                    "index": int(index_str),
                     "description": f"image a {t:.1f}",
                     "tags": list(tags),
                     "striking": t in striking_at,
@@ -142,8 +158,13 @@ def run_vision(tmp_path, responses, **settings):
     return fake, path
 
 
-def sent_images(fake, video_dir):
-    return [p.relative_to(video_dir).as_posix() for call in fake.calls for p in call.images]
+def prompt_timecodes(fake):
+    """Timecodes listes dans les prompts envoyes, tous appels confondus."""
+    return [
+        float(t)
+        for call in fake.calls
+        for _, t in re.findall(r"Image (\d+) : ([\d.]+) s", call.prompt)
+    ]
 
 
 # --------------------------------------------------------------------------
@@ -154,10 +175,7 @@ def sent_images(fake, video_dir):
 def test_kept_moment_and_rescuable_rejected_windows_are_sent(tmp_path, video_dir):
     fake, _ = run_vision(tmp_path, [describe_all()] * 5)
 
-    # les images envoyees sont des copies redimensionnees dans un dossier
-    # temporaire, pas les originaux, mais elles en portent le nom
-    names = sorted(strip_index(p.name) for call in fake.calls for p in call.images)
-    assert names == ["f0091.jpg", "f0115.jpg", "f0139.jpg", "f0295.jpg", "f0335.jpg"]
+    assert sorted(prompt_timecodes(fake)) == [91.0, 115.0, 139.0, 295.0, 335.0]
 
 
 def test_no_candidate_window_means_no_llm_call(tmp_path, video_dir):
@@ -180,8 +198,7 @@ def test_rejection_without_bounds_opens_no_window(tmp_path, video_dir):
 
     fake, _ = run_vision(tmp_path, [describe_all()] * 3)
 
-    names = sorted(strip_index(p.name) for call in fake.calls for p in call.images)
-    assert names == ["f0091.jpg", "f0115.jpg", "f0139.jpg"]
+    assert sorted(prompt_timecodes(fake)) == [91.0, 115.0, 139.0]
 
 
 def test_rejected_candidate_below_min_score_even_with_visual_bonus_gets_no_window(tmp_path, video_dir):
@@ -196,8 +213,7 @@ def test_rejected_candidate_below_min_score_even_with_visual_bonus_gets_no_windo
 
     fake, _ = run_vision(tmp_path, [describe_all()] * 3)
 
-    names = sorted(strip_index(p.name) for call in fake.calls for p in call.images)
-    assert names == ["f0091.jpg", "f0115.jpg", "f0139.jpg"]
+    assert sorted(prompt_timecodes(fake)) == [91.0, 115.0, 139.0]
 
 
 def test_rejected_candidate_already_at_bonus_max_total_gets_no_window(tmp_path, video_dir):
@@ -212,8 +228,7 @@ def test_rejected_candidate_already_at_bonus_max_total_gets_no_window(tmp_path, 
 
     fake, _ = run_vision(tmp_path, [describe_all()] * 3)
 
-    names = sorted(strip_index(p.name) for call in fake.calls for p in call.images)
-    assert names == ["f0091.jpg", "f0115.jpg", "f0139.jpg"]
+    assert sorted(prompt_timecodes(fake)) == [91.0, 115.0, 139.0]
 
 
 def test_rejected_candidate_without_score_data_gets_no_window(tmp_path, video_dir):
@@ -227,8 +242,7 @@ def test_rejected_candidate_without_score_data_gets_no_window(tmp_path, video_di
 
     fake, _ = run_vision(tmp_path, [describe_all()] * 3)
 
-    names = sorted(strip_index(p.name) for call in fake.calls for p in call.images)
-    assert names == ["f0091.jpg", "f0115.jpg", "f0139.jpg"]
+    assert sorted(prompt_timecodes(fake)) == [91.0, 115.0, 139.0]
 
 
 # --------------------------------------------------------------------------
@@ -241,9 +255,45 @@ def test_frames_are_described_by_llm_vision_in_batches(tmp_path, video_dir):
     fake, _ = run_vision(tmp_path, [describe_all(record=sizes)] * 3, batch_size=2, parallel=1)
 
     assert [c.usage for c in fake.calls] == ["vision", "vision", "vision"]
-    assert [len(c.images) for c in fake.calls] == [2, 2, 1]
-    assert len(sizes) == 5  # chaque image existait bien au moment de l'appel
+    assert [len(c.images) for c in fake.calls] == [1, 1, 1]  # une seule planche par appel
+    assert len(sizes) == 3  # chaque planche existait bien au moment de l'appel
     assert "115.0 s" in fake.calls[0].prompt
+
+
+def test_each_call_sends_a_single_montage_image_for_the_whole_batch(tmp_path, video_dir):
+    fake, _ = run_vision(tmp_path, [describe_all()], batch_size=8)
+
+    assert len(fake.calls) == 1
+    assert len(fake.calls[0].images) == 1
+
+
+def test_montage_contains_every_selected_frame_labeled_in_timecode_order(tmp_path, video_dir):
+    """La planche contient bien chaque image du lot (verifie par une couleur
+    unie distincte par image, echantillonnee sous la bande de legende), dans
+    l'ordre des timecodes, avec une legende dessinee au-dessus de chacune
+    (bande de tete non uniformement noire)."""
+    colors = seed_colored_scenes(video_dir)
+    captured = []
+
+    def capture(request):
+        img = cv2.imread(str(request.images[0]))
+        h, w = img.shape[:2]
+        n = len(re.findall(r"Image \d+ : [\d.]+ s", request.prompt))
+        cell_w = w // n
+        for i in range(n):
+            label_region = img[0:LABEL_HEIGHT, i * cell_w : (i + 1) * cell_w]
+            assert label_region.max() > 200, f"pas de legende dessinee pour l'image {i}"
+            x, y = i * cell_w + cell_w // 2, h - 5
+            captured.append(tuple(int(c) for c in img[y, x]))
+        return describe_all()(request)
+
+    fake, _ = run_vision(tmp_path, [capture])
+
+    # tolerance : la planche est ecrite en JPEG (compression avec pertes)
+    expected = [colors[t] for t in (91.0, 115.0, 139.0, 295.0, 335.0)]
+    assert len(captured) == len(expected)
+    for got, exp in zip(captured, expected):
+        assert all(abs(g - e) <= 6 for g, e in zip(got, exp)), (captured, expected)
 
 
 def test_answer_missing_a_frame_is_a_failure_and_writes_nothing(tmp_path, video_dir):
@@ -333,21 +383,24 @@ def test_vision_section_is_configurable(tmp_path):
 # --------------------------------------------------------------------------
 
 
-def test_images_sent_are_resized_to_max_width_preserving_aspect_ratio(tmp_path, video_dir):
+def test_montage_cells_are_resized_to_max_width_preserving_aspect_ratio(tmp_path, video_dir):
     sizes = []
-    run_vision(tmp_path, [describe_all(record=sizes)] * 5, max_width=200)
+    run_vision(tmp_path, [describe_all(record=sizes)], max_width=200)
 
-    assert len(sizes) == 5
-    for w, h in sizes:
-        assert w == 200
-        assert abs(h / w - FRAME_HEIGHT / FRAME_WIDTH) < 0.01
+    assert len(sizes) == 1  # une seule planche, les 5 images selectionnees cote a cote
+    w, h = sizes[0]
+    assert w == 200 * 5
+    assert abs((h - LABEL_HEIGHT) / 200 - FRAME_HEIGHT / FRAME_WIDTH) < 0.01
 
 
-def test_images_narrower_than_max_width_are_not_upscaled(tmp_path, video_dir):
+def test_montage_cells_are_not_upscaled_past_original_width(tmp_path, video_dir):
     sizes = []
-    run_vision(tmp_path, [describe_all(record=sizes)] * 5, max_width=4000)
+    run_vision(tmp_path, [describe_all(record=sizes)], max_width=4000)
 
-    assert sizes and set(sizes) == {(FRAME_WIDTH, FRAME_HEIGHT)}
+    assert len(sizes) == 1
+    w, h = sizes[0]
+    assert w == FRAME_WIDTH * 5
+    assert h == FRAME_HEIGHT + LABEL_HEIGHT
 
 
 def test_original_frame_files_are_untouched_after_resize(tmp_path, video_dir):
@@ -421,24 +474,23 @@ def test_parallel_defaults_to_four(tmp_path, video_dir):
 
 
 def test_vision_json_order_matches_sequential_regardless_of_batch_completion_order(tmp_path, video_dir):
-    """Chaque lot est decrit d'apres son propre contenu (pas d'apres l'ordre
-    d'arrivee des reponses scriptees) : le resultat final reste trie par
-    timecode, quel que soit l'ordre d'execution des threads."""
+    """Chaque lot est decrit d'apres son propre contenu (le timecode lu dans
+    sa propre planche/prompt, pas d'apres l'ordre d'arrivee des reponses
+    scriptees ni l'ordre d'appel du backend) : le resultat final reste trie
+    par timecode, quel que soit l'ordre d'execution des threads."""
 
-    def make_response(batch_index):
-        def respond(request):
-            time.sleep(0.01 * (5 - batch_index))  # ordre d'arrivee inverse
-            return {"frames": [{"index": 0, "description": f"lot{batch_index}", "tags": [], "striking": False}]}
+    def respond(request):
+        t = float(re.search(r"Image \d+ : ([\d.]+) s", request.prompt).group(1))
+        time.sleep(0.01 * (400.0 - t) / 100)  # ordre d'arrivee inverse au timecode
+        return {"frames": [{"index": 0, "description": f"lot{t:.1f}", "tags": [], "striking": False}]}
 
-        return respond
-
-    fake, path = run_vision(
-        tmp_path, [make_response(i) for i in range(5)], batch_size=1, parallel=5
-    )
+    fake, path = run_vision(tmp_path, [respond], batch_size=1, parallel=5)
 
     data = json.loads(path.read_text(encoding="utf-8"))
     assert [f["timecode"] for f in data["frames"]] == [91.0, 115.0, 139.0, 295.0, 335.0]
-    assert [f["description"] for f in data["frames"]] == [f"lot{i}" for i in range(5)]
+    assert [f["description"] for f in data["frames"]] == [
+        f"lot{t:.1f}" for t in (91.0, 115.0, 139.0, 295.0, 335.0)
+    ]
 
 
 # --------------------------------------------------------------------------
@@ -448,15 +500,17 @@ def test_vision_json_order_matches_sequential_regardless_of_batch_completion_ord
 
 
 def test_partial_file_stays_valid_after_concurrent_batch_writes(tmp_path, video_dir):
-    def boom(request):
-        raise llm.TransientLLMError("quota")
+    # le lot qui echoue est choisi par son propre contenu (timecode 139.0,
+    # 3e des 5 lots par ordre de timecode), pas par l'ordre d'appel du
+    # backend : construire la planche est desormais fait dans chaque thread,
+    # donc cet ordre n'est plus deterministe.
+    def respond(request):
+        if "139.0 s" in request.prompt:
+            raise llm.TransientLLMError("quota")
+        return describe_all()(request)
 
     with pytest.raises(llm.TransientLLMError):
-        run_vision(
-            tmp_path,
-            [describe_all(), describe_all(), boom, describe_all(), describe_all()],
-            batch_size=1, parallel=4,
-        )
+        run_vision(tmp_path, [respond], batch_size=1, parallel=4)
 
     partial = json.loads((video_dir / "vision_partial.json").read_text(encoding="utf-8"))
     assert sorted(int(k) for k in partial["batches"]) == [0, 1, 3, 4]
@@ -464,12 +518,13 @@ def test_partial_file_stays_valid_after_concurrent_batch_writes(tmp_path, video_
 
 
 def test_retry_after_batch_failure_does_not_redescribe_completed_batches(tmp_path, video_dir):
+    def respond(request):
+        if "115.0 s" in request.prompt:
+            raise llm.TransientLLMError("quota")
+        return describe_all()(request)
+
     with pytest.raises(llm.TransientLLMError):
-        run_vision(
-            tmp_path,
-            [describe_all(), llm.TransientLLMError("quota"), describe_all(), describe_all(), describe_all()],
-            batch_size=1, parallel=4,
-        )
+        run_vision(tmp_path, [respond], batch_size=1, parallel=4)
     partial_before = json.loads((video_dir / "vision_partial.json").read_text(encoding="utf-8"))
     assert sorted(int(k) for k in partial_before["batches"]) == [0, 2, 3, 4]
 

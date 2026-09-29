@@ -16,13 +16,18 @@ Seules les images dont le timecode tombe dans la fenetre (``window_seconds``
 de chaque cote) d'un moment retenu, ou d'un moment rejete pour score sous
 min_score que le bonus visuel de rubric.toml (dans la limite de
 [bonus].max_total) suffirait a faire remonter, partent au LLM : les autres
-rejetes ne sont pas decrits. Les images sont reduites a ``max_width`` pixels
-de large (proportions conservees) dans un dossier temporaire du workspace,
-supprime en fin d'etape ; les originaux ne sont jamais modifies. Les lots
-(``batch_size`` images chacun) sont traites jusqu'a ``parallel`` a la fois ;
-chaque lot reussi est enregistre au fil de l'eau dans vision_partial.json
-(ecriture atomique, verrou), relu au demarrage pour ne pas redemander un lot
-deja decrit apres une relance.
+rejetes ne sont pas decrits. Chaque lot (``batch_size`` images chacun) est
+assemble en une seule planche : une grille horizontale, chaque image reduite
+a ``max_width`` pixels de large (proportions conservees, jamais agrandie) et
+legendee sur l'image (index, timecode) ; un seul fichier part au LLM par
+appel, dans un dossier temporaire du workspace supprime en fin d'etape (les
+originaux ne sont jamais modifies). Ce montage evite qu'un backend qui lit
+les images une a une (ex. ``claude -p`` via l'outil Read, cf. clipper.llm.
+claude_cli) ne fasse un tour de contexte par image d'un meme lot. Les lots
+sont traites jusqu'a ``parallel`` a la fois ; chaque lot reussi est
+enregistre au fil de l'eau dans vision_partial.json (ecriture atomique,
+verrou), relu au demarrage pour ne pas redemander un lot deja decrit apres
+une relance.
 
 L'etape moments, relancee par clipper.pipeline, lit ``frames`` (description
 et ``striking``) et peut reviser ses notes. Reponse invalide ou LLM
@@ -39,19 +44,27 @@ from pathlib import Path
 from typing import Any
 
 import cv2
+import numpy as np
 
 from clipper import llm
 
 CONFIG_DEFAULTS: dict[str, object] = {
     # Marge autour de chaque moment candidat, en secondes.
     "window_seconds": 10,
-    # Images jointes par appel au LLM.
+    # Images assemblees dans une meme planche, par appel au LLM.
     "batch_size": 8,
-    # Largeur max des images envoyees au LLM, proportions conservees.
+    # Largeur max de chaque image dans la planche, proportions conservees.
     "max_width": 768,
     # Lots traites en meme temps (appels clipper.llm en sous-processus).
     "parallel": 4,
 }
+
+# Hauteur de la bande de legende (index, timecode) au-dessus de chaque image
+# de la planche ; fait partie du format de sortie, pas un detail interne.
+LABEL_HEIGHT = 28
+_LABEL_FONT = cv2.FONT_HERSHEY_SIMPLEX
+_LABEL_SCALE = 0.6
+_LABEL_COLOR = (255, 255, 255)
 
 
 class VisionError(Exception):
@@ -98,7 +111,9 @@ def _prompt(batch: list[dict[str, Any]]) -> str:
     listing = "\n".join(f"Image {n} : {f['timecode']:.1f} s" for n, f in enumerate(batch))
     return (
         "Tu aides un monteur de clips verticaux courts (TikTok, Shorts, Reels) tires de videos "
-        "longues. Voici des images cles extraites de la video, jointes dans cet ordre :\n"
+        f"longues. La planche jointe est une grille de {len(batch)} images cles extraites de la "
+        "video, disposees cote a cote dans cet ordre, chacune legendee sur l'image avec son index "
+        "et son timecode :\n"
         f"{listing}\n\n"
         "Pour chaque image (index = son numero) : une description concrete de ce qu'on voit "
         "(personnes, action, expression, texte a l'ecran), quelques tags, et striking = true "
@@ -169,15 +184,40 @@ def _settings(config: Any) -> dict[str, Any]:
     return {**CONFIG_DEFAULTS, **config.section("vision")}
 
 
-def _resized_copy(path: Path, dest_dir: Path, max_width: int, index: int) -> Path:
-    image = cv2.imread(str(path))
-    if image is None:
-        raise VisionError(f"image illisible : {path}")
+def _labeled_cell(image: np.ndarray, index: int, timecode: float, target_h: int) -> np.ndarray:
     h, w = image.shape[:2]
-    if w > max_width:
-        image = cv2.resize(image, (max_width, max(1, round(h * max_width / w))))
-    dest = dest_dir / f"{index:05d}_{Path(path).name}"
-    if not cv2.imwrite(str(dest), image):
+    if h < target_h:
+        image = np.vstack([image, np.zeros((target_h - h, w, 3), dtype=image.dtype)])
+    label = np.zeros((LABEL_HEIGHT, w, 3), dtype=np.uint8)
+    cv2.putText(
+        label, f"Image {index} : {timecode:.1f} s", (4, LABEL_HEIGHT - 8),
+        _LABEL_FONT, _LABEL_SCALE, _LABEL_COLOR, 1, cv2.LINE_AA,
+    )
+    return np.vstack([label, image])
+
+
+def _montage(batch: list[dict[str, Any]], video_dir: Path, dest_dir: Path, max_width: int, index: int) -> Path:
+    """Assemble ``batch`` (deja trie par timecode) en une planche unique :
+    grille horizontale, chaque image reduite a ``max_width`` (jamais
+    agrandie) et legendee avec son index et son timecode."""
+    images = []
+    for f in batch:
+        path = video_dir / f["path"]
+        image = cv2.imread(str(path))
+        if image is None:
+            raise VisionError(f"image illisible : {path}")
+        h, w = image.shape[:2]
+        if w > max_width:
+            image = cv2.resize(image, (max_width, max(1, round(h * max_width / w))))
+        images.append(image)
+    target_h = max(image.shape[0] for image in images)
+    cells = [
+        _labeled_cell(image, n, f["timecode"], target_h)
+        for n, (image, f) in enumerate(zip(images, batch))
+    ]
+    montage = np.hstack(cells)
+    dest = dest_dir / f"{index:05d}_montage.jpg"
+    if not cv2.imwrite(str(dest), montage):
         raise VisionError(f"ecriture impossible : {dest}")
     return dest
 
@@ -241,10 +281,11 @@ def run(
 
     def process(n: int) -> None:
         batch = batches[n]
+        montage = _montage(batch, video_dir, resize_dir, max_width, n)
         answer = llm.ask(
             "vision",
             _prompt(batch),
-            [resized[f["path"]] for f in batch],
+            [montage],
             response_schema(len(batch)),
             config=config,
         )
@@ -268,10 +309,6 @@ def run(
     resize_dir = video_dir / "vision_resize_tmp"
     resize_dir.mkdir(exist_ok=True)
     try:
-        resized = {
-            f["path"]: _resized_copy(video_dir / f["path"], resize_dir, max_width, n)
-            for n, f in enumerate(selected)
-        }
         pending = [n for n in range(len(batches)) if results[n] is None]
         if pending:
             with ThreadPoolExecutor(max_workers=max(1, parallel)) as executor:
