@@ -120,6 +120,18 @@ def fake_extractor(video_path, audio_path):
     Path(audio_path).write_bytes(b"RIFF fake wav")
 
 
+class FakePipeline:
+    """Imite BatchedInferencePipeline (le vrai gere le batching en interne ;
+    ici on verifie seulement le branchement et le batch_size transmis) :
+    delegue tel quel au transcribe() du modele qu'elle enveloppe."""
+
+    def __init__(self, model):
+        self.model = model
+
+    def transcribe(self, audio, **kwargs):
+        return self.model.transcribe(audio, **kwargs)
+
+
 def make_config(tmp_path, **transcribe):
     return Config(
         mode="review",
@@ -158,6 +170,7 @@ def run(tmp_path, factory, config=None, **kwargs):
     from clipper.transcribe import transcribe
 
     config = config or make_config(tmp_path)
+    kwargs.setdefault("pipeline_factory", FakePipeline)
     return transcribe(
         VIDEO_ID,
         tmp_path / "workspace",
@@ -857,6 +870,54 @@ def test_default_fix_chunk_words_and_fix_parallel(tmp_path):
 
     assert CONFIG_DEFAULTS["fix_chunk_words"] == 3000
     assert CONFIG_DEFAULTS["fix_parallel"] == 4
+
+
+def test_default_batch_size_is_8(tmp_path):
+    from clipper.transcribe import CONFIG_DEFAULTS
+
+    assert CONFIG_DEFAULTS["batch_size"] == 8
+
+
+# --------------------------------------------------------------------------
+# TASK-746b (banc docs/bench-whisper-vitesse.md) : BatchedInferencePipeline,
+# batch_size de la config ; sequentiel (WhisperModel.transcribe direct) si
+# batch_size <= 1.
+# --------------------------------------------------------------------------
+
+
+def test_batched_pipeline_wraps_the_model_with_batch_size_from_config(tmp_path, video_dir, cpu):
+    factory = ModelFactory()
+    built_with = []
+
+    def pipeline_factory(model):
+        built_with.append(model)
+        return FakePipeline(model)
+
+    with llm.use_backend(FakeBackend([VOCAB, NO_FIX])):
+        run(tmp_path, factory, pipeline_factory=pipeline_factory)
+
+    assert len(built_with) == 1
+    assert factory.kwargs_seen["batch_size"] == 8
+
+
+@pytest.mark.parametrize("batch_size", [0, 1])
+def test_batch_size_at_most_1_runs_sequentially_without_a_pipeline(tmp_path, video_dir, cpu, batch_size):
+    factory = ModelFactory()
+    built_with = []
+
+    def pipeline_factory(model):
+        built_with.append(model)
+        return FakePipeline(model)
+
+    with llm.use_backend(FakeBackend([VOCAB, NO_FIX])):
+        run(
+            tmp_path, factory,
+            config=make_config(tmp_path, batch_size=batch_size),
+            pipeline_factory=pipeline_factory,
+        )
+
+    assert built_with == []
+    assert "batch_size" not in factory.kwargs_seen
 
 
 def test_config_section_is_accepted_by_clipper_config(tmp_path):

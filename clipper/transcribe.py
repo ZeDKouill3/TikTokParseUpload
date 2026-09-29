@@ -16,9 +16,13 @@ Deroulement :
    un LLM local et whisper en meme temps, ADR-fb9b), raccourcis a
    ``vocab_max_tokens`` tokens pour tenir dans la fenetre du decodeur
    (journalise ; transcript.json et la correction gardent tout) ;
-2. extraction de l'audio (ffmpeg, wav 16 kHz mono), transcription, puis
-   liberation du modele ; le resultat brut est ecrit dans
-   transcript_raw.json avant la correction ;
+2. extraction de l'audio (ffmpeg, wav 16 kHz mono), transcription via
+   ``BatchedInferencePipeline`` (``batch_size`` de la config, defaut 8 ;
+   ~4,9x plus rapide qu'un ``WhisperModel.transcribe`` sequentiel sur une
+   video reelle, sans perte de mots mais ponctuation/majuscules internes
+   moins riches, banc docs/bench-whisper-vitesse.md), ou sequentiel si
+   ``batch_size <= 1`` ; puis liberation du modele et ecriture du resultat
+   brut dans transcript_raw.json avant la correction ;
 3. usage ``transcript_fix`` par tranches de ``fix_chunk_words`` mots,
    jusqu'a ``fix_parallel`` tranches en meme temps (threads : les appels
    clipper.llm sont des sous-processus) : la reponse ne liste que des
@@ -60,6 +64,11 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "language": None,
     "beam_size": 5,
     "vad_filter": True,
+    # Taille de lot BatchedInferencePipeline (banc TASK-be65 : ~4,9x plus
+    # rapide que le sequentiel sur une video reelle, sans perte de mots,
+    # docs/bench-whisper-vitesse.md). <= 1 = sequentiel (WhisperModel.transcribe
+    # direct, comportement d'avant ce reglage).
+    "batch_size": 8,
     # Vocabulaire de noms propres demande a clipper.llm (usage vocab).
     "vocab": True,
     # Tokens maximum du vocabulaire passe a whisper en initial_prompt :
@@ -127,6 +136,12 @@ def _whisper_model(name: str, device: str, compute_type: str) -> Any:
     from faster_whisper import WhisperModel
 
     return WhisperModel(name, device=device, compute_type=compute_type)
+
+
+def _batched_pipeline(model: Any) -> Any:
+    from faster_whisper import BatchedInferencePipeline
+
+    return BatchedInferencePipeline(model)
 
 
 def _cuda_dll_dirs() -> list[Path]:
@@ -246,6 +261,7 @@ def _run_whisper(
     audio_path: Path,
     settings: dict[str, Any],
     vocab: list[str],
+    pipeline_factory: Callable[[Any], Any] = _batched_pipeline,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     device = get_device()
     options: dict[str, Any] = {
@@ -261,7 +277,12 @@ def _run_whisper(
         prompt_vocab = _whisper_vocab(model, vocab, int(settings["vocab_max_tokens"]))
         if prompt_vocab:
             options["initial_prompt"] = ", ".join(prompt_vocab)
-        raw_segments, info = model.transcribe(str(audio_path), **options)
+        batch_size = int(settings["batch_size"])
+        if batch_size > 1:
+            runner = pipeline_factory(model)
+            raw_segments, info = runner.transcribe(str(audio_path), batch_size=batch_size, **options)
+        else:
+            raw_segments, info = model.transcribe(str(audio_path), **options)
         segments = [_segment_dict(seg) for seg in raw_segments]
         header = {
             "language": info.language,
@@ -407,6 +428,7 @@ def transcribe(
     force: bool = False,
     model_factory: Callable[[str, str, str], Any] = _whisper_model,
     audio_extractor: Callable[[Path, Path], None] = extract_audio,
+    pipeline_factory: Callable[[Any], Any] = _batched_pipeline,
 ) -> Path:
     """Transcrit workspace/<video_id>/<video_id>.mp4 dans transcript.json et
     renvoie ce chemin. Un transcript deja present n'est pas refait, sauf
@@ -442,7 +464,7 @@ def transcribe(
         audio = video_dir / "transcribe_audio.wav"
         try:
             audio_extractor(video, audio)
-            segments, header = _run_whisper(model_factory, audio, settings, vocab)
+            segments, header = _run_whisper(model_factory, audio, settings, vocab, pipeline_factory)
         finally:
             audio.unlink(missing_ok=True)
 

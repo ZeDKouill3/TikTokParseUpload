@@ -127,6 +127,19 @@ def fake_audio_extractor(video_path, audio_path):
     Path(audio_path).write_bytes(b"RIFF")
 
 
+class FakeWhisperPipeline:
+    """Imite BatchedInferencePipeline (TASK-746b, batch_size par defaut de
+    clipper.transcribe) : delegue tel quel au transcribe() du faux modele
+    whisper de WhisperFactory, qui n'a pas les attributs internes (comme
+    feature_extractor) qu'exige le vrai BatchedInferencePipeline."""
+
+    def __init__(self, model):
+        self.model = model
+
+    def transcribe(self, audio, **kwargs):
+        return self.model.transcribe(audio, **kwargs)
+
+
 class DetectorFactory:
     """Aucun visage ; verifie a la construction que whisper est deja libere
     (un seul modele lourd en VRAM, ADR-fb9b)."""
@@ -153,7 +166,10 @@ def step_options(source, whisper=None):
     whisper = whisper or WhisperFactory()
     return {
         "download": {"ydl_factory": fake_ydl(source)},
-        "transcribe": {"model_factory": whisper, "audio_extractor": fake_audio_extractor},
+        "transcribe": {
+            "model_factory": whisper, "audio_extractor": fake_audio_extractor,
+            "pipeline_factory": FakeWhisperPipeline,
+        },
         "reframe": {"detector_factory": DetectorFactory(whisper)},
     }
 
