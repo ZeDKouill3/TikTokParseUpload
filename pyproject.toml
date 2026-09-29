@@ -40,3 +40,6 @@ clipper = ["assets/**/*", "web/static/**/*"]
 # garder un seul paquet OpenCV installe : opencv-contrib-python, sur-ensemble de
 # opencv-python, satisfait cv2 pour scenedetect comme pour mediapipe.
 override-dependencies = ["opencv-python; sys_platform == 'never'"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "tools"]

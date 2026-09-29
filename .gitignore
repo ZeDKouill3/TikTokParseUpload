@@ -7,3 +7,6 @@ config.toml
 *.egg-info/
 __pycache__/
 *.pyc
+
+# Dossier de travail local (planches, bancs, sauvegardes) : jamais commite
+research/
