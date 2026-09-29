@@ -170,3 +170,186 @@ def test_detect_scenes_force_recomputes_even_if_scenes_json_exists(
     result = detect_scenes(three_scene_video, workspace_dir, "vid1", force=True)
 
     assert len(result["scenes"]) == 3
+
+
+# -- TASK-1f16 : analyse reduite, keyframes pleine resolution, decodeur strict --
+
+
+@pytest.fixture
+def hd_three_scene_video(tmp_path):
+    """640x360 at 50 fps: wider than the analysis width and faster than the
+    analysis frame rate bound used below, cuts at 2 s and 4 s."""
+    video_path = tmp_path / "hd_three_scenes.mp4"
+    _make_color_video(
+        video_path, ["red", "blue", "green"], segment_seconds=2.0, size="640x360", fps=50
+    )
+    return video_path
+
+
+@pytest.fixture
+def recorded_analysis_frames(monkeypatch):
+    """Record the shape of every frame handed to the content detector."""
+    import clipper.scenes as scenes_module
+
+    shapes: list[tuple[int, ...]] = []
+    real_detector = scenes_module.ContentDetector
+
+    class RecordingDetector(real_detector):
+        def process_frame(self, timecode, frame_img):
+            shapes.append(frame_img.shape)
+            return super().process_frame(timecode, frame_img)
+
+    monkeypatch.setattr(scenes_module, "ContentDetector", RecordingDetector)
+    return shapes
+
+
+def test_config_defaults_declares_reduced_decoding_options():
+    from clipper.scenes import CONFIG_DEFAULTS
+
+    assert CONFIG_DEFAULTS["analysis_width"] == 256
+    assert CONFIG_DEFAULTS["analysis_max_fps"] == 30.0
+    assert CONFIG_DEFAULTS["decoder"] == ""
+
+
+def test_detect_scenes_accepts_every_config_default_as_keyword(isolated_cwd, three_scene_video):
+    """clipper.pipeline passes the whole [scenes] section as keywords."""
+    from clipper.scenes import CONFIG_DEFAULTS, detect_scenes
+
+    result = detect_scenes(three_scene_video, isolated_cwd / "workspace", "vid1", **CONFIG_DEFAULTS)
+
+    assert len(result["scenes"]) == 3
+
+
+def test_detection_analyses_frames_at_reduced_width(
+    isolated_cwd, hd_three_scene_video, recorded_analysis_frames
+):
+    from clipper.scenes import detect_scenes
+
+    detect_scenes(
+        hd_three_scene_video, isolated_cwd / "workspace", "vid1",
+        analysis_width=160, analysis_max_fps=50.0,
+    )
+
+    assert recorded_analysis_frames
+    assert {shape[:2] for shape in recorded_analysis_frames} == {(90, 160)}
+
+
+def test_detection_analyses_at_most_analysis_max_fps(
+    isolated_cwd, hd_three_scene_video, recorded_analysis_frames
+):
+    from clipper.scenes import detect_scenes
+
+    detect_scenes(
+        hd_three_scene_video, isolated_cwd / "workspace", "vid1", analysis_max_fps=10.0
+    )
+
+    # 6 s de video a 50 fps, analysee a 10 fps -> ~60 images (300 a pleine cadence)
+    assert 55 <= len(recorded_analysis_frames) <= 65
+
+
+def test_cuts_stay_within_half_a_second_with_reduced_analysis(isolated_cwd, hd_three_scene_video):
+    from clipper.scenes import detect_scenes
+
+    result = detect_scenes(
+        hd_three_scene_video, isolated_cwd / "workspace", "vid1",
+        analysis_width=128, analysis_max_fps=10.0,
+    )
+
+    starts = [scene["start"] for scene in result["scenes"]]
+    assert len(starts) == 3
+    assert starts[0] == pytest.approx(0.0, abs=0.5)
+    assert starts[1] == pytest.approx(2.0, abs=0.5)
+    assert starts[2] == pytest.approx(4.0, abs=0.5)
+    assert result["scenes"][-1]["end"] == pytest.approx(6.0, abs=0.5)
+
+
+def test_keyframes_are_extracted_at_full_resolution(isolated_cwd, hd_three_scene_video):
+    import cv2
+
+    from clipper.scenes import detect_scenes
+
+    workspace_dir = isolated_cwd / "workspace"
+    result = detect_scenes(
+        hd_three_scene_video, workspace_dir, "vid1",
+        analysis_width=160, keyframe_interval_seconds=100.0,
+    )
+
+    assert len(result["frames"]) == 3
+    for frame in result["frames"]:
+        image = cv2.imread(str(workspace_dir / "vid1" / frame["path"]))
+        assert image.shape[:2] == (360, 640)
+
+
+def test_keyframes_show_the_image_at_their_timecode(isolated_cwd, hd_three_scene_video):
+    """Scene 0 is red, 1 blue, 2 green: the keyframe of each scene is taken
+    at its middle and must show that scene's colour (BGR)."""
+    import cv2
+
+    from clipper.scenes import detect_scenes
+
+    workspace_dir = isolated_cwd / "workspace"
+    result = detect_scenes(
+        hd_three_scene_video, workspace_dir, "vid1", keyframe_interval_seconds=100.0
+    )
+
+    dominant = []
+    for frame in result["frames"]:
+        image = cv2.imread(str(workspace_dir / "vid1" / frame["path"]))
+        dominant.append(int(image.reshape(-1, 3).mean(axis=0).argmax()))
+    assert dominant == [2, 0, 1]
+
+
+def test_scenes_json_keeps_its_format(isolated_cwd, three_scene_video):
+    from clipper.scenes import detect_scenes
+
+    workspace_dir = isolated_cwd / "workspace"
+    detect_scenes(three_scene_video, workspace_dir, "vid1")
+
+    on_disk = json.loads((workspace_dir / "vid1" / "scenes.json").read_text(encoding="utf-8"))
+    assert set(on_disk) == {"scenes", "frames"}
+    for scene in on_disk["scenes"]:
+        assert set(scene) == {"start", "end"}
+        assert isinstance(scene["start"], float) and isinstance(scene["end"], float)
+    for frame in on_disk["frames"]:
+        assert set(frame) == {"path", "timecode", "scene"}
+        assert isinstance(frame["timecode"], float) and isinstance(frame["scene"], int)
+
+
+def test_configured_decoder_is_used(isolated_cwd, three_scene_video):
+    from clipper.scenes import detect_scenes
+
+    result = detect_scenes(three_scene_video, isolated_cwd / "workspace", "vid1", decoder="h264")
+
+    assert len(result["scenes"]) == 3
+
+
+def test_unknown_decoder_fails_the_step_without_falling_back(isolated_cwd, three_scene_video):
+    from clipper.scenes import ScenesError, detect_scenes
+
+    workspace_dir = isolated_cwd / "workspace"
+    with pytest.raises(ScenesError, match="decodeur_inexistant"):
+        detect_scenes(three_scene_video, workspace_dir, "vid1", decoder="decodeur_inexistant")
+
+    assert not (workspace_dir / "vid1" / "scenes.json").exists()
+
+
+def test_decoder_unable_to_decode_the_stream_fails_the_step(isolated_cwd, three_scene_video):
+    """A decoder that exists but does not match the stream (vp9 on h264)
+    is a failure, never a silent switch to another decoder."""
+    from clipper.scenes import ScenesError, detect_scenes
+
+    workspace_dir = isolated_cwd / "workspace"
+    with pytest.raises(ScenesError, match="vp9"):
+        detect_scenes(three_scene_video, workspace_dir, "vid1", decoder="vp9")
+
+    assert not (workspace_dir / "vid1" / "scenes.json").exists()
+
+
+def test_missing_ffmpeg_fails_the_step_with_a_clear_message(isolated_cwd, three_scene_video):
+    from clipper.scenes import ScenesError, detect_scenes
+
+    with pytest.raises(ScenesError, match="introuvable"):
+        detect_scenes(
+            three_scene_video, isolated_cwd / "workspace", "vid1",
+            ffmpeg_bin="ffmpeg-absent-du-path",
+        )
