@@ -371,10 +371,14 @@ FIXED = {"retention": 9, "spectateur": 8, "conformite": 5, "monteur": 2, "avocat
 def fixed_jury(request):
     judge = request.usage.removeprefix("jury_")
     refs = re.findall(r"^### (C\d+)$", request.prompt, re.M)
+    # Le schema (partage par tout le modele, TASK-b0fa) dit si veto et
+    # veto_reason sont attendus, pas le nom du juge (spectateur/conformite
+    # partagent le modele "fast" par defaut).
+    schema_item = request.schema["properties"]["candidates"]["items"]["properties"]
     answer = []
     for ref in refs:
         item = {"ref": ref, "argument": "arg", "scores": {"hook": FIXED[judge]}}
-        if judge == "conformite":
+        if "veto" in schema_item:
             item["veto"], item["veto_reason"] = False, ""
         answer.append(item)
     return {"candidates": answer}

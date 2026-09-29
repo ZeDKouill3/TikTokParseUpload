@@ -2,8 +2,9 @@
 
 Commande construite :
 
-    claude -p --output-format json --model <modele> --tools <Read|"">
-           [--allowedTools Read --add-dir <dossier image>...]
+    claude -p --model <modele> --output-format <json|stream-json>
+           [--input-format stream-json --verbose]  # avec images
+           --tools ""
            [--json-schema <schema JSON compact>]
            --system-prompt <court> --setting-sources "" --no-session-persistence
 
@@ -16,14 +17,14 @@ voies existent :
 - ``--input-format stream-json`` avec un bloc image base64 sur stdin, mais
   cela impose ``--output-format stream-json`` ;
 - donner a Claude le chemin du fichier et l'outil Read, qui lit les images
-  (PNG, JPEG, GIF, WebP) et les lui presente visuellement.
-On prend la seconde, compatible avec ``--output-format json`` : les chemins
-absolus sont listes dans le prompt, ``--tools Read`` ne rend disponible que
-cet outil, ``--allowedTools Read`` evite toute demande de permission (le mode
--p n'a personne pour y repondre) et ``--add-dir`` ouvre l'acces au dossier de
-chaque image. Verifie en reel une fois : image rouge 32x32 -> reponse
-{"couleur": "rouge"} en 2 tours (lecture puis reponse). Sans image, ``--tools
-""`` retire tous les outils.
+  et les presente visuellement, en 2 tours agentiques (lecture puis reponse).
+La seconde a ete mesuree (TASK-b0fa, ivl0nxa3C7o) : chaque tour relit tout le
+contexte, ~90k tokens de cache par appel vision sur la duree d'une video, un
+cout qui ne baisse pas avec une planche unique d'images. On prend donc la
+premiere : les images partent en blocs base64 dans le message utilisateur
+(stdin, stream-json), sans outil (``--tools ""``), reponse en un seul tour.
+Sans image, le prompt reste du texte brut sur stdin (``--output-format
+json``, comportement inchange).
 
 ``--system-prompt`` remplace le prompt systeme de Claude Code (~170k tokens
 de contexte mis en cache par appel sinon) et ``--setting-sources ""`` ignore
@@ -38,14 +39,17 @@ chemin ni ``@fichier``, verifie sur 2.1.281) : le schema passe donc par argv,
 en JSON compact, et une ligne de commande qui depasserait la limite Windows
 est un echec explicite plutot qu'un envoi sans schema.
 
-Sortie (--output-format json) : un objet unique ``{"type": "result",
-"subtype": "success", "is_error": bool, "api_error_status": int|null,
-"result": "<texte de la reponse>", "structured_output": <objet>|absent,
-"num_turns", "session_id", "total_cost_usd", ...}``. Avec --json-schema, la
-reponse deja decodee est dans ``structured_output`` et fait foi ; ``result``
-(texte) ne sert que si elle est absente. Dans les deux cas clipper.llm la
-valide contre le schema. Une erreur API (quota, surcharge) arrive avec
-``is_error: true``, le message dans ``result`` et le code HTTP dans
+Sortie. Avec --output-format json (sans image) : un objet unique ``{"type":
+"result", "subtype": "success", "is_error": bool, "api_error_status":
+int|null, "result": "<texte de la reponse>", "structured_output":
+<objet>|absent, "num_turns", "session_id", "total_cost_usd", ...}``. Avec
+--output-format stream-json (images) : le meme objet arrive en NDJSON, un
+evenement par ligne, celui a retenir etant le dernier ``type: result``
+(``_result_object`` gere les deux formes). Avec --json-schema, la reponse
+deja decodee est dans ``structured_output`` et fait foi ; ``result`` (texte)
+ne sert que si elle est absente. Dans les deux cas clipper.llm la valide
+contre le schema. Une erreur API (quota, surcharge) arrive avec ``is_error:
+true``, le message dans ``result`` et le code HTTP dans
 ``api_error_status``, et un code de sortie non nul.
 """
 
@@ -58,7 +62,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from clipper.llm.backend import LLMRequest, Usage
+from clipper.llm.backend import LLMRequest, Usage, image_b64, image_media_type
 from clipper.llm.errors import LLMError, TransientLLMError
 
 SYSTEM_PROMPT = (
@@ -113,13 +117,27 @@ def resolve_command(command: str) -> str:
     return str(exe) if exe else found
 
 
-def image_prompt(request: LLMRequest) -> str:
+def stdin_input(request: LLMRequest) -> str:
+    """Contenu envoye sur stdin. Sans image : le prompt tel quel (texte
+    brut, ``--output-format json``). Avec images : un unique message
+    ``--input-format stream-json`` dont le contenu liste les blocs image
+    (base64, comme clipper.llm.claude_api) suivis du bloc texte du prompt."""
     if not request.images:
         return request.prompt
-    paths = "\n".join(f"- {p.resolve()}" for p in request.images)
-    return (
-        f"Images a regarder avec l'outil Read (dans cet ordre) :\n{paths}\n\n{request.prompt}"
-    )
+    content: list[dict[str, Any]] = [
+        {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": image_media_type(p),
+                "data": image_b64(p),
+            },
+        }
+        for p in request.images
+    ]
+    content.append({"type": "text", "text": request.prompt})
+    message = {"type": "user", "message": {"role": "user", "content": content}}
+    return json.dumps(message, ensure_ascii=False) + "\n"
 
 
 class ClaudeCLIBackend:
@@ -129,14 +147,16 @@ class ClaudeCLIBackend:
         self.last_usage: Usage | None = None
 
     def build_command(self, request: LLMRequest) -> list[str]:
-        cmd = [resolve_command(self.command), "-p", "--output-format", "json", "--model", request.model]
+        cmd = [resolve_command(self.command), "-p", "--model", request.model]
         if request.images:
-            cmd += ["--tools", "Read", "--allowedTools", "Read"]
-            dirs = dict.fromkeys(str(p.resolve().parent) for p in request.images)
-            for d in dirs:
-                cmd += ["--add-dir", d]
+            # --verbose : requis par le CLI avec --print + --output-format
+            # stream-json (verifie en reel, Claude Code 2.1.281 : "Error:
+            # When using --print, --output-format=stream-json requires
+            # --verbose"), sans effet observe sur la forme du flux NDJSON.
+            cmd += ["--input-format", "stream-json", "--output-format", "stream-json", "--verbose"]
         else:
-            cmd += ["--tools", ""]
+            cmd += ["--output-format", "json"]
+        cmd += ["--tools", ""]
         if request.schema:
             cmd += ["--json-schema", json.dumps(request.schema, ensure_ascii=False, separators=(",", ":"))]
         cmd += [
@@ -157,7 +177,7 @@ class ClaudeCLIBackend:
         try:
             proc = subprocess.run(
                 cmd,
-                input=image_prompt(request),
+                input=stdin_input(request),
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -185,14 +205,38 @@ def _usage_from(data: dict[str, Any]) -> Usage:
     )
 
 
-def parse_output(stdout: str, returncode: int = 0, stderr: str = "") -> tuple[str, Usage]:
-    """Extract the answer from ``claude -p --output-format json`` : the
-    structured output (re-encoded as JSON text) when present, else the
-    ``result`` text ; alongside the call's telemetry (Usage)."""
+def _result_object(stdout: str) -> dict[str, Any] | None:
+    """The final ``{"type": "result", ...}`` object of the response. With
+    ``--output-format json`` (no image), ``stdout`` is that object whole.
+    With ``--output-format stream-json`` (images), ``stdout`` is NDJSON (one
+    event per line) : the last ``type: result`` line is the one that carries
+    the answer and its telemetry, same shape either way."""
     try:
         data = json.loads(stdout)
     except json.JSONDecodeError:
         data = None
+    if isinstance(data, dict):
+        return data
+    result = None
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and obj.get("type") == "result":
+            result = obj
+    return result
+
+
+def parse_output(stdout: str, returncode: int = 0, stderr: str = "") -> tuple[str, Usage]:
+    """Extract the answer from ``claude -p`` output (``--output-format json``
+    or ``stream-json``, see ``_result_object``) : the structured output
+    (re-encoded as JSON text) when present, else the ``result`` text ;
+    alongside the call's telemetry (Usage)."""
+    data = _result_object(stdout)
     if not isinstance(data, dict):
         text = (stderr or stdout or "").strip()[:500]
         message = f"claude -p (code {returncode}) : sortie illisible : {text!r}"

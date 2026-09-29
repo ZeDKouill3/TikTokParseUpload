@@ -164,19 +164,39 @@ def test_claude_cli_builds_print_json_command_and_parses_recorded_output(fake_ru
     assert "De quelle couleur ?" in run.calls[0]["input"]
 
 
-def test_claude_cli_passes_images_as_files_readable_by_read_tool(fake_run, tmp_path):
+def test_claude_cli_passes_images_as_stream_json_blocks_without_read_tool(fake_run, tmp_path):
     img = tmp_path / "frames" / "f001.jpg"
     img.parent.mkdir()
-    img.write_bytes(b"\xff\xd8")
+    img_bytes = b"\xff\xd8fake-jpeg-bytes"
+    img.write_bytes(img_bytes)
     run = fake_run(json.dumps(RECORDED_CLAUDE_CLI_OK))
 
     llm.ask("vision", "Decris.", [img], COLOR_SCHEMA, config=make_config())
 
     cmd = run.calls[0]["cmd"]
-    assert cmd[cmd.index("--tools") + 1] == "Read"
-    assert cmd[cmd.index("--allowedTools") + 1] == "Read"
-    assert cmd[cmd.index("--add-dir") + 1] == str(img.parent.resolve())
-    assert str(img.resolve()) in run.calls[0]["input"]
+    # Ni outil Read ni --add-dir : les images partent dans le message, pas
+    # lues depuis le disque par un tour agentique (TASK-b0fa).
+    assert "Read" not in cmd
+    assert "--add-dir" not in cmd
+    assert "--allowedTools" not in cmd
+    assert cmd[cmd.index("--tools") + 1] == ""
+    assert cmd[cmd.index("--input-format") + 1] == "stream-json"
+    assert cmd[cmd.index("--output-format") + 1] == "stream-json"
+    assert "--verbose" in cmd
+
+    stdin = run.calls[0]["input"]
+    message = json.loads(stdin)
+    assert message["type"] == "user"
+    content = message["message"]["content"]
+    image_blocks = [b for b in content if b["type"] == "image"]
+    text_blocks = [b for b in content if b["type"] == "text"]
+    assert len(image_blocks) == 1
+    assert image_blocks[0]["source"]["type"] == "base64"
+    assert image_blocks[0]["source"]["media_type"] == "image/jpeg"
+    import base64 as _b64
+
+    assert _b64.b64decode(image_blocks[0]["source"]["data"]) == img_bytes
+    assert any("Decris." in b["text"] for b in text_blocks)
 
 
 def test_claude_cli_without_images_disables_all_tools(fake_run):
@@ -983,5 +1003,9 @@ def test_integration_real_claude_cli_imposes_array_schema_on_image(monkeypatch, 
     )
 
     assert out == {"bandes": ["rouge", "vert", "bleu"]}
-    # La reponse est bien venue du canal structure impose par --json-schema.
-    assert json.loads(outputs[0])["structured_output"] == out
+    # La reponse est bien venue du canal structure impose par --json-schema ;
+    # avec une image, --output-format stream-json rend un NDJSON (un event
+    # par ligne), l'evenement final (type: result) porte la reponse.
+    from clipper.llm.claude_cli import _result_object
+
+    assert _result_object(outputs[0])["structured_output"] == out
