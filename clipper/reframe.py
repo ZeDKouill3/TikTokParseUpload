@@ -116,8 +116,24 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "facecam_corner_size": 0.3,
     "facecam_corner_zoom": 2.0,
     # Rectangle source de la facecam : au format du panneau camera, centre
-    # sur le visage, qui en occupe cette part de la hauteur.
+    # sur le visage, qui en occupe cette part de la hauteur. Repli quand les
+    # bords reels de l'incrustation ne sont pas trouves (voir plus bas).
     "stream_face_height": 0.5,
+    # Bords reels de l'incrustation (TASK-6404), cherches de part et d'autre
+    # du visage stable plutot que devines depuis sa seule taille : premiere
+    # position, en s'eloignant du visage, ou le gradient moyen (colonne pour
+    # les bords gauche/droit, ligne pour haut/bas, sur l'etendue du visage)
+    # depasse facecam_edge_min_gradient sur au moins facecam_edge_min_share
+    # des images cles -- une discontinuite forte et constante. La recherche
+    # part du bord du visage elargi de facecam_edge_gap_ratio (fraction de sa
+    # largeur/hauteur, pour sauter son propre contour) et s'arrete a
+    # facecam_edge_search_ratio fois sa largeur/hauteur. Si un bord manque,
+    # repli sur le rectangle centre sur le visage (stream_face_height
+    # ci-dessus), raison journalisee (ADR-ad2e).
+    "facecam_edge_gap_ratio": 0.05,
+    "facecam_edge_search_ratio": 3.0,
+    "facecam_edge_min_gradient": 30.0,
+    "facecam_edge_min_share": 0.8,
     # Panneau camera : part de la hauteur de sortie, a partir de stream_top
     # (titre d'ecran au-dessus) ; le jeu occupe tout le bas.
     "stream_camera_ratio": 0.4,
@@ -1132,26 +1148,137 @@ def _camera_size(settings: dict[str, Any]) -> tuple[int, int, int]:
     return out_w, _even(out_h * float(settings["stream_camera_ratio"])), int(settings["stream_top"])
 
 
-def _facecam_rect(
-    face: Box, width: int, height: int, settings: dict[str, Any]
+def _size_camera_rect(
+    cx: float, cy: float, bw: float, bh: float, width: int, height: int, settings: dict[str, Any]
 ) -> tuple[tuple[int, int, int, int] | None, str | None]:
-    """Rectangle source de la facecam : au format du panneau camera, centre
-    sur le visage stable (qui en occupe ``stream_face_height`` de la
-    hauteur), ramene dans l'image ; ``None`` et la raison s'il ne tient pas
-    ou depasse ``facecam_max_area`` de l'image."""
+    """Rectangle centre sur (``cx``, ``cy``), agrandi au format du panneau
+    camera pour contenir une zone ``bw`` x ``bh``, ramene dans l'image ;
+    ``None`` et la raison s'il ne tient pas ou depasse ``facecam_max_area``
+    de l'image."""
     cam_w, cam_h, _ = _camera_size(settings)
-    h = _even((face[3] - face[1]) / float(settings["stream_face_height"]))
-    w = _even(h * cam_w / cam_h)
+    aspect = cam_w / cam_h
+    if bw / bh > aspect:
+        bh = bw / aspect
+    else:
+        bw = bh * aspect
+    w, h = _even(bw), _even(bh)
     max_area = float(settings["facecam_max_area"])
     if w > width or h > height or w * h >= max_area * width * height:
         return None, (
-            f"zone du visage stable ({w}x{h} px au format du panneau camera) pas plus petite qu'un quart "
+            f"zone de l'incrustation ({w}x{h} px au format du panneau camera) pas plus petite qu'un quart "
             f"(facecam_max_area = {max_area:g}) de l'image {width}x{height} : pas une incrustation"
         )
-    cx, cy = _center(face)
     x = min(max(round(cx - w / 2), 0), width - w)
     y = min(max(round(cy - h / 2), 0), height - h)
     return (x, y, w, h), None
+
+
+def _facecam_rect_from_face(
+    face: Box, width: int, height: int, settings: dict[str, Any]
+) -> tuple[tuple[int, int, int, int] | None, str | None]:
+    """Repli : rectangle source de la facecam au format du panneau camera,
+    centre sur le seul visage stable (qui en occupe ``stream_face_height`` de
+    la hauteur) -- utilise quand les bords reels de l'incrustation ne sont
+    pas trouves (voir ``_incrustation_rect``)."""
+    cx, cy = _center(face)
+    bh = (face[3] - face[1]) / float(settings["stream_face_height"])
+    cam_w, cam_h, _ = _camera_size(settings)
+    return _size_camera_rect(cx, cy, bh * cam_w / cam_h, bh, width, height, settings)
+
+
+def _edge_mask(image: np.ndarray, threshold: float) -> np.ndarray:
+    """Pixels ou le gradient (Sobel) de l'image en niveaux de gris depasse
+    ``threshold`` : une image cle a la fois (pas de pile en memoire, une
+    video peut avoir des milliers d'images cles)."""
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.float64)
+    gx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+    return np.hypot(gx, gy) >= threshold
+
+
+def _edge_position(
+    counts: np.ndarray, n_frames: int, axis: str, lo: int, hi: int, start: int, step: int, limit: int, min_share: float
+) -> int | None:
+    """Premiere position, en s'eloignant de ``start`` par pas de ``step``
+    jusqu'a ``limit`` (les deux inclus), ou la part des images cles ou le
+    gradient depasse le seuil (``counts``, cumule par ``_edge_mask``), moyennee
+    sur [``lo``, ``hi``) (colonne ``pos`` si ``axis`` == "x", ligne sinon),
+    atteint ``min_share`` ; ``None`` si aucune position ne convient."""
+    if hi <= lo or n_frames <= 0:
+        return None
+    pos = start
+    while (step > 0 and pos <= limit) or (step < 0 and pos >= limit):
+        band = counts[lo:hi, pos] if axis == "x" else counts[pos, lo:hi]
+        if band.mean() / n_frames >= min_share - 1e-9:
+            return pos
+        pos += step
+    return None
+
+
+def _incrustation_rect(
+    counts: np.ndarray, n_frames: int, face: Box, width: int, height: int, settings: dict[str, Any]
+) -> tuple[Box | None, str | None]:
+    """Bords reels de l'incrustation autour du visage stable ``face`` :
+    premiere discontinuite forte et constante (``counts``, voir
+    ``_edge_mask``) de part et d'autre de lui (voir CONFIG_DEFAULTS) ;
+    ``None`` et la raison si un bord manque (TASK-6404)."""
+    gap_ratio = float(settings["facecam_edge_gap_ratio"])
+    search_ratio = float(settings["facecam_edge_search_ratio"])
+    min_share = float(settings["facecam_edge_min_share"])
+    fx0, fy0, fx1, fy1 = face
+    fw, fh = fx1 - fx0, fy1 - fy0
+    gap_x, gap_y = max(1, round(fw * gap_ratio)), max(1, round(fh * gap_ratio))
+    search_x, search_y = max(1, round(fw * search_ratio)), max(1, round(fh * search_ratio))
+    y0i, y1i = max(0, round(fy0)), min(height, round(fy1))
+    x0i, x1i = max(0, round(fx0)), min(width, round(fx1))
+
+    left = _edge_position(
+        counts, n_frames, "x", y0i, y1i, round(fx0) - gap_x, -1,
+        max(0, round(fx0) - gap_x - search_x), min_share,
+    )
+    right = _edge_position(
+        counts, n_frames, "x", y0i, y1i, round(fx1) + gap_x, 1,
+        min(width - 1, round(fx1) + gap_x + search_x), min_share,
+    )
+    top = _edge_position(
+        counts, n_frames, "y", x0i, x1i, round(fy0) - gap_y, -1,
+        max(0, round(fy0) - gap_y - search_y), min_share,
+    )
+    bottom = _edge_position(
+        counts, n_frames, "y", x0i, x1i, round(fy1) + gap_y, 1,
+        min(height - 1, round(fy1) + gap_y + search_y), min_share,
+    )
+
+    missing = [name for name, v in (("gauche", left), ("droit", right), ("haut", top), ("bas", bottom)) if v is None]
+    if missing:
+        return None, (
+            f"bord(s) {', '.join(missing)} de l'incrustation introuvable(s) autour du visage stable "
+            f"(gradient marque sur >= {min_share:.0%} des images cles, recherche jusqu'a "
+            f"{search_x:g}x{search_y:g} px) : rectangle centre sur le visage conserve"
+        )
+    assert left is not None and top is not None and right is not None and bottom is not None
+    return (float(left), float(top), float(right + 1), float(bottom + 1)), None
+
+
+def _facecam_rect(
+    counts: np.ndarray, n_frames: int, face: Box, width: int, height: int, settings: dict[str, Any]
+) -> tuple[tuple[int, int, int, int] | None, str | None, str | None]:
+    """Rectangle source de la facecam, au format du panneau camera : cale sur
+    les bords reels de l'incrustation quand ils sont trouves (voir
+    ``_incrustation_rect``), sinon repli sur le seul visage stable
+    (``_facecam_rect_from_face``), avec la raison du repli (TASK-6404).
+    ``None`` et la raison si meme le repli ne tient pas dans l'image."""
+    edge_box, edge_reason = _incrustation_rect(counts, n_frames, face, width, height, settings)
+    if edge_box is not None:
+        ex0, ey0, ex1, ey1 = edge_box
+        rect, reason = _size_camera_rect(
+            (ex0 + ex1) / 2, (ey0 + ey1) / 2, ex1 - ex0, ey1 - ey0, width, height, settings
+        )
+        if rect is not None:
+            return rect, None, None
+        edge_reason = reason
+    rect, reason = _facecam_rect_from_face(face, width, height, settings)
+    return rect, reason, edge_reason
 
 
 def _stable_face(
@@ -1222,6 +1349,9 @@ def detect_facecam(
 
         {"video_id", "source": {"width", "height"},
          "facecam": {"x", "y", "w", "h"} | null, "reason": null | pourquoi pas,
+         "edge_reason": null | pourquoi le rectangle est centre sur le seul
+             visage plutot que cale sur les bords reels de l'incrustation
+             (TASK-6404, ADR-ad2e),
          "face": [x0, y0, x1, y1] | null, "share", "min_share",
          "keyframes": [{"timecode", "path", "faces", "face_in_rect"}]}
 
@@ -1246,8 +1376,12 @@ def detect_facecam(
 
     min_conf = float(settings["min_confidence"])
     dup_iou = float(settings["duplicate_iou"])
+    edge_threshold = float(settings["facecam_edge_min_gradient"])
     detections: list[list[Box]] = []
     size: tuple[int, int] | None = None
+    # Comptes de pixels a fort gradient, cumules image cle par image cle (pas
+    # de pile d'images en memoire : une video peut en avoir des milliers).
+    edge_counts: np.ndarray | None = None
     if frames:
         detector = detector_factory(settings, get_device())
         try:
@@ -1262,6 +1396,10 @@ def detect_facecam(
                 found += _detect_corners(detector, image, width, height, settings)
                 found = [d for d in found if d[4] >= min_conf]
                 detections.append([d[:4] for d in _nms(found, dup_iou)])  # type: ignore[misc]
+                mask = _edge_mask(image, edge_threshold)
+                if edge_counts is None:
+                    edge_counts = np.zeros((height, width), dtype=np.uint32)
+                edge_counts += mask
         finally:
             detector.close()
             detector = None
@@ -1270,6 +1408,7 @@ def detect_facecam(
     min_share = float(settings["facecam_min_share"])
     tolerance = float(settings["facecam_tolerance"])
     rect: tuple[int, int, int, int] | None = None
+    edge_reason: str | None = None
     face, count = _stable_face(detections, tolerance)
     share = count / len(frames) if frames else 0.0
     if not frames:
@@ -1282,8 +1421,8 @@ def detect_facecam(
             f"seulement (facecam_min_share = {min_share:.0%})"
         )
     else:
-        assert size is not None
-        rect, reason = _facecam_rect(face, size[0], size[1], settings)
+        assert size is not None and edge_counts is not None
+        rect, reason, edge_reason = _facecam_rect(edge_counts, len(frames), face, size[0], size[1], settings)
 
     keyframes = []
     for frame_info, boxes in zip(frames, detections):
@@ -1299,6 +1438,7 @@ def detect_facecam(
         "source": None if size is None else {"width": size[0], "height": size[1]},
         "facecam": None if rect is None else dict(zip("xywh", rect)),
         "reason": reason,
+        "edge_reason": edge_reason,
         "face": None if face is None else [round(v, 1) for v in face],
         "share": share,
         "min_share": min_share,
@@ -1306,6 +1446,10 @@ def detect_facecam(
     }
     if rect is None:
         log.warning("%s : pas de facecam, clips en letterbox (%s)", video_id, reason)
+    elif edge_reason is not None:
+        log.info(
+            "%s : facecam %s, bords de l'incrustation non trouves (%s)", video_id, data["facecam"], edge_reason
+        )
     else:
         log.info("%s : facecam %s (visage sur %.0f%% des images cles)", video_id, data["facecam"], share * 100)
     _write_plan(out, data)
