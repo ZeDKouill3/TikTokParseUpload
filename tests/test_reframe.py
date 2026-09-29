@@ -1114,3 +1114,315 @@ def test_existing_letterbox_plan_with_crop_config_is_an_error_without_force(tmp_
     assert out2 == out
     assert len(fake.calls) == 1
     assert "format" not in load(out2)
+
+
+# --------------------------------------------------------------------------
+# Format stream (SPEC-3a88, TASK-9e0c) : facecam fixe agrandie en haut, jeu en
+# bas ; detection une fois par video sur les images cles de scenes.json,
+# choix par clip tout ou rien, aucun suivi.
+# --------------------------------------------------------------------------
+
+import cv2  # noqa: E402
+
+# Facecam typique (SMYVmdpRMow) : ~526x296 en haut a gauche d'un 1920x1080,
+# visage d'environ 130x150 dedans.
+CAM_FACE = (190, 70, 320, 220)
+
+
+class PixelFaceDetector:
+    """Detecteur simule : un "visage" est le rectangle blanc dessine dans
+    l'image cle synthetique (boite englobante des pixels clairs)."""
+
+    def __init__(self):
+        self.closed = False
+        self.frames = 0
+
+    def detect(self, frame):
+        assert not self.closed, "detecteur utilise apres close()"
+        self.frames += 1
+        x, y, w, h = cv2.boundingRect((frame[:, :, 0] > 128).astype(np.uint8))
+        return [(float(x), float(y), float(x + w), float(y + h), 0.9)] if w and h else []
+
+    def close(self):
+        self.closed = True
+
+
+class PixelDetectorFactory:
+    def __init__(self):
+        self.built: list[tuple[dict, Device]] = []
+        self.detectors: list[PixelFaceDetector] = []
+
+    def __call__(self, settings, device):
+        self.built.append((settings, device))
+        detector = PixelFaceDetector()
+        self.detectors.append(detector)
+        return detector
+
+
+def write_keyframes(video_dir, faces, *, scenes=((0.0, 100.0),), width=W, height=H):
+    """scenes.json avec une image cle par entree de ``faces`` : (temps, boite
+    du visage ou None). Images synthetiques noires, visage en blanc."""
+    frames_dir = video_dir / "frames"
+    frames_dir.mkdir(exist_ok=True)
+    frames = []
+    encoded: dict = {}  # une image encodee par boite distincte
+    for k, (t, box) in enumerate(faces):
+        if box not in encoded:
+            image = np.zeros((height, width, 3), dtype=np.uint8)
+            if box is not None:
+                x0, y0, x1, y1 = box
+                image[y0:y1, x0:x1] = 255
+            encoded[box] = cv2.imencode(".bmp", image)[1].tobytes()
+        name = f"scene0000_{k:03d}.bmp"
+        (frames_dir / name).write_bytes(encoded[box])
+        frames.append({"path": f"frames/{name}", "timecode": t, "scene": 0})
+    (video_dir / "scenes.json").write_text(
+        json.dumps({"scenes": [{"start": s, "end": e} for s, e in scenes], "frames": frames}),
+        encoding="utf-8",
+    )
+
+
+def pattern(n, present, box=CAM_FACE, t0=0.5, step=1.0):
+    """``n`` images cles a t0, t0+step..., visage present sur les ``present``
+    premieres (legerement bouge, sous la tolerance), absent sur les autres."""
+    out = []
+    for k in range(n):
+        dx = (k % 3) - 1  # +-1 px : meme position a la tolerance pres
+        b = (box[0] + dx, box[1] - dx, box[2] + dx, box[3] - dx)
+        out.append((t0 + k * step, b if k < present else None))
+    return out
+
+
+def stream_config(tmp_path, **reframe):
+    reframe.setdefault("format", "letterbox")
+    reframe.setdefault("layout", "stream_auto")
+    return make_config(tmp_path, **reframe)
+
+
+def run_stream(tmp_path, *, start=0.0, end=20.0, clip_id="01", factory=None, force=False, **reframe):
+    from clipper.reframe import reframe as do_reframe
+
+    factory = factory or PixelDetectorFactory()
+    fake = FakeBackend([])
+    with llm.use_backend(fake):
+        out = do_reframe(
+            VIDEO_ID, clip_id, start, end, tmp_path / "workspace",
+            config=stream_config(tmp_path, **reframe), force=force,
+            detector_factory=factory, frame_source=FakeVideo(),
+        )
+    assert fake.calls == []  # jamais d'appel LLM pour le format stream
+    return out, factory
+
+
+def detect(tmp_path, factory=None, force=False, **reframe):
+    from clipper.reframe import detect_facecam
+
+    factory = factory or PixelDetectorFactory()
+    path = detect_facecam(VIDEO_ID, tmp_path / "workspace", config=stream_config(tmp_path, **reframe),
+                          force=force, detector_factory=factory)
+    return path, factory
+
+
+def rect_box(r):
+    return (r["x"], r["y"], r["x"] + r["w"], r["y"] + r["h"])
+
+
+def test_stable_facecam_on_90_percent_of_keyframes_gives_a_fixed_rectangle(tmp_path, video_dir):
+    write_keyframes(video_dir, pattern(20, 18))
+    path, factory = detect(tmp_path)
+
+    assert path == video_dir / "facecam.json"
+    data = load(path)
+    assert data["reason"] is None
+    rect = data["facecam"]
+    assert set(rect) == {"x", "y", "w", "h"}
+    # le visage est entier dans le rectangle, qui fait moins d'un quart de l'image
+    assert contains(rect, CAM_FACE)
+    assert rect["w"] * rect["h"] < W * H / 4
+    # rectangle au format du panneau camera (1080 x 40 % de 1920)
+    assert rect["w"] / rect["h"] == pytest.approx(1080 / 768, rel=0.02)
+    assert data["share"] == pytest.approx(0.9)
+    # detecteur construit une fois avec le device de clipper.gpu, puis ferme
+    assert len(factory.built) == 1
+    assert isinstance(factory.built[0][1], Device)
+    assert factory.detectors[0].closed
+    assert factory.detectors[0].frames == 20
+
+
+def test_facecam_on_50_percent_of_keyframes_is_a_motivated_absence(tmp_path, video_dir):
+    write_keyframes(video_dir, pattern(20, 10))
+    path, factory = detect(tmp_path)
+
+    data = load(path)
+    assert data["facecam"] is None
+    assert "50" in data["reason"] and "80" in data["reason"]
+    assert factory.detectors[0].closed
+
+
+def test_face_moving_beyond_the_tolerance_is_not_a_facecam(tmp_path, video_dir):
+    faces = [(0.5 + k, (100 + 60 * k, 70, 230 + 60 * k, 220)) for k in range(20)]
+    write_keyframes(video_dir, faces)
+    data = load(detect(tmp_path)[0])
+    assert data["facecam"] is None
+    assert data["reason"]
+
+
+def test_facecam_tolerance_and_share_are_configurable(tmp_path, video_dir):
+    faces = [(0.5 + k, (100 + 30 * (k % 2), 70, 230 + 30 * (k % 2), 220)) for k in range(20)]
+    write_keyframes(video_dir, faces)
+    assert load(detect(tmp_path, facecam_tolerance=10)[0])["facecam"] is None
+    assert load(detect(tmp_path, facecam_tolerance=40, force=True)[0])["facecam"] is not None
+    write_keyframes(video_dir, pattern(20, 12))
+    assert load(detect(tmp_path, facecam_min_share=0.5, force=True)[0])["facecam"] is not None
+
+
+def test_stable_face_whose_zone_exceeds_a_quarter_of_the_image_is_not_a_facecam(tmp_path, video_dir):
+    # un presentateur plein cadre : visage stable, mais pas une incrustation
+    write_keyframes(video_dir, pattern(20, 20, box=(760, 240, 1160, 740)))
+    data = load(detect(tmp_path)[0])
+    assert data["facecam"] is None
+    assert "quart" in data["reason"]
+
+
+def test_facecam_detection_is_cached_per_video(tmp_path, video_dir):
+    write_keyframes(video_dir, pattern(40, 40))
+    factory = PixelDetectorFactory()
+    run_stream(tmp_path, start=0.0, end=20.0, clip_id="01", factory=factory)
+    run_stream(tmp_path, start=20.0, end=40.0, clip_id="02", factory=factory)
+    assert len(factory.built) == 1  # une seule detection pour toute la video
+    detect(tmp_path, factory=factory, force=True)
+    assert len(factory.built) == 2
+
+
+def test_clip_with_face_on_85_percent_of_its_keyframes_is_stream(tmp_path, video_dir):
+    # 20 images cles dans le clip [0, 20] (17 avec visage), 60 autres toutes avec
+    write_keyframes(video_dir, pattern(20, 17) + pattern(60, 60, t0=20.5))
+    out, _ = run_stream(tmp_path, start=0.0, end=20.0)
+
+    data = load(out)
+    assert data["layout"] == "stream"
+    [plan] = data["plans"]
+    assert plan["layout"] == "stream"
+    facecam = load(video_dir / "facecam.json")["facecam"]
+    assert data["facecam"] == facecam
+    panels = {p["name"]: p for p in plan["panels"]}
+    [cam] = panels["camera"]["rects"]
+    assert {k: cam[k] for k in "xywh"} == facecam
+
+
+def test_clip_with_face_on_60_percent_of_its_keyframes_stays_letterbox(tmp_path, video_dir, caplog):
+    write_keyframes(video_dir, pattern(20, 12) + pattern(60, 60, t0=20.5))
+    with caplog.at_level("INFO", logger="clipper.reframe"):
+        out, _ = run_stream(tmp_path, start=0.0, end=20.0)
+
+    data = load(out)
+    assert data["layout"] == "letterbox"
+    assert [p["name"] for p in data["plans"][0]["panels"]] == ["background", "main"]
+    assert "60" in data["layout_reason"]
+    assert data["layout_reason"] in caplog.text
+
+
+def test_video_without_facecam_stays_letterbox_with_a_logged_reason(tmp_path, video_dir, caplog):
+    write_keyframes(video_dir, pattern(20, 10))
+    with caplog.at_level("INFO", logger="clipper.reframe"):
+        out, _ = run_stream(tmp_path, start=0.0, end=20.0)
+
+    data = load(out)
+    assert data["layout"] == "letterbox"
+    assert data["layout_reason"]
+    assert load(video_dir / "facecam.json")["reason"] in data["layout_reason"]
+    assert data["layout_reason"] in caplog.text
+
+
+def test_stream_plan_is_one_fixed_plan_over_the_whole_clip(tmp_path, video_dir):
+    # plusieurs coupes de scene dans le clip et visage qui faiblit sur 3
+    # images : un seul plan, un seul rectangle par panneau, sans zoom ni suivi
+    faces = pattern(20, 20)
+    faces[4] = (faces[4][0], None)
+    faces[9] = (faces[9][0], (400, 500, 600, 700))
+    faces[15] = (faces[15][0], None)
+    write_keyframes(video_dir, faces, scenes=((0.0, 5.0), (5.0, 12.0), (12.0, 100.0)))
+    out, _ = run_stream(tmp_path, start=1.0, end=19.0)
+
+    data = load(out)
+    assert data["layout"] == "stream"
+    [plan] = data["plans"]
+    assert (plan["start"], plan["end"]) == (1.0, 19.0)
+    for panel in plan["panels"]:
+        [r] = panel["rects"]
+        assert (r["start"], r["end"]) == (1.0, 19.0)
+
+
+def test_stream_geometry_camera_on_top_game_below_texts_off_the_face(tmp_path, video_dir):
+    write_keyframes(video_dir, pattern(20, 20))
+    data = load(run_stream(tmp_path)[0])
+
+    assert data["output"] == {"width": 1080, "height": 1920}
+    assert data["source"] == {"width": W, "height": H}
+    panels = {p["name"]: p for p in data["plans"][0]["panels"]}
+    assert [p["name"] for p in data["plans"][0]["panels"]] == ["background", "camera", "gameplay"]
+    assert panels["background"]["effect"] == "blur"
+    assert panels["background"]["dest"] == {"x": 0, "y": 0, "w": 1080, "h": 1920}
+
+    cam, game = panels["camera"]["dest"], panels["gameplay"]["dest"]
+    assert cam["x"] == 0 and cam["w"] == 1080
+    assert cam["h"] == 768  # 40 % de 1920
+    assert game["x"] == 0 and game["w"] == 1080
+    assert game["y"] == cam["y"] + cam["h"]
+    assert game["y"] + game["h"] == 1920
+
+    # jeu : le centre de l'image hors facecam, au format de son panneau
+    [g] = panels["gameplay"]["rects"]
+    facecam = data["facecam"]
+    assert g["x"] >= facecam["x"] + facecam["w"] or g["y"] >= facecam["y"] + facecam["h"]
+    assert g["w"] / g["h"] == pytest.approx(game["w"] / game["h"], rel=0.02)
+    assert 0 <= g["x"] and g["x"] + g["w"] <= W and 0 <= g["y"] and g["y"] + g["h"] <= H
+
+    # titre au-dessus de la camera, sous-titres dans la zone du jeu, jamais sur le visage
+    zones = data["text_zones"]
+    assert set(zones) == {"title", "subtitles", "part"}
+    assert zones["title"]["y1"] <= cam["y"]
+    assert zones["subtitles"]["y0"] >= cam["y"] + cam["h"]
+    for z in zones.values():
+        assert 150 <= z["x0"] < z["x1"] <= 930 and 160 <= z["y0"] < z["y1"] <= 1520
+
+
+def test_stream_camera_ratio_is_configurable(tmp_path, video_dir):
+    write_keyframes(video_dir, pattern(20, 20))
+    data = load(run_stream(tmp_path, stream_camera_ratio=0.35)[0])
+    cam = {p["name"]: p for p in data["plans"][0]["panels"]}["camera"]["dest"]
+    assert cam["h"] == 672
+
+
+def test_default_layout_is_letterbox_without_facecam_detection(tmp_path, video_dir):
+    from clipper.reframe import CONFIG_DEFAULTS
+
+    assert CONFIG_DEFAULTS["layout"] == "letterbox"
+    assert CONFIG_DEFAULTS["facecam_min_share"] == 0.8
+    write_keyframes(video_dir, pattern(20, 20))
+    out, factory, fake = run(tmp_path, static(), [], format="letterbox", start=0.0, end=20.0)
+    assert load(out)["layout"] == "letterbox"
+    assert "layout_reason" not in load(out)
+    assert factory.built == []
+    assert not (video_dir / "facecam.json").exists()
+
+
+def test_unknown_layout_or_stream_with_crop_format_is_an_error(tmp_path, video_dir):
+    from clipper.reframe import ReframeError
+
+    write_keyframes(video_dir, pattern(20, 20))
+    with pytest.raises(ReframeError, match="layout"):
+        run_stream(tmp_path, layout="stream")
+    with pytest.raises(ReframeError, match="crop"):
+        run_stream(tmp_path, format="crop")
+
+
+def test_existing_letterbox_plan_with_stream_auto_config_is_an_error_without_force(tmp_path, video_dir):
+    from clipper.reframe import ReframeError
+
+    write_keyframes(video_dir, pattern(20, 20))
+    run(tmp_path, static(), [], format="letterbox", start=0.0, end=20.0)
+    with pytest.raises(ReframeError, match="stream_auto"):
+        run_stream(tmp_path)
+    out, _ = run_stream(tmp_path, force=True)
+    assert load(out)["layout"] == "stream"

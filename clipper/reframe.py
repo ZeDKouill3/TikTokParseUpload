@@ -95,6 +95,29 @@ CONFIG_DEFAULTS: dict[str, object] = {
     # Mise en page : "letterbox" (zoom fixe, sans visage suivi, defaut) ou
     # "crop" (suivi de visage, option figee, voir le reste de ce module).
     "format": "letterbox",
+    # Format letterbox seulement (SPEC-3a88) : "letterbox" (defaut) ou
+    # "stream_auto" = clip en stream (facecam fixe agrandie en haut, jeu en
+    # bas) si la video a une facecam et que son visage y est sur au moins
+    # facecam_min_share des images cles du clip, sinon letterbox (raison
+    # journalisee). Voir detect_facecam.
+    "layout": "letterbox",
+    # Facecam : visage a la meme position (centre a moins de
+    # facecam_tolerance px) sur au moins facecam_min_share des images cles de
+    # scenes.json, dans une zone de moins de facecam_max_area de l'image.
+    "facecam_min_share": 0.8,
+    "facecam_tolerance": 40,
+    "facecam_max_area": 0.25,
+    # Rectangle source de la facecam : au format du panneau camera, centre
+    # sur le visage, qui en occupe cette part de la hauteur.
+    "stream_face_height": 0.5,
+    # Panneau camera : part de la hauteur de sortie, a partir de stream_top
+    # (titre d'ecran au-dessus) ; le jeu occupe tout le bas.
+    "stream_camera_ratio": 0.4,
+    "stream_top": 440,
+    # Le jeu est la plus grande fenetre, au format de son panneau, la plus
+    # centree possible, qui evite la facecam elargie de cette marge (px source :
+    # le cadre reel de la facecam deborde le rectangle centre sur le visage).
+    "stream_exclude_margin": 80,
     # Zoom fixe du format letterbox : fenetre centrale de largeur
     # source_w / letterbox_zoom, pleine hauteur. Pensees pour une source 16:9.
     "letterbox_zoom": 1.3,
@@ -190,6 +213,7 @@ CONFIG_DEFAULTS: dict[str, object] = {
 LAYOUTS = ("facecam_gameplay", "single")
 _FALLBACKS = ("auto", "blur")
 _FORMATS = ("letterbox", "crop")
+_LAYOUT_MODES = ("letterbox", "stream_auto")
 
 LAYOUT_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -1021,7 +1045,11 @@ def _reframe_letterbox(
     video: Path,
     settings: dict[str, Any],
     frame_source: Callable[[Path, Sequence[float]], Iterable[tuple[float, np.ndarray]]],
+    *,
+    layout_reason: str | None = None,
 ) -> Path:
+    """Plan letterbox ; ``layout_reason`` (layout = stream_auto seulement) dit
+    pourquoi le clip n'est pas en stream."""
     [(_, frame)] = list(frame_source(video, [start]))
     source_h, source_w = frame.shape[:2]
     geometry = _letterbox_geometry(source_w, source_h, settings)
@@ -1066,10 +1094,318 @@ def _reframe_letterbox(
         },
         "plans": [plan],
     }
+    if layout_reason is not None:
+        data["layout_mode"] = settings["layout"]
+        data["layout_reason"] = layout_reason
+    _write_plan(out, data)
+    return out
+
+
+def _write_plan(out: Path, data: dict[str, Any]) -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(out)
+
+
+# --------------------------------------------------------------------------
+# Format stream (SPEC-3a88) : facecam fixe agrandie en haut, jeu en bas.
+# --------------------------------------------------------------------------
+
+
+def _even(v: float) -> int:
+    n = int(round(v))
+    return n - n % 2
+
+
+def _camera_size(settings: dict[str, Any]) -> tuple[int, int, int]:
+    """(largeur, hauteur, haut) du panneau camera en pixels de sortie."""
+    out_w, out_h = int(settings["output_width"]), int(settings["output_height"])
+    return out_w, _even(out_h * float(settings["stream_camera_ratio"])), int(settings["stream_top"])
+
+
+def _facecam_rect(
+    face: Box, width: int, height: int, settings: dict[str, Any]
+) -> tuple[tuple[int, int, int, int] | None, str | None]:
+    """Rectangle source de la facecam : au format du panneau camera, centre
+    sur le visage stable (qui en occupe ``stream_face_height`` de la
+    hauteur), ramene dans l'image ; ``None`` et la raison s'il ne tient pas
+    ou depasse ``facecam_max_area`` de l'image."""
+    cam_w, cam_h, _ = _camera_size(settings)
+    h = _even((face[3] - face[1]) / float(settings["stream_face_height"]))
+    w = _even(h * cam_w / cam_h)
+    max_area = float(settings["facecam_max_area"])
+    if w > width or h > height or w * h >= max_area * width * height:
+        return None, (
+            f"zone du visage stable ({w}x{h} px au format du panneau camera) pas plus petite qu'un quart "
+            f"(facecam_max_area = {max_area:g}) de l'image {width}x{height} : pas une incrustation"
+        )
+    cx, cy = _center(face)
+    x = min(max(round(cx - w / 2), 0), width - w)
+    y = min(max(round(cy - h / 2), 0), height - h)
+    return (x, y, w, h), None
+
+
+def _stable_face(
+    detections: list[list[Box]], tolerance: float
+) -> tuple[Box | None, int]:
+    """Visage a la meme position (centre a moins de ``tolerance`` px) sur le
+    plus d'images : sa boite mediane et le nombre d'images ou il est."""
+    best: tuple[int, list[Box]] | None = None
+    for boxes in detections:
+        for ref in boxes:
+            rc = _center(ref)
+            support = []
+            for other in detections:
+                near = [b for b in other if math.dist(_center(b), rc) <= tolerance]
+                if near:
+                    support.append(min(near, key=lambda b: math.dist(_center(b), rc)))
+            if best is None or len(support) > best[0]:
+                best = (len(support), support)
+    if best is None:
+        return None, 0
+    count, support = best
+    median = tuple(float(np.median([b[k] for b in support])) for k in range(4))
+    return median, count  # type: ignore[return-value]
+
+
+def detect_facecam(
+    video_id: str,
+    workspace_dir: str | Path = "workspace",
+    *,
+    config: Any = None,
+    force: bool = False,
+    detector_factory: Callable[[dict[str, Any], Device], Any] | None = None,
+    image_reader: Callable[[str], np.ndarray | None] = cv2.imread,
+) -> Path:
+    """Detection de la facecam, une fois par video (SPEC-3a88 regle 1), sur
+    les images cles de scenes.json ; resultat en cache dans
+    workspace/<video_id>/facecam.json (pas refait sauf ``force``) :
+
+        {"video_id", "source": {"width", "height"},
+         "facecam": {"x", "y", "w", "h"} | null, "reason": null | pourquoi pas,
+         "face": [x0, y0, x1, y1] | null, "share", "min_share",
+         "keyframes": [{"timecode", "path", "faces", "face_in_rect"}]}
+
+    Detecteur de visages de reframe (``detector``), device via clipper.gpu,
+    ferme avant de rendre la main (ADR-fb9b)."""
+    video_dir = Path(workspace_dir) / video_id
+    out = video_dir / "facecam.json"
+    if out.exists() and not force:
+        return out
+    settings = _settings(config)
+    scenes_file = video_dir / "scenes.json"
+    if not scenes_file.exists():
+        raise ReframeError(f"scenes.json absent : {scenes_file}")
+    frames = sorted(json.loads(scenes_file.read_text(encoding="utf-8")).get("frames", []),
+                    key=lambda f: f["timecode"])
+    if detector_factory is None:
+        if settings["detector"] not in _DETECTORS:
+            raise ReframeError(
+                f"[reframe] detecteur inconnu {settings['detector']!r} (attendu : {' | '.join(_DETECTORS)})"
+            )
+        detector_factory = _DETECTORS[settings["detector"]]
+
+    min_conf = float(settings["min_confidence"])
+    dup_iou = float(settings["duplicate_iou"])
+    detections: list[list[Box]] = []
+    size: tuple[int, int] | None = None
+    if frames:
+        detector = detector_factory(settings, get_device())
+        try:
+            for frame_info in frames:
+                path = video_dir / frame_info["path"]
+                image = image_reader(str(path))
+                if image is None:
+                    raise ReframeError(f"image cle illisible : {path}")
+                height, width = image.shape[:2]
+                size = size or (width, height)
+                found = [tuple(float(v) for v in d[:5]) for d in detector.detect(image) if d[4] >= min_conf]
+                detections.append([d[:4] for d in _nms(found, dup_iou)])  # type: ignore[misc]
+        finally:
+            detector.close()
+            detector = None
+            gc.collect()
+
+    min_share = float(settings["facecam_min_share"])
+    tolerance = float(settings["facecam_tolerance"])
+    rect: tuple[int, int, int, int] | None = None
+    face, count = _stable_face(detections, tolerance)
+    share = count / len(frames) if frames else 0.0
+    if not frames:
+        reason = "aucune image cle dans scenes.json"
+    elif face is None:
+        reason = f"aucun visage detecte sur les {len(frames)} images cles"
+    elif share < min_share - 1e-9:
+        reason = (
+            f"visage a la meme position (tolerance {tolerance:g} px) sur {share:.0%} des images cles "
+            f"seulement (facecam_min_share = {min_share:.0%})"
+        )
+    else:
+        assert size is not None
+        rect, reason = _facecam_rect(face, size[0], size[1], settings)
+
+    keyframes = []
+    for frame_info, boxes in zip(frames, detections):
+        keyframes.append({
+            "timecode": frame_info["timecode"],
+            "path": frame_info["path"],
+            "faces": [[round(v, 1) for v in b] for b in boxes],
+            "face_in_rect": None if rect is None else any(_contains_point(
+                (rect[0], rect[1], rect[0] + rect[2], rect[1] + rect[3]), _center(b)) for b in boxes),
+        })
+    data = {
+        "video_id": video_id,
+        "source": None if size is None else {"width": size[0], "height": size[1]},
+        "facecam": None if rect is None else dict(zip("xywh", rect)),
+        "reason": reason,
+        "face": None if face is None else [round(v, 1) for v in face],
+        "share": share,
+        "min_share": min_share,
+        "keyframes": keyframes,
+    }
+    if rect is None:
+        log.warning("%s : pas de facecam, clips en letterbox (%s)", video_id, reason)
+    else:
+        log.info("%s : facecam %s (visage sur %.0f%% des images cles)", video_id, data["facecam"], share * 100)
+    _write_plan(out, data)
+    return out
+
+
+def _clip_facecam(
+    facecam: dict[str, Any], start: float, end: float, settings: dict[str, Any]
+) -> tuple[dict[str, int] | None, str | None]:
+    """Choix du clip, tout ou rien (SPEC-3a88 regle 2) : le rectangle de la
+    facecam si son visage y est sur au moins ``facecam_min_share`` des images
+    cles du clip, sinon ``None`` et la raison."""
+    if facecam["facecam"] is None:
+        return None, f"pas de facecam dans la video : {facecam['reason']}"
+    keys = [k for k in facecam["keyframes"] if start - 1e-6 <= k["timecode"] <= end + 1e-6]
+    if not keys:
+        return None, f"aucune image cle de scenes.json dans le clip [{start}, {end}]"
+    share = sum(1 for k in keys if k["face_in_rect"]) / len(keys)
+    min_share = float(settings["facecam_min_share"])
+    if share < min_share - 1e-9:
+        return None, (
+            f"visage dans la facecam sur {share:.0%} des images cles du clip seulement "
+            f"(facecam_min_share = {min_share:.0%})"
+        )
+    return facecam["facecam"], None
+
+
+def _game_window(
+    width: int, height: int, aspect: float, exclude: tuple[int, int, int, int]
+) -> tuple[int, int, int, int]:
+    """Plus grande fenetre de rapport ``aspect`` qui evite ``exclude`` (x0,
+    y0, x1, y1) : entierement a gauche, a droite, au-dessus ou au-dessous ;
+    a surface egale, la plus proche du centre de l'image."""
+    ex0, ey0, ex1, ey1 = exclude
+    regions = [(0, 0, ex0, height), (ex1, 0, width, height), (0, 0, width, ey0), (0, ey1, width, height)]
+    best: tuple[float, float, tuple[int, int, int, int]] | None = None
+    for rx0, ry0, rx1, ry1 in regions:
+        if rx1 - rx0 < 2 or ry1 - ry0 < 2:
+            continue
+        ww, wh = _window(rx1 - rx0, ry1 - ry0, aspect)
+        ww, wh = ww - ww % 2, wh - wh % 2
+        x = min(max(round(width / 2 - ww / 2), rx0), rx1 - ww)
+        y = min(max(round(height / 2 - wh / 2), ry0), ry1 - wh)
+        key = (ww * wh, -math.dist((x + ww / 2, y + wh / 2), (width / 2, height / 2)))
+        if best is None or key > best[:2]:
+            best = (*key, (x, y, ww, wh))
+    if best is None:
+        raise ReframeError(f"aucune place pour le jeu hors de la facecam {exclude} dans {width}x{height}")
+    return best[2]
+
+
+def _reframe_stream(
+    video_id: str,
+    clip_id: str,
+    start: float,
+    end: float,
+    out: Path,
+    facecam: dict[str, Any],
+    rect: dict[str, int],
+    settings: dict[str, Any],
+) -> Path:
+    """Un seul plan, rectangles figes sur tout le clip : fond flou, camera
+    (rectangle de la facecam) en haut, jeu en bas ; aucun suivi ni zoom
+    (SPEC-3a88 regle 3)."""
+    source_w, source_h = facecam["source"]["width"], facecam["source"]["height"]
+    out_w, out_h = int(settings["output_width"]), int(settings["output_height"])
+    cam_w, cam_h, top = _camera_size(settings)
+    if abs(rect["w"] / rect["h"] - cam_w / cam_h) > 0.02 * cam_w / cam_h:
+        raise ReframeError(
+            f"facecam.json ({rect['w']}x{rect['h']}) calcule pour un autre panneau camera ({cam_w}x{cam_h}) : "
+            "relancer reframe --force"
+        )
+    game_top = top + cam_h
+    game_h = out_h - game_top
+    if top < 0 or game_h <= 0:
+        raise ReframeError(f"[reframe] stream_top/stream_camera_ratio : panneau camera hors de {out_w}x{out_h}")
+    margin = int(settings["stream_exclude_margin"])
+    exclude = (
+        max(0, rect["x"] - margin), max(0, rect["y"] - margin),
+        min(source_w, rect["x"] + rect["w"] + margin), min(source_h, rect["y"] + rect["h"] + margin),
+    )
+    gx, gy, gw, gh = _game_window(source_w, source_h, out_w / game_h, exclude)
+
+    camera_dest = (0, top, out_w, game_top)
+    safe_left, safe_right = int(settings["safe_left"]), int(settings["safe_right"])
+    safe_top, safe_bottom = int(settings["safe_top"]), int(settings["safe_bottom"])
+    text_gap, part_height = int(settings["text_gap"]), int(settings["part_height"])
+    zones = {
+        "title": (safe_left, safe_top, safe_right, top - text_gap),
+        "subtitles": (safe_left, game_top + text_gap, safe_right, safe_bottom - part_height - text_gap),
+        "part": (safe_left, safe_bottom - part_height, safe_right, safe_bottom),
+    }
+    for name, (x0, y0, x1, y1) in zones.items():
+        if x1 <= x0 or y1 <= y0 or x0 < 0 or y0 < 0 or x1 > out_w or y1 > out_h:
+            raise ReframeError(f"[reframe] zone {name} du format stream vide ou hors cadre : ({x0},{y0})-({x1},{y1})")
+        if _rects_overlap(camera_dest, (x0, y0, x1, y1)):
+            raise ReframeError(f"[reframe] zone {name} du format stream recouvre la facecam : ({x0},{y0})-({x1},{y1})")
+
+    def panel(name: str, x: int, y: int, w: int, h: int, dest: tuple[int, int, int, int]) -> dict[str, Any]:
+        return {
+            "name": name,
+            "dest": {"x": dest[0], "y": dest[1], "w": dest[2], "h": dest[3]},
+            "rects": [{"start": start, "end": end, "x": x, "y": y, "w": w, "h": h}],
+        }
+
+    background = panel("background", 0, 0, source_w, source_h, (0, 0, out_w, out_h))
+    panels = [
+        {"name": "background", "effect": "blur", "dest": background["dest"], "rects": background["rects"]},
+        panel("camera", rect["x"], rect["y"], rect["w"], rect["h"], (0, top, out_w, cam_h)),
+        panel("gameplay", gx, gy, gw, gh, (0, game_top, out_w, game_h)),
+    ]
+    data = {
+        "video_id": video_id,
+        "clip_id": clip_id,
+        "start": start,
+        "end": end,
+        "source": {"width": source_w, "height": source_h},
+        "output": {"width": out_w, "height": out_h},
+        "layout": "stream",
+        "format": "letterbox",
+        "layout_mode": settings["layout"],
+        "layout_reason": None,
+        "facecam": dict(rect),
+        "text_zones": {
+            name: {"x0": x0, "y0": y0, "x1": x1, "y1": y1} for name, (x0, y0, x1, y1) in zones.items()
+        },
+        "plans": [{
+            "index": 0,
+            "start": start,
+            "end": end,
+            "image": None,
+            "llm": None,
+            "layout": "stream",
+            "reason": None,
+            "faces": [],
+            "panels": panels,
+        }],
+    }
+    log.info("reframe %s/%s : stream, facecam %s", video_id, clip_id, rect)
+    _write_plan(out, data)
     return out
 
 
@@ -1173,6 +1509,15 @@ def _settings(config: Any) -> dict[str, Any]:
     settings = {**CONFIG_DEFAULTS, **config.section("reframe")}
     if settings["format"] not in _FORMATS:
         raise ReframeError(f"[reframe] format inconnu {settings['format']!r} (attendu : {' | '.join(_FORMATS)})")
+    if settings["layout"] not in _LAYOUT_MODES:
+        raise ReframeError(
+            f"[reframe] layout inconnu {settings['layout']!r} (attendu : {' | '.join(_LAYOUT_MODES)})"
+        )
+    if settings["layout"] != "letterbox" and settings["format"] != "letterbox":
+        raise ReframeError(
+            f"[reframe] layout = {settings['layout']!r} demande format = \"letterbox\" "
+            f"(le format {settings['format']!r} est fige)"
+        )
     if not all(isinstance(m, (int, float)) and m >= 0 for m in settings["fit_margins"]):
         raise ReframeError(f"[reframe] fit_margins invalide {settings['fit_margins']!r} (liste de marges >= 0)")
     if settings["fallback"] not in _FALLBACKS:
@@ -1276,11 +1621,18 @@ def reframe(
     out = out_dir / f"{clip_id}.json"
     settings = _settings(config)
     if out.exists() and not force:
-        existing_format = json.loads(out.read_text(encoding="utf-8")).get("format", "crop")
+        existing = json.loads(out.read_text(encoding="utf-8"))
+        existing_format = existing.get("format", "crop")
         if existing_format != settings["format"]:
             raise ReframeError(
                 f"reframe/{clip_id}.json existant au format {existing_format!r}, config [reframe] "
                 f"demande {settings['format']!r} : --force pour le recalculer"
+            )
+        existing_mode = existing.get("layout_mode", "letterbox")
+        if existing_format == "letterbox" and existing_mode != settings["layout"]:
+            raise ReframeError(
+                f"reframe/{clip_id}.json existant calcule avec layout = {existing_mode!r}, config [reframe] "
+                f"demande {settings['layout']!r} : --force pour le recalculer"
             )
         return out
 
@@ -1288,6 +1640,18 @@ def reframe(
     if not video.exists():
         raise ReframeError(f"video absente : {video}")
 
+    if settings["format"] == "letterbox" and settings["layout"] == "stream_auto":
+        facecam = json.loads(
+            detect_facecam(video_id, workspace_dir, config=config, detector_factory=detector_factory)
+            .read_text(encoding="utf-8")
+        )
+        rect, reason = _clip_facecam(facecam, start, end, settings)
+        if rect is not None:
+            return _reframe_stream(video_id, clip_id, start, end, out, facecam, rect, settings)
+        log.info("reframe %s/%s : letterbox, pas de stream (%s)", video_id, clip_id, reason)
+        return _reframe_letterbox(
+            video_id, clip_id, start, end, out, video, settings, frame_source, layout_reason=reason
+        )
     if settings["format"] == "letterbox":
         return _reframe_letterbox(video_id, clip_id, start, end, out, video, settings, frame_source)
 

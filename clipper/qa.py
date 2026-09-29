@@ -33,6 +33,12 @@ Pour chaque clip :
   ``black_pixel_threshold`` et de part d'image noire ``black_picture_ratio``
   aussi reglables). Un clip letterbox sans ``video_rect`` est une erreur
   explicite (render l'ecrit toujours en letterbox).
+- clip stream (``layout`` = "stream", SPEC-3a88 : facecam agrandie en haut,
+  jeu en bas) : ``camera_rect`` et ``video_rect`` obligatoires, dans
+  l'image attendue et sans se recouvrir, sinon erreur explicite ; ecran noir
+  mesure sur ``camera_rect`` (aucun texte ne la recouvre) ; prompt avec le
+  titre d'ecran permanent ; face_cut et subtitle_on_face restent demandes
+  (le visage est a l'image).
 
 Sortie : le JSON du clip est mis a jour en place :
 
@@ -255,6 +261,33 @@ def _black_segments(
     ]
 
 
+def _rect(clip: dict[str, Any], key: str) -> tuple[int, int, int, int]:
+    rect = clip.get(key)
+    if not isinstance(rect, dict) or not {"x", "y", "w", "h"} <= set(rect):
+        raise QAError(
+            f"clip {clip.get('clip_id')} en layout {clip.get('layout')} sans {key} valide : relancer render --force"
+        )
+    try:
+        return tuple(int(rect[k]) for k in ("x", "y", "w", "h"))  # type: ignore[return-value]
+    except (TypeError, ValueError) as exc:
+        raise QAError(f"clip {clip.get('clip_id')} : {key} invalide {rect!r}") from exc
+
+
+def _stream_rect(clip: dict[str, Any], settings: dict[str, Any]) -> tuple[int, int, int, int]:
+    """Clip stream (SPEC-3a88) : ``camera_rect`` (facecam) et ``video_rect``
+    (jeu) valides, dans l'image attendue, sans se recouvrir ; renvoie
+    ``camera_rect``, ou l'ecran noir se mesure (aucun texte ne la recouvre)."""
+    want_w, want_h = int(settings["expected_width"]), int(settings["expected_height"])
+    camera, game = _rect(clip, "camera_rect"), _rect(clip, "video_rect")
+    for key, (x, y, w, h) in (("camera_rect", camera), ("video_rect", game)):
+        if w <= 0 or h <= 0 or x < 0 or y < 0 or x + w > want_w or y + h > want_h:
+            raise QAError(f"clip stream {clip.get('clip_id')} : {key} {(x, y, w, h)} hors de {want_w}x{want_h}")
+    (cx, cy, cw, ch), (gx, gy, gw, gh) = camera, game
+    if cx < gx + gw and gx < cx + cw and cy < gy + gh and gy < cy + ch:
+        raise QAError(f"clip stream {clip.get('clip_id')} : camera_rect {camera} recouvre video_rect {game}")
+    return camera
+
+
 def _video_rect(clip: dict[str, Any]) -> tuple[int, int, int, int] | None:
     """``video_rect`` (panneau main, pixels de sortie) pour un clip letterbox,
     ou ``None`` hors letterbox. Un clip letterbox sans ``video_rect`` valide
@@ -471,7 +504,14 @@ def _prompt(clip: dict[str, Any], frames: list[tuple[Path, float, list[str]]], l
     images = "\n".join(
         f"Image {k} : t={t:.2f} s ({', '.join(labels)})" for k, (_, t, labels) in enumerate(frames, 1)
     )
-    if letterbox:
+    if clip.get("layout") == "stream":
+        format_line = (
+            "## Format\n"
+            "Clip stream : titre d'ecran sur encadre blanc en haut, la facecam (webcam du "
+            "createur) agrandie dessous, le jeu ou l'ecran en bas, sous-titres sur le jeu.\n\n"
+        )
+        hook_line = f"Titre d'ecran affiche en permanence (accroche) : {clip.get('screen_title', '')}\n"
+    elif letterbox:
         format_line = (
             "## Format\n"
             "Clip letterbox : titre d'ecran sur encadre blanc en haut, video zoomee au centre "
@@ -548,7 +588,7 @@ def check_clip(
     renvoie le champ ``qa``."""
     clip = json.loads(json_path.read_text(encoding="utf-8"))
     letterbox = clip.get("layout") == "letterbox"
-    crop = _video_rect(clip)
+    crop = _stream_rect(clip, settings) if clip.get("layout") == "stream" else _video_rect(clip)
     mp4 = json_path.with_suffix(".mp4")
     if not mp4.exists():
         raise QAError(f"video du clip absente : {mp4}")

@@ -1289,3 +1289,155 @@ def test_real_render_of_a_clip_far_into_the_source_shows_the_right_frames(tmp_pa
     for t in (0.0, 1.0, 1.9):
         r, g, b = _frame_center_rgb(out, t)
         assert b > 200 and r < 60 and g < 60, f"image a t={t} : {(r, g, b)} (bleu attendu)"
+
+
+# --------------------------------------------------------------------------
+# Format stream (SPEC-3a88, TASK-9e0c) : facecam agrandie en haut, jeu en
+# bas, titre d'ecran et sous-titres dans leurs zones, hors du visage.
+# --------------------------------------------------------------------------
+
+STREAM_TITLE_ZONE = {"x0": 150, "y0": 160, "x1": 930, "y1": 424}
+STREAM_SUBTITLES_ZONE = {"x0": 150, "y0": 1224, "x1": 930, "y1": 1448}
+CAMERA_RECT = {"x": 0, "y": 440, "w": 1080, "h": 768}
+GAMEPLAY_RECT = {"x": 0, "y": 1208, "w": 1080, "h": 712}
+# Source 1920x1080 : facecam 526x296 en haut a gauche, le reste est le jeu.
+FACECAM = (0, 0, 526, 296)
+
+
+def _reframe_json_stream():
+    """Plan stream tel que l'ecrit reframe : un seul plan fige, fond flou,
+    camera (rectangle de la facecam) puis jeu (hors facecam)."""
+    panels = [
+        _panel("background", 0, 0, SRC_W, SRC_H, {"x": 0, "y": 0, "w": OUT_W, "h": OUT_H}, effect="blur"),
+        _panel("camera", 44, 0, 420, 298, dict(CAMERA_RECT)),
+        _panel("gameplay", 606, 84, 1314, 866, dict(GAMEPLAY_RECT)),
+    ]
+    plan = {
+        "index": 0, "start": 1.0, "end": 3.5, "image": None, "llm": None, "layout": "stream",
+        "reason": None, "faces": [], "panels": panels,
+    }
+    return {
+        "video_id": VIDEO_ID, "clip_id": CLIP_ID, "start": 1.0, "end": 3.5,
+        "source": {"width": SRC_W, "height": SRC_H}, "output": {"width": OUT_W, "height": OUT_H},
+        "layout": "stream", "format": "letterbox", "layout_mode": "stream_auto", "layout_reason": None,
+        "facecam": {"x": 44, "y": 0, "w": 420, "h": 298},
+        "text_zones": {"title": dict(STREAM_TITLE_ZONE), "subtitles": dict(STREAM_SUBTITLES_ZONE),
+                       "part": dict(PART_ZONE)},
+        "plans": [plan],
+    }
+
+
+@pytest.fixture
+def stream_dir(video_dir):
+    (video_dir / "reframe" / f"{CLIP_ID}.json").write_text(json.dumps(_reframe_json_stream()), encoding="utf-8")
+    return video_dir
+
+
+def test_stream_filter_scales_facecam_on_top_and_game_below_with_the_title(tmp_path, video_dir):
+    from clipper.render import CONFIG_DEFAULTS, _build_filter_complex
+
+    filt, label = _build_filter_complex(
+        _reframe_json_stream(), 1.0, 3.5, video_dir / "subtitles" / f"{CLIP_ID}.ass", None, None, tmp_path,
+        CONFIG_DEFAULTS, title_input=1,
+    )
+    parts = filt.split(";")
+    assert "color=c=black:s=1080x1920" in filt
+    # camera : rectangle fige de la facecam, agrandi en 1080x768 a y=440
+    assert any("crop=w='420':h='298':x='44':y='0'" in f for f in parts)
+    assert any(f.endswith("scale=1080:768[p0_1s]") for f in parts)
+    assert any("overlay=x=0:y=440" in f for f in parts)
+    # jeu : hors facecam, en 1080x712 sous la camera
+    assert any("crop=w='1314':h='866':x='606':y='84'" in f for f in parts)
+    assert any(f.endswith("scale=1080:712[p0_2s]") for f in parts)
+    assert any("overlay=x=0:y=1208" in f for f in parts)
+    assert "lt(t," not in filt  # aucun suivi : rectangles constants
+    # titre d'ecran sur toute la duree, pas d'accroche
+    assert f"[1:v]overlay=x={STREAM_TITLE_ZONE['x0']}:y={STREAM_TITLE_ZONE['y0']}" in filt
+    assert "drawtext" not in filt
+
+
+def test_stream_render_writes_layout_stream_and_both_rects_in_the_sidecar(
+    tmp_path, stream_dir, fake_ffmpeg, cpu_device
+):
+    from clipper.render import render
+
+    (stream_dir / f"{VIDEO_ID}.mp4").write_bytes(b"")
+    render(VIDEO_ID, CLIP_ID, workspace_dir=stream_dir.parent, output_dir=tmp_path / "output",
+           config=make_config())
+
+    cmd = fake_ffmpeg[0]["cmd"]
+    inputs = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-i"]
+    assert inputs[1].endswith("title.png")
+    assert "hook.txt" not in fake_ffmpeg[0]["scratch"]
+    data = json.loads((tmp_path / "output" / VIDEO_ID / f"{CLIP_ID}.json").read_text(encoding="utf-8"))
+    assert data["layout"] == "stream"
+    assert data["camera_rect"] == CAMERA_RECT
+    assert data["video_rect"] == GAMEPLAY_RECT
+    assert data["screen_title"] == "Il m'a menti en garde à vue"
+
+
+@pytest.mark.parametrize("missing", ["camera", "gameplay"])
+def test_stream_without_camera_or_gameplay_panel_asks_to_rerun_reframe(tmp_path, stream_dir, fake_ffmpeg, missing):
+    from clipper.render import RenderError, render
+
+    (stream_dir / f"{VIDEO_ID}.mp4").write_bytes(b"")
+    reframe = _reframe_json_stream()
+    reframe["plans"][0]["panels"] = [p for p in reframe["plans"][0]["panels"] if p["name"] != missing]
+    (stream_dir / "reframe" / f"{CLIP_ID}.json").write_text(json.dumps(reframe), encoding="utf-8")
+    with pytest.raises(RenderError, match=missing):
+        render(VIDEO_ID, CLIP_ID, workspace_dir=stream_dir.parent, output_dir=tmp_path / "output",
+               config=make_config())
+    assert fake_ffmpeg == []
+
+
+@no_ffmpeg
+@no_ffprobe
+def test_render_stream_real_ffmpeg_gives_1080x1920_with_facecam_on_top_and_game_below(
+    tmp_path, stream_dir, cpu_device
+):
+    from PIL import Image
+
+    from clipper.render import render
+
+    x0, y0, x1, y1 = FACECAM
+    subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error",
+         "-f", "lavfi", "-i",
+         f"color=c=green:s={SRC_W}x{SRC_H}:r=25:d=5,drawbox=x={x0}:y={y0}:w={x1 - x0}:h={y1 - y0}:color=red:t=fill",
+         "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100:duration=5",
+         "-ac", "2", "-shortest", str(stream_dir / f"{VIDEO_ID}.mp4")],
+        check=True,
+    )
+    out = render(VIDEO_ID, CLIP_ID, workspace_dir=stream_dir.parent, output_dir=tmp_path / "output",
+                 config=make_config(x264_preset="ultrafast"))
+
+    probe = _ffprobe_json(out)
+    streams = {s["codec_type"]: s for s in probe["streams"]}
+    assert (streams["video"]["width"], streams["video"]["height"]) == (OUT_W, OUT_H)
+    assert float(probe["format"]["duration"]) == pytest.approx(2.5, abs=0.1)
+
+    frame = tmp_path / "frame.png"
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-ss", "2.0", "-i", str(out),
+                    "-frames:v", "1", str(frame)], check=True)
+    img = Image.open(frame).convert("RGB")
+
+    def is_red(p):
+        return p[0] > 180 and p[1] < 80 and p[2] < 80
+
+    def is_green(p):
+        return p[1] > 90 and p[0] < 80 and p[2] < 80
+
+    # zone haute : la facecam (rouge) agrandie sur toute la largeur
+    for x in (100, 540, 980):
+        for y in (CAMERA_RECT["y"] + 60, CAMERA_RECT["y"] + 384, CAMERA_RECT["y"] + 700):
+            assert is_red(img.getpixel((x, y))), (x, y, img.getpixel((x, y)))
+    # zone basse : le jeu (vert), sans rien de la facecam
+    for x in (100, 540, 980):
+        for y in (GAMEPLAY_RECT["y"] + 60, GAMEPLAY_RECT["y"] + 356, GAMEPLAY_RECT["y"] + 650):
+            assert is_green(img.getpixel((x, y))), (x, y, img.getpixel((x, y)))
+    # titre d'ecran : encadre blanc au-dessus de la camera
+    from clipper.render import CONFIG_DEFAULTS, layout_title
+
+    bx0, by0, _bx1, by1 = layout_title("Il m'a menti en garde à vue", STREAM_TITLE_ZONE, CONFIG_DEFAULTS).box
+    assert by1 <= CAMERA_RECT["y"]
+    assert min(img.getpixel((bx0 + 6, (by0 + by1) // 2))) > 225
