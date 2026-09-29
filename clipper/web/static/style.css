@@ -40,7 +40,8 @@ header {
   border-bottom: 1px solid var(--border);
 }
 
-header h1 { margin: 0; font-size: 1.6rem; }
+header h1 { margin: 0; font-size: 1.6rem; display: flex; align-items: center; gap: 0.6rem; }
+header h1 .logo { width: 2.5rem; height: 2.5rem; flex: none; }
 .tagline { margin: 0.2rem 0 0.8rem; color: var(--muted); }
 
 main {
