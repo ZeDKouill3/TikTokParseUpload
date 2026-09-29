@@ -12,9 +12,18 @@ etape (ADR-b16b) et passe par clipper.llm pour chaque appel (ADR-b1c1).
 
 Deroulement :
 1. Tour 1, a l'aveugle : chaque juge configure note tous les candidats en un
-   seul appel (usage ``jury_<nom>``), juges en parallele. Les candidats sont
-   anonymises (C1, C2... dans l'ordre ou le juge les voit) et melanges de
-   facon deterministe, avec une graine propre a chaque juge (``seed``).
+   seul appel (usage ``jury_<nom>``). Les candidats sont anonymises (C1, C2...
+   dans l'ordre ou le juge les voit) et melanges de facon deterministe, avec
+   une graine partagee par tous les juges d'un meme ``model`` configure
+   (``seed``) : ils voient donc les candidats dans le meme ordre. Un prompt
+   de juge place le bloc commun (intro, grille, contexte, candidats,
+   consignes generiques) EN PREMIER et les consignes propres au role
+   (perspective, veto) EN DERNIER ; ce bloc commun est alors identique octet
+   pour octet entre juges d'un meme modele, ce qui laisse le fournisseur du
+   modele relire son cache de prompt au lieu de le reecrire a chaque juge.
+   Les appels d'un tour partent en 2 vagues : un juge par modele d'abord (le
+   "leader", pour chauffer le cache), attendu jusqu'au bout, puis les autres
+   juges de ce tour ; chaque vague en parallele.
 2. Desaccord : un candidat dont les scores par juge (0-100, grille ponderee)
    s'ecartent de plus de ``threshold`` passe au debat.
 3. Tour 2 (un seul) sur ces candidats : chaque juge relit ses notes et son
@@ -308,23 +317,31 @@ def _grid_text(rubric: Mapping[str, Any]) -> str:
     )
 
 
-def _frame(judge: dict[str, Any], n_judges: int, rubric: Mapping[str, Any], context: str) -> str:
+def _common(n_judges: int, rubric: Mapping[str, Any], context: str) -> str:
+    """Bloc commun a tous les juges (intro, grille, contexte) : aucune donnee
+    propre a un juge, pour que ce bloc soit identique octet pour octet entre
+    juges (memes candidats a la suite : voir ``_round1_prompt``)."""
+    return (
+        f"Tu fais partie d'un jury de {n_judges} juges qui decide quels extraits d'une video longue "
+        "deviennent des clips TikTok pour un public francophone. Chaque juge a sa perspective ; les "
+        "notes sont agregees par mediane. Reste strictement dans ta perspective : c'est elle qui rend "
+        "le jury utile.\n\n"
+        + _grid_text(rubric)
+        + (f"\n## Contexte de la video\n{context}\n" if context else "")
+    )
+
+
+def _role(judge: dict[str, Any]) -> str:
+    """Consignes propres au juge (perspective, veto) : placees en fin de
+    prompt (voir ``_round1_prompt``/``_round2_prompt``) pour que le bloc
+    commun qui precede reste inchange d'un juge a l'autre."""
     veto = (
         "Tu es le seul juge a pouvoir poser un veto : veto = true rejette le candidat quelles que "
         "soient les notes, veto_reason dit pourquoi.\n\n"
         if judge["veto"]
         else ""
     )
-    return (
-        f"Tu fais partie d'un jury de {n_judges} juges qui decide quels extraits d'une video longue "
-        "deviennent des clips TikTok pour un public francophone. Chaque juge a sa perspective ; les "
-        "notes sont agregees par mediane. Reste strictement dans ta perspective : c'est elle qui rend "
-        "le jury utile.\n\n"
-        f"## Ta perspective\n{judge['perspective']}\n\n"
-        + veto
-        + _grid_text(rubric)
-        + (f"\n## Contexte de la video\n{context}\n" if context else "")
-    )
+    return f"## Ta perspective\n{judge['perspective']}\n\n" + veto
 
 
 def _block(ref: str, candidate: Mapping[str, Any]) -> str:
@@ -332,24 +349,26 @@ def _block(ref: str, candidate: Mapping[str, Any]) -> str:
     return f"### {ref}\n" + (f"Contexte : {ctx}\n" if ctx else "") + f"Texte : « {candidate['text']} »"
 
 
-def _round1_prompt(frame: str, shown: list[tuple[str, Mapping[str, Any]]]) -> str:
+def _round1_prompt(common: str, shown: list[tuple[str, Mapping[str, Any]]], role: str) -> str:
     return (
-        frame
+        common
         + f"\n## Candidats ({len(shown)}), dans un ordre aleatoire\n\n"
         + "\n\n".join(_block(ref, c) for ref, c in shown)
         + "\n\n## Consignes\n"
         "Note chaque candidat sur son seul texte, independamment des autres et de sa place dans la "
         "liste. Pour chacun : ref, puis argument (une ou deux phrases concretes qui citent entre "
         "guillemets le passage decisif et disent ce qui marche ou bloque de ton point de vue, sans "
-        "formule generique), puis les notes. Un element par candidat, sans en omettre."
+        "formule generique), puis les notes. Un element par candidat, sans en omettre.\n\n"
+        + role
     )
 
 
 def _round2_prompt(
-    frame: str,
+    common: str,
     shown: list[tuple[str, Mapping[str, Any]]],
     own: dict[str, dict[str, Any]],
     others: dict[str, list[str]],
+    role: str,
     veto: bool,
 ) -> str:
     blocks = []
@@ -365,7 +384,7 @@ def _round2_prompt(
             + f"Autres avis :\n{heard}"
         )
     return (
-        frame
+        common
         + "\n## Debat\nLe jury diverge sur les candidats ci-dessous. Pour chacun, tu retrouves tes "
         "notes et ton argument du premier tour, puis les arguments des autres juges, anonymes et "
         "dans un ordre aleatoire. Lis-les honnetement en restant dans ta perspective. Revise une note "
@@ -375,6 +394,7 @@ def _round2_prompt(
         + "\n\n## Consignes\nPour chaque candidat : ref, puis argument (ce qui a change et pourquoi, "
         "ou pourquoi tu maintiens, en une ou deux phrases), puis toutes tes notes, revisees ou non."
         + (" Redonne aussi veto et veto_reason, maintenus ou leves." if veto else "")
+        + "\n\n" + role
     )
 
 
@@ -414,6 +434,23 @@ def _ask(
     return out
 
 
+def _waves(judges: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
+    """Noms des juges en 2 vagues : un "leader" par ``model`` configure
+    (premiere occurrence, dans l'ordre de ``judges``), puis le reste. Le
+    leader chauffe le cache de prompt de son modele (meme bloc commun) avant
+    que les autres juges de ce modele n'appellent a leur tour."""
+    seen: set[Any] = set()
+    leaders, others = [], []
+    for judge in judges:
+        key = judge["model"]
+        if key not in seen:
+            seen.add(key)
+            leaders.append(judge["name"])
+        else:
+            others.append(judge["name"])
+    return leaders, others
+
+
 def _run_round(
     rnd: int,
     tasks: dict[str, Any],
@@ -422,21 +459,31 @@ def _run_round(
     parallel: int,
     failed: list[dict[str, Any]],
 ) -> dict[str, dict[str, dict[str, Any]]]:
-    """Lance ``tasks`` (nom de juge -> appel sans argument) en parallele ;
-    renvoie nom -> reponse pour les juges valides, selon la regle du quorum."""
-    with ThreadPoolExecutor(max_workers=max(1, min(parallel, len(tasks)))) as executor:
-        futures = {name: executor.submit(task) for name, task in tasks.items()}
-    answers, errors = {}, {}
-    for judge in judges:
-        name = judge["name"]
-        if name not in futures:
-            continue
-        try:
-            answers[name] = futures[name].result()
-        except llm.SchemaError as exc:
-            if quorum is None or judge["veto"]:
-                raise
-            errors[name] = exc
+    """Lance ``tasks`` (nom de juge -> appel sans argument) en 2 vagues (voir
+    ``_waves``), chaque vague en parallele, la 2e attendant la fin complete
+    de la 1re ; renvoie nom -> reponse pour les juges valides, selon la regle
+    du quorum."""
+    present = [j for j in judges if j["name"] in tasks]
+    by_name = {j["name"]: j for j in present}
+    answers: dict[str, Any] = {}
+    errors: dict[str, Exception] = {}
+
+    def _run_wave(names: list[str]) -> None:
+        if not names:
+            return
+        with ThreadPoolExecutor(max_workers=max(1, min(parallel, len(names)))) as executor:
+            futures = {name: executor.submit(tasks[name]) for name in names}
+        for name in names:
+            try:
+                answers[name] = futures[name].result()
+            except llm.SchemaError as exc:
+                if quorum is None or by_name[name]["veto"]:
+                    raise
+                errors[name] = exc
+
+    for wave in _waves(present):
+        _run_wave(wave)
+
     for name, exc in errors.items():
         failed.append({"judge": name, "round": rnd, "error": str(exc)})
     if errors and len(answers) < quorum:
@@ -538,17 +585,19 @@ def deliberate(
     parallel = int(settings["parallel"])
     failed: list[dict[str, Any]] = []
     by_id = {c["id"]: c for c in candidates}
+    common = _common(len(judges), rubric, context)
 
-    # Tour 1 : ordre et refs propres a chaque juge.
+    # Tour 1 : ordre et refs partages par les juges d'un meme modele, pour
+    # un bloc commun identique octet pour octet entre eux (voir _common).
     views: dict[str, dict[str, str]] = {}  # juge -> ref -> id
     tasks = {}
     for judge in judges:
         ids = [c["id"] for c in candidates]
-        random.Random(f"{seed}:{judge['name']}").shuffle(ids)
+        random.Random(f"{seed}:{judge['model']}").shuffle(ids)
         refs = {f"C{n}": cid for n, cid in enumerate(ids, 1)}
         views[judge["name"]] = refs
         shown = [(ref, by_id[cid]) for ref, cid in refs.items()]
-        prompt = _round1_prompt(_frame(judge, len(judges), rubric, context), shown)
+        prompt = _round1_prompt(common, shown, _role(judge))
         tasks[judge["name"]] = (lambda j=judge, p=prompt, r=list(refs): _ask(j, p, r, criteria, config))
     answers = _run_round(1, tasks, judges, quorum, parallel, failed) if candidates else {}
     active = [j for j in judges if j["name"] in answers]
@@ -574,7 +623,7 @@ def deliberate(
                 heard = [round1[cid][o["name"]]["argument"] for o in active if o["name"] != name]
                 rng.shuffle(heard)
                 others[ref] = heard
-            prompt = _round2_prompt(_frame(judge, len(judges), rubric, context), shown, own, others, judge["veto"])
+            prompt = _round2_prompt(common, shown, own, others, _role(judge), judge["veto"])
             tasks[name] = (lambda j=judge, p=prompt, r=[s[0] for s in shown]: _ask(j, p, r, criteria, config))
         answers2 = _run_round(2, tasks, active, quorum, parallel, failed)
         for name, answer in answers2.items():
