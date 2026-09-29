@@ -41,10 +41,17 @@ Decision, bornes de [durations] dans rubric.toml, ``tolerance`` comprise
 
 Reponse LLM invalide ou Claude indisponible : l'erreur remonte, rien n'est
 ecrit.
+
+Les moments sont independants (chacun son propre appel LLM ``parts``) : ils
+sont traites en parallele, au plus ``parallel`` a la fois (CONFIG_DEFAULTS,
+defaut 4 ; 1 = sequentiel). La sortie (ordre de ``moments``/``rejected``)
+est celle de moments.json, quel que soit l'ordre d'arrivee des reponses.
+``parallel`` < 1 est refuse avec une erreur explicite.
 """
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import logging
 import math
@@ -68,6 +75,9 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "part_overlap_seconds": 3,
     "part_overlap_min": 1,
     "part_overlap_max": 8,
+    # Nombre de moments traites en parallele (chacun son appel LLM) ; 1 =
+    # sequentiel, comme avant.
+    "parallel": 4,
 }
 
 _DURATION_KEYS = ("single_min", "single_max", "part_min", "part_max", "min_parts", "max_parts", "tolerance")
@@ -135,6 +145,14 @@ def overlap_settings(settings: dict[str, Any], d: dict[str, float]) -> Overlap:
     if ov.seconds >= d["part_min"] - d["tolerance"]:
         raise PartsError("[parts] part_overlap_seconds doit rester sous part_min - tolerance")
     return ov
+
+
+def parallel_workers(settings: dict[str, Any]) -> int:
+    """Nombre de moments traites en parallele ; < 1 : PartsError qui le nomme."""
+    value = settings["parallel"]
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise PartsError(f"[parts] parallel doit etre un entier >= 1, recu {value!r}")
+    return value
 
 
 # --------------------------------------------------------------------------
@@ -476,7 +494,9 @@ def run(
 ) -> Path:
     """Decoupe chaque moment de moments.json et ecrit
     workspace/<video_id>/parts.json, dont le chemin est renvoye. Un resultat
-    deja present n'est pas refait, sauf ``force``."""
+    deja present n'est pas refait, sauf ``force``. Les moments sont traites
+    en parallele ([parts] parallel, defaut 4) ; l'echec de l'un fait remonter
+    l'erreur sans rien ecrire."""
     video_dir = Path(workspace_dir) / video_id
     out = video_dir / "parts.json"
     if out.exists() and not force:
@@ -488,12 +508,18 @@ def run(
     rubric_path = Path(settings["rubric_path"])
     durations = load_durations(rubric_path)
     overlap = overlap_settings(settings, durations)
+    workers = parallel_workers(settings)
     sents = split_sentences(transcript)
+
+    def process(moment: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+        return _split(moment, sents, durations, overlap, config)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        outcomes = list(executor.map(process, moments["moments"]))
 
     kept: list[dict[str, Any]] = []
     rejected: list[dict[str, Any]] = []
-    for moment in moments["moments"]:
-        split, reason = _split(moment, sents, durations, overlap, config)
+    for moment, (split, reason) in zip(moments["moments"], outcomes):
         if split is None:
             rejected.append({"id": moment["id"], "start": moment["start"], "end": moment["end"],
                              "duration": round(moment["end"] - moment["start"], 2), "reason": reason})
