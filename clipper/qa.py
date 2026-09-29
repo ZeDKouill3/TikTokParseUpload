@@ -56,6 +56,7 @@ controle (passed/rejected) n'est pas recontrole, sauf ``force``.
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import math
 import re
@@ -101,6 +102,9 @@ CONFIG_DEFAULTS: dict[str, object] = {
     # Part de pixels noirs (0-1) au-dela de laquelle une image compte comme
     # noire (blackdetect pic_th).
     "black_picture_ratio": 0.98,
+    # Nombre de clips controles en meme temps au plus (1 = sequentiel comme
+    # avant TASK-1366). Une valeur < 1 est une erreur explicite (ADR-ad2e).
+    "parallel": 4,
 }
 
 DEFECTS: dict[str, str] = {
@@ -614,21 +618,48 @@ def run(
 ) -> Path:
     """Controle chaque clip rendu de output/<video_id>/ et met a jour son
     JSON ; renvoie ce dossier. Un clip deja controle n'est pas refait, sauf
-    ``force``. Une fois toutes les parties controlees, une partie rejetee
-    est signalee aux autres parties de sa serie (avertissement)."""
+    ``force``. Au plus ``parallel`` clips sont controles en meme temps
+    (reglage ``[qa] parallel``, defaut 4 ; valeur < 1 refusee). Si un clip
+    echoue, les autres clips en cours de controle vont au bout et gardent
+    leur JSON ecrit, puis l'erreur d'origine remonte (ADR-ad2e) ; dans ce
+    cas, ``_warn_series`` n'est pas applique. Sinon, une fois toutes les
+    parties controlees, une partie rejetee est signalee aux autres parties
+    de sa serie (avertissement)."""
     out_dir = Path(output_dir) / video_id
     clips = sorted(out_dir.glob("*.json")) if out_dir.is_dir() else []
     if not clips:
         raise QAError(f"aucun clip rendu dans {out_dir}")
     settings = _settings(config)
+    parallel = int(settings["parallel"])
+    if parallel < 1:
+        raise QAError(f"[qa] parallel doit etre >= 1, recu {parallel}")
     frames_root = Path(workspace_dir) / video_id / "qa"
+
+    pending = []
     for json_path in clips:
         clip = json.loads(json_path.read_text(encoding="utf-8"))
         if not force and clip.get("qa", {}).get("status") in _CHECKED:
             continue
-        check_clip(
-            json_path, frames_root / json_path.stem, settings,
-            config=config, ffmpeg_bin=ffmpeg_bin, ffprobe_bin=ffprobe_bin,
-        )
+        pending.append(json_path)
+
+    errors: dict[Path, Exception] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as pool:
+        futures = {
+            pool.submit(
+                check_clip, json_path, frames_root / json_path.stem, settings,
+                config=config, ffmpeg_bin=ffmpeg_bin, ffprobe_bin=ffprobe_bin,
+            ): json_path
+            for json_path in pending
+        }
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                future.result()
+            except Exception as exc:  # aucune perte silencieuse (ADR-ad2e)
+                errors[futures[future]] = exc
+
+    if errors:
+        first = next(json_path for json_path in pending if json_path in errors)
+        raise errors[first]
+
     _warn_series(clips)
     return out_dir

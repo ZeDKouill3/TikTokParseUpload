@@ -4,6 +4,8 @@ import json
 import re
 import shutil
 import subprocess
+import threading
+import time
 
 import pytest
 
@@ -189,9 +191,14 @@ def read(path):
 
 
 def config(tmp_path, **qa_overrides):
+    # parallel=1 par defaut dans les tests : deterministe (les reponses
+    # scriptees en liste ordonnee restent affectees clip par clip dans
+    # l'ordre) ; les tests de TASK-1366 qui veulent du parallelisme le
+    # demandent explicitement.
+    sections = {"parallel": 1, **qa_overrides}
     return Config(
         mode="auto", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output",
-        _sections={"qa": qa_overrides} if qa_overrides else {},
+        _sections={"qa": sections},
     )
 
 
@@ -791,3 +798,121 @@ def test_series_warning_is_not_duplicated_on_rerun(tmp_path, dirs):
         run(tmp_path, workspace, output)
     types = [i["type"] for i in read(p1)["qa"]["issues"]]
     assert types == ["series_part_rejected"]
+
+
+# --------------------------------------------------------------------------
+# TASK-1366 : clips controles en parallele (au plus `parallel` a la fois)
+# --------------------------------------------------------------------------
+
+
+def test_parallel_config_default_is_four():
+    assert qa.CONFIG_DEFAULTS["parallel"] == 4
+
+
+def test_parallel_zero_is_refused(tmp_path, dirs):
+    workspace, output = dirs
+    write_clip(output)
+    with llm.use_backend(FakeBackend([no_issue])) as fake:
+        with pytest.raises(qa.QAError):
+            qa.run(VIDEO_ID, workspace, output, config=config(tmp_path, parallel=0))
+    assert fake.calls == []
+
+
+class _ConcurrencyBackend:
+    """Backend qui ne repond rien d'utile : il mesure combien d'appels a
+    ``complete`` sont en cours simultanement (verrou + compteur), pour
+    verifier le chevauchement des appels LLM selon ``parallel``."""
+
+    def __init__(self, delay: float = 0.15):
+        self._lock = threading.Lock()
+        self._active = 0
+        self.max_active = 0
+        self.calls = 0
+        self.delay = delay
+
+    def complete(self, request):
+        with self._lock:
+            self._active += 1
+            self.max_active = max(self.max_active, self._active)
+        time.sleep(self.delay)
+        with self._lock:
+            self._active -= 1
+            self.calls += 1
+        return json.dumps({"issues": []})
+
+
+def _write_four_clips(output):
+    for clip_id in ("01", "02", "03", "04"):
+        write_clip(output, clip_id=clip_id)
+
+
+def test_parallel_four_overlaps_llm_calls(tmp_path, dirs):
+    workspace, output = dirs
+    _write_four_clips(output)
+    backend = _ConcurrencyBackend()
+    with llm.use_backend(backend):
+        qa.run(VIDEO_ID, workspace, output, config=config(tmp_path, parallel=4))
+    assert backend.calls == 4
+    assert backend.max_active >= 2
+
+
+def test_parallel_one_never_overlaps_llm_calls(tmp_path, dirs):
+    workspace, output = dirs
+    _write_four_clips(output)
+    backend = _ConcurrencyBackend()
+    with llm.use_backend(backend):
+        qa.run(VIDEO_ID, workspace, output, config=config(tmp_path, parallel=1))
+    assert backend.calls == 4
+    assert backend.max_active == 1
+
+
+def _routed_answer(request):
+    """Reponse deterministe d'apres le clip (nom du dossier d'images), pas
+    d'apres l'ordre d'appel : les appels concurrents n'ont pas d'ordre fixe."""
+    stem = request.images[0].parent.name
+    if stem == "02":
+        return {"issues": [{"type": "weak_hook", "detail": "accroche faible"}]}
+    return {"issues": []}
+
+
+def test_json_identical_between_parallel_one_and_four(tmp_path):
+    results = {}
+    for parallel in (1, 4):
+        base = tmp_path / f"p{parallel}"
+        output = base / "output"
+        (output / VIDEO_ID).mkdir(parents=True)
+        workspace = base / "workspace"
+        for clip_id in ("01", "02", "03"):
+            write_clip(output, clip_id=clip_id)
+        with llm.use_backend(FakeBackend([_routed_answer])):
+            qa.run(VIDEO_ID, workspace, output, config=config(base, parallel=parallel))
+        results[parallel] = {
+            clip_id: read(output / VIDEO_ID / f"{clip_id}.json") for clip_id in ("01", "02", "03")
+        }
+    assert results[1] == results[4]
+
+
+def test_clip_llm_failure_raises_but_other_clips_are_written_and_no_series_warning(tmp_path, dirs):
+    workspace, output = dirs
+    p1 = write_clip_part(output, part=1, parts_total=3, clip_id="06-p1")
+    p2 = write_clip_part(output, part=2, parts_total=3, clip_id="06-p2")
+    p3 = write_clip_part(output, part=3, parts_total=3, clip_id="06-p3")
+
+    def answer(request):
+        stem = request.images[0].parent.name
+        if stem == "06-p1":
+            return {"issues": [{"type": "incomprehensible", "detail": "histoire decousue"}]}
+        if stem == "06-p2":
+            raise llm.TransientLLMError("quota")
+        return {"issues": []}
+
+    with llm.use_backend(FakeBackend([answer])):
+        with pytest.raises(llm.TransientLLMError):
+            qa.run(VIDEO_ID, workspace, output, config=config(tmp_path, parallel=4))
+
+    assert read(p1)["qa"]["status"] == "rejected"
+    assert read(p3)["qa"]["status"] == "passed"
+    # _warn_series pas applique (le run a echoue) : p3 n'est pas averti du
+    # rejet de p1 bien que p1 soit bien rejete.
+    assert "series_part_rejected" not in [i["type"] for i in read(p3)["qa"]["issues"]]
+    assert read(p2)["qa"]["status"] == "skipped"
