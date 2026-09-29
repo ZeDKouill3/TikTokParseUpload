@@ -4,6 +4,7 @@ import ast
 import os
 import re
 import threading
+import time
 from collections import defaultdict
 from pathlib import Path
 
@@ -192,13 +193,43 @@ def test_model_is_set_per_judge():
     assert models["jury_monteur"] == "rapide"
 
 
-def test_judges_run_in_parallel():
-    # Les 5 juges doivent etre en vol en meme temps pour franchir la barriere.
-    barrier = threading.Barrier(5, timeout=5)
-    script = ScriptedJury({1: uniform({"secret-id-0": 7, "secret-id-1": 5, "secret-id-2": 3})}, barrier=barrier)
-    result, fake = run(script)
+def test_judges_run_in_two_waves_a_leader_per_model_then_the_rest():
+    # 2 modeles par defaut (strong, fast) : 2 leaders d'abord (en parallele
+    # entre eux), puis les 3 autres juges (en parallele entre eux), pour que
+    # la 2e vague profite du cache de prompt chauffe par la 1re (meme
+    # prefixe, meme modele). Les leaders sont ralentis : un suiveur ne doit
+    # demarrer qu'une fois les DEUX leaders termines (mesure par horodatage,
+    # pas par une barriere que le vieux comportement a une chance de croiser
+    # par coincidence).
+    leaders = {"retention", "spectateur"}
+    followers = {"monteur", "avocat", "conformite"}
+    script = ScriptedJury({1: uniform({"secret-id-0": 7, "secret-id-1": 5, "secret-id-2": 3})})
+    starts: dict[str, float] = {}
+    finishes: dict[str, float] = {}
+    lock = threading.Lock()
+
+    def synced(request):
+        judge = request.usage.removeprefix("jury_")
+        with lock:
+            starts[judge] = time.monotonic()
+        if judge in leaders:
+            time.sleep(0.2)
+        answer = script(request)
+        with lock:
+            finishes[judge] = time.monotonic()
+        return answer
+
+    fake = FakeBackend([synced] * 5)
+    with llm.use_backend(fake):
+        jury.deliberate(candidates(), RUBRIC, config=make_config())
+
     assert len(fake.calls) == 5
-    assert not barrier.broken
+    last_leader_finish = max(finishes[j] for j in leaders)
+    for j in followers:
+        assert starts[j] >= last_leader_finish, j
+    order = [c.usage.removeprefix("jury_") for c in fake.calls]
+    assert set(order[:2]) == leaders
+    assert set(order[2:]) == followers
 
 
 def test_candidates_are_anonymized():
@@ -208,6 +239,19 @@ def test_candidates_are_anonymized():
         assert "secret-id" not in call.prompt
         assert set(blocks(call.prompt)) == {"C1", "C2", "C3"}
         assert "[60-90] s" in call.prompt  # le contexte du candidat est transmis
+
+
+def test_same_model_judges_share_an_identical_prompt_prefix_for_the_cache():
+    script = ScriptedJury({1: uniform({"secret-id-0": 7, "secret-id-1": 5, "secret-id-2": 3})})
+    _, fake = run(script)
+    prompts = {c.usage.removeprefix("jury_"): c.prompt for c in fake.calls}
+
+    def prefix(name):
+        return prompts[name].split("## Ta perspective")[0]
+
+    assert prefix("retention") == prefix("monteur") == prefix("avocat")
+    assert prefix("spectateur") == prefix("conformite")
+    assert prefix("retention") != prefix("spectateur")
 
 
 def test_round_one_is_blind():
@@ -238,10 +282,14 @@ def orders_for(seed):
     return {j: order(script.prompts[j][0]) for j in JUDGES}
 
 
-def test_shuffle_is_deterministic_and_specific_to_each_judge():
+def test_shuffle_is_deterministic_and_specific_to_each_model():
     first, again = orders_for(0), orders_for(0)
     assert first == again
-    assert len({tuple(o) for o in first.values()}) > 1
+    # meme modele (defaut : strong = retention/monteur/avocat, fast =
+    # spectateur/conformite) => meme ordre, pour un prefixe de prompt commun.
+    assert first["retention"] == first["monteur"] == first["avocat"]
+    assert first["spectateur"] == first["conformite"]
+    assert first["retention"] != first["spectateur"]
     assert any(o != [f"secret-id-{k}" for k in range(8)] for o in first.values())
     assert orders_for(1) != first
 
