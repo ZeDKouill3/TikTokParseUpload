@@ -533,7 +533,13 @@ def test_vocab_max_tokens_outside_the_window_is_refused_before_loading_the_model
 
 
 def test_fix_changes_word_text_only(tmp_path, video_dir, cpu):
-    fake = FakeBackend([VOCAB, {"corrections": [{"i": 1, "word": "Rockstar"}, {"i": 3, "word": "6"}]}])
+    fake = FakeBackend([
+        VOCAB,
+        {"corrections": [
+            {"i": 1, "old": "Rokstar", "word": "Rockstar"},
+            {"i": 3, "old": "six", "word": "6"},
+        ]},
+    ])
     with llm.use_backend(fake):
         run(tmp_path, ModelFactory())
 
@@ -566,9 +572,10 @@ def test_fix_cannot_change_timecodes_or_word_count(tmp_path, video_dir, cpu):
     """Une reponse qui tente d'ajouter des champs (timecodes) ou de viser un
     mot inexistant est un echec, pas une donnee."""
     for bad in (
-        {"corrections": [{"i": 1, "word": "Rockstar", "start": 9.9}]},
-        {"corrections": [{"i": 5, "word": "en trop"}]},
-        {"corrections": [{"i": -1, "word": "avant"}]},
+        {"corrections": [{"i": 1, "old": "Rokstar", "word": "Rockstar", "start": 9.9}]},
+        {"corrections": [{"i": 5, "old": "en", "word": "en trop"}]},
+        {"corrections": [{"i": -1, "old": "avant", "word": "avant"}]},
+        {"corrections": [{"i": 1, "word": "Rockstar"}]},  # old manquant
         {"words": [" Salut", " Rockstar", " Games"]},
     ):
         (video_dir / "transcript.json").unlink(missing_ok=True)
@@ -580,12 +587,33 @@ def test_fix_cannot_change_timecodes_or_word_count(tmp_path, video_dir, cpu):
 def test_fix_word_that_would_merge_words_is_refused(tmp_path, video_dir, cpu):
     """Un mot corrige ne peut pas contenir d'espace interne : sinon il
     deviendrait deux mots pour les sous-titres sans timecode propre."""
-    from clipper.transcribe import TranscribeError
-
-    with llm.use_backend(FakeBackend([VOCAB, {"corrections": [{"i": 0, "word": "Salut les"}]}])):
-        with pytest.raises(TranscribeError):
+    bad = {"corrections": [{"i": 0, "old": "Salut", "word": "Salut les"}]}
+    with llm.use_backend(FakeBackend([VOCAB, bad])):
+        with pytest.raises(llm.SchemaError):
             run(tmp_path, ModelFactory())
     assert not (video_dir / "transcript.json").exists()
+
+
+def test_fix_correction_whose_old_does_not_match_the_actual_word_is_refused_and_logged(
+    tmp_path, video_dir, cpu
+):
+    """Une correction visant un mot different de celui reellement present a
+    cet index (LLM decale, index hallucine...) ne correspond pas au texte :
+    refusee, jamais appliquee en silence (ADR-ad2e), et journalisee dans
+    llm_refusals.jsonl (meme convention que captions.py)."""
+    bad = {"corrections": [{"i": 1, "old": "Rockstar", "word": "Rockstars"}]}  # le mot 1 est " Rokstar"
+    with llm.use_backend(FakeBackend([VOCAB, bad])):
+        with pytest.raises(llm.SchemaError):
+            run(tmp_path, ModelFactory())
+    assert not (video_dir / "transcript.json").exists()
+
+    refusals_path = video_dir / "llm_refusals.jsonl"
+    assert refusals_path.exists()
+    entries = [json.loads(line) for line in refusals_path.read_text(encoding="utf-8").splitlines()]
+    assert any(
+        e["usage"] == "transcript_fix" and "Rokstar" in e["error"] and "Rockstar" in e["error"]
+        for e in entries
+    )
 
 
 def test_fix_disabled_explicitly_in_config_skips_the_call(tmp_path, video_dir, cpu):
@@ -607,9 +635,9 @@ def test_fix_runs_in_chunks_with_global_word_indexes_mapped_per_chunk(tmp_path, 
         for i in range(5)
     ]  # 10 mots, 2 par segment
     answers = [
-        {"corrections": [{"i": 0, "word": "UN"}]},     # tranche 1 : mots 0-3
-        {"corrections": [{"i": 1, "word": "DEUX"}]},   # tranche 2 : mots 4-7 -> mot 5
-        {"corrections": [{"i": 1, "word": "TROIS"}]},  # tranche 3 : mots 8-9 -> mot 9
+        {"corrections": [{"i": 0, "old": "mot0a", "word": "UN"}]},     # tranche 1 : mots 0-3
+        {"corrections": [{"i": 1, "old": "mot2b", "word": "DEUX"}]},   # tranche 2 : mots 4-7 -> mot 5
+        {"corrections": [{"i": 1, "old": "mot4b", "word": "TROIS"}]},  # tranche 3 : mots 8-9 -> mot 9
     ]
     fake = FakeBackend([VOCAB, *answers])
     with llm.use_backend(fake):
@@ -697,7 +725,7 @@ def test_fix_parallel_result_matches_sequential_processing_regardless_of_schedul
         def respond(request):
             time.sleep(0.01 * (5 - chunk_index))  # ordre d'arrivee inverse
             assert f"mot{chunk_index * 2}" in request.prompt
-            return {"corrections": [{"i": 0, "word": f"CORRIGE{chunk_index}"}]}
+            return {"corrections": [{"i": 0, "old": f"mot{chunk_index * 2}", "word": f"CORRIGE{chunk_index}"}]}
 
         return respond
 
@@ -786,7 +814,7 @@ def test_retry_reuses_raw_vocab_and_applies_correction(tmp_path, video_dir, cpu)
         with pytest.raises(llm.TransientLLMError):
             run(tmp_path, factory)
 
-    with llm.use_backend(FakeBackend([{"corrections": [{"i": 1, "word": "Rockstar"}]}])):
+    with llm.use_backend(FakeBackend([{"corrections": [{"i": 1, "old": "Rokstar", "word": "Rockstar"}]}])):
         run(tmp_path, factory)
 
     data = read_transcript(video_dir)

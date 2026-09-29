@@ -22,8 +22,11 @@ Deroulement :
 3. usage ``transcript_fix`` par tranches de ``fix_chunk_words`` mots,
    jusqu'a ``fix_parallel`` tranches en meme temps (threads : les appels
    clipper.llm sont des sous-processus) : la reponse ne liste que des
-   corrections {i, word} par index de mot, donc ni le nombre de mots ni
-   leurs timecodes ne peuvent changer.
+   corrections {i, old, word} par index de mot (ancien texte, nouveau texte),
+   donc ni le nombre de mots ni leurs timecodes ne peuvent changer. Une
+   correction dont ``old`` ne correspond pas au mot reellement present a cet
+   index est refusee et journalisee dans llm_refusals.jsonl (ADR-ad2e),
+   jamais appliquee en silence.
 
 Si transcript_raw.json existe deja (retour apres un echec de la correction),
 il est reutilise et whisper n'est pas relance, sauf ``force``.
@@ -306,9 +309,10 @@ def _fix_schema(n_words: int) -> dict[str, Any]:
                     "type": "object",
                     "properties": {
                         "i": {"type": "integer", "minimum": 0, "maximum": n_words - 1},
+                        "old": {"type": "string", "minLength": 1},
                         "word": {"type": "string", "minLength": 1},
                     },
-                    "required": ["i", "word"],
+                    "required": ["i", "old", "word"],
                     "additionalProperties": False,
                 },
             },
@@ -318,7 +322,37 @@ def _fix_schema(n_words: int) -> dict[str, Any]:
     }
 
 
-def _fix_chunk(chunk: list[dict[str, Any]], vocab: list[str], config: Any) -> None:
+def _check_corrections(words: list[dict[str, Any]]) -> Callable[[Any], None]:
+    """Controle passe a llm.ask (comme clipper.captions) : une correction
+    dont ``old`` ne correspond pas au mot reellement present a cet index (LLM
+    decale, index hallucine...) ne correspond pas au texte et est renvoyee au
+    modele pour correction, comme une reponse hors schema ; si elle est
+    encore refusee apres les tentatives de reparation, l'echec est journalise
+    dans llm_refusals.jsonl (ADR-ad2e) et remonte, jamais applique en
+    silence. Un mot corrige ne peut pas non plus contenir d'espace interne :
+    il deviendrait deux mots pour les sous-titres, sans timecode propre."""
+
+    def check(answer: dict[str, Any]) -> None:
+        for correction in answer["corrections"]:
+            i = correction["i"]
+            old = correction["old"].strip()
+            actual = words[i]["word"].strip()
+            if old != actual:
+                raise llm.SchemaError(
+                    f"correction refusee pour le mot {i} : le modele visait {old!r}, "
+                    f"le texte a cet index est {actual!r}"
+                )
+            new = correction["word"].strip()
+            if not new or any(c.isspace() for c in new):
+                raise llm.SchemaError(
+                    f"correction refusee pour le mot {i} : {correction['word']!r} "
+                    "(un mot doit rester un seul mot)"
+                )
+
+    return check
+
+
+def _fix_chunk(chunk: list[dict[str, Any]], vocab: list[str], config: Any, log_path: Path) -> None:
     words = [w for seg in chunk for w in seg["words"]]
     if not words:
         return
@@ -328,28 +362,28 @@ def _fix_chunk(chunk: list[dict[str, Any]], vocab: list[str], config: Any) -> No
         "precede de son index. Corrige uniquement l'orthographe des mots mal "
         "reconnus (surtout les noms propres). Ne fusionne, ne coupe, n'ajoute "
         "et ne supprime aucun mot : une correction remplace exactement un mot "
-        "par un seul mot, sans espace. Ne liste que les mots a changer.\n\n"
+        "par un seul mot, sans espace. Ne liste que les mots a changer, "
+        "chacun avec son index, le mot original exact (old) et le mot "
+        "corrige (word).\n\n"
         f"Vocabulaire attendu : {', '.join(vocab) if vocab else '(aucun)'}\n\n"
         f"{lines}"
     )
-    answer = llm.ask("transcript_fix", prompt, [], _fix_schema(len(words)), config=config)
+    answer = llm.ask(
+        "transcript_fix", prompt, [], _fix_schema(len(words)),
+        config=config, check=_check_corrections(words), log_path=log_path,
+    )
     for correction in answer["corrections"]:
-        text = correction["word"].strip()
-        if not text or any(c.isspace() for c in text):
-            raise TranscribeError(
-                f"correction refusee pour le mot {correction['i']} : {correction['word']!r} "
-                "(un mot doit rester un seul mot)"
-            )
         word = words[correction["i"]]
         original = word["word"]
-        word["word"] = original[: len(original) - len(original.lstrip())] + text
+        new = correction["word"].strip()
+        word["word"] = original[: len(original) - len(original.lstrip())] + new
     for seg in chunk:
         if seg["words"]:
             seg["text"] = "".join(w["word"] for w in seg["words"])
 
 
 def _fix_chunks(
-    chunks: list[list[dict[str, Any]]], vocab: list[str], config: Any, parallel: int
+    chunks: list[list[dict[str, Any]]], vocab: list[str], config: Any, parallel: int, log_path: Path
 ) -> None:
     """Corrige jusqu'a ``parallel`` tranches en meme temps (threads : les
     appels clipper.llm sont des sous-processus, pas du calcul CPU Python).
@@ -360,7 +394,7 @@ def _fix_chunks(
     if not chunks:
         return
     with ThreadPoolExecutor(max_workers=max(1, parallel)) as executor:
-        futures = [executor.submit(_fix_chunk, chunk, vocab, config) for chunk in chunks]
+        futures = [executor.submit(_fix_chunk, chunk, vocab, config, log_path) for chunk in chunks]
         for future in futures:
             future.result()
 
@@ -420,7 +454,8 @@ def transcribe(
 
     if settings["transcript_fix"]:
         chunks = _chunks(segments, int(settings["fix_chunk_words"]))
-        _fix_chunks(chunks, vocab, config, int(settings["fix_parallel"]))
+        log_path = video_dir / "llm_refusals.jsonl"
+        _fix_chunks(chunks, vocab, config, int(settings["fix_parallel"]), log_path)
 
     transcript = {
         "video_id": video_id,
