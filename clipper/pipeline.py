@@ -562,6 +562,26 @@ def decide(
 # --------------------------------------------------------------------------
 
 
+def _zero_clip_reason(run: _Run) -> str | None:
+    """Raison explicite (ADR-ad2e) quand la video finit sans aucun clip parce
+    que l'etape moments n'a retenu aucun candidat : nombre de candidats notes,
+    meilleur score, seuil ``min_score``. ``None`` si moments.json est absent
+    ou a retenu au moins un moment (0 clip final vient alors d'ailleurs, ex.
+    revue humaine, hors perimetre de cette raison)."""
+    moments_path = run.dir / "moments.json"
+    if not moments_path.exists():
+        return None
+    data = _read_json(moments_path)
+    if data["moments"]:
+        return None
+    scored = [m for m in data["rejected"] if "final_score" in m]
+    if not scored:
+        return "aucun candidat retenu par moments, 0 clip"
+    best = max(m["final_score"] for m in scored)
+    min_score = data["rubric"]["min_score"]
+    return f"{len(scored)} candidats, meilleur score {best} < min_score {min_score}, 0 clip"
+
+
 def _summary(run: _Run) -> list[dict[str, Any]]:
     out = []
     for clip in run.clips():
@@ -673,7 +693,11 @@ def _advance_steps(run: _Run, *, through_review: bool) -> dict[str, Any]:
         step.update(status="done", finished_at=_iso(_now()))
         save_state(state, config=config)
 
-    state.update(status="done", reason=None, retry_at=None, attempts=0, clips=_summary(run))
+    clips = _summary(run)
+    reason = _zero_clip_reason(run) if not clips else None
+    if reason:
+        log.info("%s : termine sans clip (%s)", run.video_id, reason)
+    state.update(status="done", reason=reason, retry_at=None, attempts=0, clips=clips)
     save_state(state, config=config)
     return state
 
