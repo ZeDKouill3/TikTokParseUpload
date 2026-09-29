@@ -107,6 +107,13 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "facecam_min_share": 0.8,
     "facecam_tolerance": 40,
     "facecam_max_area": 0.25,
+    # detect_facecam seulement (TASK-493f184c4ce1) : au plus ce nombre
+    # d'images cles examinees (image entiere + 4 coins agrandis), a
+    # intervalles reguliers sur toute la duree de la video (indices
+    # equirepartis, bornes comprises) quand scenes.json en fournit plus ;
+    # borne le nombre d'appels au detecteur sur une video a beaucoup
+    # d'images cles (248 s sur 2326 images cles avant ce reglage).
+    "facecam_max_keyframes": 200,
     # detect_facecam seulement : en plus de l'image entiere, chaque coin de
     # l'image cle est recadre a facecam_corner_size de la largeur/hauteur puis
     # agrandi facecam_corner_zoom fois avant detection (coordonnees ramenees
@@ -1349,6 +1356,21 @@ def _detect_corners(
     return found
 
 
+def _sample_keyframes(frames: list[dict[str, Any]], max_count: int) -> list[dict[str, Any]]:
+    """Au plus ``max_count`` images cles (``frames``, triees par timecode), a
+    intervalles reguliers (indices equirepartis, bornes comprises) : borne le
+    nombre d'appels au detecteur sur une video a beaucoup d'images cles, sans
+    perdre la couverture du debut et de la fin (TASK-493f184c4ce1)."""
+    n = len(frames)
+    if max_count <= 0 or n <= max_count:
+        return frames
+    if max_count == 1:
+        return [frames[0]]
+    step = (n - 1) / (max_count - 1)
+    indices = sorted({round(i * step) for i in range(max_count)})
+    return [frames[i] for i in indices]
+
+
 def detect_facecam(
     video_id: str,
     workspace_dir: str | Path = "workspace",
@@ -1382,6 +1404,7 @@ def detect_facecam(
         raise ReframeError(f"scenes.json absent : {scenes_file}")
     frames = sorted(json.loads(scenes_file.read_text(encoding="utf-8")).get("frames", []),
                     key=lambda f: f["timecode"])
+    frames = _sample_keyframes(frames, int(settings["facecam_max_keyframes"]))
     if detector_factory is None:
         if settings["detector"] not in _DETECTORS:
             raise ReframeError(
