@@ -6,6 +6,11 @@ de plusieurs heures est découpée en moments forts, chaque moment devenant un
 clip (ou plusieurs parties s'il est trop long), sous-titré mot par mot,
 recadré pour garder les visages dans le cadre.
 
+Résultat pour un moment retenu : `output/<video_id>/<clip_id>.mp4` (vertical,
+letterbox par défaut — zoom fixe, titre d'écran en haut, sous-titres dans la
+bande floue du bas) accompagné d'un `.json` avec titre, légende, hashtags et
+le rapport du contrôle qualité. Voir `docs/GUIDE.md` pour le détail du format.
+
 Le pipeline tourne en local : transcription (faster-whisper), détection de
 scènes/visages, rendu (ffmpeg) sur ta machine ; seules les étapes qui
 demandent du jugement (choix des moments, points de coupe, titres/légendes,
@@ -30,7 +35,7 @@ Deux modes :
   `claude-cli`).
 - **Pilote NVIDIA** (optionnel) pour accélérer la transcription
   (faster-whisper/CTranslate2) et le rendu (NVENC) sur GPU. Sans GPU, tout le
-  pipeline tourne sur CPU (plus lentement).
+  pipeline tourne sur CPU (plus lentement, voir `clipper.gpu`).
   Pour que faster-whisper utilise le GPU sous Windows, les DLL cuBLAS/cuDNN
   doivent être trouvables : voir *Pièges* dans `AGENTS.md`.
 
@@ -44,47 +49,35 @@ uv pip install -e ".[test]"
 `uv` est **obligatoire** (pas `pip` seul) : `pyproject.toml` déclare sous
 `[tool.uv] override-dependencies` un contournement qui force un seul paquet
 OpenCV installé (`opencv-contrib-python`, sur-ensemble d'`opencv-python`) —
-`mediapipe` et `scenedetect` en réclament chacun un différent, et les deux
-s'installer écraserait le module `cv2` de l'autre. `pip` seul ignore ce
+`mediapipe` et `scenedetect` en réclament chacun un différent, et installer
+les deux écraserait le module `cv2` de l'un par l'autre. `pip` seul ignore ce
 réglage `[tool.uv]` et peut installer les deux.
 
-Ou lance `tools/setup.ps1`, qui fait tout ça et vérifie les prérequis.
+Ou lance `tools/setup.ps1`, qui fait tout ça et vérifie les prérequis
+(uv, Python 3.11, ffmpeg, `claude`, `ank`, GPU optionnel).
 
-## Utilisation
+## Démarrage rapide
+
+Copie `config.example.toml` vers `config.toml` (réglages par défaut : mode
+`review`), puis :
 
 ```powershell
-python -m clipper run <url-youtube>              # jusqu'a la revue (review) ou jusqu'au bout (auto)
-python -m clipper render <video_id>               # reprend apres la revue (ou un echec) jusqu'au bout
-python -m clipper decide <video_id> <moment_id> accepted|rejected|adjusted [--start S] [--end S] [--comment C]
-python -m clipper status <video_id>               # etat courant (JSON)
-python -m clipper queue [--watch] [--interval S]  # reprend les videos en file d'attente
-python -m clipper serve [--port P]                # interface web locale (FastAPI, 127.0.0.1)
+python -m clipper run <url-youtube>    # jusqu'a la revue (review) ou jusqu'au bout (auto)
+python -m clipper serve                # interface web locale : http://127.0.0.1:8000
 ```
 
-`--config chemin.toml` (defaut `config.toml`) et `-v`/`--verbose` sont
-disponibles sur toutes les commandes. Une video en cours produit son etat
-sous `workspace/<video_id>/` ; une etape dont le resultat existe deja n'est
-pas relancee, sauf `--force`.
+En mode `review`, l'interface web (ou `python -m clipper decide`) sert à
+accepter/refuser/ajuster chaque moment proposé, puis `python -m clipper
+render <video_id>` (ou le bouton "rendre" de l'interface) termine le clip.
 
-## Configuration
+Voir `docs/GUIDE.md` pour toutes les commandes, les modes, les formats, la
+configuration détaillée et le dépannage.
 
-Copie `config.example.toml` vers `config.toml` puis ajuste :
+## Où sont les sorties
 
-```toml
-mode = "review"          # ou "auto"
-workspace_dir = "workspace"
-output_dir = "output"
-
-[llm]
-backend = "claude-cli"
-```
-
-Chaque étape du pipeline (un module `clipper/<etape>.py`) déclare son propre
-`CONFIG_DEFAULTS` : une table `[<etape>]` dans `config.toml` (ex. `[llm]`,
-`[transcribe]`, `[render]`, `[web]`...) est validée contre ce dict — une clé
-absente de `CONFIG_DEFAULTS` est refusée, une section sans module
-`clipper.<etape>` ou sans `CONFIG_DEFAULTS` aussi. Regarde `CONFIG_DEFAULTS`
-dans le module concerné pour la liste des clés disponibles et leur sens.
+- `workspace/<video_id>/` : état de travail par vidéo (transcript, moments,
+  plans de recadrage, `pipeline.json`...), pas versionné.
+- `output/<video_id>/<clip_id>.mp4` + `.json` : clips prêts à publier.
 
 `workspace/` et `output/` sont gitignorés : ce sont des dossiers de travail
 par machine, pas des artefacts à versionner.
@@ -95,4 +88,13 @@ par machine, pas des artefacts à versionner.
 pytest
 ```
 
-Voir `AGENTS.md` pour ce que la suite couvre et ce qu'elle saute par défaut.
+Tout le pipeline tourne sur CPU pour les tests (ADR-fb9b) : aucun test n'a
+besoin d'un GPU pour passer. Voir `AGENTS.md` pour ce que la suite couvre et
+ce qu'elle saute par défaut.
+
+## Documentation
+
+- `docs/GUIDE.md` — guide utilisateur : les 12 étapes du pipeline, modes,
+  formats, configuration complète, consommation du quota Claude, dépannage.
+- `AGENTS.md` — conventions du dépôt et décisions ratifiées (ADR/SPEC),
+  pour qui contribue au code.
