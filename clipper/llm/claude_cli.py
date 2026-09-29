@@ -39,6 +39,23 @@ chemin ni ``@fichier``, verifie sur 2.1.281) : le schema passe donc par argv,
 en JSON compact, et une ligne de commande qui depasserait la limite Windows
 est un echec explicite plutot qu'un envoi sans schema.
 
+Cache de prompt (TASK-2cbb). Le cache de contexte d'Anthropic marque des
+BLOCS de contenu (``cache_control``), pas un prefixe de caracteres a
+l'interieur d'un bloc unique : un prompt texte identique octet pour octet
+entre deux appels ne produit aucune relecture de cache tant qu'il n'est
+qu'une seule chaine sur stdin, faute de frontiere de bloc ou poser ce
+marqueur (mesure reelle, cache_read quasi nul malgre un prefixe deja partage
+depuis TASK-b0fa). Quand ``LLMRequest.cache_prefix`` est donne, le prompt
+part donc en (au moins) 2 blocs de texte, meme sans image (``--input-format
+stream-json`` comme pour les images) : le premier (``cache_prefix``) porte
+``cache_control: {"type": "ephemeral", "ttl": "1h"}``, le reste (role du juge
+compris) n'en porte pas. Des juges d'un meme modele (clipper.jury) partagent
+alors un bloc identique que le fournisseur peut relire au lieu de le
+refacturer. ``ttl: "1h"`` est obligatoire : Claude Code pose deja son propre
+cache_control ttl=1h sur le systeme (interne, hors controle), et l'API
+refuse (400) un ttl="5m" (le defaut si omis) place apres dans l'ordre de
+traitement (tools, system, messages) -- mesure reelle, pas une supposition.
+
 Sortie. Avec --output-format json (sans image) : un objet unique ``{"type":
 "result", "subtype": "success", "is_error": bool, "api_error_status":
 int|null, "result": "<texte de la reponse>", "structured_output":
@@ -118,11 +135,15 @@ def resolve_command(command: str) -> str:
 
 
 def stdin_input(request: LLMRequest) -> str:
-    """Contenu envoye sur stdin. Sans image : le prompt tel quel (texte
-    brut, ``--output-format json``). Avec images : un unique message
-    ``--input-format stream-json`` dont le contenu liste les blocs image
-    (base64, comme clipper.llm.claude_api) suivis du bloc texte du prompt."""
-    if not request.images:
+    """Contenu envoye sur stdin. Sans image ni cache_prefix : le prompt tel
+    quel (texte brut, ``--output-format json``). Avec l'un des deux : un
+    unique message ``--input-format stream-json`` dont le contenu liste les
+    blocs image (base64, comme clipper.llm.claude_api), puis le texte du
+    prompt soit en un bloc, soit coupe en 2 blocs (cache_prefix marque
+    ``cache_control``, le reste n'en porte pas) si ``cache_prefix`` est
+    donne -- necessaire pour que le fournisseur puisse relire son cache sur
+    ce prefixe (voir la docstring du module)."""
+    if not request.images and not request.cache_prefix:
         return request.prompt
     content: list[dict[str, Any]] = [
         {
@@ -135,7 +156,24 @@ def stdin_input(request: LLMRequest) -> str:
         }
         for p in request.images
     ]
-    content.append({"type": "text", "text": request.prompt})
+    if request.cache_prefix:
+        # ttl explicite : Claude Code pose deja un cache_control ttl=1h sur le
+        # systeme (interne, hors de notre controle) ; sans le meme ttl ici,
+        # l'API refuse (400 : "a ttl='1h' cache_control block must not come
+        # after a ttl='5m' cache_control block") puisque le defaut serait 5m,
+        # place apres dans l'ordre de traitement (tools, system, messages).
+        content.append(
+            {
+                "type": "text",
+                "text": request.cache_prefix,
+                "cache_control": {"type": "ephemeral", "ttl": "1h"},
+            }
+        )
+        remainder = request.prompt[len(request.cache_prefix):]
+        if remainder:
+            content.append({"type": "text", "text": remainder})
+    else:
+        content.append({"type": "text", "text": request.prompt})
     message = {"type": "user", "message": {"role": "user", "content": content}}
     return json.dumps(message, ensure_ascii=False) + "\n"
 
@@ -148,7 +186,7 @@ class ClaudeCLIBackend:
 
     def build_command(self, request: LLMRequest) -> list[str]:
         cmd = [resolve_command(self.command), "-p", "--model", request.model]
-        if request.images:
+        if request.images or request.cache_prefix:
             # --verbose : requis par le CLI avec --print + --output-format
             # stream-json (verifie en reel, Claude Code 2.1.281 : "Error:
             # When using --print, --output-format=stream-json requires

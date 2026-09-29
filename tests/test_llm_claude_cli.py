@@ -5,6 +5,7 @@ sortie de `claude -p --output-format json`."""
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -12,6 +13,7 @@ import pytest
 
 import clipper.llm as llm
 from clipper.config import Config
+from clipper.llm import LLMError
 
 COLOR_SCHEMA = {
     "type": "object",
@@ -117,3 +119,114 @@ def test_claude_cli_usage_log_writes_null_fields_when_usage_is_absent(fake_run, 
     assert entry["output_tokens"] is None
     assert entry["cache_read_tokens"] is None
     assert entry["cost_usd"] is None
+
+
+# --------------------------------------------------------------------------
+# cache_prefix (TASK-2cbb) : le cache de contexte d'Anthropic marque des
+# blocs de contenu, pas un prefixe de caracteres dans un bloc unique. Un
+# prompt texte identique octet pour octet entre deux appels (deja acquis par
+# TASK-b0fa) ne produit donc aucune relecture de cache tant que le prompt
+# n'est qu'une seule chaine sur stdin : il faut une frontiere de bloc pour
+# poser cache_control.
+# --------------------------------------------------------------------------
+
+PREFIX = "Bloc commun a tous les juges, identique octet pour octet. " * 5
+
+
+def test_cache_prefix_becomes_its_own_cache_controlled_content_block(fake_run):
+    run = fake_run(json.dumps(RECORDED_CLAUDE_CLI_WITH_USAGE))
+
+    llm.ask("jury_x", PREFIX + "Role specifique.", [], COLOR_SCHEMA, config=make_config(), cache_prefix=PREFIX)
+
+    cmd = run.calls[0]["cmd"]
+    # Sans image, un cache_prefix impose quand meme le format structure : un
+    # prompt texte brut sur stdin ne peut porter aucune frontiere de bloc.
+    assert cmd[cmd.index("--input-format") + 1] == "stream-json"
+    assert cmd[cmd.index("--output-format") + 1] == "stream-json"
+    assert "--verbose" in cmd
+
+    message = json.loads(run.calls[0]["input"])
+    content = message["message"]["content"]
+    assert len(content) == 2
+    assert content[0] == {
+        "type": "text",
+        "text": PREFIX,
+        "cache_control": {"type": "ephemeral", "ttl": "1h"},
+    }
+    assert "cache_control" not in content[1]
+    assert content[1]["text"].startswith("Role specifique.")
+
+
+def test_no_cache_prefix_keeps_the_plain_text_stdin_unchanged(fake_run):
+    # Regression : un appel sans cache_prefix (le cas courant hors jury)
+    # garde le comportement d'avant TASK-2cbb (stdin brut, --output-format json).
+    run = fake_run(json.dumps(RECORDED_CLAUDE_CLI_WITH_USAGE))
+
+    llm.ask("vision", "p", [], COLOR_SCHEMA, config=make_config())
+
+    cmd = run.calls[0]["cmd"]
+    assert cmd[cmd.index("--output-format") + 1] == "json"
+    assert "--input-format" not in cmd
+    assert run.calls[0]["input"].startswith("p")
+
+
+def test_only_the_message_diverges_between_two_same_model_roles_flags_are_identical(fake_run):
+    run = fake_run(json.dumps(RECORDED_CLAUDE_CLI_WITH_USAGE))
+
+    llm.ask("jury_a", PREFIX + "Role A.", [], COLOR_SCHEMA, config=make_config(), cache_prefix=PREFIX)
+    llm.ask("jury_b", PREFIX + "Role B.", [], COLOR_SCHEMA, config=make_config(), cache_prefix=PREFIX)
+
+    cmd_a, cmd_b = run.calls[0]["cmd"], run.calls[1]["cmd"]
+    assert cmd_a == cmd_b  # meme modele, meme schema : aucun flag ne diverge
+
+    content_a = json.loads(run.calls[0]["input"])["message"]["content"]
+    content_b = json.loads(run.calls[1]["input"])["message"]["content"]
+    assert content_a[0] == content_b[0]  # bloc cache_control identique
+    assert content_a[1] != content_b[1]  # seul le role (2e bloc) diverge
+
+
+def test_cache_prefix_must_be_an_actual_prefix_of_the_prompt(fake_run):
+    fake_run(json.dumps(RECORDED_CLAUDE_CLI_WITH_USAGE))
+    with pytest.raises(LLMError):
+        llm.ask("jury_x", "autre chose", [], COLOR_SCHEMA, config=make_config(), cache_prefix=PREFIX)
+
+
+# --------------------------------------------------------------------------
+# Integration reelle (optionnelle)
+# CLIPPER_CLAUDE_INTEGRATION=1 pytest tests/test_llm_claude_cli.py -k integration
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(
+    os.environ.get("CLIPPER_CLAUDE_INTEGRATION") != "1",
+    reason="integration Claude : definir CLIPPER_CLAUDE_INTEGRATION=1 (consomme du quota)",
+)
+def test_integration_second_role_reads_the_shared_prefix_from_cache(tmp_path):
+    # 2 "roles" d'un meme modele (comme 2 juges de clipper.jury) : meme
+    # cache_prefix (assez long pour depasser le minimum cacheable d'Anthropic,
+    # ~1024 tokens sur sonnet/opus, sinon cache_control est pose mais ignore
+    # sans erreur), role different en fin de prompt. Le 2e appel doit relire
+    # le prefixe du cache pose par le 1er (TASK-2cbb).
+    prefix = "Contexte commun de test, invariant entre les deux appels. " * 200
+    schema = {
+        "type": "object",
+        "properties": {"ok": {"type": "boolean"}},
+        "required": ["ok"],
+        "additionalProperties": False,
+    }
+    usage_log_path = tmp_path / "usage.jsonl"
+    config = make_config()
+
+    llm.ask(
+        "cache_test", prefix + "Role A : reponds ok=true.", [], schema,
+        config=config, cache_prefix=prefix, usage_log_path=usage_log_path,
+    )
+    llm.ask(
+        "cache_test", prefix + "Role B : reponds ok=true.", [], schema,
+        config=config, cache_prefix=prefix, usage_log_path=usage_log_path,
+    )
+
+    entries = [json.loads(line) for line in usage_log_path.read_text(encoding="utf-8").splitlines()]
+    assert len(entries) == 2
+    cache_read_2nd = entries[1]["cache_read_tokens"]
+    assert cache_read_2nd is not None and cache_read_2nd > 2000, entries

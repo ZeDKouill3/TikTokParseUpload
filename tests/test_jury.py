@@ -310,6 +310,41 @@ def orders_for(seed):
     return {j: order(script.prompts[j][0]) for j in JUDGES}
 
 
+def test_same_model_judges_share_the_llm_cache_prefix_field():
+    # TASK-2cbb : le prefixe textuel commun (deja teste ci-dessus) ne suffit
+    # pas a faire relire le cache par le modele : encore faut-il que
+    # clipper.llm sache ou il se termine pour le marquer (LLMRequest.cache_prefix),
+    # sans quoi claude_cli.stdin_input() ne peut jamais poser de cache_control
+    # (voir claude_cli.py). Round 1 : chaque juge d'un meme modele doit porter
+    # exactement le meme cache_prefix, egal a son prompt prive de son role.
+    script = ScriptedJury({1: uniform({"secret-id-0": 7, "secret-id-1": 5, "secret-id-2": 3})})
+    _, fake = run(script)
+    by_judge = {c.usage.removeprefix("jury_"): c for c in fake.calls}
+
+    for name, call in by_judge.items():
+        assert call.cache_prefix, name
+        assert call.prompt.startswith(call.cache_prefix), name
+        role_start = call.prompt.index("## Ta perspective")
+        assert call.cache_prefix == call.prompt[:role_start], name
+
+    assert by_judge["retention"].cache_prefix == by_judge["monteur"].cache_prefix == by_judge["avocat"].cache_prefix
+    assert by_judge["spectateur"].cache_prefix == by_judge["conformite"].cache_prefix
+    assert by_judge["retention"].cache_prefix != by_judge["spectateur"].cache_prefix
+
+
+def test_round_two_debate_prompt_also_carries_a_cache_prefix():
+    script = ScriptedJury({1: split_notes()})
+    _, fake = run(script)
+    second_calls = {
+        c.usage.removeprefix("jury_"): c
+        for c in fake.calls[len(JUDGES):]  # tour 2 : un appel de plus par juge
+    }
+    for name, call in second_calls.items():
+        assert call.cache_prefix, name
+        assert call.prompt.startswith(call.cache_prefix), name
+        assert call.cache_prefix != call.prompt, name  # le role divergent suit bien le prefixe
+
+
 def test_shuffle_is_deterministic_and_specific_to_each_model():
     first, again = orders_for(0), orders_for(0)
     assert first == again

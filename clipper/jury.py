@@ -19,9 +19,12 @@ Deroulement :
    de juge place le bloc commun (intro, grille, contexte, candidats,
    consignes generiques) EN PREMIER et les consignes propres au role
    (perspective, veto) EN DERNIER ; ce bloc commun est alors identique octet
-   pour octet entre juges d'un meme modele, ce qui laisse le fournisseur du
-   modele relire son cache de prompt au lieu de le reecrire a chaque juge.
-   Les appels d'un tour partent en 2 vagues : un juge par modele d'abord (le
+   pour octet entre juges d'un meme modele, et transmis a clipper.llm comme
+   ``cache_prefix`` (voir ``_ask``) pour que claude_cli le marque comme bloc
+   cacheable (TASK-2cbb) -- un prefixe textuel identique seul ne suffit pas,
+   le fournisseur ne relit que des blocs, jamais un prefixe de caracteres a
+   l'interieur d'un bloc unique. Les appels d'un tour partent en 2 vagues :
+   un juge par modele d'abord (le
    "leader", pour chauffer le cache), attendu jusqu'au bout, puis les autres
    juges de ce tour ; chaque vague en parallele.
 2. Desaccord : un candidat dont les scores par juge (0-100, grille ponderee)
@@ -426,6 +429,7 @@ def _round2_prompt(
 def _ask(
     judge: dict[str, Any],
     prompt: str,
+    cache_prefix: str,
     schema: Mapping[str, Any],
     config: Any,
 ) -> dict[str, dict[str, Any]]:
@@ -433,13 +437,17 @@ def _ask(
     incomplete ou incoherente est une llm.SchemaError. ``schema`` peut
     imposer veto/veto_reason meme a un juge sans veto (partage par son
     modele, TASK-b0fa) : seul ``judge["veto"]`` decide si on en tient
-    compte."""
+    compte. ``cache_prefix`` (le prompt prive de son role, identique entre
+    juges d'un meme modele) va a clipper.llm pour qu'il soit marque comme
+    bloc cacheable (TASK-2cbb) : un prefixe textuel identique seul ne suffit
+    pas, le fournisseur ne relit que des blocs, pas un prefixe de caracteres."""
     answer = llm.ask(
         judge["usage"],
         prompt,
         [],
         schema,
         config=_JudgeConfig(config, judge["usage"], judge["model"]),
+        cache_prefix=cache_prefix,
     )
     out: dict[str, dict[str, Any]] = {}
     for item in answer["candidates"]:
@@ -633,8 +641,12 @@ def deliberate(
         views[judge["name"]] = refs
         shown = [(ref, by_id[cid]) for ref, cid in refs.items()]
         schema = _schema(criteria, list(refs), model_veto[judge["model"]])
-        prompt = _round1_prompt(common, shown, _role(judge), schema)
-        tasks[judge["name"]] = (lambda j=judge, p=prompt, s=schema: _ask(j, p, s, config))
+        role_text = _role(judge)
+        prompt = _round1_prompt(common, shown, role_text, schema)
+        cache_prefix = prompt.removesuffix(role_text)
+        tasks[judge["name"]] = (
+            lambda j=judge, p=prompt, c=cache_prefix, s=schema: _ask(j, p, c, s, config)
+        )
     answers = _run_round(1, tasks, judges, quorum, parallel, failed) if candidates else {}
     active = [j for j in judges if j["name"] in answers]
 
@@ -660,8 +672,12 @@ def deliberate(
                 rng.shuffle(heard)
                 others[ref] = heard
             schema = _schema(criteria, [s[0] for s in shown], model_veto[judge["model"]])
-            prompt = _round2_prompt(common, shown, own, others, _role(judge), judge["veto"], schema)
-            tasks[name] = (lambda j=judge, p=prompt, s=schema: _ask(j, p, s, config))
+            role_text = _role(judge)
+            prompt = _round2_prompt(common, shown, own, others, role_text, judge["veto"], schema)
+            cache_prefix = prompt.removesuffix(role_text)
+            tasks[name] = (
+                lambda j=judge, p=prompt, c=cache_prefix, s=schema: _ask(j, p, c, s, config)
+            )
         answers2 = _run_round(2, tasks, active, quorum, parallel, failed)
         for name, answer in answers2.items():
             for ref, entry in answer.items():

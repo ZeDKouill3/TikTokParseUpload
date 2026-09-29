@@ -10,13 +10,21 @@ from typing import Any, Protocol
 @dataclass(frozen=True)
 class LLMRequest:
     """One call, as a backend sees it. ``prompt`` already carries the
-    instruction to answer with JSON matching ``schema``."""
+    instruction to answer with JSON matching ``schema``.
+
+    ``cache_prefix``, when given, is a prefix of ``prompt`` shared byte for
+    byte with other calls (e.g. clipper.jury's same-model judges): a backend
+    that supports Anthropic-style prompt caching should send it as its own
+    content block carrying ``cache_control``, since the cache matches whole
+    blocks, not an arbitrary prefix inside one block of text (TASK-2cbb) ; a
+    backend that does not support this can ignore the field."""
 
     usage: str
     model: str
     prompt: str
     images: list[Path] = field(default_factory=list)
     schema: dict[str, Any] = field(default_factory=dict)
+    cache_prefix: str | None = None
 
 
 @dataclass(frozen=True)
