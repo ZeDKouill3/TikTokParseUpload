@@ -107,6 +107,14 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "facecam_min_share": 0.8,
     "facecam_tolerance": 40,
     "facecam_max_area": 0.25,
+    # detect_facecam seulement : en plus de l'image entiere, chaque coin de
+    # l'image cle est recadre a facecam_corner_size de la largeur/hauteur puis
+    # agrandi facecam_corner_zoom fois avant detection (coordonnees ramenees
+    # a l'image source) : une petite facecam en coin (visage ~160 px sur
+    # 1920) y occupe une part bien plus grande que dans l'image entiere
+    # reduite par le detecteur.
+    "facecam_corner_size": 0.3,
+    "facecam_corner_zoom": 2.0,
     # Rectangle source de la facecam : au format du panneau camera, centre
     # sur le visage, qui en occupe cette part de la hauteur.
     "stream_face_height": 0.5,
@@ -1169,6 +1177,36 @@ def _stable_face(
     return median, count  # type: ignore[return-value]
 
 
+def _corner_boxes(width: int, height: int, size: float) -> list[tuple[int, int, int, int]]:
+    """4 vignettes de coin (``size`` de la largeur/hauteur chacune)."""
+    cw, ch = round(width * size), round(height * size)
+    return [
+        (0, 0, cw, ch),
+        (width - cw, 0, width, ch),
+        (0, height - ch, cw, height),
+        (width - cw, height - ch, width, height),
+    ]
+
+
+def _detect_corners(
+    detector: Any, image: np.ndarray, width: int, height: int, settings: dict[str, Any]
+) -> list[Detection]:
+    """Detections sur les 4 coins de l'image, recadres puis agrandis avant
+    detection (une petite facecam en coin est trop reduite une fois l'image
+    entiere passee au detecteur) ; coordonnees ramenees a l'image source."""
+    size = float(settings["facecam_corner_size"])
+    zoom = float(settings["facecam_corner_zoom"])
+    found: list[Detection] = []
+    for x0, y0, x1, y1 in _corner_boxes(width, height, size):
+        crop = image[y0:y1, x0:x1]
+        if crop.size == 0:
+            continue
+        enlarged = cv2.resize(crop, None, fx=zoom, fy=zoom, interpolation=cv2.INTER_LINEAR)
+        for bx0, by0, bx1, by1, score in detector.detect(enlarged):
+            found.append((x0 + bx0 / zoom, y0 + by0 / zoom, x0 + bx1 / zoom, y0 + by1 / zoom, score))
+    return found
+
+
 def detect_facecam(
     video_id: str,
     workspace_dir: str | Path = "workspace",
@@ -1220,7 +1258,9 @@ def detect_facecam(
                     raise ReframeError(f"image cle illisible : {path}")
                 height, width = image.shape[:2]
                 size = size or (width, height)
-                found = [tuple(float(v) for v in d[:5]) for d in detector.detect(image) if d[4] >= min_conf]
+                found = [tuple(float(v) for v in d[:5]) for d in detector.detect(image)]
+                found += _detect_corners(detector, image, width, height, settings)
+                found = [d for d in found if d[4] >= min_conf]
                 detections.append([d[:4] for d in _nms(found, dup_iou)])  # type: ignore[misc]
         finally:
             detector.close()
