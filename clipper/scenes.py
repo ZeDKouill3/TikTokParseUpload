@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import subprocess
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from fractions import Fraction
 from pathlib import Path
 from typing import Any
@@ -36,6 +37,8 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "analysis_max_fps": 30.0,
     # Decodeur ffmpeg force (-c:v) ; "" = celui que ffmpeg associe au codec.
     "decoder": "",
+    # Processus ffmpeg d'extraction d'images cles lances en parallele au plus.
+    "extract_parallel": 4,
 }
 
 
@@ -194,6 +197,7 @@ def detect_scenes(
     analysis_width: int = 256,
     analysis_max_fps: float = 30.0,
     decoder: str = "",
+    extract_parallel: int = 4,
     ffmpeg_bin: str = "ffmpeg",
     ffprobe_bin: str = "ffprobe",
     force: bool = False,
@@ -202,8 +206,13 @@ def detect_scenes(
     a step reads its inputs and writes workspace/<video_id>/ itself).
 
     A video already analysed (scenes.json present) is not re-analysed unless
-    ``force`` is set.
+    ``force`` is set. Keyframes are extracted with at most ``extract_parallel``
+    ffmpeg processes running at once (1 = sequential).
     """
+    if extract_parallel < 1:
+        raise ScenesError(
+            f"extract_parallel doit etre >= 1 (recu {extract_parallel})"
+        )
     video_path = Path(video_path)
     video_dir = Path(workspace_dir) / video_id
     scenes_file = video_dir / "scenes.json"
@@ -217,12 +226,19 @@ def detect_scenes(
     )
 
     frames_dir.mkdir(parents=True, exist_ok=True)
-    frames: list[dict[str, Any]] = []
+    tasks: list[tuple[int, float, str]] = []
     for scene_index, (start, end) in enumerate(scene_list):
         timecodes = _keyframe_timecodes(start, end, keyframe_interval_seconds)
         for seq, timecode in enumerate(timecodes):
-            frame = _extract_frame(video_path, timecode, decoder, ffmpeg_bin)
             filename = f"scene{scene_index:04d}_{seq:03d}.jpg"
+            tasks.append((scene_index, timecode, filename))
+
+    frames: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=extract_parallel) as executor:
+        extracted = executor.map(
+            lambda task: _extract_frame(video_path, task[1], decoder, ffmpeg_bin), tasks
+        )
+        for (scene_index, timecode, filename), frame in zip(tasks, extracted):
             cv2.imwrite(
                 str(frames_dir / filename),
                 frame,

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -353,3 +355,142 @@ def test_missing_ffmpeg_fails_the_step_with_a_clear_message(isolated_cwd, three_
             three_scene_video, isolated_cwd / "workspace", "vid1",
             ffmpeg_bin="ffmpeg-absent-du-path",
         )
+
+
+# -- TASK-559adc7a1505 : extraction des images cles en parallele --
+
+
+def _has_overlap(intervals: list[tuple[float, float]]) -> bool:
+    ordered = sorted(intervals)
+    return any(ordered[i][1] > ordered[i + 1][0] for i in range(len(ordered) - 1))
+
+
+@pytest.fixture
+def recorded_extraction_intervals(monkeypatch):
+    """Record start/end wall-clock time of every _extract_frame call, and
+    return a fake image so no real ffmpeg extraction runs."""
+    import numpy as np
+
+    import clipper.scenes as scenes_module
+
+    intervals: list[tuple[float, float]] = []
+    lock = threading.Lock()
+
+    def fake_extract_frame(video_path, timecode, decoder, ffmpeg_bin):
+        start = time.monotonic()
+        time.sleep(0.05)
+        end = time.monotonic()
+        with lock:
+            intervals.append((start, end))
+        return np.zeros((4, 4, 3), dtype=np.uint8)
+
+    monkeypatch.setattr(scenes_module, "_extract_frame", fake_extract_frame)
+    return intervals
+
+
+def test_config_defaults_declares_extract_parallel():
+    from clipper.scenes import CONFIG_DEFAULTS
+
+    assert CONFIG_DEFAULTS["extract_parallel"] == 4
+
+
+def test_extract_parallel_below_one_is_refused(isolated_cwd, three_scene_video):
+    from clipper.scenes import ScenesError, detect_scenes
+
+    with pytest.raises(ScenesError, match="extract_parallel"):
+        detect_scenes(
+            three_scene_video, isolated_cwd / "workspace", "vid1", extract_parallel=0
+        )
+
+
+def test_extraction_runs_in_parallel_up_to_extract_parallel(
+    isolated_cwd, three_scene_video, recorded_extraction_intervals
+):
+    from clipper.scenes import detect_scenes
+
+    detect_scenes(
+        three_scene_video, isolated_cwd / "workspace", "vid1",
+        keyframe_interval_seconds=100.0, extract_parallel=4,
+    )
+
+    assert _has_overlap(recorded_extraction_intervals)
+
+
+def test_extraction_is_sequential_when_extract_parallel_is_one(
+    isolated_cwd, three_scene_video, recorded_extraction_intervals
+):
+    from clipper.scenes import detect_scenes
+
+    detect_scenes(
+        three_scene_video, isolated_cwd / "workspace", "vid1",
+        keyframe_interval_seconds=100.0, extract_parallel=1,
+    )
+
+    assert not _has_overlap(recorded_extraction_intervals)
+
+
+def test_scenes_json_identical_between_sequential_and_parallel_extraction(
+    isolated_cwd, three_scene_video, monkeypatch
+):
+    """Meme sortie (timecodes, noms de fichiers, ordre, octets JPEG) que les
+    extractions se terminent dans l'ordre (extract_parallel=1) ou non
+    (extract_parallel=4, delais inverses pour forcer un ordre d'arrivee
+    different de l'ordre de soumission)."""
+    import numpy as np
+
+    import clipper.scenes as scenes_module
+
+    def fake_extract_frame(video_path, timecode, decoder, ffmpeg_bin):
+        time.sleep(max(0.0, 0.06 - timecode * 0.001))
+        seed = int(timecode * 1000) % 256
+        return np.full((4, 4, 3), seed, dtype=np.uint8)
+
+    monkeypatch.setattr(scenes_module, "_extract_frame", fake_extract_frame)
+
+    from clipper.scenes import detect_scenes
+
+    workspace_seq = isolated_cwd / "workspace_seq"
+    result_seq = detect_scenes(
+        three_scene_video, workspace_seq, "vid1",
+        keyframe_interval_seconds=100.0, extract_parallel=1,
+    )
+
+    workspace_par = isolated_cwd / "workspace_par"
+    result_par = detect_scenes(
+        three_scene_video, workspace_par, "vid1",
+        keyframe_interval_seconds=100.0, extract_parallel=4,
+    )
+
+    assert result_seq["scenes"] == result_par["scenes"]
+    assert [f["path"] for f in result_seq["frames"]] == [f["path"] for f in result_par["frames"]]
+    assert [f["timecode"] for f in result_seq["frames"]] == [
+        f["timecode"] for f in result_par["frames"]
+    ]
+    assert [f["scene"] for f in result_seq["frames"]] == [f["scene"] for f in result_par["frames"]]
+
+    for f_seq, f_par in zip(result_seq["frames"], result_par["frames"]):
+        bytes_seq = (workspace_seq / "vid1" / f_seq["path"]).read_bytes()
+        bytes_par = (workspace_par / "vid1" / f_par["path"]).read_bytes()
+        assert bytes_seq == bytes_par
+
+
+def test_extraction_failure_propagates_and_does_not_write_scenes_json_when_parallel(
+    isolated_cwd, three_scene_video, monkeypatch
+):
+    import clipper.scenes as scenes_module
+
+    def failing_extract_frame(video_path, timecode, decoder, ffmpeg_bin):
+        raise scenes_module.ScenesError(f"echec simule a {timecode:.3f}s")
+
+    monkeypatch.setattr(scenes_module, "_extract_frame", failing_extract_frame)
+
+    from clipper.scenes import ScenesError, detect_scenes
+
+    workspace_dir = isolated_cwd / "workspace"
+    with pytest.raises(ScenesError, match=r"\d+\.\d+s"):
+        detect_scenes(
+            three_scene_video, workspace_dir, "vid1",
+            keyframe_interval_seconds=100.0, extract_parallel=4,
+        )
+
+    assert not (workspace_dir / "vid1" / "scenes.json").exists()
