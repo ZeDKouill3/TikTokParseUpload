@@ -23,14 +23,20 @@ Deroulement :
    moins riches, banc docs/bench-whisper-vitesse.md), ou sequentiel si
    ``batch_size <= 1`` ; puis liberation du modele et ecriture du resultat
    brut dans transcript_raw.json avant la correction ;
-3. usage ``transcript_fix`` par tranches de ``fix_chunk_words`` mots,
-   jusqu'a ``fix_parallel`` tranches en meme temps (threads : les appels
-   clipper.llm sont des sous-processus) : la reponse ne liste que des
-   corrections {i, old, word} par index de mot (ancien texte, nouveau texte),
-   donc ni le nombre de mots ni leurs timecodes ne peuvent changer. Une
-   correction dont ``old`` ne correspond pas au mot reellement present a cet
-   index est refusee et journalisee dans llm_refusals.jsonl (ADR-ad2e),
-   jamais appliquee en silence.
+3. usage ``transcript_fix`` par tranches de ``fix_chunk_words`` mots : le
+   prompt d'une tranche est un bloc commun (consignes + vocabulaire,
+   ``_fix_prefix``, identique octet pour octet d'une tranche a l'autre)
+   suivi de son seul contenu (index + mot par ligne, jamais le JSON complet
+   des segments ni leurs horodatages). La premiere tranche part seule pour
+   que le fournisseur du modele mette ce bloc commun en cache, puis jusqu'a
+   ``fix_parallel`` tranches suivantes partent en meme temps (threads : les
+   appels clipper.llm sont des sous-processus) et le relisent au lieu de le
+   reecrire chacune (meme principe que clipper.jury, TASK-2852). La reponse
+   ne liste que des corrections {i, old, word} par index de mot (ancien
+   texte, nouveau texte), donc ni le nombre de mots ni leurs timecodes ne
+   peuvent changer. Une correction dont ``old`` ne correspond pas au mot
+   reellement present a cet index est refusee et journalisee dans
+   llm_refusals.jsonl (ADR-ad2e), jamais appliquee en silence.
 
 Si transcript_raw.json existe deja (retour apres un echec de la correction),
 il est reutilise et whisper n'est pas relance, sauf ``force``.
@@ -373,12 +379,14 @@ def _check_corrections(words: list[dict[str, Any]]) -> Callable[[Any], None]:
     return check
 
 
-def _fix_chunk(chunk: list[dict[str, Any]], vocab: list[str], config: Any, log_path: Path) -> None:
-    words = [w for seg in chunk for w in seg["words"]]
-    if not words:
-        return
-    lines = "\n".join(f"{i}\t{w['word'].strip()}" for i, w in enumerate(words))
-    prompt = (
+def _fix_prefix(vocab: list[str]) -> str:
+    """Bloc commun a toutes les tranches de correction d'une meme video
+    (consignes + vocabulaire) : aucune donnee propre a une tranche, pour
+    qu'il soit identique octet pour octet d'une tranche a l'autre et que le
+    fournisseur du modele puisse relire son cache de prompt au lieu de le
+    reecrire a chaque tranche (voir _fix_chunks ; meme principe que
+    clipper.jury, TASK-2852)."""
+    return (
         "Voici un extrait de transcription automatique, un mot par ligne, "
         "precede de son index. Corrige uniquement l'orthographe des mots mal "
         "reconnus (surtout les noms propres). Ne fusionne, ne coupe, n'ajoute "
@@ -387,8 +395,15 @@ def _fix_chunk(chunk: list[dict[str, Any]], vocab: list[str], config: Any, log_p
         "chacun avec son index, le mot original exact (old) et le mot "
         "corrige (word).\n\n"
         f"Vocabulaire attendu : {', '.join(vocab) if vocab else '(aucun)'}\n\n"
-        f"{lines}"
     )
+
+
+def _fix_chunk(chunk: list[dict[str, Any]], vocab: list[str], config: Any, log_path: Path) -> None:
+    words = [w for seg in chunk for w in seg["words"]]
+    if not words:
+        return
+    lines = "\n".join(f"{i}\t{w['word'].strip()}" for i, w in enumerate(words))
+    prompt = _fix_prefix(vocab) + lines
     answer = llm.ask(
         "transcript_fix", prompt, [], _fix_schema(len(words)),
         config=config, check=_check_corrections(words), log_path=log_path,
@@ -406,16 +421,24 @@ def _fix_chunk(chunk: list[dict[str, Any]], vocab: list[str], config: Any, log_p
 def _fix_chunks(
     chunks: list[list[dict[str, Any]]], vocab: list[str], config: Any, parallel: int, log_path: Path
 ) -> None:
-    """Corrige jusqu'a ``parallel`` tranches en meme temps (threads : les
-    appels clipper.llm sont des sous-processus, pas du calcul CPU Python).
+    """Corrige les tranches en 2 vagues : la premiere seule, pour que le
+    fournisseur du modele mette en cache le bloc commun (_fix_prefix) qu'elle
+    partage octet pour octet avec les suivantes ; puis jusqu'a ``parallel``
+    tranches suivantes en meme temps (threads : les appels clipper.llm sont
+    des sous-processus, pas du calcul CPU Python), qui relisent ce cache au
+    lieu de le reecrire chacune (meme principe que clipper.jury, TASK-2852).
     Chaque tranche porte des segments distincts, donc les threads n'ecrivent
     jamais dans la meme structure. Une tranche en echec fait echouer l'etape
     avec sa raison (ADR-ad2e) ; les autres deja lancees terminent avant que
     l'exception ne remonte."""
     if not chunks:
         return
-    with ThreadPoolExecutor(max_workers=max(1, parallel)) as executor:
-        futures = [executor.submit(_fix_chunk, chunk, vocab, config, log_path) for chunk in chunks]
+    _fix_chunk(chunks[0], vocab, config, log_path)
+    rest = chunks[1:]
+    if not rest:
+        return
+    with ThreadPoolExecutor(max_workers=max(1, min(parallel, len(rest)))) as executor:
+        futures = [executor.submit(_fix_chunk, chunk, vocab, config, log_path) for chunk in rest]
         for future in futures:
             future.result()
 

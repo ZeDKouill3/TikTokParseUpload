@@ -581,6 +581,21 @@ def test_fix_changes_word_text_only(tmp_path, video_dir, cpu):
     ]
 
 
+def test_fix_prompt_is_compact_lines_not_json_segments_or_timestamps(tmp_path, video_dir, cpu):
+    """Le texte envoye par tranche est un mot par ligne (index<TAB>mot), pas
+    le JSON complet des segments ni leurs horodatages (cout de l'entree,
+    TASK-2cac)."""
+    fake = FakeBackend([VOCAB, {"corrections": []}])
+    with llm.use_backend(fake):
+        run(tmp_path, ModelFactory())
+
+    fix_call = fake.calls[1]
+    assert "0\tSalut" in fix_call.prompt
+    assert "1\tRokstar" in fix_call.prompt
+    for verbose in ('"start"', '"end"', '"segments"', '"words"', '"probability"'):
+        assert verbose not in fix_call.prompt
+
+
 def test_fix_cannot_change_timecodes_or_word_count(tmp_path, video_dir, cpu):
     """Une reponse qui tente d'ajouter des champs (timecodes) ou de viser un
     mot inexistant est un echec, pas une donnee."""
@@ -758,6 +773,66 @@ def test_fix_parallel_result_matches_sequential_processing_regardless_of_schedul
         " CORRIGE3", " mot7",
         " CORRIGE4", " mot9",
     ]
+
+
+# --------------------------------------------------------------------------
+# C14 : cache de prompt du prefixe commun (consignes + vocabulaire) entre
+# tranches de correction (TASK-2cac, meme principe que clipper.jury/TASK-2852)
+# --------------------------------------------------------------------------
+
+
+def test_fix_chunks_share_an_identical_prompt_prefix_for_the_cache(tmp_path, video_dir, cpu):
+    segments = _many_word_segments(12)  # fix_chunk_words=2 -> 6 tranches
+    fake = FakeBackend([VOCAB] + [{"corrections": []}] * 6)
+    with llm.use_backend(fake):
+        run(
+            tmp_path,
+            ModelFactory(segments=segments),
+            config=make_config(tmp_path, fix_chunk_words=2, fix_parallel=3),
+        )
+    fix_prompts = [c.prompt for c in fake.calls if c.usage == "transcript_fix"]
+    assert len(fix_prompts) == 6
+
+    def prefix(prompt):
+        return prompt.split("0\t")[0]  # tout ce qui precede la 1re ligne (mot d'index 0)
+
+    assert len({prefix(p) for p in fix_prompts}) == 1
+
+
+def test_fix_chunks_send_the_first_chunk_alone_to_warm_the_prompt_cache(tmp_path, video_dir, cpu):
+    # La 1re tranche part seule pour que le fournisseur du modele mette en
+    # cache le prefixe commun (_fix_prefix) avant que les suivantes ne
+    # partent en parallele et le relisent, au lieu de le reecrire chacune.
+    # Mesure par horodatage, pas par une barriere qu'un envoi groupe en une
+    # seule vague a une chance de croiser par coincidence.
+    segments = _many_word_segments(12)  # fix_chunk_words=2 -> 6 tranches
+    starts: dict[int, float] = {}
+    finishes: dict[int, float] = {}
+    lock = threading.Lock()
+    counter = {"n": 0}
+
+    def synced(request):
+        with lock:
+            index = counter["n"]
+            counter["n"] += 1
+            starts[index] = time.monotonic()
+        if index == 0:
+            time.sleep(0.2)
+        with lock:
+            finishes[index] = time.monotonic()
+        return {"corrections": []}
+
+    fake = FakeBackend([VOCAB] + [synced] * 6)
+    with llm.use_backend(fake):
+        run(
+            tmp_path,
+            ModelFactory(segments=segments),
+            config=make_config(tmp_path, fix_chunk_words=2, fix_parallel=3),
+        )
+
+    assert counter["n"] == 6
+    for index in range(1, 6):
+        assert starts[index] >= finishes[0], index
 
 
 # --------------------------------------------------------------------------
