@@ -75,12 +75,18 @@ class Config:
         return {**defaults, **table}
 
 
-def load_config(path: str | Path = "config.toml") -> Config:
-    path = Path(path)
+_UNSET = object()
+
+
+def load_config(path: str | Path | object = _UNSET) -> Config:
+    explicit = path is not _UNSET
+    path = Path(path) if explicit else Path("config.toml")
     data: dict[str, object] = {}
     if path.exists():
         with path.open("rb") as f:
             data = tomllib.load(f)
+    elif explicit:
+        raise ConfigError(f"fichier de config introuvable : {path}")
 
     flat = {k: v for k, v in data.items() if not isinstance(v, dict)}
     sections = {k: v for k, v in data.items() if isinstance(v, dict)}
