@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import gc
 import json
+import logging
 import shutil
 import subprocess
 import weakref
@@ -20,6 +21,7 @@ import pytest
 
 from clipper import llm
 from clipper.config import Config
+from clipper.llm.backend import Usage
 from clipper.llm.fake import FakeBackend
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -202,7 +204,7 @@ def answer(request):
     raise AssertionError(f"usage inattendu {usage!r}")
 
 
-def backend(*overrides):
+def backend(*overrides, backend_cls=FakeBackend):
     """FakeBackend qui repond ``answer`` ; ``overrides`` : (usage, reponse)
     consommes une fois, a la premiere requete de cet usage."""
     pending = list(overrides)
@@ -214,7 +216,7 @@ def backend(*overrides):
                 return response(request) if callable(response) else response
         return answer(request)
 
-    return FakeBackend([respond] * 500)
+    return backend_cls([respond] * 500)
 
 
 def make_config(tmp_path, mode="auto", **sections):
@@ -503,6 +505,70 @@ def test_moments_gets_feedback_examples_and_is_rescored_after_vision_without_llm
     data = json.loads((video_dir / "moments.json").read_text(encoding="utf-8"))
     assert "rescored" in data, "moments non re-note apres vision"
     assert (video_dir / "moments.json").stat().st_mtime_ns >= (video_dir / "vision.json").stat().st_mtime_ns
+
+
+# --------------------------------------------------------------------------
+# TASK-15129acecf26 : journal de consommation LLM (llm_usage.jsonl) branche
+# sur le pipeline, y compris les appels faits depuis un thread (subtitles).
+# --------------------------------------------------------------------------
+
+
+class UsageFakeBackend(FakeBackend):
+    """FakeBackend qui rapporte une consommation fixe a chaque appel
+    (clipper.llm.fake.FakeBackend n'en rapporte aucune : ce n'est pas dans le
+    perimetre de cette tache de l'y ajouter)."""
+
+    def complete(self, request):
+        text = super().complete(request)
+        self.last_usage = Usage(input_tokens=100, output_tokens=20, cost_usd=0.01)
+        return text
+
+
+@no_ffmpeg
+def test_pipeline_pass_journals_every_llm_call_including_from_threads_then_summarizes(
+    tmp_path, isolated_cwd, source_video, caplog
+):
+    from clipper import pipeline
+
+    # parallel=1 : l'appel emphase du clip tourne quand meme dans un thread du
+    # pool (ThreadPoolExecutor(max_workers=1)), sans le rendre concurrent avec
+    # un autre appel sur le meme FakeBackend partage (last_usage n'est pas
+    # protege par un verrou).
+    config = make_config(tmp_path, mode="auto", subtitles={"parallel": 1})
+    fake = backend(backend_cls=UsageFakeBackend)
+
+    with llm.use_backend(fake), caplog.at_level(logging.INFO, logger="clipper.pipeline"):
+        state = pipeline.run(URL, config=config, step_options=step_options(source_video))
+
+    assert state["status"] == "done", state
+    assert fake.calls, "aucun appel LLM effectue : le test ne prouve rien"
+
+    usage_log_path = tmp_path / "workspace" / VIDEO_ID / "llm_usage.jsonl"
+    lines = [json.loads(line) for line in usage_log_path.read_text(encoding="utf-8").splitlines()]
+    assert len(lines) == len(fake.calls)
+    usages = [line["usage"] for line in lines]
+    # L'etape subtitles appelle le LLM (emphase) depuis un thread du pool :
+    # journalise au meme titre que les appels du thread principal.
+    assert "emphasis" in usages
+    for line in lines:
+        assert (line["input_tokens"], line["output_tokens"], line["cost_usd"]) == (100, 20, 0.01)
+
+    # Resume par usage (tokens, cout) journalise a la fin du passage.
+    [summary] = [r.getMessage() for r in caplog.records if "consommation LLM par usage" in r.message]
+    assert VIDEO_ID in summary
+    emphasis_calls = usages.count("emphasis")
+    assert "'emphasis'" in summary
+    assert f"'calls': {emphasis_calls}" in summary
+
+
+def test_ask_outside_any_pipeline_pass_writes_nothing_to_a_video_journal(tmp_path, isolated_cwd):
+    # ADR-ad2e / criterion TASK-15129acecf26 : le contexte que pipeline pose
+    # pour la duree d'un passage ne fuit jamais vers un ask() qui n'en fait
+    # pas partie (ici, aucun passage n'a jamais commence).
+    with llm.use_backend(FakeBackend([{"issues": []}])):
+        llm.ask("qa", "p", [], {"type": "object", "properties": {"issues": {"type": "array"}},
+                                "required": ["issues"], "additionalProperties": False})
+    assert not (tmp_path / "workspace").exists()
 
 
 # --------------------------------------------------------------------------
