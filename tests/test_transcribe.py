@@ -312,7 +312,7 @@ def test_model_released_when_transcription_fails(tmp_path, video_dir, cpu):
 
 # --------------------------------------------------------------------------
 # C5 : vocabulaire demande a clipper.llm (usage vocab) depuis titre et
-# description, passe en initial_prompt / hotwords
+# description, passe en initial_prompt seulement (plus de hotwords, TASK-913b)
 # --------------------------------------------------------------------------
 
 
@@ -329,7 +329,7 @@ def test_vocab_asked_from_title_and_description_and_passed_to_whisper(tmp_path, 
     assert vocab_call.images == []
     for name in ("Rockstar", "Vice City", "Lucia", "Jason"):
         assert name in factory.kwargs_seen["initial_prompt"]
-        assert name in factory.kwargs_seen["hotwords"]
+    assert "hotwords" not in factory.kwargs_seen
     assert read_transcript(video_dir)["vocab"] == ["Rockstar", "Vice City", "Lucia", "Jason"]
 
 
@@ -360,33 +360,31 @@ def test_vocab_disabled_explicitly_in_config_skips_the_call(tmp_path, video_dir,
     with llm.use_backend(fake):
         run(tmp_path, factory, config=make_config(tmp_path, vocab=False))
     assert [c.usage for c in fake.calls] == ["transcript_fix"]
-    assert not factory.kwargs_seen.get("initial_prompt")
-    assert not factory.kwargs_seen.get("hotwords")
+    assert "initial_prompt" not in factory.kwargs_seen
+    assert "hotwords" not in factory.kwargs_seen
 
 
 # --------------------------------------------------------------------------
 # TASK-b20f : le prompt passe a whisper ne depasse jamais la fenetre du
-# decodeur (448 positions), quelle que soit la taille du vocabulaire.
-# Defaut constate sur ivl0nxa3C7o : vocabulaire de 58 entrees, hotwords 317
-# tokens et initial_prompt 374 tokens, que faster-whisper 1.2.1 tronque
-# chacun a 223 : 1 (sot_prev) + 223 + 223 + 3 (sot_sequence) = 450 > 448,
-# RuntimeError "No position encodings are defined for positions >= 448".
+# decodeur (448 positions), quelle que soit la taille du vocabulaire. Avant
+# le retrait de hotwords (TASK-913b), un vocabulaire long donnait 1 (sot_prev)
+# + 223 (hotwords tronques) + 223 (initial_prompt tronque) + 3 (sot_sequence)
+# = 450 > 448, RuntimeError "No position encodings are defined for positions
+# >= 448" ; sans hotwords, seul initial_prompt occupe encore ce budget.
 # --------------------------------------------------------------------------
 
 WHISPER_POSITIONS = 448
 
 
-def whisper_prompt_length(kwargs, previous_tokens):
+def whisper_prompt_length(previous_tokens):
     """Longueur du prompt que faster-whisper 1.2.1 (WhisperModel.get_prompt)
-    construit pour une fenetre : [sot_prev] + hotwords (tronques a 223) +
-    previous_tokens (223 derniers) + sot_sequence (sot, langue, tache)."""
+    construit pour une fenetre : [sot_prev] + previous_tokens (223 derniers,
+    initial_prompt pour la premiere fenetre puis texte deja transcrit) +
+    sot_sequence (sot, langue, tache)."""
     half = WHISPER_POSITIONS // 2
-    hotwords = kwargs.get("hotwords")
     length = 0
-    if previous_tokens or hotwords:
+    if previous_tokens:
         length += 1
-        if hotwords:
-            length += min(len(FakeHfTokenizer().encode(" " + hotwords.strip()).ids), half - 1)
         length += min(previous_tokens, half - 1)
     return length + 3
 
@@ -406,8 +404,8 @@ class WindowCheckingFactory(ModelFactory):
             initial = kwargs.get("initial_prompt")
             first = len(FakeHfTokenizer().encode(" " + initial.strip()).ids) if initial else 0
             factory.prompt_lengths = [
-                whisper_prompt_length(kwargs, first),
-                whisper_prompt_length(kwargs, WHISPER_POSITIONS // 2 - 1),
+                whisper_prompt_length(first),
+                whisper_prompt_length(WHISPER_POSITIONS // 2 - 1),
             ]
             for length in factory.prompt_lengths:
                 if length >= WHISPER_POSITIONS:
@@ -441,9 +439,9 @@ def test_prompt_fits_the_window_with_room_to_generate_whatever_the_vocab_size(tm
     with llm.use_backend(FakeBackend([credits_vocab(n), NO_FIX])):
         run(tmp_path, factory)
     tokenizer = FakeHfTokenizer()
-    for key in ("initial_prompt", "hotwords"):
-        text = factory.kwargs_seen.get(key) or ""
-        assert len(tokenizer.encode(" " + text.strip()).ids) <= CONFIG_DEFAULTS["vocab_max_tokens"]
+    text = factory.kwargs_seen.get("initial_prompt") or ""
+    assert len(tokenizer.encode(" " + text.strip()).ids) <= CONFIG_DEFAULTS["vocab_max_tokens"]
+    assert "hotwords" not in factory.kwargs_seen
     # au moins une centaine de positions restent pour la transcription
     assert max(factory.prompt_lengths) <= WHISPER_POSITIONS - 100
 
@@ -452,10 +450,10 @@ def test_vocab_max_tokens_comes_from_config(tmp_path, video_dir, cpu):
     factory = WindowCheckingFactory()
     with llm.use_backend(FakeBackend([credits_vocab(58), NO_FIX])):
         run(tmp_path, factory, config=make_config(tmp_path, vocab_max_tokens=10))
-    hotwords = factory.kwargs_seen["hotwords"]
-    assert len(FakeHfTokenizer().encode(" " + hotwords).ids) <= 10
-    assert hotwords == "Prenom0 NOM0-COMPOSE0 Prenom1 NOM1-COMPOSE1"
-    assert factory.kwargs_seen["initial_prompt"] == "Prenom0 NOM0-COMPOSE0, Prenom1 NOM1-COMPOSE1"
+    initial_prompt = factory.kwargs_seen["initial_prompt"]
+    assert len(FakeHfTokenizer().encode(" " + initial_prompt).ids) <= 10
+    assert initial_prompt == "Prenom0 NOM0-COMPOSE0, Prenom1 NOM1-COMPOSE1"
+    assert "hotwords" not in factory.kwargs_seen
 
 
 def test_shortened_vocab_is_logged_with_the_dropped_entries(tmp_path, video_dir, cpu, caplog):
@@ -476,8 +474,8 @@ def test_short_vocab_is_passed_whole_without_warning(tmp_path, video_dir, cpu, c
     with caplog.at_level(logging.WARNING, logger="clipper.transcribe"):
         with llm.use_backend(FakeBackend([VOCAB, NO_FIX])):
             run(tmp_path, factory)
-    assert factory.kwargs_seen["hotwords"] == "Rockstar Vice City Lucia Jason"
     assert factory.kwargs_seen["initial_prompt"] == "Rockstar, Vice City, Lucia, Jason"
+    assert "hotwords" not in factory.kwargs_seen
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
 
@@ -498,8 +496,8 @@ def test_model_without_tokenizer_bounds_the_prompt_by_utf8_bytes_and_says_so(
         with llm.use_backend(FakeBackend([{"words": ["Éric", "Zoé Lefèvre", "Anaïs"]}, NO_FIX])):
             run(tmp_path, factory, config=make_config(tmp_path, vocab_max_tokens=18))
     # " Éric, Zoé Lefèvre" = 21 octets > 18 ; " Éric Zoé Lefèvre" = 20 > 18
-    assert factory.kwargs_seen["hotwords"] == "Éric"
     assert factory.kwargs_seen["initial_prompt"] == "Éric"
+    assert "hotwords" not in factory.kwargs_seen
     messages = " ".join(r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
     assert "hf_tokenizer" in messages
     assert "Zoé Lefèvre" in messages and "Anaïs" in messages
@@ -880,6 +878,10 @@ def test_cuda_dll_dirs_are_prefixed_on_path_before_loading_model_on_windows(
 
     nvidia_dir, bin_dirs = fake_nvidia_bin_dirs
     monkeypatch.setattr(t.sys, "platform", "win32")
+    # ";" (pas le ":" reel de l'hote) : sur Windows os.pathsep est ";", or
+    # "C:\Windows\System32" contient deja un ":" (lettre de lecteur) que ":"
+    # couperait a tort.
+    monkeypatch.setattr(t.os, "pathsep", ";")
     monkeypatch.setattr(t, "get_device", lambda: Device(type="cuda", compute_type="float16"))
     monkeypatch.setattr(t, "find_spec", _fake_find_spec(nvidia_dir))
     monkeypatch.setenv("PATH", r"C:\Windows\System32")
