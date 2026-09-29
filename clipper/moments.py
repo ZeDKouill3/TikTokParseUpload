@@ -1,5 +1,5 @@
 """Etape moments : choix des meilleurs moments d'une video longue par
-clipper.llm (usage ``moments``), selon la grille de SPEC-1557 (rubric.toml).
+clipper.llm (usage ``moments``), selon la grille de SPEC-0eec (rubric.toml).
 
 Entrees (workspace/<video_id>/) :
 - meta.json (download) : titre, chapitres, heatmap, segments SponsorBlock ;
@@ -71,8 +71,13 @@ tout le reste est fait ici, de facon verifiable :
 4. rejet sous ``min_score``, puis non-chevauchement (regle 4) : un passage
    multipart qui atteint ``min_score`` passe avant tout clip single qui le
    chevauche, meme mieux note (le contenu du single y figure deja) ; entre
-   deux candidats du meme format, le mieux note reste. Aucun plafond sur le
-   nombre de moments.
+   deux candidats du meme format, le mieux note reste. Puis plafond souple
+   (``max_moments_per_hour``, regle 4) : au plus ``ceil(max_moments_per_hour
+   x duree de la video en heures)`` moments (au moins 1 ; duree lue dans
+   meta.json, jamais de valeur par defaut silencieuse), pris par score
+   decroissant ; un moment a ``always_keep_score`` ou plus est retenu meme
+   au-dela du plafond, et compte dedans. Chaque moment ecarte par le plafond
+   est motive dans ``rejected``.
 
 Transcription trop longue pour un appel (``max_transcript_chars``) : tranches
 avec recouvrement, puis un tour de comparaison final qui re-note ensemble
@@ -99,7 +104,7 @@ CONFIG_DEFAULTS: dict[str, object] = {
     # Qui note les candidats du proposeur : "single" (le proposeur seul) ou
     # "jury" (clipper.jury, ADR-ff87). En mode auto, le jury note toujours.
     "selection": "single",
-    # Grille de notation (SPEC-1557), relative au dossier courant.
+    # Grille de notation (SPEC-0eec), relative au dossier courant.
     "rubric_path": "rubric.toml",
     # Au-dela, la transcription part en tranches (environ 4 caracteres par
     # token : 400 000 caracteres ~ 100k tokens).
@@ -172,6 +177,10 @@ def load_rubric(path: str | Path) -> dict[str, Any]:
         raise MomentsError(f"{path} : la somme des poids doit etre positive")
     if not _number(rubric.get("min_score")):
         raise MomentsError(f"{path} : min_score manquant ou invalide")
+    for key in ("max_moments_per_hour", "always_keep_score"):
+        value = rubric.get(key)
+        if not _number(value) or value <= 0:
+            raise MomentsError(f"{path} : {key} manquant ou invalide (attendu : nombre > 0)")
     keywords = rubric.get("trend_keywords")
     if not isinstance(keywords, list) or not all(isinstance(k, str) for k in keywords):
         raise MomentsError(f"{path} : trend_keywords doit etre une liste de chaines")
@@ -211,7 +220,7 @@ def _ceil1(x: float) -> float:
 
 
 def _round2(x: float) -> float:
-    """Borne publiee (SPEC-1557 regle 5) : centieme superieur, jamais en
+    """Borne publiee (SPEC-0eec regle 5) : centieme superieur, jamais en
     dessous de ``x`` (un connecteur retire ne recule jamais dedans)."""
     return math.ceil(x * 100 - 1e-6) / 100
 
@@ -693,16 +702,32 @@ def _overlaps(c: dict[str, Any], others: list[dict[str, Any]]) -> dict[str, Any]
     return next((k for k in others if c["_start"] < k["_end"] and k["_start"] < c["_end"]), None)
 
 
+def _cap(rubric: dict[str, Any], meta: dict[str, Any]) -> int:
+    """Plafond souple (SPEC-0eec regle 4) : au plus ``max_moments_per_hour``
+    moments par heure de video source, arrondi superieur, au moins 1. La
+    duree est lue dans meta.json ; absente ou invalide, une MomentsError
+    (jamais de valeur par defaut silencieuse, ADR-ad2e)."""
+    duration = meta.get("duration")
+    if not _number(duration) or duration <= 0:
+        raise MomentsError("meta.json : duration manquante ou invalide (necessaire au plafond de moments par heure)")
+    hours = duration / 3600
+    return max(1, math.ceil(rubric["max_moments_per_hour"] * hours - 1e-9))
+
+
 def _select(
-    candidates: list[dict[str, Any]], rubric: dict[str, Any], exploration: tuple[float, int] | None = None
+    candidates: list[dict[str, Any]], rubric: dict[str, Any], meta: dict[str, Any],
+    exploration: tuple[float, int] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any] | None]:
     """(retenus, rejets motives, bloc exploration ou None) : rejet sous
-    ``min_score``, puis non-chevauchement (SPEC-1557 regle 4) : les passages
+    ``min_score``, puis non-chevauchement (SPEC-0eec regle 4) : les passages
     multipart d'abord, si bien qu'un single qui chevauche un passage retenu
     est rejete meme mieux note ; entre deux candidats du meme format, le
-    mieux note reste. Avec ``exploration`` (part, graine), les clips
-    d'exploration suivent les retenus (voir ``_explore``), jamais sur un
-    retenu."""
+    mieux note reste. Puis plafond souple (``_cap``) : les retenus au-dela du
+    plafond sont ecartes par score decroissant, sauf ceux a
+    ``always_keep_score`` ou plus (toujours gardes, et comptes dans le
+    plafond). Avec ``exploration`` (part, graine), les clips d'exploration
+    suivent les retenus (voir ``_explore``, qui peut piocher parmi les
+    candidats ecartes par le plafond), jamais sur un retenu."""
     kept: list[dict[str, Any]] = []
     rejected: list[tuple[dict[str, Any], str]] = []
     for c in sorted(candidates, key=lambda c: (c["format"] != "multipart", -c["final_score"], c["_start"])):
@@ -718,6 +743,20 @@ def _select(
                 rejected.append((c, f"chevauche un passage en serie retenu [{span}], prioritaire sur un clip unique"))
             continue
         kept.append(c)
+
+    cap = _cap(rubric, meta)
+    always_keep_score = rubric["always_keep_score"]
+    ranked = sorted(kept, key=lambda c: (-c["final_score"], c["_start"]))
+    within_cap = {id(c) for i, c in enumerate(ranked) if i < cap or c["final_score"] >= always_keep_score}
+    for c in kept:
+        if id(c) not in within_cap:
+            rejected.append((
+                c,
+                f"ecarte par le plafond de {cap} moments par heure de video "
+                f"(max_moments_per_hour {rubric['max_moments_per_hour']})",
+            ))
+    kept = [c for c in kept if id(c) in within_cap]
+
     info = None
     if exploration is not None:
         share, seed = exploration
@@ -957,7 +996,7 @@ def run(
         c["bonus"] = _bonus(c["_start"], c["_end"], meta, audio, vision, rubric)
         c["final_score"] = final_score(c["scores"], rubric, c["bonus"]["total"])
 
-    kept, rejected_scored, exploration_info = _select(candidates, rubric, exploration)
+    kept, rejected_scored, exploration_info = _select(candidates, rubric, meta, exploration)
 
     result = {
         "video_id": video_id,
@@ -1018,6 +1057,7 @@ def _rescore(video_dir: Path, out: Path, settings: dict[str, Any]) -> Path:
     principe. ``rescored.changed`` liste les candidats dont le score ou le
     sort (retenu ou non) a change."""
     previous = _read_json(out)
+    meta = _read_json(video_dir / "meta.json")
     vision = _read_json(video_dir / "vision.json")
     sents = split_sentences(_read_json(video_dir / "transcript.json"))
     connectors = _connectors(settings)
@@ -1037,7 +1077,7 @@ def _rescore(video_dir: Path, out: Path, settings: dict[str, Any]) -> Path:
         c["final_score"] = final_score(c["scores"], rubric, c["bonus"]["total"])
 
     exploration = _exploration(settings) if previous.get("selection") == "jury" else None
-    kept, rejected_scored, exploration_info = _select(candidates, rubric, exploration)
+    kept, rejected_scored, exploration_info = _select(candidates, rubric, meta, exploration)
     moments_out = [{"id": n, **_public(c)} for n, c in enumerate(kept)]
     ids = {id(c): n for n, c in enumerate(kept)}
     changed = []

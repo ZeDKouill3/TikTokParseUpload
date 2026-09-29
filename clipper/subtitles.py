@@ -64,7 +64,7 @@ _GLUED_PREFIXES = ("'", "\u2019", "-")
 _PUNCT_SPACE_BEFORE = {"?": " ", "!": " ", ":": " ", ";": " ", "\u00bb": " "}
 
 # Un mot dont le debut precede le debut du clip de plus que cette tolerance
-# n'est jamais sous-titre (SPEC-1557 regle 5 : une borne de clip peut arrondir
+# n'est jamais sous-titre (SPEC-0eec regle 5 : une borne de clip peut arrondir
 # de quelques centiemes au-dessus du mot qu'elle garde, mais un mot entier
 # d'avant le clip, comme un connecteur retire, ne doit jamais s'afficher).
 _WORD_START_TOLERANCE = 0.05

@@ -497,6 +497,8 @@ def test_batch_failure_fails_the_step_with_its_reason(tmp_path, video_dir):
 
 RUBRIC = """
 min_score = 60
+max_moments_per_hour = 1000
+always_keep_score = 1000
 trend_keywords = []
 
 [criteria.hook]

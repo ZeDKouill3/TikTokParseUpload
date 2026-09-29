@@ -1,6 +1,6 @@
 """Etape parts : decoupage de chaque moment retenu en clip unique ou en
 Partie 1/2/.../N qui se suivent, chacune finissant sur un suspense et
-reprenant la fin de la precedente (SPEC-1557, regle 3).
+reprenant la fin de la precedente (SPEC-0eec, regle 3).
 
 Entrees (workspace/<video_id>/) :
 - moments.json (moments) : ``moments[].id, start, end, format, parts,
@@ -65,10 +65,10 @@ from clipper import llm
 log = logging.getLogger(__name__)
 
 CONFIG_DEFAULTS: dict[str, object] = {
-    # Grille (SPEC-1557) dont [durations] fixe les bornes, relative au
+    # Grille (SPEC-0eec) dont [durations] fixe les bornes, relative au
     # dossier courant ; la meme que [moments] rubric_path.
     "rubric_path": "rubric.toml",
-    # Reprise (SPEC-1557, regle 3) : la partie k+1 recommence environ
+    # Reprise (SPEC-0eec, regle 3) : la partie k+1 recommence environ
     # part_overlap_seconds s avant la fin de la partie k, de preference sur
     # un debut de phrase situe entre part_overlap_min et part_overlap_max s
     # avant la coupe.
