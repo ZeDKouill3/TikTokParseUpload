@@ -10,3 +10,5 @@ __pycache__/
 
 # Dossier de travail local (planches, bancs, sauvegardes) : jamais commite
 research/
+# Worktrees des workers (un par tache)
+.worktrees/
