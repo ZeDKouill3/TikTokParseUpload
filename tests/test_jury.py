@@ -406,6 +406,31 @@ def test_veto_without_reason_is_invalid():
         jury.deliberate(candidates(), RUBRIC, config=make_config())
 
 
+def test_compliance_prompt_excuses_reported_speech_and_lists_real_ban_risks():
+    script = ScriptedJury({1: uniform({"secret-id-0": 7, "secret-id-1": 5, "secret-id-2": 3})})
+    _, fake = run(script)
+    prompt = next(c.prompt for c in fake.calls if c.usage == "jury_conformite")
+    # regle du propos rapporte : pas de veto sur un propos clivant/polemique tenu
+    # par une personnalite publique ou un invite, rapporte tel quel
+    assert "rapport" in prompt
+    assert "personnalite publique" in prompt or "invite" in prompt
+    assert "n'est pas un motif de veto" in prompt or "N'EST PAS un motif de veto" in prompt
+    assert "religion" in prompt
+    # liste des motifs de veto reserves a un vrai risque de ban
+    for motif in (
+        "harcelement",
+        "mineur identifiable",
+        "contenu sexuel",
+        "violence graphique gratuite",
+        "incitation",
+        "diffamation",
+        "oeuvre protegee",
+    ):
+        assert motif in prompt, motif
+    # "haine" seule n'est plus un motif generique
+    assert "haine ou harcelement" not in prompt
+
+
 def test_only_veto_judges_are_asked_for_a_veto():
     script = ScriptedJury({1: uniform({"secret-id-0": 7, "secret-id-1": 5, "secret-id-2": 3})})
     _, fake = run(script)

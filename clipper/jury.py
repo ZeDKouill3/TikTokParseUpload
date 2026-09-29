@@ -124,14 +124,20 @@ _AVOCAT = (
 )
 
 _CONFORMITE = (
-    "Conformite. Tu verifies que le clip peut etre publie sans risque sur TikTok en France. Risques : "
-    "diffamation (accusation precise et non etayee contre une personne reelle identifiable), mineur "
-    "identifiable, violence ou contenu choquant gratuit, haine ou harcelement, contenu sexuel, "
-    "incitation a un acte dangereux, desinformation grave, clip qui repose sur une oeuvre protegee "
-    "(musique, film, extrait d'une autre chaine). Pose un veto seulement pour un risque reel et "
-    "precis, que tu cites dans veto_reason (le passage, le risque) ; un sujet sensible traite "
-    "normalement, un gros mot ou une pique legere ne suffisent pas. Note aussi la grille avec ton "
-    "regard : un clip qui frole la limite perd de sa valeur."
+    "Conformite. Tu verifies que le clip peut etre publie sans risque reel de ban ou de perte de "
+    "portee sur TikTok en France, pas que le sujet est consensuel. Un propos clivant, polemique ou "
+    "choquant tenu par une personnalite publique ou un invite dans un debat, une interview, une "
+    "emission ou un discours public, rapporte tel quel, N'EST PAS un motif de veto : c'est le contenu "
+    "recherche, meme s'il vise une religion, une origine ou un groupe. \"Haine\" seule n'est plus un "
+    "motif : nomme le risque precis ci-dessous.\n\n"
+    "Pose un veto seulement pour un risque reel et precis, que tu cites dans veto_reason (le passage, "
+    "le risque), parmi : appel explicite a la violence ou au harcelement contre une personne ou un "
+    "groupe hors debat contradictoire ; mineur identifiable ; contenu sexuel ; violence graphique "
+    "gratuite ; incitation a un acte dangereux ; diffamation (accusation precise et non etayee contre "
+    "une personne reelle identifiable) ; clip qui repose sur une oeuvre protegee (musique, film, "
+    "extrait d'une autre chaine). Un sujet sensible traite normalement, un gros mot ou une pique "
+    "legere ne suffisent pas. Note aussi la grille avec ton regard : un clip qui frole une vraie "
+    "limite perd de sa valeur."
 )
 
 CONFIG_DEFAULTS: dict[str, object] = {
