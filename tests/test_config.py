@@ -42,9 +42,18 @@ def test_cli_help_exits_zero():
 def test_config_defaults_to_review_mode_when_no_config_file(isolated_cwd):
     from clipper.config import load_config
 
-    config = load_config(isolated_cwd / "config.toml")
+    config = load_config()
 
     assert config.mode == "review"
+
+
+def test_config_raises_when_explicit_path_is_missing(isolated_cwd):
+    from clipper.config import ConfigError, load_config
+
+    missing = isolated_cwd / "nope" / "absent.toml"
+
+    with pytest.raises(ConfigError, match=r"absent\.toml"):
+        load_config(missing)
 
 
 def test_config_loads_mode_auto_from_toml_file(isolated_cwd):
@@ -118,6 +127,7 @@ def test_config_section_returns_only_defaults_when_table_absent(isolated_cwd, mo
     _install_fake_section_module(
         monkeypatch, "fake_step", config_defaults={"model": "small", "threshold": 0.5}
     )
+    (isolated_cwd / "config.toml").write_text("")
 
     config = load_config(isolated_cwd / "config.toml")
 

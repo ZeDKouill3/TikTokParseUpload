@@ -17,7 +17,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="clipper",
         description="Pipeline de clips verticaux sous-titres a partir de videos YouTube longues",
     )
-    parser.add_argument("--config", default="config.toml", help="Fichier de configuration (defaut : config.toml)")
+    parser.add_argument("--config", default=None, help="Fichier de configuration (defaut : config.toml)")
     parser.add_argument("-v", "--verbose", action="store_true", help="Journal detaille des etapes")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -185,7 +185,7 @@ def main(argv: list[str] | None = None) -> int:
     from clipper import download, pipeline
 
     try:
-        config = load_config(args.config)
+        config = load_config(args.config) if args.config is not None else load_config()
         if args.command == "run":
             video_id = download.extract_video_id(args.url)
             state = _run_with_progress(
