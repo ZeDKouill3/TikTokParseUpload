@@ -602,7 +602,47 @@ def _fail(run: _Run, name: str, exc: BaseException) -> dict[str, Any]:
     return state
 
 
+USAGE_LOG_FILE = "llm_usage.jsonl"
+
+
+def _usage_summary(usage_log_path: Path) -> dict[str, dict[str, float | int]]:
+    """Totaux par usage (appels, tokens, cout) accumules dans le journal de
+    consommation de la video depuis son debut ; vide si aucun appel LLM
+    n'a encore ete journalise."""
+    totals: dict[str, dict[str, float | int]] = {}
+    if not usage_log_path.exists():
+        return totals
+    for line in usage_log_path.read_text(encoding="utf-8").splitlines():
+        entry = json.loads(line)
+        bucket = totals.setdefault(entry["usage"], {
+            "calls": 0, "input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "cost_usd": 0.0,
+        })
+        bucket["calls"] += 1
+        for field_name in ("input_tokens", "output_tokens", "cache_read_tokens", "cost_usd"):
+            value = entry.get(field_name)
+            if value is not None:
+                bucket[field_name] += value
+    return totals
+
+
 def _advance(run: _Run, *, through_review: bool) -> dict[str, Any]:
+    """Enchaine les etapes restantes (voir _advance_steps) sous
+    ``llm.usage_log`` : chaque appel LLM du passage (y compris ceux faits
+    depuis un thread, ex. l'etape subtitles) est journalise dans
+    workspace/<video_id>/llm_usage.jsonl ; un resume par usage (tokens, cout,
+    cumules depuis le debut de la video) est journalise a la fin du passage,
+    qu'il se termine en succes, en echec ou en attente de revue."""
+    usage_log_path = run.dir / USAGE_LOG_FILE
+    with llm.usage_log(usage_log_path):
+        try:
+            return _advance_steps(run, through_review=through_review)
+        finally:
+            summary = _usage_summary(usage_log_path)
+            if summary:
+                log.info("%s : consommation LLM par usage %s", run.video_id, summary)
+
+
+def _advance_steps(run: _Run, *, through_review: bool) -> dict[str, Any]:
     state, config = run.state, run.config
     state.update(status="running", reason=None, retry_at=None, mode=config.mode)
     save_state(state, config=config)

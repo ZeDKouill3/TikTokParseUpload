@@ -833,6 +833,90 @@ def test_usage_log_path_not_given_writes_nothing(tmp_path):
     assert list(tmp_path.iterdir()) == []
 
 
+# --- contexte de journal (usage_log(), pour clipper.pipeline) ---------------
+
+
+def test_usage_log_context_is_used_by_ask_calls_without_their_own_path(tmp_path):
+    path = tmp_path / "llm_usage.jsonl"
+    fake = FakeBackend([{"couleur": "rouge"}, {"couleur": "bleu"}])
+    with llm.use_backend(fake), llm.usage_log(path):
+        llm.ask("vision", "p", [], COLOR_SCHEMA, config=make_config())
+        llm.ask("qa", "p", [], COLOR_SCHEMA, config=make_config())
+
+    lines = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert [line["usage"] for line in lines] == ["vision", "qa"]
+
+
+def test_usage_log_context_restores_previous_value_on_exit(tmp_path):
+    inner = tmp_path / "inner.jsonl"
+    fake = FakeBackend([{"couleur": "rouge"}, {"couleur": "bleu"}])
+    with llm.use_backend(fake):
+        with llm.usage_log(inner):
+            llm.ask("vision", "p", [], COLOR_SCHEMA, config=make_config())
+        # Hors du bloc : plus de contexte, donc plus aucune ecriture.
+        llm.ask("qa", "p", [], COLOR_SCHEMA, config=make_config())
+
+    lines = [json.loads(line) for line in inner.read_text(encoding="utf-8").splitlines()]
+    assert [line["usage"] for line in lines] == ["vision"]
+
+
+def test_ask_explicit_usage_log_path_overrides_the_context_default(tmp_path):
+    context_path = tmp_path / "context.jsonl"
+    explicit_path = tmp_path / "explicit.jsonl"
+    fake = FakeBackend([{"couleur": "rouge"}])
+    with llm.use_backend(fake), llm.usage_log(context_path):
+        llm.ask("vision", "p", [], COLOR_SCHEMA, config=make_config(), usage_log_path=explicit_path)
+
+    assert not context_path.exists()
+    lines = [json.loads(line) for line in explicit_path.read_text(encoding="utf-8").splitlines()]
+    assert [line["usage"] for line in lines] == ["vision"]
+
+
+def test_usage_log_concurrent_writes_from_several_threads_never_interleave(tmp_path):
+    # clipper.pipeline journalise depuis plusieurs threads a la fois (etape
+    # subtitles, ``parallel`` clips en meme temps) : une ecriture qui n'est
+    # pas serialisee corromprait une ligne (append() + write() sans verrou).
+    from concurrent.futures import ThreadPoolExecutor
+
+    path = tmp_path / "llm_usage.jsonl"
+    n_calls = 40
+    fake = FakeBackend([{"couleur": "rouge"}] * (n_calls * 2))
+
+    def call(_):
+        llm.ask("qa", "p" * 200, [], COLOR_SCHEMA, config=make_config())
+
+    with llm.use_backend(fake), llm.usage_log(path):
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            list(executor.map(call, range(n_calls)))
+
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == n_calls
+    for line in lines:
+        entry = json.loads(line)  # une ligne entrelacee leverait JSONDecodeError
+        assert entry["usage"] == "qa"
+
+
+def test_usage_log_context_is_visible_from_a_worker_thread(tmp_path):
+    # clipper.pipeline positionne le contexte depuis le thread principal puis
+    # lance des etapes (subtitles) dans un ThreadPoolExecutor : le contexte
+    # doit s'appliquer aussi aux appels faits depuis ces threads, ce qu'une
+    # contextvar ne ferait pas sans copie explicite du contexte.
+    from concurrent.futures import ThreadPoolExecutor
+
+    path = tmp_path / "llm_usage.jsonl"
+    fake = FakeBackend([{"couleur": "rouge"}])
+
+    def call_from_thread():
+        llm.ask("vision", "p", [], COLOR_SCHEMA, config=make_config())
+
+    with llm.use_backend(fake), llm.usage_log(path):
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            executor.submit(call_from_thread).result()
+
+    lines = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert [line["usage"] for line in lines] == ["vision"]
+
+
 # --- integration reelle (optionnelle) ---------------------------------------
 # CLIPPER_CLAUDE_INTEGRATION=1 pytest tests/test_llm.py -k integration
 

@@ -25,6 +25,14 @@ exacte) ; si une correction finit acceptee, une derniere ligne
 ``accepted: true`` l'enregistre. Sans ``log_path``, rien n'est ecrit, et une
 reponse acceptee du premier coup n'est jamais journalisee.
 
+``usage_log(path)`` (gestionnaire de contexte) fixe le ``usage_log_path`` par
+defaut de tout ``ask()`` du bloc qui n'en precise pas le sien ;
+``clipper.pipeline`` l'ouvre pour la duree d'un passage sur une video. C'est
+une variable de module ordinaire, pas une contextvar : une contextvar n'est
+jamais copiee vers un thread cree hors asyncio, alors qu'une etape (ex.
+``subtitles``, via ``ThreadPoolExecutor``) doit journaliser ses appels LLM au
+meme titre que celles qui restent dans le thread principal.
+
 Backends : ``claude-cli`` (defaut, voir clipper.llm.claude_cli pour la facon
 dont ``claude -p`` recoit les images), ``claude-api``, ``ollama``. Pour les
 tests des autres etapes : ``clipper.llm.fake.FakeBackend`` et
@@ -53,6 +61,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import replace
@@ -75,6 +84,7 @@ __all__ = [
     "TransientLLMError",
     "ask",
     "register_backend",
+    "usage_log",
     "use_backend",
 ]
 
@@ -115,6 +125,10 @@ _BACKENDS: dict[str, tuple[str, Callable[[dict[str, Any]], Backend]]] = {
 }
 
 _override: Backend | None = None
+# Chemin par defaut de usage_log_path pour ask() dans ce bloc (usage_log()) ;
+# variable de module ordinaire (pas une contextvar) : visible telle quelle
+# depuis un thread lance pendant le bloc, cf. usage_log().
+_usage_log_path: Path | None = None
 
 
 def _deep_merge(base: dict[str, Any], top: dict[str, Any]) -> dict[str, Any]:
@@ -178,9 +192,17 @@ def _accept(text: str, schema: dict[str, Any], check: Callable[[Any], None] | No
     return value
 
 
+# Plusieurs threads (etape subtitles, clips en parallele) peuvent journaliser
+# en meme temps sur le meme fichier : sans verrou, deux open(mode="a") +
+# write() concurrents entrelacent leurs lignes (fichier JSONL corrompu).
+_log_lock = threading.Lock()
+
+
 def _log_line(log_path: Path, entry: dict[str, Any]) -> None:
-    with open(log_path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    line = json.dumps(entry, ensure_ascii=False) + "\n"
+    with _log_lock:
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(line)
 
 
 _USAGE_FIELDS = ("input_tokens", "output_tokens", "cache_read_tokens", "cost_usd")
@@ -234,7 +256,10 @@ def ask(
     finally refused) appends one JSON line to it once it is done: usage,
     model, input_tokens, output_tokens, cache_read_tokens, cost_usd (summed
     over every backend call this ask() made, including repairs ; null for a
-    field no call reported), duration_s (wall time summed over those calls)."""
+    field no call reported), duration_s (wall time summed over those calls).
+    Without ``usage_log_path``, the default set by an enclosing ``usage_log()``
+    block (if any) is used instead; with neither, nothing is written."""
+    effective_usage_log_path = usage_log_path if usage_log_path is not None else _usage_log_path
     settings = _settings(config)
     name, model, backend_settings = _resolve(usage, settings)
     attempts = int(settings["repair_attempts"])
@@ -267,8 +292,8 @@ def ask(
                     "error": str(error),
                 })
             if attempt == attempts:
-                if usage_log_path is not None:
-                    _log_line(usage_log_path, _usage_entry(usage, model, totals, duration_total))
+                if effective_usage_log_path is not None:
+                    _log_line(effective_usage_log_path, _usage_entry(usage, model, totals, duration_total))
                 raise
             text, duration, call_usage = _call_backend(
                 backend, replace(request, prompt=_with_repair_instruction(request.prompt, text, error))
@@ -285,9 +310,23 @@ def ask(
                 "accepted": True,
                 "response": value,
             })
-        if usage_log_path is not None:
-            _log_line(usage_log_path, _usage_entry(usage, model, totals, duration_total))
+        if effective_usage_log_path is not None:
+            _log_line(effective_usage_log_path, _usage_entry(usage, model, totals, duration_total))
         return value
+
+
+@contextlib.contextmanager
+def usage_log(path: Path | str) -> Iterator[None]:
+    """Set the default ``usage_log_path`` for every ask() of the block that
+    doesn't give its own. Not a contextvar (see the module docstring): a bare
+    module global, so a thread started during the block (e.g. by
+    clipper.pipeline's parallel subtitles step) sees it too."""
+    global _usage_log_path
+    previous, _usage_log_path = _usage_log_path, Path(path)
+    try:
+        yield
+    finally:
+        _usage_log_path = previous
 
 
 @contextlib.contextmanager
