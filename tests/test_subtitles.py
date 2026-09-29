@@ -526,6 +526,40 @@ def test_glued_apostrophe_and_hyphen_tokens_stay_with_the_previous_word(tmp_path
 
 
 # --------------------------------------------------------------------------
+# TASK-746b (banc docs/bench-whisper-vitesse.md) : le batching whisper rend
+# une ponctuation et des majuscules internes moins riches (segments sans
+# virgule ni majuscule de phrase) ; le format letterbox (SPEC-6127, format
+# par defaut) ne doit pas en dependre pour decouper et afficher le texte.
+# --------------------------------------------------------------------------
+
+
+def low_punctuation_words():
+    """Comme le rendrait BatchedInferencePipeline : aucune ponctuation ni
+    majuscule interne, un seul point final absent (segment coupe en plein
+    milieu d'une phrase, cas reel observe dans le banc)."""
+    text = "salut tout le monde aujourd hui on va parler du prochain gta qui arrive bientot pour tous"
+    raw = text.split(" ")
+    words = []
+    t = 0.0
+    for i, w in enumerate(raw):
+        prefix = "" if i == 0 else " "
+        words.append(_word(prefix + w, t, t + 0.3))
+        t += 0.35
+    return words
+
+
+def test_letterbox_low_punctuation_batched_text_is_grouped_and_uppercased(tmp_path, video_dir):
+    words = low_punctuation_words()
+    path = run_letterbox(tmp_path, video_dir, words=words)
+    events = lb_events(path)
+    assert events
+    full_text = " ".join(line_text(ev).strip() for ev in events)
+    assert full_text == " ".join(w["word"].strip() for w in words).upper()
+    for ev in events:
+        assert_ink_in_zone(ev, 120, ZONE)
+
+
+# --------------------------------------------------------------------------
 # C9 : rendu ffmpeg d'echantillon, test optionnel (saute par defaut)
 # --------------------------------------------------------------------------
 
