@@ -5,15 +5,19 @@ slug: grille-de-notation-des-moments-v3-trend-0-plafon
 title: Grille de notation des moments v3 (trend à 0, plafond souple par heure)
 created: 2026-09-29T09:23:31Z
 author: orch-main
-status: proposed
+status: accepted
 scope:
   - clipper/moments.py
   - clipper/parts.py
   - rubric.toml
 references: [ADR-b1c17749b528]
 supersedes: SPEC-1557120ad84b
+ratified: 23546c6e672f
+verified:
+  - by: nicoc@zedk_ordi
+    at: 2026-09-29T09:43:56Z
 schema: 4
-version: 1
+version: 2
 ---
 
 ## Objet
