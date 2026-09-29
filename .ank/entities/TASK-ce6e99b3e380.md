@@ -5,7 +5,7 @@ slug: subtitles-g-n-rer-les-sous-titres-des-clips-en-p
 title: "subtitles : générer les sous-titres des clips en parallèle"
 created: 2026-09-29T08:15:06Z
 author: orch-main
-status: open
+status: done
 scope:
   - clipper/pipeline.py
   - clipper/subtitles.py
@@ -17,6 +17,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/a27485e0b942@049f2fa
+    tree: scope/8ee60293d1c0
+    criteria: 7a123859f45c
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---
