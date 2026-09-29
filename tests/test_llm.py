@@ -766,6 +766,73 @@ def test_log_path_file_not_created_when_first_answer_is_accepted(tmp_path):
     assert not log_path.exists()
 
 
+# --- journal de consommation (usage_log_path) -------------------------------
+
+
+def test_usage_log_records_nulls_when_backend_gives_no_usage_info(tmp_path):
+    # FakeBackend ne fournit aucune telemetrie : aucune valeur inventee
+    # (ADR-ad2e), les compteurs sont null.
+    usage_log_path = tmp_path / "llm_usage.jsonl"
+    fake = FakeBackend([{"couleur": "rouge"}])
+    with llm.use_backend(fake):
+        value = llm.ask(
+            "vision", "p", [], COLOR_SCHEMA,
+            config=make_config(), usage_log_path=usage_log_path,
+        )
+
+    assert value == {"couleur": "rouge"}
+    lines = [json.loads(line) for line in usage_log_path.read_text(encoding="utf-8").splitlines()]
+    assert len(lines) == 1
+    entry = lines[0]
+    assert entry["usage"] == "vision"
+    assert entry["model"] == fake.calls[0].model
+    assert entry["input_tokens"] is None
+    assert entry["output_tokens"] is None
+    assert entry["cache_read_tokens"] is None
+    assert entry["cost_usd"] is None
+    assert isinstance(entry["duration_s"], float)
+    assert entry["duration_s"] >= 0
+    assert "T" in entry["timestamp"]
+
+
+def test_usage_log_records_one_line_per_ask_call_even_with_repairs(tmp_path):
+    usage_log_path = tmp_path / "llm_usage.jsonl"
+    fake = FakeBackend([{"couleur": "rouge"}, {"couleur": "or"}])
+    with llm.use_backend(fake):
+        llm.ask(
+            "vision", "Quelle couleur ?", [], COLOR_SCHEMA,
+            config=make_config(), check=at_most_two_letters, usage_log_path=usage_log_path,
+        )
+
+    # 2 appels reels au backend (reponse + reparation), une seule ligne pour
+    # l'appel a ask() qui les regroupe.
+    assert len(fake.calls) == 2
+    lines = usage_log_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+
+
+def test_usage_log_records_a_line_even_when_the_answer_is_finally_refused(tmp_path):
+    usage_log_path = tmp_path / "llm_usage.jsonl"
+    fake = FakeBackend([{"couleur": "rouge"}, {"couleur": "violet"}])
+    with llm.use_backend(fake):
+        with pytest.raises(SchemaError, match="couleur de 6 lettres"):
+            llm.ask(
+                "qa", "p", [], COLOR_SCHEMA, config=make_config(),
+                check=at_most_two_letters, usage_log_path=usage_log_path,
+            )
+
+    lines = [json.loads(line) for line in usage_log_path.read_text(encoding="utf-8").splitlines()]
+    assert len(lines) == 1
+    assert lines[0]["usage"] == "qa"
+
+
+def test_usage_log_path_not_given_writes_nothing(tmp_path):
+    fake = FakeBackend([{"couleur": "rouge"}])
+    with llm.use_backend(fake):
+        llm.ask("qa", "p", [], COLOR_SCHEMA, config=make_config())
+    assert list(tmp_path.iterdir()) == []
+
+
 # --- integration reelle (optionnelle) ---------------------------------------
 # CLIPPER_CLAUDE_INTEGRATION=1 pytest tests/test_llm.py -k integration
 
