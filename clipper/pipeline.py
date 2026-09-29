@@ -20,6 +20,9 @@ Enchainement, par video (``STEPS``, dans l'ordre d'execution) :
   recadrage, et la bande de l'accroche (``hook_zones``) des reglages de
   render ; en format letterbox (``layout = "letterbox"`` a la racine du plan),
   subtitles recoit a la place la zone ``text_zones.subtitles`` du plan ;
+- ``subtitles`` genere jusqu'a ``parallel`` clips a la fois ([subtitles] de
+  config.toml ; 1 = un clip apres l'autre), sans modele en VRAM ; reframe
+  et render traitent leurs clips un par un ;
 - un clip n'est pret que si ``qa.is_ready`` le dit.
 
 Modes (``mode`` de config.toml, ADR-ad2e) :
@@ -71,6 +74,7 @@ import json
 import logging
 import time
 import urllib.error
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -327,15 +331,29 @@ class _Run:
             reframe.reframe(self.video_id, clip["id"], clip["start"], clip["end"], self.ws,
                             config=self.config, force=self.force, **self.opts("reframe"))
 
+    def _subtitles_clip(self, clip: dict[str, Any]) -> None:
+        plan = _read_json(self.dir / "reframe" / f"{clip['id']}.json")
+        if plan.get("layout") == "letterbox":
+            zones = {"text_zone": subtitles_zone(plan, clip["id"])}
+        else:
+            zones = {"avoid_zones": avoid_zones(plan), "reserved_zones": hook_zones(clip, self.config)}
+        subtitles.generate(self.video_id, clip["id"], clip["start"], clip["end"], self.ws,
+                           config=self.config, force=self.force, **zones, **self.opts("subtitles"))
+
     def subtitles(self) -> None:
-        for clip in self.clips():
-            plan = _read_json(self.dir / "reframe" / f"{clip['id']}.json")
-            if plan.get("layout") == "letterbox":
-                zones = {"text_zone": subtitles_zone(plan, clip["id"])}
-            else:
-                zones = {"avoid_zones": avoid_zones(plan), "reserved_zones": hook_zones(clip, self.config)}
-            subtitles.generate(self.video_id, clip["id"], clip["start"], clip["end"], self.ws,
-                               config=self.config, force=self.force, **zones, **self.opts("subtitles"))
+        # Jusqu'a ``parallel`` clips a la fois (threads : le temps passe dans
+        # l'appel LLM d'emphase, un sous-processus). Un clip en echec laisse
+        # les autres aller au bout (leurs .ass restent ecrits), puis l'erreur
+        # du premier clip en echec remonte (ADR-ad2e). reframe et render
+        # restent sequentiels (GPU/NVENC, ADR-fb9b).
+        parallel = self.config.section("subtitles")["parallel"]
+        if isinstance(parallel, bool) or not isinstance(parallel, int) or parallel < 1:
+            raise PipelineError(f"[subtitles] parallel doit etre un entier >= 1, recu {parallel!r}")
+        clips = self.clips()
+        with ThreadPoolExecutor(max_workers=parallel) as executor:
+            futures = [executor.submit(self._subtitles_clip, clip) for clip in clips]
+        for future in futures:
+            future.result()
 
     def render(self) -> None:
         for clip in self.clips():

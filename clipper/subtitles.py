@@ -105,6 +105,10 @@ CONFIG_DEFAULTS: dict[str, object] = {
     # Decalage (px) entre le haut de la zone subtitles et la premiere ligne
     # (TASK-ea6e : les sous-titres etaient trop colles a la video sans lui).
     "letterbox_offset_y": 28,
+    # Clips generes en meme temps par l'etape subtitles de clipper.pipeline
+    # (TASK-ce6e : un appel LLM d'emphase par clip) ; 1 = un clip apres
+    # l'autre. Lu par le pipeline, jamais passe a generate.
+    "parallel": 4,
 }
 
 EMPHASIS_PROMPT = (

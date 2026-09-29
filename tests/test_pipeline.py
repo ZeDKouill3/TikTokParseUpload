@@ -707,3 +707,140 @@ def test_hook_zones_reserve_the_hook_band_for_the_hook_duration(tmp_path):
     assert zone["end"] == pytest.approx(686.3)
     [(top, bottom)] = zone["bands"]
     assert top * 1920 <= 300 and bottom * 1920 >= 380 and bottom * 1920 < 500
+
+
+# --------------------------------------------------------------------------
+# TASK-ce6e : l'etape subtitles genere les clips en parallele, au plus
+# ``parallel`` a la fois (CONFIG_DEFAULTS de subtitles).
+# --------------------------------------------------------------------------
+
+N_CLIPS = 6
+CROP_CLIP = "01"  # un clip recadre (zones a eviter + accroche), les autres letterbox
+
+
+def parallel_workspace(tmp_path, fail_clip=None):
+    """captions.json, transcript.json et reframe/<id>.json pour N_CLIPS clips
+    de 4 s, clip k de 4k a 4k + 4 ; les mots du clip ``fail_clip`` contiennent
+    ``echec``."""
+    d = tmp_path / "workspace" / VIDEO_ID
+    (d / "reframe").mkdir(parents=True)
+    words, clips = [], []
+    for k in range(N_CLIPS):
+        clip_id = f"{k:02d}"
+        texts = ["echec"] * 4 if clip_id == fail_clip else [f"mot{k}{c}" for c in "abcd"]
+        words += [{"word": f" {w}", "start": 4 * k + 0.5 * j + 0.2, "end": 4 * k + 0.5 * j + 0.6,
+                   "probability": 0.9} for j, w in enumerate(texts)]
+        clips.append({"id": clip_id, "start": 4.0 * k, "end": 4.0 * k + 4})
+        plan = {"output": {"width": 1080, "height": 1920},
+                "plans": [{"index": 0, "start": 4.0 * k, "end": 4.0 * k + 4, "faces": [], "panels": []}]}
+        if clip_id != CROP_CLIP:
+            plan.update(layout="letterbox", format="letterbox",
+                        text_zones={"subtitles": {"x0": 150, "y0": 1400, "x1": 930, "y1": 1700}})
+        (d / "reframe" / f"{clip_id}.json").write_text(json.dumps(plan), encoding="utf-8")
+    (d / "transcript.json").write_text(json.dumps({"video_id": VIDEO_ID, "language": "fr", "segments": [
+        {"id": 0, "start": 0.0, "end": 4.0 * N_CLIPS, "text": "", "words": words}]}), encoding="utf-8")
+    (d / "captions.json").write_text(json.dumps({"clips": clips}), encoding="utf-8")
+    return d
+
+
+class ConcurrentEmphasis:
+    """Reponse d'emphase qui compte les appels simultanes (pic dans ``peak``)
+    et echoue pour un clip dont les mots contiennent ``echec``."""
+
+    def __init__(self):
+        import threading
+
+        self.lock = threading.Lock()
+        self.active = 0
+        self.peak = 0
+
+    def __call__(self, request):
+        import time
+
+        assert request.usage == "emphasis"
+        with self.lock:
+            self.active += 1
+            self.peak = max(self.peak, self.active)
+        try:
+            time.sleep(0.1)
+            if "echec" in request.prompt:
+                return llm.LLMError("reponse refusee pour le clip en echec")
+            return {"indices": [0, 2]}
+        finally:
+            with self.lock:
+                self.active -= 1
+
+
+def run_parallel_subtitles(tmp_path, parallel, emphasis=None):
+    from clipper import pipeline
+
+    config = Config(mode="auto", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output",
+                    _sections={"subtitles": {"parallel": parallel}})
+    run = pipeline._Run(pipeline.new_state(VIDEO_ID, URL, "auto"), config, False, None)
+    emphasis = emphasis or ConcurrentEmphasis()
+    with llm.use_backend(FakeBackend([emphasis] * 500)):
+        run.subtitles()
+    return emphasis
+
+
+def test_subtitles_parallel_defaults_to_4():
+    from clipper.subtitles import CONFIG_DEFAULTS as SUBTITLES_DEFAULTS
+
+    assert SUBTITLES_DEFAULTS["parallel"] == 4
+
+
+def test_subtitles_step_overlaps_emphasis_calls_with_parallel_4(tmp_path):
+    parallel_workspace(tmp_path)
+    emphasis = run_parallel_subtitles(tmp_path, 4)
+    assert emphasis.peak >= 2
+    assert emphasis.peak <= 4
+
+
+def test_subtitles_step_never_overlaps_with_parallel_1(tmp_path):
+    parallel_workspace(tmp_path)
+    emphasis = run_parallel_subtitles(tmp_path, 1)
+    assert emphasis.peak == 1
+
+
+def test_subtitles_files_are_identical_with_parallel_1_and_4(tmp_path):
+    files = {}
+    for parallel in (1, 4):
+        d = parallel_workspace(tmp_path / f"p{parallel}")
+        run_parallel_subtitles(tmp_path / f"p{parallel}", parallel)
+        files[parallel] = {p.name: p.read_bytes() for p in sorted((d / "subtitles").glob("*.ass"))}
+    assert sorted(files[1]) == [f"{k:02d}.ass" for k in range(N_CLIPS)]
+    assert files[1] == files[4]
+    # zones calculees clip par clip : letterbox pour tous sauf le clip recadre
+    assert files[4]["00.ass"].startswith(b"; format: letterbox")
+    assert not files[4][f"{CROP_CLIP}.ass"].startswith(b"; format: letterbox")
+
+
+def test_a_failing_clip_fails_the_step_after_the_other_clips_are_written(tmp_path):
+    d = parallel_workspace(tmp_path, fail_clip="03")
+    with pytest.raises(llm.LLMError, match="clip en echec"):
+        run_parallel_subtitles(tmp_path, 4)
+    written = sorted(p.name for p in (d / "subtitles").glob("*.ass"))
+    assert written == [f"{k:02d}.ass" for k in range(N_CLIPS) if k != 3]
+
+
+def test_a_rerun_after_a_failure_skips_the_clips_already_written(tmp_path):
+    d = parallel_workspace(tmp_path, fail_clip="03")
+    with pytest.raises(llm.LLMError):
+        run_parallel_subtitles(tmp_path, 4)
+    before = {p.name: p.stat().st_mtime_ns for p in (d / "subtitles").glob("*.ass")}
+    emphasis = ConcurrentEmphasis()
+    with pytest.raises(llm.LLMError):
+        run_parallel_subtitles(tmp_path, 4, emphasis)
+    after = {p.name: p.stat().st_mtime_ns for p in (d / "subtitles").glob("*.ass")}
+    assert after == before
+    assert emphasis.peak == 1  # seul le clip en echec rappelle le LLM
+
+
+@pytest.mark.parametrize("parallel", [0, -2])
+def test_subtitles_parallel_below_1_is_refused(tmp_path, parallel):
+    from clipper.pipeline import PipelineError
+
+    d = parallel_workspace(tmp_path)
+    with pytest.raises(PipelineError, match="parallel"):
+        run_parallel_subtitles(tmp_path, parallel)
+    assert not (d / "subtitles").exists()
