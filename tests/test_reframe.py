@@ -1494,6 +1494,53 @@ def test_face_too_small_even_in_corner_vignettes_keeps_the_reason(tmp_path, vide
     assert "aucun visage detecte" in data["reason"]
 
 
+# --------------------------------------------------------------------------
+# Echantillonnage des images cles (TASK-493f184c4ce1) : borne le nombre
+# d'appels au detecteur sur une video a beaucoup d'images cles (248 s sur
+# 2326 images cles avant ce reglage).
+# --------------------------------------------------------------------------
+
+
+def test_detector_calls_are_bounded_by_facecam_max_keyframes(tmp_path, video_dir):
+    # 50 images cles, cadence limitee a 10 : 5 appels (image + 4 coins) par
+    # image cle examinee, jamais plus que 10 * 5, quel que soit le nombre
+    # d'images cles de scenes.json.
+    write_keyframes(video_dir, pattern(50, 45))
+    path, factory = detect(tmp_path, facecam_max_keyframes=10)
+    assert factory.detectors[0].frames == 10 * 5
+    assert len(load(path)["keyframes"]) == 10
+
+
+def test_sampled_keyframes_are_spread_over_the_whole_video_and_find_the_facecam(tmp_path, video_dir):
+    # Visage present partout (45/50) mais examine seulement 10 images cles,
+    # reparties du debut a la fin : le partage mesure sur l'echantillon
+    # retrouve quand meme la facecam (share proche de 45/50 = 0.9).
+    write_keyframes(video_dir, pattern(50, 45))
+    path, _ = detect(tmp_path, facecam_max_keyframes=10)
+    data = load(path)
+    timecodes = [k["timecode"] for k in data["keyframes"]]
+    assert timecodes[0] == pytest.approx(0.5)  # premiere image cle
+    assert timecodes[-1] == pytest.approx(49.5)  # derniere image cle
+    assert data["facecam"] is not None
+    assert data["reason"] is None
+
+
+def test_fewer_keyframes_than_facecam_max_keyframes_examines_them_all(tmp_path, video_dir):
+    # Reglage plus grand que le nombre d'images cles disponibles : aucun
+    # echantillonnage, tout est examine comme avant.
+    write_keyframes(video_dir, pattern(20, 18))
+    path, factory = detect(tmp_path, facecam_max_keyframes=200)
+    assert factory.detectors[0].frames == 20 * 5
+    assert load(path)["share"] == pytest.approx(0.9)
+
+
+def test_facecam_max_keyframes_default_does_not_affect_small_videos(tmp_path, video_dir):
+    write_keyframes(video_dir, pattern(20, 18))
+    path, factory = detect(tmp_path)  # reglage par defaut
+    assert factory.detectors[0].frames == 20 * 5
+    assert load(path)["share"] == pytest.approx(0.9)
+
+
 def test_facecam_detection_is_cached_per_video(tmp_path, video_dir):
     write_keyframes(video_dir, pattern(40, 40))
     factory = PixelDetectorFactory()
