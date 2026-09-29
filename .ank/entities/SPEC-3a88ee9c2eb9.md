@@ -5,14 +5,18 @@ slug: format-stream-facecam-fixe-agrandie-en-haut-jeu
 title: "Format stream : facecam fixe agrandie en haut, jeu en bas, jamais de bascule dans un clip"
 created: 2026-09-29T09:25:23Z
 author: orch-main
-status: proposed
+status: accepted
 scope:
   - clipper/reframe.py
   - clipper/render.py
   - clipper/pipeline.py
 references: [SPEC-612781386e1d, ADR-fb9bcb1e98f5, ADR-ad2e562b1810]
+ratified: 847193da5c57
+verified:
+  - by: nicoc@zedk_ordi
+    at: 2026-09-29T09:28:01Z
 schema: 4
-version: 1
+version: 2
 ---
 
 ## Objet
