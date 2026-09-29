@@ -19,10 +19,23 @@ class LLMRequest:
     schema: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class Usage:
+    """Telemetry for one backend.complete() call. A field the backend does
+    not report stays None (ADR-ad2e: no invented value)."""
+
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    cache_read_tokens: int | None = None
+    cost_usd: float | None = None
+
+
 class Backend(Protocol):
     def complete(self, request: LLMRequest) -> str:
         """Return the model's raw text answer, or raise LLMError /
-        TransientLLMError."""
+        TransientLLMError. A backend that can report telemetry sets
+        ``self.last_usage`` (a Usage) for the call it just completed; a
+        backend without one is read as Usage() (every field None)."""
 
 
 def image_b64(path: Path) -> str:

@@ -58,7 +58,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from clipper.llm.backend import LLMRequest
+from clipper.llm.backend import LLMRequest, Usage
 from clipper.llm.errors import LLMError, TransientLLMError
 
 SYSTEM_PROMPT = (
@@ -126,6 +126,7 @@ class ClaudeCLIBackend:
     def __init__(self, settings: dict[str, Any]):
         self.command = str(settings.get("command", "claude"))
         self.timeout = settings.get("timeout", 900)
+        self.last_usage: Usage | None = None
 
     def build_command(self, request: LLMRequest) -> list[str]:
         cmd = [resolve_command(self.command), "-p", "--output-format", "json", "--model", request.model]
@@ -166,13 +167,28 @@ class ClaudeCLIBackend:
             raise LLMError(f"commande {self.command!r} introuvable (Claude Code installe ?)") from exc
         except subprocess.TimeoutExpired as exc:
             raise TransientLLMError(f"claude -p : pas de reponse en {self.timeout} s") from exc
-        return parse_output(proc.stdout, proc.returncode, proc.stderr)
+        text, usage = parse_output(proc.stdout, proc.returncode, proc.stderr)
+        self.last_usage = usage
+        return text
 
 
-def parse_output(stdout: str, returncode: int = 0, stderr: str = "") -> str:
+def _usage_from(data: dict[str, Any]) -> Usage:
+    """Telemetry from a successful ``claude -p --output-format json`` object.
+    A missing field stays None (ADR-ad2e : aucune valeur inventee)."""
+    raw = data.get("usage")
+    raw = raw if isinstance(raw, dict) else {}
+    return Usage(
+        input_tokens=raw.get("input_tokens"),
+        output_tokens=raw.get("output_tokens"),
+        cache_read_tokens=raw.get("cache_read_input_tokens"),
+        cost_usd=data.get("total_cost_usd"),
+    )
+
+
+def parse_output(stdout: str, returncode: int = 0, stderr: str = "") -> tuple[str, Usage]:
     """Extract the answer from ``claude -p --output-format json`` : the
     structured output (re-encoded as JSON text) when present, else the
-    ``result`` text."""
+    ``result`` text ; alongside the call's telemetry (Usage)."""
     try:
         data = json.loads(stdout)
     except json.JSONDecodeError:
@@ -191,9 +207,10 @@ def parse_output(stdout: str, returncode: int = 0, stderr: str = "") -> str:
         if _is_transient(status, str(result or "")):
             raise TransientLLMError(message)
         raise LLMError(message)
+    usage = _usage_from(data)
     structured = data.get("structured_output")
     if structured is not None:
-        return json.dumps(structured, ensure_ascii=False)
+        return json.dumps(structured, ensure_ascii=False), usage
     if not isinstance(result, str):
         raise LLMError(f"claude -p : pas de champ 'result' texte dans {sorted(data)}")
-    return result
+    return result, usage

@@ -53,13 +53,14 @@ from __future__ import annotations
 
 import contextlib
 import json
+import time
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from clipper.llm.backend import Backend, LLMRequest
+from clipper.llm.backend import Backend, LLMRequest, Usage
 from clipper.llm.claude_api import ClaudeAPIBackend
 from clipper.llm.claude_cli import ClaudeCLIBackend
 from clipper.llm.errors import LLMError, SchemaError, TransientLLMError
@@ -182,6 +183,34 @@ def _log_line(log_path: Path, entry: dict[str, Any]) -> None:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
+_USAGE_FIELDS = ("input_tokens", "output_tokens", "cache_read_tokens", "cost_usd")
+
+
+def _call_backend(backend: Backend, request: LLMRequest) -> tuple[str, float, Usage]:
+    start = time.monotonic()
+    text = backend.complete(request)
+    duration = time.monotonic() - start
+    usage = getattr(backend, "last_usage", None)
+    return text, duration, usage if isinstance(usage, Usage) else Usage()
+
+
+def _accumulate(totals: dict[str, float | int | None], usage: Usage) -> None:
+    for field_name in _USAGE_FIELDS:
+        value = getattr(usage, field_name)
+        if value is not None:
+            totals[field_name] = value if totals[field_name] is None else totals[field_name] + value
+
+
+def _usage_entry(usage: str, model: str, totals: dict[str, float | int | None], duration_s: float) -> dict[str, Any]:
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "usage": usage,
+        "model": model,
+        **totals,
+        "duration_s": duration_s,
+    }
+
+
 def ask(
     usage: str,
     prompt: str,
@@ -191,6 +220,7 @@ def ask(
     config: Any = None,
     check: Callable[[Any], None] | None = None,
     log_path: Path | None = None,
+    usage_log_path: Path | None = None,
 ) -> Any:
     """Ask the model configured for ``usage`` and return its JSON answer,
     validated against ``schema`` then by ``check`` (which raises SchemaError
@@ -200,7 +230,11 @@ def ask(
     JSON line to it (timestamp, usage, model, attempt number, raw refused
     text, exact error), and an answer accepted after repair adds a final
     ``accepted: true`` line; an answer accepted on the first try is never
-    logged."""
+    logged. When ``usage_log_path`` is given, this call (successful or
+    finally refused) appends one JSON line to it once it is done: usage,
+    model, input_tokens, output_tokens, cache_read_tokens, cost_usd (summed
+    over every backend call this ask() made, including repairs ; null for a
+    field no call reported), duration_s (wall time summed over those calls)."""
     settings = _settings(config)
     name, model, backend_settings = _resolve(usage, settings)
     attempts = int(settings["repair_attempts"])
@@ -214,7 +248,11 @@ def ask(
         images=[Path(p) for p in images],
         schema=schema,
     )
-    text = backend.complete(request)
+    totals: dict[str, float | int | None] = dict.fromkeys(_USAGE_FIELDS)
+    duration_total = 0.0
+    text, duration, call_usage = _call_backend(backend, request)
+    duration_total += duration
+    _accumulate(totals, call_usage)
     for attempt in range(attempts + 1):
         try:
             value = _accept(text, schema, check)
@@ -229,10 +267,14 @@ def ask(
                     "error": str(error),
                 })
             if attempt == attempts:
+                if usage_log_path is not None:
+                    _log_line(usage_log_path, _usage_entry(usage, model, totals, duration_total))
                 raise
-            text = backend.complete(
-                replace(request, prompt=_with_repair_instruction(request.prompt, text, error))
+            text, duration, call_usage = _call_backend(
+                backend, replace(request, prompt=_with_repair_instruction(request.prompt, text, error))
             )
+            duration_total += duration
+            _accumulate(totals, call_usage)
             continue
         if log_path is not None and attempt > 0:
             _log_line(log_path, {
@@ -243,6 +285,8 @@ def ask(
                 "accepted": True,
                 "response": value,
             })
+        if usage_log_path is not None:
+            _log_line(usage_log_path, _usage_entry(usage, model, totals, duration_total))
         return value
 
 
