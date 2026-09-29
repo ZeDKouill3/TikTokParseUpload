@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import json
 import os
 import re
 import threading
@@ -95,8 +96,13 @@ class ScriptedJury:
             note = table[cid]
             scores = note if isinstance(note, dict) else {c: note for c in RUBRIC["criteria"]}
             item = {"ref": ref, "argument": f"ARG-{judge}-r{rnd}-{cid}", "scores": scores}
-            if judge == "conformite":
-                reason = self.veto.get((rnd, cid), "")
+            # Le schema (partage par tout le modele, TASK-b0fa) dit si veto
+            # et veto_reason sont attendus dans la reponse, pas le nom du
+            # juge : seul conformite (le juge a veto) fixe une raison via
+            # self.veto, les autres juges du meme modele repondent veto=False.
+            schema_item = request.schema["properties"]["candidates"]["items"]["properties"]
+            if "veto" in schema_item:
+                reason = self.veto.get((rnd, cid), "") if judge == "conformite" else ""
                 item["veto"] = bool(reason)
                 item["veto_reason"] = reason
             answer.append(item)
@@ -252,6 +258,28 @@ def test_same_model_judges_share_an_identical_prompt_prefix_for_the_cache():
     assert prefix("retention") == prefix("monteur") == prefix("avocat")
     assert prefix("spectateur") == prefix("conformite")
     assert prefix("retention") != prefix("spectateur")
+
+
+def test_prompt_prefix_before_the_role_includes_the_schema():
+    # TASK-b0fa : le schema (--json-schema) doit faire partie de ce qui
+    # precede la consigne de role, pas etre ajoute apres (llm.ask l'ajoute
+    # de toute facon a la toute fin, en plus, mais ca ne casse pas ce
+    # prefixe puisque c'est apres le role).
+    script = ScriptedJury({1: uniform({"secret-id-0": 7, "secret-id-1": 5, "secret-id-2": 3})})
+    _, fake = run(script)
+    prompts = {c.usage.removeprefix("jury_"): c.prompt for c in fake.calls}
+
+    def prefix(name):
+        return prompts[name].split("## Ta perspective")[0]
+
+    for name in ("retention", "monteur", "avocat", "spectateur", "conformite"):
+        schema_json = json.dumps(fake.calls[[c.usage.removeprefix("jury_") for c in fake.calls].index(name)].schema, ensure_ascii=False)
+        assert schema_json in prefix(name), name
+    # Le schema (candidats a noter, veto compris) est desormais partage par
+    # tout le jury d'un meme modele : spectateur et conformite (tous deux
+    # "fast" par defaut) partagent le meme schema, veto/veto_reason compris,
+    # meme si seul conformite en tient compte (voir _ask).
+    assert fake.calls[0].schema is not None
 
 
 def test_round_one_is_blind():
@@ -479,12 +507,19 @@ def test_compliance_prompt_excuses_reported_speech_and_lists_real_ban_risks():
     assert "haine ou harcelement" not in prompt
 
 
-def test_only_veto_judges_are_asked_for_a_veto():
+def test_veto_field_in_schema_is_shared_by_the_veto_judges_model_group():
+    # Le schema est identique pour tous les juges d'un meme modele (prefixe
+    # de prompt commun, TASK-b0fa) : les champs veto/veto_reason y figurent
+    # des qu'un juge de ce modele a veto=True, meme pour un juge qui n'en
+    # tient pas compte (seul conformite l'exploite, voir _ask). Composition
+    # par defaut : "fast" = spectateur + conformite (veto), "strong" = le
+    # reste (aucun veto).
     script = ScriptedJury({1: uniform({"secret-id-0": 7, "secret-id-1": 5, "secret-id-2": 3})})
     _, fake = run(script)
+    fast_group = {"jury_spectateur", "jury_conformite"}
     for call in fake.calls:
         item = call.schema["properties"]["candidates"]["items"]["properties"]
-        assert ("veto" in item) == (call.usage == "jury_conformite")
+        assert ("veto" in item) == (call.usage in fast_group), call.usage
 
 
 # --------------------------------------------------------------------------

@@ -760,6 +760,31 @@ def test_fix_parallel_result_matches_sequential_processing_regardless_of_schedul
     ]
 
 
+# --------------------------------------------------------------------------
+# C_usage_log : les appels LLM faits depuis les threads de correction sont
+# journalises dans llm_usage.jsonl (TASK-b0fa) : llm.usage_log() fixe un
+# chemin par defaut via une variable de module ordinaire, visible depuis un
+# thread lance pendant le bloc (voir clipper.llm.usage_log).
+# --------------------------------------------------------------------------
+
+
+def test_llm_usage_log_captures_calls_made_from_fix_threads(tmp_path, video_dir, cpu):
+    segments = _many_word_segments(8)  # fix_chunk_words=2 -> 4 tranches
+    fake = FakeBackend([VOCAB] + [{"corrections": []}] * 4)
+    usage_log_path = tmp_path / "llm_usage.jsonl"
+    with llm.use_backend(fake), llm.usage_log(usage_log_path):
+        run(
+            tmp_path,
+            ModelFactory(segments=segments),
+            config=make_config(tmp_path, fix_chunk_words=2, fix_parallel=4),
+        )
+
+    lines = [json.loads(line) for line in usage_log_path.read_text(encoding="utf-8").splitlines()]
+    usages = [line["usage"] for line in lines]
+    assert usages.count("vocab") == 1
+    assert usages.count("transcript_fix") == 4
+
+
 def test_one_chunk_failure_fails_the_step_with_its_reason_others_may_run(
     tmp_path, video_dir, cpu
 ):

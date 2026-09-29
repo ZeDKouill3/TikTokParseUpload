@@ -349,7 +349,23 @@ def _block(ref: str, candidate: Mapping[str, Any]) -> str:
     return f"### {ref}\n" + (f"Contexte : {ctx}\n" if ctx else "") + f"Texte : « {candidate['text']} »"
 
 
-def _round1_prompt(common: str, shown: list[tuple[str, Mapping[str, Any]]], role: str) -> str:
+def _schema_block(schema: Mapping[str, Any]) -> str:
+    """Consigne de format place avant le role (voir _round1_prompt et
+    _round2_prompt) : le schema (--json-schema) fait ainsi partie du
+    prefixe identique entre juges d'un meme modele (TASK-b0fa), pour que le
+    fournisseur du modele puisse relire son cache de prompt au lieu de le
+    reecrire a chaque juge. llm.ask ajoute de toute facon sa propre consigne
+    de schema a la toute fin du prompt (ADR-b1c1) : redondant mais sans
+    consequence, puisque cette fin vient apres le role, deja divergent."""
+    return (
+        "\n## Format de reponse\nReponds avec un JSON conforme a ce schema, sans texte ni balise "
+        f"autour :\n{json.dumps(schema, ensure_ascii=False)}\n\n"
+    )
+
+
+def _round1_prompt(
+    common: str, shown: list[tuple[str, Mapping[str, Any]]], role: str, schema: Mapping[str, Any]
+) -> str:
     return (
         common
         + f"\n## Candidats ({len(shown)}), dans un ordre aleatoire\n\n"
@@ -358,7 +374,8 @@ def _round1_prompt(common: str, shown: list[tuple[str, Mapping[str, Any]]], role
         "Note chaque candidat sur son seul texte, independamment des autres et de sa place dans la "
         "liste. Pour chacun : ref, puis argument (une ou deux phrases concretes qui citent entre "
         "guillemets le passage decisif et disent ce qui marche ou bloque de ton point de vue, sans "
-        "formule generique), puis les notes. Un element par candidat, sans en omettre.\n\n"
+        "formule generique), puis les notes. Un element par candidat, sans en omettre.\n"
+        + _schema_block(schema)
         + role
     )
 
@@ -370,6 +387,7 @@ def _round2_prompt(
     others: dict[str, list[str]],
     role: str,
     veto: bool,
+    schema: Mapping[str, Any],
 ) -> str:
     blocks = []
     for ref, c in shown:
@@ -394,7 +412,9 @@ def _round2_prompt(
         + "\n\n## Consignes\nPour chaque candidat : ref, puis argument (ce qui a change et pourquoi, "
         "ou pourquoi tu maintiens, en une ou deux phrases), puis toutes tes notes, revisees ou non."
         + (" Redonne aussi veto et veto_reason, maintenus ou leves." if veto else "")
-        + "\n\n" + role
+        + "\n"
+        + _schema_block(schema)
+        + role
     )
 
 
@@ -406,17 +426,19 @@ def _round2_prompt(
 def _ask(
     judge: dict[str, Any],
     prompt: str,
-    refs: list[str],
-    criteria: Mapping[str, Any],
+    schema: Mapping[str, Any],
     config: Any,
 ) -> dict[str, dict[str, Any]]:
     """ref -> {"scores", "argument", ("veto", "veto_reason")} ; toute reponse
-    incomplete ou incoherente est une llm.SchemaError."""
+    incomplete ou incoherente est une llm.SchemaError. ``schema`` peut
+    imposer veto/veto_reason meme a un juge sans veto (partage par son
+    modele, TASK-b0fa) : seul ``judge["veto"]`` decide si on en tient
+    compte."""
     answer = llm.ask(
         judge["usage"],
         prompt,
         [],
-        _schema(criteria, refs, judge["veto"]),
+        schema,
         config=_JudgeConfig(config, judge["usage"], judge["model"]),
     )
     out: dict[str, dict[str, Any]] = {}
@@ -432,6 +454,18 @@ def _ask(
             entry["veto_reason"] = item["veto_reason"] if item["veto"] else ""
         out[ref] = entry
     return out
+
+
+def _model_veto_flags(judges: list[dict[str, Any]]) -> dict[Any, bool]:
+    """``judge["model"]`` -> True si un juge au moins de ce modele a
+    veto=True. Sert a batir un schema identique pour tout juge d'un meme
+    modele (TASK-b0fa, prefixe de prompt commun) : un juge sans veto dont le
+    modele en compte un repond quand meme sur veto/veto_reason, ignores par
+    _ask (seul son propre judge["veto"] compte pour l'exploiter)."""
+    flags: dict[Any, bool] = {}
+    for j in judges:
+        flags[j["model"]] = flags.get(j["model"], False) or j["veto"]
+    return flags
 
 
 def _waves(judges: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
@@ -576,6 +610,7 @@ def deliberate(
         config = load_config()
     settings = _deep_merge(CONFIG_DEFAULTS, config.section("jury"))
     judges = _judges(settings)
+    model_veto = _model_veto_flags(judges)
     weights = _weights(config, judges)
     _check_candidates(candidates)
     criteria = rubric["criteria"]
@@ -597,8 +632,9 @@ def deliberate(
         refs = {f"C{n}": cid for n, cid in enumerate(ids, 1)}
         views[judge["name"]] = refs
         shown = [(ref, by_id[cid]) for ref, cid in refs.items()]
-        prompt = _round1_prompt(common, shown, _role(judge))
-        tasks[judge["name"]] = (lambda j=judge, p=prompt, r=list(refs): _ask(j, p, r, criteria, config))
+        schema = _schema(criteria, list(refs), model_veto[judge["model"]])
+        prompt = _round1_prompt(common, shown, _role(judge), schema)
+        tasks[judge["name"]] = (lambda j=judge, p=prompt, s=schema: _ask(j, p, s, config))
     answers = _run_round(1, tasks, judges, quorum, parallel, failed) if candidates else {}
     active = [j for j in judges if j["name"] in answers]
 
@@ -623,8 +659,9 @@ def deliberate(
                 heard = [round1[cid][o["name"]]["argument"] for o in active if o["name"] != name]
                 rng.shuffle(heard)
                 others[ref] = heard
-            prompt = _round2_prompt(common, shown, own, others, _role(judge), judge["veto"])
-            tasks[name] = (lambda j=judge, p=prompt, r=[s[0] for s in shown]: _ask(j, p, r, criteria, config))
+            schema = _schema(criteria, [s[0] for s in shown], model_veto[judge["model"]])
+            prompt = _round2_prompt(common, shown, own, others, _role(judge), judge["veto"], schema)
+            tasks[name] = (lambda j=judge, p=prompt, s=schema: _ask(j, p, s, config))
         answers2 = _run_round(2, tasks, active, quorum, parallel, failed)
         for name, answer in answers2.items():
             for ref, entry in answer.items():
