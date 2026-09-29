@@ -1362,6 +1362,46 @@ def test_incrustation_edges_missing_falls_back_to_face_rect_with_logged_reason(t
     assert rect["w"] / rect["h"] == pytest.approx(1080 / 768, rel=0.02)
 
 
+# Meme incrustation que PANEL, decalee pour toucher le bord droit de l'image
+# (x1 = W), respectivement le coin haut-droit (x1 = W et y0 = 0) : le bord
+# d'image compte comme bord valide de l'incrustation quand les autres cotes
+# sont nets (TASK-6519).
+PANEL_AT_RIGHT_EDGE = (W - 526, 30, W, 326)
+FACE_AT_RIGHT_EDGE = (W - 526 + 90, 70, W - 526 + 220, 220)
+PANEL_AT_TOP_RIGHT_CORNER = (W - 526, 0, W, 296)
+FACE_AT_TOP_RIGHT_CORNER = (W - 526 + 90, 40, W - 526 + 220, 190)
+
+
+def test_incrustation_stuck_to_the_right_edge_uses_the_image_border_as_that_edge(tmp_path, video_dir):
+    write_panel_keyframes(video_dir, PANEL_AT_RIGHT_EDGE, pattern(20, 20, box=FACE_AT_RIGHT_EDGE))
+    data = load(detect(tmp_path)[0])
+
+    assert data["reason"] is None
+    assert data["edge_reason"] is None  # bord droit = bord d'image, pas un repli
+    rect = data["facecam"]
+    px0, py0, px1, py1 = PANEL_AT_RIGHT_EDGE
+    assert contains(rect, PANEL_AT_RIGHT_EDGE, eps=3)
+    assert abs(rect["x"] - px0) <= 3
+    assert abs((rect["x"] + rect["w"]) - px1) <= 3
+    assert rect["w"] / rect["h"] == pytest.approx(1080 / 768, rel=0.02)
+
+
+def test_incrustation_stuck_to_two_edges_in_a_corner_uses_the_image_border_for_both(tmp_path, video_dir):
+    write_panel_keyframes(video_dir, PANEL_AT_TOP_RIGHT_CORNER, pattern(20, 20, box=FACE_AT_TOP_RIGHT_CORNER))
+    data = load(detect(tmp_path)[0])
+
+    assert data["reason"] is None
+    assert data["edge_reason"] is None  # bords droit et haut = bords d'image, pas un repli
+    rect = data["facecam"]
+    px0, py0, px1, py1 = PANEL_AT_TOP_RIGHT_CORNER
+    # couvre toute l'incrustation, y compris le coin haut-droit
+    assert contains(rect, PANEL_AT_TOP_RIGHT_CORNER, eps=3)
+    assert abs(rect["x"] - px0) <= 3
+    assert abs((rect["x"] + rect["w"]) - px1) <= 3
+    assert rect["y"] <= py0 + 3
+    assert rect["w"] / rect["h"] == pytest.approx(1080 / 768, rel=0.02)
+
+
 def test_incrustation_edges_are_excluded_from_the_game_window(tmp_path, video_dir):
     write_panel_keyframes(video_dir, PANEL, pattern(20, 20))
     data = load(run_stream(tmp_path)[0])

@@ -127,9 +127,12 @@ CONFIG_DEFAULTS: dict[str, object] = {
     # des images cles -- une discontinuite forte et constante. La recherche
     # part du bord du visage elargi de facecam_edge_gap_ratio (fraction de sa
     # largeur/hauteur, pour sauter son propre contour) et s'arrete a
-    # facecam_edge_search_ratio fois sa largeur/hauteur. Si un bord manque,
-    # repli sur le rectangle centre sur le visage (stream_face_height
-    # ci-dessus), raison journalisee (ADR-ad2e).
+    # facecam_edge_search_ratio fois sa largeur/hauteur. Un ou deux bords non
+    # adjacents (un cote, ou un coin) introuvables alors que les autres sont
+    # nets sont pris pour des bords de l'image elle-meme (TASK-6519, cas
+    # courant : facecam collee a 1 ou 2 bords) ; au-dela (ou deux manquants
+    # sur le meme axe), repli sur le rectangle centre sur le visage
+    # (stream_face_height ci-dessus), raison journalisee (ADR-ad2e).
     "facecam_edge_gap_ratio": 0.05,
     "facecam_edge_search_ratio": 3.0,
     "facecam_edge_min_gradient": 30.0,
@@ -1220,8 +1223,13 @@ def _incrustation_rect(
 ) -> tuple[Box | None, str | None]:
     """Bords reels de l'incrustation autour du visage stable ``face`` :
     premiere discontinuite forte et constante (``counts``, voir
-    ``_edge_mask``) de part et d'autre de lui (voir CONFIG_DEFAULTS) ;
-    ``None`` et la raison si un bord manque (TASK-6404)."""
+    ``_edge_mask``) de part et d'autre de lui (voir CONFIG_DEFAULTS). Un ou
+    deux bords non adjacents introuvables (un cote, ou un coin) alors que les
+    autres sont nets sont ceux de l'image elle-meme : rien au-dela d'un bord
+    d'image ne peut y creer de discontinuite, donc une incrustation qui y est
+    collee n'en montre jamais (TASK-6519). ``None`` et la raison si plus de
+    bords manquent, ou si les deux manquants sont sur le meme axe (aucun bord
+    reel trouve pour donner la largeur ou la hauteur)."""
     gap_ratio = float(settings["facecam_edge_gap_ratio"])
     search_ratio = float(settings["facecam_edge_search_ratio"])
     min_share = float(settings["facecam_edge_min_share"])
@@ -1249,13 +1257,20 @@ def _incrustation_rect(
         min(height - 1, round(fy1) + gap_y + search_y), min_share,
     )
 
-    missing = [name for name, v in (("gauche", left), ("droit", right), ("haut", top), ("bas", bottom)) if v is None]
-    if missing:
+    borders = {"gauche": 0, "droit": width - 1, "haut": 0, "bas": height - 1}
+    axis = {"gauche": "x", "droit": "x", "haut": "y", "bas": "y"}
+    found = {"gauche": left, "droit": right, "haut": top, "bas": bottom}
+    missing = [name for name, v in found.items() if v is None]
+    same_axis = len(missing) == 2 and axis[missing[0]] == axis[missing[1]]
+    if len(missing) > 2 or same_axis:
         return None, (
             f"bord(s) {', '.join(missing)} de l'incrustation introuvable(s) autour du visage stable "
             f"(gradient marque sur >= {min_share:.0%} des images cles, recherche jusqu'a "
             f"{search_x:g}x{search_y:g} px) : rectangle centre sur le visage conserve"
         )
+    for name in missing:
+        found[name] = borders[name]
+    left, right, top, bottom = found["gauche"], found["droit"], found["haut"], found["bas"]
     assert left is not None and top is not None and right is not None and bottom is not None
     return (float(left), float(top), float(right + 1), float(bottom + 1)), None
 
