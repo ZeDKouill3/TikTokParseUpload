@@ -61,7 +61,8 @@ jamais lancé en CI ni par défaut en local.
   format crop (suivi de visage) reste une option figée. Ajoute un appel à
   l'abonnement optionnel (pseudo de chaîne discret sous le titre d'écran +
   carte de fin « Abonne-toi ! »), désactivé par défaut. Remplace SPEC-6127
-  (elle-même remplaçait SPEC-350f).
+  (elle-même remplaçait SPEC-350f). Successeur proposé (non ratifié) :
+  **SPEC-6a86** — titre d'écran sobre, sans emoji ni superlatif par défaut.
 - **SPEC-53f3** — grille de notation des moments (`rubric.toml`), critères et
   règles de sélection.
 - **SPEC-8257** *(proposée, pas encore `ank accept`)* — succède à SPEC-3a88
