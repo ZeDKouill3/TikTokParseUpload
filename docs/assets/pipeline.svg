@@ -70,7 +70,7 @@
   <g class="step">
     <rect class="box" x="100" y="136" width="420" height="46" rx="8"/>
     <text x="122" y="164" class="step-name">transcribe</text>
-    <text x="260" y="164" class="step-desc">transcription FR (faster-whisper)</text>
+    <text x="260" y="164" class="step-desc">transcription mot par mot (faster-whisper, GPU si dispo)</text>
   </g>
   <path class="arrow" d="M310,182 L310,202"/>
 
@@ -86,7 +86,7 @@
   <g class="step">
     <rect class="box" x="100" y="268" width="420" height="46" rx="8"/>
     <text x="122" y="296" class="step-name">audio</text>
-    <text x="260" y="296" class="step-desc">pistes audio découpées par plan</text>
+    <text x="260" y="296" class="step-desc">pics d'énergie (rires, cris, réactions) : indice pour les moments</text>
   </g>
   <path class="arrow" d="M310,314 L310,334"/>
 
@@ -127,7 +127,7 @@
   <g class="step">
     <rect class="box" x="100" y="598" width="420" height="46" rx="8"/>
     <text x="122" y="626" class="step-name">reframe</text>
-    <text x="260" y="626" class="step-desc">recadrage 9:16 (letterbox ou crop)</text>
+    <text x="260" y="626" class="step-desc">recadrage 9:16 (letterbox ou stream facecam)</text>
   </g>
   <path class="arrow" d="M310,644 L310,664"/>
 

@@ -146,6 +146,19 @@ def test_demo_terminal_svg_replays_the_real_pipeline_command():
     assert "python -m clipper -v run" in text
 
 
+def test_demo_terminal_svg_command_line_visible_without_animation():
+    """Une capture statique (t=0, animation non jouee) ne doit pas etre vide :
+    au minimum la ligne de commande a une opacite de base de 1, independante
+    du @keyframes qui la revele."""
+    text = DEMO_TERMINAL_SVG.read_text(encoding="utf-8")
+    match = re.search(r'<text[^>]*class="[^"]*prompt[^"]*"[^>]*>', text)
+    assert match, "aucune ligne de commande (classe prompt) trouvee"
+    prompt_tag = match.group(0)
+    assert re.search(r"opacity:\s*1\b", prompt_tag), (
+        "la ligne de commande n'a pas d'opacite de base 1 : invisible si l'animation ne joue pas"
+    )
+
+
 def test_demo_terminal_svg_shows_the_step_sequence():
     text = DEMO_TERMINAL_SVG.read_text(encoding="utf-8")
     positions = [text.index(f"etape {step}") for step in PIPELINE_STEPS]
