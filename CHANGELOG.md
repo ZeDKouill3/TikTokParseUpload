@@ -63,7 +63,8 @@ verticaux sous-titrés, en local.
 
 ### Connu comme limite
 
-- Pré-version : pas de tag ni de publication GitHub Release à ce stade.
+- Pré-version : pas de garantie de stabilité de l'interface en ligne de
+  commande ni du format de configuration.
 - Chaque vidéo traitée consomme du quota Claude (coût variable selon la
   durée, le nombre de clips et le mode de sélection ; voir
   `docs/benchmarks/rtx3050.md`).
