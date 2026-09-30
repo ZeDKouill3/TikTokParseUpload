@@ -89,6 +89,7 @@ n'est ecrit (ADR-ad2e).
 
 from __future__ import annotations
 
+import importlib.resources
 import json
 import math
 import random
@@ -104,7 +105,12 @@ CONFIG_DEFAULTS: dict[str, object] = {
     # Qui note les candidats du proposeur : "single" (le proposeur seul) ou
     # "jury" (clipper.jury, ADR-ff87). En mode auto, le jury note toujours.
     "selection": "single",
-    # Grille de notation (SPEC-0eec), relative au dossier courant.
+    # Grille de notation (SPEC-0eec), relative au dossier courant. "builtin"
+    # : grille embarquee dans le paquet (clipper/assets/rubric.toml), utile
+    # sans fichier local (ex. juste apres installation de la wheel, avant
+    # 'clipper init'). Toute autre valeur est un chemin utilise tel quel ;
+    # fichier absent = erreur explicite (voir resolve_rubric_path), jamais de
+    # repli silencieux (ADR-ad2e).
     "rubric_path": "rubric.toml",
     # Au-dela, la transcription part en tranches (environ 4 caracteres par
     # token : 400 000 caracteres ~ 100k tokens).
@@ -151,6 +157,20 @@ _BONUS_KEYS = ("max_total", "replayed", "audio_peaks", "audio_peaks_full", "visu
 
 def _number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+_BUILTIN_RUBRIC = "builtin"
+
+
+def resolve_rubric_path(value: str) -> Path:
+    """Resout [moments] rubric_path : "builtin" -> grille embarquee dans le
+    paquet (clipper/assets/rubric.toml) ; toute autre valeur est un chemin
+    utilise tel quel, relatif au dossier courant si non absolu. Un fichier
+    absent est une MomentsError explicite (load_rubric), jamais de repli
+    silencieux (ADR-ad2e)."""
+    if value == _BUILTIN_RUBRIC:
+        return importlib.resources.files("clipper").joinpath("assets", "rubric.toml")
+    return Path(value)
 
 
 def load_rubric(path: str | Path) -> dict[str, Any]:
@@ -936,7 +956,7 @@ def run(
     selection = _selection(config, settings)
     exploration = _exploration(settings) if selection == "jury" else None
     connectors = _connectors(settings)
-    rubric_path = Path(settings["rubric_path"])
+    rubric_path = resolve_rubric_path(settings["rubric_path"])
     rubric = load_rubric(rubric_path)
     examples = list(examples or [])
 
@@ -1061,7 +1081,7 @@ def _rescore(video_dir: Path, out: Path, settings: dict[str, Any]) -> Path:
     vision = _read_json(video_dir / "vision.json")
     sents = split_sentences(_read_json(video_dir / "transcript.json"))
     connectors = _connectors(settings)
-    rubric_path = Path(settings["rubric_path"])
+    rubric_path = resolve_rubric_path(settings["rubric_path"])
     rubric = load_rubric(rubric_path)
     b = rubric["bonus"]
 

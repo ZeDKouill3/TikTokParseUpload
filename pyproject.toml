@@ -28,6 +28,9 @@ test = [
     "httpx",
 ]
 
+[project.scripts]
+clipper = "clipper.__main__:main"
+
 [tool.setuptools.packages.find]
 include = ["clipper", "clipper.*"]
 

@@ -5,7 +5,7 @@ slug: wheel-autonome-grille-et-config-d-exemple-embarq
 title: "Wheel autonome : grille et config d'exemple embarquées, commande clipper, 'clipper init'"
 created: 2026-09-30T10:54:46Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - pyproject.toml
   - clipper/__main__.py
@@ -22,8 +22,15 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/cff5a7b7db47@bdd1c48
+    tree: scope/010a209ea9ac
+    criteria: 6b40f3453162
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 1
+version: 4
 ---
 
 Constat 2026-09-30 avant la release v0.1.0 (uv build) : la wheel ne contient que clipper/*.py, les polices et le web statique ; rubric.toml (lu via [moments] rubric_path = "rubric.toml", chemin relatif au dossier courant) et config.example.toml n'y sont pas, et il n'y a pas d'entrée [project.scripts]. Une installation depuis la wheel échoue donc dès l'étape moments (et load_config exige un config.toml). Un autre worker (TASK-8abc, sortie verbeuse) modifie aussi clipper/__main__.py et clipper/moments.py : changements minimaux dans ces fichiers pour limiter les conflits.

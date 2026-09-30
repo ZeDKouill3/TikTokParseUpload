@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import argparse
+import importlib.resources
 import json
 import logging
 import sys
 import threading
 from datetime import datetime
+from pathlib import Path
 
 from clipper.config import ConfigError, load_config
 
 _PROGRESS_POLL_SECONDS = 0.1
+_INIT_FILES = (("config.toml", "config.example.toml"), ("rubric.toml", "rubric.toml"))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -20,6 +23,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", default=None, help="Fichier de configuration (defaut : config.toml)")
     parser.add_argument("-v", "--verbose", action="store_true", help="Journal detaille des etapes")
     sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("init", help="Ecrit config.toml et rubric.toml (grille embarquee) dans le dossier courant")
+    p.add_argument("--force", action="store_true", help="Ecrase config.toml/rubric.toml existants")
 
     p = sub.add_parser("run", help="Traite une video : jusqu'a la revue (review) ou jusqu'au bout (auto)")
     p.add_argument("url", help="URL YouTube ou VOD Twitch (twitch.tv/videos/<id>) de la video")
@@ -177,10 +183,32 @@ def _run_with_progress(action, video_id: str, config, force: bool) -> dict:
     return state
 
 
+def _init(force: bool) -> int:
+    """Ecrit config.toml et rubric.toml dans le dossier courant a partir de
+    la grille et de l'exemple de config embarques dans le paquet (clipper
+    /assets), pour une installation depuis la wheel sans checkout du depot.
+    Refuse d'ecraser un fichier existant sans --force (erreur explicite,
+    ADR-ad2e : jamais de repli silencieux)."""
+    assets = importlib.resources.files("clipper").joinpath("assets")
+    targets = [(Path(dest), asset) for dest, asset in _INIT_FILES]
+    if not force:
+        existing = [str(dest) for dest, _ in targets if dest.exists()]
+        if existing:
+            print(f"erreur : {', '.join(existing)} existe(nt) deja (--force pour ecraser)", file=sys.stderr)
+            return 1
+    for dest, asset in targets:
+        dest.write_bytes(assets.joinpath(asset).read_bytes())
+        print(f"{dest} ecrit")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING,
                         format="%(asctime)s %(levelname)s %(message)s")
+
+    if args.command == "init":
+        return _init(args.force)
 
     from clipper import download, pipeline
 

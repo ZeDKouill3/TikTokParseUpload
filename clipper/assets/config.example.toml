@@ -1,0 +1,36 @@
+# Copier ce fichier vers config.toml puis ajuster.
+
+# review : aucun rendu final sans decision humaine enregistree.
+# auto   : pipeline autonome, file d'attente sur echec transitoire,
+#          le controle qualite (etape qa) remplace la revue humaine.
+mode = "review"
+
+# Racine des dossiers de travail par video (workspace/<video_id>/).
+workspace_dir = "workspace"
+
+# Racine des clips rendus.
+output_dir = "output"
+
+# Chaque etape du pipeline (module clipper/x.py) peut declarer son propre
+# dict CONFIG_DEFAULTS pour documenter les cles qu'elle accepte. Une table
+# [x] ici est validee contre ce dict : cle absente de CONFIG_DEFAULTS
+# refusee, section sans module clipper.x ou sans CONFIG_DEFAULTS refusee.
+# Voir CONFIG_DEFAULTS dans le module clipper.x concerne pour la liste des
+# cles disponibles, par exemple :
+#
+# [llm]
+# backend = "claude-cli"
+#
+# [reframe]
+# format = "letterbox"    # letterbox (zoom fixe, defaut) | crop (option figee)
+# letterbox_zoom = 1.3     # fenetre centrale de largeur source_w / zoom
+
+# Reglages retenus apres le banc RTX 3050 4 Go (docs/benchmarks/rtx3050.md) :
+# deja les valeurs par defaut de CONFIG_DEFAULTS, rappelees ici pour memoire,
+# pas necessaire de les recopier dans un config.toml reel.
+#
+# [transcribe]
+# model = "small"    # pic VRAM whisper mesure : 1,68 Go (marge large sur 4 Go)
+# batch_size = 8     # BatchedInferencePipeline : ~4-5x plus rapide qu'en
+#                    # sequentiel sur une video reelle, sans perte de mots
+#                    # (docs/bench-whisper-vitesse.md)

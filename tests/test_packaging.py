@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 import tomllib
 import zipfile
 from pathlib import Path
@@ -98,3 +99,127 @@ def test_wheel_contains_the_web_static_assets(tmp_path):
     assert "clipper/web/static/index.html" in names
     assert "clipper/web/static/app.js" in names
     assert "clipper/web/static/style.css" in names
+
+
+def test_console_script_clipper_is_declared():
+    """TASK-c8a11756eb4e : la wheel doit fournir la commande 'clipper' en
+    plus de 'python -m clipper'."""
+    scripts = _load_pyproject()["project"]["scripts"]
+    assert scripts["clipper"] == "clipper.__main__:main"
+
+
+def test_embedded_rubric_matches_repo_rubric():
+    """La grille embarquee (clipper/assets/rubric.toml) est une copie exacte
+    de rubric.toml a la racine du depot : les deux doivent rester
+    synchronises (utilisee par [moments] rubric_path = "builtin" et par
+    'clipper init')."""
+    embedded = ROOT / "clipper" / "assets" / "rubric.toml"
+    repo = ROOT / "rubric.toml"
+    assert embedded.read_text(encoding="utf-8") == repo.read_text(encoding="utf-8")
+
+
+def test_embedded_config_example_matches_repo():
+    embedded = ROOT / "clipper" / "assets" / "config.example.toml"
+    repo = ROOT / "config.example.toml"
+    assert embedded.read_text(encoding="utf-8") == repo.read_text(encoding="utf-8")
+
+
+@pytest.mark.skipif(shutil.which("uv") is None, reason="uv absent du PATH")
+def test_wheel_contains_rubric_and_config_example_assets(tmp_path):
+    """La grille par defaut et config.example.toml doivent etre embarquees
+    dans la wheel (package data), pas seulement presentes dans le depot."""
+    src = tmp_path / "src"
+    shutil.copytree(ROOT / "clipper", src / "clipper")
+    shutil.copy2(PYPROJECT, src / "pyproject.toml")
+
+    out_dir = tmp_path / "dist"
+    result = subprocess.run(
+        ["uv", "build", "--offline", "--wheel", "--out-dir", str(out_dir), str(src)],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+    wheels = list(out_dir.glob("*.whl"))
+    assert wheels, f"aucun wheel produit dans {out_dir}"
+
+    with zipfile.ZipFile(wheels[0]) as zf:
+        names = zf.namelist()
+    assert "clipper/assets/rubric.toml" in names
+    assert "clipper/assets/config.example.toml" in names
+
+
+def _venv_python(venv_dir: Path) -> Path:
+    if sys.platform.startswith("win"):
+        return venv_dir / "Scripts" / "python.exe"
+    return venv_dir / "bin" / "python"
+
+
+def _venv_console_script(venv_dir: Path, name: str) -> Path:
+    if sys.platform.startswith("win"):
+        return venv_dir / "Scripts" / f"{name}.exe"
+    return venv_dir / "bin" / name
+
+
+@pytest.mark.skipif(shutil.which("uv") is None, reason="uv absent du PATH")
+def test_wheel_installed_alone_in_a_fresh_venv_runs_clipper_help_and_init(tmp_path):
+    """TASK-c8a11756eb4e (critere principal) : installee SEULE dans un venv
+    neuf hors depot (uv venv + uv pip install de la wheel), la wheel fournit
+    la commande 'clipper' et 'clipper init' ecrit config.toml/rubric.toml
+    dans le dossier courant, identiques a la grille et a l'exemple de config
+    du depot."""
+    src = tmp_path / "src"
+    shutil.copytree(ROOT / "clipper", src / "clipper")
+    shutil.copy2(PYPROJECT, src / "pyproject.toml")
+
+    dist_dir = tmp_path / "dist"
+    build = subprocess.run(
+        ["uv", "build", "--offline", "--wheel", "--out-dir", str(dist_dir), str(src)],
+        capture_output=True,
+        text=True,
+    )
+    assert build.returncode == 0, build.stderr
+    wheels = list(dist_dir.glob("*.whl"))
+    assert wheels, f"aucun wheel produit dans {dist_dir}"
+
+    venv_dir = tmp_path / "venv"
+    venv_created = subprocess.run(
+        ["uv", "venv", "--offline", str(venv_dir)],
+        capture_output=True,
+        text=True,
+    )
+    assert venv_created.returncode == 0, venv_created.stderr
+
+    installed = subprocess.run(
+        [
+            "uv", "pip", "install", "--offline",
+            "--python", str(_venv_python(venv_dir)),
+            str(wheels[0]),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert installed.returncode == 0, installed.stderr
+
+    clipper_bin = _venv_console_script(venv_dir, "clipper")
+    assert clipper_bin.exists(), f"commande 'clipper' absente du venv : {clipper_bin}"
+
+    help_result = subprocess.run([str(clipper_bin), "--help"], capture_output=True, text=True)
+    assert help_result.returncode == 0, help_result.stderr
+    assert "clipper" in help_result.stdout.lower()
+
+    workdir = tmp_path / "projet"
+    workdir.mkdir()
+    init_result = subprocess.run([str(clipper_bin), "init"], capture_output=True, text=True, cwd=workdir)
+    assert init_result.returncode == 0, init_result.stderr
+
+    assert (workdir / "config.toml").read_text(encoding="utf-8") == (
+        ROOT / "config.example.toml"
+    ).read_text(encoding="utf-8")
+    assert (workdir / "rubric.toml").read_text(encoding="utf-8") == (ROOT / "rubric.toml").read_text(
+        encoding="utf-8"
+    )
+
+    init_again = subprocess.run([str(clipper_bin), "init"], capture_output=True, text=True, cwd=workdir)
+    assert init_again.returncode == 1
+    assert "config.toml" in init_again.stderr
