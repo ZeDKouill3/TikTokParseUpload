@@ -71,6 +71,13 @@ jamais lancé en CI ni par défaut en local.
   bords retrouvés, non figé), plus sur la détection du visage dedans ; la
   localisation (une fois par vidéo) garde le visage comme indice, avec un
   seuil séparé et plus bas par défaut.
+- **SPEC-76dc** *(proposée, pas encore `ank accept`)* — succède à SPEC-8257 :
+  reprend ses règles de format stream à l'identique et ajoute un second
+  agencement stream `split` réglable (`stream_variant`), choisi par config,
+  le `top` de SPEC-3a88 restant le défaut global : webcam en haut, jeu en
+  bas, badge de chaîne optionnel (logo + nom sur fond noir) à leur jonction,
+  style des sous-titres réglable (police, couleurs, contour, ombre,
+  position).
 
 ## Conventions
 
