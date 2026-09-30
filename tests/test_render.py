@@ -1488,7 +1488,7 @@ def test_render_stream_real_ffmpeg_gives_1080x1920_with_facecam_on_top_and_game_
 
 
 def _cta_config(**overrides):
-    settings = {"cta_enabled": True, "cta_handle": "twitch.tv/madajel", "cta_seconds": 1.0}
+    settings = {"cta_enabled": True, "cta_handle": "twitch.tv/exemple", "cta_seconds": 1.0}
     settings.update(overrides)
     return make_config(**settings)
 
@@ -1588,7 +1588,7 @@ def test_cta_enabled_on_a_non_text_layout_is_not_applied(tmp_path, video_dir, fa
 def test_layout_pseudo_fits_a_short_handle_at_the_configured_size():
     from clipper.render import CONFIG_DEFAULTS, layout_pseudo
 
-    lay = layout_pseudo("twitch.tv/madajel", 780, CONFIG_DEFAULTS)
+    lay = layout_pseudo("twitch.tv/exemple", 780, CONFIG_DEFAULTS)
 
     assert lay.font_size == CONFIG_DEFAULTS["cta_handle_font_size"]
     assert 0 < lay.width <= 780
@@ -1598,7 +1598,7 @@ def test_layout_pseudo_fits_a_short_handle_at_the_configured_size():
 def test_layout_pseudo_steps_down_the_font_size_for_a_narrow_zone():
     from clipper.render import CONFIG_DEFAULTS, layout_pseudo
 
-    lay = layout_pseudo("twitch.tv/madajel", 220, CONFIG_DEFAULTS)
+    lay = layout_pseudo("twitch.tv/exemple", 220, CONFIG_DEFAULTS)
 
     assert lay.font_size < CONFIG_DEFAULTS["cta_handle_font_size"]
     assert lay.width <= 220
@@ -1608,7 +1608,7 @@ def test_layout_pseudo_too_long_even_at_minimum_size_is_an_explicit_error():
     from clipper.render import CONFIG_DEFAULTS, RenderError, layout_pseudo
 
     with pytest.raises(RenderError, match="pseudo"):
-        layout_pseudo("twitch.tv/" + "madajel" * 20, 100, CONFIG_DEFAULTS)
+        layout_pseudo("twitch.tv/" + "exemple" * 20, 100, CONFIG_DEFAULTS)
 
 
 def test_layout_pseudo_empty_is_an_explicit_error():
@@ -1632,7 +1632,7 @@ def test_screen_title_box_moves_up_to_make_room_for_the_pseudo_when_cta_applies(
     zone_w = TITLE_ZONE["x1"] - TITLE_ZONE["x0"]
     from clipper.render import layout_pseudo
 
-    pseudo = layout_pseudo("twitch.tv/madajel", zone_w, CONFIG_DEFAULTS)
+    pseudo = layout_pseudo("twitch.tv/exemple", zone_w, CONFIG_DEFAULTS)
     reserved = int(CONFIG_DEFAULTS["cta_handle_gap"]) + pseudo.height
     effective = {**CONFIG_DEFAULTS, "title_lift": int(CONFIG_DEFAULTS["title_lift"]) + reserved}
 
@@ -1667,7 +1667,7 @@ def test_render_draws_the_pseudo_handle_under_the_title_box(tmp_path, letterbox_
     from clipper.render import CONFIG_DEFAULTS, layout_pseudo, layout_title
 
     zone_w = TITLE_ZONE["x1"] - TITLE_ZONE["x0"]
-    pseudo = layout_pseudo("twitch.tv/madajel", zone_w, CONFIG_DEFAULTS)
+    pseudo = layout_pseudo("twitch.tv/exemple", zone_w, CONFIG_DEFAULTS)
     reserved = int(CONFIG_DEFAULTS["cta_handle_gap"]) + pseudo.height
     effective = {**CONFIG_DEFAULTS, "title_lift": int(CONFIG_DEFAULTS["title_lift"]) + reserved}
     title_layout = layout_title("Il m'a menti en garde à vue", TITLE_ZONE, effective)

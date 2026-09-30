@@ -116,15 +116,15 @@ supplémentaires dans la description. S'applique en letterbox et en stream
 Un preset par chaîne est un fichier de config séparé, passé avec `--config` :
 
 ```powershell
-python -m clipper run https://www.twitch.tv/videos/<id> --config presets/madajel.toml
+python -m clipper run https://www.twitch.tv/videos/<id> --config presets/ma-chaine.toml
 ```
 
-`presets/madajel.toml` :
+`presets/ma-chaine.toml` :
 
 ```toml
 [render]
 cta_enabled = true
-cta_handle = "twitch.tv/madajel"
+cta_handle = "twitch.tv/ma_chaine"
 cta_seconds = 2.0                        # duree de la carte de fin (defaut)
 cta_text = "Abonne-toi !"                # texte de la carte de fin (defaut)
 

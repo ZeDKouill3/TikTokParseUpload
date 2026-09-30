@@ -51,8 +51,8 @@ def test_extract_video_id_from_twitch_vod_url(url):
 @pytest.mark.parametrize(
     "url",
     [
-        "https://www.twitch.tv/madajel",  # chaine (ou live, meme forme d'URL)
-        "https://www.twitch.tv/madajel/clip/AwkwardHelplessSalamanderSwiftRage",  # clip
+        "https://www.twitch.tv/ma_chaine",  # chaine (ou live, meme forme d'URL)
+        "https://www.twitch.tv/ma_chaine/clip/AwkwardHelplessSalamanderSwiftRage",  # clip
     ],
 )
 def test_extract_video_id_raises_for_non_vod_twitch_url(url):
