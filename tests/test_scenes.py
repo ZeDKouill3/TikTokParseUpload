@@ -38,6 +38,27 @@ def _make_color_video(
     subprocess.run(cmd, check=True, capture_output=True)
 
 
+def _write_transcript(workspace_dir: Path, video_id: str, segments: list[dict]) -> None:
+    video_dir = workspace_dir / video_id
+    video_dir.mkdir(parents=True, exist_ok=True)
+    (video_dir / "transcript.json").write_text(
+        json.dumps({"segments": segments}), encoding="utf-8"
+    )
+
+
+def _write_audio(workspace_dir: Path, video_id: str, peaks: list[dict]) -> None:
+    video_dir = workspace_dir / video_id
+    video_dir.mkdir(parents=True, exist_ok=True)
+    (video_dir / "audio.json").write_text(json.dumps({"peaks": peaks}), encoding="utf-8")
+
+
+def _full_speech(workspace_dir: Path, video_id: str = "vid1") -> None:
+    """Transcript covering the whole video (end far past any real duration:
+    ffmpeg just stops at EOF) -- the decode range every test below had
+    before TASK-22a9 restricted it to speech."""
+    _write_transcript(workspace_dir, video_id, [{"start": 0.0, "end": 1e6}])
+
+
 @pytest.fixture
 def three_scene_video(tmp_path):
     video_path = tmp_path / "three_scenes.mp4"
@@ -75,6 +96,7 @@ def test_detect_scenes_finds_correct_number_of_cuts(isolated_cwd, three_scene_vi
     from clipper.scenes import detect_scenes
 
     workspace_dir = isolated_cwd / "workspace"
+    _full_speech(workspace_dir)
     result = detect_scenes(three_scene_video, workspace_dir, "vid1")
 
     assert len(result["scenes"]) == 3
@@ -84,6 +106,7 @@ def test_detect_scenes_writes_scenes_json_with_start_end(isolated_cwd, three_sce
     from clipper.scenes import detect_scenes
 
     workspace_dir = isolated_cwd / "workspace"
+    _full_speech(workspace_dir)
     result = detect_scenes(three_scene_video, workspace_dir, "vid1")
 
     scenes_file = workspace_dir / "vid1" / "scenes.json"
@@ -99,6 +122,7 @@ def test_detect_scenes_extracts_one_keyframe_per_scene(isolated_cwd, three_scene
     from clipper.scenes import detect_scenes
 
     workspace_dir = isolated_cwd / "workspace"
+    _full_speech(workspace_dir)
     result = detect_scenes(
         three_scene_video, workspace_dir, "vid1", keyframe_interval_seconds=100.0
     )
@@ -110,6 +134,7 @@ def test_detect_scenes_writes_jpeg_frames_under_frames_dir(isolated_cwd, three_s
     from clipper.scenes import detect_scenes
 
     workspace_dir = isolated_cwd / "workspace"
+    _full_speech(workspace_dir)
     result = detect_scenes(
         three_scene_video, workspace_dir, "vid1", keyframe_interval_seconds=100.0
     )
@@ -130,6 +155,7 @@ def test_detect_scenes_adds_extra_keyframes_every_n_seconds_in_long_scenes(
     from clipper.scenes import detect_scenes
 
     workspace_dir = isolated_cwd / "workspace"
+    _full_speech(workspace_dir)
     result = detect_scenes(
         one_scene_video, workspace_dir, "vid1", keyframe_interval_seconds=5.0
     )
@@ -151,6 +177,7 @@ def test_detect_scenes_skips_recompute_when_scenes_json_already_exists(
     existing = {"scenes": [{"start": 0.0, "end": 1.0}], "frames": []}
     (video_dir / "scenes.json").write_text(json.dumps(existing), encoding="utf-8")
 
+    # scenes.json existe deja : transcript.json n'est pas lu, pas besoin ici.
     result = detect_scenes(three_scene_video, workspace_dir, "vid1")
 
     assert result == existing
@@ -168,6 +195,7 @@ def test_detect_scenes_force_recomputes_even_if_scenes_json_exists(
         json.dumps({"scenes": [{"start": 0.0, "end": 1.0}], "frames": []}),
         encoding="utf-8",
     )
+    _full_speech(workspace_dir)
 
     result = detect_scenes(three_scene_video, workspace_dir, "vid1", force=True)
 
@@ -205,6 +233,23 @@ def recorded_analysis_frames(monkeypatch):
     return shapes
 
 
+@pytest.fixture
+def recorded_ffmpeg_commands(monkeypatch):
+    """Record every ffmpeg command used to decode analysis frames (the real
+    process still runs -- only the command line is captured)."""
+    import clipper.scenes as scenes_module
+
+    commands: list[list[str]] = []
+    real_popen = subprocess.Popen
+
+    def recording_popen(cmd, *args, **kwargs):
+        commands.append(cmd)
+        return real_popen(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(scenes_module.subprocess, "Popen", recording_popen)
+    return commands
+
+
 def test_config_defaults_declares_reduced_decoding_options():
     from clipper.scenes import CONFIG_DEFAULTS
 
@@ -217,7 +262,9 @@ def test_detect_scenes_accepts_every_config_default_as_keyword(isolated_cwd, thr
     """clipper.pipeline passes the whole [scenes] section as keywords."""
     from clipper.scenes import CONFIG_DEFAULTS, detect_scenes
 
-    result = detect_scenes(three_scene_video, isolated_cwd / "workspace", "vid1", **CONFIG_DEFAULTS)
+    workspace_dir = isolated_cwd / "workspace"
+    _full_speech(workspace_dir)
+    result = detect_scenes(three_scene_video, workspace_dir, "vid1", **CONFIG_DEFAULTS)
 
     assert len(result["scenes"]) == 3
 
@@ -227,8 +274,10 @@ def test_detection_analyses_frames_at_reduced_width(
 ):
     from clipper.scenes import detect_scenes
 
+    workspace_dir = isolated_cwd / "workspace"
+    _full_speech(workspace_dir)
     detect_scenes(
-        hd_three_scene_video, isolated_cwd / "workspace", "vid1",
+        hd_three_scene_video, workspace_dir, "vid1",
         analysis_width=160, analysis_max_fps=50.0,
     )
 
@@ -241,8 +290,10 @@ def test_detection_analyses_at_most_analysis_max_fps(
 ):
     from clipper.scenes import detect_scenes
 
+    workspace_dir = isolated_cwd / "workspace"
+    _full_speech(workspace_dir)
     detect_scenes(
-        hd_three_scene_video, isolated_cwd / "workspace", "vid1", analysis_max_fps=10.0
+        hd_three_scene_video, workspace_dir, "vid1", analysis_max_fps=10.0
     )
 
     # 6 s de video a 50 fps, analysee a 10 fps -> ~60 images (300 a pleine cadence)
@@ -252,8 +303,10 @@ def test_detection_analyses_at_most_analysis_max_fps(
 def test_cuts_stay_within_half_a_second_with_reduced_analysis(isolated_cwd, hd_three_scene_video):
     from clipper.scenes import detect_scenes
 
+    workspace_dir = isolated_cwd / "workspace"
+    _full_speech(workspace_dir)
     result = detect_scenes(
-        hd_three_scene_video, isolated_cwd / "workspace", "vid1",
+        hd_three_scene_video, workspace_dir, "vid1",
         analysis_width=128, analysis_max_fps=10.0,
     )
 
@@ -271,6 +324,7 @@ def test_keyframes_are_extracted_at_full_resolution(isolated_cwd, hd_three_scene
     from clipper.scenes import detect_scenes
 
     workspace_dir = isolated_cwd / "workspace"
+    _full_speech(workspace_dir)
     result = detect_scenes(
         hd_three_scene_video, workspace_dir, "vid1",
         analysis_width=160, keyframe_interval_seconds=100.0,
@@ -290,6 +344,7 @@ def test_keyframes_show_the_image_at_their_timecode(isolated_cwd, hd_three_scene
     from clipper.scenes import detect_scenes
 
     workspace_dir = isolated_cwd / "workspace"
+    _full_speech(workspace_dir)
     result = detect_scenes(
         hd_three_scene_video, workspace_dir, "vid1", keyframe_interval_seconds=100.0
     )
@@ -305,6 +360,7 @@ def test_scenes_json_keeps_its_format(isolated_cwd, three_scene_video):
     from clipper.scenes import detect_scenes
 
     workspace_dir = isolated_cwd / "workspace"
+    _full_speech(workspace_dir)
     detect_scenes(three_scene_video, workspace_dir, "vid1")
 
     on_disk = json.loads((workspace_dir / "vid1" / "scenes.json").read_text(encoding="utf-8"))
@@ -320,7 +376,9 @@ def test_scenes_json_keeps_its_format(isolated_cwd, three_scene_video):
 def test_configured_decoder_is_used(isolated_cwd, three_scene_video):
     from clipper.scenes import detect_scenes
 
-    result = detect_scenes(three_scene_video, isolated_cwd / "workspace", "vid1", decoder="h264")
+    workspace_dir = isolated_cwd / "workspace"
+    _full_speech(workspace_dir)
+    result = detect_scenes(three_scene_video, workspace_dir, "vid1", decoder="h264")
 
     assert len(result["scenes"]) == 3
 
@@ -329,6 +387,7 @@ def test_unknown_decoder_fails_the_step_without_falling_back(isolated_cwd, three
     from clipper.scenes import ScenesError, detect_scenes
 
     workspace_dir = isolated_cwd / "workspace"
+    _full_speech(workspace_dir)
     with pytest.raises(ScenesError, match="decodeur_inexistant"):
         detect_scenes(three_scene_video, workspace_dir, "vid1", decoder="decodeur_inexistant")
 
@@ -341,6 +400,7 @@ def test_decoder_unable_to_decode_the_stream_fails_the_step(isolated_cwd, three_
     from clipper.scenes import ScenesError, detect_scenes
 
     workspace_dir = isolated_cwd / "workspace"
+    _full_speech(workspace_dir)
     with pytest.raises(ScenesError, match="vp9"):
         detect_scenes(three_scene_video, workspace_dir, "vid1", decoder="vp9")
 
@@ -350,14 +410,23 @@ def test_decoder_unable_to_decode_the_stream_fails_the_step(isolated_cwd, three_
 def test_missing_ffmpeg_fails_the_step_with_a_clear_message(isolated_cwd, three_scene_video):
     from clipper.scenes import ScenesError, detect_scenes
 
+    workspace_dir = isolated_cwd / "workspace"
+    _full_speech(workspace_dir)
     with pytest.raises(ScenesError, match="introuvable"):
         detect_scenes(
-            three_scene_video, isolated_cwd / "workspace", "vid1",
+            three_scene_video, workspace_dir, "vid1",
             ffmpeg_bin="ffmpeg-absent-du-path",
         )
 
 
 # -- TASK-559adc7a1505 : extraction des images cles en parallele --
+
+
+def _decode_commands(commands: list[list[str]]) -> list[list[str]]:
+    """``recorded_ffmpeg_commands`` also sees ffprobe and keyframe-extraction
+    calls (subprocess.run uses the same patched Popen internally): keep only
+    the raw-video decode passes used for scene detection."""
+    return [cmd for cmd in commands if "rawvideo" in cmd]
 
 
 def _has_overlap(intervals: list[tuple[float, float]]) -> bool:
@@ -408,8 +477,10 @@ def test_extraction_runs_in_parallel_up_to_extract_parallel(
 ):
     from clipper.scenes import detect_scenes
 
+    workspace_dir = isolated_cwd / "workspace"
+    _full_speech(workspace_dir)
     detect_scenes(
-        three_scene_video, isolated_cwd / "workspace", "vid1",
+        three_scene_video, workspace_dir, "vid1",
         keyframe_interval_seconds=100.0, extract_parallel=4,
     )
 
@@ -421,8 +492,10 @@ def test_extraction_is_sequential_when_extract_parallel_is_one(
 ):
     from clipper.scenes import detect_scenes
 
+    workspace_dir = isolated_cwd / "workspace"
+    _full_speech(workspace_dir)
     detect_scenes(
-        three_scene_video, isolated_cwd / "workspace", "vid1",
+        three_scene_video, workspace_dir, "vid1",
         keyframe_interval_seconds=100.0, extract_parallel=1,
     )
 
@@ -450,12 +523,14 @@ def test_scenes_json_identical_between_sequential_and_parallel_extraction(
     from clipper.scenes import detect_scenes
 
     workspace_seq = isolated_cwd / "workspace_seq"
+    _full_speech(workspace_seq)
     result_seq = detect_scenes(
         three_scene_video, workspace_seq, "vid1",
         keyframe_interval_seconds=100.0, extract_parallel=1,
     )
 
     workspace_par = isolated_cwd / "workspace_par"
+    _full_speech(workspace_par)
     result_par = detect_scenes(
         three_scene_video, workspace_par, "vid1",
         keyframe_interval_seconds=100.0, extract_parallel=4,
@@ -487,6 +562,7 @@ def test_extraction_failure_propagates_and_does_not_write_scenes_json_when_paral
     from clipper.scenes import ScenesError, detect_scenes
 
     workspace_dir = isolated_cwd / "workspace"
+    _full_speech(workspace_dir)
     with pytest.raises(ScenesError, match=r"\d+\.\d+s"):
         detect_scenes(
             three_scene_video, workspace_dir, "vid1",
@@ -494,3 +570,209 @@ def test_extraction_failure_propagates_and_does_not_write_scenes_json_when_paral
         )
 
     assert not (workspace_dir / "vid1" / "scenes.json").exists()
+
+
+# -- TASK-22a9 : ne decoder que les zones de parole (VAD de la transcription) --
+
+
+def test_config_defaults_declares_speech_margin_seconds():
+    from clipper.scenes import CONFIG_DEFAULTS
+
+    assert CONFIG_DEFAULTS["speech_margin_seconds"] == 5.0
+
+
+def test_detect_scenes_requires_transcript_json(isolated_cwd, three_scene_video):
+    """transcript.json est une entree obligatoire, comme scenes.json pour
+    clipper.reframe : absent, l'etape echoue plutot que de decoder toute la
+    video en silence (ADR-ad2e)."""
+    from clipper.scenes import ScenesError, detect_scenes
+
+    workspace_dir = isolated_cwd / "workspace"
+    with pytest.raises(ScenesError, match="transcript.json"):
+        detect_scenes(three_scene_video, workspace_dir, "vid1")
+
+    assert not (workspace_dir / "vid1" / "scenes.json").exists()
+
+
+def test_detect_scenes_fails_when_transcript_has_no_speech_segment(
+    isolated_cwd, three_scene_video
+):
+    from clipper.scenes import ScenesError, detect_scenes
+
+    workspace_dir = isolated_cwd / "workspace"
+    _write_transcript(workspace_dir, "vid1", [])
+
+    with pytest.raises(ScenesError, match="aucun segment de parole"):
+        detect_scenes(three_scene_video, workspace_dir, "vid1")
+
+    assert not (workspace_dir / "vid1" / "scenes.json").exists()
+
+
+def test_detect_scenes_only_decodes_the_speech_windows(
+    isolated_cwd, three_scene_video, recorded_ffmpeg_commands, recorded_analysis_frames
+):
+    """three_scene_video dure 6 s (25 fps -> 150 images a pleine cadence) ;
+    deux plages de parole de 0,5 s a chaque bout, marge 0,5 s, ne couvrent
+    que 2 s : largement moins d'images analysees que la video entiere."""
+    from clipper.scenes import detect_scenes
+
+    workspace_dir = isolated_cwd / "workspace"
+    _write_transcript(
+        workspace_dir, "vid1",
+        [{"start": 0.0, "end": 0.5}, {"start": 5.5, "end": 6.0}],
+    )
+
+    detect_scenes(three_scene_video, workspace_dir, "vid1", speech_margin_seconds=0.5)
+
+    decode_commands = _decode_commands(recorded_ffmpeg_commands)
+    ss_values = sorted(float(cmd[cmd.index("-ss") + 1]) for cmd in decode_commands)
+    assert ss_values == pytest.approx([0.0, 5.0])
+    assert len(recorded_analysis_frames) < 100
+
+
+def test_detect_scenes_merges_speech_windows_that_overlap_once_widened(
+    isolated_cwd, three_scene_video, recorded_ffmpeg_commands
+):
+    """Deux lignes a [0,1] et [2,3] separees d'1 s : une marge de 1 s les
+    elargit a [0,2] et [1,4], qui se chevauchent et fusionnent en une seule
+    fenetre [0,4] (un seul appel ffmpeg, pas deux)."""
+    from clipper.scenes import detect_scenes
+
+    workspace_dir = isolated_cwd / "workspace"
+    _write_transcript(
+        workspace_dir, "vid1",
+        [{"start": 0.0, "end": 1.0}, {"start": 2.0, "end": 3.0}],
+    )
+
+    detect_scenes(three_scene_video, workspace_dir, "vid1", speech_margin_seconds=1.0)
+
+    decode_commands = _decode_commands(recorded_ffmpeg_commands)
+    assert len(decode_commands) == 1
+    cmd = decode_commands[0]
+    assert float(cmd[cmd.index("-ss") + 1]) == pytest.approx(0.0)
+    assert float(cmd[cmd.index("-t") + 1]) == pytest.approx(4.0)
+
+
+def test_detect_scenes_adds_a_window_around_an_audio_peak_when_audio_json_exists(
+    isolated_cwd, three_scene_video, recorded_ffmpeg_commands
+):
+    """audio.json n'existe normalement pas encore quand scenes tourne
+    (clipper.pipeline.STEPS l'enchaine apres) ; s'il existe deja (rejeu avec
+    --force), ses pics hors parole deviennent eux aussi des fenetres."""
+    from clipper.scenes import detect_scenes
+
+    workspace_dir = isolated_cwd / "workspace"
+    _write_transcript(workspace_dir, "vid1", [{"start": 0.0, "end": 0.5}])
+    _write_audio(workspace_dir, "vid1", [{"timecode": 5.5, "relative_db": 12.0}])
+
+    detect_scenes(three_scene_video, workspace_dir, "vid1", speech_margin_seconds=0.5)
+
+    decode_commands = _decode_commands(recorded_ffmpeg_commands)
+    ss_values = sorted(float(cmd[cmd.index("-ss") + 1]) for cmd in decode_commands)
+    assert ss_values == pytest.approx([0.0, 5.0])
+
+
+def test_detect_scenes_ignores_audio_json_when_absent(
+    isolated_cwd, three_scene_video, recorded_ffmpeg_commands
+):
+    """audio.json absent (le cas normal) : pas d'erreur, seule la parole
+    borne le decodage."""
+    from clipper.scenes import detect_scenes
+
+    workspace_dir = isolated_cwd / "workspace"
+    _write_transcript(workspace_dir, "vid1", [{"start": 0.0, "end": 0.5}])
+
+    detect_scenes(three_scene_video, workspace_dir, "vid1", speech_margin_seconds=0.5)
+
+    assert len(_decode_commands(recorded_ffmpeg_commands)) == 1
+
+
+def test_speech_margin_seconds_widens_each_window(
+    isolated_cwd, three_scene_video, recorded_ffmpeg_commands
+):
+    from clipper.scenes import detect_scenes
+
+    workspace_dir = isolated_cwd / "workspace"
+    _write_transcript(workspace_dir, "vid1", [{"start": 2.0, "end": 3.0}])
+
+    detect_scenes(three_scene_video, workspace_dir, "vid1", speech_margin_seconds=0.0)
+
+    decode_commands = _decode_commands(recorded_ffmpeg_commands)
+    assert len(decode_commands) == 1
+    cmd = decode_commands[0]
+    assert float(cmd[cmd.index("-ss") + 1]) == pytest.approx(2.0)
+    assert float(cmd[cmd.index("-t") + 1]) == pytest.approx(1.0)
+
+
+def test_speech_window_start_never_goes_below_zero(
+    isolated_cwd, three_scene_video, recorded_ffmpeg_commands
+):
+    from clipper.scenes import detect_scenes
+
+    workspace_dir = isolated_cwd / "workspace"
+    _write_transcript(workspace_dir, "vid1", [{"start": 0.2, "end": 0.5}])
+
+    detect_scenes(three_scene_video, workspace_dir, "vid1", speech_margin_seconds=5.0)
+
+    cmd = _decode_commands(recorded_ffmpeg_commands)[0]
+    assert float(cmd[cmd.index("-ss") + 1]) == pytest.approx(0.0)
+
+
+def test_unanalysed_ranges_produce_no_scene_entries(isolated_cwd, three_scene_video):
+    """Video de 3 plans (coupures a 2 s et 4 s) mais parole seulement dans
+    [0, 0.5] (+- marge) : la fenetre decodee ne recouvre aucune coupure, donc
+    scenes.json garde un seul plan (format inchange, la plage non analysee
+    n'a simplement pas de coupure)."""
+    from clipper.scenes import detect_scenes
+
+    workspace_dir = isolated_cwd / "workspace"
+    _write_transcript(workspace_dir, "vid1", [{"start": 0.0, "end": 0.5}])
+
+    result = detect_scenes(three_scene_video, workspace_dir, "vid1", speech_margin_seconds=0.5)
+
+    assert len(result["scenes"]) == 1
+    assert result["scenes"][0]["end"] <= 1.0 + 1e-3
+    assert set(result) == {"scenes", "frames"}
+
+
+def test_cut_inside_a_speech_window_is_detected_like_a_full_decode(
+    isolated_cwd, hd_three_scene_video
+):
+    """La coupure a 2 s (rouge -> bleu) tombe au milieu d'une fenetre de
+    parole [0.5, 3.5] : elle est detectee au meme instant qu'un decodage
+    entier (test_cuts_stay_within_half_a_second_with_reduced_analysis)."""
+    from clipper.scenes import detect_scenes
+
+    workspace_dir = isolated_cwd / "workspace"
+    _write_transcript(workspace_dir, "vid1", [{"start": 1.5, "end": 2.5}])
+
+    result = detect_scenes(
+        hd_three_scene_video, workspace_dir, "vid1",
+        analysis_width=128, analysis_max_fps=10.0, speech_margin_seconds=1.0,
+    )
+
+    starts = [scene["start"] for scene in result["scenes"]]
+    assert any(abs(start - 2.0) < 0.5 for start in starts)
+
+
+def test_cuts_match_a_full_decode_when_speech_covers_the_whole_video(
+    isolated_cwd, hd_three_scene_video
+):
+    """Une seule fenetre de parole couvrant toute la video (marge 0) doit
+    retrouver exactement les coupures d'un decodage entier."""
+    from clipper.scenes import detect_scenes
+
+    workspace_dir = isolated_cwd / "workspace"
+    _write_transcript(workspace_dir, "vid1", [{"start": 0.0, "end": 6.0}])
+
+    result = detect_scenes(
+        hd_three_scene_video, workspace_dir, "vid1",
+        analysis_width=128, analysis_max_fps=10.0, speech_margin_seconds=0.0,
+    )
+
+    starts = [scene["start"] for scene in result["scenes"]]
+    assert len(starts) == 3
+    assert starts[0] == pytest.approx(0.0, abs=0.5)
+    assert starts[1] == pytest.approx(2.0, abs=0.5)
+    assert starts[2] == pytest.approx(4.0, abs=0.5)
+    assert result["scenes"][-1]["end"] == pytest.approx(6.0, abs=0.5)
