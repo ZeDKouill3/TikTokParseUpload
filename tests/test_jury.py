@@ -13,6 +13,7 @@ import pytest
 
 from clipper import jury, llm
 from clipper.config import Config
+from clipper.llm import claude_cli
 from clipper.llm.fake import FakeBackend
 
 JUDGES = ["retention", "spectateur", "monteur", "avocat", "conformite"]
@@ -343,6 +344,23 @@ def test_round_two_debate_prompt_also_carries_a_cache_prefix():
         assert call.cache_prefix, name
         assert call.prompt.startswith(call.cache_prefix), name
         assert call.cache_prefix != call.prompt, name  # le role divergent suit bien le prefixe
+
+
+def test_spectateur_message_carries_at_most_one_cache_control_block():
+    # TASK-f89f : le 400 "A maximum of 4 blocks with cache_control may be
+    # provided" releve en reel sur jury_spectateur n'est jamais du a nos
+    # propres marqueurs (voir clipper/llm/claude_cli.py) -- verifie ici sur
+    # le message reellement construit pour ce role (cache_prefix + role,
+    # comme jury._ask l'envoie), en repassant par le meme stdin_input() que
+    # le backend claude-cli utilise pour poser cache_control sur les blocs.
+    script = ScriptedJury({1: uniform({"secret-id-0": 7, "secret-id-1": 5, "secret-id-2": 3})})
+    _, fake = run(script)
+    spectateur_call = next(c for c in fake.calls if c.usage == "jury_spectateur")
+
+    stdin = claude_cli.stdin_input(spectateur_call)
+    content = json.loads(stdin)["message"]["content"]
+    marked = [b for b in content if "cache_control" in b]
+    assert len(marked) <= 1, content
 
 
 def test_shuffle_is_deterministic_and_specific_to_each_model():
@@ -688,6 +706,36 @@ def test_added_judge_takes_part():
 # Integration reelle (optionnelle)
 # CLIPPER_CLAUDE_INTEGRATION=1 pytest tests/test_jury.py -k integration
 # --------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(
+    os.environ.get("CLIPPER_CLAUDE_INTEGRATION") != "1",
+    reason="integration Claude : definir CLIPPER_CLAUDE_INTEGRATION=1 (consomme du quota)",
+)
+def test_integration_real_claude_spectateur_role_alone():
+    # TASK-f89f : appel de controle isole du role spectateur seul (pas de
+    # 2e meneur de vague en parallele, contrairement a jury.deliberate) sur
+    # un vrai candidat, pour verifier que le message qu'il envoie ne
+    # declenche pas le 400 cache_control par lui-meme.
+    judge = {"name": "spectateur", **jury.CONFIG_DEFAULTS["judges"]["spectateur"]}
+    cand = {
+        "id": "m0",
+        "text": "Alors la, vous n'allez pas me croire, mais je viens de tester un truc de fou. "
+        "J'ai lance le jeu sans installer les mises a jour, et devinez quoi, ca plante direct "
+        "sur l'ecran de chargement. Puis j'ai retente avec la derniere version, et la, magie, "
+        "tout fonctionne. Franchement c'est le genre de bug qui te fait perdre une soiree "
+        "entiere pour rien.",
+        "context": "[10.0-45.0] s, single",
+    }
+    common = jury._common(5, RUBRIC, "Chaine de tests, video de demo.")
+    schema = jury._schema(RUBRIC["criteria"], ["C1"], False)
+    role_text = jury._role(judge)
+    prompt = jury._round1_prompt(common, [("C1", cand)], role_text, schema)
+    cache_prefix = prompt.removesuffix(role_text)
+
+    out = jury._ask(judge, prompt, cache_prefix, schema, make_config())
+    assert set(out) == {"C1"}
+    assert set(out["C1"]["scores"]) == set(RUBRIC["criteria"])
 
 
 @pytest.mark.skipif(
