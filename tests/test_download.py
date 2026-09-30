@@ -33,6 +33,45 @@ def test_extract_video_id_raises_for_unrecognized_url():
         extract_video_id("https://example.com/not-youtube")
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://www.twitch.tv/videos/2887271276",
+        "https://twitch.tv/videos/2887271276",
+        "https://www.twitch.tv/videos/2887271276?t=01h02m03s",
+        "https://www.twitch.tv/videos/2887271276/",
+    ],
+)
+def test_extract_video_id_from_twitch_vod_url(url):
+    from clipper.download import extract_video_id
+
+    assert extract_video_id(url) == "v2887271276"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://www.twitch.tv/madajel",  # chaine (ou live, meme forme d'URL)
+        "https://www.twitch.tv/madajel/clip/AwkwardHelplessSalamanderSwiftRage",  # clip
+    ],
+)
+def test_extract_video_id_raises_for_non_vod_twitch_url(url):
+    from clipper.download import DownloadError, extract_video_id
+
+    with pytest.raises(DownloadError):
+        extract_video_id(url)
+
+
+def test_extract_video_id_does_not_collide_twitch_and_youtube_id_spaces():
+    from clipper.download import extract_video_id
+
+    twitch_id = extract_video_id("https://www.twitch.tv/videos/2887271276")
+    youtube_id = extract_video_id("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+
+    assert twitch_id != youtube_id
+    assert twitch_id.startswith("v")  # prefixe yt-dlp : jamais un id YouTube nu
+
+
 def _load_fixture(name: str) -> dict:
     return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
 
@@ -80,6 +119,7 @@ def test_download_writes_meta_json_with_full_fields(isolated_cwd):
 
     expected = {
         "video_id": info["id"],
+        "webpage_url": info["webpage_url"],
         "title": info["title"],
         "description": info["description"],
         "duration": info["duration"],
@@ -113,6 +153,40 @@ def test_download_defaults_chapters_heatmap_sponsorblock_to_empty_list(isolated_
     assert meta["heatmap"] == []
     assert meta["sponsorblock_segments"] == []
     assert meta["channel"] == info["uploader"]
+
+
+def test_download_twitch_vod_writes_meta_with_real_webpage_url(isolated_cwd):
+    from clipper.download import download
+
+    info = _load_fixture("info_dict_twitch.json")
+    workspace_dir = isolated_cwd / "workspace"
+    captured_opts: dict = {}
+    ydl_factory = _make_fake_ydl(info, captured_opts)
+
+    meta = download(
+        "https://www.twitch.tv/videos/2887271276",
+        workspace_dir=workspace_dir,
+        ydl_factory=ydl_factory,
+    )
+
+    assert meta["video_id"] == "v2887271276"
+    assert meta["webpage_url"] == "https://www.twitch.tv/videos/2887271276"
+    assert meta["channel"] == info["uploader"]
+
+
+def test_download_falls_back_to_requested_url_when_info_lacks_webpage_url(isolated_cwd):
+    from clipper.download import download
+
+    info = _load_fixture("info_dict_full.json")
+    del info["webpage_url"]
+    workspace_dir = isolated_cwd / "workspace"
+    captured_opts: dict = {}
+    ydl_factory = _make_fake_ydl(info, captured_opts)
+    requested_url = f"https://www.youtube.com/watch?v={info['id']}"
+
+    meta = download(requested_url, workspace_dir=workspace_dir, ydl_factory=ydl_factory)
+
+    assert meta["webpage_url"] == requested_url
 
 
 def test_download_skips_when_video_and_meta_already_present(isolated_cwd):
