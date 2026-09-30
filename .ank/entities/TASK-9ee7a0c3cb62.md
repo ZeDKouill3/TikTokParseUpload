@@ -5,7 +5,7 @@ slug: sous-titres-rien-l-cran-pendant-les-silences
 title: "Sous-titres : rien à l'écran pendant les silences"
 created: 2026-09-30T17:14:51Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/subtitles.py
   - tests/test_subtitles.py
@@ -16,8 +16,15 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: diagnose
+proof:
+  - type: test
+    ref: local/240dff866ffb@c0c00c6
+    tree: scope/0ba1d8e709d5
+    criteria: 4d328fda5ea8
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---
 
 Retour utilisateur 2026-09-30 sur les clips de démo : « un souci que je remarque beaucoup : quand ça ne parle pas, il ne faut pas afficher les sous-titres, tu ne mets rien ». Jeu d'horreur : beaucoup de silences et de réactions courtes ; les sous-titres restent affichés pendant les blancs.
