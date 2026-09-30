@@ -64,6 +64,12 @@ jamais lancé en CI ni par défaut en local.
   (elle-même remplaçait SPEC-350f).
 - **SPEC-53f3** — grille de notation des moments (`rubric.toml`), critères et
   règles de sélection.
+- **SPEC-8257** *(proposée, pas encore `ank accept`)* — succède à SPEC-3a88
+  (format stream) : le choix du format par clip (stream ou letterbox) se
+  fait sur la présence du rectangle de webcam lui-même (contenu non noir,
+  bords retrouvés, non figé), plus sur la détection du visage dedans ; la
+  localisation (une fois par vidéo) garde le visage comme indice, avec un
+  seuil séparé et plus bas par défaut.
 
 ## Conventions
 
