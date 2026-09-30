@@ -114,6 +114,11 @@ Deux réglages indépendants dans `config.toml` :
   où elle est présente rendent en format stream (facecam fixe agrandie en
   haut, jeu en bas, **jamais de bascule dans un clip**), les autres en
   letterbox classique.
+  Une fois un clip en stream, `stream_variant` (SPEC-76dc) choisit
+  l'agencement visuel : `"top"` (défaut, comportement inchangé, décrit
+  ci-dessus) ou `"split"` (webcam en haut sur ~1/3 de la hauteur, jeu en bas
+  pleine largeur, badge de chaîne optionnel à la jonction) — voir *Agencement
+  stream split* ci-dessous.
 
 Le contrat de sortie d'un clip (`SPEC-6a47`, succède à `SPEC-6127`) :
 `.mp4` vertical 1080x1920 + `.json` sidecar (titre, légende, hashtags,
@@ -164,6 +169,50 @@ cta_hashtags = ["#twitch", "#horreur"]
 pseudo tronqué ou absent en silence. Les réglages de mise en page (tailles de
 police, marges) vivent dans `CONFIG_DEFAULTS` de `clipper/render.py`
 (`cta_handle_font_size`, `cta_card_font_size`...).
+
+## Agencement stream split (SPEC-76dc, `preset` par chaîne)
+
+Un second agencement visuel pour les clips déjà en stream (`stream_variant`,
+voir *Formats de sortie* ci-dessus), pensé pour reproduire le montage
+« webcam en haut, jeu en bas » qu'une streameuse ou un streamer fait
+déjà lui-même : deux zones fixes qui se partagent toute la hauteur (jamais de
+déformation, chaque zone est recadrée au ratio de son rectangle de
+destination), un badge de chaîne optionnel (logo + pseudo sur fond noir) à
+leur jonction, et un style de sous-titres à deux couleurs (mot en train
+d'être prononcé dans une couleur distincte, pas de fond). `title_enabled`
+(nouveau réglage, défaut `true` — comportement inchangé) permet de retirer le
+titre d'écran, utile ici puisque ce modèle n'en a pas.
+
+`presets/ma-chaine-stream.toml` :
+
+```toml
+[reframe]
+layout = "stream_auto"
+stream_variant = "split"
+
+[render]
+title_enabled = false             # pas de titre d'ecran pour ce modele
+cta_enabled = false                # ni carte de fin
+badge_enabled = true
+badge_logo = "presets/logo-ma-chaine.png"   # PNG, jamais dans clipper/assets
+badge_name = "ma_chaine"
+
+[subtitles]
+split_current_word_color = "#9146FF"   # violet Twitch (defaut) ; #RRGGBB ou un nom
+split_shadow_enabled = false
+```
+
+Les zones (`split_webcam_dest`, `split_gameplay_dest`, `badge_dest`,
+`split_subtitle_dest`, toutes `[reframe]`) ont des valeurs par défaut qui
+correspondent à la maquette de référence ; réglables (mêmes clés
+`{x, y, w, h}` en pixels du canevas 1080x1920), mais une config qui les fait
+déborder du canevas, se chevaucher entre elles ou sortir de la zone sûre
+TikTok (badge, sous-titres) est une erreur explicite au chargement
+(ADR-ad2e). `badge_enabled` sans `badge_logo` (fichier
+introuvable inclus) ou sans `badge_name`, ou activé sur un layout qui n'a pas
+de zone badge (letterbox, stream `"top"`, format crop), est aussi une erreur
+explicite : le badge remplace le pseudo de chaîne de l'appel à l'abonnement
+quand les deux sont actifs, sans toucher à la carte de fin.
 
 ## Configuration (`config.toml`)
 
@@ -231,21 +280,34 @@ parallèle), `cta_line`/`cta_hashtags` (SPEC-6a47, vides par défaut, voir
 `[reframe]` — voir *Formats* ci-dessus, plus le détecteur de visages
 (`detector` = `"mediapipe"`, `min_confidence` = 0.5, `sample_fps` = 5.0),
 `output_width`/`output_height` = 1080/1920, `letterbox_zoom` = 1.3.
+`stream_variant` (SPEC-76dc, voir *Agencement stream split* ci-dessus) et ses
+zones (`split_webcam_dest`, `split_gameplay_dest`, `badge_dest`,
+`split_subtitle_dest`).
 
 `[subtitles]` — `font_name` = `"Poppins ExtraBold"`, `font_size` = 96,
 `min_words_per_group`/`max_words_per_group` = 2/4, `emphasis` = `true`
 (emphase choisie par LLM), `parallel` = 4 (clips traités en parallèle, lu par
-le pipeline).
+le pipeline). Style de l'agencement stream split (SPEC-76dc, préfixe
+`split_`, jamais d'appel LLM) : `split_font_name`/`split_font_size`,
+`split_uppercase`, `split_text_color`/`split_current_word_color` (le mot en
+train d'être prononcé) — couleurs `#RRGGBB` ou un nom (`white`, `black`,
+`purple`...), pas le format ASS des réglages ci-dessus —
+`split_outline_color`/`split_outline`, `split_shadow_enabled` (défaut
+`false`) et `split_shadow_color`/`split_shadow_offset`.
 
 `[render]` — `crf` = 20, `x264_preset` = `"medium"`, `nvenc_preset` = `"p5"`
 (si GPU), `audio_bitrate` = `"192k"`, normalisation loudness
 (`loudnorm_i/tp/lra`), réglages du titre d'écran (`title_font_size`,
 `title_pad_x/y`...) et de l'accroche (`hook_seconds`, `hook_font_size`,
 `hook_margin_top`). Encodeur choisi par `clipper.gpu` (`h264_nvenc` si CUDA
-détecté, sinon `libx264`). `cta_enabled`/`cta_handle`/`cta_seconds`/
-`cta_text` (SPEC-6a47, désactivé par défaut, voir *Appel à l'abonnement*
-ci-dessus) et leurs réglages de mise en page (`cta_handle_font_size`,
-`cta_card_font_size`...).
+détecté, sinon `libx264`). `title_enabled` (SPEC-76dc, défaut `true` —
+comportement inchangé) : désactive le titre d'écran, sur tout layout.
+`cta_enabled`/`cta_handle`/`cta_seconds`/`cta_text` (SPEC-6a47, désactivé par
+défaut, voir *Appel à l'abonnement* ci-dessus) et leurs réglages de mise en
+page (`cta_handle_font_size`, `cta_card_font_size`...). Badge de chaîne
+(SPEC-76dc, voir *Agencement stream split* ci-dessus) : `badge_enabled`
+(défaut `false`), `badge_logo`, `badge_name`, `badge_logo_size` = 100,
+`badge_glyph_scale` = 0.65, `badge_font_size` = 40.
 
 `[qa]` — `expected_width`/`expected_height` = 1080/1920,
 `duration_tolerance` = 0.5, seuils de silence et d'image noire

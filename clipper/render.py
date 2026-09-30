@@ -189,6 +189,27 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "cta_card_pad_y": 16,
     "cta_card_radius": 22,
     "cta_card_line_height": 1.25,
+    # Titre d'ecran (SPEC-76dc, nouveau reglage : jusqu'ici toujours dessine).
+    # Defaut True = comportement inchange. False : aucun titre, sur aucun
+    # layout ; text_zones.title n'est alors plus requis.
+    "title_enabled": True,
+    # Badge de chaine (SPEC-76dc, agencement stream split seulement : la
+    # zone badge n'existe que dans reframe/<clip_id>.json en stream_split,
+    # erreur explicite sinon). Remplace le pseudo texte de l'appel a
+    # l'abonnement (cta_handle) sur ce clip quand les deux sont actifs,
+    # sans affecter la carte de fin.
+    "badge_enabled": False,
+    # Chemin du logo (PNG), requis si badge_enabled ; fichier absent = erreur
+    # explicite (ADR-ad2e).
+    "badge_logo": "",
+    # Nom affiche a droite du logo, requis si badge_enabled.
+    "badge_name": "",
+    # Cote (px) du carre de fond noir qui contient le logo.
+    "badge_logo_size": 100,
+    # Le glyphe du logo est reduit de ce facteur a l'interieur du carre
+    # (marge visuelle autour de lui).
+    "badge_glyph_scale": 0.65,
+    "badge_font_size": 40,
 }
 
 FONTS_DIR = Path(__file__).resolve().parent / "assets" / "fonts"
@@ -207,7 +228,14 @@ EMOJI_FONT_CANDIDATES: dict[str, tuple[str, ...]] = {
 
 _QA_DEFAULT: dict[str, Any] = {"status": "skipped", "issues": []}
 # Mises en page a titre d'ecran permanent et zones de texte fixes (text_zones).
-_TEXT_LAYOUTS = ("letterbox", "stream")
+_TEXT_LAYOUTS = ("letterbox", "stream", "stream_split")
+# Champ du sidecar JSON -> nom du panneau video, par layout (SPEC-6127,
+# SPEC-3a88, SPEC-76dc) : lu par render() pour la qa.
+_VIDEO_RECT_FIELDS: dict[str, dict[str, str]] = {
+    "letterbox": {"video_rect": "main"},
+    "stream": {"camera_rect": "camera", "video_rect": "gameplay"},
+    "stream_split": {"webcam_rect": "webcam", "video_rect": "gameplay"},
+}
 _EDGE = 0.1
 _EPS = 1e-6
 
@@ -695,6 +723,60 @@ def cta_card_png(text: str, zone: dict[str, Any], settings: dict[str, Any], path
     return layout
 
 
+_BADGE_GAP = 16  # px entre le carre du logo et le nom, sur fond noir
+
+
+def badge_png(logo_path: Path, name: str, zone: dict[str, Any], settings: dict[str, Any], path: Path) -> None:
+    """Ecrit dans ``path`` le badge de chaine (SPEC-76dc, agencement stream
+    split) : logo sur fond noir dans un carre de ``badge_logo_size`` (glyphe
+    reduit de ``badge_glyph_scale``, jamais deforme), nom a droite mesure
+    avec la vraie police."""
+    if not logo_path.is_file():
+        raise RenderError(f"logo du badge introuvable : {logo_path} (reglage [render] badge_logo)")
+    if not name.strip():
+        raise RenderError("[render] badge_enabled sans badge_name")
+    if not FONT_FILE.is_file():
+        raise RenderError(f"police absente : {FONT_FILE}")
+    text_cmap = _cmap(str(FONT_FILE))
+    missing = sorted({c for c in name if not c.isspace() and ord(c) not in text_cmap})
+    if missing:
+        raise RenderError(
+            f"caractere(s) {''.join(missing)!r} du nom du badge absent(s) de Poppins ExtraBold : {name!r}"
+        )
+
+    zx0, zy0, zx1, zy1 = _zone(zone)
+    zw, zh = zx1 - zx0, zy1 - zy0
+    square = int(settings["badge_logo_size"])
+    if square <= 0 or square > zw or square > zh:
+        raise RenderError(
+            f"[render] badge_logo_size ({square}) invalide pour badge_dest ({zw}x{zh})"
+        )
+
+    img = Image.new("RGBA", (zw, zh), (0, 0, 0, 255))
+    draw = ImageDraw.Draw(img)
+
+    logo = Image.open(logo_path).convert("RGBA")
+    glyph_max = max(1, round(square * float(settings["badge_glyph_scale"])))
+    ratio = logo.width / logo.height
+    gw, gh = (glyph_max, max(1, round(glyph_max / ratio))) if ratio >= 1 else (max(1, round(glyph_max * ratio)), glyph_max)
+    logo = logo.resize((gw, gh), Image.LANCZOS)
+    square_top = (zh - square) // 2
+    img.alpha_composite(logo, ((square - gw) // 2, square_top + (square - gh) // 2))
+
+    font_size = int(settings["badge_font_size"])
+    font = _text_font(font_size)
+    text_x = square + _BADGE_GAP
+    left, top, right, bottom = font.getbbox(name, anchor="ls")
+    if text_x + (right - left) > zw:
+        raise RenderError(
+            f"badge_name {name!r} trop long pour badge_dest ({zw} px, logo {square}px + marge {_BADGE_GAP}px) "
+            "(reglage [render] badge_name)"
+        )
+    baseline = (zh - (bottom - top)) // 2 - top
+    draw.text((text_x, baseline), name, font=font, fill="white", anchor="ls")
+    img.save(path, format="PNG")
+
+
 def _draw_pseudo(
     png_path: Path, zone: dict[str, Any], title_layout: TitleLayout, text: str,
     pseudo: PseudoLayout, settings: dict[str, Any],
@@ -821,16 +903,19 @@ def _build_filter_complex(
     source_offset: float = 0.0,
     cta_input: int | None = None,
     cta_start: float | None = None,
+    badge_input: int | None = None,
 ) -> tuple[str, str]:
-    """Graphe ffmpeg du clip. En letterbox (``layout`` = letterbox a la racine
-    de reframe_data), ``title_input`` est l'index de l'entree ffmpeg du PNG
-    de titre, incruste en haut-gauche de la zone title pour tout le clip ;
+    """Graphe ffmpeg du clip. En letterbox (``layout`` = letterbox, stream ou
+    stream_split a la racine de reframe_data), ``title_input`` (absent si
+    ``[render] title_enabled`` est faux) est l'index de l'entree ffmpeg du
+    PNG de titre, incruste en haut-gauche de la zone title pour tout le clip ;
     pas d'accroche ; « Partie N » (``part_path``) centre dans la zone part.
-    ``cta_input`` (SPEC-6a47) : index de l'entree ffmpeg du PNG de la carte
-    de fin, incruste sur la zone subtitles a partir de ``cta_start`` (s,
-    relatif au debut du clip) jusqu'a la fin. ``source_offset`` : point (s)
-    ou l'entree source est positionnee par ``-ss`` ; trim et atrim sont
-    relatifs a lui."""
+    ``badge_input`` (SPEC-76dc) : index de l'entree ffmpeg du PNG du badge de
+    chaine, incruste sur la zone badge pour tout le clip. ``cta_input``
+    (SPEC-6a47) : index de l'entree ffmpeg du PNG de la carte de fin,
+    incruste sur la zone subtitles a partir de ``cta_start`` (s, relatif au
+    debut du clip) jusqu'a la fin. ``source_offset`` : point (s) ou l'entree
+    source est positionnee par ``-ss`` ; trim et atrim sont relatifs a lui."""
     letterbox = reframe_data.get("layout") in _TEXT_LAYOUTS
     out_w = reframe_data["output"]["width"]
     out_h = reframe_data["output"]["height"]
@@ -858,11 +943,14 @@ def _build_filter_complex(
 
     if letterbox:
         zones = reframe_data["text_zones"]
-        if title_input is None:
-            raise RenderError("letterbox : le PNG du titre d'ecran n'est pas fourni a ffmpeg")
-        tx0, ty0, _tx1, _ty1 = _zone(zones["title"])
-        lines.append(f"[{cur}][{title_input}:v]overlay=x={tx0}:y={ty0}:eof_action=repeat[vtitle]")
-        cur = "vtitle"
+        if title_input is not None:
+            tx0, ty0, _tx1, _ty1 = _zone(zones["title"])
+            lines.append(f"[{cur}][{title_input}:v]overlay=x={tx0}:y={ty0}:eof_action=repeat[vtitle]")
+            cur = "vtitle"
+        if badge_input is not None:
+            bx0, by0, _bx1, _by1 = _zone(zones["badge"])
+            lines.append(f"[{cur}][{badge_input}:v]overlay=x={bx0}:y={by0}:eof_action=repeat[vbadge]")
+            cur = "vbadge"
         if part_path is not None:
             px0, _py0, px1, _py1 = _zone(zones["part"])
             baseline = _part_placement(part_path.read_text(encoding="utf-8"), zones["part"], settings)
@@ -1052,6 +1140,8 @@ def render(
 
     settings = _settings(config)
     cta_enabled = bool(settings["cta_enabled"])
+    title_enabled = bool(settings["title_enabled"])
+    badge_enabled = bool(settings["badge_enabled"])
     if cta_enabled:
         # ADR-ad2e : jamais de CTA a moitie active (verification independante
         # du clip, avant toute lecture de fichier).
@@ -1064,6 +1154,12 @@ def render(
             raise RenderError(
                 f"[render] cta_seconds doit etre > 0, recu {cta_seconds_setting}"
             )
+    if badge_enabled:
+        # ADR-ad2e : jamais de badge a moitie active.
+        if not str(settings["badge_logo"]).strip():
+            raise RenderError("[render] badge_enabled sans badge_logo")
+        if not str(settings["badge_name"]).strip():
+            raise RenderError("[render] badge_enabled sans badge_name")
 
     source = video_dir / f"{video_id}.mp4"
     if not source.exists():
@@ -1107,25 +1203,38 @@ def render(
     layout = reframe_data.get("layout")
     letterbox = layout in _TEXT_LAYOUTS
     rects: dict[str, dict[str, int]] = {}
+    zones: dict[str, Any] | None = None
     if letterbox:
         zones = reframe_data.get("text_zones")
-        if not isinstance(zones, dict) or not {"title", "subtitles", "part"} <= set(zones):
+        if not isinstance(zones, dict) or not {"subtitles", "part"} <= set(zones):
             raise RenderError(
-                f"reframe/{clip_id}.json est en {layout} sans text_zones (title, subtitles, part) : "
+                f"reframe/{clip_id}.json est en {layout} sans text_zones (subtitles, part) : "
                 "relancer reframe --force"
             )
+        if title_enabled and "title" not in zones:
+            raise RenderError(
+                f"reframe/{clip_id}.json ({layout}) n'a pas de zone title : [render] title_enabled=true "
+                "la requiert (la desactiver, ou pour l'agencement split remonter split_webcam_dest.y pour "
+                "laisser de la place au-dessus de la webcam)"
+            )
+        if badge_enabled and "badge" not in zones:
+            raise RenderError(
+                f"reframe/{clip_id}.json ({layout}) n'a pas de zone badge : [render] badge_enabled "
+                "requiert l'agencement stream split (SPEC-76dc)"
+            )
         # champ du sidecar -> panneau (pixels de sortie), pour la qa
-        wanted = (
-            {"video_rect": "main"} if layout == "letterbox"
-            else {"camera_rect": "camera", "video_rect": "gameplay"}
-        )
-        for key, name in wanted.items():
+        for key, name in _VIDEO_RECT_FIELDS[layout].items():
             panel = [p for p in reframe_data["plans"][0]["panels"] if p.get("name") == name]
             if not panel:
                 raise RenderError(
                     f"reframe/{clip_id}.json est en {layout} sans panneau {name} : relancer reframe --force"
                 )
             rects[key] = {k: int(panel[0]["dest"][k]) for k in ("x", "y", "w", "h")}
+    elif badge_enabled:
+        raise RenderError(
+            f"reframe/{clip_id}.json ({layout}) n'a pas de zone badge : [render] badge_enabled "
+            "requiert l'agencement stream split (SPEC-76dc)"
+        )
 
     cta_applies = letterbox and cta_enabled
     if cta_applies:
@@ -1139,6 +1248,16 @@ def render(
                 f"cta_seconds ({cta_seconds}) >= duree du clip {clip_id} ({clip['duration']}) : "
                 "reduire [render] cta_seconds ou desactiver cta_enabled pour ce clip"
             )
+    # SPEC-76dc : le badge remplace le pseudo texte quand les deux sont
+    # actifs (la carte de fin n'est pas affectee). Sans titre ni badge, il
+    # n'y a pas d'ancre pour le pseudo (ADR-ad2e : jamais devinee).
+    handle_shown = cta_applies and not badge_enabled
+    if handle_shown and not title_enabled:
+        raise RenderError(
+            "[render] cta_enabled avec cta_handle mais sans titre (title_enabled=false) et sans badge "
+            "(badge_enabled=false) : le pseudo de chaine n'a pas d'ancre -- activer [render] badge_enabled, "
+            "[render] title_enabled, ou vider cta_handle"
+        )
 
     scratch_dir = video_dir / "render" / clip_id
     scratch_dir.mkdir(parents=True, exist_ok=True)
@@ -1149,26 +1268,38 @@ def render(
         ass_for_filter = ass_path
         cta_start_rel: float | None = None
         cta_input: int | None = None
+        title_input: int | None = None
+        badge_input: int | None = None
         if letterbox:
             # Titre d'ecran pendant tout le clip, pas d'accroche de 2 s (SPEC-6127,
-            # letterbox comme stream).
-            title_zone = reframe_data["text_zones"]["title"]
-            if cta_applies:
-                # Le pseudo se place sous l'encadre du titre : on reserve la
-                # place en remontant le titre (title_lift effectif plus grand
-                # que celui configure), sans toucher au rendu par defaut
-                # (SPEC-6a47).
-                zone_w = title_zone["x1"] - title_zone["x0"]
-                pseudo = layout_pseudo(str(settings["cta_handle"]), zone_w, settings)
-                reserved = int(settings["cta_handle_gap"]) + pseudo.height
-                title_settings = {**settings, "title_lift": int(settings["title_lift"]) + reserved}
-            else:
-                title_settings = settings
-            png = scratch_dir / "title.png"
-            title_layout = title_png(screen_title, title_zone, title_settings, png)
-            if cta_applies:
-                _draw_pseudo(png, title_zone, title_layout, str(settings["cta_handle"]), pseudo, settings)
-            extra_inputs = (png,)
+            # letterbox comme stream) -- sauf title_enabled = false (SPEC-76dc).
+            if title_enabled:
+                title_zone = reframe_data["text_zones"]["title"]
+                if handle_shown:
+                    # Le pseudo se place sous l'encadre du titre : on reserve
+                    # la place en remontant le titre (title_lift effectif plus
+                    # grand que celui configure), sans toucher au rendu par
+                    # defaut (SPEC-6a47).
+                    zone_w = title_zone["x1"] - title_zone["x0"]
+                    pseudo = layout_pseudo(str(settings["cta_handle"]), zone_w, settings)
+                    reserved = int(settings["cta_handle_gap"]) + pseudo.height
+                    title_settings = {**settings, "title_lift": int(settings["title_lift"]) + reserved}
+                else:
+                    title_settings = settings
+                png = scratch_dir / "title.png"
+                title_layout = title_png(screen_title, title_zone, title_settings, png)
+                if handle_shown:
+                    _draw_pseudo(png, title_zone, title_layout, str(settings["cta_handle"]), pseudo, settings)
+                extra_inputs = extra_inputs + (png,)
+                title_input = len(extra_inputs)
+            if badge_enabled:
+                badge_out = scratch_dir / "badge.png"
+                badge_png(
+                    Path(str(settings["badge_logo"])), str(settings["badge_name"]),
+                    reframe_data["text_zones"]["badge"], settings, badge_out,
+                )
+                extra_inputs = extra_inputs + (badge_out,)
+                badge_input = len(extra_inputs)
             if clip["parts_total"] > 1:
                 part_path = scratch_dir / "part.txt"
                 part_path.write_text(f"Partie {clip['part']}", encoding="utf-8")
@@ -1176,7 +1307,7 @@ def render(
                 card_png = scratch_dir / "cta_card.png"
                 cta_card_png(str(settings["cta_text"]), reframe_data["text_zones"]["subtitles"], settings, card_png)
                 extra_inputs = extra_inputs + (card_png,)
-                cta_input = len(extra_inputs)  # 1 = title.png, 2 = cta_card.png (entrees apres la source)
+                cta_input = len(extra_inputs)
                 cutoff = float(clip["duration"]) - float(settings["cta_seconds"])
                 truncated = truncate_ass_for_cta(ass_path.read_text(encoding="utf-8"), cutoff)
                 ass_for_filter = scratch_dir / "subtitles_cta.ass"
@@ -1195,8 +1326,8 @@ def render(
         seek_end = max([clip["end"]] + [p["end"] for p in reframe_data["plans"]])
         filter_complex, vout_label = _build_filter_complex(
             reframe_data, clip["start"], clip["end"], ass_for_filter, hook_path, part_path, scratch_dir, settings,
-            title_input=1 if letterbox else None, source_offset=seek,
-            cta_input=cta_input, cta_start=cta_start_rel,
+            title_input=title_input, source_offset=seek,
+            cta_input=cta_input, cta_start=cta_start_rel, badge_input=badge_input,
         )
 
         target_fps = float(settings["max_fps"])

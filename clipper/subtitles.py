@@ -39,6 +39,7 @@ import functools
 import json
 import logging
 import math
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -49,7 +50,19 @@ PLAY_RES_Y = 1920
 
 FONT_FILE = Path(__file__).resolve().parent / "assets" / "fonts" / "Poppins-ExtraBold.ttf"
 LETTERBOX_HEADER = "; format: letterbox"
+SPLIT_HEADER = "; format: split"
 _ZONE_KEYS = ("x0", "y0", "x1", "y1")
+
+# Couleurs "amicales" acceptees par les reglages split_* (#RRGGBB ou un de
+# ces noms), converties en ASS &H00BBGGRR& (voir _ass_color) : les autres
+# couleurs du module (primary_color, emphasis_color...) restent au format
+# ASS natif, deja utilise tel quel dans config.toml.
+_NAMED_COLORS: dict[str, tuple[int, int, int]] = {
+    "white": (255, 255, 255), "black": (0, 0, 0), "red": (255, 0, 0), "green": (0, 128, 0),
+    "blue": (0, 0, 255), "yellow": (255, 255, 0), "orange": (255, 165, 0), "purple": (128, 0, 128),
+    "gray": (128, 128, 128), "grey": (128, 128, 128), "pink": (255, 192, 203), "cyan": (0, 255, 255),
+    "magenta": (255, 0, 255),
+}
 
 log = logging.getLogger(__name__)
 
@@ -109,6 +122,24 @@ CONFIG_DEFAULTS: dict[str, object] = {
     # (TASK-ce6e : un appel LLM d'emphase par clip) ; 1 = un clip apres
     # l'autre. Lu par le pipeline, jamais passe a generate.
     "parallel": 4,
+    # Style de l'agencement stream split (SPEC-76dc, generate(style="split")) :
+    # deux couleurs seulement (texte, mot en cours), jamais d'appel LLM
+    # d'emphase (chaque mot est "en cours" a son propre instant). Couleurs au
+    # format amical (#RRGGBB ou un nom, voir _NAMED_COLORS), pas le format
+    # ASS natif des reglages ci-dessus.
+    "split_font_name": "Poppins ExtraBold",
+    "split_font_size": 80,
+    "split_min_font_size": 44,
+    "split_font_step": 4,
+    "split_uppercase": True,
+    "split_text_color": "white",
+    "split_current_word_color": "#9146FF",
+    "split_outline_color": "black",
+    "split_outline": 10,
+    # Sans ombre par defaut (style de reference sans ombre, SPEC-76dc).
+    "split_shadow_enabled": False,
+    "split_shadow_color": "black",
+    "split_shadow_offset": [2, 2],
 }
 
 EMPHASIS_PROMPT = (
@@ -295,7 +326,27 @@ def _position(
     return best
 
 
-def _karaoke_run(word: dict[str, Any], prev_end: float, emphasized: bool, settings: dict[str, Any],
+def _ass_color(spec: str) -> str:
+    """``spec`` (``#RRGGBB`` ou un nom de ``_NAMED_COLORS``) converti au
+    format ASS ``&H00BBGGRR&`` (alpha opaque). Une couleur inconnue est une
+    erreur explicite (ADR-ad2e), jamais une supposition silencieuse."""
+    spec = spec.strip()
+    if spec.startswith("#"):
+        hexpart = spec[1:]
+        if len(hexpart) != 6 or any(c not in "0123456789abcdefABCDEF" for c in hexpart):
+            raise SubtitlesError(f"couleur hexadecimale invalide : {spec!r} (attendu #RRGGBB)")
+        r, g, b = (int(hexpart[i:i + 2], 16) for i in (0, 2, 4))
+    else:
+        key = spec.lower()
+        if key not in _NAMED_COLORS:
+            raise SubtitlesError(
+                f"couleur inconnue : {spec!r} (attendu #RRGGBB ou : {', '.join(sorted(_NAMED_COLORS))})"
+            )
+        r, g, b = _NAMED_COLORS[key]
+    return f"&H00{b:02X}{g:02X}{r:02X}&"
+
+
+def _karaoke_run(word: dict[str, Any], prev_end: float, emphasized: bool, emphasis_color: str,
                  text: str | None = None, reset: str = "{\\r}") -> str:
     """Un mot en karaoke. ``text`` remplace le texte du mot (majuscules,
     espace de tete retire) ; ``reset`` suit un mot d'emphase (retour au style,
@@ -305,7 +356,7 @@ def _karaoke_run(word: dict[str, Any], prev_end: float, emphasized: bool, settin
     text = word["word"] if text is None else text
     prefix = f"{{\\k{gap_cs}}}" if gap_cs > 0 else ""
     if emphasized:
-        return f"{prefix}{{\\k{dur_cs}\\c{settings['emphasis_color']}}}{text}{reset}"
+        return f"{prefix}{{\\k{dur_cs}\\c{emphasis_color}}}{text}{reset}"
     return f"{prefix}{{\\k{dur_cs}}}{text}"
 
 
@@ -322,7 +373,7 @@ def _dialogue_line(
     prev_end = group[0]["start"]
     runs = []
     for w in group:
-        runs.append(_karaoke_run(w, prev_end, index[id(w)] in emphasis, settings))
+        runs.append(_karaoke_run(w, prev_end, index[id(w)] in emphasis, str(settings["emphasis_color"])))
         prev_end = w["end"]
     text = "".join(runs)
     return (
@@ -432,16 +483,94 @@ def libass_font_size(size: int, font_file: Path = FONT_FILE) -> int:
     return round(size * (ascent + descent) / upm)
 
 
+@dataclass(frozen=True)
+class _Style:
+    """Style d'un texte positionne (letterbox ou split, SPEC-76dc) : ce que
+    ``_render_positioned`` a besoin de savoir au-dela des mots et de la
+    zone. La mesure (Pillow, libass) reste toujours sur ``FONT_FILE`` (seule
+    police embarquee), quel que soit ``font_name`` (nom ASS, deja le cas du
+    style letterbox existant)."""
+
+    font_name: str
+    font_size: int
+    min_font_size: int
+    font_step: int
+    line_height: float
+    offset: int
+    outline: int
+    outline_color: str
+    uppercase: bool
+    max_words_per_group: int
+    primary_color: str
+    secondary_color: str
+    back_color: str
+    shadow: int
+    header: str
+
+
+def _letterbox_style(settings: dict[str, Any]) -> _Style:
+    return _Style(
+        font_name=str(settings["font_name"]),
+        font_size=int(settings["letterbox_font_size"]),
+        min_font_size=int(settings["letterbox_min_font_size"]),
+        font_step=int(settings["letterbox_font_step"]),
+        line_height=float(settings["letterbox_line_height"]),
+        offset=int(settings["letterbox_offset_y"]),
+        outline=int(settings["letterbox_outline"]),
+        outline_color=str(settings["outline_color"]),
+        uppercase=bool(settings["letterbox_uppercase"]),
+        max_words_per_group=int(settings["letterbox_max_words_per_group"]),
+        primary_color=str(settings["primary_color"]),
+        secondary_color=str(settings["secondary_color"]),
+        back_color="&H00000000",
+        shadow=0,
+        header=LETTERBOX_HEADER,
+    )
+
+
+def _split_style(settings: dict[str, Any]) -> _Style:
+    back_color, shadow = "&H00000000", 0
+    if bool(settings["split_shadow_enabled"]):
+        offset = settings["split_shadow_offset"]
+        if (
+            not isinstance(offset, (list, tuple)) or len(offset) != 2
+            or not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in offset)
+        ):
+            raise SubtitlesError(f"[subtitles] split_shadow_offset invalide {offset!r} (attendu [x, y])")
+        # ASS ne connait qu'une distance d'ombre unique (Shadow), pas un
+        # decalage (x, y) independant : approximee par la moyenne des deux.
+        shadow = max(0, round((abs(float(offset[0])) + abs(float(offset[1]))) / 2))
+        back_color = _ass_color(str(settings["split_shadow_color"]))
+    text_color = _ass_color(str(settings["split_text_color"]))
+    return _Style(
+        font_name=str(settings["split_font_name"]),
+        font_size=int(settings["split_font_size"]),
+        min_font_size=int(settings["split_min_font_size"]),
+        font_step=int(settings["split_font_step"]),
+        line_height=float(settings["letterbox_line_height"]),
+        offset=int(settings["letterbox_offset_y"]),
+        outline=int(settings["split_outline"]),
+        outline_color=_ass_color(str(settings["split_outline_color"])),
+        uppercase=bool(settings["split_uppercase"]),
+        max_words_per_group=int(settings["letterbox_max_words_per_group"]),
+        primary_color=text_color,
+        secondary_color=text_color,
+        back_color=back_color,
+        shadow=shadow,
+        header=SPLIT_HEADER,
+    )
+
+
 class _Box:
     """Mesure du texte dans la zone, comme libass le dessine : ligne centree
     entre x0 et x1, ligne i en haut a y0 + i x pas, ligne de base a
     round(em x usWinAscent / unitsPerEm) sous ce haut."""
 
-    def __init__(self, zone: dict[str, int], settings: dict[str, Any], where: str = ""):
+    def __init__(self, zone: dict[str, int], style: _Style, where: str = ""):
         self.zone = zone
-        self.outline = int(settings["letterbox_outline"])
-        self.line_height = float(settings["letterbox_line_height"])
-        self.offset = int(settings["letterbox_offset_y"])
+        self.outline = style.outline
+        self.line_height = style.line_height
+        self.offset = style.offset
         zone_h = zone["y1"] - zone["y0"]
         if not (0 <= self.offset < zone_h):
             raise SubtitlesError(
@@ -493,54 +622,57 @@ def _layout(units: list[list[dict[str, Any]]], size: int, box: _Box,
     return best
 
 
-def _sizes_below(size: int, settings: dict[str, Any]) -> list[int]:
-    low = int(settings["letterbox_min_font_size"])
-    sizes = list(range(size - int(settings["letterbox_font_step"]), low - 1,
-                       -int(settings["letterbox_font_step"])))
+def _sizes_below(size: int, style: _Style) -> list[int]:
+    low = style.min_font_size
+    sizes = list(range(size - style.font_step, low - 1, -style.font_step))
     if low < size and (not sizes or sizes[-1] != low):
         sizes.append(low)
     return sizes
 
 
-def _place(units: list[list[dict[str, Any]]], size: int, box: _Box, settings: dict[str, Any],
+def _place(units: list[list[dict[str, Any]]], size: int, box: _Box, style: _Style,
            where: str) -> list[tuple[list[list[list[dict[str, Any]]]], int]]:
     """Groupe -> [(lignes, taille em), ...] : une ou deux lignes a la taille
     donnee, sinon deux groupes plus courts, sinon (mot seul) taille reduite
     par paliers ; un mot seul qui ne tient pas est une erreur."""
-    upper = bool(settings["letterbox_uppercase"])
+    upper = style.uppercase
     lines = _layout(units, size, box, upper)
     if lines:
         return [(lines, size)]
     if len(units) > 1:
         half = (len(units) + 1) // 2
-        return _place(units[:half], size, box, settings, where) + _place(units[half:], size, box, settings, where)
-    for smaller in _sizes_below(size, settings):
+        return _place(units[:half], size, box, style, where) + _place(units[half:], size, box, style, where)
+    for smaller in _sizes_below(size, style):
         if box.fits([_line_text(units, upper)], smaller):
             return [([units], smaller)]
     raise SubtitlesError(
         f"{where} : le mot {_line_text(units, upper)!r} ne tient pas dans la zone de sous-titres "
-        f"{box.zone}, meme a letterbox_min_font_size = {settings['letterbox_min_font_size']}"
+        f"{box.zone}, meme a la taille minimale {style.min_font_size}"
     )
 
 
-def _render_letterbox(
+def _render_positioned(
     words: list[dict[str, Any]],
     clip_start: float,
     settings: dict[str, Any],
+    style: _Style,
     emphasis: set[int],
+    emphasis_color: str,
     zone: dict[str, int],
     where: str,
 ) -> str:
-    box = _Box(zone, settings, where)
-    size = int(settings["letterbox_font_size"])
-    upper = bool(settings["letterbox_uppercase"])
+    """Texte positionne dans ``zone`` (letterbox ou split, SPEC-76dc) : le
+    mot d'indice dans ``emphasis`` est dessine dans ``emphasis_color``
+    pendant sa propre duree (letterbox : les quelques mots choisis par le
+    LLM ; split : chaque mot, son propre "mot en cours")."""
+    box = _Box(zone, style, where)
+    size = style.font_size
     index = {id(w): i for i, w in enumerate(words)}
     margin_r = PLAY_RES_X - zone["x1"]
 
     events = []
-    for group in _group_words(words, int(settings["min_words_per_group"]),
-                              int(settings["letterbox_max_words_per_group"])):
-        for lines, em in _place(_units(group), size, box, settings, where):
+    for group in _group_words(words, int(settings["min_words_per_group"]), style.max_words_per_group):
+        for lines, em in _place(_units(group), size, box, style, where):
             first = lines[0][0][0]
             last = lines[-1][-1][-1]
             start = _format_timestamp(first["start"] - clip_start)
@@ -551,8 +683,8 @@ def _render_letterbox(
                 prev_end = first["start"]
                 runs = []
                 for j, w in enumerate(word for unit in line for word in unit):
-                    text = w["word"].upper() if upper else w["word"]
-                    runs.append(_karaoke_run(w, prev_end, index[id(w)] in emphasis, settings,
+                    text = w["word"].upper() if style.uppercase else w["word"]
+                    runs.append(_karaoke_run(w, prev_end, index[id(w)] in emphasis, emphasis_color,
                                              text=text.lstrip() if j == 0 else text,
                                              reset=f"{{\\r{fs}}}"))
                     prev_end = w["end"]
@@ -563,26 +695,129 @@ def _render_letterbox(
                     f"{zone['y0'] + box.offset + i * box.step(em)},,{{\\q2\\an8{fs}}}{''.join(runs)}"
                 )
 
-    style = (
-        "Style: Default,{font},{size},{primary},{secondary},{outline_color},&H00000000,"
-        "0,0,0,0,100,100,0,0,1,{outline},0,8,{margin_l},{margin_r},{margin_v},1"
+    style_line = (
+        "Style: Default,{font},{size},{primary},{secondary},{outline_color},{back},"
+        "0,0,0,0,100,100,0,0,1,{outline},{shadow},8,{margin_l},{margin_r},{margin_v},1"
     ).format(
-        font=settings["font_name"],
+        font=style.font_name,
         size=libass_font_size(size),
-        primary=settings["primary_color"],
-        secondary=settings["secondary_color"],
-        outline_color=settings["outline_color"],
+        primary=style.primary_color,
+        secondary=style.secondary_color,
+        outline_color=style.outline_color,
+        back=style.back_color,
         outline=box.outline,
+        shadow=style.shadow,
         margin_l=zone["x0"],
         margin_r=margin_r,
         margin_v=zone["y0"],
     )
-    return _ass_document(style, events, header=LETTERBOX_HEADER + "\n")
+    return _ass_document(style_line, events, header=style.header + "\n")
 
 
-def _is_letterbox_file(path: Path) -> bool:
+def _render_letterbox(
+    words: list[dict[str, Any]],
+    clip_start: float,
+    settings: dict[str, Any],
+    emphasis: set[int],
+    zone: dict[str, int],
+    where: str,
+) -> str:
+    return _render_positioned(
+        words, clip_start, settings, _letterbox_style(settings), emphasis, str(settings["emphasis_color"]),
+        zone, where,
+    )
+
+
+def _render_split(
+    words: list[dict[str, Any]],
+    clip_start: float,
+    settings: dict[str, Any],
+    zone: dict[str, int],
+    where: str,
+) -> str:
+    """Style split (SPEC-76dc) : le mot en train d'etre prononce est mis en
+    valeur (``split_current_word_color``) SEULEMENT pendant sa propre duree,
+    les autres restant ``split_text_color`` (avant et apres) -- contrairement
+    a l'emphase letterbox (``\\c`` statique pour toute la duree d'affichage
+    du groupe), il faut donc deux calques ASS par ligne : le texte de base
+    (toute la duree du groupe, ``split_text_color``) et, superpose par-dessus
+    en ``\\pos`` a la meme place, un evenement par mot dont le Start/End ASS
+    est la propre duree du mot (``split_current_word_color``). Jamais
+    d'appel LLM (pas une emphase choisie, chaque mot a son tour)."""
+    style = _split_style(settings)
+    current_color = _ass_color(str(settings["split_current_word_color"]))
+    box = _Box(zone, style, where)
+    size = style.font_size
+    zx0, _zy0, zx1, _zy1 = (zone[k] for k in _ZONE_KEYS)
+    zone_w = zx1 - zx0
+    margin_r = PLAY_RES_X - zx1
+
+    events: list[str] = []
+    for group in _group_words(words, int(settings["min_words_per_group"]), style.max_words_per_group):
+        for lines, em in _place(_units(group), size, box, style, where):
+            font = _pil_font(str(FONT_FILE), em)
+            fs = "" if em == size else f"\\fs{libass_font_size(em)}"
+            for i, line_units in enumerate(lines):
+                unit_texts = [_unit_text(u, style.uppercase) for u in line_units]
+                unit_texts[0] = unit_texts[0].lstrip()
+                line_text_str = "".join(unit_texts)
+                line_x0 = zx0 + (zone_w - font.getlength(line_text_str)) / 2
+                top_y = zone["y0"] + box.offset + i * box.step(em)
+                g_start = _format_timestamp(line_units[0][0]["start"] - clip_start)
+                g_end = _format_timestamp(line_units[-1][-1]["end"] - clip_start)
+                events.append(
+                    f"Dialogue: {2 * i},{g_start},{g_end},Default,,{zx0},{margin_r},{top_y},,"
+                    f"{{\\q2\\an7\\pos({line_x0:.2f},{top_y}){fs}}}{line_text_str}"
+                )
+                cursor = 0.0
+                for unit, utext in zip(line_units, unit_texts):
+                    # le calque de surbrillance est un evenement ASS a part
+                    # (Text) pour chaque mot : un espace de tete y serait
+                    # rogne par libass (contrairement a la ligne de base, un
+                    # seul champ Text continu) -- avance separement, dessine
+                    # seulement le texte visible.
+                    stripped = utext.lstrip()
+                    cursor += font.getlength(utext) - font.getlength(stripped)
+                    u_start = _format_timestamp(unit[0]["start"] - clip_start)
+                    u_end = _format_timestamp(unit[-1]["end"] - clip_start)
+                    events.append(
+                        f"Dialogue: {2 * i + 1},{u_start},{u_end},Default,,{zx0},{margin_r},{top_y},,"
+                        f"{{\\q2\\an7\\pos({line_x0 + cursor:.2f},{top_y}){fs}\\c{current_color}}}{stripped}"
+                    )
+                    cursor += font.getlength(stripped)
+
+    style_line = (
+        "Style: Default,{font},{size},{primary},{secondary},{outline_color},{back},"
+        "0,0,0,0,100,100,0,0,1,{outline},{shadow},7,{margin_l},{margin_r},{margin_v},1"
+    ).format(
+        font=style.font_name,
+        size=libass_font_size(size),
+        primary=style.primary_color,
+        secondary=style.secondary_color,
+        outline_color=style.outline_color,
+        back=style.back_color,
+        outline=box.outline,
+        shadow=style.shadow,
+        margin_l=zx0,
+        margin_r=margin_r,
+        margin_v=zone["y0"],
+    )
+    return _ass_document(style_line, events, header=SPLIT_HEADER + "\n")
+
+
+def _file_style(path: Path) -> str:
+    """Format d'un .ass deja ecrit : "letterbox", "split" (SPEC-76dc) ou
+    "recadre" (sans en-tete, format karaoke recadre)."""
     with path.open(encoding="utf-8") as f:
-        return f.readline().rstrip("\r\n") == LETTERBOX_HEADER
+        first = f.readline().rstrip("\r\n")
+    if first == LETTERBOX_HEADER:
+        return "letterbox"
+    if first == SPLIT_HEADER:
+        return "split"
+    return "recadre"
+
+
+_STYLES = ("letterbox", "split")
 
 
 def generate(
@@ -597,13 +832,19 @@ def generate(
     avoid_zones: list[dict[str, Any]] | None = None,
     reserved_zones: list[dict[str, Any]] | None = None,
     text_zone: dict[str, int] | None = None,
+    style: str = "letterbox",
 ) -> Path:
     """Genere workspace/<video_id>/subtitles/<clip_id>.ass pour [start, end]
     et renvoie ce chemin. Un .ass deja present n'est pas refait (ADR-b16b),
     sauf ``force`` ; s'il est d'un autre format que celui demande, c'est une
     erreur. ``avoid_zones`` (visages) et ``reserved_zones`` (accroche), ou
-    ``text_zone`` (format letterbox) : voir la docstring du module."""
+    ``text_zone`` (format letterbox ou split selon ``style``, SPEC-76dc) :
+    voir la docstring du module. ``style`` n'a d'effet qu'avec ``text_zone`` ;
+    le style split ne fait jamais appel a un LLM (chaque mot est "en cours"
+    a son propre instant, pas une emphase choisie)."""
     where = f"{video_id}/{clip_id}"
+    if style not in _STYLES:
+        raise SubtitlesError(f"{where} : style de sous-titres inconnu {style!r} (attendu : {' | '.join(_STYLES)})")
     letterbox = text_zone is not None
     if letterbox:
         if avoid_zones or reserved_zones:
@@ -612,11 +853,12 @@ def generate(
 
     video_dir = Path(workspace_dir) / video_id
     out = video_dir / "subtitles" / f"{clip_id}.ass"
+    wanted_style = style if letterbox else "recadre"
     if out.exists() and not force:
-        if _is_letterbox_file(out) != letterbox:
-            found, wanted = ("letterbox", "recadre") if not letterbox else ("recadre", "letterbox")
+        found_style = _file_style(out)
+        if found_style != wanted_style:
             raise SubtitlesError(
-                f"{out} est au format {found}, format {wanted} demande : relancer avec --force"
+                f"{out} est au format {found_style}, format {wanted_style} demande : relancer avec --force"
             )
         return out
 
@@ -628,13 +870,15 @@ def generate(
     settings = _settings(config)
     words = _words_in_interval(transcript, start, end)
 
-    emphasis = _ask_emphasis(words, config) if settings["emphasis"] else set()
-
-    if letterbox:
-        ass_text = _render_letterbox(words, start, settings, emphasis, text_zone, where)
+    if letterbox and style == "split":
+        ass_text = _render_split(words, start, settings, text_zone, where)
     else:
-        ass_text = _render_ass(words, start, settings, emphasis, avoid_zones or [],
-                               reserved_zones or [], where)
+        emphasis = _ask_emphasis(words, config) if settings["emphasis"] else set()
+        if letterbox:
+            ass_text = _render_letterbox(words, start, settings, emphasis, text_zone, where)
+        else:
+            ass_text = _render_ass(words, start, settings, emphasis, avoid_zones or [],
+                                   reserved_zones or [], where)
 
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_suffix(".ass.tmp")

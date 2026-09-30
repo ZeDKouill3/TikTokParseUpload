@@ -1940,3 +1940,291 @@ def test_render_multipart_with_cta_still_draws_partie_n_during_the_end_card(
 
     data = json.loads((tmp_path / "output" / VIDEO_ID / f"{CLIP_ID}.json").read_text(encoding="utf-8"))
     assert data["cta"] is True
+
+
+# --------------------------------------------------------------------------
+# Agencement stream split (SPEC-76dc) : webcam en haut, jeu en bas, badge de
+# chaine optionnel, titre desactivable (title_enabled, nouveau reglage).
+# --------------------------------------------------------------------------
+
+SPLIT_BADGE_ZONE = {"x0": 330, "y0": 590, "x1": 750, "y1": 690}
+SPLIT_SUBTITLES_ZONE = {"x0": 150, "y0": 710, "x1": 930, "y1": 860}
+WEBCAM_RECT = {"x": 20, "y": 0, "w": 1040, "h": 640}
+SPLIT_GAMEPLAY_RECT = {"x": 0, "y": 640, "w": 1080, "h": 1280}
+
+
+def _reframe_json_stream_split(with_title=False):
+    """Plan stream_split tel que l'ecrit reframe (SPEC-76dc) : webcam en
+    haut, jeu en bas, aucun ne se chevauche ; pas de zone title par defaut
+    (split_webcam_dest.y = 0 ne laisse pas de place au-dessus)."""
+    panels = [
+        _panel("webcam", 1400, 40, 500, 308, dict(WEBCAM_RECT)),
+        _panel("gameplay", 0, 0, 911, 1080, dict(SPLIT_GAMEPLAY_RECT)),
+    ]
+    plan = {
+        "index": 0, "start": 1.0, "end": 3.5, "image": None, "llm": None, "layout": "stream_split",
+        "reason": None, "faces": [], "panels": panels,
+    }
+    zones = {"badge": dict(SPLIT_BADGE_ZONE), "subtitles": dict(SPLIT_SUBTITLES_ZONE), "part": dict(PART_ZONE)}
+    if with_title:
+        zones["title"] = dict(STREAM_TITLE_ZONE)
+    return {
+        "video_id": VIDEO_ID, "clip_id": CLIP_ID, "start": 1.0, "end": 3.5,
+        "source": {"width": SRC_W, "height": SRC_H}, "output": {"width": OUT_W, "height": OUT_H},
+        "layout": "stream_split", "format": "letterbox", "layout_mode": "stream_auto", "layout_reason": None,
+        "facecam": {"x": 1400, "y": 40, "w": 500, "h": 308},
+        "text_zones": zones,
+        "plans": [plan],
+    }
+
+
+@pytest.fixture
+def stream_split_dir(video_dir):
+    (video_dir / "reframe" / f"{CLIP_ID}.json").write_text(
+        json.dumps(_reframe_json_stream_split()), encoding="utf-8")
+    return video_dir
+
+
+def test_split_render_defaults_are_present_and_unchanged_by_default():
+    from clipper.render import CONFIG_DEFAULTS
+
+    assert CONFIG_DEFAULTS["title_enabled"] is True
+    assert CONFIG_DEFAULTS["badge_enabled"] is False
+    assert CONFIG_DEFAULTS["badge_logo"] == ""
+    assert CONFIG_DEFAULTS["badge_name"] == ""
+    assert CONFIG_DEFAULTS["badge_logo_size"] == 100
+    assert CONFIG_DEFAULTS["badge_glyph_scale"] == 0.65
+
+
+def test_stream_split_filter_overlays_webcam_and_gameplay_without_a_title(tmp_path, video_dir):
+    from clipper.render import CONFIG_DEFAULTS, _build_filter_complex
+
+    filt, _label = _build_filter_complex(
+        _reframe_json_stream_split(), 1.0, 3.5, video_dir / "subtitles" / f"{CLIP_ID}.ass", None, None, tmp_path,
+        CONFIG_DEFAULTS,
+    )
+    parts = filt.split(";")
+    assert any("crop=w='500':h='308':x='1400':y='40'" in f for f in parts)
+    assert any(f.endswith("scale=1040:640[p0_0s]") for f in parts)
+    assert any("overlay=x=20:y=0" in f for f in parts)
+    assert any("crop=w='911':h='1080':x='0':y='0'" in f for f in parts)
+    assert any(f.endswith("scale=1080:1280[p0_1s]") for f in parts)
+    assert any("overlay=x=0:y=640" in f for f in parts)
+    assert "[1:v]overlay" not in filt  # pas de titre sans title_input
+
+
+def test_stream_split_render_without_title_zone_and_title_disabled_succeeds(
+    tmp_path, stream_split_dir, fake_ffmpeg, cpu_device
+):
+    from clipper.render import render
+
+    (stream_split_dir / f"{VIDEO_ID}.mp4").write_bytes(b"")
+    render(VIDEO_ID, CLIP_ID, workspace_dir=stream_split_dir.parent, output_dir=tmp_path / "output",
+           config=make_config(title_enabled=False))
+
+    cmd = fake_ffmpeg[0]["cmd"]
+    inputs = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-i"]
+    assert not any(i.endswith("title.png") for i in inputs)
+    data = json.loads((tmp_path / "output" / VIDEO_ID / f"{CLIP_ID}.json").read_text(encoding="utf-8"))
+    assert data["layout"] == "stream_split"
+    assert data["webcam_rect"] == WEBCAM_RECT
+    assert data["video_rect"] == SPLIT_GAMEPLAY_RECT
+
+
+def test_stream_split_title_enabled_without_a_title_zone_is_an_explicit_error(
+    tmp_path, stream_split_dir, fake_ffmpeg
+):
+    from clipper.render import RenderError, render
+
+    (stream_split_dir / f"{VIDEO_ID}.mp4").write_bytes(b"")
+    with pytest.raises(RenderError, match="title"):
+        render(VIDEO_ID, CLIP_ID, workspace_dir=stream_split_dir.parent, output_dir=tmp_path / "output",
+               config=make_config())  # title_enabled par defaut = true
+    assert fake_ffmpeg == []
+
+
+def test_stream_split_render_with_title_enabled_and_a_title_zone_draws_it(
+    tmp_path, video_dir, fake_ffmpeg, cpu_device
+):
+    from clipper.render import render
+
+    (video_dir / "reframe" / f"{CLIP_ID}.json").write_text(
+        json.dumps(_reframe_json_stream_split(with_title=True)), encoding="utf-8")
+    (video_dir / f"{VIDEO_ID}.mp4").write_bytes(b"")
+    render(VIDEO_ID, CLIP_ID, workspace_dir=video_dir.parent, output_dir=tmp_path / "output", config=make_config())
+
+    cmd = fake_ffmpeg[0]["cmd"]
+    inputs = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-i"]
+    assert inputs[1].endswith("title.png")
+
+
+@pytest.mark.parametrize("missing", ["webcam", "gameplay"])
+def test_stream_split_without_webcam_or_gameplay_panel_asks_to_rerun_reframe(
+    tmp_path, stream_split_dir, fake_ffmpeg, missing
+):
+    from clipper.render import RenderError, render
+
+    (stream_split_dir / f"{VIDEO_ID}.mp4").write_bytes(b"")
+    reframe = _reframe_json_stream_split()
+    reframe["plans"][0]["panels"] = [p for p in reframe["plans"][0]["panels"] if p["name"] != missing]
+    (stream_split_dir / "reframe" / f"{CLIP_ID}.json").write_text(json.dumps(reframe), encoding="utf-8")
+    with pytest.raises(RenderError, match=missing):
+        render(VIDEO_ID, CLIP_ID, workspace_dir=stream_split_dir.parent, output_dir=tmp_path / "output",
+               config=make_config(title_enabled=False))
+    assert fake_ffmpeg == []
+
+
+# --------------------------------------------------------------------------
+# Badge de chaine (SPEC-76dc) : logo + nom sur fond noir, requiert une zone
+# badge (donc l'agencement stream split), jamais a moitie active.
+# --------------------------------------------------------------------------
+
+
+def _write_logo(path, size=(64, 64)):
+    from PIL import Image
+
+    Image.new("RGBA", size, (255, 0, 0, 255)).save(path)
+
+
+def test_badge_enabled_without_logo_is_an_explicit_error(tmp_path, stream_split_dir, fake_ffmpeg):
+    from clipper.render import RenderError, render
+
+    (stream_split_dir / f"{VIDEO_ID}.mp4").write_bytes(b"")
+    with pytest.raises(RenderError, match="badge_logo"):
+        render(VIDEO_ID, CLIP_ID, workspace_dir=stream_split_dir.parent, output_dir=tmp_path / "output",
+               config=make_config(title_enabled=False, badge_enabled=True, badge_name="Exemple"))
+    assert fake_ffmpeg == []
+
+
+def test_badge_enabled_without_name_is_an_explicit_error(tmp_path, stream_split_dir, fake_ffmpeg):
+    from clipper.render import RenderError, render
+
+    logo = tmp_path / "logo.png"
+    _write_logo(logo)
+    (stream_split_dir / f"{VIDEO_ID}.mp4").write_bytes(b"")
+    with pytest.raises(RenderError, match="badge_name"):
+        render(VIDEO_ID, CLIP_ID, workspace_dir=stream_split_dir.parent, output_dir=tmp_path / "output",
+               config=make_config(title_enabled=False, badge_enabled=True, badge_logo=str(logo)))
+    assert fake_ffmpeg == []
+
+
+def test_badge_enabled_with_a_missing_logo_file_is_an_explicit_error(tmp_path, stream_split_dir, fake_ffmpeg):
+    from clipper.render import RenderError, render
+
+    (stream_split_dir / f"{VIDEO_ID}.mp4").write_bytes(b"")
+    with pytest.raises(RenderError, match="introuvable"):
+        render(VIDEO_ID, CLIP_ID, workspace_dir=stream_split_dir.parent, output_dir=tmp_path / "output",
+               config=make_config(title_enabled=False, badge_enabled=True,
+                                  badge_logo=str(tmp_path / "absent.png"), badge_name="Exemple"))
+    assert fake_ffmpeg == []
+
+
+def test_badge_enabled_on_a_layout_without_a_badge_zone_is_an_explicit_error(
+    tmp_path, letterbox_dir, fake_ffmpeg
+):
+    from clipper.render import RenderError, render
+
+    logo = tmp_path / "logo.png"
+    _write_logo(logo)
+    (letterbox_dir / f"{VIDEO_ID}.mp4").write_bytes(b"")
+    with pytest.raises(RenderError, match="badge"):
+        render(VIDEO_ID, CLIP_ID, workspace_dir=letterbox_dir.parent, output_dir=tmp_path / "output",
+               config=make_config(badge_enabled=True, badge_logo=str(logo), badge_name="Exemple"))
+    assert fake_ffmpeg == []
+
+
+def test_badge_enabled_draws_the_logo_and_name_and_is_included_as_an_ffmpeg_input(
+    tmp_path, stream_split_dir, fake_ffmpeg, cpu_device
+):
+    from clipper.render import render
+
+    logo = tmp_path / "logo.png"
+    _write_logo(logo)
+    (stream_split_dir / f"{VIDEO_ID}.mp4").write_bytes(b"")
+    render(VIDEO_ID, CLIP_ID, workspace_dir=stream_split_dir.parent, output_dir=tmp_path / "output",
+           config=make_config(title_enabled=False, badge_enabled=True, badge_logo=str(logo),
+                              badge_name="Exemple"))
+
+    cmd = fake_ffmpeg[0]["cmd"]
+    inputs = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-i"]
+    assert any(i.endswith("badge.png") for i in inputs)
+    filt = cmd[cmd.index("-filter_complex") + 1]
+    assert f"overlay=x={SPLIT_BADGE_ZONE['x0']}:y={SPLIT_BADGE_ZONE['y0']}" in filt
+
+
+def test_badge_png_draws_a_black_square_logo_and_the_measured_name(tmp_path):
+    from PIL import Image
+
+    from clipper.render import CONFIG_DEFAULTS, badge_png
+
+    logo = tmp_path / "logo.png"
+    _write_logo(logo, size=(64, 64))
+    out = tmp_path / "badge.png"
+    zone = {"x0": 0, "y0": 0, "x1": 420, "y1": 100}
+    badge_png(logo, "Exemple", zone, CONFIG_DEFAULTS, out)
+
+    img = Image.open(out).convert("RGBA")
+    assert img.size == (420, 100)
+    # fond noir opaque loin du glyphe (coin haut-gauche)
+    assert img.getpixel((2, 2))[:3] == (0, 0, 0)
+    # le glyphe (logo rouge) est bien present quelque part dans le carre
+    square = int(CONFIG_DEFAULTS["badge_logo_size"])
+    reds = [img.getpixel((x, y)) for x in range(square) for y in range(100) if img.getpixel((x, y))[0] > 200]
+    assert reds
+    # du texte (blanc) a droite du carre
+    whites = [
+        img.getpixel((x, y)) for x in range(square + 20, 420) for y in range(100)
+        if img.getpixel((x, y))[:3] == (255, 255, 255)
+    ]
+    assert whites
+
+
+def test_badge_png_missing_logo_file_is_an_explicit_error(tmp_path):
+    from clipper.render import CONFIG_DEFAULTS, RenderError, badge_png
+
+    zone = {"x0": 0, "y0": 0, "x1": 420, "y1": 100}
+    with pytest.raises(RenderError, match="introuvable"):
+        badge_png(tmp_path / "absent.png", "Exemple", zone, CONFIG_DEFAULTS, tmp_path / "badge.png")
+
+
+def test_badge_png_name_too_long_is_an_explicit_error(tmp_path):
+    from clipper.render import CONFIG_DEFAULTS, RenderError, badge_png
+
+    logo = tmp_path / "logo.png"
+    _write_logo(logo)
+    zone = {"x0": 0, "y0": 0, "x1": 150, "y1": 100}  # trop etroit pour le nom
+    with pytest.raises(RenderError):
+        badge_png(logo, "Un nom de chaine bien trop long pour ce bandeau", zone, CONFIG_DEFAULTS,
+                  tmp_path / "badge.png")
+
+
+def test_badge_replaces_the_cta_handle_pseudo_when_both_are_enabled(tmp_path, stream_split_dir, fake_ffmpeg):
+    from clipper.render import render
+
+    logo = tmp_path / "logo.png"
+    _write_logo(logo)
+    (stream_split_dir / "reframe" / f"{CLIP_ID}.json").write_text(
+        json.dumps(_reframe_json_stream_split(with_title=True)), encoding="utf-8")
+    (stream_split_dir / f"{VIDEO_ID}.mp4").write_bytes(b"")
+    # pseudo bien trop long pour la zone title -> echouerait si badge ne le
+    # remplacait pas (SPEC-76dc : le badge remplace le pseudo, jamais les deux).
+    long_handle = "twitch.tv/" + "x" * 200
+    render(VIDEO_ID, CLIP_ID, workspace_dir=stream_split_dir.parent, output_dir=tmp_path / "output",
+           config=make_config(cta_enabled=True, cta_handle=long_handle, cta_seconds=1.0,
+                              badge_enabled=True, badge_logo=str(logo), badge_name="Exemple"))
+    cmd = fake_ffmpeg[0]["cmd"]
+    inputs = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-i"]
+    assert any(i.endswith("badge.png") for i in inputs)
+    data = json.loads((tmp_path / "output" / VIDEO_ID / f"{CLIP_ID}.json").read_text(encoding="utf-8"))
+    assert data["cta"] is True  # la carte de fin n'est pas affectee
+
+
+def test_cta_handle_without_a_pseudo_anchor_is_an_explicit_error(tmp_path, stream_split_dir, fake_ffmpeg):
+    from clipper.render import RenderError, render
+
+    (stream_split_dir / f"{VIDEO_ID}.mp4").write_bytes(b"")
+    with pytest.raises(RenderError, match="ancre"):
+        render(VIDEO_ID, CLIP_ID, workspace_dir=stream_split_dir.parent, output_dir=tmp_path / "output",
+               config=make_config(title_enabled=False, cta_enabled=True, cta_handle="twitch.tv/exemple",
+                                  cta_seconds=1.0))
+    assert fake_ffmpeg == []

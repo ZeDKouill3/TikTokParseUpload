@@ -189,6 +189,28 @@ CONFIG_DEFAULTS: dict[str, object] = {
     # (titre d'ecran au-dessus) ; le jeu occupe tout le bas.
     "stream_camera_ratio": 0.4,
     "stream_top": 440,
+    # Agencement d'un clip deja en stream (SPEC-76dc) : n'intervient qu'apres
+    # les regles 1/2 ci-dessus (aucun effet sur le choix stream/letterbox
+    # lui-meme). "top" (defaut, comportement inchange) = SPEC-3a88 ci-dessus.
+    # "split" = webcam en haut (~1/3 de la hauteur), jeu en bas pleine largeur,
+    # badge de chaine optionnel, sous-titres a deux couleurs (voir
+    # clipper.subtitles split_*).
+    "stream_variant": "top",
+    # Zones de sortie de l'agencement split (SPEC-76dc), en pixels du canevas
+    # 1080x1920 : webcam agrandie en haut, jeu en bas pleine largeur. Chacune
+    # est recadree (jamais etiree) au ratio de son rectangle dest ; doivent
+    # tenir dans le canevas et ne jamais se chevaucher (erreur explicite au
+    # chargement sinon, ADR-ad2e).
+    "split_webcam_dest": {"x": 20, "y": 0, "w": 1040, "h": 640},
+    "split_gameplay_dest": {"x": 0, "y": 640, "w": 1080, "h": 1280},
+    # Bandeau de badge de chaine (logo + nom, [render] badge_*), a cheval par
+    # defaut sur la jonction webcam/jeu. Doit tenir dans la zone sure TikTok
+    # (erreur explicite sinon).
+    "badge_dest": {"x": 330, "y": 590, "w": 420, "h": 100},
+    # Zone des sous-titres de l'agencement split (clipper.subtitles split_*),
+    # entierement dans la zone jeu, sans jamais recouvrir le badge. Doit
+    # tenir dans la zone sure TikTok (erreur explicite sinon).
+    "split_subtitle_dest": {"x": 150, "y": 710, "w": 780, "h": 150},
     # Le jeu est la plus grande fenetre, au format de son panneau, la plus
     # centree possible, qui evite la facecam elargie de cette marge (px source :
     # le cadre reel de la facecam deborde le rectangle centre sur le visage).
@@ -289,6 +311,7 @@ LAYOUTS = ("facecam_gameplay", "single")
 _FALLBACKS = ("auto", "blur")
 _FORMATS = ("letterbox", "crop")
 _LAYOUT_MODES = ("letterbox", "stream_auto")
+_STREAM_VARIANTS = ("top", "split")
 
 LAYOUT_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -1776,6 +1799,153 @@ def _reframe_stream(
 
 
 # --------------------------------------------------------------------------
+# Agencement stream split (SPEC-76dc) : webcam en haut, jeu en bas, tous
+# deux recadres (jamais etires) au ratio de leur rectangle dest.
+# --------------------------------------------------------------------------
+
+
+def _crop_to_ratio(box: Box, aspect: float) -> Box:
+    """``box`` rogne symetriquement autour de son centre pour atteindre
+    ``aspect`` (largeur/hauteur) : jamais etire, jamais agrandi."""
+    x0, y0, x1, y1 = box
+    w, h = x1 - x0, y1 - y0
+    if w / h > aspect:
+        new_w = h * aspect
+        dx = (w - new_w) / 2
+        return x0 + dx, y0, x1 - dx, y1
+    new_h = w / aspect
+    dy = (h - new_h) / 2
+    return x0, y0 + dy, x1, y1 - dy
+
+
+def _split_webcam_rect(facecam_rect: dict[str, int], dest: dict[str, Any]) -> dict[str, int]:
+    """Rectangle source de la webcam : le rectangle deja localise
+    (``facecam_rect``), rogne au ratio de ``dest`` en le centrant sur lui
+    (SPEC-76dc, agencement split)."""
+    box = (
+        float(facecam_rect["x"]), float(facecam_rect["y"]),
+        float(facecam_rect["x"] + facecam_rect["w"]), float(facecam_rect["y"] + facecam_rect["h"]),
+    )
+    x0, y0, x1, y1 = _crop_to_ratio(box, float(dest["w"]) / float(dest["h"]))
+    x0, y0, x1, y1 = round(x0), round(y0), round(x1), round(y1)
+    return {"x": x0, "y": y0, "w": max(1, x1 - x0), "h": max(1, y1 - y0)}
+
+
+def _split_gameplay_rect(
+    source_w: int, source_h: int, dest: dict[str, Any], webcam_source: dict[str, int]
+) -> tuple[dict[str, int], str | None]:
+    """Rectangle source du jeu : la plus grande fenetre au ratio de ``dest``
+    (pleine hauteur en general), centree dans la largeur qui reste une fois
+    la colonne de la webcam exclue quand c'est possible ; sinon centree dans
+    l'image entiere, avec une note (repli silencieux accepte, SPEC-76dc)."""
+    ww, wh = _window(source_w, source_h, float(dest["w"]) / float(dest["h"]))
+    ex0, ex1 = webcam_source["x"], webcam_source["x"] + webcam_source["w"]
+    left_w, right_w = ex0, source_w - ex1
+    note = None
+    if left_w >= ww and left_w >= right_w:
+        x = round((left_w - ww) / 2)
+    elif right_w >= ww:
+        x = ex1 + round((right_w - ww) / 2)
+    else:
+        x = round((source_w - ww) / 2)
+        note = (
+            f"jeu recadre au centre ({ww}x{wh}) : la zone webcam ({webcam_source}) ne laisse pas assez de "
+            f"largeur pour l'exclure (gauche {left_w}px, droite {right_w}px, {ww}px requis)"
+        )
+    y = round((source_h - wh) / 2)
+    return {"x": x, "y": y, "w": ww, "h": wh}, note
+
+
+def _reframe_stream_split(
+    video_id: str,
+    clip_id: str,
+    start: float,
+    end: float,
+    out: Path,
+    facecam: dict[str, Any],
+    rect: dict[str, int],
+    settings: dict[str, Any],
+) -> Path:
+    """Un seul plan, rectangles figes sur tout le clip : webcam en haut,
+    jeu en bas, tous deux recadres (jamais etires) au ratio de leur
+    rectangle dest (SPEC-76dc) ; aucun suivi ni zoom, comme le format stream
+    'top' (SPEC-3a88 regle 3)."""
+    source_w, source_h = facecam["source"]["width"], facecam["source"]["height"]
+    out_w, out_h = int(settings["output_width"]), int(settings["output_height"])
+    webcam_dest = settings["split_webcam_dest"]
+    gameplay_dest = settings["split_gameplay_dest"]
+    webcam_source = _split_webcam_rect(rect, webcam_dest)
+    gameplay_source, note = _split_gameplay_rect(source_w, source_h, gameplay_dest, webcam_source)
+
+    def panel(name: str, src: dict[str, int], dest: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "name": name,
+            "dest": {"x": dest["x"], "y": dest["y"], "w": dest["w"], "h": dest["h"]},
+            "rects": [{"start": start, "end": end, **src}],
+        }
+
+    panels = [panel("webcam", webcam_source, webcam_dest), panel("gameplay", gameplay_source, gameplay_dest)]
+
+    safe_left, safe_right = int(settings["safe_left"]), int(settings["safe_right"])
+    safe_top, safe_bottom = int(settings["safe_top"]), int(settings["safe_bottom"])
+    text_gap, part_height = int(settings["text_gap"]), int(settings["part_height"])
+    badge_dest = settings["badge_dest"]
+    subtitle_dest = settings["split_subtitle_dest"]
+    zones: dict[str, tuple[int, int, int, int]] = {
+        "badge": (badge_dest["x"], badge_dest["y"], badge_dest["x"] + badge_dest["w"], badge_dest["y"] + badge_dest["h"]),
+        "subtitles": (
+            subtitle_dest["x"], subtitle_dest["y"],
+            subtitle_dest["x"] + subtitle_dest["w"], subtitle_dest["y"] + subtitle_dest["h"],
+        ),
+        "part": (safe_left, safe_bottom - part_height, safe_right, safe_bottom),
+    }
+    # Zone titre : reframe ignore [render] title_enabled (une etape ne lit
+    # jamais la config d'une autre, ADR-b16b) ; elle fournit la zone quand la
+    # geometrie le permet (place au-dessus de la webcam), l'omet sinon --
+    # render.py exige alors une erreur explicite s'il doit malgre tout
+    # dessiner un titre (ADR-ad2e).
+    title_bottom = int(webcam_dest["y"]) - text_gap
+    if title_bottom > safe_top:
+        zones["title"] = (safe_left, safe_top, safe_right, title_bottom)
+    for name, (x0, y0, x1, y1) in zones.items():
+        if x0 < 0 or y0 < 0 or x1 > out_w or y1 > out_h:
+            raise ReframeError(f"[reframe] zone {name} de l'agencement split hors cadre : ({x0},{y0})-({x1},{y1})")
+
+    data = {
+        "video_id": video_id,
+        "clip_id": clip_id,
+        "start": start,
+        "end": end,
+        "source": {"width": source_w, "height": source_h},
+        "output": {"width": out_w, "height": out_h},
+        "layout": "stream_split",
+        "format": "letterbox",
+        "layout_mode": settings["layout"],
+        "layout_reason": None,
+        "facecam": dict(rect),
+        "text_zones": {
+            name: {"x0": x0, "y0": y0, "x1": x1, "y1": y1} for name, (x0, y0, x1, y1) in zones.items()
+        },
+        "plans": [{
+            "index": 0,
+            "start": start,
+            "end": end,
+            "image": None,
+            "llm": None,
+            "layout": "stream_split",
+            "reason": note,
+            "faces": [],
+            "panels": panels,
+        }],
+    }
+    log.info(
+        "reframe %s/%s : stream_split, webcam %s, jeu %s", video_id, clip_id, webcam_source, gameplay_source
+    )
+    _write_plan(out, data)
+    return out
+
+
+# --------------------------------------------------------------------------
 # Appel LLM
 # --------------------------------------------------------------------------
 
@@ -1893,7 +2063,63 @@ def _settings(config: Any) -> dict[str, Any]:
         raise ReframeError(f"[reframe] fit_margins invalide {settings['fit_margins']!r} (liste de marges >= 0)")
     if settings["fallback"] not in _FALLBACKS:
         raise ReframeError(f"[reframe] fallback invalide {settings['fallback']!r} (attendu : {' | '.join(_FALLBACKS)})")
+    if settings["stream_variant"] not in _STREAM_VARIANTS:
+        raise ReframeError(
+            f"[reframe] stream_variant inconnu {settings['stream_variant']!r} "
+            f"(attendu : {' | '.join(_STREAM_VARIANTS)})"
+        )
+    if settings["stream_variant"] == "split":
+        _validate_split_geometry(settings)
     return settings
+
+
+def _dest_box(name: str, dest: Any) -> tuple[int, int, int, int]:
+    if not isinstance(dest, dict) or set(dest) != {"x", "y", "w", "h"}:
+        raise ReframeError(f"[reframe] {name} invalide {dest!r} (attendu un rectangle {{x, y, w, h}})")
+    x, y, w, h = dest["x"], dest["y"], dest["w"], dest["h"]
+    if not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (x, y, w, h)) or w <= 0 or h <= 0:
+        raise ReframeError(f"[reframe] {name} invalide {dest!r} (attendu x, y, w, h numeriques, w > 0, h > 0)")
+    return x, y, x + w, y + h
+
+
+def _validate_split_geometry(settings: dict[str, Any]) -> None:
+    """Geometrie de l'agencement split (SPEC-76dc), verifiee des le
+    chargement de la config (ne depend que d'elle, jamais de la source) :
+    webcam/jeu dans le canevas sans se chevaucher, badge/sous-titres dans la
+    zone sure TikTok sans se chevaucher entre eux (ADR-ad2e : jamais un
+    rendu tronque ou chevauchant en silence)."""
+    out_w, out_h = int(settings["output_width"]), int(settings["output_height"])
+    webcam = _dest_box("split_webcam_dest", settings["split_webcam_dest"])
+    gameplay = _dest_box("split_gameplay_dest", settings["split_gameplay_dest"])
+    badge = _dest_box("badge_dest", settings["badge_dest"])
+    subtitles = _dest_box("split_subtitle_dest", settings["split_subtitle_dest"])
+
+    for name, (x0, y0, x1, y1) in (
+        ("split_webcam_dest", webcam), ("split_gameplay_dest", gameplay),
+        ("badge_dest", badge), ("split_subtitle_dest", subtitles),
+    ):
+        if x0 < 0 or y0 < 0 or x1 > out_w or y1 > out_h:
+            raise ReframeError(f"[reframe] {name} deborde du canevas {out_w}x{out_h} : ({x0},{y0})-({x1},{y1})")
+
+    if _rects_overlap(webcam, gameplay):
+        raise ReframeError(
+            f"[reframe] split_webcam_dest {settings['split_webcam_dest']!r} et split_gameplay_dest "
+            f"{settings['split_gameplay_dest']!r} se chevauchent"
+        )
+
+    safe_left, safe_right = int(settings["safe_left"]), int(settings["safe_right"])
+    safe_top, safe_bottom = int(settings["safe_top"]), int(settings["safe_bottom"])
+    for name, (x0, y0, x1, y1) in (("badge_dest", badge), ("split_subtitle_dest", subtitles)):
+        if x0 < safe_left or y0 < safe_top or x1 > safe_right or y1 > safe_bottom:
+            raise ReframeError(
+                f"[reframe] {name} hors de la zone sure TikTok "
+                f"(x {safe_left}-{safe_right}, y {safe_top}-{safe_bottom}) : ({x0},{y0})-({x1},{y1})"
+            )
+    if _rects_overlap(badge, subtitles):
+        raise ReframeError(
+            f"[reframe] badge_dest {settings['badge_dest']!r} et split_subtitle_dest "
+            f"{settings['split_subtitle_dest']!r} se chevauchent"
+        )
 
 
 def _plans(scenes_file: Path, start: float, end: float, fps: float, min_seconds: float) -> list[_Plan]:
@@ -2005,6 +2231,14 @@ def reframe(
                 f"reframe/{clip_id}.json existant calcule avec layout = {existing_mode!r}, config [reframe] "
                 f"demande {settings['layout']!r} : --force pour le recalculer"
             )
+        existing_layout = existing.get("layout")
+        if existing_layout in ("stream", "stream_split"):
+            existing_variant = "split" if existing_layout == "stream_split" else "top"
+            if existing_variant != settings["stream_variant"]:
+                raise ReframeError(
+                    f"reframe/{clip_id}.json existant calcule avec stream_variant = {existing_variant!r}, "
+                    f"config [reframe] demande {settings['stream_variant']!r} : --force pour le recalculer"
+                )
         return out
 
     video = video_dir / f"{video_id}.mp4"
@@ -2018,6 +2252,8 @@ def reframe(
         )
         rect, reason = _clip_facecam(facecam, start, end, settings, video_dir)
         if rect is not None:
+            if settings["stream_variant"] == "split":
+                return _reframe_stream_split(video_id, clip_id, start, end, out, facecam, rect, settings)
             return _reframe_stream(video_id, clip_id, start, end, out, facecam, rect, settings)
         log.info("reframe %s/%s : letterbox, pas de stream (%s)", video_id, clip_id, reason)
         return _reframe_letterbox(

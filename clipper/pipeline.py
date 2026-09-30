@@ -367,8 +367,13 @@ class _Run:
 
     def _subtitles_clip(self, clip: dict[str, Any]) -> None:
         plan = _read_json(self.dir / "reframe" / f"{clip['id']}.json")
-        if plan.get("layout") in ("letterbox", "stream"):
+        layout = plan.get("layout")
+        if layout in ("letterbox", "stream"):
             zones = {"text_zone": subtitles_zone(plan, clip["id"])}
+        elif layout == "stream_split":
+            # SPEC-76dc : style a deux couleurs (mot en cours), jamais les
+            # paliers d'emphase LLM du style letterbox.
+            zones = {"text_zone": subtitles_zone(plan, clip["id"]), "style": "split"}
         else:
             zones = {"avoid_zones": avoid_zones(plan), "reserved_zones": hook_zones(clip, self.config)}
         subtitles.generate(self.video_id, clip["id"], clip["start"], clip["end"], self.ws,
