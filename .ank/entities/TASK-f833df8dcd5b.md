@@ -5,7 +5,7 @@ slug: format-stream-d-cider-par-clip-selon-la-pr-sence
 title: "Format stream : décider par clip selon la présence du rectangle de webcam statique, pas selon la détection de visage"
 created: 2026-09-30T11:07:57Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/reframe.py
   - tests/test_reframe.py
@@ -15,8 +15,15 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/d61f2eb827ce@a0004ad
+    tree: scope/e96dcc424575
+    criteria: ac385635df9e
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---
 
 Remarque utilisateur 2026-09-30 : « la caméra est statique pourtant ». VOD Twitch v2887271276 (Madajel, Silent Hill, webcam 354x252 à gauche, jeu très sombre, casque) : avec facecam_min_share 0.1, facecam localisée {'x': 0, 'y': 346, 'w': 354, 'h': 252} (visage sur 14 % des images clés), mais chaque clip retombe en letterbox : « visage dans la facecam sur 0% des images clés du clip ». Le même réglage facecam_min_share sert aux deux décisions (reframe.py ~l.1446 et ~l.1509). En letterbox, la webcam est coupée et une bande reste au bord gauche : moche.
