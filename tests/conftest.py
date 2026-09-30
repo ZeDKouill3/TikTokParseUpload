@@ -3,7 +3,17 @@ from __future__ import annotations
 import sys
 import types
 
+import cv2
 import pytest
+
+# OpenCV lance par defaut autant de threads internes (Sobel, cvtColor, resize,
+# imread/imencode) que de coeurs logiques. Sous pytest-xdist, chaque worker
+# fait la meme chose : N workers x jusqu'a cv2.getNumThreads() threads natifs
+# sur une machine a 12 coeurs logiques sature largement le CPU, ce qui degrade
+# le passage a l'echelle et starve l'ordonnancement des threads Python des
+# tests bases sur le temps reel (ConcurrencyTracker). Un thread OpenCV par
+# worker laisse la parallelisation reelle a pytest-xdist (process-level).
+cv2.setNumThreads(1)
 
 
 @pytest.fixture

@@ -25,6 +25,7 @@ dependencies = [
 [project.optional-dependencies]
 test = [
     "pytest>=8",
+    "pytest-xdist>=3",
     "httpx",
 ]
 
@@ -46,3 +47,8 @@ override-dependencies = ["opencv-python; sys_platform == 'never'"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "tools"]
+# Suite CPU-bound (ADR-fb9b) : chaque test est isole (tmp_path, llm.use_backend,
+# FakeBackend), donc distribuable sur les coeurs sans etat partage. -n auto
+# borne pytest-xdist au nombre de coeurs logiques detectes par le PC qui lance
+# la commande (os.cpu_count() cote pytest-xdist) : pas de valeur codee en dur.
+addopts = "-n auto"
