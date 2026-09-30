@@ -5,7 +5,7 @@ slug: stabiliser-les-tests-de-concurrence-reelle-concu
 title: Stabiliser les tests de concurrence reelle (ConcurrencyTracker) sous execution parallele
 created: 2026-09-30T19:33:25Z
 author: w-42a46cb23f78
-status: open
+status: closed
 scope:
   - tests/test_qa.py
   - tests/test_vision.py
@@ -17,7 +17,7 @@ criteria_by: creator
 verify: [tests]
 method: diagnose
 schema: 4
-version: 1
+version: 2
 ---
 
 Decouvert en travaillant TASK-42a46cb23f78 (paralleliser la suite via pytest-xdist pour repasser sous 90s). cv2.setNumThreads(1) (voir tests/conftest.py) a deja supprime une bonne partie de la sursouscription (N workers x threads OpenCV), mais un ank done complet a encore vu tests/test_qa.py::test_parallel_four_overlaps_llm_calls echouer une fois sous charge partagee (autres sessions agent actives sur la meme machine). Ces tests de concurrence 'temps reel' restent hors du scope de TASK-42a46cb23f78 (pyproject.toml, tests/conftest.py seulement) : le correctif touche forcement ces fichiers de test eux-memes.
