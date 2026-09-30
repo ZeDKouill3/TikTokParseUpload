@@ -1132,9 +1132,9 @@ def test_existing_letterbox_plan_with_crop_config_is_an_error_without_force(tmp_
 
 
 # --------------------------------------------------------------------------
-# Format stream (SPEC-3a88, TASK-9e0c) : facecam fixe agrandie en haut, jeu en
-# bas ; detection une fois par video sur les images cles de scenes.json,
-# choix par clip tout ou rien, aucun suivi.
+# Format stream (SPEC-8257, succede a SPEC-3a88/TASK-9e0c) : facecam fixe
+# agrandie en haut, jeu en bas ; localisation une fois par video sur les
+# images cles de scenes.json, choix par clip tout ou rien, aucun suivi.
 # --------------------------------------------------------------------------
 
 import cv2  # noqa: E402
@@ -1266,13 +1266,15 @@ def test_stable_facecam_on_90_percent_of_keyframes_gives_a_fixed_rectangle(tmp_p
     assert factory.detectors[0].frames == 20 * 5
 
 
-def test_facecam_on_50_percent_of_keyframes_is_a_motivated_absence(tmp_path, video_dir):
-    write_keyframes(video_dir, pattern(20, 10))
+def test_facecam_on_5_percent_of_keyframes_is_a_motivated_absence(tmp_path, video_dir):
+    # SPEC-8257 regle 1 : seuil de localisation par defaut nettement plus bas
+    # (facecam_localize_min_share = 0.1) que l'ancien facecam_min_share (0.8).
+    write_keyframes(video_dir, pattern(20, 1))
     path, factory = detect(tmp_path)
 
     data = load(path)
     assert data["facecam"] is None
-    assert "50" in data["reason"] and "80" in data["reason"]
+    assert "5" in data["reason"] and "10" in data["reason"]
     assert factory.detectors[0].closed
 
 
@@ -1284,13 +1286,21 @@ def test_face_moving_beyond_the_tolerance_is_not_a_facecam(tmp_path, video_dir):
     assert data["reason"]
 
 
-def test_facecam_tolerance_and_share_are_configurable(tmp_path, video_dir):
-    faces = [(0.5 + k, (100 + 30 * (k % 2), 70, 230 + 30 * (k % 2), 220)) for k in range(20)]
+def test_facecam_tolerance_is_configurable(tmp_path, video_dir):
+    # visage qui derive de 60 px par image cle : hors tolerance par defaut
+    # (40 px, aucune paire ne se recolle), regroupe par une tolerance large.
+    faces = [(0.5 + k, (100 + 60 * k, 70, 230 + 60 * k, 220)) for k in range(20)]
     write_keyframes(video_dir, faces)
-    assert load(detect(tmp_path, facecam_tolerance=10)[0])["facecam"] is None
-    assert load(detect(tmp_path, facecam_tolerance=40, force=True)[0])["facecam"] is not None
-    write_keyframes(video_dir, pattern(20, 12))
-    assert load(detect(tmp_path, facecam_min_share=0.5, force=True)[0])["facecam"] is not None
+    assert load(detect(tmp_path, facecam_tolerance=40)[0])["facecam"] is None
+    assert load(detect(tmp_path, facecam_tolerance=2000, force=True)[0])["facecam"] is not None
+
+
+def test_facecam_localize_min_share_is_configurable(tmp_path, video_dir):
+    # seuil de la regle 1 (SPEC-8257), distinct de celui de la regle 2
+    # (facecam_clip_min_share, teste plus bas).
+    write_keyframes(video_dir, pattern(20, 1))  # visage sur 5 % des images cles
+    assert load(detect(tmp_path)[0])["facecam"] is None  # sous le defaut (10 %)
+    assert load(detect(tmp_path, facecam_localize_min_share=0.05, force=True)[0])["facecam"] is not None
 
 
 def test_stable_face_whose_zone_exceeds_a_quarter_of_the_image_is_not_a_facecam(tmp_path, video_dir):
@@ -1566,36 +1576,126 @@ def test_facecam_detection_is_cached_per_video(tmp_path, video_dir):
     assert len(factory.built) == 2
 
 
-def test_clip_with_face_on_85_percent_of_its_keyframes_is_stream(tmp_path, video_dir):
-    # 20 images cles dans le clip [0, 20] (17 avec visage), 60 autres toutes avec
-    write_keyframes(video_dir, pattern(20, 17) + pattern(60, 60, t0=20.5))
-    out, _ = run_stream(tmp_path, start=0.0, end=20.0)
+# --------------------------------------------------------------------------
+# Presence de la facecam par clip (SPEC-8257 regle 2, succede a la regle 2 de
+# SPEC-3a88) : le format stream d'un clip se decide desormais sur la
+# presence et la vivacite du rectangle lui-meme (contenu non noir, bords
+# retrouves, non fige), plus sur la detection d'un visage dedans -- qui ne
+# sert plus qu'a LOCALISER la facecam une fois par video (regle 1). VOD
+# Twitch v2887271276 (Madajel) : webcam visible tout du long, visage detecte
+# sur 14 % des images cles globales mais 0 % par clip (jeu sombre, casque).
+# --------------------------------------------------------------------------
+
+# Panneau au format exact du panneau camera de sortie (1080 / (1920 * 0.4) =
+# 1080/768 = 45/32) : le rectangle localise colle exactement sur ses bords
+# reels (aucun agrandissement par _size_camera_rect), loin des vignettes de
+# coin (facecam_corner_size = 30 %).
+STREAM_PANEL = (700, 350, 1240, 734)  # 540 x 384
+STREAM_FACE = (
+    STREAM_PANEL[0] + 90, STREAM_PANEL[1] + 40, STREAM_PANEL[0] + 220, STREAM_PANEL[1] + 190,
+)
+
+
+def write_stream_clip_fixture(video_dir, clip_specs, *, panel=STREAM_PANEL, face=STREAM_FACE, seed=0):
+    """Images cles synthetiques : un segment de localisation (100 premieres
+    secondes, hors de tout clip teste ici ; visage stable dans ``panel``,
+    bords nets et constants -- meme esprit que ``write_panel_keyframes``)
+    suivi du segment du clip teste (``clip_specs``, liste de (temps, mode)),
+    SANS aucun visage dessine dedans : verifie que le choix du format par
+    clip ne depend plus de la detection d'un visage (SPEC-8257 regle 2),
+    seulement du contenu du rectangle deja localise. ``mode`` :
+    - "live" : contenu du panneau qui varie a chaque image (bruit
+      reproductible, simule une webcam active sans visage visible) ;
+    - "black" : panneau peint en noir uni (camera coupee ou masquee) ;
+    - "frozen" : panneau identique a l'image cle precedente (ecran de pause,
+      BRB)."""
+    rng = np.random.default_rng(seed)
+    frames_dir = video_dir / "frames"
+    frames_dir.mkdir(exist_ok=True)
+    px0, py0, px1, py1 = panel
+    frames: list[dict] = []
+    index = 0
+
+    def write_frame(t, patch, face_box):
+        nonlocal index
+        image = rng.integers(0, 40, size=(H, W, 3), dtype=np.uint8)
+        image[py0:py1, px0:px1] = patch
+        if face_box is not None:
+            x0, y0, x1, y1 = face_box
+            image[y0:y1, x0:x1] = 255
+        name = f"scene0000_{index:03d}.bmp"
+        (frames_dir / name).write_bytes(cv2.imencode(".bmp", image)[1].tobytes())
+        frames.append({"path": f"frames/{name}", "timecode": t, "scene": 0})
+        index += 1
+        return image[py0:py1, px0:px1].copy()
+
+    for t, box in pattern(20, 20, box=face, t0=100.5):
+        write_frame(t, 90, box)
+
+    prev_patch = None
+    for t, mode in clip_specs:
+        if mode == "black":
+            patch = 0
+        elif mode == "frozen" and prev_patch is not None:
+            patch = prev_patch
+        else:
+            patch = rng.integers(60, 121, size=(py1 - py0, px1 - px0, 3), dtype=np.uint8)
+        prev_patch = write_frame(t, patch, None)
+
+    (video_dir / "scenes.json").write_text(
+        json.dumps({"scenes": [{"start": 0.0, "end": 200.0}], "frames": frames}),
+        encoding="utf-8",
+    )
+
+
+def test_clip_with_a_live_but_faceless_facecam_stays_stream(tmp_path, video_dir):
+    # 20 images cles du clip, rectangle present et vivant partout, aucun
+    # visage dedans (jeu sombre, casque) : reste en stream (SPEC-8257 regle
+    # 2, contrairement a l'ancienne regle basee sur la detection du visage).
+    write_stream_clip_fixture(video_dir, [(0.5 + k, "live") for k in range(20)])
+    out, _ = run_stream(tmp_path)
 
     data = load(out)
     assert data["layout"] == "stream"
     [plan] = data["plans"]
     assert plan["layout"] == "stream"
     facecam = load(video_dir / "facecam.json")["facecam"]
+    assert rect_box(facecam) == STREAM_PANEL  # bords reels retrouves exactement (aspect deja au format camera)
     assert data["facecam"] == facecam
+    # aucun visage detecte dans les images cles du clip lui-meme
+    clip_keys = [k for k in load(video_dir / "facecam.json")["keyframes"] if k["timecode"] < 100.0]
+    assert clip_keys and all(not k["faces"] for k in clip_keys)
     panels = {p["name"]: p for p in plan["panels"]}
     [cam] = panels["camera"]["rects"]
     assert {k: cam[k] for k in "xywh"} == facecam
 
 
-def test_clip_with_face_on_60_percent_of_its_keyframes_stays_letterbox(tmp_path, video_dir, caplog):
-    write_keyframes(video_dir, pattern(20, 12) + pattern(60, 60, t0=20.5))
+def test_clip_with_a_black_facecam_stays_letterbox_with_a_logged_reason(tmp_path, video_dir, caplog):
+    write_stream_clip_fixture(video_dir, [(0.5 + k, "black") for k in range(20)])
     with caplog.at_level("INFO", logger="clipper.reframe"):
-        out, _ = run_stream(tmp_path, start=0.0, end=20.0)
+        out, _ = run_stream(tmp_path)
 
     data = load(out)
     assert data["layout"] == "letterbox"
     assert [p["name"] for p in data["plans"][0]["panels"]] == ["background", "main"]
-    assert "60" in data["layout_reason"]
+    assert "0/20" in data["layout_reason"]
     assert data["layout_reason"] in caplog.text
 
 
+def test_clip_with_a_frozen_facecam_stays_letterbox(tmp_path, video_dir):
+    # ecran de pause / BRB : contenu clair (pas noir) mais fige des la
+    # deuxieme image cle -- ne satisfait pas le critere "vivant".
+    specs = [(0.5, "live")] + [(1.5 + k, "frozen") for k in range(19)]
+    write_stream_clip_fixture(video_dir, specs)
+    out, _ = run_stream(tmp_path)
+
+    data = load(out)
+    assert data["layout"] == "letterbox"
+    assert "fige" in data["layout_reason"] or "figee" in data["layout_reason"]
+
+
 def test_video_without_facecam_stays_letterbox_with_a_logged_reason(tmp_path, video_dir, caplog):
-    write_keyframes(video_dir, pattern(20, 10))
+    write_keyframes(video_dir, pattern(20, 0))  # jamais de visage : pas de facecam a localiser
     with caplog.at_level("INFO", logger="clipper.reframe"):
         out, _ = run_stream(tmp_path, start=0.0, end=20.0)
 
@@ -1670,7 +1770,8 @@ def test_default_layout_is_letterbox_without_facecam_detection(tmp_path, video_d
     from clipper.reframe import CONFIG_DEFAULTS
 
     assert CONFIG_DEFAULTS["layout"] == "letterbox"
-    assert CONFIG_DEFAULTS["facecam_min_share"] == 0.8
+    assert CONFIG_DEFAULTS["facecam_localize_min_share"] == 0.1
+    assert CONFIG_DEFAULTS["facecam_clip_min_share"] == 0.8
     write_keyframes(video_dir, pattern(20, 20))
     out, factory, fake = run(tmp_path, static(), [], format="letterbox", start=0.0, end=20.0)
     assert load(out)["layout"] == "letterbox"

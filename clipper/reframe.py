@@ -95,16 +95,22 @@ CONFIG_DEFAULTS: dict[str, object] = {
     # Mise en page : "letterbox" (zoom fixe, sans visage suivi, defaut) ou
     # "crop" (suivi de visage, option figee, voir le reste de ce module).
     "format": "letterbox",
-    # Format letterbox seulement (SPEC-3a88) : "letterbox" (defaut) ou
-    # "stream_auto" = clip en stream (facecam fixe agrandie en haut, jeu en
-    # bas) si la video a une facecam et que son visage y est sur au moins
-    # facecam_min_share des images cles du clip, sinon letterbox (raison
-    # journalisee). Voir detect_facecam.
+    # Format letterbox seulement (SPEC-8257, succede a SPEC-3a88) :
+    # "letterbox" (defaut) ou "stream_auto" = clip en stream (facecam fixe
+    # agrandie en haut, jeu en bas) si la video a une facecam et que son
+    # rectangle y est present et vivant sur au moins facecam_clip_min_share
+    # des images cles du clip, sinon letterbox (raison journalisee). Voir
+    # detect_facecam et _clip_facecam.
     "layout": "letterbox",
-    # Facecam : visage a la meme position (centre a moins de
-    # facecam_tolerance px) sur au moins facecam_min_share des images cles de
-    # scenes.json, dans une zone de moins de facecam_max_area de l'image.
-    "facecam_min_share": 0.8,
+    # Localisation de la facecam (une fois par video, SPEC-8257 regle 1) :
+    # visage a la meme position (centre a moins de facecam_tolerance px) sur
+    # au moins facecam_localize_min_share des images cles de scenes.json,
+    # dans une zone de moins de facecam_max_area de l'image. Seuil distinct
+    # de, et par defaut bien plus bas que, celui exige par clip
+    # (facecam_clip_min_share ci-dessous) : une facecam est reperee des
+    # qu'un visage y apparait de temps en temps, meme rarement (jeu sombre,
+    # webcam petite, casque).
+    "facecam_localize_min_share": 0.1,
     "facecam_tolerance": 40,
     "facecam_max_area": 0.25,
     # detect_facecam seulement (TASK-493f184c4ce1) : au plus ce nombre
@@ -144,6 +150,41 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "facecam_edge_search_ratio": 3.0,
     "facecam_edge_min_gradient": 30.0,
     "facecam_edge_min_share": 0.8,
+    # Presence de la facecam par clip (SPEC-8257 regle 2) : un clip reste en
+    # stream si le rectangle de la facecam (deja localise) y est present et
+    # vivant sur au moins facecam_clip_min_share de ses images cles, SANS
+    # exiger qu'un visage y soit detecte (webcam petite, jeu sombre, casque,
+    # tete tournee : le visage n'est qu'un indice de localisation, pas une
+    # condition par clip). Un rectangle est present et vivant sur une image
+    # cle quand, a la fois :
+    # (a) son contenu n'est pas noir : luminosite moyenne au moins
+    #     facecam_black_min_mean, ou texture (ecart-type des niveaux de
+    #     gris) au moins facecam_black_min_std ;
+    # (b) ses bords sont retrouves au meme endroit qu'a la localisation
+    #     (meme methode de gradient, facecam_edge_min_gradient) sur au moins
+    #     facecam_clip_edge_min_share d'une paire de cotes opposes
+    #     (gauche/droit ou haut/bas) : le rectangle n'est agrandi que sur un
+    #     seul axe pour tenir le format du panneau camera, l'autre garde le
+    #     bord reel de l'incrustation ; ignoree quand la localisation
+    #     elle-meme n'a trouve aucun bord reel (repli sur le seul visage
+    #     stable, edge_reason non nul dans facecam.json : rien de comparable
+    #     a chercher par image cle) ;
+    # (c) il n'est pas fige : au moins facecam_frozen_min_pixel_share de ses
+    #     pixels different (niveaux de gris, ecart au moins
+    #     facecam_frozen_min_diff pour ecarter le bruit de capteur) de
+    #     l'image cle precedente du meme clip (un ecran de pause immobile ou
+    #     un BRB ne satisfont pas ce critere). Part de pixels plutot que
+    #     moyenne globale : le rectangle est plus grand que la personne qui
+    #     y bouge (marge de stream_face_height), une moyenne diluerait un
+    #     mouvement localise mais reel.
+    # Un clip qui ne l'est pas assez souvent reste entierement en letterbox,
+    # raison journalisee (ADR-ad2e : jamais un repli silencieux).
+    "facecam_clip_min_share": 0.8,
+    "facecam_black_min_mean": 12.0,
+    "facecam_black_min_std": 6.0,
+    "facecam_clip_edge_min_share": 0.5,
+    "facecam_frozen_min_diff": 8.0,
+    "facecam_frozen_min_pixel_share": 0.001,
     # Panneau camera : part de la hauteur de sortie, a partir de stream_top
     # (titre d'ecran au-dessus) ; le jeu occupe tout le bas.
     "stream_camera_ratio": 0.4,
@@ -1380,7 +1421,7 @@ def detect_facecam(
     detector_factory: Callable[[dict[str, Any], Device], Any] | None = None,
     image_reader: Callable[[str], np.ndarray | None] = cv2.imread,
 ) -> Path:
-    """Detection de la facecam, une fois par video (SPEC-3a88 regle 1), sur
+    """Detection de la facecam, une fois par video (SPEC-8257 regle 1), sur
     les images cles de scenes.json ; resultat en cache dans
     workspace/<video_id>/facecam.json (pas refait sauf ``force``) :
 
@@ -1389,8 +1430,13 @@ def detect_facecam(
          "edge_reason": null | pourquoi le rectangle est centre sur le seul
              visage plutot que cale sur les bords reels de l'incrustation
              (TASK-6404, ADR-ad2e),
-         "face": [x0, y0, x1, y1] | null, "share", "min_share",
+         "face": [x0, y0, x1, y1] | null, "share", "localize_min_share",
          "keyframes": [{"timecode", "path", "faces", "face_in_rect"}]}
+
+    ``face_in_rect`` reste un indicateur informatif (visage detecte dans le
+    rectangle sur cette image cle) : le choix du format par clip
+    (``_clip_facecam``, SPEC-8257 regle 2) ne s'appuie plus dessus, seulement
+    sur la presence et la vivacite du rectangle lui-meme.
 
     Detecteur de visages de reframe (``detector``), device via clipper.gpu,
     ferme avant de rendre la main (ADR-fb9b)."""
@@ -1443,7 +1489,7 @@ def detect_facecam(
             detector = None
             gc.collect()
 
-    min_share = float(settings["facecam_min_share"])
+    min_share = float(settings["facecam_localize_min_share"])
     tolerance = float(settings["facecam_tolerance"])
     rect: tuple[int, int, int, int] | None = None
     edge_reason: str | None = None
@@ -1456,7 +1502,7 @@ def detect_facecam(
     elif share < min_share - 1e-9:
         reason = (
             f"visage a la meme position (tolerance {tolerance:g} px) sur {share:.0%} des images cles "
-            f"seulement (facecam_min_share = {min_share:.0%})"
+            f"seulement (facecam_localize_min_share = {min_share:.0%})"
         )
     else:
         assert size is not None and edge_counts is not None
@@ -1479,7 +1525,7 @@ def detect_facecam(
         "edge_reason": edge_reason,
         "face": None if face is None else [round(v, 1) for v in face],
         "share": share,
-        "min_share": min_share,
+        "localize_min_share": min_share,
         "keyframes": keyframes,
     }
     if rect is None:
@@ -1494,25 +1540,123 @@ def detect_facecam(
     return out
 
 
+def _rect_gray_crop(image: np.ndarray, rect: dict[str, int]) -> np.ndarray | None:
+    """Recadrage en niveaux de gris du rectangle de la facecam dans
+    ``image`` ; ``None`` si le rectangle ne recouvre pas l'image."""
+    height, width = image.shape[:2]
+    x, y, w, h = rect["x"], rect["y"], rect["w"], rect["h"]
+    x0, y0, x1, y1 = max(0, x), max(0, y), min(width, x + w), min(height, y + h)
+    if x1 <= x0 or y1 <= y0:
+        return None
+    crop = image[y0:y1, x0:x1]
+    return cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY).astype(np.float64)
+
+
+def _rect_is_black(gray: np.ndarray, settings: dict[str, Any]) -> bool:
+    """Contenu trop sombre et trop uniforme pour etre une webcam active (ecran
+    noir, camera coupee ou masquee) : luminosite ET texture toutes deux sous
+    seuil (SPEC-8257 regle 2a)."""
+    return (
+        float(gray.mean()) < float(settings["facecam_black_min_mean"])
+        and float(gray.std()) < float(settings["facecam_black_min_std"])
+    )
+
+
+def _rect_edges_found(image: np.ndarray, rect: dict[str, int], settings: dict[str, Any]) -> bool:
+    """Bords marques par un gradient fort (meme methode que la localisation,
+    ``_edge_mask``) sur au moins ``facecam_clip_edge_min_share`` d'une paire
+    de cotes opposes (gauche/droit ou haut/bas) -- le rectangle n'est
+    agrandi que sur un seul axe pour tenir le format du panneau camera
+    (``_size_camera_rect``), l'autre garde le bord reel de l'incrustation,
+    donc une seule paire nette suffit (SPEC-8257 regle 2b)."""
+    threshold = float(settings["facecam_edge_min_gradient"])
+    min_share = float(settings["facecam_clip_edge_min_share"])
+    height, width = image.shape[:2]
+    x, y, w, h = rect["x"], rect["y"], rect["w"], rect["h"]
+    x0, x1 = max(0, x), min(width, x + w)
+    y0, y1 = max(0, y), min(height, y + h)
+    if x1 - x0 < 2 or y1 - y0 < 2:
+        return False
+    mask = _edge_mask(image, threshold)
+
+    def share(*bands: np.ndarray) -> float:
+        total = sum(band.size for band in bands)
+        return sum(int(band.sum()) for band in bands) / total if total else 0.0
+
+    left_right = share(mask[y0:y1, x0], mask[y0:y1, x1 - 1])
+    top_bottom = share(mask[y0, x0:x1], mask[y1 - 1, x0:x1])
+    return left_right >= min_share - 1e-9 or top_bottom >= min_share - 1e-9
+
+
+def _rect_is_frozen(prev_gray: np.ndarray | None, gray: np.ndarray, settings: dict[str, Any]) -> bool:
+    """Contenu identique a l'image cle precedente du meme clip : un ecran de
+    pause ou un BRB ne bougent pas (SPEC-8257 regle 2c). La part de pixels
+    qui change reellement (au-dela de ``facecam_frozen_min_diff``, un bruit
+    de capteur ne compte pas) est comparee a ``facecam_frozen_min_pixel_share``
+    plutot que la moyenne : le rectangle est bien plus grand que la personne
+    qui y bouge (marge de ``stream_face_height``), une moyenne globale
+    diluerait un mouvement localise mais reel. La premiere image cle du clip
+    n'a rien a comparer : jamais consideree figee."""
+    if prev_gray is None or prev_gray.shape != gray.shape:
+        return False
+    changed = np.abs(gray - prev_gray) >= float(settings["facecam_frozen_min_diff"])
+    return float(changed.mean()) < float(settings["facecam_frozen_min_pixel_share"])
+
+
 def _clip_facecam(
-    facecam: dict[str, Any], start: float, end: float, settings: dict[str, Any]
+    facecam: dict[str, Any],
+    start: float,
+    end: float,
+    settings: dict[str, Any],
+    video_dir: Path,
+    image_reader: Callable[[str], np.ndarray | None] = cv2.imread,
 ) -> tuple[dict[str, int] | None, str | None]:
-    """Choix du clip, tout ou rien (SPEC-3a88 regle 2) : le rectangle de la
-    facecam si son visage y est sur au moins ``facecam_min_share`` des images
-    cles du clip, sinon ``None`` et la raison."""
+    """Choix du clip, tout ou rien (SPEC-8257 regle 2) : le rectangle de la
+    facecam (deja localise) s'il y est present et vivant -- contenu non noir,
+    bords retrouves, non fige (voir CONFIG_DEFAULTS) -- sur au moins
+    ``facecam_clip_min_share`` de ses images cles, sans exiger qu'un visage y
+    soit detecte ; sinon ``None`` et la raison (ADR-ad2e : jamais un repli
+    silencieux)."""
     if facecam["facecam"] is None:
         return None, f"pas de facecam dans la video : {facecam['reason']}"
+    rect = facecam["facecam"]
     keys = [k for k in facecam["keyframes"] if start - 1e-6 <= k["timecode"] <= end + 1e-6]
     if not keys:
         return None, f"aucune image cle de scenes.json dans le clip [{start}, {end}]"
-    share = sum(1 for k in keys if k["face_in_rect"]) / len(keys)
-    min_share = float(settings["facecam_min_share"])
+    # La localisation n'a pas toujours de bords reels a retrouver : quand
+    # elle est repliee sur le seul visage stable (``edge_reason`` non nul,
+    # voir detect_facecam), le rectangle n'a jamais ete cale sur une
+    # incrustation reelle -- rien de comparable a chercher par image cle,
+    # la regle (b) ne s'applique donc pas (elle ne ferait jamais que
+    # rejeter, quel que soit le contenu).
+    skip_edge_check = facecam.get("edge_reason") is not None
+
+    alive = 0
+    prev_gray: np.ndarray | None = None
+    for k in keys:
+        path = video_dir / k["path"]
+        image = image_reader(str(path))
+        if image is None:
+            raise ReframeError(f"image cle illisible : {path}")
+        gray = _rect_gray_crop(image, rect)
+        live = (
+            gray is not None
+            and not _rect_is_black(gray, settings)
+            and (skip_edge_check or _rect_edges_found(image, rect, settings))
+            and not _rect_is_frozen(prev_gray, gray, settings)
+        )
+        if live:
+            alive += 1
+        prev_gray = gray
+
+    share = alive / len(keys)
+    min_share = float(settings["facecam_clip_min_share"])
     if share < min_share - 1e-9:
         return None, (
-            f"visage dans la facecam sur {share:.0%} des images cles du clip seulement "
-            f"(facecam_min_share = {min_share:.0%})"
+            f"webcam absente, noire ou figee sur {1 - share:.0%} des images cles du clip "
+            f"({alive}/{len(keys)} vivante(s) seulement, facecam_clip_min_share = {min_share:.0%})"
         )
-    return facecam["facecam"], None
+    return rect, None
 
 
 def _game_window(
@@ -1872,7 +2016,7 @@ def reframe(
             detect_facecam(video_id, workspace_dir, config=config, detector_factory=detector_factory)
             .read_text(encoding="utf-8")
         )
-        rect, reason = _clip_facecam(facecam, start, end, settings)
+        rect, reason = _clip_facecam(facecam, start, end, settings, video_dir)
         if rect is not None:
             return _reframe_stream(video_id, clip_id, start, end, out, facecam, rect, settings)
         log.info("reframe %s/%s : letterbox, pas de stream (%s)", video_id, clip_id, reason)
