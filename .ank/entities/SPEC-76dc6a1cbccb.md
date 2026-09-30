@@ -5,7 +5,7 @@ slug: agencement-stream-split-r-glable-webcam-haut-jeu
 title: "Agencement stream 'split' réglable : webcam haut, jeu bas, badge de chaîne, style des sous-titres"
 created: 2026-09-30T14:23:30Z
 author: w-c42f0db91d65
-status: proposed
+status: accepted
 scope:
   - clipper/reframe.py
   - clipper/render.py
@@ -13,8 +13,12 @@ scope:
   - clipper/pipeline.py
 references: [ADR-b16b71007578, ADR-fb9bcb1e98f5, ADR-ad2e562b1810, SPEC-6a867ae54f94]
 supersedes: SPEC-8257564db9db
+ratified: 68343eeb44f6
+verified:
+  - by: nicoc@zedk_ordi
+    at: 2026-09-30T14:35:58Z
 schema: 4
-version: 1
+version: 2
 ---
 
 ## Objet
