@@ -5,7 +5,7 @@ slug: channel-py-cha-nes-channel-de-presets-chaine-tom
 title: "channel.py : chaînes ([channel] de presets/<chaine>.toml) : liste, chargement fusionné, validation, sauvegarde"
 created: 2026-09-30T20:42:22Z
 author: w-plan-web
-status: open
+status: done
 scope:
   - clipper/channel.py
   - tests/test_channel.py
@@ -15,8 +15,15 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/294271d27edd@cb8bf0e
+    tree: scope/90c0574a3449
+    criteria: f491505296bd
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 2
+version: 4
 ---
 
 ADR-4f6e §2, SPEC-fc0c §1. Bibliothèque, pas une étape : n'importe aucune étape ni clipper.web (ADR-b16b). Fixtures avec `ma_chaine` seulement.
