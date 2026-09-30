@@ -1,5 +1,7 @@
 # clipper
 
+[![Release](https://img.shields.io/badge/release-v0.1.0--pré--version-blue)](https://github.com/ZeDKouill3/TikTokParseUpload/releases/tag/v0.1.0)
+
 Pipeline qui transforme une vidéo YouTube longue (live, podcast, reportage...)
 en clips verticaux (9:16) sous-titrés, prêts à publier sur TikTok. Une vidéo
 de plusieurs heures est découpée en moments forts, chaque moment devenant un
