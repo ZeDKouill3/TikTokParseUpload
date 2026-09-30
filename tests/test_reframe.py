@@ -1582,7 +1582,7 @@ def test_facecam_detection_is_cached_per_video(tmp_path, video_dir):
 # presence et la vivacite du rectangle lui-meme (contenu non noir, bords
 # retrouves, non fige), plus sur la detection d'un visage dedans -- qui ne
 # sert plus qu'a LOCALISER la facecam une fois par video (regle 1). VOD
-# Twitch v2887271276 (Madajel) : webcam visible tout du long, visage detecte
+# VOD Twitch de test (streameuse) : webcam visible tout du long, visage detecte
 # sur 14 % des images cles globales mais 0 % par clip (jeu sombre, casque).
 # --------------------------------------------------------------------------
 
