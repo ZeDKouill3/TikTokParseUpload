@@ -454,6 +454,21 @@ def test_single_without_face_centers_the_crop(tmp_path, video_dir):
     assert len(fake.calls) == 1
 
 
+def test_single_with_hallucinated_face_on_an_empty_plan_is_not_a_schema_error(tmp_path, video_dir):
+    # TASK-0d30 : sur un plan sans visage detecte (ids vide), le modele
+    # peut repondre face=0 alors qu'aucun id n'existe (smoke reel du
+    # 2026-09-30, reason="Aucun visage detecte..." mais face=0 quand meme).
+    # single() ignore de toute facon ``face`` quand plan.tracks est vide
+    # (aucun id ne peut y correspondre) : ce n'est pas une reponse a
+    # rejeter, la question n'a simplement pas de bonne reponse a verifier.
+    out, _, fake = run(tmp_path, static(), [single(0)])
+    plan = load(out)["plans"][0]
+    [r] = rects(plan)
+    assert (r["x"], r["w"]) == (656, CROP_W)
+    assert plan["faces"] == []
+    assert len(fake.calls) == 1
+
+
 def test_brief_false_detection_is_ignored(tmp_path, video_dir):
     face = (1100, 300, 1300, 500)
 
