@@ -5,7 +5,7 @@ slug: console-de-gestion-web-v2-worker-s-par-presets-p
 title: "Console de gestion web v2 : worker séparé, presets par chaîne en surcouche, SSE, jeton d'accès local"
 created: 2026-09-30T20:38:47Z
 author: w-plan-web
-status: proposed
+status: accepted
 scope:
   - clipper/web/**
   - clipper/config.py
@@ -13,8 +13,12 @@ scope:
   - clipper/__main__.py
 constraint: |
   Le traitement derrière l'interface tourne dans un processus worker distinct du serveur HTTP (clipper/worker.py, lancé par 'serve' ou seul par 'clipper worker'), une vidéo à la fois, chaque vidéo dans un processus enfant 'python -m clipper' que l'annulation termine ; l'API web ne lance jamais pipeline.run/render dans son propre processus. Une chaîne = un fichier presets/<chaine>.toml, surcouche fusionnée clé par clé sur config.toml, dont la table [channel] est validée par CONFIG_DEFAULTS de clipper/channel.py comme toute autre section. Tout état hors vidéo (file de traitement, publication, surveillance) vit en fichiers JSON sous state/, jamais en base ni en mémoire seule. La progression arrive au navigateur par SSE (/api/events) alimenté par les fichiers d'état, avec repli polling ; le pipeline écrit lui-même sa progression intra-étape dans pipeline.json. Sans authentification sur l'adresse de bouclage ; toute autre adresse d'écoute exige un jeton unique ([web] token) sur chaque requête, sinon 'serve' refuse de démarrer. Jamais le nom d'une vraie chaîne ou personne dans le code, les tests ou les entités du dépôt ('ma_chaine').
+ratified: 2acd02161509
+verified:
+  - by: nicoc@zedk_ordi
+    at: 2026-09-30T21:06:50Z
 schema: 4
-version: 2
+version: 3
 ---
 
 ## Contexte
