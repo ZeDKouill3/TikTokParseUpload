@@ -5,7 +5,7 @@ slug: 3-tests-lents-de-tests-test-pipeline-py-165-s-su
 title: "3 tests lents de tests/test_pipeline.py (165 s sur 400 s de suite) : les rendre rapides sans perdre ce qu'ils prouvent"
 created: 2026-09-30T07:59:51Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - tests/test_pipeline.py
 blocked_by: []
@@ -14,8 +14,15 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: diagnose
+proof:
+  - type: test
+    ref: local/5db3a9e7e83b@968fcd6
+    tree: scope/f7e8b8909594
+    criteria: 9117cad75253
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---
 
 Mesure 2026-09-30 (main c85b56c, `pytest -q --durations=30`) : suite complète 977 tests en 398 s ; ces 3 tests font 84 + 42 + 40 = 165 s. `ank done` relance toute la suite à chaque tâche, donc chaque seconde gagnée ici l'est à chaque clôture.

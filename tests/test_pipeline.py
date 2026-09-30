@@ -10,6 +10,7 @@ from __future__ import annotations
 import gc
 import json
 import logging
+import re
 import shutil
 import subprocess
 import weakref
@@ -180,6 +181,14 @@ def step_options(source, whisper=None):
 
 MOMENT = {"start": 2.0, "end": 72.0}  # 70 s : clip unique (60-120 s, SPEC-1557)
 
+# Moment court pour les 3 tests lents de bout en bout (TASK-cde1) : le cout
+# de render/qa/scenes est domine par le nombre d'images decodees, proportion-
+# nel a la duree du clip (et de la source pour scenes), pas par le compor-
+# tement du pipeline que ces tests prouvent (enchainement, file d'attente,
+# journal llm_usage, revue humaine). Utilise avec ``fast_rubric`` (single_min/
+# single_max resserres) pour rester un clip unique, jamais une serie.
+FAST_MOMENT = {"start": 2.0, "end": 6.0}  # 4 s, alignee sur une frontiere de phrase (_segments())
+
 
 def answer(request):
     usage = request.usage
@@ -220,6 +229,13 @@ def answer(request):
     raise AssertionError(f"usage inattendu {usage!r}")
 
 
+def fast_moments_response(request):
+    scores = {k: 9 for k in ("hook", "standalone", "payoff", "emotion", "value", "trend")}
+    return {"moments": [{"hook_text": "GTA six arrive vraiment.", "start": FAST_MOMENT["start"],
+                         "end": FAST_MOMENT["end"], "format": "single", "part_breaks": [],
+                         "justification": "Annonce forte", "scores": scores}]}
+
+
 def backend(*overrides, backend_cls=FakeBackend):
     """FakeBackend qui repond ``answer`` ; ``overrides`` : (usage, reponse)
     consommes une fois, a la premiere requete de cet usage."""
@@ -249,6 +265,37 @@ def make_config(tmp_path, mode="auto", **sections):
         base[name] = {**base.get(name, {}), **table}
     return Config(mode=mode, workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output",
                   _sections=base)
+
+
+def fast_rubric(tmp_path):
+    """Copie de rubric.toml (jamais celui du depot) avec single_min/
+    single_max resserres pour accepter FAST_MOMENT comme clip unique. Ecrite
+    seulement si tmp_path/rubric.toml n'existe pas encore, comme make_config."""
+    rubric = tmp_path / "rubric.toml"
+    if not rubric.exists():
+        text = (ROOT / "rubric.toml").read_text(encoding="utf-8")
+        text, n1 = re.subn(r"single_min = 60\b", "single_min = 2", text)
+        text, n2 = re.subn(r"single_max = 120\b", "single_max = 20", text)
+        assert (n1, n2) == (1, 1), "rubric.toml : single_min/single_max introuvables ou dupliques"
+        rubric.write_text(text, encoding="utf-8")
+    return rubric
+
+
+def make_fast_config(tmp_path, mode="auto", **sections):
+    """make_config avec : un rubric.toml resserre pour FAST_MOMENT (voir
+    fast_rubric), et [scenes]/[render] a cadence d'analyse/sortie reduite.
+    Le cout de render (encodage du canevas letterbox) et de qa (deux passages
+    cv2 sur le mp4 rendu + ffmpeg blackdetect) est domine par le nombre
+    d'images decodees (duree x cadence), pas par le comportement du pipeline
+    que ces 3 tests lents prouvent (mesure ank log TASK-cde1). Resolution de
+    sortie non touchee : reframe.output_* et subtitles.PLAY_RES_* sont penses
+    pour un canevas 1080x1920 fixe (essaye, casse la validation des zones,
+    abandonne - voir le journal de la tache)."""
+    fast_rubric(tmp_path)
+    base_sections = {"scenes": {"analysis_max_fps": 2.0}, "render": {"max_fps": 4}}
+    for name, table in base_sections.items():
+        sections[name] = {**table, **sections.get(name, {})}
+    return make_config(tmp_path, mode=mode, **sections)
 
 
 def clip_files(tmp_path):
@@ -283,12 +330,12 @@ POST_REVIEW = ("captions", "reframe", "subtitles", "render", "qa")
 def test_auto_runs_every_step_queues_a_transient_error_then_finishes(tmp_path, isolated_cwd, source_video):
     from clipper import pipeline
 
-    config = make_config(tmp_path, mode="auto", pipeline={"retry_delays": [600]})
+    config = make_fast_config(tmp_path, mode="auto", pipeline={"retry_delays": [600]})
     whisper = WhisperFactory()
     opts = step_options(source_video, whisper)
     t0 = datetime.now(timezone.utc)
 
-    fake = backend(("qa", llm.TransientLLMError("quota atteint")))
+    fake = backend(("moments", fast_moments_response), ("qa", llm.TransientLLMError("quota atteint")))
     with llm.use_backend(fake):
         state = pipeline.run(URL, config=config, step_options=opts)
 
@@ -349,10 +396,10 @@ def test_auto_runs_every_step_queues_a_transient_error_then_finishes(tmp_path, i
 def test_review_stops_for_decisions_then_render_resumes(tmp_path, isolated_cwd, source_video):
     from clipper import pipeline
 
-    config = make_config(tmp_path, mode="review")
+    config = make_fast_config(tmp_path, mode="review")
     opts = step_options(source_video)
 
-    fake = backend()
+    fake = backend(("moments", fast_moments_response))
     with llm.use_backend(fake):
         state = pipeline.run(URL, config=config, step_options=opts)
 
@@ -372,11 +419,11 @@ def test_review_stops_for_decisions_then_render_resumes(tmp_path, isolated_cwd, 
     assert clip_files(tmp_path) == ([], [])
 
     # Decision humaine journalisee via feedback, bornes ajustees.
-    pipeline.decide(VIDEO_ID, 0, "adjusted", start=4.0, end=72.0, comment="debut plus net", config=config)
+    pipeline.decide(VIDEO_ID, 0, "adjusted", start=4.0, end=6.0, comment="debut plus net", config=config)
     journal = (tmp_path / "state" / "feedback.jsonl").read_text(encoding="utf-8").splitlines()
     entry = json.loads(journal[-1])
     assert entry["video_id"] == VIDEO_ID and entry["decision"] == "adjusted"
-    assert entry["moment"]["start"] == 4.0 and entry["moment"]["end"] == 72.0
+    assert entry["moment"]["start"] == 4.0 and entry["moment"]["end"] == 6.0
     assert entry["commentaire"] == "debut plus net"
     assert "GTA six arrive" in entry["texte_moment"]
 
@@ -389,7 +436,7 @@ def test_review_stops_for_decisions_then_render_resumes(tmp_path, isolated_cwd, 
     assert len(jsons) == 1
     clip = assert_valid_clip(jsons[0])
     assert clip["start"] == pytest.approx(4.0, abs=0.2)
-    assert clip["end"] == pytest.approx(72.0, abs=0.2)
+    assert clip["end"] == pytest.approx(6.0, abs=0.2)
 
     # Relancer run sur la video terminee ne la remet pas en revue.
     with llm.use_backend(FakeBackend([])):
@@ -608,8 +655,8 @@ def test_pipeline_pass_journals_every_llm_call_including_from_threads_then_summa
     # pool (ThreadPoolExecutor(max_workers=1)), sans le rendre concurrent avec
     # un autre appel sur le meme FakeBackend partage (last_usage n'est pas
     # protege par un verrou).
-    config = make_config(tmp_path, mode="auto", subtitles={"parallel": 1})
-    fake = backend(backend_cls=UsageFakeBackend)
+    config = make_fast_config(tmp_path, mode="auto", subtitles={"parallel": 1})
+    fake = backend(("moments", fast_moments_response), backend_cls=UsageFakeBackend)
 
     with llm.use_backend(fake), caplog.at_level(logging.INFO, logger="clipper.pipeline"):
         state = pipeline.run(URL, config=config, step_options=step_options(source_video))
