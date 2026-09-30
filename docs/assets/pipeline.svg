@@ -1,0 +1,164 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 620 1000" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif">
+  <title>Pipeline clipper : les 12 étapes, du téléchargement au clip prêt</title>
+  <style>
+    :root {
+      --bg: #ffffff;
+      --box-bg: #f6f8fa;
+      --box-border: #d0d7de;
+      --box-border-jury: #fb8500;
+      --title: #1f2328;
+      --text: #1f2328;
+      --desc: #57606a;
+      --arrow: #8c959f;
+      --output-bg: #ecfdf3;
+      --output-border: #2da44e;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0d1117;
+        --box-bg: #161b22;
+        --box-border: #30363d;
+        --box-border-jury: #ffa657;
+        --title: #e6edf3;
+        --text: #e6edf3;
+        --desc: #8b949e;
+        --arrow: #6e7681;
+        --output-bg: #0f2a1c;
+        --output-border: #3fb950;
+      }
+    }
+    svg { background: var(--bg); }
+    .title { fill: var(--title); font-size: 20px; font-weight: 700; }
+    .subtitle { fill: var(--desc); font-size: 12px; }
+    .box { fill: var(--box-bg); stroke: var(--box-border); stroke-width: 1.5; }
+    .box.jury { stroke: var(--box-border-jury); }
+    .step-name { fill: var(--text); font-size: 15px; font-weight: 700; }
+    .step-desc { fill: var(--desc); font-size: 11.5px; }
+    .jury-tag { fill: var(--box-border-jury); font-size: 10.5px; font-weight: 700; }
+    .arrow { stroke: var(--arrow); stroke-width: 2; fill: none; stroke-dasharray: 4 5; animation: flow 1.2s linear infinite; }
+    .output-box { fill: var(--output-bg); stroke: var(--output-border); stroke-width: 1.5; }
+    .output-text { fill: var(--text); font-size: 12.5px; font-family: 'Cascadia Code', 'Consolas', monospace; }
+    .step { animation: appear 0.5s ease-out both; }
+    @keyframes flow { from { stroke-dashoffset: 18; } to { stroke-dashoffset: 0; } }
+    @keyframes appear { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+    .step:nth-of-type(1) { animation-delay: 0.0s; }
+    .step:nth-of-type(2) { animation-delay: 0.08s; }
+    .step:nth-of-type(3) { animation-delay: 0.16s; }
+    .step:nth-of-type(4) { animation-delay: 0.24s; }
+    .step:nth-of-type(5) { animation-delay: 0.32s; }
+    .step:nth-of-type(6) { animation-delay: 0.40s; }
+    .step:nth-of-type(7) { animation-delay: 0.48s; }
+    .step:nth-of-type(8) { animation-delay: 0.56s; }
+    .step:nth-of-type(9) { animation-delay: 0.64s; }
+    .step:nth-of-type(10) { animation-delay: 0.72s; }
+    .step:nth-of-type(11) { animation-delay: 0.80s; }
+    .step:nth-of-type(12) { animation-delay: 0.88s; }
+  </style>
+
+  <text x="310" y="30" text-anchor="middle" class="title">Pipeline clipper — 12 étapes indépendantes</text>
+  <text x="310" y="50" text-anchor="middle" class="subtitle">une étape lit ses entrées, écrit sous workspace/&lt;video_id&gt;/, et ne se relance pas sauf --force (ADR-b16b)</text>
+
+  <!-- 1 download -->
+  <g class="step">
+    <rect class="box" x="100" y="70" width="420" height="46" rx="8"/>
+    <text x="122" y="98" class="step-name">download</text>
+    <text x="260" y="98" class="step-desc">téléchargement de la vidéo (yt-dlp)</text>
+  </g>
+  <path class="arrow" d="M310,116 L310,136"/>
+
+  <!-- 2 transcribe -->
+  <g class="step">
+    <rect class="box" x="100" y="136" width="420" height="46" rx="8"/>
+    <text x="122" y="164" class="step-name">transcribe</text>
+    <text x="260" y="164" class="step-desc">transcription FR (faster-whisper)</text>
+  </g>
+  <path class="arrow" d="M310,182 L310,202"/>
+
+  <!-- 3 scenes -->
+  <g class="step">
+    <rect class="box" x="100" y="202" width="420" height="46" rx="8"/>
+    <text x="122" y="230" class="step-name">scenes</text>
+    <text x="260" y="230" class="step-desc">détection des plans (scenedetect)</text>
+  </g>
+  <path class="arrow" d="M310,248 L310,268"/>
+
+  <!-- 4 audio -->
+  <g class="step">
+    <rect class="box" x="100" y="268" width="420" height="46" rx="8"/>
+    <text x="122" y="296" class="step-name">audio</text>
+    <text x="260" y="296" class="step-desc">pistes audio découpées par plan</text>
+  </g>
+  <path class="arrow" d="M310,314 L310,334"/>
+
+  <!-- 5 moments (+ jury) -->
+  <g class="step">
+    <rect class="box jury" x="100" y="334" width="420" height="46" rx="8"/>
+    <text x="122" y="362" class="step-name">moments</text>
+    <text x="260" y="356" class="step-desc">sélection des moments forts (clipper.llm)</text>
+    <text x="260" y="370" class="jury-tag">+ jury IA (retention/monteur/avocat/spectateur/conformité)</text>
+  </g>
+  <path class="arrow" d="M310,380 L310,400"/>
+
+  <!-- 6 vision -->
+  <g class="step">
+    <rect class="box" x="100" y="400" width="420" height="46" rx="8"/>
+    <text x="122" y="428" class="step-name">vision</text>
+    <text x="260" y="428" class="step-desc">repérage visuel (planches d'images)</text>
+  </g>
+  <path class="arrow" d="M310,446 L310,466"/>
+
+  <!-- 7 parts -->
+  <g class="step">
+    <rect class="box" x="100" y="466" width="420" height="46" rx="8"/>
+    <text x="122" y="494" class="step-name">parts</text>
+    <text x="260" y="494" class="step-desc">découpe en parties si le moment est long</text>
+  </g>
+  <path class="arrow" d="M310,512 L310,532"/>
+
+  <!-- 8 captions -->
+  <g class="step">
+    <rect class="box" x="100" y="532" width="420" height="46" rx="8"/>
+    <text x="122" y="560" class="step-name">captions</text>
+    <text x="260" y="560" class="step-desc">titre d'écran, légende, hashtags</text>
+  </g>
+  <path class="arrow" d="M310,578 L310,598"/>
+
+  <!-- 9 reframe -->
+  <g class="step">
+    <rect class="box" x="100" y="598" width="420" height="46" rx="8"/>
+    <text x="122" y="626" class="step-name">reframe</text>
+    <text x="260" y="626" class="step-desc">recadrage 9:16 (letterbox ou crop)</text>
+  </g>
+  <path class="arrow" d="M310,644 L310,664"/>
+
+  <!-- 10 subtitles -->
+  <g class="step">
+    <rect class="box" x="100" y="664" width="420" height="46" rx="8"/>
+    <text x="122" y="692" class="step-name">subtitles</text>
+    <text x="260" y="692" class="step-desc">sous-titres incrustés mot par mot</text>
+  </g>
+  <path class="arrow" d="M310,710 L310,730"/>
+
+  <!-- 11 render -->
+  <g class="step">
+    <rect class="box" x="100" y="730" width="420" height="46" rx="8"/>
+    <text x="122" y="758" class="step-name">render</text>
+    <text x="260" y="758" class="step-desc">rendu ffmpeg (NVENC si GPU dispo)</text>
+  </g>
+  <path class="arrow" d="M310,776 L310,796"/>
+
+  <!-- 12 qa -->
+  <g class="step">
+    <rect class="box" x="100" y="796" width="420" height="46" rx="8"/>
+    <text x="122" y="824" class="step-name">qa</text>
+    <text x="260" y="824" class="step-desc">contrôle qualité automatique du clip</text>
+  </g>
+  <path class="arrow" d="M310,842 L310,862"/>
+
+  <!-- output -->
+  <g class="step">
+    <rect class="output-box" x="70" y="862" width="480" height="62" rx="8"/>
+    <text x="310" y="888" text-anchor="middle" class="output-text">output/&lt;video_id&gt;/&lt;clip_id&gt;.mp4</text>
+    <text x="310" y="906" text-anchor="middle" class="output-text">+ &lt;clip_id&gt;.json (sidecar : titre, légende, hashtags, rapport qa)</text>
+  </g>
+</svg>
