@@ -24,6 +24,8 @@ output_dir = "output"
 # [reframe]
 # format = "letterbox"    # letterbox (zoom fixe, defaut) | crop (option figee)
 # letterbox_zoom = 1.3     # fenetre centrale de largeur source_w / zoom
+# layout = "stream_auto"   # letterbox (defaut) | stream_auto (facecam detectee, SPEC-3a88)
+# stream_variant = "split" # top (defaut, inchange) | split (SPEC-76dc, webcam haut/jeu bas)
 #
 # [captions]
 # screen_title_allow_emoji = false   # SPEC-6a86 (defaut) : titre d'ecran sobre, sans emoji

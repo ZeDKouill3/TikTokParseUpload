@@ -1799,3 +1799,190 @@ def test_existing_letterbox_plan_with_stream_auto_config_is_an_error_without_for
         run_stream(tmp_path)
     out, _ = run_stream(tmp_path, force=True)
     assert load(out)["layout"] == "stream"
+
+
+# --------------------------------------------------------------------------
+# Agencement stream split (SPEC-76dc) : webcam en haut, jeu en bas, badge et
+# sous-titres a deux couleurs. stream_variant n'intervient qu'apres les
+# regles 1/2 de SPEC-8257 (choix stream/letterbox), jamais de LLM.
+# --------------------------------------------------------------------------
+
+
+def test_stream_variant_defaults_to_top_unchanged(tmp_path, video_dir):
+    from clipper.reframe import CONFIG_DEFAULTS
+
+    assert CONFIG_DEFAULTS["stream_variant"] == "top"
+    write_stream_clip_fixture(video_dir, [(0.5 + k, "live") for k in range(20)])
+    out, _ = run_stream(tmp_path)
+    data = load(out)
+    assert data["layout"] == "stream"  # jamais "stream_split" sans le demander
+
+
+def test_unknown_stream_variant_is_an_error(tmp_path, video_dir):
+    from clipper.reframe import ReframeError
+
+    write_keyframes(video_dir, pattern(20, 20))
+    with pytest.raises(ReframeError, match="stream_variant"):
+        run_stream(tmp_path, stream_variant="diagonal")
+
+
+@pytest.mark.parametrize(
+    "name,override",
+    [
+        ("split_webcam_dest", {"x": 20, "y": 0, "w": 1040, "h": 2000}),  # deborde du canevas 1920 de haut
+        ("badge_dest", {"x": 0, "y": 0, "w": 100, "h": 100}),  # hors zone sure (y < safe_top)
+        ("split_subtitle_dest", {"x": 0, "y": 0, "w": 100, "h": 100}),  # hors zone sure
+    ],
+)
+def test_invalid_split_geometry_is_an_error_at_config_load(tmp_path, video_dir, name, override):
+    from clipper.reframe import ReframeError
+
+    write_keyframes(video_dir, pattern(20, 20))
+    with pytest.raises(ReframeError):
+        run_stream(tmp_path, stream_variant="split", **{name: override})
+
+
+def test_split_webcam_and_gameplay_dests_overlapping_is_an_error(tmp_path, video_dir):
+    from clipper.reframe import ReframeError
+
+    write_keyframes(video_dir, pattern(20, 20))
+    with pytest.raises(ReframeError, match="chevauchent"):
+        run_stream(
+            tmp_path, stream_variant="split",
+            split_webcam_dest={"x": 0, "y": 0, "w": 1080, "h": 700},
+            split_gameplay_dest={"x": 0, "y": 640, "w": 1080, "h": 1280},
+        )
+
+
+def test_badge_and_subtitle_dests_overlapping_is_an_error(tmp_path, video_dir):
+    from clipper.reframe import ReframeError
+
+    write_keyframes(video_dir, pattern(20, 20))
+    with pytest.raises(ReframeError, match="chevauchent"):
+        run_stream(
+            tmp_path, stream_variant="split",
+            badge_dest={"x": 150, "y": 700, "w": 420, "h": 100},
+            split_subtitle_dest={"x": 150, "y": 710, "w": 780, "h": 150},
+        )
+
+
+def test_split_layout_crops_webcam_and_gameplay_without_deformation(tmp_path, video_dir):
+    # STREAM_PANEL (aspect 1080/768) rogne au ratio par defaut du split
+    # (1040/640) : jamais etire (aucune deformation, ratio dest respecte).
+    write_stream_clip_fixture(video_dir, [(0.5 + k, "live") for k in range(20)])
+    out, _ = run_stream(tmp_path, stream_variant="split")
+
+    data = load(out)
+    assert data["layout"] == "stream_split"
+    [plan] = data["plans"]
+    assert plan["layout"] == "stream_split"
+    panels = {p["name"]: p for p in plan["panels"]}
+    assert set(panels) == {"webcam", "gameplay"}
+
+    webcam_dest, game_dest = panels["webcam"]["dest"], panels["gameplay"]["dest"]
+    assert webcam_dest == {"x": 20, "y": 0, "w": 1040, "h": 640}
+    assert game_dest == {"x": 0, "y": 640, "w": 1080, "h": 1280}
+    # les deux dest tiennent dans le canevas et ne se chevauchent pas
+    assert webcam_dest["y"] + webcam_dest["h"] <= game_dest["y"]
+
+    [wcam] = panels["webcam"]["rects"]
+    [game] = panels["gameplay"]["rects"]
+    assert wcam["w"] / wcam["h"] == pytest.approx(webcam_dest["w"] / webcam_dest["h"], rel=0.02)
+    assert game["w"] / game["h"] == pytest.approx(game_dest["w"] / game_dest["h"], rel=0.02)
+    # jamais hors du cadre source
+    assert 0 <= wcam["x"] and wcam["x"] + wcam["w"] <= W and 0 <= wcam["y"] and wcam["y"] + wcam["h"] <= H
+    assert 0 <= game["x"] and game["x"] + game["w"] <= W and 0 <= game["y"] and game["y"] + game["h"] <= H
+    # rectangle source webcam centre sur le rectangle localise (facecam.json)
+    facecam = data["facecam"]
+    fcx = facecam["x"] + facecam["w"] / 2
+    wcx = wcam["x"] + wcam["w"] / 2
+    assert wcx == pytest.approx(fcx, abs=1.0)
+
+    for (start, end) in ((wcam["start"], wcam["end"]), (game["start"], game["end"])):
+        assert (start, end) == (0.0, 20.0)
+
+
+def test_split_gameplay_excludes_the_webcam_source_column_when_it_fits(tmp_path, video_dir):
+    # Webcam collee au bord gauche : assez de place a droite pour exclure sa
+    # colonne entierement de la fenetre de jeu (SPEC-76dc).
+    panel = (0, 300, 400, 700)
+    face = (panel[0] + 90, panel[1] + 40, panel[0] + 220, panel[1] + 190)
+    write_stream_clip_fixture(video_dir, [(0.5 + k, "live") for k in range(20)], panel=panel, face=face)
+    out, _ = run_stream(tmp_path, stream_variant="split")
+
+    data = load(out)
+    plan = data["plans"][0]
+    panels = {p["name"]: p for p in plan["panels"]}
+    [wcam] = panels["webcam"]["rects"]
+    [game] = panels["gameplay"]["rects"]
+    assert game["x"] >= wcam["x"] + wcam["w"]  # jeu entierement a droite de la webcam
+    assert plan["reason"] is None  # exclusion reussie, pas de repli a noter
+
+
+def test_split_gameplay_falls_back_to_a_centered_crop_when_it_cannot_exclude_the_webcam(tmp_path, video_dir):
+    # STREAM_PANEL est trop central : ni a gauche ni a droite assez de place
+    # pour la fenetre de jeu (911 px) sans recouvrir la webcam -- repli
+    # centre, note dans le plan (repli silencieux accepte, SPEC-76dc).
+    write_stream_clip_fixture(video_dir, [(0.5 + k, "live") for k in range(20)])
+    out, _ = run_stream(tmp_path, stream_variant="split")
+
+    data = load(out)
+    plan = data["plans"][0]
+    panels = {p["name"]: p for p in plan["panels"]}
+    [game] = panels["gameplay"]["rects"]
+    assert game["x"] == pytest.approx((W - game["w"]) / 2, abs=1)
+    assert plan["reason"] is not None
+    assert "webcam" in plan["reason"]
+
+
+def test_split_text_zones_have_subtitles_badge_and_part_within_the_safe_zone(tmp_path, video_dir):
+    write_stream_clip_fixture(video_dir, [(0.5 + k, "live") for k in range(20)])
+    data = load(run_stream(tmp_path, stream_variant="split")[0])
+
+    zones = data["text_zones"]
+    assert {"badge", "subtitles", "part"} <= set(zones)
+    for name in ("badge", "subtitles", "part"):
+        z = zones[name]
+        assert 150 <= z["x0"] < z["x1"] <= 930 and 160 <= z["y0"] < z["y1"] <= 1520
+    # badge et sous-titres ne se recouvrent jamais
+    badge, subs = zones["badge"], zones["subtitles"]
+    assert badge["y1"] <= subs["y0"] or subs["y1"] <= badge["y0"] or badge["x1"] <= subs["x0"] or subs["x1"] <= badge["x0"]
+
+
+def test_split_title_zone_absent_by_default_webcam_leaves_no_room_above(tmp_path, video_dir):
+    # split_webcam_dest.y = 0 par defaut : pas de place pour un titre
+    # au-dessus, reframe omet la zone (render.py, pas reframe.py, decidera
+    # si c'est une erreur selon [render] title_enabled).
+    write_stream_clip_fixture(video_dir, [(0.5 + k, "live") for k in range(20)])
+    data = load(run_stream(tmp_path, stream_variant="split")[0])
+    assert "title" not in data["text_zones"]
+
+
+def test_split_title_zone_present_when_webcam_leaves_room_above(tmp_path, video_dir):
+    write_stream_clip_fixture(video_dir, [(0.5 + k, "live") for k in range(20)])
+    data = load(run_stream(
+        tmp_path, stream_variant="split",
+        split_webcam_dest={"x": 20, "y": 300, "w": 1040, "h": 640},
+        split_gameplay_dest={"x": 0, "y": 940, "w": 1080, "h": 980},
+    )[0])
+    assert "title" in data["text_zones"]
+    z = data["text_zones"]["title"]
+    assert z["y1"] <= 300 - 16  # text_gap par defaut
+
+
+def test_split_layout_json_field_is_stream_split(tmp_path, video_dir):
+    write_stream_clip_fixture(video_dir, [(0.5 + k, "live") for k in range(20)])
+    data = load(run_stream(tmp_path, stream_variant="split")[0])
+    assert data["layout"] == "stream_split"
+    assert data["plans"][0]["layout"] == "stream_split"
+
+
+def test_split_reframe_cached_with_a_different_stream_variant_is_an_error_without_force(tmp_path, video_dir):
+    from clipper.reframe import ReframeError
+
+    write_stream_clip_fixture(video_dir, [(0.5 + k, "live") for k in range(20)])
+    run_stream(tmp_path, stream_variant="top")
+    with pytest.raises(ReframeError, match="stream_variant"):
+        run_stream(tmp_path, stream_variant="split")
+    out, _ = run_stream(tmp_path, stream_variant="split", force=True)
+    assert load(out)["layout"] == "stream_split"

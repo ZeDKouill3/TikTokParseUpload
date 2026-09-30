@@ -672,8 +672,8 @@ def lb_events(path: Path) -> list[dict]:
     events = []
     for m in re.finditer(r"^Dialogue:\s*(.+)$", path.read_text(encoding="utf-8"), re.MULTILINE):
         p = m.group(1).split(",", 9)
-        events.append({"start": p[1], "end": p[2], "margin_l": int(p[5]), "margin_r": int(p[6]),
-                       "margin_v": int(p[7]), "text": p[9]})
+        events.append({"layer": p[0], "start": p[1], "end": p[2], "margin_l": int(p[5]),
+                       "margin_r": int(p[6]), "margin_v": int(p[7]), "text": p[9]})
     return events
 
 
@@ -998,3 +998,182 @@ def test_real_libass_render_keeps_all_ink_in_the_zone_with_the_line_step(tmp_pat
     runs = [ys[0]] + [b for a, b in zip(ys, ys[1:]) if b != a + 1]
     assert len(runs) == 2, runs
     assert abs((runs[1] - runs[0]) - STEP_68) <= 4
+
+
+# --------------------------------------------------------------------------
+# Agencement stream split (SPEC-76dc) : deux couleurs seulement (texte, mot
+# en cours), jamais d'appel LLM d'emphase, style entierement reglable.
+# --------------------------------------------------------------------------
+
+SPLIT_ZONE = {"x0": 150, "y0": 710, "x1": 930, "y1": 860}  # split_subtitle_dest par defaut
+
+
+def run_split(tmp_path, video_dir, words=None, zone=None, config=None, **kwargs):
+    write_words(video_dir, words or mock_words())
+    with llm.use_backend(FakeBackend([])):  # jamais d'appel LLM pour le style split
+        return Path(run(tmp_path, config=config, start=0.0, end=10.0,
+                        text_zone=dict(zone or SPLIT_ZONE), style="split", **kwargs))
+
+
+def _split_layers(path: Path) -> tuple[list[dict], list[dict]]:
+    """Evenements du style split : calque de base (ligne entiere, couleur du
+    style, toute la duree du groupe -- layers pairs) et calque de
+    surbrillance (un evenement par mot, sa propre duree seulement, superpose
+    au meme endroit via ``\\pos`` -- layers impairs)."""
+    events = lb_events(path)
+    base = [ev for ev in events if int(ev["layer"]) % 2 == 0]
+    highlights = [ev for ev in events if int(ev["layer"]) % 2 == 1]
+    return base, highlights
+
+
+def test_split_ass_starts_with_a_split_format_comment(tmp_path, video_dir):
+    path = run_split(tmp_path, video_dir)
+    assert path.read_text(encoding="utf-8").splitlines()[0] == "; format: split"
+    doc = parse_ass(path)
+    assert doc["info"] == {"PlayResX": "1080", "PlayResY": "1920"}
+    assert doc["style"]["Alignment"] == "7"  # haut-gauche : positionne par \pos, pas par les marges
+
+
+def test_split_never_calls_the_llm_for_emphasis(tmp_path, video_dir):
+    # run_split() utilise FakeBackend([]) : un appel leverait AssertionError
+    # (aucune reponse scriptee) si generate() en faisait un.
+    path = run_split(tmp_path, video_dir)
+    assert path.exists()
+
+
+def test_split_base_line_is_plain_and_stays_visible_for_the_whole_group(tmp_path, video_dir):
+    path = run_split(tmp_path, video_dir)
+    base, _highlights = _split_layers(path)
+    assert base  # au moins une ligne
+    for ev in base:
+        assert "\\c" not in ev["text"]  # couleur du style (primary), jamais de surcharge
+        assert "\\pos" in ev["text"]
+    # les 8 mots du texte de mock_words() sont tous representes une fois sur le calque de base
+    assert "".join(line_text(ev) for ev in base).replace(" ", "") == "ILN'APASFAITDEGARDEÀVUE"
+
+
+def test_split_current_word_color_only_covers_its_own_time_span(tmp_path, video_dir):
+    from clipper.subtitles import _ass_color
+
+    path = run_split(tmp_path, video_dir)
+    base, highlights = _split_layers(path)
+    current = _ass_color("#9146FF")  # defaut split_current_word_color
+    # un evenement de surbrillance par mot (8 dans mock_words(), "n'a" fusionne)
+    assert len(highlights) == 8
+    for ev in highlights:
+        assert f"\\c{current}" in ev["text"]
+        assert "\\pos" in ev["text"]
+    # chaque mot mis en valeur ne dure que sa propre fenetre, jamais celle de
+    # toute la ligne (contrairement a l'emphase letterbox, statique)
+    assert any(ev["end"] != base[0]["end"] for ev in highlights)
+    # reconstitue le texte affiche a partir des seuls evenements de surbrillance
+    text = " ".join(line_text(ev).strip() for ev in highlights)
+    assert text == "IL N'A PAS FAIT DE GARDE À VUE"
+
+
+def test_split_style_colors_and_outline_are_configurable(tmp_path, video_dir):
+    config = make_config(
+        tmp_path, split_text_color="#112233", split_current_word_color="#445566",
+        split_outline_color="#778899", split_outline=3,
+    )
+    from clipper.subtitles import _ass_color
+
+    path = run_split(tmp_path, video_dir, config=config)
+    doc = parse_ass(path)
+    assert doc["style"]["PrimaryColour"] == _ass_color("#112233")
+    assert doc["style"]["SecondaryColour"] == _ass_color("#112233")
+    assert doc["style"]["OutlineColour"] == _ass_color("#778899")
+    assert doc["style"]["Outline"] == "3"
+    _base, highlights = _split_layers(path)
+    assert highlights and all(f"\\c{_ass_color('#445566')}" in ev["text"] for ev in highlights)
+
+
+def test_split_uppercase_defaults_to_true(tmp_path, video_dir):
+    path = run_split(tmp_path, video_dir)
+    base, _highlights = _split_layers(path)
+    text = "".join(line_text(ev) for ev in base)
+    assert text == text.upper()
+
+
+def test_split_uppercase_is_configurable(tmp_path, video_dir):
+    path = run_split(tmp_path, video_dir, config=make_config(tmp_path, split_uppercase=False))
+    _base, highlights = _split_layers(path)
+    text = " ".join(line_text(ev).strip() for ev in highlights)
+    assert text == "il n'a pas fait de garde à vue"
+
+
+def test_split_unknown_color_is_an_explicit_error(tmp_path, video_dir):
+    from clipper.subtitles import SubtitlesError
+
+    with pytest.raises(SubtitlesError):
+        run_split(tmp_path, video_dir, config=make_config(tmp_path, split_text_color="notacolor"))
+
+
+def test_split_shadow_disabled_by_default_has_no_visible_shadow_style(tmp_path, video_dir):
+    path = run_split(tmp_path, video_dir)
+    doc = parse_ass(path)
+    assert doc["style"]["Shadow"] == "0"
+
+
+def test_split_shadow_enabled_sets_shadow_distance_and_color(tmp_path, video_dir):
+    config = make_config(tmp_path, split_shadow_enabled=True, split_shadow_color="#010203",
+                         split_shadow_offset=[4, 4])
+    from clipper.subtitles import _ass_color
+
+    path = run_split(tmp_path, video_dir, config=config)
+    doc = parse_ass(path)
+    assert doc["style"]["Shadow"] == "4"
+    assert doc["style"]["BackColour"] == _ass_color("#010203")
+
+
+def test_split_invalid_shadow_offset_is_an_explicit_error(tmp_path, video_dir):
+    from clipper.subtitles import SubtitlesError
+
+    config = make_config(tmp_path, split_shadow_enabled=True, split_shadow_offset=[1, 2, 3])
+    with pytest.raises(SubtitlesError):
+        run_split(tmp_path, video_dir, config=config)
+
+
+def _parse_pos(ev: dict) -> tuple[float, float]:
+    m = re.search(r"\\pos\(([-\d.]+),([-\d.]+)\)", ev["text"])
+    assert m, ev["text"]
+    return float(m.group(1)), float(m.group(2))
+
+
+def test_split_position_is_the_configured_zone_and_text_stays_inside_it(tmp_path, video_dir):
+    zone = {"x0": 200, "y0": 750, "x1": 880, "y1": 900}
+    path = run_split(tmp_path, video_dir, zone=zone)
+    base, highlights = _split_layers(path)
+    for ev in base:
+        assert (ev["margin_l"], ev["margin_r"]) == (200, 1080 - 880)
+        assert_ink_in_zone(ev, int(CONFIG_DEFAULTS["split_font_size"]), zone)
+    # chaque mot mis en valeur est positionne (\pos) dans la zone configuree
+    for ev in base + highlights:
+        x, y = _parse_pos(ev)
+        assert zone["x0"] - 5 <= x <= zone["x1"]
+        assert zone["y0"] <= y <= zone["y1"]
+
+
+def test_split_font_size_is_configurable(tmp_path, video_dir):
+    path = run_split(tmp_path, video_dir, config=make_config(tmp_path, split_font_size=50))
+    doc = parse_ass(path)
+    assert doc["style"]["Fontsize"] == str(round(50 * 1762 / 1000))
+
+
+def test_split_ass_reused_in_split_but_not_in_letterbox_without_force(tmp_path, video_dir):
+    from clipper.subtitles import SubtitlesError
+
+    path = run_split(tmp_path, video_dir)
+    with llm.use_backend(FakeBackend([])):
+        assert Path(run(tmp_path, start=0.0, end=10.0, text_zone=dict(SPLIT_ZONE), style="split")) == path
+    with pytest.raises(SubtitlesError, match="--force"):
+        run_letterbox(tmp_path, video_dir, zone=SPLIT_ZONE)
+    relaid = run_letterbox(tmp_path, video_dir, zone=SPLIT_ZONE, force=True)
+    assert relaid.read_text(encoding="utf-8").startswith("; format: letterbox")
+
+
+def test_generate_unknown_style_is_an_explicit_error(tmp_path, video_dir):
+    from clipper.subtitles import SubtitlesError
+
+    with pytest.raises(SubtitlesError, match="style"):
+        run_letterbox(tmp_path, video_dir, style="diagonal")
