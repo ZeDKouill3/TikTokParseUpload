@@ -79,8 +79,10 @@ Ou lance `tools/setup.ps1`, qui fait tout ça et vérifie les prérequis (uv,
 Python 3.11, ffmpeg, `claude`, `ank`, GPU optionnel).
 
 Depuis la release (sans cloner le dépôt) : télécharge le `.whl` de la
-[dernière release](docs/releases/v0.1.0.md) puis `uv pip install
-clipper-0.1.0-py3-none-any.whl`.
+[dernière release](docs/releases/v0.1.0.md), `uv pip install
+clipper-0.1.0-py3-none-any.whl` puis `clipper init` (écrit `config.toml` et
+`rubric.toml` — la grille par défaut, embarquée dans la wheel — dans le
+dossier courant). La commande `clipper` s'ajoute à `python -m clipper`.
 
 **Prérequis** : Python 3.11 (géré par uv), [ffmpeg](https://ffmpeg.org/)
 (et `ffprobe`) dans le PATH, [Claude Code CLI](https://docs.claude.com/claude-code)

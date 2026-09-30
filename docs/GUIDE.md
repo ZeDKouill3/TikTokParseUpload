@@ -180,9 +180,11 @@ small, medium, large-v3...), `language` (défaut détection auto),
 `median_window_seconds` = 15.0, `peak_threshold_db` = 6.0.
 
 `[moments]` — `selection` = `"single"` (ou `"jury"`, forcé en mode auto),
-`rubric_path` = `"rubric.toml"`, `max_transcript_chars`, `chunk_chars`
-(découpe les longues vidéos), `exploration_share` = 0.1 (part de candidats
-hors grille stricte, pour ne pas se figer sur les mêmes formats).
+`rubric_path` = `"rubric.toml"` (chemin utilisé tel quel ; `"builtin"` :
+grille embarquée dans le paquet, sans fichier local), `max_transcript_chars`,
+`chunk_chars` (découpe les longues vidéos), `exploration_share` = 0.1 (part
+de candidats hors grille stricte, pour ne pas se figer sur les mêmes
+formats).
 
 `[vision]` — `window_seconds` = 10, `batch_size` = 8, `max_width` = 768,
 `parallel` = 4.
@@ -294,8 +296,9 @@ faut le réseau une fois, les lancements suivants réutilisent le cache.
 `--config chemin.toml` explicite pointant vers un fichier absent (jamais en
 silence, voir `clipper/config.py`). Sans `--config`, l'absence de
 `config.toml` n'est pas une erreur : les valeurs par défaut (`mode =
-"review"`, etc.) s'appliquent. Copie `config.example.toml` vers
-`config.toml` si tu veux personnaliser.
+"review"`, etc.) s'appliquent. `clipper init` écrit `config.toml` (à partir
+de `config.example.toml`) et `rubric.toml` dans le dossier courant — refuse
+d'écraser un fichier déjà présent sans `--force`.
 
 **`cle(s) inconnue(s) dans la section [...]`** — une clé de `config.toml` ne
 figure pas dans le `CONFIG_DEFAULTS` du module correspondant (faute de frappe
