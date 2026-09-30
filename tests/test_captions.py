@@ -911,3 +911,64 @@ def test_a_failing_moment_propagates_and_writes_nothing_in_parallel(workspace, t
     with pytest.raises(llm.TransientLLMError):
         run_with_backend(workspace, make_config(tmp_path, parallel=4), backend)
     assert not (workspace / VIDEO_ID / "captions.json").exists()
+
+
+# --------------------------------------------------------------------------
+# Appel a l'abonnement (SPEC-6a47) : cta_line/cta_hashtags, vide par defaut.
+# --------------------------------------------------------------------------
+
+
+def test_cta_line_and_hashtags_are_empty_by_default():
+    from clipper.captions import CONFIG_DEFAULTS
+
+    assert CONFIG_DEFAULTS["cta_line"] == ""
+    assert CONFIG_DEFAULTS["cta_hashtags"] == []
+
+
+def test_default_config_leaves_caption_and_hashtags_unchanged(workspace, tmp_path):
+    write_moments(workspace, moment(0))
+    write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
+
+    run(workspace, make_config(tmp_path), [answer(caption="Une legende.", hashtags=("#un", "#deux"))])
+
+    clip = by_id(read_captions(workspace), "00")
+    assert clip["caption"] == "Une legende."
+    assert clip["hashtags"] == ["#un", "#deux"]
+
+
+def test_cta_line_is_appended_to_every_clips_caption(workspace, tmp_path):
+    write_moments(workspace, moment(0), moment(1))
+    write_parts(
+        workspace,
+        parts_record(0, "single", 1, [part(1, 0.0, 3.9)]),
+        parts_record(1, "single", 1, [part(1, 0.0, 3.9)]),
+    )
+
+    run(workspace, make_config(tmp_path, cta_line="Abonne-toi sur Twitch pour plus de lives !"),
+        [answer(caption="Une legende."), answer(caption="Une autre legende.")])
+
+    data = read_captions(workspace)
+    assert by_id(data, "00")["caption"] == "Une legende.\nAbonne-toi sur Twitch pour plus de lives !"
+    assert by_id(data, "01")["caption"] == "Une autre legende.\nAbonne-toi sur Twitch pour plus de lives !"
+
+
+def test_cta_hashtags_are_appended_without_duplicating_existing_ones(workspace, tmp_path):
+    write_moments(workspace, moment(0))
+    write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
+
+    run(workspace, make_config(tmp_path, cta_hashtags=["#Twitch", "#horreur"]),
+        [answer(hashtags=("#gta6", "#twitch"))])  # #twitch de l'IA duplique #Twitch (casse ignoree)
+
+    clip = by_id(read_captions(workspace), "00")
+    assert clip["hashtags"] == ["#gta6", "#twitch", "#horreur"]
+
+
+def test_cta_hashtag_without_a_leading_hash_is_an_explicit_error(workspace, tmp_path):
+    from clipper.captions import CaptionsError
+
+    write_moments(workspace, moment(0))
+    write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
+
+    with pytest.raises(CaptionsError, match="cta_hashtags"):
+        run(workspace, make_config(tmp_path, cta_hashtags=["horreur"]), [answer()])
+    assert not (workspace / VIDEO_ID / "captions.json").exists()

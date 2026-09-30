@@ -55,13 +55,13 @@ jamais lancé en CI ni par défaut en local.
   échec remonte, est journalisé, ou met la vidéo en attente.
 - **ADR-09ad** — interface web (`clipper/web/`) : page statique servie par
   FastAPI, aucune logique de traitement vidéo/audio/LLM dedans.
-- **SPEC-6127** — contrat de sortie d'un clip (`output/<video_id>/<clip_id>.mp4`
+- **SPEC-6a47** — contrat de sortie d'un clip (`output/<video_id>/<clip_id>.mp4`
   + `.json` sidecar, champs obligatoires), format letterbox par défaut (zoom
   fixe, titre d'écran en haut, sous-titres dans la bande floue du bas) ; le
-  format crop (suivi de visage) reste une option figée. Remplace SPEC-350f.
-- **SPEC-6a47** — proposée, à ratifier : succède à SPEC-6127 avec un appel à
+  format crop (suivi de visage) reste une option figée. Ajoute un appel à
   l'abonnement optionnel (pseudo de chaîne discret sous le titre d'écran +
-  carte de fin « Abonne-toi ! »), désactivé par défaut.
+  carte de fin « Abonne-toi ! »), désactivé par défaut. Remplace SPEC-6127
+  (elle-même remplaçait SPEC-350f).
 - **SPEC-53f3** — grille de notation des moments (`rubric.toml`), critères et
   règles de sélection.
 

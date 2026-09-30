@@ -1478,3 +1478,465 @@ def test_render_stream_real_ffmpeg_gives_1080x1920_with_facecam_on_top_and_game_
     bx0, by0, _bx1, by1 = layout_title("Il m'a menti en garde à vue", STREAM_TITLE_ZONE, CONFIG_DEFAULTS).box
     assert by1 <= CAMERA_RECT["y"]
     assert min(img.getpixel((bx0 + 6, (by0 + by1) // 2))) > 225
+
+
+# --------------------------------------------------------------------------
+# Appel a l'abonnement (SPEC-6a47) : pseudo de chaine sous le titre + carte
+# de fin, desactive par defaut. Letterbox et stream seulement (crop reste
+# fige) ; jamais de CTA a moitie active (ADR-ad2e).
+# --------------------------------------------------------------------------
+
+
+def _cta_config(**overrides):
+    settings = {"cta_enabled": True, "cta_handle": "twitch.tv/madajel", "cta_seconds": 1.0}
+    settings.update(overrides)
+    return make_config(**settings)
+
+
+# --- (0) config : desactive par defaut ------------------------------------
+
+
+def test_cta_config_defaults_are_present_and_disabled():
+    from clipper.render import CONFIG_DEFAULTS
+
+    assert CONFIG_DEFAULTS["cta_enabled"] is False
+    assert CONFIG_DEFAULTS["cta_handle"] == ""
+    assert CONFIG_DEFAULTS["cta_text"] == "Abonne-toi !"
+    assert CONFIG_DEFAULTS["cta_seconds"] == 2.0
+    for key in ("cta_handle_font_size", "cta_handle_font_size_min", "cta_handle_gap",
+                "cta_card_font_size", "cta_card_font_size_min", "cta_card_radius"):
+        assert key in CONFIG_DEFAULTS
+
+
+def test_cta_field_is_false_by_default_in_the_sidecar(tmp_path, letterbox_dir, fake_ffmpeg, cpu_device):
+    from clipper.render import render
+
+    (letterbox_dir / f"{VIDEO_ID}.mp4").write_bytes(b"")
+    render(VIDEO_ID, CLIP_ID, workspace_dir=letterbox_dir.parent, output_dir=tmp_path / "output",
+           config=make_config())
+
+    data = json.loads((tmp_path / "output" / VIDEO_ID / f"{CLIP_ID}.json").read_text(encoding="utf-8"))
+    assert data["cta"] is False
+    cmd = fake_ffmpeg[0]["cmd"]
+    assert cmd.count("-i") == 2  # source + title.png : rendu inchange
+    assert "cta_card.png" not in fake_ffmpeg[0]["scratch"]
+    assert "gte(t," not in cmd[cmd.index("-filter_complex") + 1]
+
+
+# --- (1) validations explicites, jamais de CTA a moitie active -------------
+
+
+def test_cta_enabled_without_handle_is_an_explicit_error(tmp_path, video_dir, fake_ffmpeg):
+    from clipper.render import RenderError, render
+
+    (video_dir / f"{VIDEO_ID}.mp4").write_bytes(b"")
+    with pytest.raises(RenderError, match="cta_handle"):
+        render(VIDEO_ID, CLIP_ID, workspace_dir=video_dir.parent, output_dir=tmp_path / "output",
+               config=make_config(cta_enabled=True))
+    assert fake_ffmpeg == []
+
+
+@pytest.mark.parametrize("cta_seconds", [0, -1.0])
+def test_cta_seconds_not_positive_is_an_explicit_error(tmp_path, video_dir, fake_ffmpeg, cta_seconds):
+    from clipper.render import RenderError, render
+
+    (video_dir / f"{VIDEO_ID}.mp4").write_bytes(b"")
+    with pytest.raises(RenderError, match="cta_seconds"):
+        render(VIDEO_ID, CLIP_ID, workspace_dir=video_dir.parent, output_dir=tmp_path / "output",
+               config=_cta_config(cta_seconds=cta_seconds))
+    assert fake_ffmpeg == []
+
+
+def test_cta_text_empty_on_a_letterbox_clip_is_an_explicit_error(tmp_path, letterbox_dir, fake_ffmpeg, cpu_device):
+    from clipper.render import RenderError, render
+
+    (letterbox_dir / f"{VIDEO_ID}.mp4").write_bytes(b"")
+    with pytest.raises(RenderError, match="cta_text"):
+        render(VIDEO_ID, CLIP_ID, workspace_dir=letterbox_dir.parent, output_dir=tmp_path / "output",
+               config=_cta_config(cta_text=""))
+    assert fake_ffmpeg == []
+
+
+def test_cta_seconds_at_least_clip_duration_is_an_explicit_error(tmp_path, letterbox_dir, fake_ffmpeg, cpu_device):
+    from clipper.render import RenderError, render
+
+    (letterbox_dir / f"{VIDEO_ID}.mp4").write_bytes(b"")
+    with pytest.raises(RenderError, match="cta_seconds"):
+        render(VIDEO_ID, CLIP_ID, workspace_dir=letterbox_dir.parent, output_dir=tmp_path / "output",
+               config=_cta_config(cta_seconds=2.5))  # == duration du clip (2.5 s)
+    assert fake_ffmpeg == []
+
+
+# --- (2) crop : le format reste fige, cta ignore sans erreur ---------------
+
+
+def test_cta_enabled_on_a_non_text_layout_is_not_applied(tmp_path, video_dir, fake_ffmpeg, cpu_device):
+    from clipper.render import render
+
+    (video_dir / f"{VIDEO_ID}.mp4").write_bytes(b"")
+    render(VIDEO_ID, CLIP_ID, workspace_dir=video_dir.parent, output_dir=tmp_path / "output",
+           config=_cta_config())
+
+    data = json.loads((tmp_path / "output" / VIDEO_ID / f"{CLIP_ID}.json").read_text(encoding="utf-8"))
+    assert data["cta"] is False
+    assert "cta_card.png" not in fake_ffmpeg[0]["scratch"]
+
+
+# --- (3) pseudo de chaine : mesure avec la vraie police ---------------------
+
+
+def test_layout_pseudo_fits_a_short_handle_at_the_configured_size():
+    from clipper.render import CONFIG_DEFAULTS, layout_pseudo
+
+    lay = layout_pseudo("twitch.tv/madajel", 780, CONFIG_DEFAULTS)
+
+    assert lay.font_size == CONFIG_DEFAULTS["cta_handle_font_size"]
+    assert 0 < lay.width <= 780
+    assert lay.height > 0
+
+
+def test_layout_pseudo_steps_down_the_font_size_for_a_narrow_zone():
+    from clipper.render import CONFIG_DEFAULTS, layout_pseudo
+
+    lay = layout_pseudo("twitch.tv/madajel", 220, CONFIG_DEFAULTS)
+
+    assert lay.font_size < CONFIG_DEFAULTS["cta_handle_font_size"]
+    assert lay.width <= 220
+
+
+def test_layout_pseudo_too_long_even_at_minimum_size_is_an_explicit_error():
+    from clipper.render import CONFIG_DEFAULTS, RenderError, layout_pseudo
+
+    with pytest.raises(RenderError, match="pseudo"):
+        layout_pseudo("twitch.tv/" + "madajel" * 20, 100, CONFIG_DEFAULTS)
+
+
+def test_layout_pseudo_empty_is_an_explicit_error():
+    from clipper.render import CONFIG_DEFAULTS, RenderError, layout_pseudo
+
+    with pytest.raises(RenderError, match="vide"):
+        layout_pseudo("   ", 780, CONFIG_DEFAULTS)
+
+
+# --- (4) titre remonte pour laisser la place au pseudo ---------------------
+
+
+def test_screen_title_box_moves_up_to_make_room_for_the_pseudo_when_cta_applies(
+    tmp_path, letterbox_dir, cpu_device
+):
+    """Le PNG du titre est produit avec un title_lift effectif plus grand
+    quand le CTA s'applique : son encadre remonte, laissant un espace libre
+    sous lui pour le pseudo, sans jamais deborder de la zone (ADR-ad2e)."""
+    from clipper.render import CONFIG_DEFAULTS, layout_title
+
+    zone_w = TITLE_ZONE["x1"] - TITLE_ZONE["x0"]
+    from clipper.render import layout_pseudo
+
+    pseudo = layout_pseudo("twitch.tv/madajel", zone_w, CONFIG_DEFAULTS)
+    reserved = int(CONFIG_DEFAULTS["cta_handle_gap"]) + pseudo.height
+    effective = {**CONFIG_DEFAULTS, "title_lift": int(CONFIG_DEFAULTS["title_lift"]) + reserved}
+
+    plain = layout_title("Il m'a menti en garde à vue", TITLE_ZONE, CONFIG_DEFAULTS)
+    lifted = layout_title("Il m'a menti en garde à vue", TITLE_ZONE, effective)
+
+    assert lifted.box[3] < plain.box[3]  # l'encadre remonte (moins de by1)
+    _assert_box_inside(lifted.box, TITLE_ZONE)
+    # l'espace libere est bien celui reserve pour le pseudo
+    assert plain.box[3] - lifted.box[3] == reserved
+
+
+def test_render_draws_the_pseudo_handle_under_the_title_box(tmp_path, letterbox_dir, monkeypatch, cpu_device):
+    from PIL import Image
+
+    from clipper.render import render
+
+    (letterbox_dir / f"{VIDEO_ID}.mp4").write_bytes(b"")
+    seen = {}
+
+    def run(cmd, cwd, out_path):
+        seen["png"] = Image.open(Path(cwd) / "title.png").convert("RGBA").copy()
+        Path(out_path).write_bytes(b"mp4")
+
+    monkeypatch.setattr("clipper.render._exec_ffmpeg", run)
+    render(VIDEO_ID, CLIP_ID, workspace_dir=letterbox_dir.parent, output_dir=tmp_path / "output",
+           config=_cta_config())
+
+    img = seen["png"]
+    # sous l'encadre blanc du titre (remonte), une ligne de pixels non
+    # transparents (le pseudo, dessine avec un contour noir sur fond blanc).
+    from clipper.render import CONFIG_DEFAULTS, layout_pseudo, layout_title
+
+    zone_w = TITLE_ZONE["x1"] - TITLE_ZONE["x0"]
+    pseudo = layout_pseudo("twitch.tv/madajel", zone_w, CONFIG_DEFAULTS)
+    reserved = int(CONFIG_DEFAULTS["cta_handle_gap"]) + pseudo.height
+    effective = {**CONFIG_DEFAULTS, "title_lift": int(CONFIG_DEFAULTS["title_lift"]) + reserved}
+    title_layout = layout_title("Il m'a menti en garde à vue", TITLE_ZONE, effective)
+
+    ox, oy = TITLE_ZONE["x0"], TITLE_ZONE["y0"]
+    y_row = title_layout.box[3] - oy + int(CONFIG_DEFAULTS["cta_handle_gap"]) + pseudo.height // 2
+    opaque = sum(1 for x in range(img.width) if img.getpixel((x, y_row))[3] > 0)
+    assert opaque > 5, "aucun pixel du pseudo dessine sous l'encadre du titre"
+    _assert_box_inside(title_layout.box, TITLE_ZONE)  # le titre remonte reste dans la zone
+
+
+# --- (5) carte de fin : encadre centre, mesure avec la vraie police --------
+
+
+def test_layout_cta_card_centers_a_short_text_in_its_zone():
+    from clipper.render import CONFIG_DEFAULTS, layout_cta_card
+
+    lay = layout_cta_card("Abonne-toi !", SUBTITLES_ZONE, CONFIG_DEFAULTS)
+
+    assert lay.lines == ["Abonne-toi !"]
+    _assert_box_inside(lay.box, SUBTITLES_ZONE)
+    x0, y0, x1, y1 = lay.box
+    zx0, zy0, zx1, zy1 = SUBTITLES_ZONE["x0"], SUBTITLES_ZONE["y0"], SUBTITLES_ZONE["x1"], SUBTITLES_ZONE["y1"]
+    assert abs((x0 + x1) / 2 - (zx0 + zx1) / 2) <= 1
+    assert abs((y0 + y1) / 2 - (zy0 + zy1) / 2) <= 1  # centre verticalement (pas ancre en bas)
+
+
+def test_layout_cta_card_wraps_two_lines_when_needed():
+    from clipper.render import CONFIG_DEFAULTS, layout_cta_card
+
+    zone = {"x0": 150, "y0": 1246, "x1": 500, "y1": 1448}  # 350 px de large
+    lay = layout_cta_card("Abonne-toi vite maintenant", zone, CONFIG_DEFAULTS)
+
+    assert len(lay.lines) == 2
+    _assert_box_inside(lay.box, zone)
+
+
+def test_layout_cta_card_too_long_even_at_minimum_size_is_an_explicit_error():
+    from clipper.render import CONFIG_DEFAULTS, RenderError, layout_cta_card
+
+    text = " ".join(["Anticonstitutionnellement"] * 6)
+    with pytest.raises(RenderError, match="carte de fin"):
+        layout_cta_card(text, SUBTITLES_ZONE, CONFIG_DEFAULTS)
+
+
+def test_cta_card_png_is_transparent_with_a_white_box_and_black_text(tmp_path):
+    from PIL import Image
+
+    from clipper.render import CONFIG_DEFAULTS, cta_card_png
+
+    png = tmp_path / "cta_card.png"
+    lay = cta_card_png("Abonne-toi !", SUBTITLES_ZONE, CONFIG_DEFAULTS, png)
+
+    img = Image.open(png)
+    assert img.mode == "RGBA"
+    assert img.size == (SUBTITLES_ZONE["x1"] - SUBTITLES_ZONE["x0"], SUBTITLES_ZONE["y1"] - SUBTITLES_ZONE["y0"])
+    assert img.getpixel((0, 0))[3] == 0  # hors encadre : transparent
+    ox, oy = SUBTITLES_ZONE["x0"], SUBTITLES_ZONE["y0"]
+    bx0, by0, bx1, by1 = lay.box
+    assert img.getpixel((bx0 - ox + 4, (by0 + by1) // 2 - oy)) == (255, 255, 255, 255)
+
+
+# --- (6) sous-titres tronques pendant la carte de fin -----------------------
+
+
+def test_truncate_ass_for_cta_shortens_an_event_that_overlaps_the_cutoff():
+    from clipper.render import truncate_ass_for_cta
+
+    ass = (
+        "[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+        "Dialogue: 0,0:00:00.50,0:00:02.00,Default,,0,0,0,,Bonjour\n"
+    )
+    out = truncate_ass_for_cta(ass, cutoff=1.5)
+    assert "0:00:00.50,0:00:01.50" in out
+    assert "Bonjour" in out
+
+
+def test_truncate_ass_for_cta_drops_an_event_that_starts_after_the_cutoff():
+    from clipper.render import truncate_ass_for_cta
+
+    ass = (
+        "[Events]\n"
+        "Dialogue: 0,0:00:02.00,0:00:03.00,Default,,0,0,0,,Trop tard\n"
+    )
+    out = truncate_ass_for_cta(ass, cutoff=1.5)
+    assert "Trop tard" not in out
+
+
+def test_truncate_ass_for_cta_keeps_an_event_entirely_before_the_cutoff_unchanged():
+    from clipper.render import truncate_ass_for_cta
+
+    line = "Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,Salut"
+    out = truncate_ass_for_cta(f"[Events]\n{line}\n", cutoff=1.5)
+    assert line in out
+
+
+def test_truncate_ass_for_cta_preserves_non_dialogue_lines():
+    from clipper.render import truncate_ass_for_cta
+
+    ass = "[Script Info]\nScriptType: v4.00+\n\n[Events]\nDialogue: 0,0:00:02.00,0:00:03.00,Default,,0,0,0,,x\n"
+    out = truncate_ass_for_cta(ass, cutoff=1.0)
+    assert "[Script Info]" in out
+    assert "ScriptType: v4.00+" in out
+
+
+# --- (7) filtre ffmpeg : carte de fin par-dessus les sous-titres -----------
+
+
+def test_build_filter_complex_overlays_the_cta_card_after_the_cutoff(tmp_path, video_dir):
+    from clipper.render import CONFIG_DEFAULTS, _build_filter_complex
+
+    ass_path = video_dir / "subtitles" / f"{CLIP_ID}.ass"
+    filt, label = _build_filter_complex(
+        _reframe_json_letterbox(), 1.0, 3.5, ass_path, None, None, tmp_path, CONFIG_DEFAULTS,
+        title_input=1, cta_input=2, cta_start=1.5,
+    )
+
+    overlay = next(f for f in filt.split(";") if "[2:v]overlay" in f)
+    assert f"[2:v]overlay=x={SUBTITLES_ZONE['x0']}:y={SUBTITLES_ZONE['y0']}" in overlay
+    assert "enable='gte(t,1.500000)'" in overlay
+    assert overlay.endswith(f"[{label}]")
+
+
+def test_build_filter_complex_without_cta_input_has_no_overlay_of_the_card(tmp_path, video_dir):
+    from clipper.render import CONFIG_DEFAULTS, RenderError, _build_filter_complex
+
+    ass_path = video_dir / "subtitles" / f"{CLIP_ID}.ass"
+    filt, _label = _build_filter_complex(
+        _reframe_json_letterbox(), 1.0, 3.5, ass_path, None, None, tmp_path, CONFIG_DEFAULTS, title_input=1,
+    )
+    assert "gte(t," not in filt
+
+    with pytest.raises(RenderError, match="cta_start"):
+        _build_filter_complex(
+            _reframe_json_letterbox(), 1.0, 3.5, ass_path, None, None, tmp_path, CONFIG_DEFAULTS,
+            title_input=1, cta_input=2,
+        )
+
+
+# --- (8) render() integration : letterbox et stream -------------------------
+
+
+def test_render_letterbox_with_cta_writes_three_inputs_truncated_ass_and_cta_true(
+    tmp_path, letterbox_dir, fake_ffmpeg, cpu_device
+):
+    from clipper.render import render
+
+    (letterbox_dir / f"{VIDEO_ID}.mp4").write_bytes(b"")
+    render(VIDEO_ID, CLIP_ID, workspace_dir=letterbox_dir.parent, output_dir=tmp_path / "output",
+           config=_cta_config())
+
+    cmd = fake_ffmpeg[0]["cmd"]
+    inputs = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-i"]
+    assert len(inputs) == 3
+    assert inputs[1].endswith("title.png")
+    assert inputs[2].endswith("cta_card.png")
+    assert "cta_card.png" in fake_ffmpeg[0]["scratch"]
+
+    filt = cmd[cmd.index("-filter_complex") + 1]
+    assert "[2:v]overlay" in filt
+    # cutoff = duree (2.5 s) - cta_seconds (1.0 s, _cta_config)
+    assert "enable='gte(t,1.500000)'" in filt
+
+    data = json.loads((tmp_path / "output" / VIDEO_ID / f"{CLIP_ID}.json").read_text(encoding="utf-8"))
+    assert data["cta"] is True
+
+
+def test_render_stream_with_cta_still_writes_both_rects(tmp_path, stream_dir, fake_ffmpeg, cpu_device):
+    from clipper.render import render
+
+    (stream_dir / f"{VIDEO_ID}.mp4").write_bytes(b"")
+    render(VIDEO_ID, CLIP_ID, workspace_dir=stream_dir.parent, output_dir=tmp_path / "output",
+           config=_cta_config())
+
+    data = json.loads((tmp_path / "output" / VIDEO_ID / f"{CLIP_ID}.json").read_text(encoding="utf-8"))
+    assert data["cta"] is True
+    assert data["camera_rect"] == CAMERA_RECT
+    assert data["video_rect"] == GAMEPLAY_RECT
+    cmd = fake_ffmpeg[0]["cmd"]
+    assert cmd.count("-i") == 3
+
+
+# --- (9) rendu ffmpeg reel : carte de fin visible seulement en fin de clip -
+
+def _whiteness(img, zone):
+    return sum(
+        1 for y in range(zone["y0"], zone["y1"], 2) for x in range(zone["x0"], zone["x1"], 2)
+        if min(img.getpixel((x, y))) > 235
+    )
+
+
+@no_ffmpeg
+@no_ffprobe
+def test_render_letterbox_real_ffmpeg_with_cta_shows_the_end_card_only_after_the_cutoff(
+    tmp_path, letterbox_dir, synthetic_source, cpu_device
+):
+    from PIL import Image
+
+    from clipper.render import render
+
+    out = render(VIDEO_ID, CLIP_ID, workspace_dir=letterbox_dir.parent, output_dir=tmp_path / "output",
+                 config=_cta_config(x264_preset="ultrafast"))  # duree 2.5 s, cta_seconds 1.0 -> cutoff 1.5 s
+
+    def frame(t):
+        path = tmp_path / f"frame_{t}.png"
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-ss", str(t), "-i", str(out),
+                        "-frames:v", "1", str(path)], check=True)
+        return Image.open(path).convert("RGB")
+
+    before = _whiteness(frame(1.0), SUBTITLES_ZONE)
+    after = _whiteness(frame(2.2), SUBTITLES_ZONE)
+    assert after > before + 20, (before, after)  # l'encadre blanc n'apparait qu'apres le cutoff
+
+
+@no_ffmpeg
+@no_ffprobe
+def test_render_stream_real_ffmpeg_with_cta_shows_the_end_card_only_after_the_cutoff(
+    tmp_path, stream_dir, cpu_device
+):
+    from PIL import Image
+
+    from clipper.render import render
+
+    x0, y0, x1, y1 = FACECAM
+    subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error",
+         "-f", "lavfi", "-i",
+         f"color=c=green:s={SRC_W}x{SRC_H}:r=25:d=5,drawbox=x={x0}:y={y0}:w={x1 - x0}:h={y1 - y0}:color=red:t=fill",
+         "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100:duration=5",
+         "-ac", "2", "-shortest", str(stream_dir / f"{VIDEO_ID}.mp4")],
+        check=True,
+    )
+    out = render(VIDEO_ID, CLIP_ID, workspace_dir=stream_dir.parent, output_dir=tmp_path / "output",
+                 config=_cta_config(x264_preset="ultrafast"))  # duree 2.5 s, cta_seconds 1.0 -> cutoff 1.5 s
+
+    def frame(t):
+        path = tmp_path / f"frame_{t}.png"
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-ss", str(t), "-i", str(out),
+                        "-frames:v", "1", str(path)], check=True)
+        return Image.open(path).convert("RGB")
+
+    before = _whiteness(frame(1.0), STREAM_SUBTITLES_ZONE)
+    after = _whiteness(frame(2.2), STREAM_SUBTITLES_ZONE)
+    assert after > before + 20, (before, after)
+
+
+# --- (10) « Partie N » continue de s'afficher normalement avec le CTA ------
+
+
+def test_render_multipart_with_cta_still_draws_partie_n_during_the_end_card(
+    tmp_path, letterbox_dir, fake_ffmpeg, cpu_device
+):
+    from clipper.render import render
+
+    (letterbox_dir / f"{VIDEO_ID}.mp4").write_bytes(b"")
+    (letterbox_dir / "captions.json").write_text(
+        json.dumps(_captions_json(part=2, parts_total=3)), encoding="utf-8")
+
+    render(VIDEO_ID, CLIP_ID, workspace_dir=letterbox_dir.parent, output_dir=tmp_path / "output",
+           config=_cta_config())
+
+    assert "part.txt" in fake_ffmpeg[0]["scratch"]
+    assert "cta_card.png" in fake_ffmpeg[0]["scratch"]
+    filt = fake_ffmpeg[0]["cmd"][fake_ffmpeg[0]["cmd"].index("-filter_complex") + 1]
+    part = next(f for f in filt.split(";") if "part.txt" in f)
+    assert "drawtext=textfile='part.txt'" in part
+    assert "enable=" not in part  # Partie N jamais masquee, tout le clip
+    assert "[2:v]overlay" in filt  # la carte de fin s'ajoute, sans remplacer Partie N
+
+    data = json.loads((tmp_path / "output" / VIDEO_ID / f"{CLIP_ID}.json").read_text(encoding="utf-8"))
+    assert data["cta"] is True
