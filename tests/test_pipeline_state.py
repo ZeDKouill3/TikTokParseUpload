@@ -9,12 +9,14 @@ PermissionError a volonte, sans avoir a reproduire un vrai verrou de fichier.
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import pytest
 
-from clipper import pipeline
+from clipper import llm, pipeline
 from clipper.config import Config
+from clipper.llm.fake import FakeBackend
 
 VIDEO_ID = "abcdefghijk"
 URL = f"https://www.youtube.com/watch?v={VIDEO_ID}"
@@ -22,6 +24,18 @@ URL = f"https://www.youtube.com/watch?v={VIDEO_ID}"
 
 def _config(tmp_path: Path) -> Config:
     return Config(mode="auto", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output")
+
+
+def _patch_noop_steps(monkeypatch, *, except_name=None, except_fn=None):
+    """Remplace chaque etape de pipeline._Run par un no-op (sauf
+    ``except_name``, remplacee par ``except_fn``) : prouve l'orchestration de
+    pipeline.py (etat, progression, journal) sans reseau, GPU, ffmpeg ni vrai
+    Claude (done_criteria : "avec des etapes simulees"). ``_summary`` est
+    egalement neutralisee : aucune etape simulee n'ecrit captions.json."""
+    for name in pipeline.STEPS:
+        fn = except_fn if name == except_name else (lambda self: None)
+        monkeypatch.setattr(pipeline._Run, name, fn)
+    monkeypatch.setattr(pipeline, "_summary", lambda run: [])
 
 
 def _flaky_replace(fail_times: int | None):
@@ -73,3 +87,147 @@ def test_save_state_raises_after_persistent_permission_error(tmp_path, monkeypat
     # fichier temporaire (donnee non publiee) est present.
     final = tmp_path / "workspace" / VIDEO_ID / pipeline.STATE_FILE
     assert not final.exists()
+
+
+# --------------------------------------------------------------------------
+# TASK-d2348b14bd09 : channel, enqueued_at, progress intra-etape, journal
+# events.jsonl, relance ciblee (force_steps), preset --config en surcouche.
+# --------------------------------------------------------------------------
+
+
+def test_new_state_has_channel_enqueued_at_and_null_progress_per_step():
+    from datetime import datetime
+
+    state = pipeline.new_state(VIDEO_ID, URL, "auto")
+    assert state["channel"] is None
+    datetime.fromisoformat(state["enqueued_at"])  # ISO valide, ne leve pas
+    for name in pipeline.STEPS:
+        assert state["steps"][name]["progress"] is None
+
+    named = pipeline.new_state(VIDEO_ID, URL, "auto", channel="ma_chaine")
+    assert named["channel"] == "ma_chaine"
+
+
+def test_run_and_render_accept_a_channel_kwarg(tmp_path, monkeypatch):
+    _patch_noop_steps(monkeypatch)
+    config = _config(tmp_path)
+
+    with llm.use_backend(FakeBackend([])):
+        state = pipeline.run(URL, config=config, channel="ma_chaine")
+    assert state["channel"] == "ma_chaine"
+    assert pipeline.load_state(VIDEO_ID, config=config)["channel"] == "ma_chaine"
+
+    with llm.use_backend(FakeBackend([])):
+        again = pipeline.render(VIDEO_ID, config=config, channel="autre_chaine")
+    assert again["channel"] == "autre_chaine"
+
+    with llm.use_backend(FakeBackend([])):
+        unchanged = pipeline.render(VIDEO_ID, config=config)
+    assert unchanged["channel"] == "autre_chaine"  # pas de channel= : inchange
+
+
+def test_progress_callback_updates_pipeline_json_throttled_to_the_last_value(tmp_path, monkeypatch):
+    clock = {"t": 0.0}
+    monkeypatch.setattr(pipeline.time, "monotonic", lambda: clock["t"])
+    config = _config(tmp_path)
+    seen_on_disk = []
+
+    def fake_transcribe(self):
+        cb = self.opts("transcribe")["progress"]
+        cb(0.1, 50.0, "debut")
+        seen_on_disk.append(pipeline.load_state(VIDEO_ID, config=config)["steps"]["transcribe"]["progress"])
+        clock["t"] += 0.5  # < 2s depuis la 1re ecriture : pas de nouvelle ecriture disque
+        cb(0.4, 30.0, "proche")
+        seen_on_disk.append(pipeline.load_state(VIDEO_ID, config=config)["steps"]["transcribe"]["progress"])
+        clock["t"] += 2.5  # >= 2s depuis la 1re ecriture : nouvelle ecriture
+        cb(0.8, 5.0, "presque fini")
+        seen_on_disk.append(pipeline.load_state(VIDEO_ID, config=config)["steps"]["transcribe"]["progress"])
+
+    _patch_noop_steps(monkeypatch, except_name="transcribe", except_fn=fake_transcribe)
+
+    with llm.use_backend(FakeBackend([])):
+        state = pipeline.run(URL, config=config)
+
+    assert state["status"] == "done", state
+    assert state["steps"]["transcribe"]["progress"] is None  # remis a null a la fin de l'etape
+    assert seen_on_disk[0] == {"fraction": 0.1, "eta_s": 50.0, "message": "debut"}
+    assert seen_on_disk[1] == seen_on_disk[0]  # disque pas reecrit : encore l'ancienne valeur
+    assert seen_on_disk[2] == {"fraction": 0.8, "eta_s": 5.0, "message": "presque fini"}
+
+
+def test_progress_is_reset_to_null_when_the_step_fails(tmp_path, monkeypatch):
+    config = _config(tmp_path)
+
+    def failing_render(self):
+        cb = self.opts("render")["progress"]
+        cb(0.5, 10.0, "en cours")
+        raise RuntimeError("echec simule")
+
+    _patch_noop_steps(monkeypatch, except_name="render", except_fn=failing_render)
+
+    with llm.use_backend(FakeBackend([])):
+        state = pipeline.run(URL, config=config)
+
+    assert state["status"] == "failed", state
+    assert state["steps"]["render"]["status"] == "failed"
+    assert state["steps"]["render"]["progress"] is None
+
+
+def test_events_journal_gets_info_logs_and_state_transitions_never_truncated(tmp_path, monkeypatch):
+    config = _config(tmp_path)
+
+    def fake_moments(self):
+        logging.getLogger("clipper.moments").info("travail simule des moments")
+        logging.getLogger("clipper.moments").debug("jamais journalise : sous INFO")
+
+    _patch_noop_steps(monkeypatch, except_name="moments", except_fn=fake_moments)
+
+    with llm.use_backend(FakeBackend([])):
+        state = pipeline.run(URL, config=config)
+
+    assert state["status"] == "done", state
+    events_path = tmp_path / "workspace" / VIDEO_ID / pipeline.EVENTS_FILE
+    lines = [json.loads(l) for l in events_path.read_text(encoding="utf-8").splitlines()]
+    assert lines, "aucun evenement journalise"
+    for entry in lines:
+        assert set(entry) == {"at", "level", "step", "message"}
+        assert entry["level"] in ("INFO", "WARNING", "ERROR")
+    messages = [e["message"] for e in lines]
+    assert any("travail simule des moments" in m for m in messages)
+    assert not any("jamais journalise" in m for m in messages)
+    moments_events = [e for e in lines if e["step"] == "moments"]
+    assert any("etape moments" in e["message"] for e in moments_events)
+    assert any("travail simule des moments" in e["message"] for e in moments_events)
+
+    # Jamais tronque : un 2e passage (render) ajoute des lignes, n'efface rien.
+    before = len(lines)
+    _patch_noop_steps(monkeypatch)
+    with llm.use_backend(FakeBackend([])):
+        pipeline.render(VIDEO_ID, config=config)
+    after = [json.loads(l) for l in events_path.read_text(encoding="utf-8").splitlines()]
+    assert len(after) > before
+    assert after[:before] == lines
+
+
+def test_force_steps_resets_that_step_and_following_to_pending_keeps_earlier_done(tmp_path):
+    config = _config(tmp_path)
+    state = pipeline.new_state(VIDEO_ID, URL, "auto")
+    for name in pipeline.STEPS:
+        state["steps"][name]["status"] = "done"
+
+    run = pipeline._start(state, config, False, None, force_steps=["reframe"])
+
+    idx = pipeline.STEPS.index("reframe")
+    for name in pipeline.STEPS[:idx]:
+        assert state["steps"][name]["status"] == "done", name
+        assert not run._forced(name), name
+    for name in pipeline.STEPS[idx:]:
+        assert state["steps"][name]["status"] == "pending", name
+        assert run._forced(name), name
+
+
+def test_force_steps_with_an_unknown_step_name_is_a_clear_error(tmp_path):
+    config = _config(tmp_path)
+    state = pipeline.new_state(VIDEO_ID, URL, "auto")
+    with pytest.raises(pipeline.PipelineError, match="inconnue_etape"):
+        pipeline._start(state, config, False, None, force_steps=["inconnue_etape"])

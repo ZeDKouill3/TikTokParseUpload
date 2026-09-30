@@ -709,7 +709,7 @@ def test_cli_status_prints_the_state_as_json(tmp_path, isolated_cwd, capsys):
     state = json.loads(capsys.readouterr().out)
     assert state["video_id"] == VIDEO_ID
     assert state["steps"]["download"] == {"status": "pending", "reason": None, "started_at": None,
-                                          "finished_at": None}
+                                          "finished_at": None, "progress": None}
 
 
 def test_cli_run_and_render_go_through_the_pipeline(tmp_path, isolated_cwd, monkeypatch):
@@ -730,6 +730,46 @@ def test_cli_unknown_video_status_is_an_error(tmp_path, isolated_cwd, capsys):
 
     assert main(["status", "inconnu0000"]) == 1
     assert "inconnu0000" in capsys.readouterr().err
+
+
+def test_cli_force_step_is_repeatable_and_reaches_pipeline_run_and_render(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import pipeline
+    from clipper.__main__ import main
+
+    calls = []
+    monkeypatch.setattr(pipeline, "run",
+                        lambda url, **kw: calls.append(("run", kw["force_steps"])) or {"status": "done"})
+    monkeypatch.setattr(pipeline, "render",
+                        lambda vid, **kw: calls.append(("render", kw["force_steps"])) or {"status": "done"})
+
+    assert main(["run", URL, "--force-step", "reframe", "--force-step", "render"]) == 0
+    assert main(["render", VIDEO_ID]) == 0
+    assert calls == [("run", ["reframe", "render"]), ("render", None)]
+
+
+def test_cli_config_flag_loads_the_preset_as_an_overlay_on_config_toml(isolated_cwd, monkeypatch):
+    from clipper import __main__ as main_mod
+
+    (isolated_cwd / "config.toml").write_text('mode = "review"\n', encoding="utf-8")
+    presets_dir = isolated_cwd / "presets"
+    presets_dir.mkdir()
+    (presets_dir / "ma_chaine.toml").write_text('mode = "auto"\n', encoding="utf-8")
+
+    original = main_mod.load_config
+    captured = []
+
+    def spy(*a, **kw):
+        captured.append((a, kw))
+        return original(*a, **kw)
+
+    monkeypatch.setattr(main_mod, "load_config", spy)
+
+    assert main_mod.main(["--config", "presets/ma_chaine.toml", "status", "inconnu0000"]) == 1
+    assert captured == [(("presets/ma_chaine.toml",), {"base": "config.toml"})]
+
+    captured.clear()
+    assert main_mod.main(["status", "inconnu0000"]) == 1
+    assert captured == [((), {})]
 
 
 # --------------------------------------------------------------------------
@@ -921,6 +961,39 @@ def test_reframe_step_detects_the_facecam_once_per_video_in_stream_auto(tmp_path
         assert [c[0] for c in calls] == ["facecam"] * expected + ["clip", "clip"]
         if expected:
             assert calls[0][1][0] == VIDEO_ID and calls[0][2]["force"] is True
+
+
+def test_render_targeted_at_one_clip_with_force_steps_touches_only_that_clip(tmp_path, monkeypatch):
+    """SPEC-fc0c §4.5 : render(video_id, clips=['01'], force_steps=['render',
+    'qa']) ne re-rend et ne re-controle que ce clip. render_step.render et
+    qa.check_clip sont simules (aucun rendu/controle reel requis pour prouver
+    l'orchestration de pipeline.py)."""
+    from clipper import pipeline, qa, render as render_step
+
+    d = tmp_path / "workspace" / VIDEO_ID
+    d.mkdir(parents=True)
+    (d / "captions.json").write_text(json.dumps({"clips": [
+        {"id": "00", "start": 0.0, "end": 4.0}, {"id": "01", "start": 4.0, "end": 8.0},
+        {"id": "02", "start": 8.0, "end": 12.0},
+    ]}), encoding="utf-8")
+    out_dir = tmp_path / "output" / VIDEO_ID
+    out_dir.mkdir(parents=True)
+    for clip_id in ("00", "01", "02"):
+        (out_dir / f"{clip_id}.json").write_text(json.dumps({"clip_id": clip_id}), encoding="utf-8")
+
+    render_calls = []
+    qa_calls = []
+    monkeypatch.setattr(render_step, "render", lambda video_id, clip_id, *a, **k: render_calls.append(clip_id))
+    monkeypatch.setattr(qa, "check_clip", lambda json_path, *a, **k: qa_calls.append(json_path.stem))
+
+    config = Config(mode="auto", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output")
+    run = pipeline._start(pipeline.new_state(VIDEO_ID, URL, "auto"), config, False, None,
+                          force_steps=["render", "qa"], clips=["01"])
+    run.render()
+    run.qa()
+
+    assert render_calls == ["01"]
+    assert qa_calls == ["01"]
 
 
 def test_hook_zones_reserve_the_hook_band_for_the_hook_duration(tmp_path):
