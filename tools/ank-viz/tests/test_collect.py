@@ -37,7 +37,7 @@ class Replay:
 
 def test_only_ank_json_and_git_are_called():
     run = Replay()
-    ankviz.Collector(run).refresh()
+    ankviz.Collector(run).refresh(default_branch="main")
     assert run.calls
     for argv in run.calls:
         assert argv[0] in ("ank", "git")
@@ -45,8 +45,29 @@ def test_only_ank_json_and_git_are_called():
             assert "--json" in argv
 
 
+def test_refresh_never_calls_ank_status():
+    # TASK-7177 : `ank status` peut rester bloqué plusieurs minutes, sans
+    # rapport avec la taille du dépôt ; le rafraîchissement des tâches ne
+    # doit jamais en dépendre. Voir StatusPoller dans server.py.
+    run = Replay()
+    ankviz.Collector(run).refresh(default_branch="main")
+    assert [a for a in run.calls if a[:2] == ["ank", "status"]] == []
+
+
+def test_without_a_known_default_branch_ahead_behind_stay_pending():
+    # default_branch=None : aucun statut encore lu (première passe, ou
+    # StatusPoller pas encore abouti). Jamais une avance/retard inventée.
+    run = Replay()
+    state = ankviz.Collector(run).refresh(default_branch=None)
+    assert state["default_branch"] is None
+    assert [a for a in run.calls if a[:2] == ["git", "rev-list"]] == []
+    for b in state["branches"]:
+        assert b["ahead"] is None
+        assert b["behind"] is None
+
+
 def test_state_carries_tasks_groups_documents_graph_branches():
-    state = ankviz.Collector(Replay()).refresh()
+    state = ankviz.Collector(Replay()).refresh(default_branch="main")
     tasks = {t["id"]: t for t in state["tasks"]}
     assert tasks["TASK-7291d843d843"]["criterion"].startswith("Pour chaque clip")
     assert tasks["TASK-7aca619df8f4"]["claimed_by"] == "UP60041549@wl0023729"

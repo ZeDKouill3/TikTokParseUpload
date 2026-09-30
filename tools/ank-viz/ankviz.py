@@ -187,9 +187,10 @@ def link_task(branch, tasks):
 
 
 class Collector:
-    """Assemble l'état affiché par la page. `run(argv) -> stdout` est la seule
-    porte vers le dépôt ; les critères sont gardés tant que le hash du corpus
-    renvoyé par `ank find` ne bouge pas (chaque appel ank coûte ~2 s)."""
+    """Assemble l'état des tâches affiché par la page. `run(argv) -> stdout`
+    est la seule porte vers le dépôt ; les critères sont gardés tant que le
+    hash du corpus renvoyé par `ank find` ne bouge pas (chaque appel ank
+    coûte ~2 s). `ank status` n'est pas de son ressort : voir `refresh`."""
 
     def __init__(self, run, workers=8):
         self.run = run
@@ -209,34 +210,42 @@ class Collector:
                     self._criteria[i] = parse_criterion(text)
         return self._criteria
 
-    def refresh(self, criteria=True):
-        """criteria=False : passe rapide, sans aucun `ank show`."""
-        with ThreadPoolExecutor(3) as pool:
-            find_text, graph_text, status_text = pool.map(self.run, [
-                ["ank", "find", "", "--json"], ["ank", "graph", "--json"], ["ank", "status", "--json"]])
+    def refresh(self, criteria=True, default_branch=None):
+        """criteria=False : passe rapide, sans aucun `ank show`.
+
+        `ank status` n'est jamais appelé ici (voir TASK-7177 : il peut y rester
+        bloqué plusieurs minutes, sans rapport avec la taille du dépôt). La
+        branche par défaut est fournie par l'appelant, lue séparément et mise
+        en cache (`StatusPoller` dans server.py) ; tant qu'elle est inconnue
+        (`None`), l'avance/retard des branches reste `None` plutôt qu'une
+        valeur calculée sur une base fausse."""
+        with ThreadPoolExecutor(2) as pool:
+            find_text, graph_text = pool.map(self.run, [
+                ["ank", "find", "", "--json"], ["ank", "graph", "--json"]])
         entities = parse_find(find_text)
         edges = parse_edges(graph_text)
-        status = parse_status(status_text)
         tasks = [e for e in entities if e["kind"] == "task"]
         known = self._criteria_for(parse_corpus(find_text), [t["id"] for t in tasks]) if criteria else {}
         for t in tasks:
             t["criterion"] = known.get(t["id"], "") if criteria else None
             t["blocked_by"] = [b for x, b in edges if x == t["id"]]
 
-        base = status["default_branch"]
         branches = parse_refs(self.run(["git", "for-each-ref", "--format=" + REF_FORMAT,
                                         "refs/heads", "refs/remotes"]))
         for b in branches:
-            try:
-                b.update(parse_ahead_behind(self.run(
-                    ["git", "rev-list", "--left-right", "--count", "%s...%s" % (base, b["ref"])])))
-            except (ValueError, RuntimeError):
+            if default_branch is None:
                 b.update({"ahead": None, "behind": None})
+            else:
+                try:
+                    b.update(parse_ahead_behind(self.run(
+                        ["git", "rev-list", "--left-right", "--count",
+                         "%s...%s" % (default_branch, b["ref"])])))
+                except (ValueError, RuntimeError):
+                    b.update({"ahead": None, "behind": None})
             b["task"] = link_task(b["name"], tasks)
 
         return {
-            "status": status,
-            "default_branch": base,
+            "default_branch": default_branch,
             "tasks": tasks,
             "groups": group_tasks(tasks, edges),
             "documents": [e for e in entities if e["kind"] in ("adr", "spec")],

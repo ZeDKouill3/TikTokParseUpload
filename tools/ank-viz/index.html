@@ -147,6 +147,7 @@ a.tlink:hover { text-decoration: underline; }
   <span class="chip">identité <b id="h-id">…</b></span>
   <span class="chip">claim <b id="h-claim">…</b></span>
   <span class="spacer"></span>
+  <span class="chip"><span id="h-status">statut : …</span></span>
   <span class="chip"><span class="pulse busy" id="h-pulse"></span><span id="h-time">collecte en cours…</span></span>
 </header>
 <div class="err" id="err"></div>
@@ -346,7 +347,8 @@ function renderBranches(state) {
   const current = state.status && state.status.branch;
   const rows = [...state.branches].sort((a, b) => (a.remote - b.remote) || (b.date || "").localeCompare(a.date || ""));
   $("n-branches").textContent = rows.length;
-  $("branches").innerHTML = `<tr><th>Branche</th><th>Dernier commit</th><th>Quand</th><th title="par rapport à ${esc(state.default_branch)}">↑ avance</th><th>↓ retard</th><th>Tâche</th></tr>` +
+  const vsBase = state.default_branch ? `par rapport à ${esc(state.default_branch)}` : "en attente du statut";
+  $("branches").innerHTML = `<tr><th>Branche</th><th>Dernier commit</th><th>Quand</th><th title="${vsBase}">↑ avance</th><th>↓ retard</th><th>Tâche</th></tr>` +
     rows.map((b) => {
       const t = b.task && byId[b.task];
       return `<tr>
@@ -374,11 +376,22 @@ function renderDocs(state) {
     </tr>`).join("");
 }
 
+function statusText(state) {
+  // `ank status` peut rester bloqué plusieurs minutes (TASK-7177) : jamais
+  // masqué en silence, toujours dit explicitement en attente ou périmé.
+  if (state.status_loading) return "statut : première lecture en cours (peut prendre plusieurs minutes)…";
+  let text = state.status_collected_at ? `statut il y a ${relTime(state.status_collected_at)}` : "statut : ?";
+  if (state.status_collecting) text += ", nouvelle lecture en cours…";
+  if (state.status_error) text += ` (échec : ${state.status_error})`;
+  return text;
+}
+
 function renderHeader(state) {
   const st = state.status || {};
   $("h-branch").textContent = st.branch || "?";
   $("h-id").textContent = st.identity || "?";
   $("h-claim").textContent = st.claim ? st.claim.slice(0, 9) : "aucun";
+  $("h-status").textContent = statusText(state);
   $("err").textContent = state.error ? `Dernière collecte en échec : ${state.error}` : "";
 }
 
