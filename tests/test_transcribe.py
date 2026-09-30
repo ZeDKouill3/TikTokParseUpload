@@ -622,18 +622,23 @@ def test_fix_word_that_would_merge_words_is_refused(tmp_path, video_dir, cpu):
     assert not (video_dir / "transcript.json").exists()
 
 
-def test_fix_correction_whose_old_does_not_match_the_actual_word_is_refused_and_logged(
+def test_fix_correction_whose_old_does_not_match_the_actual_word_is_ignored_and_logged(
     tmp_path, video_dir, cpu
 ):
     """Une correction visant un mot different de celui reellement present a
-    cet index (LLM decale, index hallucine...) ne correspond pas au texte :
-    refusee, jamais appliquee en silence (ADR-ad2e), et journalisee dans
-    llm_refusals.jsonl (meme convention que captions.py)."""
+    cet index (LLM decale, index hallucine...) ne correspond pas au texte,
+    meme apres comparaison tolerante a la ponctuation : ignoree, jamais
+    appliquee en silence, journalisee dans llm_refusals.jsonl (meme
+    convention que captions.py), et l'etape reussit quand meme (ADR-ad2e) :
+    une correction sans rapport, isolee, n'est pas une "majorite" de
+    corrections refusees."""
     bad = {"corrections": [{"i": 1, "old": "Rockstar", "word": "Rockstars"}]}  # le mot 1 est " Rokstar"
     with llm.use_backend(FakeBackend([VOCAB, bad])):
-        with pytest.raises(llm.SchemaError):
-            run(tmp_path, ModelFactory())
-    assert not (video_dir / "transcript.json").exists()
+        run(tmp_path, ModelFactory())
+
+    data = read_transcript(video_dir)
+    assert data["segments"][0]["words"][1]["word"] == " Rokstar"  # pas touche
+    assert data["transcript_fix_refused"] == 1
 
     refusals_path = video_dir / "llm_refusals.jsonl"
     assert refusals_path.exists()
@@ -642,6 +647,48 @@ def test_fix_correction_whose_old_does_not_match_the_actual_word_is_refused_and_
         e["usage"] == "transcript_fix" and "Rokstar" in e["error"] and "Rockstar" in e["error"]
         for e in entries
     )
+
+
+def test_fix_correction_matching_ignoring_attached_punctuation_and_case_is_applied(
+    tmp_path, video_dir, cpu
+):
+    """``old`` compare au mot reellement present en ignorant la ponctuation
+    collee et la casse : la correction s'applique en gardant la ponctuation
+    d'origine autour du mot corrige (issue reelle 7VaA8XUKrAY, TASK-59e1)."""
+    segments = [_segment(1, [_word(" Alstner,", 0.0, 0.4)])]
+    fake = FakeBackend([VOCAB, {"corrections": [{"i": 0, "old": "alstner", "word": "Alstner"}]}])
+    with llm.use_backend(fake):
+        run(tmp_path, ModelFactory(segments=segments))
+
+    data = read_transcript(video_dir)
+    assert data["segments"][0]["words"][0]["word"] == " Alstner,"
+    assert data["transcript_fix_refused"] == 0
+
+
+def test_fix_majority_of_corrections_refused_is_an_explicit_failure(tmp_path, video_dir, cpu):
+    """Si une part anormale des corrections d'une video est refusee (ici 3
+    sur 4, une majorite d'au moins 2), la correction semble decalee dans son
+    ensemble : erreur explicite, pas d'ignorer-et-continuer (ADR-ad2e). Les 4
+    tranches partant en parallele (fix_parallel par defaut), la reponse est
+    calculee depuis le contenu de sa propre requete plutot que depuis l'ordre
+    d'arrivee (comme test_fix_parallel_result_matches_sequential_processing_
+    regardless_of_scheduling)."""
+    from clipper.transcribe import TranscribeError
+
+    segments = _many_word_segments(4)  # fix_chunk_words=1 -> 4 tranches d'un mot
+
+    def respond(request):
+        line = next(l for l in request.prompt.splitlines() if "\t" in l)
+        _, word_text = line.split("\t", 1)
+        if word_text == "mot1":
+            return {"corrections": [{"i": 0, "old": word_text, "word": "UN"}]}  # correspond, appliquee
+        return {"corrections": [{"i": 0, "old": "mot-inexistant", "word": "X"}]}  # sans rapport, refusee
+
+    fake = FakeBackend([VOCAB, respond, respond, respond, respond])
+    with llm.use_backend(fake):
+        with pytest.raises(TranscribeError, match="corrections refusees"):
+            run(tmp_path, ModelFactory(segments=segments), config=make_config(tmp_path, fix_chunk_words=1))
+    assert not (video_dir / "transcript.json").exists()
 
 
 def test_fix_disabled_explicitly_in_config_skips_the_call(tmp_path, video_dir, cpu):
