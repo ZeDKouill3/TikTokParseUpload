@@ -5,7 +5,7 @@ slug: publish-py-file-de-publication-par-cha-ne-approu
 title: "publish.py : file de publication par chaîne (approuver/refuser, créneaux automatiques, séries, déplacer, marquer publié, éditions du sidecar)"
 created: 2026-09-30T20:43:37Z
 author: w-plan-web
-status: open
+status: done
 scope:
   - clipper/publish.py
   - tests/test_publish.py
@@ -15,8 +15,15 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/623c06711067@9d33a52
+    tree: scope/471ffdc4c536
+    criteria: f874359448a0
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 2
+version: 4
 ---
 
 SPEC-fc0c §4, ADR-4f6e §3. Bibliothèque : n'importe aucune étape ni clipper.web (ADR-b16b) ; lit les sidecars SPEC-6a47 et les créneaux via clipper.channel.next_slots. Le re-rendu du titre d'écran n'est pas ici : c'est l'API qui met en file (worker) une action render ciblée sur le clip (voir la tâche pipeline). L'autopost TikTok n'existe pas encore : aucun appel réseau, published seulement par action humaine.
