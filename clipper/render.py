@@ -204,12 +204,29 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "badge_logo": "",
     # Nom affiche a droite du logo, requis si badge_enabled.
     "badge_name": "",
-    # Cote (px) du carre de fond noir qui contient le logo.
+    # Cote (px) du carre qui contient le logo.
     "badge_logo_size": 100,
     # Le glyphe du logo est reduit de ce facteur a l'interieur du carre
     # (marge visuelle autour de lui).
     "badge_glyph_scale": 0.65,
     "badge_font_size": 40,
+    # Couleur de remplissage du carre du logo (jamais de noir par defaut) :
+    # vide ("") = echantillonnee automatiquement au coin (0, 0) de l'image
+    # du logo elle-meme (le fond du logo Twitch par ex. est deja viole dans
+    # le PNG). Toujours appliquee, quel que soit badge_background.
+    "badge_logo_fill": "",
+    # Fond du bandeau badge (couleur PIL, ex. "black") ou "none" : dans ce
+    # cas aucun rectangle n'est dessine derriere le nom (le carre du logo
+    # garde toujours son propre remplissage, badge_logo_fill ci-dessus) ; le
+    # nom reste lisible via badge_name_outline / badge_name_shadow_*
+    # ci-dessous. Defaut "black" = bandeau plein, comportement SPEC-76dc
+    # inchange.
+    "badge_background": "black",
+    "badge_name_outline_color": "black",
+    "badge_name_outline": 3,
+    "badge_name_shadow_enabled": False,
+    "badge_name_shadow_color": "black",
+    "badge_name_shadow_offset": [2, 2],
 }
 
 FONTS_DIR = Path(__file__).resolve().parent / "assets" / "fonts"
@@ -723,14 +740,21 @@ def cta_card_png(text: str, zone: dict[str, Any], settings: dict[str, Any], path
     return layout
 
 
-_BADGE_GAP = 16  # px entre le carre du logo et le nom, sur fond noir
+_BADGE_GAP = 16  # px entre le carre du logo et le nom
 
 
 def badge_png(logo_path: Path, name: str, zone: dict[str, Any], settings: dict[str, Any], path: Path) -> None:
     """Ecrit dans ``path`` le badge de chaine (SPEC-76dc, agencement stream
-    split) : logo sur fond noir dans un carre de ``badge_logo_size`` (glyphe
-    reduit de ``badge_glyph_scale``, jamais deforme), nom a droite mesure
-    avec la vraie police."""
+    split) : logo dans un carre de ``badge_logo_size`` rempli de
+    ``badge_logo_fill`` (couleur echantillonnee au coin de l'image du logo
+    par defaut, jamais de noir), glyphe reduit de ``badge_glyph_scale``
+    (jamais deforme) centre dedans, nom mesure avec la vraie police. Le
+    groupe logo + marge + nom est centre horizontalement sur le centre de
+    ``zone``. ``badge_background`` ("black" par defaut) dessine un
+    rectangle plein derriere tout le bandeau ; "none" ne dessine aucun
+    rectangle derriere le nom (le carre du logo, lui, garde toujours son
+    remplissage quel que soit ``badge_background``), le nom restant
+    lisible via ``badge_name_outline``/``badge_name_shadow_*``."""
     if not logo_path.is_file():
         raise RenderError(f"logo du badge introuvable : {logo_path} (reglage [render] badge_logo)")
     if not name.strip():
@@ -752,28 +776,59 @@ def badge_png(logo_path: Path, name: str, zone: dict[str, Any], settings: dict[s
             f"[render] badge_logo_size ({square}) invalide pour badge_dest ({zw}x{zh})"
         )
 
-    img = Image.new("RGBA", (zw, zh), (0, 0, 0, 255))
-    draw = ImageDraw.Draw(img)
-
-    logo = Image.open(logo_path).convert("RGBA")
-    glyph_max = max(1, round(square * float(settings["badge_glyph_scale"])))
-    ratio = logo.width / logo.height
-    gw, gh = (glyph_max, max(1, round(glyph_max / ratio))) if ratio >= 1 else (max(1, round(glyph_max * ratio)), glyph_max)
-    logo = logo.resize((gw, gh), Image.LANCZOS)
-    square_top = (zh - square) // 2
-    img.alpha_composite(logo, ((square - gw) // 2, square_top + (square - gh) // 2))
-
     font_size = int(settings["badge_font_size"])
     font = _text_font(font_size)
-    text_x = square + _BADGE_GAP
     left, top, right, bottom = font.getbbox(name, anchor="ls")
-    if text_x + (right - left) > zw:
+    text_w = right - left
+    content_w = square + _BADGE_GAP + text_w
+    if content_w > zw:
         raise RenderError(
             f"badge_name {name!r} trop long pour badge_dest ({zw} px, logo {square}px + marge {_BADGE_GAP}px) "
             "(reglage [render] badge_name)"
         )
+    group_x0 = (zw - content_w) // 2
+    square_top = (zh - square) // 2
+
+    background = str(settings["badge_background"]).strip()
+    no_background = background.lower() == "none"
+    img = Image.new("RGBA", (zw, zh), (0, 0, 0, 0) if no_background else background)
+    draw = ImageDraw.Draw(img)
+
+    logo = Image.open(logo_path).convert("RGBA")
+    fill_setting = str(settings["badge_logo_fill"]).strip()
+    if fill_setting:
+        logo_fill: str | tuple[int, int, int, int] = fill_setting
+    else:
+        r, g, b, _a = logo.getpixel((0, 0))
+        logo_fill = (r, g, b, 255)
+    draw.rectangle(
+        (group_x0, square_top, group_x0 + square - 1, square_top + square - 1), fill=logo_fill,
+    )
+
+    glyph_max = max(1, round(square * float(settings["badge_glyph_scale"])))
+    ratio = logo.width / logo.height
+    gw, gh = (glyph_max, max(1, round(glyph_max / ratio))) if ratio >= 1 else (max(1, round(glyph_max * ratio)), glyph_max)
+    logo = logo.resize((gw, gh), Image.LANCZOS)
+    img.alpha_composite(logo, (group_x0 + (square - gw) // 2, square_top + (square - gh) // 2))
+
+    text_x = group_x0 + square + _BADGE_GAP
     baseline = (zh - (bottom - top)) // 2 - top
-    draw.text((text_x, baseline), name, font=font, fill="white", anchor="ls")
+    if bool(settings["badge_name_shadow_enabled"]):
+        offset = settings["badge_name_shadow_offset"]
+        if (
+            not isinstance(offset, (list, tuple)) or len(offset) != 2
+            or not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in offset)
+        ):
+            raise RenderError(f"[render] badge_name_shadow_offset invalide {offset!r} (attendu [x, y])")
+        ox, oy = float(offset[0]), float(offset[1])
+        draw.text(
+            (text_x + ox, baseline + oy), name, font=font,
+            fill=str(settings["badge_name_shadow_color"]), anchor="ls",
+        )
+    draw.text(
+        (text_x, baseline), name, font=font, fill="white", anchor="ls",
+        stroke_width=int(settings["badge_name_outline"]), stroke_fill=str(settings["badge_name_outline_color"]),
+    )
     img.save(path, format="PNG")
 
 

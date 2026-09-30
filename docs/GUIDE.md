@@ -177,8 +177,9 @@ voir *Formats de sortie* ci-dessus), pensé pour reproduire le montage
 « webcam en haut, jeu en bas » qu'une streameuse ou un streamer fait
 déjà lui-même : deux zones fixes qui se partagent toute la hauteur (jamais de
 déformation, chaque zone est recadrée au ratio de son rectangle de
-destination), un badge de chaîne optionnel (logo + pseudo sur fond noir) à
-leur jonction, et un style de sous-titres à deux couleurs (mot en train
+destination), un badge de chaîne optionnel (logo + pseudo, fond noir par
+défaut ou sans fond) à leur jonction, et un style de sous-titres à deux
+couleurs (mot en train
 d'être prononcé dans une couleur distincte, pas de fond). `title_enabled`
 (nouveau réglage, défaut `true` — comportement inchangé) permet de retirer le
 titre d'écran, utile ici puisque ce modèle n'en a pas.
@@ -213,6 +214,20 @@ introuvable inclus) ou sans `badge_name`, ou activé sur un layout qui n'a pas
 de zone badge (letterbox, stream `"top"`, format crop), est aussi une erreur
 explicite : le badge remplace le pseudo de chaîne de l'appel à l'abonnement
 quand les deux sont actifs, sans toucher à la carte de fin.
+
+Le groupe logo + nom est toujours centré horizontalement sur `badge_dest`
+(largeur ajustée au contenu, mesurée avec la vraie police) : jamais de vide
+asymétrique. `badge_background` (défaut `"black"`) dessine un rectangle
+plein derrière tout le bandeau ; `"none"` retire ce rectangle derrière le
+nom — le nom reste lisible grâce à `badge_name_outline` /
+`badge_name_outline_color` (contour, défauts `3` / `"black"`) et, si besoin,
+une ombre réglable (`badge_name_shadow_enabled`, défaut `false`, puis
+`badge_name_shadow_color` et `badge_name_shadow_offset`). Le carré du logo
+lui-même n'est jamais noir : il est toujours rempli avec `badge_logo_fill`
+(quel que soit `badge_background`), par défaut vide (`""`) pour
+échantillonner automatiquement la couleur au coin de l'image du logo
+(ex. le fond violet déjà présent dans un logo Twitch) — réglable à une
+couleur fixe si besoin.
 
 ## Configuration (`config.toml`)
 
@@ -307,7 +322,12 @@ défaut, voir *Appel à l'abonnement* ci-dessus) et leurs réglages de mise en
 page (`cta_handle_font_size`, `cta_card_font_size`...). Badge de chaîne
 (SPEC-76dc, voir *Agencement stream split* ci-dessus) : `badge_enabled`
 (défaut `false`), `badge_logo`, `badge_name`, `badge_logo_size` = 100,
-`badge_glyph_scale` = 0.65, `badge_font_size` = 40.
+`badge_glyph_scale` = 0.65, `badge_logo_fill` = `""` (échantillonné au coin
+du logo si vide), `badge_font_size` = 40, `badge_background` =
+`"black"` (`"none"` = pas de rectangle derrière le nom), `badge_name_outline`
+= 3, `badge_name_outline_color` = `"black"`, `badge_name_shadow_enabled` =
+`false`, `badge_name_shadow_color` = `"black"`, `badge_name_shadow_offset` =
+`[2, 2]`.
 
 `[qa]` — `expected_width`/`expected_height` = 1080/1920,
 `duration_tolerance` = 0.5, seuils de silence et d'image noire
