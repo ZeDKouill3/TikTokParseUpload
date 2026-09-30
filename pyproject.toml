@@ -25,6 +25,7 @@ dependencies = [
 [project.optional-dependencies]
 test = [
     "pytest>=8",
+    "pytest-xdist>=3",
     "httpx",
 ]
 
@@ -46,3 +47,11 @@ override-dependencies = ["opencv-python; sys_platform == 'never'"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "tools"]
+# Suite CPU-bound (ADR-fb9b) : chaque test est isole (tmp_path, llm.use_backend,
+# FakeBackend), donc distribuable sur les coeurs sans etat partage. -n auto
+# (= os.cpu_count(), 12 coeurs logiques sur ce PC) sursouscrit le CPU sur une
+# machine partagee avec d'autres sessions agent actives (flaky observe sur
+# les tests de concurrence reelle avant leur correctif, cf. TASK-42a46cb23f78).
+# -n 6 (coeurs physiques) laisse une marge CPU/RAM pour le reste du PC
+# partage, au prix d'un gain moindre que -n auto.
+addopts = "-n 6"

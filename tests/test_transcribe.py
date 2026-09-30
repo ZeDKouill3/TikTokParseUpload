@@ -746,16 +746,28 @@ def _many_word_segments(n):
 
 
 class ConcurrencyTracker:
-    def __init__(self):
+    """Mesure le chevauchement reel de plusieurs appels concurrents. Chaque
+    appel bloque jusqu'a ce que ``expected`` appels soient simultanement
+    actifs (ou un timeout genereux), au lieu d'un sleep fixe qui peut rater
+    la fenetre de recouvrement sous forte charge CPU partagee -- le
+    scheduling des threads n'est alors plus garanti dans un court delai fixe
+    (cf. TASK-42a46cb23f78)."""
+
+    def __init__(self, expected, timeout=10.0):
         self.lock = threading.Lock()
         self.current = 0
         self.peak = 0
+        self._expected = expected
+        self._reached = threading.Event()
+        self._timeout = timeout
 
     def response(self, request):
         with self.lock:
             self.current += 1
             self.peak = max(self.peak, self.current)
-        time.sleep(0.05)
+            if self.current >= self._expected:
+                self._reached.set()
+        self._reached.wait(self._timeout)
         with self.lock:
             self.current -= 1
         return {"corrections": []}
@@ -763,7 +775,7 @@ class ConcurrencyTracker:
 
 def test_fix_chunks_run_concurrently_up_to_fix_parallel(tmp_path, video_dir, cpu):
     segments = _many_word_segments(12)  # fix_chunk_words=2 -> 6 tranches
-    tracker = ConcurrencyTracker()
+    tracker = ConcurrencyTracker(expected=3)
     fake = FakeBackend([VOCAB] + [tracker.response] * 6)
     with llm.use_backend(fake):
         run(
@@ -776,7 +788,7 @@ def test_fix_chunks_run_concurrently_up_to_fix_parallel(tmp_path, video_dir, cpu
 
 def test_fix_parallel_defaults_to_config_value_of_four(tmp_path, video_dir, cpu):
     segments = _many_word_segments(16)  # fix_chunk_words=2 -> 8 tranches
-    tracker = ConcurrencyTracker()
+    tracker = ConcurrencyTracker(expected=4)
     fake = FakeBackend([VOCAB] + [tracker.response] * 8)
     with llm.use_backend(fake):
         run(

@@ -821,20 +821,29 @@ def test_parallel_zero_is_refused(tmp_path, dirs):
 class _ConcurrencyBackend:
     """Backend qui ne repond rien d'utile : il mesure combien d'appels a
     ``complete`` sont en cours simultanement (verrou + compteur), pour
-    verifier le chevauchement des appels LLM selon ``parallel``."""
+    verifier le chevauchement des appels LLM selon ``parallel``. Chaque
+    appel bloque jusqu'a ce que ``expected`` appels soient simultanement
+    actifs (ou un timeout genereux), au lieu d'un sleep fixe qui peut rater
+    la fenetre de recouvrement sous forte charge CPU partagee -- le
+    scheduling des threads n'est alors plus garanti dans un court delai fixe
+    (cf. TASK-42a46cb23f78)."""
 
-    def __init__(self, delay: float = 0.15):
+    def __init__(self, expected: int = 1, timeout: float = 10.0):
         self._lock = threading.Lock()
         self._active = 0
         self.max_active = 0
         self.calls = 0
-        self.delay = delay
+        self._expected = expected
+        self._reached = threading.Event()
+        self._timeout = timeout
 
     def complete(self, request):
         with self._lock:
             self._active += 1
             self.max_active = max(self.max_active, self._active)
-        time.sleep(self.delay)
+            if self._active >= self._expected:
+                self._reached.set()
+        self._reached.wait(self._timeout)
         with self._lock:
             self._active -= 1
             self.calls += 1
@@ -849,7 +858,7 @@ def _write_four_clips(output):
 def test_parallel_four_overlaps_llm_calls(tmp_path, dirs):
     workspace, output = dirs
     _write_four_clips(output)
-    backend = _ConcurrencyBackend()
+    backend = _ConcurrencyBackend(expected=2)
     with llm.use_backend(backend):
         qa.run(VIDEO_ID, workspace, output, config=config(tmp_path, parallel=4))
     assert backend.calls == 4
@@ -859,7 +868,7 @@ def test_parallel_four_overlaps_llm_calls(tmp_path, dirs):
 def test_parallel_one_never_overlaps_llm_calls(tmp_path, dirs):
     workspace, output = dirs
     _write_four_clips(output)
-    backend = _ConcurrencyBackend()
+    backend = _ConcurrencyBackend(expected=1)
     with llm.use_backend(backend):
         qa.run(VIDEO_ID, workspace, output, config=config(tmp_path, parallel=1))
     assert backend.calls == 4
