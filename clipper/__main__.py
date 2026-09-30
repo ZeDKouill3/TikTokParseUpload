@@ -15,14 +15,14 @@ _PROGRESS_POLL_SECONDS = 0.1
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="clipper",
-        description="Pipeline de clips verticaux sous-titres a partir de videos YouTube longues",
+        description="Pipeline de clips verticaux sous-titres a partir de videos YouTube ou VOD Twitch longues",
     )
     parser.add_argument("--config", default=None, help="Fichier de configuration (defaut : config.toml)")
     parser.add_argument("-v", "--verbose", action="store_true", help="Journal detaille des etapes")
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("run", help="Traite une video : jusqu'a la revue (review) ou jusqu'au bout (auto)")
-    p.add_argument("url", help="URL YouTube de la video")
+    p.add_argument("url", help="URL YouTube ou VOD Twitch (twitch.tv/videos/<id>) de la video")
     p.add_argument("--force", action="store_true", help="Relance les etapes deja faites")
 
     p = sub.add_parser("render", help="Reprend une video apres la revue (ou apres un echec) jusqu'au bout")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
@@ -21,6 +22,8 @@ _FORMAT = (
 )
 
 _YOUTUBE_HOSTS = {"youtube.com", "m.youtube.com", "music.youtube.com"}
+_TWITCH_HOSTS = {"twitch.tv"}
+_TWITCH_VOD_PATH = re.compile(r"/videos/(\d+)/?$")
 
 
 class DownloadError(Exception):
@@ -28,10 +31,14 @@ class DownloadError(Exception):
 
 
 def extract_video_id(url: str) -> str:
-    """Pull the 11-character video id out of a YouTube URL.
+    """Pull the video id out of a YouTube or Twitch URL.
 
     Handles youtube.com/watch?v=, youtu.be/, /shorts/ and /live/ forms
-    (see TASK-4ca0's done_criteria).
+    (see TASK-4ca0's done_criteria), and Twitch VOD URLs
+    (twitch.tv/videos/<chiffres>, see TASK-9290's done_criteria). The Twitch
+    id is returned exactly as yt-dlp assigns it (prefixe 'v', ex.
+    v2887271276) : jamais un id YouTube de 11 caracteres, pas de collision
+    possible entre les deux espaces d'id.
     """
     parsed = urlparse(url)
     host = parsed.netloc.lower()
@@ -54,12 +61,26 @@ def extract_video_id(url: str) -> str:
                 if video_id:
                     return video_id
 
+    if host in _TWITCH_HOSTS:
+        match = _TWITCH_VOD_PATH.match(parsed.path)
+        if match:
+            return f"v{match.group(1)}"
+        raise DownloadError(
+            f"Twitch : seules les VOD (twitch.tv/videos/<id>) sont prises en charge, "
+            f"pas les chaines, clips ou lives ({url!r})"
+        )
+
     raise DownloadError(f"impossible d'extraire le video_id de {url!r}")
 
 
-def _build_meta(info: dict[str, Any]) -> dict[str, Any]:
+def _build_meta(info: dict[str, Any], url: str) -> dict[str, Any]:
     return {
         "video_id": info["id"],
+        # info["webpage_url"] est la source de verite (yt-dlp la renseigne
+        # toujours) ; l'URL demandee est un repli honnete si un extracteur ne
+        # la fournit pas, jamais une URL reconstruite a partir du video_id
+        # (ADR-ad2e : celle-ci suppose YouTube, fausse pour une VOD Twitch).
+        "webpage_url": info.get("webpage_url") or url,
         "title": info.get("title"),
         "description": info.get("description"),
         "duration": info.get("duration"),
@@ -124,6 +145,6 @@ def download(
     with ydl_factory(opts) as ydl:
         info = ydl.extract_info(url, download=True)
 
-    meta = _build_meta(info)
+    meta = _build_meta(info, url)
     meta_file.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     return meta

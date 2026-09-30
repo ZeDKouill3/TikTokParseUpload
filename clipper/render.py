@@ -12,7 +12,9 @@ autres etapes - ADR-b16b) :
 - subtitles/<clip_id>.ass (subtitles) : les sous-titres deja positionnes
   (SPEC-6127 : jamais sur un visage, decide par l'etape subtitles) ;
 - transcript.json (transcribe) : le texte prononce dans le clip ;
-- meta.json (download), facultatif : titre de la video source.
+- meta.json (download) : titre de la video source (facultatif) et
+  webpage_url, l'URL reelle de la source (obligatoire : RenderError sinon,
+  jamais reconstruite en supposant YouTube - ADR-ad2e).
 
 Sortie : output/<video_id>/<clip_id>.mp4 et output/<video_id>/<clip_id>.json
 conformes a SPEC-6127. Le champ ``qa`` part a ``{"status": "skipped",
@@ -786,6 +788,13 @@ def render(
 
     transcript = _read_json(video_dir / "transcript.json")
     meta = _read_json(video_dir / "meta.json", optional=True) or {}
+    source_url = meta.get("webpage_url")
+    if not source_url:
+        # ADR-ad2e : jamais reconstruire une URL (ce serait une URL YouTube
+        # supposee pour une source qui peut etre Twitch) ; on remonte l'echec.
+        raise RenderError(
+            f"meta.json de {video_id} n'a pas de webpage_url : retelecharger (download --force)"
+        )
     reframe_data = _read_json(video_dir / "reframe" / f"{clip_id}.json")
     ass_path = video_dir / "subtitles" / f"{clip_id}.ass"
     if not ass_path.exists():
@@ -876,8 +885,7 @@ def render(
 
     data = {
         "video_id": video_id,
-        # meta.json (download) ne garde pas l'URL d'origine, seulement video_id.
-        "source_url": f"https://www.youtube.com/watch?v={video_id}",
+        "source_url": source_url,
         "source_title": meta.get("title") or "",
         "clip_id": clip_id,
         "part": clip["part"],

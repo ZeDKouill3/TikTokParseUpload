@@ -10,14 +10,14 @@
 <body>
 <header>
   <h1><img class="logo" src="/static/logo.svg" alt="" width="40" height="40">Clipper</h1>
-  <p class="tagline">Clips verticaux sous-titres, depuis une video YouTube</p>
+  <p class="tagline">Clips verticaux sous-titres, depuis une video YouTube ou une VOD Twitch</p>
 </header>
 
 <main>
   <section id="submit-section">
     <h2>Nouvelle video</h2>
     <form id="submit-form">
-      <input type="url" id="submit-url" name="url" placeholder="https://www.youtube.com/watch?v=..." required>
+      <input type="url" id="submit-url" name="url" placeholder="https://www.youtube.com/watch?v=... ou https://www.twitch.tv/videos/..." required>
       <button type="submit">Lancer le traitement</button>
     </form>
     <p id="submit-message" class="message" hidden></p>

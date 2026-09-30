@@ -91,8 +91,14 @@ def _transcript_json():
     }
 
 
-def _meta_json():
-    return {"video_id": VIDEO_ID, "title": "Une video source"}
+def _meta_json(**overrides):
+    meta = {
+        "video_id": VIDEO_ID,
+        "title": "Une video source",
+        "webpage_url": f"https://www.youtube.com/watch?v={VIDEO_ID}",
+    }
+    meta.update(overrides)
+    return meta
 
 
 def _panel(name, x, y, w, h, dest, effect=None, start=1.0, end=3.5):
@@ -429,6 +435,37 @@ def test_render_writes_json_sidecar_conforming_to_spec_350f(tmp_path, video_dir,
     assert data["qa"] == {"status": "skipped", "issues": []}
     assert data["transcript"] == "Attends de voir ca.Incroyable."
     assert data["created_at"]  # horodatage ISO 8601 non vide
+
+
+@no_ffmpeg
+@no_ffprobe
+def test_render_uses_meta_webpage_url_as_source_url_never_reconstructed(
+    tmp_path, video_dir, synthetic_source, cpu_device
+):
+    from clipper.render import render
+
+    twitch_url = "https://www.twitch.tv/videos/2887271276"
+    (video_dir / "meta.json").write_text(
+        json.dumps(_meta_json(video_id=VIDEO_ID, webpage_url=twitch_url)), encoding="utf-8"
+    )
+
+    render(VIDEO_ID, CLIP_ID, workspace_dir=video_dir.parent, output_dir=tmp_path / "output", config=make_config())
+
+    data = json.loads((tmp_path / "output" / VIDEO_ID / f"{CLIP_ID}.json").read_text(encoding="utf-8"))
+    assert data["source_url"] == twitch_url
+    assert "youtube.com" not in data["source_url"]
+
+
+def test_render_raises_when_meta_json_has_no_webpage_url(tmp_path, video_dir, synthetic_source, cpu_device):
+    from clipper.render import render, RenderError
+
+    meta = _meta_json()
+    del meta["webpage_url"]
+    (video_dir / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+
+    with pytest.raises(RenderError):
+        render(VIDEO_ID, CLIP_ID, workspace_dir=video_dir.parent, output_dir=tmp_path / "output",
+               config=make_config())
 
 
 # --------------------------------------------------------------------------
