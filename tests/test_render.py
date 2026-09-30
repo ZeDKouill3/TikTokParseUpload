@@ -1994,6 +1994,7 @@ def test_split_render_defaults_are_present_and_unchanged_by_default():
     assert CONFIG_DEFAULTS["badge_name"] == ""
     assert CONFIG_DEFAULTS["badge_logo_size"] == 100
     assert CONFIG_DEFAULTS["badge_glyph_scale"] == 0.65
+    assert CONFIG_DEFAULTS["badge_logo_fill"] == ""
     assert CONFIG_DEFAULTS["badge_background"] == "black"
     assert CONFIG_DEFAULTS["badge_name_outline_color"] == "black"
     assert CONFIG_DEFAULTS["badge_name_outline"] == 3
@@ -2092,6 +2093,20 @@ def _write_logo(path, size=(64, 64)):
     Image.new("RGBA", size, (255, 0, 0, 255)).save(path)
 
 
+def _write_two_tone_logo(path, size=(64, 64), edge=(145, 70, 255, 255), center=(255, 255, 255, 255)):
+    """Logo avec une couleur de bord distincte du centre, comme le vrai logo
+    Twitch (fond viole, glyphe blanc) : permet de verifier l'echantillonnage
+    de badge_logo_fill."""
+    from PIL import Image, ImageDraw
+
+    img = Image.new("RGBA", size, edge)
+    draw = ImageDraw.Draw(img)
+    w, h = size
+    pad = w // 4
+    draw.rectangle((pad, pad, w - pad, h - pad), fill=center)
+    img.save(path)
+
+
 def test_badge_enabled_without_logo_is_an_explicit_error(tmp_path, stream_split_dir, fake_ffmpeg):
     from clipper.render import RenderError, render
 
@@ -2158,7 +2173,7 @@ def test_badge_enabled_draws_the_logo_and_name_and_is_included_as_an_ffmpeg_inpu
     assert f"overlay=x={SPLIT_BADGE_ZONE['x0']}:y={SPLIT_BADGE_ZONE['y0']}" in filt
 
 
-def test_badge_png_draws_a_black_square_logo_and_the_measured_name(tmp_path):
+def test_badge_png_draws_the_filled_square_logo_and_the_measured_name(tmp_path):
     from PIL import Image
 
     from clipper.render import CONFIG_DEFAULTS, badge_png
@@ -2173,8 +2188,8 @@ def test_badge_png_draws_a_black_square_logo_and_the_measured_name(tmp_path):
     assert img.size == (420, 100)
     # fond noir opaque loin du groupe (coin haut-gauche, defaut inchange)
     assert img.getpixel((2, 2))[:3] == (0, 0, 0)
-    # le glyphe (logo rouge) est bien present quelque part dans l'image
-    # (le groupe est desormais centre, plus force colle a gauche)
+    # le glyphe (logo rouge, echantillonne aussi pour le carre) est bien
+    # present quelque part dans l'image (le groupe est centre)
     reds = [img.getpixel((x, y)) for x in range(420) for y in range(100) if img.getpixel((x, y))[0] > 200]
     assert reds
     # du texte (blanc) present quelque part dans l'image
@@ -2250,6 +2265,47 @@ def test_badge_png_none_background_has_no_rectangle_behind_the_name(tmp_path):
         if img.getpixel((x, y))[:3] == (255, 255, 255) and img.getpixel((x, y))[3] > 0
     ]
     assert whites
+
+
+@pytest.mark.parametrize("badge_background", ["black", "none"])
+def test_badge_png_logo_square_is_filled_with_the_sampled_edge_color_by_default(tmp_path, badge_background):
+    from PIL import Image
+
+    from clipper.render import CONFIG_DEFAULTS, badge_png
+
+    logo = tmp_path / "logo.png"
+    edge = (145, 70, 255, 255)
+    _write_two_tone_logo(logo, edge=edge)
+    out = tmp_path / "badge.png"
+    zone = {"x0": 0, "y0": 0, "x1": 420, "y1": 100}
+    settings = dict(CONFIG_DEFAULTS, badge_background=badge_background)
+    badge_png(logo, "Exemple", zone, settings, out)
+
+    img = Image.open(out).convert("RGBA")
+    background_rgb = (0, 0, 0) if badge_background != "none" else None
+    x_min, _x_max = _content_x_range(img, 420, 100, background_rgb)
+    square = int(CONFIG_DEFAULTS["badge_logo_size"])
+    square_top = (100 - square) // 2
+    # coin du carre (badge_logo_size = zone height ici -> square_top = 0) :
+    # echantillonne au coin (0, 0) du logo, jamais de noir.
+    assert img.getpixel((x_min, square_top)) == edge
+
+
+def test_badge_png_logo_fill_can_be_overridden(tmp_path):
+    from PIL import Image
+
+    from clipper.render import CONFIG_DEFAULTS, badge_png
+
+    logo = tmp_path / "logo.png"
+    _write_two_tone_logo(logo, edge=(145, 70, 255, 255))
+    out = tmp_path / "badge.png"
+    zone = {"x0": 0, "y0": 0, "x1": 420, "y1": 100}
+    settings = dict(CONFIG_DEFAULTS, badge_logo_fill="#112233")
+    badge_png(logo, "Exemple", zone, settings, out)
+
+    img = Image.open(out).convert("RGBA")
+    x_min, _x_max = _content_x_range(img, 420, 100, (0, 0, 0))
+    assert img.getpixel((x_min, 0)) == (0x11, 0x22, 0x33, 255)
 
 
 def test_badge_png_default_background_fills_the_whole_zone_opaque(tmp_path):

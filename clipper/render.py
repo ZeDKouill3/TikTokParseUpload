@@ -204,15 +204,20 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "badge_logo": "",
     # Nom affiche a droite du logo, requis si badge_enabled.
     "badge_name": "",
-    # Cote (px) du carre de fond noir qui contient le logo.
+    # Cote (px) du carre qui contient le logo.
     "badge_logo_size": 100,
     # Le glyphe du logo est reduit de ce facteur a l'interieur du carre
     # (marge visuelle autour de lui).
     "badge_glyph_scale": 0.65,
     "badge_font_size": 40,
+    # Couleur de remplissage du carre du logo (jamais de noir par defaut) :
+    # vide ("") = echantillonnee automatiquement au coin (0, 0) de l'image
+    # du logo elle-meme (le fond du logo Twitch par ex. est deja viole dans
+    # le PNG). Toujours appliquee, quel que soit badge_background.
+    "badge_logo_fill": "",
     # Fond du bandeau badge (couleur PIL, ex. "black") ou "none" : dans ce
     # cas aucun rectangle n'est dessine derriere le nom (le carre du logo
-    # garde son propre fond noir, fixe, cf badge_logo_size ci-dessus) ; le
+    # garde toujours son propre remplissage, badge_logo_fill ci-dessus) ; le
     # nom reste lisible via badge_name_outline / badge_name_shadow_*
     # ci-dessous. Defaut "black" = bandeau plein, comportement SPEC-76dc
     # inchange.
@@ -735,19 +740,21 @@ def cta_card_png(text: str, zone: dict[str, Any], settings: dict[str, Any], path
     return layout
 
 
-_BADGE_GAP = 16  # px entre le carre du logo et le nom, sur fond noir
+_BADGE_GAP = 16  # px entre le carre du logo et le nom
 
 
 def badge_png(logo_path: Path, name: str, zone: dict[str, Any], settings: dict[str, Any], path: Path) -> None:
     """Ecrit dans ``path`` le badge de chaine (SPEC-76dc, agencement stream
-    split) : logo dans un carre de ``badge_logo_size`` sur son propre fond
-    noir (glyphe reduit de ``badge_glyph_scale``, jamais deforme), nom
-    mesure avec la vraie police. Le groupe logo + marge + nom est centre
-    horizontalement sur le centre de ``zone``. ``badge_background``
-    ("black" par defaut) dessine un rectangle plein derriere tout le
-    bandeau ; "none" ne dessine aucun rectangle derriere le nom (seul le
-    carre du logo garde son fond noir), le nom restant lisible via
-    ``badge_name_outline``/``badge_name_shadow_*``."""
+    split) : logo dans un carre de ``badge_logo_size`` rempli de
+    ``badge_logo_fill`` (couleur echantillonnee au coin de l'image du logo
+    par defaut, jamais de noir), glyphe reduit de ``badge_glyph_scale``
+    (jamais deforme) centre dedans, nom mesure avec la vraie police. Le
+    groupe logo + marge + nom est centre horizontalement sur le centre de
+    ``zone``. ``badge_background`` ("black" par defaut) dessine un
+    rectangle plein derriere tout le bandeau ; "none" ne dessine aucun
+    rectangle derriere le nom (le carre du logo, lui, garde toujours son
+    remplissage quel que soit ``badge_background``), le nom restant
+    lisible via ``badge_name_outline``/``badge_name_shadow_*``."""
     if not logo_path.is_file():
         raise RenderError(f"logo du badge introuvable : {logo_path} (reglage [render] badge_logo)")
     if not name.strip():
@@ -786,12 +793,18 @@ def badge_png(logo_path: Path, name: str, zone: dict[str, Any], settings: dict[s
     no_background = background.lower() == "none"
     img = Image.new("RGBA", (zw, zh), (0, 0, 0, 0) if no_background else background)
     draw = ImageDraw.Draw(img)
-    if no_background:
-        draw.rectangle(
-            (group_x0, square_top, group_x0 + square - 1, square_top + square - 1), fill="black",
-        )
 
     logo = Image.open(logo_path).convert("RGBA")
+    fill_setting = str(settings["badge_logo_fill"]).strip()
+    if fill_setting:
+        logo_fill: str | tuple[int, int, int, int] = fill_setting
+    else:
+        r, g, b, _a = logo.getpixel((0, 0))
+        logo_fill = (r, g, b, 255)
+    draw.rectangle(
+        (group_x0, square_top, group_x0 + square - 1, square_top + square - 1), fill=logo_fill,
+    )
+
     glyph_max = max(1, round(square * float(settings["badge_glyph_scale"])))
     ratio = logo.width / logo.height
     gw, gh = (glyph_max, max(1, round(glyph_max / ratio))) if ratio >= 1 else (max(1, round(glyph_max * ratio)), glyph_max)
