@@ -122,39 +122,28 @@ def test_claude_cli_usage_log_writes_null_fields_when_usage_is_absent(fake_run, 
 
 
 # --------------------------------------------------------------------------
-# cache_prefix (TASK-2cbb) : le cache de contexte d'Anthropic marque des
-# blocs de contenu, pas un prefixe de caracteres dans un bloc unique. Un
-# prompt texte identique octet pour octet entre deux appels (deja acquis par
-# TASK-b0fa) ne produit donc aucune relecture de cache tant que le prompt
-# n'est qu'une seule chaine sur stdin : il faut une frontiere de bloc pour
-# poser cache_control.
+# cache_prefix : ignore par ce backend depuis TASK-b384 (voir sa docstring
+# module -- TASK-2cbb avait pose un bloc cache_control explicite dessus,
+# cause residuelle et intermittente d'un 400 "A maximum of 4 blocks with
+# cache_control" hors de notre controle, mesuree via --debug api). Un appel
+# jury (le seul a fournir cache_prefix) suit donc desormais exactement le
+# meme chemin qu'un appel sans cache_prefix.
 # --------------------------------------------------------------------------
 
 PREFIX = "Bloc commun a tous les juges, identique octet pour octet. " * 5
 
 
-def test_cache_prefix_becomes_its_own_cache_controlled_content_block(fake_run):
+def test_cache_prefix_is_ignored_stdin_stays_plain_text(fake_run):
     run = fake_run(json.dumps(RECORDED_CLAUDE_CLI_WITH_USAGE))
 
     llm.ask("jury_x", PREFIX + "Role specifique.", [], COLOR_SCHEMA, config=make_config(), cache_prefix=PREFIX)
 
     cmd = run.calls[0]["cmd"]
-    # Sans image, un cache_prefix impose quand meme le format structure : un
-    # prompt texte brut sur stdin ne peut porter aucune frontiere de bloc.
-    assert cmd[cmd.index("--input-format") + 1] == "stream-json"
-    assert cmd[cmd.index("--output-format") + 1] == "stream-json"
-    assert "--verbose" in cmd
-
-    message = json.loads(run.calls[0]["input"])
-    content = message["message"]["content"]
-    assert len(content) == 2
-    assert content[0] == {
-        "type": "text",
-        "text": PREFIX,
-        "cache_control": {"type": "ephemeral", "ttl": "1h"},
-    }
-    assert "cache_control" not in content[1]
-    assert content[1]["text"].startswith("Role specifique.")
+    assert cmd[cmd.index("--output-format") + 1] == "json"
+    assert "--input-format" not in cmd
+    assert "--verbose" not in cmd
+    assert "cache_control" not in run.calls[0]["input"]
+    assert run.calls[0]["input"].startswith(PREFIX)
 
 
 def test_no_cache_prefix_keeps_the_plain_text_stdin_unchanged(fake_run):
@@ -179,10 +168,9 @@ def test_only_the_message_diverges_between_two_same_model_roles_flags_are_identi
     cmd_a, cmd_b = run.calls[0]["cmd"], run.calls[1]["cmd"]
     assert cmd_a == cmd_b  # meme modele, meme schema : aucun flag ne diverge
 
-    content_a = json.loads(run.calls[0]["input"])["message"]["content"]
-    content_b = json.loads(run.calls[1]["input"])["message"]["content"]
-    assert content_a[0] == content_b[0]  # bloc cache_control identique
-    assert content_a[1] != content_b[1]  # seul le role (2e bloc) diverge
+    input_a, input_b = run.calls[0]["input"], run.calls[1]["input"]
+    assert input_a != input_b  # le role divergent se voit dans le stdin
+    assert input_a.startswith(PREFIX) and input_b.startswith(PREFIX)
 
 
 def test_cache_prefix_must_be_an_actual_prefix_of_the_prompt(fake_run):
@@ -191,12 +179,13 @@ def test_cache_prefix_must_be_an_actual_prefix_of_the_prompt(fake_run):
         llm.ask("jury_x", "autre chose", [], COLOR_SCHEMA, config=make_config(), cache_prefix=PREFIX)
 
 
-def test_images_combined_with_cache_prefix_still_carry_a_single_cache_control_block(fake_run, tmp_path):
-    # TASK-746c : l'API refuse au-dela de 4 blocs cache_control par message et
-    # claude -p en pose deja (raisonnement, systeme...) -- nos propres blocs
-    # doivent donc rester au minimum, un seul, quelle que soit la combinaison
-    # (image(s) + cache_prefix compris, meme si aucun usage actuel ne les
-    # combine). Les blocs image ne portent jamais cache_control.
+def test_images_combined_with_cache_prefix_never_carry_a_cache_control_block(fake_run, tmp_path):
+    # TASK-746c puis TASK-b384 : l'API refuse au-dela de 4 blocs
+    # cache_control par message, et claude -p en pose deja pour son propre
+    # compte (systeme, tour interne...) -- nos propres blocs restent donc au
+    # minimum, desormais aucun (cache_prefix ignore par ce backend, voir sa
+    # docstring), quelle que soit la combinaison (image(s) + cache_prefix
+    # compris, meme si aucun usage actuel ne les combine).
     img = tmp_path / "f.jpg"
     img.write_bytes(b"\xff\xd8fake-jpeg-bytes")
     run = fake_run(json.dumps(RECORDED_CLAUDE_CLI_WITH_USAGE))
@@ -205,13 +194,8 @@ def test_images_combined_with_cache_prefix_still_carry_a_single_cache_control_bl
 
     content = json.loads(run.calls[0]["input"])["message"]["content"]
     marked = [b for b in content if "cache_control" in b]
-    assert len(marked) == 1, content
-    assert marked[0] == {
-        "type": "text",
-        "text": PREFIX,
-        "cache_control": {"type": "ephemeral", "ttl": "1h"},
-    }
-    assert [b["type"] for b in content] == ["image", "text", "text"]
+    assert len(marked) == 0, content
+    assert [b["type"] for b in content] == ["image", "text"]
 
 
 # --------------------------------------------------------------------------
@@ -224,12 +208,14 @@ def test_images_combined_with_cache_prefix_still_carry_a_single_cache_control_bl
     os.environ.get("CLIPPER_CLAUDE_INTEGRATION") != "1",
     reason="integration Claude : definir CLIPPER_CLAUDE_INTEGRATION=1 (consomme du quota)",
 )
-def test_integration_second_role_reads_the_shared_prefix_from_cache(tmp_path):
-    # 2 "roles" d'un meme modele (comme 2 juges de clipper.jury) : meme
-    # cache_prefix (assez long pour depasser le minimum cacheable d'Anthropic,
-    # ~1024 tokens sur sonnet/opus, sinon cache_control est pose mais ignore
-    # sans erreur), role different en fin de prompt. Le 2e appel doit relire
-    # le prefixe du cache pose par le 1er (TASK-2cbb).
+def test_integration_shared_prefix_calls_succeed_without_caching(tmp_path):
+    # TASK-b384 : 2 "roles" d'un meme modele (comme 2 juges de clipper.jury)
+    # avec le meme cache_prefix reussissent tous les deux (plus de 400
+    # intermittent, voir la docstring du module) ; leur schema/systeme n'a
+    # jamais ete envoye avant ce test (contrairement au smoke test reel, qui
+    # reutilise les schemas du jury de production, deja chauds cote Claude
+    # Code : voir ank log TASK-b384, cout jury pratiquement inchange la),
+    # donc rien a relire du cache fournisseur des le premier appel.
     prefix = "Contexte commun de test, invariant entre les deux appels. " * 200
     schema = {
         "type": "object",
@@ -251,5 +237,5 @@ def test_integration_second_role_reads_the_shared_prefix_from_cache(tmp_path):
 
     entries = [json.loads(line) for line in usage_log_path.read_text(encoding="utf-8").splitlines()]
     assert len(entries) == 2
-    cache_read_2nd = entries[1]["cache_read_tokens"]
-    assert cache_read_2nd is not None and cache_read_2nd > 2000, entries
+    for entry in entries:
+        assert not entry["cache_read_tokens"], entries  # None ou 0 : plus de bloc a relire

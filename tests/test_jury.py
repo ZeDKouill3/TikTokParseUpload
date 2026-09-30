@@ -346,21 +346,21 @@ def test_round_two_debate_prompt_also_carries_a_cache_prefix():
         assert call.cache_prefix != call.prompt, name  # le role divergent suit bien le prefixe
 
 
-def test_spectateur_message_carries_at_most_one_cache_control_block():
-    # TASK-f89f : le 400 "A maximum of 4 blocks with cache_control may be
-    # provided" releve en reel sur jury_spectateur n'est jamais du a nos
-    # propres marqueurs (voir clipper/llm/claude_cli.py) -- verifie ici sur
-    # le message reellement construit pour ce role (cache_prefix + role,
-    # comme jury._ask l'envoie), en repassant par le meme stdin_input() que
-    # le backend claude-cli utilise pour poser cache_control sur les blocs.
+def test_spectateur_message_never_carries_a_cache_control_block():
+    # TASK-f89f puis TASK-b384 : le 400 "A maximum of 4 blocks with
+    # cache_control may be provided" releve en reel sur jury_spectateur n'a
+    # jamais ete du a nos propres marqueurs, et claude_cli n'en pose plus
+    # aucun depuis TASK-b384 (cause residuelle hors de notre controle, voir
+    # clipper/llm/claude_cli.py) -- verifie ici sur le message reellement
+    # construit pour ce role (cache_prefix + role, comme jury._ask l'envoie),
+    # en repassant par le meme stdin_input() que le backend claude-cli.
     script = ScriptedJury({1: uniform({"secret-id-0": 7, "secret-id-1": 5, "secret-id-2": 3})})
     _, fake = run(script)
     spectateur_call = next(c for c in fake.calls if c.usage == "jury_spectateur")
 
     stdin = claude_cli.stdin_input(spectateur_call)
-    content = json.loads(stdin)["message"]["content"]
-    marked = [b for b in content if "cache_control" in b]
-    assert len(marked) <= 1, content
+    assert stdin == spectateur_call.prompt
+    assert "cache_control" not in stdin
 
 
 def test_shuffle_is_deterministic_and_specific_to_each_model():

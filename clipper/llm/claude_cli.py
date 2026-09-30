@@ -40,50 +40,59 @@ chemin ni ``@fichier``, verifie sur 2.1.281) : le schema passe donc par argv,
 en JSON compact, et une ligne de commande qui depasserait la limite Windows
 est un echec explicite plutot qu'un envoi sans schema.
 
-Cache de prompt (TASK-2cbb). Le cache de contexte d'Anthropic marque des
-BLOCS de contenu (``cache_control``), pas un prefixe de caracteres a
-l'interieur d'un bloc unique : un prompt texte identique octet pour octet
-entre deux appels ne produit aucune relecture de cache tant qu'il n'est
-qu'une seule chaine sur stdin, faute de frontiere de bloc ou poser ce
-marqueur (mesure reelle, cache_read quasi nul malgre un prefixe deja partage
-depuis TASK-b0fa). Quand ``LLMRequest.cache_prefix`` est donne, le prompt
-part donc en (au moins) 2 blocs de texte, meme sans image (``--input-format
-stream-json`` comme pour les images) : le premier (``cache_prefix``) porte
-``cache_control: {"type": "ephemeral", "ttl": "1h"}``, le reste (role du juge
-compris) n'en porte pas. Des juges d'un meme modele (clipper.jury) partagent
-alors un bloc identique que le fournisseur peut relire au lieu de le
-refacturer. ``ttl: "1h"`` est obligatoire : Claude Code pose deja son propre
-cache_control ttl=1h sur le systeme (interne, hors controle), et l'API
-refuse (400) un ttl="5m" (le defaut si omis) place apres dans l'ordre de
-traitement (tools, system, messages) -- mesure reelle, pas une supposition.
-On ne pose jamais plus d'un bloc ``cache_control`` par message, quel que soit
-l'usage (images comprises, jamais marquees) : l'API en refuse plus de 4, et
-claude -p en pose deja pour son propre compte.
+Cache de prompt : abandonne (TASK-b384). TASK-2cbb avait pose un bloc
+``cache_control`` explicite sur ``LLMRequest.cache_prefix`` (le cache de
+contexte d'Anthropic marque des BLOCS de contenu, jamais un prefixe de
+caracteres a l'interieur d'un bloc unique -- mesure reelle de l'epoque,
+cache_read quasi nul sans frontiere de bloc). ``LLMRequest.cache_prefix`` est
+maintenant ignore par ce backend : ``stdin_input`` ne le lit plus, aucun bloc
+n'est jamais marque ``cache_control`` de notre part. Cause (TASK-b384,
+mesuree via ``claude -p --debug api --debug-file``, script jetable rejouant
+2 juges opus paralleles avec le meme prefixe) : ``--json-schema`` force un
+echange interne a 2 tours (``num_turns: 2`` dans la sortie, ``stop:
+tool_use`` dans le log debug, meme sans image ni cache_prefix -- observe
+aussi en texte brut) ; sur le 2e tour, deja "stateless" (voir plus bas), le
+nombre total de blocs ``cache_control`` que
+Claude Code s'attribue LUI-MEME pour ce tour varie de facon non deterministe
+entre appels par ailleurs identiques : 4 (accepte) ou 5 (400 permanent,
+"A maximum of 4 blocks with cache_control may be provided. Found 5.", jamais
+recupere). Mesure comparative (4 appels reels avec notre bloc : 2 echecs
+definitifs sur 2 paires ; 10 appels reels sans notre bloc : 0 echec) : notre
+propre bloc etait le +1 qui faisait parfois deborder ce budget prive
+(mecanisme interne au CLI, non documente, hors de notre controle -- pas une
+regression de notre cote, TASK-321b avait deja verifie qu'on ne posait
+jamais plus d'un bloc). Cout : mesure avant/apres sur le smoke test reel
+(``ank log`` TASK-b384, 5 passages consecutifs apres le fix) -- sans notre
+marqueur, ``cache_read_tokens`` reste proche des valeurs d'avant (opus
+~4000-8000, sonnet ~4300-4700, jamais 0 passe le premier appel "a froid" de
+la session) : ``--system-prompt`` et le schema (``--json-schema``) sont deja
+identiques d'un juge a l'autre d'un meme modele, et Claude Code les met en
+cache pour son propre compte (bloc systeme, "hors controle" comme documente
+plus haut) independamment de notre marqueur. Cout par appel jury pratiquement
+inchange, pour zero 400 sur l'essai reel (25 appels/passage x 5 passages).
 
-Limite de blocs cache_control (TASK-746c, reclasse par TASK-f89f, cause
-supprimee par TASK-321b). Meme avec un seul bloc a nous, l'appel pouvait
-recevoir un 400 "A maximum of 4 blocks with cache_control may be provided"
--- jamais du a nos propres blocs (verifie : toujours un seul). Cause reelle
-(TASK-321b, mesuree via ``claude -p --debug api --debug-file``) : sans
-``--strict-mcp-config``, ``claude -p`` charge par defaut les serveurs MCP
-*globaux* de l'utilisateur (``~/.claude.json``, ex. Gmail/Calendar/Drive/
-Canva/TinyPages/Docs) -- ``--setting-sources ""`` et ``--no-session-
-persistence`` ne filtrent que ``settings.json`` (user/project/local), pas
-``mcpServers`` qui est une autre surface de config. Ces serveurs se
-connectent de facon asynchrone (constate : certains terminent leur connexion
-plus d'une seconde APRES que la requete API soit deja partie) ; les blocs
-``tools`` que le CLI joint a la requete -- et met en cache independamment
-par groupe de serveur -- dependent donc d'une course entre l'envoi de la
-requete et la connexion de chaque serveur, plus variable sous charge
-(plusieurs ``claude -p`` paralleles), ce qui correspond a l'intermittence
-liee au parallelisme relevee par TASK-f89f (jamais liee au role/modele/
-contenu envoye, comme mesure alors). Fix : ``--strict-mcp-config`` sans
-``--mcp-config`` fait n'utiliser aucun serveur MCP (verifie : 0 serveur dans
-le debug log, appel reussi, cache toujours partage), sans toucher a
-l'authentification OAuth (contrairement a ``--bare``, qui exige une cle API).
-Le 400 residuel eventuel (si jamais un autre 5e bloc apparaissait) reste un
-echec explicite (LLMError), jamais transitoire (ADR-ad2e) : ``_is_transient``
-ne le reconnait pas au texte.
+Effet de bord observe (sans lien avec notre marqueur, jamais corrige ici) :
+que ``cache_prefix`` soit donne ou non, le tout premier essai HTTP de
+*chaque* appel `claude -p --json-schema` echoue systematiquement avec un
+400 "thread: a maximum of 3 blocks with cache_control may be provided when
+`thread` is set" (un bloc reserve par le serveur pour un mecanisme de
+"thread" interne au CLI, jamais expose par aucun flag documente) ; le CLI le
+capte lui-meme (log ``[WARN] [tether] unsupported_request: resending this
+turn stateless``) et renvoie seul, en stateless, sans que notre code le
+voie -- ni un `--debug`, ni une erreur remontee a ``clipper.llm``. Rien a
+corriger de notre cote : ce comportement est deja invisible pour l'appelant
+quand il reussit, ce qui est le cas la quasi-totalite du temps.
+
+Limite de blocs cache_control (TASK-746c, reclasse par TASK-f89f, MCP
+supprime par TASK-321b, cause residuelle supprimee par TASK-b384, voir
+ci-dessus). Historique MCP (TASK-321b) : sans ``--strict-mcp-config``,
+``claude -p`` chargeait par defaut les serveurs MCP *globaux* de
+l'utilisateur (``~/.claude.json``), connectes de facon asynchrone et dont
+les blocs ``tools`` etaient mis en cache independamment par groupe de
+serveur -- source d'un 400 par le passe, supprimee par ``--strict-mcp-config``
+(0 serveur charge, verifie). Un 400 cache_control residuel reste un echec
+explicite (LLMError), jamais transitoire (ADR-ad2e) : ``_is_transient`` ne
+le reconnait pas au texte.
 
 Sortie. Avec --output-format json (sans image) : un objet unique ``{"type":
 "result", "subtype": "success", "is_error": bool, "api_error_status":
@@ -166,15 +175,13 @@ def resolve_command(command: str) -> str:
 
 
 def stdin_input(request: LLMRequest) -> str:
-    """Contenu envoye sur stdin. Sans image ni cache_prefix : le prompt tel
-    quel (texte brut, ``--output-format json``). Avec l'un des deux : un
-    unique message ``--input-format stream-json`` dont le contenu liste les
-    blocs image (base64, comme clipper.llm.claude_api), puis le texte du
-    prompt soit en un bloc, soit coupe en 2 blocs (cache_prefix marque
-    ``cache_control``, le reste n'en porte pas) si ``cache_prefix`` est
-    donne -- necessaire pour que le fournisseur puisse relire son cache sur
-    ce prefixe (voir la docstring du module)."""
-    if not request.images and not request.cache_prefix:
+    """Contenu envoye sur stdin. Sans image : le prompt tel quel (texte brut,
+    ``--output-format json``). Avec une ou des images : un unique message
+    ``--input-format stream-json`` dont le contenu liste les blocs image
+    (base64, comme clipper.llm.claude_api) puis le texte du prompt en un
+    seul bloc. ``request.cache_prefix`` n'est jamais marque ici (voir la
+    docstring du module, TASK-b384) : ce backend l'ignore."""
+    if not request.images:
         return request.prompt
     content: list[dict[str, Any]] = [
         {
@@ -187,24 +194,7 @@ def stdin_input(request: LLMRequest) -> str:
         }
         for p in request.images
     ]
-    if request.cache_prefix:
-        # ttl explicite : Claude Code pose deja un cache_control ttl=1h sur le
-        # systeme (interne, hors de notre controle) ; sans le meme ttl ici,
-        # l'API refuse (400 : "a ttl='1h' cache_control block must not come
-        # after a ttl='5m' cache_control block") puisque le defaut serait 5m,
-        # place apres dans l'ordre de traitement (tools, system, messages).
-        content.append(
-            {
-                "type": "text",
-                "text": request.cache_prefix,
-                "cache_control": {"type": "ephemeral", "ttl": "1h"},
-            }
-        )
-        remainder = request.prompt[len(request.cache_prefix):]
-        if remainder:
-            content.append({"type": "text", "text": remainder})
-    else:
-        content.append({"type": "text", "text": request.prompt})
+    content.append({"type": "text", "text": request.prompt})
     message = {"type": "user", "message": {"role": "user", "content": content}}
     return json.dumps(message, ensure_ascii=False) + "\n"
 
@@ -217,7 +207,7 @@ class ClaudeCLIBackend:
 
     def build_command(self, request: LLMRequest) -> list[str]:
         cmd = [resolve_command(self.command), "-p", "--model", request.model]
-        if request.images or request.cache_prefix:
+        if request.images:
             # --verbose : requis par le CLI avec --print + --output-format
             # stream-json (verifie en reel, Claude Code 2.1.281 : "Error:
             # When using --print, --output-format=stream-json requires
