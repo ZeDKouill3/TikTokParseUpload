@@ -320,6 +320,26 @@ def test_claude_cli_other_error_is_not_transient(fake_run):
     assert not isinstance(exc.value, TransientLLMError)
 
 
+def test_claude_cli_cache_control_block_limit_is_transient(fake_run):
+    # TASK-746c : releve en reel (jury, juge opus, meme prompt round1 rejoue
+    # 3 fois) -- intermittent, ~1 appel opus sur 3, jamais du a nos propres
+    # marqueurs (claude_cli n'en pose jamais plus d'un). Cote CLI (raisonnement
+    # adaptatif d'opus qui pose parfois son propre bloc cache_control en plus
+    # du notre), hors de notre controle : rejouer la meme requete reussit
+    # generalement, donc transitoire (ADR-ad2e : la video repart en file
+    # plutot que d'echouer). L'ancien code classait ce 400 en erreur
+    # permanente : tout statut int connu (ici 400, absent de 408/429/5xx)
+    # coupait court avant meme de lire le texte.
+    bad = dict(
+        RECORDED_CLAUDE_CLI_QUOTA,
+        api_error_status=400,
+        result="API Error: 400 A maximum of 4 blocks with cache_control may be provided. Found 5.",
+    )
+    fake_run(json.dumps(bad), returncode=1)
+    with pytest.raises(TransientLLMError, match="cache_control"):
+        llm.ask("qa", "p", [], COLOR_SCHEMA, config=make_config())
+
+
 def test_claude_cli_timeout_is_transient(monkeypatch):
     def boom(cmd, **kwargs):
         raise subprocess.TimeoutExpired(cmd, 1)

@@ -55,6 +55,18 @@ refacturer. ``ttl: "1h"`` est obligatoire : Claude Code pose deja son propre
 cache_control ttl=1h sur le systeme (interne, hors controle), et l'API
 refuse (400) un ttl="5m" (le defaut si omis) place apres dans l'ordre de
 traitement (tools, system, messages) -- mesure reelle, pas une supposition.
+On ne pose jamais plus d'un bloc ``cache_control`` par message, quel que soit
+l'usage (images comprises, jamais marquees) : l'API en refuse plus de 4, et
+claude -p en pose deja pour son propre compte.
+
+Limite de blocs cache_control (TASK-746c). Meme avec un seul bloc a nous,
+l'appel peut recevoir un 400 "A maximum of 4 blocks with cache_control may be
+provided" -- releve en reel comme intermittent sur un meme appel rejoue a
+l'identique (juge opus de clipper.jury, ~1 fois sur 3), jamais du a nos
+propres blocs (verifie : toujours un seul). Cote CLI (raisonnement adaptatif
+d'opus, hors de notre controle) : ``_is_transient`` le reconnait au texte
+malgre le statut 400 pour que la video reparte en file (ADR-ad2e) au lieu
+d'echouer definitivement.
 
 Sortie. Avec --output-format json (sans image) : un objet unique ``{"type":
 "result", "subtype": "success", "is_error": bool, "api_error_status":
@@ -94,16 +106,24 @@ MAX_COMMAND_LINE = 32_000
 _TRANSIENT_STATUS = {408, 429}
 _TRANSIENT_TEXT = re.compile(
     r"usage limit|rate.?limit|overloaded|quota|timed? ?out|timeout|network|"
-    r"connection|ECONNRESET|ECONNREFUSED|ENOTFOUND|ETIMEDOUT|503|529",
+    r"connection|ECONNRESET|ECONNREFUSED|ENOTFOUND|ETIMEDOUT|503|529|"
+    r"blocks? with cache_control",
     re.IGNORECASE,
 )
 
 
 def _is_transient(status: Any, text: str) -> bool:
+    """Un statut connu (408/429/5xx) est toujours transitoire. Les autres
+    statuts (ex. 400) sont normalement permanents (entree invalide), sauf un
+    texte reconnu comme transitoire malgre eux -- ex. 'A maximum of N blocks
+    with cache_control may be provided' (TASK-746c) : releve en reel comme
+    intermittent sur un meme appel rejoue a l'identique (opus, raisonnement
+    adaptatif qui pose parfois son propre bloc cache_control cote CLI, hors
+    de notre controle, jamais du a nos marqueurs -- claude_cli n'en pose
+    jamais plus d'un). Un statut int ne doit donc plus faire l'impasse sur le
+    texte."""
     if isinstance(status, int) and (status in _TRANSIENT_STATUS or status >= 500):
         return True
-    if isinstance(status, int):
-        return False
     return bool(_TRANSIENT_TEXT.search(text))
 
 
