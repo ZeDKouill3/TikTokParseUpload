@@ -1994,6 +1994,12 @@ def test_split_render_defaults_are_present_and_unchanged_by_default():
     assert CONFIG_DEFAULTS["badge_name"] == ""
     assert CONFIG_DEFAULTS["badge_logo_size"] == 100
     assert CONFIG_DEFAULTS["badge_glyph_scale"] == 0.65
+    assert CONFIG_DEFAULTS["badge_background"] == "black"
+    assert CONFIG_DEFAULTS["badge_name_outline_color"] == "black"
+    assert CONFIG_DEFAULTS["badge_name_outline"] == 3
+    assert CONFIG_DEFAULTS["badge_name_shadow_enabled"] is False
+    assert CONFIG_DEFAULTS["badge_name_shadow_color"] == "black"
+    assert CONFIG_DEFAULTS["badge_name_shadow_offset"] == [2, 2]
 
 
 def test_stream_split_filter_overlays_webcam_and_gameplay_without_a_title(tmp_path, video_dir):
@@ -2165,18 +2171,113 @@ def test_badge_png_draws_a_black_square_logo_and_the_measured_name(tmp_path):
 
     img = Image.open(out).convert("RGBA")
     assert img.size == (420, 100)
-    # fond noir opaque loin du glyphe (coin haut-gauche)
+    # fond noir opaque loin du groupe (coin haut-gauche, defaut inchange)
     assert img.getpixel((2, 2))[:3] == (0, 0, 0)
-    # le glyphe (logo rouge) est bien present quelque part dans le carre
-    square = int(CONFIG_DEFAULTS["badge_logo_size"])
-    reds = [img.getpixel((x, y)) for x in range(square) for y in range(100) if img.getpixel((x, y))[0] > 200]
+    # le glyphe (logo rouge) est bien present quelque part dans l'image
+    # (le groupe est desormais centre, plus force colle a gauche)
+    reds = [img.getpixel((x, y)) for x in range(420) for y in range(100) if img.getpixel((x, y))[0] > 200]
     assert reds
-    # du texte (blanc) a droite du carre
+    # du texte (blanc) present quelque part dans l'image
     whites = [
-        img.getpixel((x, y)) for x in range(square + 20, 420) for y in range(100)
+        img.getpixel((x, y)) for x in range(420) for y in range(100)
         if img.getpixel((x, y))[:3] == (255, 255, 255)
     ]
     assert whites
+
+
+def _content_x_range(img, zw, zh, background_rgb=None):
+    """Etendue horizontale (min, max) des pixels de contenu. Sans fond plat
+    (``background_rgb=None``), tout pixel non transparent est du contenu
+    (mode 'none' : le seul fond restant, le carre du logo, EST le contenu) ;
+    avec un fond plat opaque, seuls les pixels qui en different comptent."""
+    xs = []
+    for x in range(zw):
+        for y in range(zh):
+            r, g, b, a = img.getpixel((x, y))
+            if a == 0:
+                continue
+            if background_rgb is not None and (r, g, b) == background_rgb and a == 255:
+                continue
+            xs.append(x)
+    assert xs, "aucun pixel de contenu trouve"
+    return min(xs), max(xs)
+
+
+@pytest.mark.parametrize("badge_background", ["black", "none"])
+def test_badge_png_group_is_centered_on_the_zone(tmp_path, badge_background):
+    from PIL import Image
+
+    from clipper.render import CONFIG_DEFAULTS, badge_png
+
+    logo = tmp_path / "logo.png"
+    _write_logo(logo, size=(64, 64))
+    out = tmp_path / "badge.png"
+    zone = {"x0": 0, "y0": 0, "x1": 420, "y1": 100}
+    # badge_glyph_scale=1 : le glyphe remplit tout le carre du logo, sans
+    # marge invisible -- sinon en fond plein (noir) cette marge (glyphe <
+    # carre) fausse la mesure par pixels (le carre est indetectable sur
+    # fond de meme couleur), qui ne verifierait plus le meme groupe que
+    # celui reellement centre par l'implementation.
+    settings = dict(CONFIG_DEFAULTS, badge_background=badge_background, badge_glyph_scale=1.0)
+    badge_png(logo, "Exemple", zone, settings, out)
+
+    img = Image.open(out).convert("RGBA")
+    background_rgb = (0, 0, 0) if badge_background != "none" else None
+    x_min, x_max = _content_x_range(img, 420, 100, background_rgb)
+    content_center = (x_min + x_max + 1) / 2
+    assert abs(content_center - 420 / 2) <= 1
+
+
+def test_badge_png_none_background_has_no_rectangle_behind_the_name(tmp_path):
+    from PIL import Image
+
+    from clipper.render import CONFIG_DEFAULTS, badge_png
+
+    logo = tmp_path / "logo.png"
+    _write_logo(logo, size=(64, 64))
+    out = tmp_path / "badge.png"
+    zone = {"x0": 0, "y0": 0, "x1": 420, "y1": 100}
+    settings = dict(CONFIG_DEFAULTS, badge_background="none")
+    badge_png(logo, "Exemple", zone, settings, out)
+
+    img = Image.open(out).convert("RGBA")
+    # un coin loin du groupe reste transparent : pas de rectangle plein
+    assert img.getpixel((2, 2))[3] == 0
+    assert img.getpixel((417, 97))[3] == 0
+    # le nom (blanc) reste dessine quelque part
+    whites = [
+        img.getpixel((x, y)) for x in range(420) for y in range(100)
+        if img.getpixel((x, y))[:3] == (255, 255, 255) and img.getpixel((x, y))[3] > 0
+    ]
+    assert whites
+
+
+def test_badge_png_default_background_fills_the_whole_zone_opaque(tmp_path):
+    from PIL import Image
+
+    from clipper.render import CONFIG_DEFAULTS, badge_png
+
+    logo = tmp_path / "logo.png"
+    _write_logo(logo, size=(64, 64))
+    out = tmp_path / "badge.png"
+    zone = {"x0": 0, "y0": 0, "x1": 420, "y1": 100}
+    badge_png(logo, "Exemple", zone, CONFIG_DEFAULTS, out)
+
+    img = Image.open(out).convert("RGBA")
+    corners = [(0, 0), (419, 0), (0, 99), (419, 99)]
+    for xy in corners:
+        assert img.getpixel(xy) == (0, 0, 0, 255)
+
+
+def test_badge_png_invalid_shadow_offset_is_an_explicit_error(tmp_path):
+    from clipper.render import CONFIG_DEFAULTS, RenderError, badge_png
+
+    logo = tmp_path / "logo.png"
+    _write_logo(logo, size=(64, 64))
+    zone = {"x0": 0, "y0": 0, "x1": 420, "y1": 100}
+    settings = dict(CONFIG_DEFAULTS, badge_name_shadow_enabled=True, badge_name_shadow_offset=[1, 2, 3])
+    with pytest.raises(RenderError, match="badge_name_shadow_offset"):
+        badge_png(logo, "Exemple", zone, settings, tmp_path / "badge.png")
 
 
 def test_badge_png_missing_logo_file_is_an_explicit_error(tmp_path):

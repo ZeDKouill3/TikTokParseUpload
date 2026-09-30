@@ -5,7 +5,7 @@ slug: badge-de-cha-ne-fond-optionnel-aucun-et-groupe-l
 title: "Badge de chaîne : fond optionnel (aucun) et groupe logo+nom centré"
 created: 2026-09-30T15:45:39Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/render.py
   - tests/test_render.py
@@ -16,8 +16,15 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/c2c8d28475e6@6ef8aeb
+    tree: scope/b76d776bcb31
+    criteria: d0e041e3065f
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---
 
 Retour utilisateur 2026-09-30 sur la démo v3 (research/madajel/demo-clips-v3) : « il y a un fond noir derrière le nom, il ne faut pas ; et ce n'est pas centré, trop de noir sur la droite ». Aujourd'hui (render.py ~l.749-770) : carré logo 100 px + nom dans un rectangle noir de badge_dest (420 px) aligné à gauche. SPEC-76dc6a1cbccb décrit le fond noir : il reste le défaut ; on ajoute seulement l'option.
