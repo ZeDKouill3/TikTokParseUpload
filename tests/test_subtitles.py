@@ -145,6 +145,65 @@ def test_words_are_grouped_by_2_to_4_words_per_event(tmp_path, video_dir):
 
 
 # --------------------------------------------------------------------------
+# TASK-9ee7 : rien a l'ecran pendant les silences. Constat reel sur
+# v2887271276/00.ass : un groupe de 2 mots ("L'ÉCHAPPE. AH,") couvrait un
+# Dialogue de 7.88 a 25.22s alors que le mot suivant ne commencait qu'a
+# 25.04s (17.34s affiches pour 16.76s de vrai silence) -- _group_words()
+# regroupait par nombre de mots sans jamais tenir compte de l'ecart
+# temporel entre eux.
+# --------------------------------------------------------------------------
+
+
+def test_a_long_gap_produces_no_event_covering_the_silence(tmp_path, video_dir):
+    # "Ah" a 1.0-1.3s puis "bon" seulement a 11.0s : sans le decoupage par
+    # ecart, min_words_per_group=2 les aurait mis dans le meme groupe et le
+    # Dialogue de base aurait couvert les 9.7s de silence entre les deux.
+    words = [_word(" Ah", 1.0, 1.3), _word(" bon", 11.0, 11.3)]
+    (video_dir / "transcript.json").write_text(json.dumps(make_transcript(words)), encoding="utf-8")
+    with llm.use_backend(FakeBackend([NO_EMPHASIS])):
+        path = run(tmp_path, start=1.0, end=12.0)
+    doc = parse_ass(Path(path))
+    assert len(doc["events"]) == 2
+    mid_silence = 5.0 - 1.0  # relatif au debut du clip, bien dans le silence
+    for ev in doc["events"]:
+        s, e = to_seconds(ev["start"]), to_seconds(ev["end"])
+        assert not (s <= mid_silence <= e), (s, e)
+    # "Ah" disparait vite apres sa fin (hold_s), pas jusqu'a "bon"
+    assert to_seconds(doc["events"][0]["end"]) < (11.0 - 1.0)
+
+
+def test_close_groups_touch_without_a_blank_gap(tmp_path, video_dir):
+    # mots de default_words() groupes en [monde bienvenue sur] (fin 2.6) et
+    # [GTA six.] (debut 2.7) : ecart naturel de 0.1s < hold_s (0.3s par
+    # defaut) -- le premier groupe doit disparaitre exactement quand le
+    # second apparait, jamais avant (pas de clignotement).
+    with llm.use_backend(FakeBackend([NO_EMPHASIS])):
+        path = run(tmp_path, start=1.0, end=4.0)
+    doc = parse_ass(Path(path))
+    assert len(doc["events"]) == 2
+    first, second = doc["events"]
+    assert to_seconds(first["end"]) == pytest.approx(to_seconds(second["start"]), abs=0.011)
+
+
+def test_abnormally_long_word_end_is_bounded_by_max_word_s(tmp_path, video_dir):
+    # "fois" dure 13.8s dans la transcription (faster-whisper etire sa fin
+    # sur le silence qui suit, mesure jusqu'a plus de 10s sur v2887271276) :
+    # bornee a max_word_s, pas affichee/surlignee jusqu'a sa fin annoncee.
+    words = [_word(" Wow", 1.0, 1.2), _word(" fois", 1.2, 15.0)]
+    (video_dir / "transcript.json").write_text(json.dumps(make_transcript(words)), encoding="utf-8")
+    with llm.use_backend(FakeBackend([NO_EMPHASIS])):
+        path = run(tmp_path, start=1.0, end=16.0)
+    doc = parse_ass(Path(path))
+    max_word_s = CONFIG_DEFAULTS["max_word_s"]
+    hold_s = CONFIG_DEFAULTS["hold_s"]
+    ks = [int(k) for k in re.findall(r"\\k(\d+)", doc["events"][-1]["text"])]
+    assert ks[-1] == round(max_word_s * 100)
+    assert to_seconds(doc["events"][-1]["end"]) == pytest.approx(
+        (1.2 + max_word_s + hold_s) - 1.0, abs=0.011
+    )
+
+
+# --------------------------------------------------------------------------
 # C6 : timecodes relatifs au debut du clip (start -> 0)
 # --------------------------------------------------------------------------
 
@@ -157,8 +216,10 @@ def test_timecodes_are_relative_to_clip_start(tmp_path, video_dir):
     # premier mot dans l'intervalle : "monde" a 1.1-1.6
     assert to_seconds(first["start"]) == pytest.approx(1.1 - 1.0, abs=0.011)
     last = doc["events"][-1]
-    # dernier mot : "six." a 3.3-4.6
-    assert to_seconds(last["end"]) == pytest.approx(4.6 - 1.0, abs=0.011)
+    # dernier mot : "six." a 3.3-4.6, plus hold_s (TASK-9ee7) : rien apres
+    # pour le capper, dernier groupe du clip
+    hold_s = CONFIG_DEFAULTS["hold_s"]
+    assert to_seconds(last["end"]) == pytest.approx(4.6 + hold_s - 1.0, abs=0.011)
 
 
 # --------------------------------------------------------------------------

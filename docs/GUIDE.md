@@ -302,7 +302,13 @@ zones (`split_webcam_dest`, `split_gameplay_dest`, `badge_dest`,
 `[subtitles]` — `font_name` = `"Poppins ExtraBold"`, `font_size` = 96,
 `min_words_per_group`/`max_words_per_group` = 2/4, `emphasis` = `true`
 (emphase choisie par LLM), `parallel` = 4 (clips traités en parallèle, lu par
-le pipeline). Style de l'agencement stream split (SPEC-76dc, préfixe
+le pipeline). Rien ne s'affiche pendant un silence (TASK-9ee7) : `hold_s`
+(0,3 s) — un groupe de mots reste affiché au plus ce temps après la fin de
+son dernier mot, borné par le début du suivant — `gap_s` (0,6 s) — un écart
+de plus que ça avant le mot suivant coupe le groupe, rien n'est affiché
+pendant l'écart — `max_word_s` (1,5 s) — la fin d'un mot isolé, parfois
+étirée par faster-whisper sur le silence qui suit, est bornée à ce temps
+depuis son début. Style de l'agencement stream split (SPEC-76dc, préfixe
 `split_`, jamais d'appel LLM) : `split_font_name`/`split_font_size`,
 `split_uppercase`, `split_text_color`/`split_current_word_color` (le mot en
 train d'être prononcé) — couleurs `#RRGGBB` ou un nom (`white`, `black`,

@@ -122,6 +122,16 @@ CONFIG_DEFAULTS: dict[str, object] = {
     # (TASK-ce6e : un appel LLM d'emphase par clip) ; 1 = un clip apres
     # l'autre. Lu par le pipeline, jamais passe a generate.
     "parallel": 4,
+    # TASK-9ee7 : rien a l'ecran pendant les silences. hold_s : un groupe de
+    # mots reste affiche au plus ce temps apres la fin de son dernier mot
+    # (borne par le debut du groupe suivant, si plus proche). gap_s : un
+    # ecart de plus que ca avant le mot suivant coupe le groupe (rien
+    # n'est affiche pendant l'ecart). max_word_s : la fin d'un mot isole
+    # (faster-whisper l'etire parfois sur le silence qui suit, mesure
+    # jusqu'a plus de 10 s) est bornee a ce temps depuis son debut.
+    "hold_s": 0.3,
+    "gap_s": 0.6,
+    "max_word_s": 1.5,
     # Style de l'agencement stream split (SPEC-76dc, generate(style="split")) :
     # deux couleurs seulement (texte, mot en cours), jamais d'appel LLM
     # d'emphase (chaque mot est "en cours" a son propre instant). Couleurs au
@@ -187,6 +197,17 @@ def _words_in_interval(transcript: dict[str, Any], start: float, end: float) -> 
     return words
 
 
+def _bound_word_ends(words: list[dict[str, Any]], max_word_s: float) -> None:
+    """Borne en place (meme dicts que ``_units`` mute, TASK-9ee7) la fin d'un
+    mot isole dont la duree propre depasse ``max_word_s`` : faster-whisper
+    etire parfois la fin d'un mot sur le silence qui suit (mesure jusqu'a
+    plus de 10 s sur v2887271276), ce qui gonflerait sa duree de karaoke et
+    masquerait un ecart reel au decoupage par silence (_group_words)."""
+    for w in words:
+        if w["end"] - w["start"] > max_word_s:
+            w["end"] = w["start"] + max_word_s
+
+
 def _ask_emphasis(words: list[dict[str, Any]], config: Any) -> set[int]:
     if not words:
         return set()
@@ -227,21 +248,38 @@ def _units(words: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
     return units
 
 
-def _group_words(words: list[dict[str, Any]], min_size: int, max_size: int) -> list[list[dict[str, Any]]]:
+def _group_words(
+    words: list[dict[str, Any]], min_size: int, max_size: int, gap_s: float
+) -> list[list[dict[str, Any]]]:
     """Groupe les mots par lots de ``min_size`` a ``max_size``, sans jamais
     laisser un reliquat plus petit que ``min_size`` (sauf si l'intervalle
-    entier en compte moins). Un mot et ses jetons colles comptent pour un."""
+    entier en compte moins). Un mot et ses jetons colles comptent pour un.
+    D'abord coupe en segments aux ecarts de plus de ``gap_s`` entre deux mots
+    consecutifs (TASK-9ee7 : un silence ne doit jamais rester a l'interieur
+    d'un groupe), chaque segment ensuite regroupe par lots comme ci-dessus."""
     units = _units(words)
     groups: list[list[dict[str, Any]]] = []
-    n = len(units)
-    i = 0
-    while i < n:
-        remaining = n - i
-        take = min(max_size, remaining)
-        if 0 < remaining - take < min_size:
-            take = remaining - min_size
-        groups.append([w for unit in units[i : i + take] for w in unit])
-        i += take
+
+    def batch(segment: list[list[dict[str, Any]]]) -> None:
+        n = len(segment)
+        i = 0
+        while i < n:
+            remaining = n - i
+            take = min(max_size, remaining)
+            if 0 < remaining - take < min_size:
+                take = remaining - min_size
+            groups.append([w for unit in segment[i : i + take] for w in unit])
+            i += take
+
+    segment: list[list[dict[str, Any]]] = []
+    prev_end: float | None = None
+    for unit in units:
+        if prev_end is not None and unit[0]["start"] - prev_end > gap_s:
+            batch(segment)
+            segment = []
+        segment.append(unit)
+        prev_end = unit[-1]["end"]
+    batch(segment)
     return groups
 
 
@@ -367,9 +405,10 @@ def _dialogue_line(
     index: dict[int, int],
     settings: dict[str, Any],
     margin_v: int,
+    display_end: float,
 ) -> str:
     start = group[0]["start"] - clip_start
-    end = group[-1]["end"] - clip_start
+    end = display_end - clip_start
     prev_end = group[0]["start"]
     runs = []
     for w in group:
@@ -392,14 +431,19 @@ def _render_ass(
     where: str,
 ) -> str:
     candidates = _candidates(settings)
-    groups = _group_words(words, int(settings["min_words_per_group"]), int(settings["max_words_per_group"]))
+    groups = _group_words(words, int(settings["min_words_per_group"]), int(settings["max_words_per_group"]),
+                          float(settings["gap_s"]))
     index = {id(w): i for i, w in enumerate(words)}
+    hold_s = float(settings["hold_s"])
 
     events = []
-    for group in groups:
+    for i, group in enumerate(groups):
         _, bottom = _position(group[0]["start"], group[-1]["end"], candidates,
                               avoid_zones, reserved_zones, where)
-        events.append(_dialogue_line(group, clip_start, emphasis, index, settings, PLAY_RES_Y - bottom))
+        display_end = group[-1]["end"] + hold_s
+        if i + 1 < len(groups):
+            display_end = min(display_end, groups[i + 1][0]["start"])
+        events.append(_dialogue_line(group, clip_start, emphasis, index, settings, PLAY_RES_Y - bottom, display_end))
 
     style = (
         "Style: Default,{font},{size},{primary},{secondary},{outline_color},&H00000000,"
@@ -669,31 +713,43 @@ def _render_positioned(
     size = style.font_size
     index = {id(w): i for i, w in enumerate(words)}
     margin_r = PLAY_RES_X - zone["x1"]
+    hold_s = float(settings["hold_s"])
+
+    placements: list[tuple[list[list[list[dict[str, Any]]]], int]] = []
+    for group in _group_words(words, int(settings["min_words_per_group"]), style.max_words_per_group,
+                              float(settings["gap_s"])):
+        placements.extend(_place(_units(group), size, box, style, where))
+    # borne par le debut du placement suivant (TASK-9ee7 : un placement, pas
+    # seulement un groupe, car un groupe trop large pour la zone est lui-meme
+    # decoupe en plusieurs placements a des instants differents par _place).
+    starts = [lines[0][0][0]["start"] for lines, _em in placements]
 
     events = []
-    for group in _group_words(words, int(settings["min_words_per_group"]), style.max_words_per_group):
-        for lines, em in _place(_units(group), size, box, style, where):
-            first = lines[0][0][0]
-            last = lines[-1][-1][-1]
-            start = _format_timestamp(first["start"] - clip_start)
-            end = _format_timestamp(last["end"] - clip_start)
-            fs = "" if em == size else f"\\fs{libass_font_size(em)}"
-            for i, line in enumerate(lines):
-                # karaoke compte depuis le debut du groupe affiche
-                prev_end = first["start"]
-                runs = []
-                for j, w in enumerate(word for unit in line for word in unit):
-                    text = w["word"].upper() if style.uppercase else w["word"]
-                    runs.append(_karaoke_run(w, prev_end, index[id(w)] in emphasis, emphasis_color,
-                                             text=text.lstrip() if j == 0 else text,
-                                             reset=f"{{\\r{fs}}}"))
-                    prev_end = w["end"]
-                # layer = rang de la ligne : libass decale un evenement qui en
-                # chevauche un autre du meme layer (detection de collisions)
-                events.append(
-                    f"Dialogue: {i},{start},{end},Default,,{zone['x0']},{margin_r},"
-                    f"{zone['y0'] + box.offset + i * box.step(em)},,{{\\q2\\an8{fs}}}{''.join(runs)}"
-                )
+    for pi, (lines, em) in enumerate(placements):
+        first = lines[0][0][0]
+        last = lines[-1][-1][-1]
+        display_end = last["end"] + hold_s
+        if pi + 1 < len(placements):
+            display_end = min(display_end, starts[pi + 1])
+        start = _format_timestamp(first["start"] - clip_start)
+        end = _format_timestamp(display_end - clip_start)
+        fs = "" if em == size else f"\\fs{libass_font_size(em)}"
+        for i, line in enumerate(lines):
+            # karaoke compte depuis le debut du groupe affiche
+            prev_end = first["start"]
+            runs = []
+            for j, w in enumerate(word for unit in line for word in unit):
+                text = w["word"].upper() if style.uppercase else w["word"]
+                runs.append(_karaoke_run(w, prev_end, index[id(w)] in emphasis, emphasis_color,
+                                         text=text.lstrip() if j == 0 else text,
+                                         reset=f"{{\\r{fs}}}"))
+                prev_end = w["end"]
+            # layer = rang de la ligne : libass decale un evenement qui en
+            # chevauche un autre du meme layer (detection de collisions)
+            events.append(
+                f"Dialogue: {i},{start},{end},Default,,{zone['x0']},{margin_r},"
+                f"{zone['y0'] + box.offset + i * box.step(em)},,{{\\q2\\an8{fs}}}{''.join(runs)}"
+            )
 
     style_line = (
         "Style: Default,{font},{size},{primary},{secondary},{outline_color},{back},"
@@ -751,40 +807,53 @@ def _render_split(
     zx0, _zy0, zx1, _zy1 = (zone[k] for k in _ZONE_KEYS)
     zone_w = zx1 - zx0
     margin_r = PLAY_RES_X - zx1
+    hold_s = float(settings["hold_s"])
+
+    items: list[tuple[list[list[list[dict[str, Any]]]], int]] = []
+    for group in _group_words(words, int(settings["min_words_per_group"]), style.max_words_per_group,
+                              float(settings["gap_s"])):
+        items.extend(_place(_units(group), size, box, style, where))
+    # borne (par ligne, la granularite deja affichee ici) par le debut de la
+    # ligne suivante, toutes places/groupes confondus (TASK-9ee7).
+    line_starts = [lu[0][0]["start"] for lines, _em in items for lu in lines]
 
     events: list[str] = []
-    for group in _group_words(words, int(settings["min_words_per_group"]), style.max_words_per_group):
-        for lines, em in _place(_units(group), size, box, style, where):
-            font = _pil_font(str(FONT_FILE), em)
-            fs = "" if em == size else f"\\fs{libass_font_size(em)}"
-            for i, line_units in enumerate(lines):
-                unit_texts = [_unit_text(u, style.uppercase) for u in line_units]
-                unit_texts[0] = unit_texts[0].lstrip()
-                line_text_str = "".join(unit_texts)
-                line_x0 = zx0 + (zone_w - font.getlength(line_text_str)) / 2
-                top_y = zone["y0"] + box.offset + i * box.step(em)
-                g_start = _format_timestamp(line_units[0][0]["start"] - clip_start)
-                g_end = _format_timestamp(line_units[-1][-1]["end"] - clip_start)
+    li = 0
+    for lines, em in items:
+        font = _pil_font(str(FONT_FILE), em)
+        fs = "" if em == size else f"\\fs{libass_font_size(em)}"
+        for i, line_units in enumerate(lines):
+            unit_texts = [_unit_text(u, style.uppercase) for u in line_units]
+            unit_texts[0] = unit_texts[0].lstrip()
+            line_text_str = "".join(unit_texts)
+            line_x0 = zx0 + (zone_w - font.getlength(line_text_str)) / 2
+            top_y = zone["y0"] + box.offset + i * box.step(em)
+            display_end = line_units[-1][-1]["end"] + hold_s
+            if li + 1 < len(line_starts):
+                display_end = min(display_end, line_starts[li + 1])
+            g_start = _format_timestamp(line_units[0][0]["start"] - clip_start)
+            g_end = _format_timestamp(display_end - clip_start)
+            li += 1
+            events.append(
+                f"Dialogue: {2 * i},{g_start},{g_end},Default,,{zx0},{margin_r},{top_y},,"
+                f"{{\\q2\\an7\\pos({line_x0:.2f},{top_y}){fs}}}{line_text_str}"
+            )
+            cursor = 0.0
+            for unit, utext in zip(line_units, unit_texts):
+                # le calque de surbrillance est un evenement ASS a part
+                # (Text) pour chaque mot : un espace de tete y serait
+                # rogne par libass (contrairement a la ligne de base, un
+                # seul champ Text continu) -- avance separement, dessine
+                # seulement le texte visible.
+                stripped = utext.lstrip()
+                cursor += font.getlength(utext) - font.getlength(stripped)
+                u_start = _format_timestamp(unit[0]["start"] - clip_start)
+                u_end = _format_timestamp(unit[-1]["end"] - clip_start)
                 events.append(
-                    f"Dialogue: {2 * i},{g_start},{g_end},Default,,{zx0},{margin_r},{top_y},,"
-                    f"{{\\q2\\an7\\pos({line_x0:.2f},{top_y}){fs}}}{line_text_str}"
+                    f"Dialogue: {2 * i + 1},{u_start},{u_end},Default,,{zx0},{margin_r},{top_y},,"
+                    f"{{\\q2\\an7\\pos({line_x0 + cursor:.2f},{top_y}){fs}\\c{current_color}}}{stripped}"
                 )
-                cursor = 0.0
-                for unit, utext in zip(line_units, unit_texts):
-                    # le calque de surbrillance est un evenement ASS a part
-                    # (Text) pour chaque mot : un espace de tete y serait
-                    # rogne par libass (contrairement a la ligne de base, un
-                    # seul champ Text continu) -- avance separement, dessine
-                    # seulement le texte visible.
-                    stripped = utext.lstrip()
-                    cursor += font.getlength(utext) - font.getlength(stripped)
-                    u_start = _format_timestamp(unit[0]["start"] - clip_start)
-                    u_end = _format_timestamp(unit[-1]["end"] - clip_start)
-                    events.append(
-                        f"Dialogue: {2 * i + 1},{u_start},{u_end},Default,,{zx0},{margin_r},{top_y},,"
-                        f"{{\\q2\\an7\\pos({line_x0 + cursor:.2f},{top_y}){fs}\\c{current_color}}}{stripped}"
-                    )
-                    cursor += font.getlength(stripped)
+                cursor += font.getlength(stripped)
 
     style_line = (
         "Style: Default,{font},{size},{primary},{secondary},{outline_color},{back},"
@@ -869,6 +938,7 @@ def generate(
 
     settings = _settings(config)
     words = _words_in_interval(transcript, start, end)
+    _bound_word_ends(words, float(settings["max_word_s"]))
 
     if letterbox and style == "split":
         ass_text = _render_split(words, start, settings, text_zone, where)
