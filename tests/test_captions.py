@@ -779,6 +779,43 @@ def test_prompt_does_not_forbid_emoji_when_the_option_is_enabled(workspace, tmp_
     assert "au plus un emoji" in prompt
 
 
+def _has_emoji_char(text):
+    """Vrai si un caractere du bloc emoji usuel (U+1F300-U+1FAFF, couvre les
+    emojis clickbait typiques : 🔥😡💊🧩😱💀👻🧟😂🪓) apparait dans ``text``."""
+    return any(0x1F300 <= ord(c) <= 0x1FAFF for c in text)
+
+
+def test_no_literal_emoji_in_prompt_or_schema_by_default(workspace, tmp_path):
+    write_moments(workspace, moment(0))
+    write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
+
+    fake, _ = run(workspace, make_config(tmp_path), [answer()])
+
+    prompt = fake.calls[0].prompt
+    schema_text = json.dumps(fake.calls[0].schema, ensure_ascii=False)
+    assert not _has_emoji_char(prompt), prompt
+    assert not _has_emoji_char(schema_text), schema_text
+
+
+def test_schema_screen_title_description_forbids_emoji_by_default():
+    from clipper.captions import CONFIG_DEFAULTS, response_schema
+
+    schema = response_schema(CONFIG_DEFAULTS)
+
+    description = schema["properties"]["screen_title"]["description"]
+    assert "exactement un emoji" not in description
+    assert "aucun" in description.lower() and "emoji" in description.lower()
+
+
+def test_schema_screen_title_description_allows_one_emoji_when_enabled():
+    from clipper.captions import CONFIG_DEFAULTS, response_schema
+
+    schema = response_schema({**CONFIG_DEFAULTS, "screen_title_allow_emoji": True})
+
+    description = schema["properties"]["screen_title"]["description"]
+    assert "au plus un emoji" in description
+
+
 def test_hook_text_schema_error_lists_the_counted_words_numbered(workspace, tmp_path):
     write_moments(workspace, moment(0))
     write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))

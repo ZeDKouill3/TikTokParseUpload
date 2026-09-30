@@ -212,12 +212,19 @@ def response_schema(
         }
         required.append("title")
     if include_screen_title:
+        allow_emoji = bool(settings["screen_title_allow_emoji"])
+        emoji_desc = (
+            "au plus un emoji simple, jamais obligatoire"
+            if allow_emoji
+            else "AUCUN emoji"
+        )
         properties["screen_title"] = {
             "type": "string", "minLength": 1, "maxLength": 60,
             "description": (
                 "Titre d'ecran affiche en haut, sur un encadre blanc, pendant tout le "
                 f"clip : {settings['screen_title_words_max']} mots au plus (l'emoji ne "
-                "compte pas) et exactement un emoji simple."
+                f"compte pas), ton sobre (jamais de superlatif ni de mot d'emphase "
+                f"clickbait) ; {emoji_desc}."
             ),
         }
         required.append("screen_title")
