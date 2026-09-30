@@ -6,7 +6,7 @@ Sortie  : workspace/<video_id>/transcript.json (et un intermediaire,
 transcript_raw.json, garde avant la correction)
 
     {"video_id", "language", "language_probability", "duration", "model",
-     "vocab": [...],
+     "vocab": [...], "transcript_fix_refused": <int>,
      "segments": [{"id", "start", "end", "text",
                    "words": [{"word", "start", "end", "probability"}]}]}
 
@@ -34,9 +34,17 @@ Deroulement :
    reecrire chacune (meme principe que clipper.jury, TASK-2852). La reponse
    ne liste que des corrections {i, old, word} par index de mot (ancien
    texte, nouveau texte), donc ni le nombre de mots ni leurs timecodes ne
-   peuvent changer. Une correction dont ``old`` ne correspond pas au mot
-   reellement present a cet index est refusee et journalisee dans
-   llm_refusals.jsonl (ADR-ad2e), jamais appliquee en silence.
+   peuvent changer. ``old`` est compare au mot reellement present a cet index
+   en ignorant la ponctuation collee et la casse (``Alstner`` == ``Alstner,``) ;
+   la correction s'applique alors en gardant la ponctuation d'origine autour
+   du mot. Une correction dont ``old`` ne correspond toujours pas (index
+   decale, mot hallucine...) est ignoree et journalisee dans
+   llm_refusals.jsonl (compteur et exemples), jamais appliquee en silence,
+   sans faire echouer l'etape (ADR-ad2e) ; un compteur
+   ``transcript_fix_refused`` est aussi ecrit dans transcript.json. Si une
+   part anormale des corrections d'une video est refusee (majorite stricte,
+   au moins 2), c'est en revanche un echec explicite : la correction semble
+   decalee dans son ensemble, pas seulement pour un mot isole.
 
 Si transcript_raw.json existe deja (retour apres un echec de la correction),
 il est reutilise et whisper n'est pas relance, sauf ``force``.
@@ -54,8 +62,10 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from importlib.util import find_spec
 from pathlib import Path
 from typing import Any
@@ -349,34 +359,109 @@ def _fix_schema(n_words: int) -> dict[str, Any]:
     }
 
 
-def _check_corrections(words: list[dict[str, Any]]) -> Callable[[Any], None]:
-    """Controle passe a llm.ask (comme clipper.captions) : une correction
-    dont ``old`` ne correspond pas au mot reellement present a cet index (LLM
-    decale, index hallucine...) ne correspond pas au texte et est renvoyee au
-    modele pour correction, comme une reponse hors schema ; si elle est
-    encore refusee apres les tentatives de reparation, l'echec est journalise
-    dans llm_refusals.jsonl (ADR-ad2e) et remonte, jamais applique en
-    silence. Un mot corrige ne peut pas non plus contenir d'espace interne :
-    il deviendrait deux mots pour les sous-titres, sans timecode propre."""
+def _check_correction_shape(answer: dict[str, Any]) -> None:
+    """Controle passe a llm.ask (comme clipper.captions) : ce que le schema ne
+    peut pas exprimer, un mot corrige ne peut pas contenir d'espace interne
+    (il deviendrait deux mots pour les sous-titres, sans timecode propre).
+    Renvoye au modele pour reparation comme une reponse hors schema. La
+    correspondance ``old`` / mot reellement present a cet index est
+    controlee apres coup, tolerante a la ponctuation (_normalized_core,
+    appelee depuis _fix_chunk) : ce n'est pas une raison de redemander au
+    modele, une correction qui ne correspond toujours pas est ignoree et
+    journalisee (ADR-ad2e)."""
+    for correction in answer["corrections"]:
+        new = correction["word"].strip()
+        if not new or any(c.isspace() for c in new):
+            raise llm.SchemaError(
+                f"correction refusee pour le mot {correction['i']} : {correction['word']!r} "
+                "(un mot doit rester un seul mot)"
+            )
 
-    def check(answer: dict[str, Any]) -> None:
-        for correction in answer["corrections"]:
-            i = correction["i"]
-            old = correction["old"].strip()
-            actual = words[i]["word"].strip()
-            if old != actual:
-                raise llm.SchemaError(
-                    f"correction refusee pour le mot {i} : le modele visait {old!r}, "
-                    f"le texte a cet index est {actual!r}"
-                )
-            new = correction["word"].strip()
-            if not new or any(c.isspace() for c in new):
-                raise llm.SchemaError(
-                    f"correction refusee pour le mot {i} : {correction['word']!r} "
-                    "(un mot doit rester un seul mot)"
-                )
 
-    return check
+def _word_core_bounds(word: str) -> tuple[int, int]:
+    """Bornes du coeur alphanumerique d'un mot whisper : espace de tete et
+    ponctuation collee (debut ou fin) exclus, ponctuation interne (ex. un
+    trait d'union) gardee."""
+    start = 0
+    while start < len(word) and not word[start].isalnum():
+        start += 1
+    end = len(word)
+    while end > start and not word[end - 1].isalnum():
+        end -= 1
+    return start, end
+
+
+def _normalized_core(word: str) -> str:
+    """Coeur du mot, casse ignoree, pour une comparaison tolerante a la
+    ponctuation collee (``Alstner`` == ``Alstner,``)."""
+    start, end = _word_core_bounds(word)
+    return word[start:end].casefold()
+
+
+def _apply_word_correction(original: str, new_core: str) -> str:
+    """Remplace le coeur alphanumerique de ``original`` par ``new_core`` en
+    gardant l'espace de tete et la ponctuation collee d'origine."""
+    start, end = _word_core_bounds(original)
+    return original[:start] + new_core + original[end:]
+
+
+class _FixStats:
+    """Compteurs de corrections partages entre les tranches (executees en
+    threads, cf. _fix_chunks) : appliquees vs refusees apres la comparaison
+    tolerante de _fix_chunk (_normalized_core)."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.applied = 0
+        self.refused = 0
+
+    def record(self, *, applied: bool) -> None:
+        with self._lock:
+            if applied:
+                self.applied += 1
+            else:
+                self.refused += 1
+
+
+# Une correction refusee isolee est ignoree (ADR-ad2e) ; en dessous de ce
+# compte, ce n'est jamais une "majorite" au sens de done_criteria, quel que
+# soit le ratio (1 refus sur 1 tentative ne doit pas faire echouer l'etape).
+_MIN_REFUSALS_FOR_MAJORITY_FAILURE = 2
+
+
+def _check_refusal_ratio(stats: _FixStats) -> None:
+    total = stats.applied + stats.refused
+    if stats.refused >= _MIN_REFUSALS_FOR_MAJORITY_FAILURE and stats.refused * 2 > total:
+        raise TranscribeError(
+            f"trop de corrections refusees ({stats.refused}/{total}) : la correction "
+            "semble decalee dans son ensemble (index, vocabulaire...), etape en echec (ADR-ad2e)"
+        )
+
+
+_refusal_log_lock = threading.Lock()
+
+
+def _log_ignored_correction(log_path: Path, *, index: int, old: str, actual: str, attempted: str) -> None:
+    """Journalise (llm_refusals.jsonl, meme convention que clipper.captions)
+    une correction dont ``old`` ne correspond toujours pas au mot reellement
+    present a cet index apres comparaison tolerante : ignoree, jamais
+    appliquee en silence (ADR-ad2e)."""
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "usage": "transcript_fix",
+        "index": index,
+        "old": old,
+        "actual": actual,
+        "word": attempted,
+        "error": (
+            f"correction ignoree pour le mot {index} : le modele visait {old!r}, "
+            f"le texte a cet index est {actual!r}"
+        ),
+    }
+    line = json.dumps(entry, ensure_ascii=False) + "\n"
+    with _refusal_log_lock:
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(line)
 
 
 def _fix_prefix(vocab: list[str]) -> str:
@@ -398,7 +483,9 @@ def _fix_prefix(vocab: list[str]) -> str:
     )
 
 
-def _fix_chunk(chunk: list[dict[str, Any]], vocab: list[str], config: Any, log_path: Path) -> None:
+def _fix_chunk(
+    chunk: list[dict[str, Any]], vocab: list[str], config: Any, log_path: Path, stats: _FixStats
+) -> None:
     words = [w for seg in chunk for w in seg["words"]]
     if not words:
         return
@@ -406,20 +493,29 @@ def _fix_chunk(chunk: list[dict[str, Any]], vocab: list[str], config: Any, log_p
     prompt = _fix_prefix(vocab) + lines
     answer = llm.ask(
         "transcript_fix", prompt, [], _fix_schema(len(words)),
-        config=config, check=_check_corrections(words), log_path=log_path,
+        config=config, check=_check_correction_shape, log_path=log_path,
     )
     for correction in answer["corrections"]:
         word = words[correction["i"]]
-        original = word["word"]
+        old = correction["old"].strip()
+        actual = word["word"].strip()
+        if _normalized_core(old) != _normalized_core(actual):
+            stats.record(applied=False)
+            _log_ignored_correction(
+                log_path, index=correction["i"], old=old, actual=actual, attempted=correction["word"]
+            )
+            continue
+        stats.record(applied=True)
         new = correction["word"].strip()
-        word["word"] = original[: len(original) - len(original.lstrip())] + new
+        word["word"] = _apply_word_correction(word["word"], new)
     for seg in chunk:
         if seg["words"]:
             seg["text"] = "".join(w["word"] for w in seg["words"])
 
 
 def _fix_chunks(
-    chunks: list[list[dict[str, Any]]], vocab: list[str], config: Any, parallel: int, log_path: Path
+    chunks: list[list[dict[str, Any]]], vocab: list[str], config: Any, parallel: int, log_path: Path,
+    stats: _FixStats,
 ) -> None:
     """Corrige les tranches en 2 vagues : la premiere seule, pour que le
     fournisseur du modele mette en cache le bloc commun (_fix_prefix) qu'elle
@@ -428,19 +524,21 @@ def _fix_chunks(
     des sous-processus, pas du calcul CPU Python), qui relisent ce cache au
     lieu de le reecrire chacune (meme principe que clipper.jury, TASK-2852).
     Chaque tranche porte des segments distincts, donc les threads n'ecrivent
-    jamais dans la meme structure. Une tranche en echec fait echouer l'etape
-    avec sa raison (ADR-ad2e) ; les autres deja lancees terminent avant que
-    l'exception ne remonte."""
+    jamais dans la meme structure. Une tranche en echec (schema, transitoire)
+    fait echouer l'etape avec sa raison (ADR-ad2e) ; les autres deja lancees
+    terminent avant que l'exception ne remonte. Une fois toutes les tranches
+    traitees, une part anormale de corrections refusees (_check_refusal_ratio)
+    est elle aussi un echec explicite."""
     if not chunks:
         return
-    _fix_chunk(chunks[0], vocab, config, log_path)
+    _fix_chunk(chunks[0], vocab, config, log_path, stats)
     rest = chunks[1:]
-    if not rest:
-        return
-    with ThreadPoolExecutor(max_workers=max(1, min(parallel, len(rest)))) as executor:
-        futures = [executor.submit(_fix_chunk, chunk, vocab, config, log_path) for chunk in rest]
-        for future in futures:
-            future.result()
+    if rest:
+        with ThreadPoolExecutor(max_workers=max(1, min(parallel, len(rest)))) as executor:
+            futures = [executor.submit(_fix_chunk, chunk, vocab, config, log_path, stats) for chunk in rest]
+            for future in futures:
+                future.result()
+    _check_refusal_ratio(stats)
 
 
 def transcribe(
@@ -497,10 +595,11 @@ def transcribe(
         tmp_raw.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp_raw.replace(raw_path)
 
+    fix_stats = _FixStats()
     if settings["transcript_fix"]:
         chunks = _chunks(segments, int(settings["fix_chunk_words"]))
         log_path = video_dir / "llm_refusals.jsonl"
-        _fix_chunks(chunks, vocab, config, int(settings["fix_parallel"]), log_path)
+        _fix_chunks(chunks, vocab, config, int(settings["fix_parallel"]), log_path, fix_stats)
 
     transcript = {
         "video_id": video_id,
@@ -508,6 +607,7 @@ def transcribe(
         "model": model_name,
         "vocab": vocab,
         "segments": segments,
+        "transcript_fix_refused": fix_stats.refused,
     }
     tmp = out.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(transcript, ensure_ascii=False, indent=2), encoding="utf-8")
