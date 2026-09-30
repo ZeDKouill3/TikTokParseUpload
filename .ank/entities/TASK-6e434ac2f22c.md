@@ -18,7 +18,7 @@ criteria_by: creator
 verify: [tests]
 method: diagnose
 schema: 4
-version: 1
+version: 3
 ---
 
 Passage réel 7VaA8XUKrAY 2026-09-30 10:11-10:25 : 8 clips, le 07 (15,29-95,55 s, « L'affaire Bruel explose ») a final_score 48,7, sous min_score 60 (rubric.toml). Hypothèse : sélection faite sur le score avant vision, puis recalcul après vision (test_moments_gets_feedback_examples_and_is_rescored_after_vision_without_llm) sans réappliquer min_score. Ne relancer aucune vidéo ; rejouer seulement le code sur les JSON existants (copie) ou via tests.
