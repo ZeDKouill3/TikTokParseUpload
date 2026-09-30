@@ -59,14 +59,21 @@ On ne pose jamais plus d'un bloc ``cache_control`` par message, quel que soit
 l'usage (images comprises, jamais marquees) : l'API en refuse plus de 4, et
 claude -p en pose deja pour son propre compte.
 
-Limite de blocs cache_control (TASK-746c). Meme avec un seul bloc a nous,
-l'appel peut recevoir un 400 "A maximum of 4 blocks with cache_control may be
-provided" -- releve en reel comme intermittent sur un meme appel rejoue a
-l'identique (juge opus de clipper.jury, ~1 fois sur 3), jamais du a nos
-propres blocs (verifie : toujours un seul). Cote CLI (raisonnement adaptatif
-d'opus, hors de notre controle) : ``_is_transient`` le reconnait au texte
-malgre le statut 400 pour que la video reparte en file (ADR-ad2e) au lieu
-d'echouer definitivement.
+Limite de blocs cache_control (TASK-746c, reclasse par TASK-f89f). Meme avec
+un seul bloc a nous, l'appel peut recevoir un 400 "A maximum of 4 blocks with
+cache_control may be provided" -- jamais du a nos propres blocs (verifie :
+toujours un seul). TASK-746c l'avait classe transitoire (retente en file)
+apres l'avoir observe intermittent sur un juge opus rejoue a l'identique.
+Releve de nouveau en reel (TASK-f89f, jury_spectateur, video 7VaA8XUKrAY) :
+un appel isole du role touche ne le reproduit pas, mais 2 des meneurs de
+vague 1 de clipper.jury lances en parallele (un par modele configure,
+``_waves``) suffisent a le declencher sur l'un des deux, modele et role
+variables d'un essai a l'autre -- une course cote CLI entre processus
+``claude -p`` concurrents, hors de notre controle et non liee au contenu
+envoye. Puisque le mecanisme n'est pas garanti par un simple rejeu et que
+requeuer une video en attente pour cette seule cause consomme du quota sans
+certitude, ce 400 est desormais un echec explicite (LLMError), jamais
+transitoire (ADR-ad2e) : ``_is_transient`` ne le reconnait plus au texte.
 
 Sortie. Avec --output-format json (sans image) : un objet unique ``{"type":
 "result", "subtype": "success", "is_error": bool, "api_error_status":
@@ -106,22 +113,16 @@ MAX_COMMAND_LINE = 32_000
 _TRANSIENT_STATUS = {408, 429}
 _TRANSIENT_TEXT = re.compile(
     r"usage limit|rate.?limit|overloaded|quota|timed? ?out|timeout|network|"
-    r"connection|ECONNRESET|ECONNREFUSED|ENOTFOUND|ETIMEDOUT|503|529|"
-    r"blocks? with cache_control",
+    r"connection|ECONNRESET|ECONNREFUSED|ENOTFOUND|ETIMEDOUT|503|529",
     re.IGNORECASE,
 )
 
 
 def _is_transient(status: Any, text: str) -> bool:
-    """Un statut connu (408/429/5xx) est toujours transitoire. Les autres
-    statuts (ex. 400) sont normalement permanents (entree invalide), sauf un
-    texte reconnu comme transitoire malgre eux -- ex. 'A maximum of N blocks
-    with cache_control may be provided' (TASK-746c) : releve en reel comme
-    intermittent sur un meme appel rejoue a l'identique (opus, raisonnement
-    adaptatif qui pose parfois son propre bloc cache_control cote CLI, hors
-    de notre controle, jamais du a nos marqueurs -- claude_cli n'en pose
-    jamais plus d'un). Un statut int ne doit donc plus faire l'impasse sur le
-    texte."""
+    """Un statut connu (408/429/5xx) est toujours transitoire ; les autres
+    statuts (ex. 400, y compris la limite de blocs cache_control -- voir la
+    docstring du module, TASK-f89f) sont permanents sauf un texte reconnu
+    comme transitoire malgre eux (quota, reseau, surcharge)."""
     if isinstance(status, int) and (status in _TRANSIENT_STATUS or status >= 500):
         return True
     return bool(_TRANSIENT_TEXT.search(text))
