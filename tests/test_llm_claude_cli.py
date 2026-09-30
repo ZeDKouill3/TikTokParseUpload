@@ -191,6 +191,29 @@ def test_cache_prefix_must_be_an_actual_prefix_of_the_prompt(fake_run):
         llm.ask("jury_x", "autre chose", [], COLOR_SCHEMA, config=make_config(), cache_prefix=PREFIX)
 
 
+def test_images_combined_with_cache_prefix_still_carry_a_single_cache_control_block(fake_run, tmp_path):
+    # TASK-746c : l'API refuse au-dela de 4 blocs cache_control par message et
+    # claude -p en pose deja (raisonnement, systeme...) -- nos propres blocs
+    # doivent donc rester au minimum, un seul, quelle que soit la combinaison
+    # (image(s) + cache_prefix compris, meme si aucun usage actuel ne les
+    # combine). Les blocs image ne portent jamais cache_control.
+    img = tmp_path / "f.jpg"
+    img.write_bytes(b"\xff\xd8fake-jpeg-bytes")
+    run = fake_run(json.dumps(RECORDED_CLAUDE_CLI_WITH_USAGE))
+
+    llm.ask("vision_x", PREFIX + "Role vision.", [img], COLOR_SCHEMA, config=make_config(), cache_prefix=PREFIX)
+
+    content = json.loads(run.calls[0]["input"])["message"]["content"]
+    marked = [b for b in content if "cache_control" in b]
+    assert len(marked) == 1, content
+    assert marked[0] == {
+        "type": "text",
+        "text": PREFIX,
+        "cache_control": {"type": "ephemeral", "ttl": "1h"},
+    }
+    assert [b["type"] for b in content] == ["image", "text", "text"]
+
+
 # --------------------------------------------------------------------------
 # Integration reelle (optionnelle)
 # CLIPPER_CLAUDE_INTEGRATION=1 pytest tests/test_llm_claude_cli.py -k integration
