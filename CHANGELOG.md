@@ -34,6 +34,10 @@ verticaux sous-titrés, en local.
   jamais de bascule dans un clip, SPEC-3a88) ; `crop` (suivi de visage)
   conservé comme option figée.
 - Sous-titres mot par mot (.ass) avec emphase choisie par LLM.
+- Appel à l'abonnement optionnel (SPEC-6a47, désactivé par défaut) : pseudo de
+  chaîne discret sous le titre d'écran, carte de fin « Abonne-toi ! » sur les
+  dernières secondes, ligne d'appel et hashtags dans la description ; réglé
+  par un fichier de config par chaîne (`--config`).
 - Rendu ffmpeg (image, sous-titres, titre d'écran, audio normalisé),
   encodeur choisi par `clipper.gpu` (NVENC si CUDA détecté, sinon libx264).
 - Contrôle qualité automatique (`qa`) : résolution, durée, silence de tête,
