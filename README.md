@@ -98,3 +98,5 @@ ce qu'elle saute par défaut.
   formats, configuration complète, consommation du quota Claude, dépannage.
 - `AGENTS.md` — conventions du dépôt et décisions ratifiées (ADR/SPEC),
   pour qui contribue au code.
+- `CHANGELOG.md` — historique des versions.
+- `docs/releases/v0.1.0.md` — notes de la pré-version 0.1.0.
