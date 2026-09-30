@@ -59,6 +59,9 @@ jamais lancé en CI ni par défaut en local.
   + `.json` sidecar, champs obligatoires), format letterbox par défaut (zoom
   fixe, titre d'écran en haut, sous-titres dans la bande floue du bas) ; le
   format crop (suivi de visage) reste une option figée. Remplace SPEC-350f.
+- **SPEC-6a47** — proposée, à ratifier : succède à SPEC-6127 avec un appel à
+  l'abonnement optionnel (pseudo de chaîne discret sous le titre d'écran +
+  carte de fin « Abonne-toi ! »), désactivé par défaut.
 - **SPEC-53f3** — grille de notation des moments (`rubric.toml`), critères et
   règles de sélection.
 
