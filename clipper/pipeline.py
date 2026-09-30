@@ -79,6 +79,7 @@ import math
 import time
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -124,6 +125,14 @@ EXIT_QUEUED = 75  # EX_TEMPFAIL
 
 STATE_FILE = "pipeline.json"
 REVIEW_FILE = "review.json"
+EVENTS_FILE = "events.jsonl"
+
+# Etapes qui savent mesurer leur avancement clip par clip (reframe, render) ou
+# par unite traitee, et recoivent donc un rappel progress(fraction, eta_s,
+# message) dans step_options (SPEC-fc0c §3.1) : voir _ProgressWriter.
+_PROGRESS_STEPS = ("transcribe", "subtitles", "reframe", "render")
+# Ecriture de pipeline.json au plus une fois par ce delai par appel de progress.
+_PROGRESS_MIN_INTERVAL_S = 2.0
 
 
 class PipelineError(Exception):
@@ -148,19 +157,21 @@ def _video_dir(video_id: str, config: Config) -> Path:
     return Path(config.workspace_dir) / video_id
 
 
-def new_state(video_id: str, source_url: str, mode: str) -> dict[str, Any]:
+def new_state(video_id: str, source_url: str, mode: str, *, channel: str | None = None) -> dict[str, Any]:
     return {
         "video_id": video_id,
         "source_url": source_url,
+        "channel": channel,
         "mode": mode,
         "status": "pending",
         "reason": None,
         "attempts": 0,
         "retry_at": None,
         "awaiting": [],
+        "enqueued_at": _iso(_now()),
         "updated_at": _iso(_now()),
         "steps": {
-            name: {"status": "pending", "reason": None, "started_at": None, "finished_at": None}
+            name: {"status": "pending", "reason": None, "started_at": None, "finished_at": None, "progress": None}
             for name in STEPS
         },
         "clips": [],
@@ -281,28 +292,71 @@ def _progress_gate(total: int) -> Any:
     return gate
 
 
+class _ProgressWriter:
+    """Rappel progress(fraction, eta_s, message) injecte dans les options
+    d'une etape de _PROGRESS_STEPS : met a jour steps.<name>.progress de
+    l'etat en memoire a chaque appel, mais ne reecrit pipeline.json que si au
+    moins _PROGRESS_MIN_INTERVAL_S s se sont ecoulees depuis la derniere
+    ecriture (toujours la derniere valeur connue, jamais une valeur perimee
+    au-dela de ce delai)."""
+
+    def __init__(self, run: "_Run", name: str):
+        self._run = run
+        self._name = name
+        self._last_write: float | None = None
+
+    def __call__(self, fraction: float, eta_s: float | None, message: str) -> None:
+        state, config = self._run.state, self._run.config
+        state["steps"][self._name]["progress"] = {"fraction": fraction, "eta_s": eta_s, "message": message}
+        now = time.monotonic()
+        if self._last_write is None or now - self._last_write >= _PROGRESS_MIN_INTERVAL_S:
+            self._last_write = now
+            save_state(state, config=config)
+
+
 class _Run:
     """Contexte d'un passage du pipeline sur une video."""
 
     def __init__(self, state: dict[str, Any], config: Config, force: bool,
-                 step_options: dict[str, dict[str, Any]] | None):
+                 step_options: dict[str, dict[str, Any]] | None, *,
+                 forced: Any = frozenset(), clip_filter: list[str] | None = None):
         self.state = state
         self.config = config
         self.force = force
-        self.options = step_options or {}
+        self.forced = frozenset(forced) if forced is not None else frozenset()
+        self.clip_filter = set(clip_filter) if clip_filter is not None else None
+        # Copie par etape : ne modifie jamais le dict step_options du caller.
+        self.options = {name: dict(opts) for name, opts in (step_options or {}).items()}
+        for name in _PROGRESS_STEPS:
+            self.options.setdefault(name, {})
+            self.options[name]["progress"] = _ProgressWriter(self, name)
         self.video_id = state["video_id"]
         self.ws = Path(config.workspace_dir)
         self.out = Path(config.output_dir)
         self.dir = self.ws / self.video_id
+        self.current_step: str | None = None
 
     def opts(self, name: str) -> dict[str, Any]:
         return dict(self.options.get(name, {}))
+
+    def _forced(self, name: str) -> bool:
+        return self.force or name in self.forced
 
     def journal(self) -> str:
         return str(self.config.section("feedback")["journal_path"])
 
     def clips(self) -> list[dict[str, Any]]:
         return _read_json(self.dir / "captions.json")["clips"]
+
+    def _target_clips(self) -> list[dict[str, Any]]:
+        """``clips()`` restreint a ``clip_filter`` (render cible d'un seul
+        clip, SPEC-fc0c §4.5) ; identique a ``clips()`` sinon. N'affecte que
+        les boucles clip par clip (reframe/subtitles/render/qa), jamais le
+        resume final (_summary), qui reste sur l'ensemble des clips."""
+        clips = self.clips()
+        if self.clip_filter is None:
+            return clips
+        return [c for c in clips if c["id"] in self.clip_filter]
 
     # -- une methode par etape -------------------------------------------
 
@@ -311,17 +365,19 @@ class _Run:
         download.download(self.state["source_url"], self.ws, **settings, **self.opts("download"))
 
     def transcribe(self) -> None:
-        transcribe.transcribe(self.video_id, self.ws, config=self.config, force=self.force,
-                              **self.opts("transcribe"))
+        opts = self.opts("transcribe")
+        opts.pop("progress", None)  # pas encore consomme par clipper.transcribe (mesure par minutes)
+        transcribe.transcribe(self.video_id, self.ws, config=self.config, force=self._forced("transcribe"),
+                              **opts)
 
     def scenes(self) -> None:
         settings = self.config.section("scenes")
         scenes.detect_scenes(self.dir / f"{self.video_id}.mp4", self.ws, self.video_id,
-                             force=self.force, **settings, **self.opts("scenes"))
+                             force=self._forced("scenes"), **settings, **self.opts("scenes"))
 
     def audio(self) -> None:
         s = self.config.section("audio")
-        audio.run(self.video_id, self.ws, force=self.force, sample_rate=s["sample_rate"],
+        audio.run(self.video_id, self.ws, force=self._forced("audio"), sample_rate=s["sample_rate"],
                   window_seconds=s["window_seconds"], median_window_seconds=s["median_window_seconds"],
                   threshold_db=s["peak_threshold_db"], **self.opts("audio"))
 
@@ -332,38 +388,46 @@ class _Run:
                     **self.opts("moments"))
 
     def moments(self) -> None:
-        self._moments(self.force)
+        self._moments(self._forced("moments"))
 
     def vision(self) -> None:
-        vision.run(self.video_id, self.ws, config=self.config, force=self.force, **self.opts("vision"))
+        vision.run(self.video_id, self.ws, config=self.config, force=self._forced("vision"), **self.opts("vision"))
         # vision.json plus recent que moments.json : moments, relance sans
         # force, re-note ses candidats (bonus visuel) sans rappeler le LLM.
         self._moments(False)
 
     def parts(self) -> None:
-        parts.run(self.video_id, self.ws, config=self.config, force=self.force, **self.opts("parts"))
+        parts.run(self.video_id, self.ws, config=self.config, force=self._forced("parts"), **self.opts("parts"))
 
     def captions(self) -> None:
         if self.config.mode == "review":
             _apply_review(self)
-        captions.run(self.video_id, self.ws, config=self.config, force=self.force, **self.opts("captions"))
+        captions.run(self.video_id, self.ws, config=self.config, force=self._forced("captions"),
+                     **self.opts("captions"))
 
     def reframe(self) -> None:
         opts = self.opts("reframe")
+        progress = opts.pop("progress", None)
+        forced = self._forced("reframe")
         if self.config.section("reframe")["layout"] == "stream_auto":
             # Facecam detectee une fois pour toute la video (SPEC-3a88), avant les clips.
-            reframe.detect_facecam(self.video_id, self.ws, config=self.config, force=self.force,
+            reframe.detect_facecam(self.video_id, self.ws, config=self.config, force=forced,
                                    detector_factory=opts.get("detector_factory"))
-        clips = self.clips()
-        gate = _progress_gate(len(clips))
+        clips = self._target_clips()
+        total = len(clips)
+        gate = _progress_gate(total)
+        t_start = time.monotonic()
         for i, clip in enumerate(clips, 1):
             t0 = time.monotonic()
             reframe.reframe(self.video_id, clip["id"], clip["start"], clip["end"], self.ws,
-                            config=self.config, force=self.force, **opts)
+                            config=self.config, force=forced, **opts)
             elapsed = time.monotonic() - t0
-            log.debug("%s : reframe clip %d/%d (%s) en %.1fs", self.video_id, i, len(clips), clip["id"], elapsed)
+            log.debug("%s : reframe clip %d/%d (%s) en %.1fs", self.video_id, i, total, clip["id"], elapsed)
             if gate(i):
-                log.info("%s : reframe clip %d/%d (%s) en %.1fs", self.video_id, i, len(clips), clip["id"], elapsed)
+                log.info("%s : reframe clip %d/%d (%s) en %.1fs", self.video_id, i, total, clip["id"], elapsed)
+            if progress is not None and total:
+                avg = (time.monotonic() - t_start) / i
+                progress(i / total, avg * (total - i), f"clip {i}/{total} ({clip['id']})")
 
     def _subtitles_clip(self, clip: dict[str, Any]) -> None:
         plan = _read_json(self.dir / "reframe" / f"{clip['id']}.json")
@@ -376,8 +440,10 @@ class _Run:
             zones = {"text_zone": subtitles_zone(plan, clip["id"]), "style": "split"}
         else:
             zones = {"avoid_zones": avoid_zones(plan), "reserved_zones": hook_zones(clip, self.config)}
+        opts = self.opts("subtitles")
+        opts.pop("progress", None)
         subtitles.generate(self.video_id, clip["id"], clip["start"], clip["end"], self.ws,
-                           config=self.config, force=self.force, **zones, **self.opts("subtitles"))
+                           config=self.config, force=self._forced("subtitles"), **zones, **opts)
 
     def subtitles(self) -> None:
         # Jusqu'a ``parallel`` clips a la fois (threads : le temps passe dans
@@ -388,28 +454,50 @@ class _Run:
         parallel = self.config.section("subtitles")["parallel"]
         if isinstance(parallel, bool) or not isinstance(parallel, int) or parallel < 1:
             raise PipelineError(f"[subtitles] parallel doit etre un entier >= 1, recu {parallel!r}")
-        clips = self.clips()
+        progress = self.opts("subtitles").get("progress")
+        clips = self._target_clips()
+        total = len(clips)
         with ThreadPoolExecutor(max_workers=parallel) as executor:
             futures = [executor.submit(self._subtitles_clip, clip) for clip in clips]
-        for future in futures:
+        for i, future in enumerate(futures, 1):
             future.result()
+            if progress is not None and total:
+                progress(i / total, None, f"clip {i}/{total}")
 
     def render(self) -> None:
-        clips = self.clips()
-        gate = _progress_gate(len(clips))
+        opts = self.opts("render")
+        progress = opts.pop("progress", None)
+        forced = self._forced("render")
+        clips = self._target_clips()
+        total = len(clips)
+        gate = _progress_gate(total)
+        t_start = time.monotonic()
         for i, clip in enumerate(clips, 1):
             t0 = time.monotonic()
             render_step.render(self.video_id, clip["id"], self.ws, self.out, config=self.config,
-                               force=self.force, **self.opts("render"))
+                               force=forced, **opts)
             elapsed = time.monotonic() - t0
-            log.debug("%s : render clip %d/%d (%s) en %.1fs", self.video_id, i, len(clips), clip["id"], elapsed)
+            log.debug("%s : render clip %d/%d (%s) en %.1fs", self.video_id, i, total, clip["id"], elapsed)
             if gate(i):
-                log.info("%s : render clip %d/%d (%s) en %.1fs", self.video_id, i, len(clips), clip["id"], elapsed)
+                log.info("%s : render clip %d/%d (%s) en %.1fs", self.video_id, i, total, clip["id"], elapsed)
+            if progress is not None and total:
+                avg = (time.monotonic() - t_start) / i
+                progress(i / total, avg * (total - i), f"clip {i}/{total} ({clip['id']})")
 
     def qa(self) -> None:
         if not self.clips():
             return
-        qa.run(self.video_id, self.ws, self.out, config=self.config, force=self.force, **self.opts("qa"))
+        if self.clip_filter is not None:
+            # Cible un seul clip (SPEC-fc0c §4.5, re-rendu apres edition du
+            # titre d'ecran) : controle direct par qa.check_clip, jamais
+            # qa.run qui parcourt tout output/<video_id>/.
+            settings = self.config.section("qa")
+            opts = self.opts("qa")
+            for clip in self._target_clips():
+                json_path = self.out / self.video_id / f"{clip['id']}.json"
+                qa.check_clip(json_path, self.dir / "qa" / clip["id"], settings, config=self.config, **opts)
+            return
+        qa.run(self.video_id, self.ws, self.out, config=self.config, force=self._forced("qa"), **self.opts("qa"))
 
 
 def subtitles_zone(plan: dict[str, Any], clip_id: str) -> dict[str, Any]:
@@ -641,6 +729,7 @@ def _fail(run: _Run, name: str, exc: BaseException) -> dict[str, Any]:
     reason = f"{type(exc).__name__}: {exc}"
     step = state["steps"][name]
     step.update(status="failed", reason=reason, finished_at=_iso(_now()))
+    step["progress"] = None
     settings = config.section("pipeline")
     if config.mode == "auto" and is_transient(exc):
         state["attempts"] += 1
@@ -707,6 +796,50 @@ def _log_run_summary(run: _Run, usage_summary: dict[str, dict[str, float | int]]
     )
 
 
+class _EventsHandler(logging.Handler):
+    """Ecrit chaque enregistrement INFO+ emis par le logger ``clipper`` (donc
+    par toute etape, y compris les transitions deja journalisees par
+    _advance_steps a ce niveau) comme une ligne JSON dans
+    workspace/<video_id>/events.jsonl (SPEC-fc0c §3.2), jamais tronque."""
+
+    def __init__(self, path: Path, run: _Run):
+        super().__init__(level=logging.INFO)
+        self.path = path
+        self.run = run
+
+    def emit(self, record: logging.LogRecord) -> None:
+        entry = {
+            "at": _iso(_now()),
+            "level": record.levelname,
+            "step": self.run.current_step,
+            "message": record.getMessage(),
+        }
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+@contextmanager
+def _events_journal(path: Path, run: _Run):
+    """Attache _EventsHandler au logger ``clipper`` pour la duree du passage.
+    Force temporairement ce logger a INFO si son niveau effectif etait plus
+    haut (ex. WARNING par defaut de la CLI sans -v) : sinon les
+    enregistrements INFO n'atteindraient jamais le handler."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger("clipper")
+    handler = _EventsHandler(path, run)
+    previous_level = logger.level
+    raise_level = previous_level == logging.NOTSET or previous_level > logging.INFO
+    if raise_level:
+        logger.setLevel(logging.INFO)
+    logger.addHandler(handler)
+    try:
+        yield
+    finally:
+        logger.removeHandler(handler)
+        if raise_level:
+            logger.setLevel(previous_level)
+
+
 def _advance(run: _Run, *, through_review: bool) -> dict[str, Any]:
     """Enchaine les etapes restantes (voir _advance_steps) sous
     ``llm.usage_log`` : chaque appel LLM du passage (y compris ceux faits
@@ -715,9 +848,11 @@ def _advance(run: _Run, *, through_review: bool) -> dict[str, Any]:
     cumules depuis le debut de la video) est journalise a la fin du passage,
     qu'il se termine en succes, en echec ou en attente de revue. Un run qui va
     jusqu'au bout (status done) ajoute un resume complet (voir
-    ``_log_run_summary``)."""
+    ``_log_run_summary``). Sous ``_events_journal``, chaque enregistrement
+    INFO+ de ce passage (y compris ceux-ci) devient une ligne d'events.jsonl."""
     usage_log_path = run.dir / USAGE_LOG_FILE
-    with llm.usage_log(usage_log_path):
+    events_path = run.dir / EVENTS_FILE
+    with _events_journal(events_path, run), llm.usage_log(usage_log_path):
         try:
             return _advance_steps(run, through_review=through_review)
         finally:
@@ -748,6 +883,7 @@ def _advance_steps(run: _Run, *, through_review: bool) -> dict[str, Any]:
                 return state
 
         step = state["steps"][name]
+        run.current_step = name
         step.update(status="running", reason=None, started_at=_iso(_now()), finished_at=None)
         save_state(state, config=config)
         log.info("%s : etape %s", run.video_id, name)
@@ -756,11 +892,15 @@ def _advance_steps(run: _Run, *, through_review: bool) -> dict[str, Any]:
             getattr(run, name)()
         except Exception as exc:  # noqa: BLE001 - toute erreur est journalisee dans l'etat
             log.debug("%s : %s", run.video_id, name, exc_info=True)
-            return _fail(run, name, exc)
+            result = _fail(run, name, exc)
+            run.current_step = None
+            return result
         elapsed = time.monotonic() - t0
         step.update(status="done", finished_at=_iso(_now()))
+        step["progress"] = None
         save_state(state, config=config)
         log.info("%s : etape %s terminee en %.1fs", run.video_id, name, elapsed)
+        run.current_step = None
 
     clips = _summary(run)
     reason = _zero_clip_reason(run) if not clips else None
@@ -771,12 +911,33 @@ def _advance_steps(run: _Run, *, through_review: bool) -> dict[str, Any]:
     return state
 
 
-def _start(state: dict[str, Any], config: Config, force: bool,
-           step_options: dict[str, dict[str, Any]] | None) -> _Run:
+def _start(
+    state: dict[str, Any], config: Config, force: bool,
+    step_options: dict[str, dict[str, Any]] | None,
+    *, force_steps: list[str] | None = None, clips: list[str] | None = None,
+) -> _Run:
+    """``force`` remet toutes les etapes a pending et les force toutes.
+    ``force_steps`` (sans ``force``) ne remet a pending, et ne force, que
+    l'etape nommee la plus en amont et toutes celles qui la suivent dans
+    STEPS (SPEC-fc0c §3.3) : les precedentes restent ``done``."""
     if force:
+        forced = set(STEPS)
         for step in state["steps"].values():
-            step.update(status="pending", reason=None, started_at=None, finished_at=None)
-    return _Run(state, config, force, step_options)
+            step.update(status="pending", reason=None, started_at=None, finished_at=None, progress=None)
+    elif force_steps:
+        unknown = set(force_steps) - set(STEPS)
+        if unknown:
+            raise PipelineError(
+                f"force_steps inconnue(s) : {', '.join(sorted(unknown))} (attendu parmi {', '.join(STEPS)})"
+            )
+        idx = min(STEPS.index(name) for name in force_steps)
+        forced = set(STEPS[idx:])
+        for name in forced:
+            state["steps"][name].update(status="pending", reason=None, started_at=None, finished_at=None,
+                                        progress=None)
+    else:
+        forced = set()
+    return _Run(state, config, force, step_options, forced=forced, clip_filter=clips)
 
 
 def run(
@@ -784,13 +945,16 @@ def run(
     *,
     config: Config | None = None,
     force: bool = False,
+    force_steps: list[str] | None = None,
     step_options: dict[str, dict[str, Any]] | None = None,
+    channel: str | None = None,
 ) -> dict[str, Any]:
     """Traite la video ``url`` : jusqu'a la revue en mode review, jusqu'au
     bout en mode auto. Renvoie l'etat (voir le docstring du module).
 
     ``step_options`` : arguments supplementaires par etape (injection pour
-    les tests, ex. ``{"download": {"ydl_factory": ...}}``)."""
+    les tests, ex. ``{"download": {"ydl_factory": ...}}``). ``channel`` :
+    chaine dont le preset a servi (SPEC-fc0c §3.1), gardee dans l'etat."""
     config = config or load_config()
     try:
         video_id = download.extract_video_id(url)
@@ -799,9 +963,11 @@ def run(
     try:
         state = load_state(video_id, config=config)
     except PipelineError:
-        state = new_state(video_id, url, config.mode)
+        state = new_state(video_id, url, config.mode, channel=channel)
     state["source_url"] = url
-    return _advance(_start(state, config, force, step_options), through_review=False)
+    if channel is not None:
+        state["channel"] = channel
+    return _advance(_start(state, config, force, step_options, force_steps=force_steps), through_review=False)
 
 
 def render(
@@ -809,13 +975,23 @@ def render(
     *,
     config: Config | None = None,
     force: bool = False,
+    force_steps: list[str] | None = None,
     step_options: dict[str, dict[str, Any]] | None = None,
+    channel: str | None = None,
+    clips: list[str] | None = None,
 ) -> dict[str, Any]:
     """Reprend une video deja lancee jusqu'au bout (captions .. qa) ; en mode
-    review, exige une decision pour chaque moment (PipelineError sinon)."""
+    review, exige une decision pour chaque moment (PipelineError sinon).
+    ``clips`` restreint reframe/subtitles/render/qa a ces clip_id (render
+    cible, SPEC-fc0c §4.5) ; le resume final reste sur tous les clips."""
     config = config or load_config()
     state = load_state(video_id, config=config)
-    return _advance(_start(state, config, force, step_options), through_review=True)
+    if channel is not None:
+        state["channel"] = channel
+    return _advance(
+        _start(state, config, force, step_options, force_steps=force_steps, clips=clips),
+        through_review=True,
+    )
 
 
 def queued(*, config: Config | None = None) -> list[dict[str, Any]]:
