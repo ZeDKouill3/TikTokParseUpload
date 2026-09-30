@@ -36,6 +36,11 @@ output_dir = "output"
 #
 # [transcribe]
 # model = "small"    # pic VRAM whisper mesure : 1,68 Go (marge large sur 4 Go)
+#                    # ; large-v3-turbo banc a part (docs/benchmarks/whisper-modeles.md) :
+#                    # meilleure qualite sur de la parole propre mais pic VRAM 3,29 Go
+#                    # (marge insuffisante sur 4 Go) et resultat mitige sur le stream de
+#                    # jeu (code-switching vers l'anglais) -> pas retenu par defaut, option
+#                    # au cas par cas sur une video de parole propre seulement
 # batch_size = 8     # BatchedInferencePipeline : ~4-5x plus rapide qu'en
 #                    # sequentiel sur une video reelle, sans perte de mots
 #                    # (docs/bench-whisper-vitesse.md)

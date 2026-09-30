@@ -587,6 +587,50 @@ def test_glued_apostrophe_and_hyphen_tokens_stay_with_the_previous_word(tmp_path
 
 
 # --------------------------------------------------------------------------
+# TASK-c492 : un jeton colle (apostrophe/trait d'union) ou une ponctuation
+# isolee separe du mot precedent par un vrai silence (ecart > gap_s) ne doit
+# plus le rejoindre inconditionnellement -- _units ignorait gap_s, residu de
+# TASK-9ee7 mesure sur v2887271276 clip 05 : " d" (80.80-81.74) et "'accord"
+# (84.52-85.04) restaient dans la meme unite malgre 2.78s de vrai silence
+# entre les deux (faster-whisper avait coupe l'elision en deux jetons avec
+# une hesitation au milieu).
+# --------------------------------------------------------------------------
+
+
+def test_glued_token_separated_by_a_real_silence_stays_in_its_own_unit(tmp_path, video_dir):
+    words = [
+        _word(" d", 1.0, 1.2),
+        _word("'accord", 2.0, 2.3),
+        _word(" mais", 2.4, 2.6),
+    ]
+    (video_dir / "transcript.json").write_text(json.dumps(make_transcript(words)), encoding="utf-8")
+    with llm.use_backend(FakeBackend([NO_EMPHASIS])):
+        path = run(tmp_path, start=1.0, end=3.0)
+    events = parse_ass(Path(path))["events"]
+    tokens = [event_tokens(ev) for ev in events]
+    # " d" reste seul dans son evenement : rien n'est affiche pendant le
+    # silence de 0.8s qui le separe de "'accord" (sinon l'evenement
+    # s'etendrait sur tout l'ecart, comme observe sur le cas reel).
+    assert tokens[0] == [" d"]
+    assert any(ev == ["'accord", " mais"] for ev in tokens[1:])
+
+
+def test_isolated_punctuation_separated_by_a_real_silence_is_omitted(tmp_path, video_dir):
+    words = [
+        _word(" mot1", 1.0, 1.2),
+        _word(" ?", 2.0, 2.1),
+        _word(" mot2", 2.2, 2.4),
+    ]
+    (video_dir / "transcript.json").write_text(json.dumps(make_transcript(words)), encoding="utf-8")
+    with llm.use_backend(FakeBackend([NO_EMPHASIS])):
+        path = run(tmp_path, start=1.0, end=3.0)
+    events = parse_ass(Path(path))["events"]
+    all_tokens = [t for ev in events for t in event_tokens(ev)]
+    assert "?" not in " ".join(all_tokens)
+    assert all_tokens == [" mot1", " mot2"]
+
+
+# --------------------------------------------------------------------------
 # TASK-746b (banc docs/bench-whisper-vitesse.md) : le batching whisper rend
 # une ponctuation et des majuscules internes moins riches (segments sans
 # virgule ni majuscule de phrase) ; le format letterbox (SPEC-6127, format
