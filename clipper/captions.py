@@ -26,8 +26,10 @@ Sortie : workspace/<video_id>/captions.json
 Pour chaque clip, l'IA recoit le texte prononce dans la partie, l'accroche
 et la justification du moment, et rend titre, legende, hashtags (chacun
 commencant par #, sans doublon), texte d'accroche (8 mots au plus, valeur
-par defaut) et titre d'ecran ``screen_title`` (SPEC-6127, format letterbox :
-6 mots au plus, valeur par defaut, et exactement un emoji simple) dans la
+par defaut) et titre d'ecran ``screen_title`` (SPEC-6a86 : 6 mots au plus,
+valeur par defaut, ton sobre sans mot d'emphase clickbait, aucun emoji sauf
+``[captions] screen_title_allow_emoji`` explicite, qui autorise au plus un
+emoji simple sans le rendre obligatoire) dans la
 langue de la video ; ces regles sont revalidees ici et passees a llm.ask
 comme controle : une reponse qui les enfreint est renvoyee au modele avec
 l'erreur pour correction ([llm] repair_attempts), puis traitee comme une
@@ -69,6 +71,8 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
+import re
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -80,6 +84,17 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "hashtags_max": 8,
     "hook_words_max": 8,
     "screen_title_words_max": 6,
+    # SPEC-6a86 : sans configuration explicite, un screen_title avec un
+    # emoji est refuse. Activer l'option ne rend pas l'emoji obligatoire,
+    # elle permet seulement d'en accepter un (au plus un).
+    "screen_title_allow_emoji": False,
+    # SPEC-6a86 : ton sobre, aucun superlatif ni mot d'emphase clickbait.
+    # Insensible a la casse et aux accents, comparaison mot entier. Liste
+    # non exhaustive, reglable par preset de chaine.
+    "screen_title_forbidden_words": [
+        "pur", "total", "explose", "choc", "incroyable", "fou", "dingue",
+        "glaçant", "assourdissant", "dévoilé",
+    ],
     # Nombre de moments traites en parallele (leurs parties restant
     # sequentielles entre elles) ; 1 = sequentiel, comme avant.
     "parallel": 4,
@@ -247,10 +262,19 @@ def _prompt(
         "au plus, qui arrete le scroll."
     )
     if screen_title is None:
+        allow_emoji = bool(settings["screen_title_allow_emoji"])
+        emoji_rule = (
+            "au plus un emoji simple, jamais obligatoire (pas de sequence composee, pas de drapeau)"
+            if allow_emoji
+            else "aucun emoji"
+        )
+        forbidden_words = ", ".join(str(w) for w in settings["screen_title_forbidden_words"])
         rules.append(
             f"screen_title : titre de 5-6 mots au plus ({int(settings['screen_title_words_max'])} au "
-            "plus) affiche dans un encadre blanc au-dessus de la video, pendant tout le clip ; "
-            "exactement un emoji simple (pas de sequence composee, pas de drapeau)."
+            "plus) affiche dans un encadre blanc au-dessus de la video, pendant tout le clip ; ton "
+            "sobre, de preference une phrase reellement prononcee dans ce clip (citation courte entre "
+            "« »), sinon un fait concret et precis du clip, jamais un contenu absent du clip ; "
+            f"{emoji_rule} ; aucun superlatif ni mot d'emphase clickbait, notamment : {forbidden_words}."
         )
     rules.append(
         "Comptage des mots pour hook_text et screen_title : tout groupe separe par des espaces "
@@ -328,9 +352,11 @@ def _validate_hook_text(hook_text: str, max_words: int) -> None:
         )
 
 
-def _validate_screen_title_emoji(screen_title: str) -> None:
-    """Exactement un emoji Extended_Pictographic, avec au plus un VS16 et un
-    modificateur de teint ; sequence ZWJ et drapeau refuses (SPEC-6127)."""
+def _validate_screen_title_emoji(screen_title: str, allow_emoji: bool) -> None:
+    """SPEC-6a86 : par defaut (``allow_emoji`` faux), le moindre emoji est
+    refuse. Si autorise, au plus un emoji Extended_Pictographic simple, avec
+    au plus un VS16 et un modificateur de teint ; sequence ZWJ et drapeau
+    toujours refuses."""
     codepoints = [ord(c) for c in screen_title]
     n = len(codepoints)
     emoji_count = 0
@@ -338,8 +364,18 @@ def _validate_screen_title_emoji(screen_title: str) -> None:
     while i < n:
         cp = codepoints[i]
         if cp in _REGIONAL_INDICATORS and i + 1 < n and codepoints[i + 1] in _REGIONAL_INDICATORS:
+            if not allow_emoji:
+                raise llm.SchemaError(
+                    f"aucun emoji autorise par defaut dans screen_title (SPEC-6a86, "
+                    f"[captions] screen_title_allow_emoji) : {screen_title!r}"
+                )
             raise llm.SchemaError(f"emoji de type drapeau refuse dans screen_title : {screen_title!r}")
         if _is_pictographic(cp):
+            if not allow_emoji:
+                raise llm.SchemaError(
+                    f"aucun emoji autorise par defaut dans screen_title (SPEC-6a86, "
+                    f"[captions] screen_title_allow_emoji) : {screen_title!r}"
+                )
             j = i + 1
             if j < n and codepoints[j] == ord(_VS16):
                 j += 1
@@ -353,22 +389,52 @@ def _validate_screen_title_emoji(screen_title: str) -> None:
             i = j
             continue
         i += 1
-    if emoji_count != 1:
+    if emoji_count > 1:
         raise llm.SchemaError(
-            f"screen_title doit contenir exactement un emoji, {emoji_count} trouve(s) : {screen_title!r}"
+            f"screen_title doit contenir au plus un emoji, {emoji_count} trouve(s) : {screen_title!r}"
         )
 
 
-def _validate_screen_title(screen_title: str, max_words: int) -> None:
+_WORD_RE = re.compile(r"[^\W\d_]+", re.UNICODE)
+
+
+def _normalize_word(word: str) -> str:
+    decomposed = unicodedata.normalize("NFKD", word)
+    return "".join(c for c in decomposed if not unicodedata.combining(c)).lower()
+
+
+def _validate_screen_title_forbidden_words(screen_title: str, forbidden_words: list[str]) -> None:
+    """SPEC-6a86 : aucun mot de la liste, insensible a la casse et aux
+    accents, comparaison mot entier (« choquant » n'est pas « choc »)."""
+    forbidden = {_normalize_word(w) for w in forbidden_words}
+    for token in _WORD_RE.findall(screen_title):
+        if _normalize_word(token) in forbidden:
+            raise llm.SchemaError(
+                f"screen_title contient un mot interdit (ton sobre, SPEC-6a86) : "
+                f"{token!r} dans {screen_title!r}"
+            )
+
+
+def _validate_screen_title(
+    screen_title: str, max_words: int, forbidden_words: list[str], allow_emoji: bool,
+) -> None:
     n = _count_words(screen_title)
     if n > max_words:
         raise llm.SchemaError(
             f"titre d'ecran de {n} mots, {max_words} au plus : {_numbered_words(screen_title)}"
         )
-    _validate_screen_title_emoji(screen_title)
+    _validate_screen_title_forbidden_words(screen_title, forbidden_words)
+    _validate_screen_title_emoji(screen_title, allow_emoji)
 
 
-def _check_answer(hook_words_max: int, screen_title_words_max: int, *, require_screen_title: bool = True):
+def _check_answer(
+    hook_words_max: int,
+    screen_title_words_max: int,
+    screen_title_forbidden_words: list[str],
+    screen_title_allow_emoji: bool,
+    *,
+    require_screen_title: bool = True,
+):
     """Controle passe a llm.ask : ce qui le refuse est renvoye au modele
     pour correction, comme une reponse hors schema. ``require_screen_title``
     faux pour les parties d'un moment multipart apres la premiere : le
@@ -378,7 +444,10 @@ def _check_answer(hook_words_max: int, screen_title_words_max: int, *, require_s
         _validate_hashtags(answer["hashtags"])
         _validate_hook_text(answer["hook_text"], hook_words_max)
         if require_screen_title:
-            _validate_screen_title(answer["screen_title"], screen_title_words_max)
+            _validate_screen_title(
+                answer["screen_title"], screen_title_words_max,
+                screen_title_forbidden_words, screen_title_allow_emoji,
+            )
 
     return check
 
@@ -471,8 +540,11 @@ def _process_moment(
         schema = response_schema(
             schema_settings, include_screen_title=request_screen_title, include_title=request_title
         )
-        check = _check_answer(hook_words_max, screen_title_words_max,
-                               require_screen_title=request_screen_title)
+        check = _check_answer(
+            hook_words_max, screen_title_words_max,
+            list(settings["screen_title_forbidden_words"]), bool(settings["screen_title_allow_emoji"]),
+            require_screen_title=request_screen_title,
+        )
         text = _part_text(transcript, part["start"], part["end"])
         prompt = _prompt(language, video_title, source, part, parts_total, text, settings,
                           screen_title=screen_title, title=title)
