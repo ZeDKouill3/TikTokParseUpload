@@ -20,7 +20,7 @@ verticaux sous-titrés, en local.
   `batch_size=8`), avec correction de la transcription et du vocabulaire de
   noms propres par LLM.
 - Sélection des moments forts par LLM notée selon une grille (`rubric.toml`,
-  SPEC-53f3), avec un mode jury à cinq juges (retention, spectateur,
+  SPEC-0eec), avec un mode jury à cinq juges (retention, spectateur,
   monteur, avocat, conformite) pour la sélection en mode `auto` (ADR-ff87),
   débat déclenché sur écart de score et apprentissage à partir des
   décisions passées sans uniformisation des juges (ADR-1cf0).
