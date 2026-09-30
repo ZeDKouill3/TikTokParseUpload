@@ -20,13 +20,16 @@ Deroulement :
    consignes generiques) EN PREMIER et les consignes propres au role
    (perspective, veto) EN DERNIER ; ce bloc commun est alors identique octet
    pour octet entre juges d'un meme modele, et transmis a clipper.llm comme
-   ``cache_prefix`` (voir ``_ask``) pour que claude_cli le marque comme bloc
-   cacheable (TASK-2cbb) -- un prefixe textuel identique seul ne suffit pas,
-   le fournisseur ne relit que des blocs, jamais un prefixe de caracteres a
-   l'interieur d'un bloc unique. Les appels d'un tour partent en 2 vagues :
-   un juge par modele d'abord (le
-   "leader", pour chauffer le cache), attendu jusqu'au bout, puis les autres
-   juges de ce tour ; chaque vague en parallele.
+   ``cache_prefix`` (voir ``_ask``) pour qu'un backend qui sait relire un
+   cache de blocs le marque comme cacheable (TASK-2cbb) -- un prefixe
+   textuel identique seul ne suffit pas, le fournisseur ne relit que des
+   blocs, jamais un prefixe de caracteres a l'interieur d'un bloc unique.
+   Le backend claude-cli (defaut) ignore ce marquage depuis TASK-b384 : un
+   400 "A maximum of 4 blocks with cache_control" intermittent et hors de
+   notre controle lui etait imputable (voir clipper/llm/claude_cli.py).
+   Les appels d'un tour partent en 2 vagues : un juge par modele d'abord (le
+   "leader"), attendu jusqu'au bout, puis les autres juges de ce tour ;
+   chaque vague en parallele.
 2. Desaccord : un candidat dont les scores par juge (0-100, grille ponderee)
    s'ecartent de plus de ``threshold`` passe au debat.
 3. Tour 2 (un seul) sur ces candidats : chaque juge relit ses notes et son
@@ -438,9 +441,9 @@ def _ask(
     imposer veto/veto_reason meme a un juge sans veto (partage par son
     modele, TASK-b0fa) : seul ``judge["veto"]`` decide si on en tient
     compte. ``cache_prefix`` (le prompt prive de son role, identique entre
-    juges d'un meme modele) va a clipper.llm pour qu'il soit marque comme
-    bloc cacheable (TASK-2cbb) : un prefixe textuel identique seul ne suffit
-    pas, le fournisseur ne relit que des blocs, pas un prefixe de caracteres."""
+    juges d'un meme modele) va a clipper.llm pour qu'un backend qui le
+    supporte le marque comme bloc cacheable (TASK-2cbb) : ignore par
+    claude-cli depuis TASK-b384 (voir clipper/llm/claude_cli.py)."""
     answer = llm.ask(
         judge["usage"],
         prompt,
@@ -478,9 +481,8 @@ def _model_veto_flags(judges: list[dict[str, Any]]) -> dict[Any, bool]:
 
 def _waves(judges: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
     """Noms des juges en 2 vagues : un "leader" par ``model`` configure
-    (premiere occurrence, dans l'ordre de ``judges``), puis le reste. Le
-    leader chauffe le cache de prompt de son modele (meme bloc commun) avant
-    que les autres juges de ce modele n'appellent a leur tour."""
+    (premiere occurrence, dans l'ordre de ``judges``), puis le reste, pour
+    ne pas envoyer tous les juges d'un tour en une seule salve parallele."""
     seen: set[Any] = set()
     leaders, others = [], []
     for judge in judges:
