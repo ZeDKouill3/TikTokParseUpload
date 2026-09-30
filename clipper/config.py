@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import importlib
+import time
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import tomli_w
+
 VALID_MODES = ("review", "auto")
+
+_REPLACE_ATTEMPTS = 5
+_REPLACE_DELAY_S = 0.05
 
 DEFAULTS: dict[str, object] = {
     "mode": "review",
@@ -78,15 +84,42 @@ class Config:
 _UNSET = object()
 
 
-def load_config(path: str | Path | object = _UNSET) -> Config:
-    explicit = path is not _UNSET
-    path = Path(path) if explicit else Path("config.toml")
-    data: dict[str, object] = {}
+def _parse_toml_file(path: Path, *, required: bool) -> dict[str, object]:
     if path.exists():
         with path.open("rb") as f:
-            data = tomllib.load(f)
-    elif explicit:
+            return tomllib.load(f)
+    if required:
         raise ConfigError(f"fichier de config introuvable : {path}")
+    return {}
+
+
+def _merge_raw(base: dict[str, object], preset: dict[str, object]) -> dict[str, object]:
+    """Merge preset over base: flat keys merged, then each section merged
+    key by key (preset wins). A nested sub-table is a single value under its
+    key, so it is replaced wholesale, never merged further."""
+    base_flat = {k: v for k, v in base.items() if not isinstance(v, dict)}
+    base_sections = {k: v for k, v in base.items() if isinstance(v, dict)}
+    preset_flat = {k: v for k, v in preset.items() if not isinstance(v, dict)}
+    preset_sections = {k: v for k, v in preset.items() if isinstance(v, dict)}
+
+    merged_flat = {**base_flat, **preset_flat}
+    merged_sections = {k: dict(v) for k, v in base_sections.items()}
+    for name, table in preset_sections.items():
+        merged_sections[name] = {**merged_sections.get(name, {}), **table}
+
+    return {**merged_flat, **merged_sections}
+
+
+def load_config(
+    path: str | Path | object = _UNSET, *, base: str | Path | None = None
+) -> Config:
+    explicit = path is not _UNSET
+    path = Path(path) if explicit else Path("config.toml")
+    data = _parse_toml_file(path, required=explicit)
+
+    if base is not None:
+        base_data = _parse_toml_file(Path(base), required=True)
+        data = _merge_raw(base_data, data)
 
     flat = {k: v for k, v in data.items() if not isinstance(v, dict)}
     sections = {k: v for k, v in data.items() if isinstance(v, dict)}
@@ -105,3 +138,35 @@ def load_config(path: str | Path | object = _UNSET) -> Config:
         output_dir=Path(merged["output_dir"]),
         _sections=sections,
     )
+
+
+def _atomic_replace(tmp: Path, path: Path) -> None:
+    for attempt in range(_REPLACE_ATTEMPTS):
+        try:
+            tmp.replace(path)
+            return
+        except PermissionError:
+            if attempt == _REPLACE_ATTEMPTS - 1:
+                raise
+            time.sleep(_REPLACE_DELAY_S)
+
+
+def write_config(
+    path: str | Path, data: dict[str, object], *, base: str | Path | None = None
+) -> None:
+    """Serialize data to TOML, reread it through load_config with the same
+    base to validate it, then replace path atomically. A ConfigError leaves
+    the original file untouched and propagates (ADR-ad2e: no silent
+    fallback)."""
+    path = Path(path)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(tomli_w.dumps(data), encoding="utf-8")
+    try:
+        if base is not None:
+            load_config(tmp, base=base)
+        else:
+            load_config(tmp)
+    except ConfigError:
+        tmp.unlink(missing_ok=True)
+        raise
+    _atomic_replace(tmp, path)
