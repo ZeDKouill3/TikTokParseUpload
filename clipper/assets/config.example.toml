@@ -24,6 +24,9 @@ output_dir = "output"
 # [reframe]
 # format = "letterbox"    # letterbox (zoom fixe, defaut) | crop (option figee)
 # letterbox_zoom = 1.3     # fenetre centrale de largeur source_w / zoom
+#
+# [captions]
+# screen_title_allow_emoji = false   # SPEC-6a86 (defaut) : titre d'ecran sobre, sans emoji
 
 # Reglages retenus apres le banc RTX 3050 4 Go (docs/benchmarks/rtx3050.md) :
 # deja les valeurs par defaut de CONFIG_DEFAULTS, rappelees ici pour memoire,

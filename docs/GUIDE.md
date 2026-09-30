@@ -218,7 +218,13 @@ formats).
 `parallel` = 4.
 
 `[captions]` — `title_max_chars` = 100, `caption_max_chars` = 300,
-`hashtags_max` = 8, `hook_words_max` = 8, `parallel` = 4 (moments traités en
+`hashtags_max` = 8, `hook_words_max` = 8, `screen_title_words_max` = 6,
+`screen_title_allow_emoji` = `false` (SPEC-6a86 : sans configuration
+explicite, un `screen_title` avec un emoji est refusé — activer l'option ne
+le rend pas obligatoire, elle permet seulement d'en accepter un au plus),
+`screen_title_forbidden_words` (liste de mots d'emphase clickbait refusés
+dans `screen_title`, insensible à la casse et aux accents, mot entier ;
+réglable par preset de chaîne), `parallel` = 4 (moments traités en
 parallèle), `cta_line`/`cta_hashtags` (SPEC-6a47, vides par défaut, voir
 *Appel à l'abonnement* ci-dessus).
 

@@ -96,7 +96,7 @@ def make_config(tmp_path, **captions_overrides):
 
 
 def answer(title="Titre choc", caption="Une legende qui donne envie.", hashtags=("#un", "#deux"),
-           hook_text="quatre mots pour accrocher", screen_title="Info choc \U0001F525",
+           hook_text="quatre mots pour accrocher", screen_title="Info precise du clip",
            include_screen_title=True, include_title=True):
     result = {"caption": caption, "hashtags": list(hashtags), "hook_text": hook_text}
     if include_title:
@@ -141,7 +141,7 @@ def test_single_clip_gets_title_caption_hashtags_and_hook_text_from_the_llm(work
     assert clip["caption"] == "Une legende qui donne envie."
     assert clip["hashtags"] == ["#un", "#deux"]
     assert clip["hook_text"] == "quatre mots pour accrocher"
-    assert clip["screen_title"] == "Info choc \U0001F525"
+    assert clip["screen_title"] == "Info precise du clip"
     assert clip["moment_id"] == 0 and clip["part"] == 1 and clip["parts_total"] == 1
     assert clip["start"] == 0.0 and clip["end"] == 3.9
     assert clip["language"] == "fr"
@@ -383,96 +383,98 @@ def test_default_config_values():
     assert CONFIG_DEFAULTS["title_max_chars"] == 100
     assert CONFIG_DEFAULTS["caption_max_chars"] == 300
     assert CONFIG_DEFAULTS["screen_title_words_max"] == 6
+    assert CONFIG_DEFAULTS["screen_title_allow_emoji"] is False
+    assert CONFIG_DEFAULTS["screen_title_forbidden_words"] == [
+        "pur", "total", "explose", "choc", "incroyable", "fou", "dingue",
+        "glaçant", "assourdissant", "dévoilé",
+    ]
     assert CONFIG_DEFAULTS["parallel"] == 4
 
 
 # --------------------------------------------------------------------------
-# screen_title (SPEC-6127, format letterbox) : mots, emoji unique
+# screen_title (SPEC-6a86) : mots, ton sobre (sans emoji ni superlatif par
+# defaut), option emoji
 # --------------------------------------------------------------------------
 
 
-def test_screen_title_valid_answer_is_kept(workspace, tmp_path):
+def test_screen_title_sober_answer_without_emoji_is_kept_by_default(workspace, tmp_path):
     write_moments(workspace, moment(0))
     write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
 
-    fake, _ = run(workspace, make_config(tmp_path), [answer(screen_title="Attention arnaque totale \U0001F525")])
+    fake, _ = run(workspace, make_config(tmp_path), [answer(screen_title="C'est des salopards")])
 
     assert len(fake.calls) == 1
-    assert by_id(read_captions(workspace), "00")["screen_title"] == "Attention arnaque totale \U0001F525"
+    assert by_id(read_captions(workspace), "00")["screen_title"] == "C'est des salopards"
 
 
-def test_screen_title_without_an_emoji_is_sent_back_for_correction_then_fails(workspace, tmp_path):
+def test_screen_title_with_an_emoji_is_refused_by_default_then_fails(workspace, tmp_path):
     from clipper.captions import run as run_captions
 
     write_moments(workspace, moment(0))
     write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
-    fake = FakeBackend([answer(screen_title="Sans emoji ici")] * 2)
+    fake = FakeBackend([answer(screen_title="Info precise ici \U0001F525")] * 2)
 
-    with llm.use_backend(fake), pytest.raises(llm.SchemaError, match="exactement un emoji"):
+    with llm.use_backend(fake), pytest.raises(llm.SchemaError, match="aucun emoji"):
         run_captions(VIDEO_ID, workspace, config=make_config(tmp_path))
 
     assert len(fake.calls) == 2
-    assert "exactement un emoji" in fake.calls[1].prompt
+    assert "aucun emoji" in fake.calls[1].prompt
     assert not (workspace / VIDEO_ID / "captions.json").exists()
 
 
-def test_screen_title_with_two_emojis_is_a_failure(workspace, tmp_path):
+def test_screen_title_with_a_forbidden_word_is_refused_by_default_then_fails(workspace, tmp_path):
+    from clipper.captions import run as run_captions
+
     write_moments(workspace, moment(0))
     write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
-    two_emojis = "Choc total \U0001F525\U0001F389"
+    fake = FakeBackend([answer(screen_title="C'est vraiment fou")] * 2)
 
-    with pytest.raises(llm.SchemaError, match="exactement un emoji"):
-        run(workspace, make_config(tmp_path), [answer(screen_title=two_emojis)] * 2)
+    with llm.use_backend(fake), pytest.raises(llm.SchemaError, match="mot interdit") as exc_info:
+        run_captions(VIDEO_ID, workspace, config=make_config(tmp_path))
+
+    assert "'fou'" in str(exc_info.value)
+    assert len(fake.calls) == 2
+    assert "mot interdit" in fake.calls[1].prompt
+    assert not (workspace / VIDEO_ID / "captions.json").exists()
+
+
+def test_screen_title_forbidden_word_is_case_and_accent_insensitive(workspace, tmp_path):
+    write_moments(workspace, moment(0))
+    write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
+
+    with pytest.raises(llm.SchemaError, match="mot interdit"):
+        run(workspace, make_config(tmp_path), [answer(screen_title="Ambiance GLAÇANT ce soir")] * 2)
+    assert not (workspace / VIDEO_ID / "captions.json").exists()
+
+
+def test_screen_title_forbidden_word_matches_whole_word_only(workspace, tmp_path):
+    write_moments(workspace, moment(0))
+    write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
+
+    run(workspace, make_config(tmp_path), [answer(screen_title="Ce type est choquant")])
+
+    assert by_id(read_captions(workspace), "00")["screen_title"] == "Ce type est choquant"
+
+
+def test_screen_title_forbidden_words_list_is_configurable(workspace, tmp_path):
+    write_moments(workspace, moment(0))
+    write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
+
+    with pytest.raises(llm.SchemaError, match="mot interdit"):
+        run(
+            workspace, make_config(tmp_path, screen_title_forbidden_words=["salopards"]),
+            [answer(screen_title="C'est des salopards")] * 2,
+        )
     assert not (workspace / VIDEO_ID / "captions.json").exists()
 
 
 def test_screen_title_with_seven_words_is_a_failure(workspace, tmp_path):
     write_moments(workspace, moment(0))
     write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
-    seven_words = "un deux trois quatre cinq six sept \U0001F525"
+    seven_words = "un deux trois quatre cinq six sept"
 
     with pytest.raises(llm.SchemaError, match="7 mots"):
         run(workspace, make_config(tmp_path), [answer(screen_title=seven_words)] * 2)
-    assert not (workspace / VIDEO_ID / "captions.json").exists()
-
-
-def test_screen_title_emoji_followed_by_variation_selector_is_accepted(workspace, tmp_path):
-    write_moments(workspace, moment(0))
-    write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
-    emoji_vs16 = "Depart imminent \U0001F680️"
-
-    run(workspace, make_config(tmp_path), [answer(screen_title=emoji_vs16)])
-
-    assert by_id(read_captions(workspace), "00")["screen_title"] == emoji_vs16
-
-
-def test_screen_title_emoji_with_skin_tone_modifier_is_accepted(workspace, tmp_path):
-    write_moments(workspace, moment(0))
-    write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
-    emoji_skin_tone = "Bien joue \U0001F44D\U0001F3FD"
-
-    run(workspace, make_config(tmp_path), [answer(screen_title=emoji_skin_tone)])
-
-    assert by_id(read_captions(workspace), "00")["screen_title"] == emoji_skin_tone
-
-
-def test_screen_title_zwj_sequence_is_refused(workspace, tmp_path):
-    write_moments(workspace, moment(0))
-    write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
-    zwj_family = "En famille " + "\U0001F468‍\U0001F469‍\U0001F467"
-
-    with pytest.raises(llm.SchemaError, match="ZWJ"):
-        run(workspace, make_config(tmp_path), [answer(screen_title=zwj_family)] * 2)
-    assert not (workspace / VIDEO_ID / "captions.json").exists()
-
-
-def test_screen_title_flag_is_refused(workspace, tmp_path):
-    write_moments(workspace, moment(0))
-    write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
-    flag = "Exclusif France " + "\U0001F1EB\U0001F1F7"
-
-    with pytest.raises(llm.SchemaError, match="drapeau"):
-        run(workspace, make_config(tmp_path), [answer(screen_title=flag)] * 2)
     assert not (workspace / VIDEO_ID / "captions.json").exists()
 
 
@@ -482,7 +484,99 @@ def test_screen_title_words_max_is_configurable(workspace, tmp_path):
     three_words = "un deux trois \U0001F525"
 
     with pytest.raises(llm.SchemaError, match="2 au plus"):
-        run(workspace, make_config(tmp_path, screen_title_words_max=2), [answer(screen_title=three_words)] * 2)
+        run(
+            workspace, make_config(tmp_path, screen_title_words_max=2, screen_title_allow_emoji=True),
+            [answer(screen_title=three_words)] * 2,
+        )
+
+
+# --------------------------------------------------------------------------
+# screen_title_allow_emoji=True (SPEC-6a86) : emoji redevenu possible, mais
+# jamais obligatoire, au plus un, memes regles ZWJ/drapeau qu'avant
+# --------------------------------------------------------------------------
+
+
+def test_screen_title_allow_emoji_accepts_a_single_emoji(workspace, tmp_path):
+    write_moments(workspace, moment(0))
+    write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
+
+    run(
+        workspace, make_config(tmp_path, screen_title_allow_emoji=True),
+        [answer(screen_title="Attention arnaque \U0001F525")],
+    )
+
+    assert by_id(read_captions(workspace), "00")["screen_title"] == "Attention arnaque \U0001F525"
+
+
+def test_screen_title_allow_emoji_still_accepts_no_emoji_at_all(workspace, tmp_path):
+    write_moments(workspace, moment(0))
+    write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
+
+    run(
+        workspace, make_config(tmp_path, screen_title_allow_emoji=True),
+        [answer(screen_title="C'est des salopards")],
+    )
+
+    assert by_id(read_captions(workspace), "00")["screen_title"] == "C'est des salopards"
+
+
+def test_screen_title_allow_emoji_still_refuses_two_emojis(workspace, tmp_path):
+    write_moments(workspace, moment(0))
+    write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
+    two_emojis = "Arnaque totale \U0001F525\U0001F389"
+
+    with pytest.raises(llm.SchemaError, match="au plus un emoji"):
+        run(
+            workspace, make_config(tmp_path, screen_title_allow_emoji=True),
+            [answer(screen_title=two_emojis)] * 2,
+        )
+    assert not (workspace / VIDEO_ID / "captions.json").exists()
+
+
+def test_screen_title_allow_emoji_followed_by_variation_selector_is_accepted(workspace, tmp_path):
+    write_moments(workspace, moment(0))
+    write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
+    emoji_vs16 = "Depart imminent \U0001F680️"
+
+    run(workspace, make_config(tmp_path, screen_title_allow_emoji=True), [answer(screen_title=emoji_vs16)])
+
+    assert by_id(read_captions(workspace), "00")["screen_title"] == emoji_vs16
+
+
+def test_screen_title_allow_emoji_with_skin_tone_modifier_is_accepted(workspace, tmp_path):
+    write_moments(workspace, moment(0))
+    write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
+    emoji_skin_tone = "Bien joue \U0001F44D\U0001F3FD"
+
+    run(workspace, make_config(tmp_path, screen_title_allow_emoji=True), [answer(screen_title=emoji_skin_tone)])
+
+    assert by_id(read_captions(workspace), "00")["screen_title"] == emoji_skin_tone
+
+
+def test_screen_title_zwj_sequence_is_refused_even_when_emoji_allowed(workspace, tmp_path):
+    write_moments(workspace, moment(0))
+    write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
+    zwj_family = "En famille " + "\U0001F468‍\U0001F469‍\U0001F467"
+
+    with pytest.raises(llm.SchemaError, match="ZWJ"):
+        run(
+            workspace, make_config(tmp_path, screen_title_allow_emoji=True),
+            [answer(screen_title=zwj_family)] * 2,
+        )
+    assert not (workspace / VIDEO_ID / "captions.json").exists()
+
+
+def test_screen_title_flag_is_refused_even_when_emoji_allowed(workspace, tmp_path):
+    write_moments(workspace, moment(0))
+    write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
+    flag = "Exclusif France " + "\U0001F1EB\U0001F1F7"
+
+    with pytest.raises(llm.SchemaError, match="drapeau"):
+        run(
+            workspace, make_config(tmp_path, screen_title_allow_emoji=True),
+            [answer(screen_title=flag)] * 2,
+        )
+    assert not (workspace / VIDEO_ID / "captions.json").exists()
 
 
 # --------------------------------------------------------------------------
@@ -502,14 +596,14 @@ def test_multipart_screen_title_is_requested_only_once_and_shared_across_parts(w
     fake, _ = run(
         workspace, make_config(tmp_path),
         [
-            answer(title="Grosse histoire", screen_title="Info choc \U0001F525"),
+            answer(title="Grosse histoire"),
             answer(include_title=False, include_screen_title=False),
             answer(include_title=False, include_screen_title=False),
         ],
     )
 
     data = read_captions(workspace)
-    assert [c["screen_title"] for c in data["clips"]] == ["Info choc \U0001F525"] * 3
+    assert [c["screen_title"] for c in data["clips"]] == ["Info precise du clip"] * 3
     assert len(fake.calls) == 3
 
 
@@ -525,7 +619,7 @@ def test_multipart_only_the_first_calls_schema_requires_screen_title(workspace, 
     fake, _ = run(
         workspace, make_config(tmp_path),
         [
-            answer(screen_title="Info choc \U0001F525"),
+            answer(),
             answer(include_title=False, include_screen_title=False),
             answer(include_title=False, include_screen_title=False),
         ],
@@ -549,12 +643,12 @@ def test_multipart_later_parts_prompt_cites_the_chosen_screen_title_as_context(w
     fake, _ = run(
         workspace, make_config(tmp_path),
         [
-            answer(screen_title="Info choc \U0001F525"),
+            answer(),
             answer(include_title=False, include_screen_title=False),
         ],
     )
 
-    assert "Info choc \U0001F525" in fake.calls[1].prompt
+    assert "Info precise du clip" in fake.calls[1].prompt
 
 
 def test_multipart_first_part_failing_writes_nothing(workspace, tmp_path):
@@ -662,6 +756,64 @@ def test_prompt_states_the_exact_word_counting_rule_with_examples(workspace, tmp
     assert "à" in prompt and "n'ai" in prompt and "l'égorger" in prompt
     assert "hook_text" in prompt and "screen_title" in prompt
     assert "ne comptent pas" in prompt
+
+
+def test_prompt_states_the_sober_screen_title_rule_by_default(workspace, tmp_path):
+    write_moments(workspace, moment(0))
+    write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
+
+    fake, _ = run(workspace, make_config(tmp_path), [answer()])
+
+    prompt = fake.calls[0].prompt
+    assert "aucun emoji" in prompt
+    assert "choc" in prompt and "incroyable" in prompt
+
+
+def test_prompt_does_not_forbid_emoji_when_the_option_is_enabled(workspace, tmp_path):
+    write_moments(workspace, moment(0))
+    write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
+
+    fake, _ = run(workspace, make_config(tmp_path, screen_title_allow_emoji=True), [answer()])
+
+    prompt = fake.calls[0].prompt
+    assert "au plus un emoji" in prompt
+
+
+def _has_emoji_char(text):
+    """Vrai si un caractere du bloc emoji usuel (U+1F300-U+1FAFF, couvre les
+    emojis clickbait typiques : 🔥😡💊🧩😱💀👻🧟😂🪓) apparait dans ``text``."""
+    return any(0x1F300 <= ord(c) <= 0x1FAFF for c in text)
+
+
+def test_no_literal_emoji_in_prompt_or_schema_by_default(workspace, tmp_path):
+    write_moments(workspace, moment(0))
+    write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
+
+    fake, _ = run(workspace, make_config(tmp_path), [answer()])
+
+    prompt = fake.calls[0].prompt
+    schema_text = json.dumps(fake.calls[0].schema, ensure_ascii=False)
+    assert not _has_emoji_char(prompt), prompt
+    assert not _has_emoji_char(schema_text), schema_text
+
+
+def test_schema_screen_title_description_forbids_emoji_by_default():
+    from clipper.captions import CONFIG_DEFAULTS, response_schema
+
+    schema = response_schema(CONFIG_DEFAULTS)
+
+    description = schema["properties"]["screen_title"]["description"]
+    assert "exactement un emoji" not in description
+    assert "aucun" in description.lower() and "emoji" in description.lower()
+
+
+def test_schema_screen_title_description_allows_one_emoji_when_enabled():
+    from clipper.captions import CONFIG_DEFAULTS, response_schema
+
+    schema = response_schema({**CONFIG_DEFAULTS, "screen_title_allow_emoji": True})
+
+    description = schema["properties"]["screen_title"]["description"]
+    assert "au plus un emoji" in description
 
 
 def test_hook_text_schema_error_lists_the_counted_words_numbered(workspace, tmp_path):
