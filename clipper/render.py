@@ -68,6 +68,28 @@ resolve_emoji_font) : Windows ``C:/Windows/Fonts/seguiemj.ttf`` ; Linux
 s'ouvre qu'a la taille 109 : chaque emoji est donc rasterise a
 ``emoji_raster_size`` (109) puis reduit a la taille du texte, sur toutes
 les plateformes. Police absente = RenderError.
+
+Appel a l'abonnement (SPEC-6a47, ``cta_enabled``, desactive par defaut :
+rendu identique a SPEC-6127 sans configuration explicite). Letterbox et
+stream seulement (``_TEXT_LAYOUTS``) ; ignore en crop (``cta`` reste ``false``
+dans le JSON, pas une erreur : SPEC-6a47 fige ce format). ``cta_enabled``
+sans ``cta_handle`` ou sans ``cta_text``, ou ``cta_seconds`` <= 0 ou >= la
+duree du clip, est une erreur explicite (ADR-ad2e, jamais de CTA a moitie
+active) :
+- pseudo de chaine (``cta_handle``) sous l'encadre du titre, dans la meme
+  bande floue du haut, pendant tout le clip : texte seul (pas d'encadre),
+  mesure avec la vraie police (``layout_pseudo``), reduit par paliers. Le
+  titre remonte de la hauteur ainsi reservee (``title_lift`` effectif plus
+  grand), rendu ensuite comme d'habitude (``title_png``) puis le pseudo est
+  dessine sur le meme PNG (``_draw_pseudo``) ;
+- carte de fin (``cta_text``, defaut « Abonne-toi ! ») sur les
+  ``cta_seconds`` dernieres secondes (defaut 2 s) : encadre blanc/texte noir
+  centre dans ``text_zones.subtitles`` (``layout_cta_card``/``cta_card_png``,
+  meme style que le titre mais centre, pas ancre en bas), incruste par-dessus
+  les sous-titres via un overlay ffmpeg ``enable='gte(t,cutoff)'``. Les
+  sous-titres de cette fenetre sont retires d'une copie du .ass
+  (``truncate_ass_for_cta``) : le fichier ecrit par l'etape subtitles n'est
+  jamais modifie (ADR-b16b, render n'importe pas subtitles.py).
 """
 
 from __future__ import annotations
@@ -140,6 +162,33 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "emoji_raster_size": 109,
     # « Partie N » en letterbox (taille : part_font_size, couleur : part_font_color).
     "part_border": 4,
+    # Appel a l'abonnement (SPEC-6a47), desactive par defaut : sans
+    # configuration explicite, le rendu reste identique a SPEC-6127. Ne
+    # s'applique qu'aux layouts letterbox/stream (_TEXT_LAYOUTS) ; le format
+    # crop reste fige (ADR-ad2e : jamais applique en silence hors de ces deux
+    # layouts, jamais non plus a moitie active sans cta_handle/cta_text).
+    "cta_enabled": False,
+    "cta_handle": "",
+    "cta_seconds": 2.0,
+    "cta_text": "Abonne-toi !",
+    # Pseudo de chaine, sous le titre d'ecran, dans la meme bande floue du
+    # haut (texte discret, sans encadre) : tailles en pixels d'em.
+    "cta_handle_font_size": 32,
+    "cta_handle_font_size_min": 20,
+    "cta_handle_font_size_step": 2,
+    "cta_handle_font_color": "white",
+    "cta_handle_outline": 3,
+    # Ecart (px) entre le bas de l'encadre du titre et le pseudo.
+    "cta_handle_gap": 8,
+    # Carte de fin (encadre blanc, texte noir, meme style que le titre mais
+    # centree dans sa zone) : tailles en pixels d'em.
+    "cta_card_font_size": 56,
+    "cta_card_font_size_min": 32,
+    "cta_card_font_size_step": 4,
+    "cta_card_pad_x": 28,
+    "cta_card_pad_y": 16,
+    "cta_card_radius": 22,
+    "cta_card_line_height": 1.25,
 }
 
 FONTS_DIR = Path(__file__).resolve().parent / "assets" / "fonts"
@@ -369,13 +418,74 @@ def _zone(zone: dict[str, Any]) -> tuple[int, int, int, int]:
     return int(zone["x0"]), int(zone["y0"]), int(zone["x1"]), int(zone["y1"])
 
 
-def _font_sizes(settings: dict[str, Any]) -> list[int]:
-    start, low = int(settings["title_font_size"]), int(settings["title_font_size_min"])
-    step = max(1, int(settings["title_font_size_step"]))
+def _step_sizes(start: int, low: int, step: int) -> list[int]:
+    """Tailles de ``start`` a ``low`` par paliers de ``step``, ``low`` toujours
+    inclus meme s'il n'est pas un multiple exact du pas."""
+    step = max(1, step)
     sizes = list(range(start, low - 1, -step))
     if not sizes or sizes[-1] != low:
         sizes.append(low)
     return sizes
+
+
+def _font_sizes(settings: dict[str, Any]) -> list[int]:
+    return _step_sizes(
+        int(settings["title_font_size"]), int(settings["title_font_size_min"]),
+        int(settings["title_font_size_step"]),
+    )
+
+
+def _cta_handle_sizes(settings: dict[str, Any]) -> list[int]:
+    return _step_sizes(
+        int(settings["cta_handle_font_size"]), int(settings["cta_handle_font_size_min"]),
+        int(settings["cta_handle_font_size_step"]),
+    )
+
+
+def _cta_card_sizes(settings: dict[str, Any]) -> list[int]:
+    return _step_sizes(
+        int(settings["cta_card_font_size"]), int(settings["cta_card_font_size_min"]),
+        int(settings["cta_card_font_size_step"]),
+    )
+
+
+@dataclass
+class PseudoLayout:
+    """Mise en page du pseudo de chaine (texte seul, sans encadre), en pixels
+    de sortie."""
+
+    font_size: int
+    width: float
+    height: int
+    top: int  # decalage (px) du haut du texte au-dessus de sa ligne de base
+
+
+def layout_pseudo(text: str, zone_width: int, settings: dict[str, Any]) -> PseudoLayout:
+    """Mise en page du pseudo de chaine (``cta_handle``) : une seule ligne,
+    mesuree avec la vraie police, reduite par paliers (``cta_handle_font_size``
+    a ``cta_handle_font_size_min``) jusqu'a tenir dans ``zone_width`` ;
+    RenderError si meme la taille minimale deborde (ADR-ad2e : jamais tronque
+    ni debordant en silence)."""
+    if not text.strip():
+        raise RenderError("pseudo de chaine vide (reglage [render] cta_handle)")
+    if not FONT_FILE.is_file():
+        raise RenderError(f"police absente : {FONT_FILE}")
+    text_cmap = _cmap(str(FONT_FILE))
+    missing = sorted({c for c in text if not c.isspace() and ord(c) not in text_cmap})
+    if missing:
+        raise RenderError(
+            f"caractere(s) {''.join(missing)!r} du pseudo de chaine absent(s) de Poppins ExtraBold : {text!r}"
+        )
+    for size in _cta_handle_sizes(settings):
+        font = _text_font(size)
+        width = font.getlength(text)
+        if width <= zone_width:
+            _left, top, _right, bottom = font.getbbox(text, anchor="ls")
+            return PseudoLayout(font_size=size, width=width, height=bottom - top, top=top)
+    raise RenderError(
+        f"pseudo de chaine trop long pour sa zone ({zone_width} px) meme a la taille "
+        f"{settings['cta_handle_font_size_min']} (reglage [render] cta_handle) : {text!r}"
+    )
 
 
 def layout_title(text: str, zone: dict[str, Any], settings: dict[str, Any]) -> TitleLayout:
@@ -505,6 +615,109 @@ def title_png(text: str, zone: dict[str, Any], settings: dict[str, Any], path: P
     return layout
 
 
+# --------------------------------------------------------------------------
+# Carte de fin (SPEC-6a47) : encadre blanc/texte noir, style du titre mais
+# centre (pas ancre en bas) dans sa zone ; pas d'emoji (cta_text est un texte
+# de configuration, pas une reponse LLM soumise a la meme regle que le titre).
+# --------------------------------------------------------------------------
+
+
+def layout_cta_card(text: str, zone: dict[str, Any], settings: dict[str, Any]) -> TitleLayout:
+    """Mise en page de la carte de fin (``cta_text``) : encadre blanc centre
+    horizontalement et verticalement dans ``zone`` (contrairement au titre,
+    qui est ancre en bas). Une ligne, puis deux, puis taille reduite par
+    paliers (``cta_card_font_size`` a ``cta_card_font_size_min``) ; RenderError
+    si ca ne tient toujours pas (ADR-ad2e)."""
+    words = text.split()
+    if not words:
+        raise RenderError("texte de la carte de fin vide (reglage [render] cta_text)")
+    if not FONT_FILE.is_file():
+        raise RenderError(f"police absente : {FONT_FILE}")
+    text_cmap = _cmap(str(FONT_FILE))
+    missing = sorted({c for c in text if not c.isspace() and ord(c) not in text_cmap})
+    if missing:
+        raise RenderError(
+            f"caractere(s) {''.join(missing)!r} de la carte de fin absent(s) de Poppins ExtraBold : {text!r}"
+        )
+
+    zx0, zy0, zx1, zy1 = _zone(zone)
+    zone_w, zone_h = zx1 - zx0, zy1 - zy0
+    pad_x, pad_y = int(settings["cta_card_pad_x"]), int(settings["cta_card_pad_y"])
+
+    n = len(words)
+    for size in _cta_card_sizes(settings):
+        font = _text_font(size)
+        line_h = round(size * float(settings["cta_card_line_height"]))
+        candidates = [[(0, n)]]
+        if n > 1:
+            k = min(
+                range(1, n),
+                key=lambda k: max(font.getlength(" ".join(words[:k])), font.getlength(" ".join(words[k:]))),
+            )
+            candidates.append([(0, k), (k, n)])
+        for spans in candidates:
+            lines = [" ".join(words[a:b]) for a, b in spans]
+            widths = [font.getlength(line) for line in lines]
+            box_w = math.ceil(max(widths)) + 2 * pad_x
+            box_h = len(spans) * line_h + 2 * pad_y
+            if box_w > zone_w or box_h > zone_h:
+                continue
+            bx0 = zx0 + (zone_w - box_w) // 2
+            by0 = zy0 + (zone_h - box_h) // 2
+            cap = -font.getbbox("H", anchor="ls")[1]
+            layout = TitleLayout(font_size=size, lines=lines, box=(bx0, by0, bx0 + box_w, by0 + box_h))
+            for i, line in enumerate(lines):
+                baseline = by0 + pad_y + i * line_h + round((line_h + cap) / 2)
+                x = bx0 + (box_w - widths[i]) / 2
+                layout.items.append(("text", line, round(x), baseline))
+            return layout
+    raise RenderError(
+        f"carte de fin trop longue pour sa zone ({zone_w}x{zone_h} px) meme a la taille "
+        f"{settings['cta_card_font_size_min']} sur 2 lignes (reglage [render] cta_text) : {text!r}"
+    )
+
+
+def cta_card_png(text: str, zone: dict[str, Any], settings: dict[str, Any], path: Path) -> TitleLayout:
+    """Ecrit dans ``path`` la carte de fin en PNG transparent de la taille de
+    ``zone`` ; renvoie sa mise en page."""
+    layout = layout_cta_card(text, zone, settings)
+    zx0, zy0, zx1, zy1 = _zone(zone)
+    img = Image.new("RGBA", (zx1 - zx0, zy1 - zy0), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    bx0, by0, bx1, by1 = layout.box
+    draw.rounded_rectangle(
+        (bx0 - zx0, by0 - zy0, bx1 - zx0 - 1, by1 - zy0 - 1), radius=int(settings["cta_card_radius"]), fill="white"
+    )
+    font = _text_font(layout.font_size)
+    for _kind, content, x, y in layout.items:
+        draw.text((x - zx0, y - zy0), content, font=font, fill="black", anchor="ls")
+    img.save(path, format="PNG")
+    return layout
+
+
+def _draw_pseudo(
+    png_path: Path, zone: dict[str, Any], title_layout: TitleLayout, text: str,
+    pseudo: PseudoLayout, settings: dict[str, Any],
+) -> None:
+    """Dessine le pseudo de chaine sous l'encadre du titre (``title_layout``),
+    sur le PNG deja ecrit par ``title_png`` pour la meme ``zone`` : texte
+    discret, sans encadre, colle au bas de l'espace reserve par ``render``
+    (``title_lift`` effectif)."""
+    zx0, zy0, zx1, _zy1 = _zone(zone)
+    img = Image.open(png_path).convert("RGBA")
+    draw = ImageDraw.Draw(img)
+    font = _text_font(pseudo.font_size)
+    x = zx0 + (zx1 - zx0 - pseudo.width) / 2
+    gap = int(settings["cta_handle_gap"])
+    _bx0, _by0, _bx1, by1 = title_layout.box
+    baseline = by1 + gap - pseudo.top
+    draw.text(
+        (x - zx0, baseline - zy0), text, font=font, fill=str(settings["cta_handle_font_color"]),
+        anchor="ls", stroke_width=int(settings["cta_handle_outline"]), stroke_fill="black",
+    )
+    img.save(png_path, format="PNG")
+
+
 def _part_placement(text: str, zone: dict[str, Any], settings: dict[str, Any]) -> int:
     """Ligne de base (y, pixels de sortie) qui centre verticalement ``text``
     (encre + bordure, mesuree avec Poppins a part_font_size) dans ``zone`` ;
@@ -606,13 +819,18 @@ def _build_filter_complex(
     *,
     title_input: int | None = None,
     source_offset: float = 0.0,
+    cta_input: int | None = None,
+    cta_start: float | None = None,
 ) -> tuple[str, str]:
     """Graphe ffmpeg du clip. En letterbox (``layout`` = letterbox a la racine
     de reframe_data), ``title_input`` est l'index de l'entree ffmpeg du PNG
     de titre, incruste en haut-gauche de la zone title pour tout le clip ;
     pas d'accroche ; « Partie N » (``part_path``) centre dans la zone part.
-    ``source_offset`` : point (s) ou l'entree source est positionnee par
-    ``-ss`` ; trim et atrim sont relatifs a lui."""
+    ``cta_input`` (SPEC-6a47) : index de l'entree ffmpeg du PNG de la carte
+    de fin, incruste sur la zone subtitles a partir de ``cta_start`` (s,
+    relatif au debut du clip) jusqu'a la fin. ``source_offset`` : point (s)
+    ou l'entree source est positionnee par ``-ss`` ; trim et atrim sont
+    relatifs a lui."""
     letterbox = reframe_data.get("layout") in _TEXT_LAYOUTS
     out_w = reframe_data["output"]["width"]
     out_h = reframe_data["output"]["height"]
@@ -656,6 +874,14 @@ def _build_filter_complex(
                 f"x={px0}+({px1 - px0}-text_w)/2:y={baseline}:y_align=baseline[vpart]"
             )
             cur = "vpart"
+        if cta_input is not None:
+            if cta_start is None:
+                raise RenderError("carte de fin : cta_start absent pour l'entree ffmpeg cta_input")
+            sx0, sy0, _sx1, _sy1 = _zone(zones["subtitles"])
+            lines.append(
+                f"[{cur}][{cta_input}:v]overlay=x={sx0}:y={sy0}:enable='gte(t,{cta_start:.6f})'[vcta]"
+            )
+            cur = "vcta"
         lines.append(_audio_filter(clip_start - source_offset, clip_end - source_offset, settings))
         return ";".join(lines), cur
 
@@ -688,6 +914,56 @@ def _audio_filter(clip_start: float, clip_end: float, settings: dict[str, Any]) 
         f"[0:a]atrim=start={clip_start:.6f}:end={clip_end:.6f},asetpts=PTS-STARTPTS,"
         f"loudnorm=I={settings['loudnorm_i']}:TP={settings['loudnorm_tp']}:LRA={settings['loudnorm_lra']}[aout]"
     )
+
+
+# --------------------------------------------------------------------------
+# Carte de fin (SPEC-6a47) : les sous-titres sont absents pendant les
+# dernieres cta_seconds. On tronque une COPIE du .ass ecrit par l'etape
+# subtitles (jamais l'original sur disque - ADR-b16b, render n'importe pas
+# subtitles.py, ce parseur lui est donc propre) : un evenement qui deborde du
+# point de coupure est raccourci a ce point, un evenement qui commence apres
+# est retire.
+# --------------------------------------------------------------------------
+
+_ASS_DIALOGUE_PREFIX = "Dialogue:"
+
+
+def _parse_ass_time(ts: str) -> float:
+    h, m, s = ts.split(":")
+    return int(h) * 3600 + int(m) * 60 + float(s)
+
+
+def _format_ass_time(seconds: float) -> str:
+    seconds = max(0.0, seconds)
+    centis = round(seconds * 100)
+    cs = centis % 100
+    total_seconds = centis // 100
+    s = total_seconds % 60
+    total_minutes = total_seconds // 60
+    m = total_minutes % 60
+    h = total_minutes // 60
+    return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
+
+
+def truncate_ass_for_cta(ass_text: str, cutoff: float) -> str:
+    """``ass_text`` avec tout evenement Dialogue absent au-dela de ``cutoff``
+    (secondes depuis le debut du clip, jamais negatif) : un evenement qui
+    deborde est raccourci a ``cutoff``, un evenement qui commence a ou apres
+    ``cutoff`` est retire."""
+    out_lines = []
+    for line in ass_text.splitlines():
+        if line.startswith(_ASS_DIALOGUE_PREFIX):
+            rest = line[len(_ASS_DIALOGUE_PREFIX):].lstrip()
+            fields = rest.split(",", 9)
+            start, end = _parse_ass_time(fields[1]), _parse_ass_time(fields[2])
+            if start >= cutoff:
+                continue
+            if end > cutoff:
+                fields[2] = _format_ass_time(cutoff)
+            out_lines.append(f"{_ASS_DIALOGUE_PREFIX} " + ",".join(fields))
+        else:
+            out_lines.append(line)
+    return "\n".join(out_lines) + ("\n" if out_lines else "")
 
 
 # --------------------------------------------------------------------------
@@ -775,6 +1051,19 @@ def render(
         return mp4_out
 
     settings = _settings(config)
+    cta_enabled = bool(settings["cta_enabled"])
+    if cta_enabled:
+        # ADR-ad2e : jamais de CTA a moitie active (verification independante
+        # du clip, avant toute lecture de fichier).
+        if not str(settings["cta_handle"]).strip():
+            raise RenderError(
+                "[render] cta_enabled sans cta_handle : renseigner cta_handle ou desactiver cta_enabled"
+            )
+        cta_seconds_setting = float(settings["cta_seconds"])
+        if cta_seconds_setting <= 0:
+            raise RenderError(
+                f"[render] cta_seconds doit etre > 0, recu {cta_seconds_setting}"
+            )
 
     source = video_dir / f"{video_id}.mp4"
     if not source.exists():
@@ -838,21 +1127,61 @@ def render(
                 )
             rects[key] = {k: int(panel[0]["dest"][k]) for k in ("x", "y", "w", "h")}
 
+    cta_applies = letterbox and cta_enabled
+    if cta_applies:
+        if not str(settings["cta_text"]).strip():
+            raise RenderError(
+                "[render] cta_enabled sans cta_text : renseigner cta_text ou desactiver cta_enabled"
+            )
+        cta_seconds = float(settings["cta_seconds"])
+        if cta_seconds >= float(clip["duration"]):
+            raise RenderError(
+                f"cta_seconds ({cta_seconds}) >= duree du clip {clip_id} ({clip['duration']}) : "
+                "reduire [render] cta_seconds ou desactiver cta_enabled pour ce clip"
+            )
+
     scratch_dir = video_dir / "render" / clip_id
     scratch_dir.mkdir(parents=True, exist_ok=True)
     try:
         hook_path: Path | None = None
         part_path: Path | None = None
         extra_inputs: tuple[Path, ...] = ()
+        ass_for_filter = ass_path
+        cta_start_rel: float | None = None
+        cta_input: int | None = None
         if letterbox:
             # Titre d'ecran pendant tout le clip, pas d'accroche de 2 s (SPEC-6127,
             # letterbox comme stream).
+            title_zone = reframe_data["text_zones"]["title"]
+            if cta_applies:
+                # Le pseudo se place sous l'encadre du titre : on reserve la
+                # place en remontant le titre (title_lift effectif plus grand
+                # que celui configure), sans toucher au rendu par defaut
+                # (SPEC-6a47).
+                zone_w = title_zone["x1"] - title_zone["x0"]
+                pseudo = layout_pseudo(str(settings["cta_handle"]), zone_w, settings)
+                reserved = int(settings["cta_handle_gap"]) + pseudo.height
+                title_settings = {**settings, "title_lift": int(settings["title_lift"]) + reserved}
+            else:
+                title_settings = settings
             png = scratch_dir / "title.png"
-            title_png(screen_title, reframe_data["text_zones"]["title"], settings, png)
+            title_layout = title_png(screen_title, title_zone, title_settings, png)
+            if cta_applies:
+                _draw_pseudo(png, title_zone, title_layout, str(settings["cta_handle"]), pseudo, settings)
             extra_inputs = (png,)
             if clip["parts_total"] > 1:
                 part_path = scratch_dir / "part.txt"
                 part_path.write_text(f"Partie {clip['part']}", encoding="utf-8")
+            if cta_applies:
+                card_png = scratch_dir / "cta_card.png"
+                cta_card_png(str(settings["cta_text"]), reframe_data["text_zones"]["subtitles"], settings, card_png)
+                extra_inputs = extra_inputs + (card_png,)
+                cta_input = len(extra_inputs)  # 1 = title.png, 2 = cta_card.png (entrees apres la source)
+                cutoff = float(clip["duration"]) - float(settings["cta_seconds"])
+                truncated = truncate_ass_for_cta(ass_path.read_text(encoding="utf-8"), cutoff)
+                ass_for_filter = scratch_dir / "subtitles_cta.ass"
+                ass_for_filter.write_text(truncated, encoding="utf-8")
+                cta_start_rel = cutoff
         else:
             hook_path = scratch_dir / "hook.txt"
             hook_path.write_text(clip["hook_text"], encoding="utf-8")
@@ -865,8 +1194,9 @@ def render(
         seek = max(0.0, min([clip["start"]] + [p["start"] for p in reframe_data["plans"]]))
         seek_end = max([clip["end"]] + [p["end"] for p in reframe_data["plans"]])
         filter_complex, vout_label = _build_filter_complex(
-            reframe_data, clip["start"], clip["end"], ass_path, hook_path, part_path, scratch_dir, settings,
+            reframe_data, clip["start"], clip["end"], ass_for_filter, hook_path, part_path, scratch_dir, settings,
             title_input=1 if letterbox else None, source_offset=seek,
+            cta_input=cta_input, cta_start=cta_start_rel,
         )
 
         target_fps = float(settings["max_fps"])
@@ -904,6 +1234,7 @@ def render(
         "hashtags": clip["hashtags"],
         "transcript": _clip_transcript(transcript, clip["start"], clip["end"]),
         "layout": reframe_data["layout"],
+        "cta": cta_applies,
         "qa": dict(_QA_DEFAULT),
         "created_at": datetime.now(timezone.utc).isoformat(),
     }

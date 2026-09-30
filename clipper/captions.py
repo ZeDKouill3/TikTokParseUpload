@@ -56,6 +56,13 @@ partie 1 fixe title et screen_title, repris par les suivantes). La sortie
 (ordre des clips) est celle de parts.json (moments, puis parties), quel que
 soit l'ordre d'arrivee des reponses. ``parallel`` < 1 est refuse avec une
 erreur explicite.
+
+Appel a l'abonnement (SPEC-6a47, config, vide par defaut) : ``cta_line``
+(chaine) ajoutee a la fin de ``caption`` sur une nouvelle ligne quand non
+vide ; ``cta_hashtags`` (liste) ajoutes a ``hashtags`` (sans doublon avec
+ceux deja choisis par l'IA). Applique une fois tous les clips generes,
+independamment de l'IA ; un ``cta_hashtags`` qui ne commence pas par # est
+une erreur explicite (ADR-ad2e).
 """
 
 from __future__ import annotations
@@ -76,6 +83,12 @@ CONFIG_DEFAULTS: dict[str, object] = {
     # Nombre de moments traites en parallele (leurs parties restant
     # sequentielles entre elles) ; 1 = sequentiel, comme avant.
     "parallel": 4,
+    # Appel a l'abonnement (SPEC-6a47), vide par defaut : sans configuration
+    # explicite, caption et hashtags restent inchanges par cette spec.
+    # cta_line : ajoutee a la fin de caption. cta_hashtags : ajoutes a
+    # hashtags, memes regles que les autres (commencent par #, sans doublon).
+    "cta_line": "",
+    "cta_hashtags": [],
 }
 
 _EDGE = 0.1
@@ -396,6 +409,29 @@ def _clip_id(moment_id: int, part: int, parts_total: int) -> str:
     return base if parts_total == 1 else f"{base}-p{part}"
 
 
+def _apply_cta_line(clips: list[dict[str, Any]], settings: dict[str, Any]) -> None:
+    """Applique ``[captions] cta_line``/``cta_hashtags`` (SPEC-6a47) a chaque
+    clip : vide par defaut, donc sans effet sans configuration explicite. Un
+    hashtag qui ne commence pas par # est une erreur explicite (ADR-ad2e) ;
+    un doublon avec un hashtag deja choisi par l'IA est simplement omis."""
+    cta_line = str(settings.get("cta_line") or "").strip()
+    cta_hashtags = settings.get("cta_hashtags") or []
+    if not cta_line and not cta_hashtags:
+        return
+    for tag in cta_hashtags:
+        if not isinstance(tag, str) or not tag.startswith("#") or not tag[1:].strip():
+            raise CaptionsError(f"[captions] cta_hashtags : hashtag invalide (doit commencer par #) : {tag!r}")
+    for clip in clips:
+        if cta_line:
+            clip["caption"] = f"{clip['caption']}\n{cta_line}"
+        if cta_hashtags:
+            seen = {h.lower() for h in clip["hashtags"]}
+            for tag in cta_hashtags:
+                if tag.lower() not in seen:
+                    clip["hashtags"].append(tag)
+                    seen.add(tag.lower())
+
+
 def parallel_workers(settings: dict[str, Any]) -> int:
     """Nombre de moments traites en parallele ; < 1 : CaptionsError qui le nomme."""
     value = settings["parallel"]
@@ -513,6 +549,7 @@ def run(
         grouped = list(executor.map(process, pairs))
 
     clips = [clip for group in grouped for clip in group]
+    _apply_cta_line(clips, settings)
 
     result = {"video_id": video_id, "clips": clips}
     video_dir.mkdir(parents=True, exist_ok=True)

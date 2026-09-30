@@ -90,15 +90,55 @@ Deux réglages indépendants dans `config.toml` :
   haut, jeu en bas, **jamais de bascule dans un clip**), les autres en
   letterbox classique.
 
-Le contrat de sortie d'un clip (`SPEC-6127`) : `.mp4` vertical 1080x1920 +
-`.json` sidecar (titre, légende, hashtags, rapport qa...). En letterbox,
-titre d'écran en haut, sous-titres dans la bande floue du bas.
+Le contrat de sortie d'un clip (`SPEC-6a47`, succède à `SPEC-6127`) :
+`.mp4` vertical 1080x1920 + `.json` sidecar (titre, légende, hashtags,
+rapport qa...). En letterbox, titre d'écran en haut, sous-titres dans la
+bande floue du bas. Voir *Appel à l'abonnement* ci-dessous pour le pseudo de
+chaîne et la carte de fin optionnels.
 
 ```toml
 [reframe]
 format = "letterbox"
 layout = "stream_auto"   # ou "letterbox"
 ```
+
+## Appel à l'abonnement (SPEC-6a47, `preset` par chaîne)
+
+Désactivé par défaut : sans configuration explicite, le rendu, le sidecar et
+la légende restent identiques à `SPEC-6127`. Utile pour une chaîne tierce
+(ex. un·e streameur·se dont on republie les meilleurs moments) : pseudo de
+chaîne discret sous le titre d'écran pendant tout le clip, carte de fin
+« Abonne-toi ! » sur les dernières secondes, ligne d'appel et hashtags
+supplémentaires dans la description. S'applique en letterbox et en stream
+(`layout = "stream_auto"`) ; ignoré en `format = "crop"` (option figée,
+`cta` reste `false` dans le sidecar, ce n'est pas une erreur).
+
+Un preset par chaîne est un fichier de config séparé, passé avec `--config` :
+
+```powershell
+python -m clipper run https://www.twitch.tv/videos/<id> --config presets/madajel.toml
+```
+
+`presets/madajel.toml` :
+
+```toml
+[render]
+cta_enabled = true
+cta_handle = "twitch.tv/madajel"
+cta_seconds = 2.0                        # duree de la carte de fin (defaut)
+cta_text = "Abonne-toi !"                # texte de la carte de fin (defaut)
+
+[captions]
+cta_line = "Abonne-toi sur Twitch pour plus de lives !"
+cta_hashtags = ["#twitch", "#horreur"]
+```
+
+`cta_enabled` sans `cta_handle` (côté `[render]`) ou sans `cta_text`, ou un
+`cta_seconds` <= 0 ou >= la durée d'un clip, est une erreur explicite
+(ADR-ad2e : jamais de CTA à moitié activé) — jamais une carte de fin ou un
+pseudo tronqué ou absent en silence. Les réglages de mise en page (tailles de
+police, marges) vivent dans `CONFIG_DEFAULTS` de `clipper/render.py`
+(`cta_handle_font_size`, `cta_card_font_size`...).
 
 ## Configuration (`config.toml`)
 
@@ -152,7 +192,8 @@ hors grille stricte, pour ne pas se figer sur les mêmes formats).
 
 `[captions]` — `title_max_chars` = 100, `caption_max_chars` = 300,
 `hashtags_max` = 8, `hook_words_max` = 8, `parallel` = 4 (moments traités en
-parallèle).
+parallèle), `cta_line`/`cta_hashtags` (SPEC-6a47, vides par défaut, voir
+*Appel à l'abonnement* ci-dessus).
 
 `[reframe]` — voir *Formats* ci-dessus, plus le détecteur de visages
 (`detector` = `"mediapipe"`, `min_confidence` = 0.5, `sample_fps` = 5.0),
@@ -168,7 +209,10 @@ le pipeline).
 (`loudnorm_i/tp/lra`), réglages du titre d'écran (`title_font_size`,
 `title_pad_x/y`...) et de l'accroche (`hook_seconds`, `hook_font_size`,
 `hook_margin_top`). Encodeur choisi par `clipper.gpu` (`h264_nvenc` si CUDA
-détecté, sinon `libx264`).
+détecté, sinon `libx264`). `cta_enabled`/`cta_handle`/`cta_seconds`/
+`cta_text` (SPEC-6a47, désactivé par défaut, voir *Appel à l'abonnement*
+ci-dessus) et leurs réglages de mise en page (`cta_handle_font_size`,
+`cta_card_font_size`...).
 
 `[qa]` — `expected_width`/`expected_height` = 1080/1920,
 `duration_tolerance` = 0.5, seuils de silence et d'image noire
