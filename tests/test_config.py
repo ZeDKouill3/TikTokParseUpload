@@ -212,3 +212,164 @@ def test_config_flat_keys_still_work_alongside_sections(isolated_cwd, monkeypatc
 
     assert config.mode == "auto"
     assert config.section("fake_step") == {"model": "large"}
+
+
+def test_config_with_base_merges_flat_keys_preset_wins(isolated_cwd):
+    from clipper.config import load_config
+
+    (isolated_cwd / "config.toml").write_text('mode = "review"\nworkspace_dir = "ws"\n')
+    (isolated_cwd / "preset.toml").write_text('mode = "auto"\n')
+
+    config = load_config(isolated_cwd / "preset.toml", base=isolated_cwd / "config.toml")
+
+    assert config.mode == "auto"
+    assert config.workspace_dir == Path("ws")
+
+
+def test_config_with_base_merges_sections_key_by_key_preset_wins(isolated_cwd, monkeypatch):
+    from clipper.config import load_config
+
+    _install_fake_section_module(
+        monkeypatch, "fake_step", config_defaults={"model": "small", "threshold": 0.5}
+    )
+    (isolated_cwd / "config.toml").write_text('[fake_step]\nmodel = "large"\nthreshold = 0.9\n')
+    (isolated_cwd / "preset.toml").write_text('[fake_step]\nmodel = "xlarge"\n')
+
+    config = load_config(isolated_cwd / "preset.toml", base=isolated_cwd / "config.toml")
+
+    assert config.section("fake_step") == {"model": "xlarge", "threshold": 0.9}
+
+
+def test_config_with_base_replaces_subtable_wholesale(isolated_cwd, monkeypatch):
+    from clipper.config import load_config
+
+    _install_fake_section_module(
+        monkeypatch,
+        "fake_step",
+        config_defaults={"usages": {"default": {"model": "small", "temperature": 0.1}}},
+    )
+    (isolated_cwd / "config.toml").write_text(
+        '[fake_step.usages.default]\nmodel = "small"\ntemperature = "0.1"\n'
+    )
+    (isolated_cwd / "preset.toml").write_text(
+        '[fake_step.usages.default]\nmodel = "large"\n'
+    )
+
+    config = load_config(isolated_cwd / "preset.toml", base=isolated_cwd / "config.toml")
+
+    assert config.section("fake_step") == {"usages": {"default": {"model": "large"}}}
+
+
+def test_config_with_base_rejects_unknown_flat_key_in_preset(isolated_cwd):
+    from clipper.config import ConfigError, load_config
+
+    (isolated_cwd / "config.toml").write_text('mode = "review"\n')
+    (isolated_cwd / "preset.toml").write_text('not_a_real_key = 1\n')
+
+    with pytest.raises(ConfigError, match="not_a_real_key"):
+        load_config(isolated_cwd / "preset.toml", base=isolated_cwd / "config.toml")
+
+
+def test_config_with_base_rejects_unknown_section_in_preset(isolated_cwd):
+    from clipper.config import ConfigError, load_config
+
+    (isolated_cwd / "config.toml").write_text('mode = "review"\n')
+    (isolated_cwd / "preset.toml").write_text('[no_such_clipper_module_xyz]\nfoo = 1\n')
+
+    with pytest.raises(ConfigError, match="no_such_clipper_module_xyz"):
+        load_config(isolated_cwd / "preset.toml", base=isolated_cwd / "config.toml")
+
+
+def test_config_with_base_rejects_unknown_key_in_known_section_of_preset(isolated_cwd, monkeypatch):
+    from clipper.config import ConfigError, load_config
+
+    _install_fake_section_module(monkeypatch, "fake_step", config_defaults={"model": "small"})
+    (isolated_cwd / "config.toml").write_text('[fake_step]\nmodel = "large"\n')
+    (isolated_cwd / "preset.toml").write_text('[fake_step]\nnot_a_real_key = 1\n')
+
+    with pytest.raises(ConfigError, match=r"fake_step.*not_a_real_key"):
+        load_config(isolated_cwd / "preset.toml", base=isolated_cwd / "config.toml")
+
+
+def test_config_with_base_full_preset_loads_identically_with_or_without_base(
+    isolated_cwd, monkeypatch
+):
+    from clipper.config import load_config
+
+    _install_fake_section_module(
+        monkeypatch, "fake_step", config_defaults={"model": "small", "threshold": 0.5}
+    )
+    (isolated_cwd / "config.toml").write_text(
+        'mode = "review"\nworkspace_dir = "ws1"\noutput_dir = "out1"\n'
+        '[fake_step]\nmodel = "base_model"\nthreshold = 0.1\n'
+    )
+    (isolated_cwd / "preset.toml").write_text(
+        'mode = "auto"\nworkspace_dir = "ws2"\noutput_dir = "out2"\n'
+        '[fake_step]\nmodel = "preset_model"\nthreshold = 0.9\n'
+    )
+
+    with_base = load_config(isolated_cwd / "preset.toml", base=isolated_cwd / "config.toml")
+    without_base = load_config(isolated_cwd / "preset.toml")
+
+    assert with_base.mode == without_base.mode == "auto"
+    assert with_base.workspace_dir == without_base.workspace_dir == Path("ws2")
+    assert with_base.output_dir == without_base.output_dir == Path("out2")
+    assert with_base.section("fake_step") == without_base.section("fake_step") == {
+        "model": "preset_model",
+        "threshold": 0.9,
+    }
+
+
+def test_write_config_serializes_toml_and_is_reread_by_load_config(isolated_cwd, monkeypatch):
+    from clipper.config import load_config, write_config
+
+    _install_fake_section_module(monkeypatch, "fake_step", config_defaults={"model": "small"})
+    path = isolated_cwd / "config.toml"
+
+    write_config(path, {"mode": "auto", "fake_step": {"model": "large"}})
+
+    assert "mode" in path.read_text()
+    config = load_config(path)
+    assert config.mode == "auto"
+    assert config.section("fake_step") == {"model": "large"}
+
+
+def test_write_config_with_base_rereads_using_same_base(isolated_cwd, monkeypatch):
+    from clipper.config import load_config, write_config
+
+    _install_fake_section_module(monkeypatch, "fake_step", config_defaults={"model": "small"})
+    base_path = isolated_cwd / "config.toml"
+    base_path.write_text('[fake_step]\nmodel = "base_model"\n')
+    preset_path = isolated_cwd / "preset.toml"
+
+    write_config(preset_path, {"mode": "auto"}, base=base_path)
+
+    config = load_config(preset_path, base=base_path)
+    assert config.mode == "auto"
+    assert config.section("fake_step") == {"model": "base_model"}
+
+
+def test_write_config_replaces_file_atomically(isolated_cwd):
+    from clipper.config import write_config
+
+    path = isolated_cwd / "config.toml"
+    path.write_text('mode = "review"\n')
+
+    write_config(path, {"mode": "auto"})
+
+    assert path.read_text().strip() == 'mode = "auto"'
+    assert not path.with_suffix(".toml.tmp").exists()
+
+
+def test_write_config_leaves_original_file_intact_on_config_error(isolated_cwd):
+    from clipper.config import ConfigError, write_config
+
+    path = isolated_cwd / "config.toml"
+    original = 'mode = "review"\n'
+    path.write_text(original)
+
+    with pytest.raises(ConfigError):
+        write_config(path, {"mode": "review", "not_a_real_key": 1})
+
+    assert path.read_text() == original
+    assert not path.with_suffix(".toml.tmp").exists()

@@ -5,7 +5,7 @@ slug: config-preset-de-cha-ne-en-surcouche-de-config-t
 title: "config : preset de chaîne en surcouche de config.toml (base) et écriture TOML validée"
 created: 2026-09-30T20:42:22Z
 author: w-plan-web
-status: open
+status: in_progress
 scope:
   - clipper/config.py
   - tests/test_config.py
@@ -17,7 +17,7 @@ criteria_by: creator
 verify: [tests]
 method: tdd
 schema: 4
-version: 1
+version: 2
 ---
 
 ADR-4f6e §2, SPEC-fc0c §1.2 et §1.5. Décision utilisateur 2026-09-30 : un preset ne porte que ce qui diffère de config.toml ; backend LLM, modèles et dossiers vivent une seule fois dans config.toml. Les commentaires TOML sont perdus à l'écriture (accepté).
