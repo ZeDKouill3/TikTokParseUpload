@@ -37,9 +37,12 @@ indisponible : l'erreur remonte, rien n'est ecrit (ADR-ad2e).
 from __future__ import annotations
 
 import json
+import logging
+import math
 import threading
+import time
 import tomllib
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +50,8 @@ import cv2
 import numpy as np
 
 from clipper import llm
+
+log = logging.getLogger(__name__)
 
 CONFIG_DEFAULTS: dict[str, object] = {
     # Marge autour de chaque moment candidat, en secondes.
@@ -236,6 +241,23 @@ def _save_partial(path: Path, results: list[list[dict[str, Any]] | None]) -> Non
     tmp.replace(path)
 
 
+def _progress_gate(total: int) -> Any:
+    """Ferme une fonction ``gate(i)`` (i de 1 a ``total``) qui dit si le lot
+    ``i`` doit etre annonce a INFO : au plus toutes les 30 s ou tous les 10 %
+    (toujours le dernier). Done_criteria de TASK-8abc."""
+    last: dict[str, float] = {"i": 0, "t": time.monotonic()}
+    step = max(1, math.ceil(total * 0.1)) if total else 1
+
+    def gate(i: int) -> bool:
+        now = time.monotonic()
+        if i >= total or i - last["i"] >= step or now - last["t"] >= 30.0:
+            last["i"], last["t"] = i, now
+            return True
+        return False
+
+    return gate
+
+
 def run(
     video_id: str,
     workspace_dir: str | Path = "workspace",
@@ -311,10 +333,28 @@ def run(
     try:
         pending = [n for n in range(len(batches)) if results[n] is None]
         if pending:
+            total = len(batches)
+            gate = _progress_gate(total)
+            done_count = total - len(pending)
+            errors: dict[int, Exception] = {}
             with ThreadPoolExecutor(max_workers=max(1, parallel)) as executor:
-                futures = [executor.submit(process, n) for n in pending]
-                for future in futures:
-                    future.result()
+                futures = {executor.submit(process, n): n for n in pending}
+                for future in as_completed(futures):
+                    n = futures[future]
+                    try:
+                        future.result()
+                    except Exception as exc:  # noqa: BLE001 - la premiere levee est deterministe (voir errors)
+                        errors[n] = exc
+                        continue
+                    done_count += 1
+                    log.debug("%s : vision lot %d/%d", video_id, done_count, total)
+                    if gate(done_count):
+                        log.info("%s : vision lot %d/%d", video_id, done_count, total)
+            if errors:
+                # Meme lot en echec quel que soit l'ordre reel de fin des threads
+                # (as_completed n'est pas deterministe) : celui soumis en premier.
+                first = next(n for n in pending if n in errors)
+                raise errors[first]
     finally:
         for f in resize_dir.iterdir():
             f.unlink()

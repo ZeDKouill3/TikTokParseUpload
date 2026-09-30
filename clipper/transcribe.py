@@ -63,6 +63,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -272,7 +273,40 @@ def _whisper_vocab(model: Any, vocab: list[str], max_tokens: int) -> list[str]:
     return vocab[:kept]
 
 
+def _progress_gate(total: float) -> Any:
+    """Ferme une fonction ``gate(done)`` (secondes d'audio traitees, sur
+    ``total``) qui dit si cet avancement doit etre annonce a INFO : au plus
+    toutes les 30 s ou tous les 10 % (toujours l'arrivee). Done_criteria de
+    TASK-8abc."""
+    last: dict[str, float] = {"done": 0.0, "t": time.monotonic()}
+    step = total * 0.1 if total else 0.0
+
+    def gate(done: float) -> bool:
+        now = time.monotonic()
+        if done >= total - 1e-6 or done - last["done"] >= step or now - last["t"] >= 30.0:
+            last["done"], last["t"] = done, now
+            return True
+        return False
+
+    return gate
+
+
+def _log_whisper_progress(video_id: str, seg_end: float, total_duration: float, start_wall: float, gate: Any) -> None:
+    elapsed_wall = max(1e-9, time.monotonic() - start_wall)
+    rtf = seg_end / elapsed_wall
+    log.debug(
+        "%s : transcription %.1f/%.1f min (facteur temps reel %.1fx)",
+        video_id, seg_end / 60.0, total_duration / 60.0, rtf,
+    )
+    if gate(seg_end):
+        log.info(
+            "%s : transcription %.1f/%.1f min (facteur temps reel %.1fx)",
+            video_id, seg_end / 60.0, total_duration / 60.0, rtf,
+        )
+
+
 def _run_whisper(
+    video_id: str,
     model_factory: Callable[[str, str, str], Any],
     audio_path: Path,
     settings: dict[str, Any],
@@ -299,7 +333,14 @@ def _run_whisper(
             raw_segments, info = runner.transcribe(str(audio_path), batch_size=batch_size, **options)
         else:
             raw_segments, info = model.transcribe(str(audio_path), **options)
-        segments = [_segment_dict(seg) for seg in raw_segments]
+        total_duration = float(info.duration or 0.0)
+        gate = _progress_gate(total_duration)
+        start_wall = time.monotonic()
+        segments = []
+        for seg in raw_segments:
+            segments.append(_segment_dict(seg))
+            if total_duration > 0:
+                _log_whisper_progress(video_id, segments[-1]["end"], total_duration, start_wall, gate)
         header = {
             "language": info.language,
             "language_probability": info.language_probability,
@@ -585,7 +626,7 @@ def transcribe(
         audio = video_dir / "transcribe_audio.wav"
         try:
             audio_extractor(video, audio)
-            segments, header = _run_whisper(model_factory, audio, settings, vocab, pipeline_factory)
+            segments, header = _run_whisper(video_id, model_factory, audio, settings, vocab, pipeline_factory)
         finally:
             audio.unlink(missing_ok=True)
 

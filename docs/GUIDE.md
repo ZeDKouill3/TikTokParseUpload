@@ -2,8 +2,8 @@
 
 Ce guide suppose l'installation faite (voir `README.md`). Toutes les
 commandes sont `python -m clipper <commande> ...` ; `--config chemin.toml`
-(défaut `config.toml`) et `-v`/`--verbose` (journal détaillé des étapes)
-marchent sur toutes.
+(défaut `config.toml`) et `-v`/`-vv` (journal détaillé des étapes, voir
+*Sortie détaillée* ci-dessous) marchent sur toutes.
 
 ## Les 12 étapes du pipeline
 
@@ -38,6 +38,31 @@ une étape dont le résultat existe déjà n'est pas relancée (sauf `--force`).
 Un seul modèle lourd est en VRAM à la fois (ADR-fb9b) : les étapes tournent
 en séquence et chacune libère le sien (whisper dans `transcribe`, détecteur
 de visages dans `reframe`) avant la suivante.
+
+## Sortie détaillée (`-v` / `-vv`)
+
+Sans `-v`, la sortie ne change pas : les lignes `[étape] démarrée` / `[étape]
+terminée en X s` de la CLI (indépendantes du niveau de journal). Avec `-v`
+(niveau `INFO`), la console montre en plus, au fil de l'eau :
+
+- début et fin de chaque étape, avec sa durée ;
+- la progression des étapes longues, au plus toutes les 30 s ou tous les
+  10 % : `download` (pourcentage et débit), `transcribe` (minutes d'audio
+  traitées sur le total, facteur temps réel), `reframe`/`render`/`qa` (clip
+  i/N avec sa durée), `vision` (lot d'images i/N) ;
+- une ligne par appel LLM (usage, modèle, tokens entrée/sortie/cache, coût,
+  durée, et son issue : réussi, réessai avant réparation, ou échec) ;
+- en sélection par jury (`moments`, ADR-ff87), la décision de chaque candidat
+  jugé (score final, retenu, rejeté, veto, ou exploration) ;
+- un résumé de `moments` (candidats notés, retenus, raison des rejets) ;
+- à la fin d'un run qui va jusqu'au bout : un résumé (durée par étape, nombre
+  de clips, statuts qa, coût LLM total et par usage, chemin de `output/`).
+
+`-vv` (niveau `DEBUG`) ajoute le détail : chaque événement de progression
+(chaque appel LLM, chaque segment transcrit, chaque clip ou lot traité) sans
+attendre le seuil des 30 s / 10 %, plus quelques lignes internes (détail des
+appels LLM). `scenes` n'est pas concerné ici (sa propre progression est une
+tâche séparée).
 
 ## Modes : review et auto
 

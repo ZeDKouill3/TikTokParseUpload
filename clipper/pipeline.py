@@ -75,6 +75,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor
@@ -262,6 +263,24 @@ def is_transient(exc: BaseException) -> bool:
 # --------------------------------------------------------------------------
 
 
+def _progress_gate(total: int) -> Any:
+    """Ferme une fonction ``gate(i)`` (i de 1 a ``total``) qui dit si l'element
+    ``i`` doit etre annonce a INFO : au plus toutes les 30 s ou tous les 10 %
+    (toujours le dernier). Sert a la progression des boucles longues (clip par
+    clip) sans inonder la console (done_criteria de TASK-8abc)."""
+    last: dict[str, float] = {"i": 0, "t": time.monotonic()}
+    step = max(1, math.ceil(total * 0.1)) if total else 1
+
+    def gate(i: int) -> bool:
+        now = time.monotonic()
+        if i >= total or i - last["i"] >= step or now - last["t"] >= 30.0:
+            last["i"], last["t"] = i, now
+            return True
+        return False
+
+    return gate
+
+
 class _Run:
     """Contexte d'un passage du pipeline sur une video."""
 
@@ -335,9 +354,16 @@ class _Run:
             # Facecam detectee une fois pour toute la video (SPEC-3a88), avant les clips.
             reframe.detect_facecam(self.video_id, self.ws, config=self.config, force=self.force,
                                    detector_factory=opts.get("detector_factory"))
-        for clip in self.clips():
+        clips = self.clips()
+        gate = _progress_gate(len(clips))
+        for i, clip in enumerate(clips, 1):
+            t0 = time.monotonic()
             reframe.reframe(self.video_id, clip["id"], clip["start"], clip["end"], self.ws,
                             config=self.config, force=self.force, **opts)
+            elapsed = time.monotonic() - t0
+            log.debug("%s : reframe clip %d/%d (%s) en %.1fs", self.video_id, i, len(clips), clip["id"], elapsed)
+            if gate(i):
+                log.info("%s : reframe clip %d/%d (%s) en %.1fs", self.video_id, i, len(clips), clip["id"], elapsed)
 
     def _subtitles_clip(self, clip: dict[str, Any]) -> None:
         plan = _read_json(self.dir / "reframe" / f"{clip['id']}.json")
@@ -364,9 +390,16 @@ class _Run:
             future.result()
 
     def render(self) -> None:
-        for clip in self.clips():
+        clips = self.clips()
+        gate = _progress_gate(len(clips))
+        for i, clip in enumerate(clips, 1):
+            t0 = time.monotonic()
             render_step.render(self.video_id, clip["id"], self.ws, self.out, config=self.config,
                                force=self.force, **self.opts("render"))
+            elapsed = time.monotonic() - t0
+            log.debug("%s : render clip %d/%d (%s) en %.1fs", self.video_id, i, len(clips), clip["id"], elapsed)
+            if gate(i):
+                log.info("%s : render clip %d/%d (%s) en %.1fs", self.video_id, i, len(clips), clip["id"], elapsed)
 
     def qa(self) -> None:
         if not self.clips():
@@ -645,13 +678,39 @@ def _usage_summary(usage_log_path: Path) -> dict[str, dict[str, float | int]]:
     return totals
 
 
+def _step_duration(step: dict[str, Any]) -> float:
+    started, finished = step.get("started_at"), step.get("finished_at")
+    if not started or not finished:
+        return 0.0
+    return round((datetime.fromisoformat(finished) - datetime.fromisoformat(started)).total_seconds(), 1)
+
+
+def _log_run_summary(run: _Run, usage_summary: dict[str, dict[str, float | int]]) -> None:
+    """Resume final d'un run termine (status done) : duree par etape, nombre
+    de clips, statuts qa, cout LLM total et par usage, chemin de sortie
+    (done_criteria de TASK-8abc)."""
+    durations = {name: _step_duration(run.state["steps"][name]) for name in STEPS}
+    clips = run.state.get("clips") or []
+    qa_counts: dict[str, int] = {}
+    for clip in clips:
+        qa_counts[clip["qa_status"]] = qa_counts.get(clip["qa_status"], 0) + 1
+    total_cost = sum(bucket.get("cost_usd") or 0.0 for bucket in usage_summary.values())
+    log.info(
+        "%s : termine - %d clip(s) %s, duree par etape %s, cout LLM total %.4f$ (%s), sortie %s",
+        run.video_id, len(clips), qa_counts, durations, total_cost, usage_summary,
+        run.out / run.video_id,
+    )
+
+
 def _advance(run: _Run, *, through_review: bool) -> dict[str, Any]:
     """Enchaine les etapes restantes (voir _advance_steps) sous
     ``llm.usage_log`` : chaque appel LLM du passage (y compris ceux faits
     depuis un thread, ex. l'etape subtitles) est journalise dans
     workspace/<video_id>/llm_usage.jsonl ; un resume par usage (tokens, cout,
     cumules depuis le debut de la video) est journalise a la fin du passage,
-    qu'il se termine en succes, en echec ou en attente de revue."""
+    qu'il se termine en succes, en echec ou en attente de revue. Un run qui va
+    jusqu'au bout (status done) ajoute un resume complet (voir
+    ``_log_run_summary``)."""
     usage_log_path = run.dir / USAGE_LOG_FILE
     with llm.usage_log(usage_log_path):
         try:
@@ -660,6 +719,8 @@ def _advance(run: _Run, *, through_review: bool) -> dict[str, Any]:
             summary = _usage_summary(usage_log_path)
             if summary:
                 log.info("%s : consommation LLM par usage %s", run.video_id, summary)
+            if run.state.get("status") == "done":
+                _log_run_summary(run, summary)
 
 
 def _advance_steps(run: _Run, *, through_review: bool) -> dict[str, Any]:
@@ -685,13 +746,16 @@ def _advance_steps(run: _Run, *, through_review: bool) -> dict[str, Any]:
         step.update(status="running", reason=None, started_at=_iso(_now()), finished_at=None)
         save_state(state, config=config)
         log.info("%s : etape %s", run.video_id, name)
+        t0 = time.monotonic()
         try:
             getattr(run, name)()
         except Exception as exc:  # noqa: BLE001 - toute erreur est journalisee dans l'etat
             log.debug("%s : %s", run.video_id, name, exc_info=True)
             return _fail(run, name, exc)
+        elapsed = time.monotonic() - t0
         step.update(status="done", finished_at=_iso(_now()))
         save_state(state, config=config)
+        log.info("%s : etape %s terminee en %.1fs", run.video_id, name, elapsed)
 
     clips = _summary(run)
     reason = _zero_clip_reason(run) if not clips else None

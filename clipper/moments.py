@@ -91,6 +91,7 @@ from __future__ import annotations
 
 import importlib.resources
 import json
+import logging
 import math
 import random
 import re
@@ -100,6 +101,8 @@ from pathlib import Path
 from typing import Any
 
 from clipper import jury, llm
+
+log = logging.getLogger(__name__)
 
 CONFIG_DEFAULTS: dict[str, object] = {
     # Qui note les candidats du proposeur : "single" (le proposeur seul) ou
@@ -841,6 +844,38 @@ def _public(c: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _log_jury_decisions(
+    video_id: str, vetoed: list[dict[str, Any]], rejected_scored: list[dict[str, Any]], kept: list[dict[str, Any]],
+) -> None:
+    """Une ligne par candidat juge (done_criteria de TASK-8abc) : score final
+    et decision (retenu, rejete avec sa raison, veto, ou exploration)."""
+    for r in vetoed:
+        log.info("%s : jury [%s-%s] veto : %s", video_id, r["start"], r["end"], r["reason"])
+    for r in rejected_scored:
+        log.info(
+            "%s : jury [%s-%s] score %s -> rejete : %s",
+            video_id, r["start"], r["end"], r.get("final_score"), r["reason"],
+        )
+    for c in kept:
+        status = "exploration" if c.get("exploration") else "retenu"
+        log.info(
+            "%s : jury [%.1f-%.1f] score %.1f -> %s",
+            video_id, c["_start"], c["_end"], c["final_score"], status,
+        )
+
+
+def _log_moments_summary(video_id: str, n_scored: int, n_kept: int, all_rejected: list[dict[str, Any]]) -> None:
+    """Nombre de candidats, retenus, raison des rejets (done_criteria de
+    TASK-8abc)."""
+    reasons: dict[str, int] = {}
+    for r in all_rejected:
+        reasons[r["reason"]] = reasons.get(r["reason"], 0) + 1
+    log.info(
+        "%s : moments - %d candidats notes, %d retenus, %d rejetes %s",
+        video_id, n_scored, n_kept, len(all_rejected), reasons,
+    )
+
+
 # --------------------------------------------------------------------------
 # Jury
 # --------------------------------------------------------------------------
@@ -990,8 +1025,10 @@ def run(
             seen.add((candidate["_first"], candidate["_last"]))
             candidates.append(candidate)
     candidates.sort(key=lambda c: c["_start"])
+    scored_count = len(candidates)
 
     jury_info = None
+    vetoed: list[dict[str, Any]] = []
     if selection == "jury":
         # Le jury note tous les candidats ensemble : pas de tour de comparaison.
         jury_info, candidates, vetoed = _judge(candidates, sents, rubric, context, config)
@@ -1017,6 +1054,10 @@ def run(
         c["final_score"] = final_score(c["scores"], rubric, c["bonus"]["total"])
 
     kept, rejected_scored, exploration_info = _select(candidates, rubric, meta, exploration)
+
+    if selection == "jury":
+        _log_jury_decisions(video_id, vetoed, rejected_scored, kept)
+    _log_moments_summary(video_id, scored_count, len(kept), rejected + rejected_scored)
 
     result = {
         "video_id": video_id,
@@ -1112,6 +1153,8 @@ def _rescore(video_dir: Path, out: Path, settings: dict[str, Any]) -> Path:
                 "before": c["_before"],
                 "after": after,
             })
+
+    _log_moments_summary(video_dir.name, len(candidates), len(kept), unscored + rejected_scored)
 
     result = {
         **{k: v for k, v in previous.items() if k != "exploration"},

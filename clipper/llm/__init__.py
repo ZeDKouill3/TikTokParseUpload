@@ -61,6 +61,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
@@ -87,6 +88,8 @@ __all__ = [
     "usage_log",
     "use_backend",
 ]
+
+log = logging.getLogger(__name__)
 
 DEFAULT_TIER = "fast"
 
@@ -209,11 +212,32 @@ _USAGE_FIELDS = ("input_tokens", "output_tokens", "cache_read_tokens", "cost_usd
 
 
 def _call_backend(backend: Backend, request: LLMRequest) -> tuple[str, float, Usage]:
+    log.debug(
+        "llm %s : appel modele %s, prompt %d caracteres, %d image(s)",
+        request.usage, request.model, len(request.prompt), len(request.images),
+    )
     start = time.monotonic()
     text = backend.complete(request)
     duration = time.monotonic() - start
     usage = getattr(backend, "last_usage", None)
     return text, duration, usage if isinstance(usage, Usage) else Usage()
+
+
+def _fmt_usage(usage: Usage) -> str:
+    def fmt(value: Any) -> str:
+        return "?" if value is None else str(value)
+
+    cost = f"{usage.cost_usd:.4f}$" if usage.cost_usd is not None else "?"
+    return f"tokens entree={fmt(usage.input_tokens)} sortie={fmt(usage.output_tokens)} cache={fmt(usage.cache_read_tokens)} cout={cost}"
+
+
+def _log_call(usage: str, model: str, status: str, call_usage: Usage, duration: float) -> None:
+    """Une ligne par appel LLM (done_criteria de TASK-8abc) : usage, modele,
+    tokens entree/sortie/cache, cout, duree, et l'issue de cet appel precis
+    (reussi, reessai avant reparation, ou echec definitif)."""
+    log.info(
+        "llm %s : modele %s, %s (%s), duree %.1fs", usage, model, status, _fmt_usage(call_usage), duration,
+    )
 
 
 def _accumulate(totals: dict[str, float | int | None], usage: Usage) -> None:
@@ -299,15 +323,18 @@ def ask(
                     "error": str(error),
                 })
             if attempt == attempts:
+                _log_call(usage, model, "echec", call_usage, duration)
                 if effective_usage_log_path is not None:
                     _log_line(effective_usage_log_path, _usage_entry(usage, model, totals, duration_total))
                 raise
+            _log_call(usage, model, "reessai", call_usage, duration)
             text, duration, call_usage = _call_backend(
                 backend, replace(request, prompt=_with_repair_instruction(request.prompt, text, error))
             )
             duration_total += duration
             _accumulate(totals, call_usage)
             continue
+        _log_call(usage, model, "reussi", call_usage, duration)
         if log_path is not None and attempt > 0:
             _log_line(log_path, {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
