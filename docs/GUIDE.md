@@ -261,3 +261,32 @@ ou réglage qui n'existe pas) ; le message liste les clés refusées.
 `queued` et sera reprise par `python -m clipper queue` (ou `--watch`) une
 fois `retry_at` passé ; en mode `review`, l'étape en échec remonte
 directement (relance `run`/`render` une fois le problème résolu).
+
+**Détecter une erreur de l'API Claude avant une vidéo d'1 h** — les erreurs
+réelles de l'API (ex. un `400` inattendu) n'apparaissent qu'à l'usage : le
+test de fumée `tests/integration/test_smoke_real.py` fait un vrai petit
+appel `claude -p` pour chaque usage LLM du pipeline (`vocab`,
+`transcript_fix`, `moments`, les 5 juges, `vision`, `parts`, `captions`,
+`layout`, `emphasis`, `qa`), avec une entrée minuscule construite via le
+vrai code de l'étape. Coût typique < 1 $ pour l'ensemble. Sauté par défaut
+(consomme du quota) :
+
+```powershell
+$env:CLIPPER_CLAUDE_INTEGRATION = "1"
+pytest tests/integration/test_smoke_real.py -k "not mini_video" -v -s
+```
+
+`-s` affiche la ligne `llm_usage.jsonl` (modèle, tokens, coût, durée) de
+chaque appel. `tests/test_smoke_coverage.py` (toujours exécuté, sans
+réseau) vérifie que la liste d'usages testés couvre bien tout le code du
+pipeline, pas une liste recopiée à la main.
+
+Option plus lourde : rejouer le pipeline complet (mode `auto`) sur un
+extrait de 5 min d'une vidéo déjà présente dans `workspace/` (ffmpeg
+requis) :
+
+```powershell
+$env:CLIPPER_CLAUDE_INTEGRATION = "1"
+$env:CLIPPER_SMOKE_VIDEO = "workspace\<video_id>\<video_id>.mp4"
+pytest "tests/integration/test_smoke_real.py::test_smoke_mini_video_end_to_end" -v -s
+```
