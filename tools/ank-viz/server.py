@@ -80,10 +80,49 @@ def make_runner(cwd):
     return run
 
 
+class StatusPoller:
+    """Interroge `ank status --json` en continu, indépendamment du reste.
+
+    Cet appel peut rester bloqué plusieurs minutes sans rapport avec la
+    taille du dépôt (TASK-7177 : mesuré > 160 s, quasi aucun CPU consommé
+    pendant l'attente) ; il ne doit donc jamais retarder l'affichage des
+    tâches. Garde le dernier statut connu, son âge et si une collecte est en
+    cours, pour que la page ne présente jamais une information périmée comme
+    si elle était fraîche (ADR-ad2e)."""
+
+    def __init__(self, run, min_pause=1.0):
+        self.run = run
+        self.min_pause = min_pause
+        self.lock = threading.Lock()
+        self.state = {"data": None, "loading": True, "collecting": True,
+                      "collected_at": None, "collect_seconds": None, "error": None}
+
+    def loop(self):
+        while True:
+            with self.lock:
+                self.state = dict(self.state, collecting=True)
+            started = time.time()
+            try:
+                data = ankviz.parse_status(self.run(["ank", "status", "--json"]))
+                update = {"data": data, "loading": False, "collecting": False,
+                          "collected_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                          "collect_seconds": round(time.time() - started, 1), "error": None}
+            except Exception as exc:  # l'erreur s'affiche dans la page, le serveur continue
+                update = {"loading": False, "collecting": False, "error": str(exc)}
+            with self.lock:
+                self.state = dict(self.state, **update)
+            time.sleep(self.min_pause)
+
+    def snapshot(self):
+        with self.lock:
+            return dict(self.state)
+
+
 class Poller:
-    def __init__(self, collector, interval):
+    def __init__(self, collector, interval, status_poller):
         self.collector = collector
         self.interval = interval
+        self.status_poller = status_poller
         self.lock = threading.Lock()
         self.state = {"loading": True}
 
@@ -91,8 +130,10 @@ class Poller:
         quick = True  # première passe sans critères : la page s'affiche en quelques secondes
         while True:
             started = time.time()
+            status = self.status_poller.snapshot()
+            default_branch = (status["data"] or {}).get("default_branch")
             try:
-                state = self.collector.refresh(criteria=not quick)
+                state = self.collector.refresh(criteria=not quick, default_branch=default_branch)
                 state["error"] = None
             except Exception as exc:  # l'erreur s'affiche dans la page, le serveur continue
                 with self.lock:
@@ -101,6 +142,11 @@ class Poller:
             state["collected_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
             state["collect_seconds"] = round(time.time() - started, 1)
             state["interval"] = self.interval
+            state["status"] = status["data"]
+            state["status_loading"] = status["loading"]
+            state["status_collecting"] = status["collecting"]
+            state["status_collected_at"] = status["collected_at"]
+            state["status_error"] = status["error"]
             with self.lock:
                 self.state = state
             if quick:
@@ -125,7 +171,10 @@ def main():
     start = Path(args.repo) if args.repo else HERE
     root = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=str(start),
                           capture_output=True, text=True, check=True).stdout.strip()
-    poller = Poller(ankviz.Collector(make_runner(root)), args.interval)
+    run = make_runner(root)
+    status_poller = StatusPoller(run)
+    poller = Poller(ankviz.Collector(run), args.interval, status_poller)
+    threading.Thread(target=status_poller.loop, daemon=True).start()
     threading.Thread(target=poller.loop, daemon=True).start()
 
     httpd = make_server(args.host, args.port, poller.snapshot)
