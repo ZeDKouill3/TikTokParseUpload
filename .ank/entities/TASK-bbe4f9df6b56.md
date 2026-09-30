@@ -5,7 +5,7 @@ slug: worker-py-file-state-queue-json-processus-enfant
 title: "worker.py : file state/queue.json, processus enfant par vidéo, annulation, commandes 'clipper worker' et lancement par 'serve'"
 created: 2026-09-30T20:42:23Z
 author: w-plan-web
-status: open
+status: done
 scope:
   - clipper/worker.py
   - clipper/__main__.py
@@ -16,8 +16,15 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/716833f73698@9d33a52
+    tree: scope/f0e7f5187f12
+    criteria: 9f7bb6d5b9f0
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 2
+version: 4
 ---
 
 ADR-4f6e §1, SPEC-fc0c §2. Le worker n'importe que clipper.pipeline, clipper.channel, clipper.watch (quand elle existera) et clipper.config. Un seul enfant à la fois (ADR-fb9b). Terminaison sous Windows : Popen.terminate puis kill après délai ; l'enfant peut être un script python trivial dans les tests.

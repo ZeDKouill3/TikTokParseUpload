@@ -4,6 +4,7 @@ import argparse
 import importlib.resources
 import json
 import logging
+import subprocess
 import sys
 import threading
 from datetime import datetime
@@ -13,6 +14,10 @@ from clipper.config import ConfigError, load_config
 
 _PROGRESS_POLL_SECONDS = 0.1
 _INIT_FILES = (("config.toml", "config.example.toml"), ("rubric.toml", "rubric.toml"))
+
+# Indirection pour injection dans les tests (ADR-4f6e §1 : 'serve' lance le
+# worker en sous-processus).
+_popen = subprocess.Popen
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -56,6 +61,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("queue", help="Reprend les videos en file d'attente dont l'heure est venue")
     p.add_argument("--watch", action="store_true", help="Tourne en boucle")
     p.add_argument("--interval", type=float, default=60.0, help="Secondes entre deux passages (--watch)")
+
+    sub.add_parser("worker", help="Lance le worker seul (file state/queue.json, un enfant a la fois)")
 
     p = sub.add_parser("serve", help="Lance l'interface web locale (FastAPI sur 127.0.0.1)")
     p.add_argument("--port", type=int, default=None, help="Port d'ecoute (defaut : [web] port de config.toml)")
@@ -244,13 +251,22 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "status":
             print(json.dumps(pipeline.load_state(args.video_id, config=config), ensure_ascii=False, indent=2))
             return 0
+        elif args.command == "worker":
+            from clipper import worker as worker_mod
+
+            worker_mod.Worker(config=config).loop()
+            return 0
         elif args.command == "serve":
             import uvicorn
 
             from clipper.web import create_app
 
             port = args.port if args.port is not None else config.section("web")["port"]
-            uvicorn.run(create_app(config=config), host="127.0.0.1", port=int(port))
+            worker_proc = _popen([sys.executable, "-m", "clipper", "worker"])
+            try:
+                uvicorn.run(create_app(config=config), host="127.0.0.1", port=int(port))
+            finally:
+                worker_proc.terminate()
             return 0
         else:
             if args.watch:
