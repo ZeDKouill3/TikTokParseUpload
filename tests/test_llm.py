@@ -207,6 +207,21 @@ def test_claude_cli_without_images_disables_all_tools(fake_run):
     assert "--add-dir" not in cmd
 
 
+def test_claude_cli_isolates_from_the_users_global_mcp_servers(fake_run):
+    # TASK-321b : sans --strict-mcp-config, `claude -p` charge par defaut les
+    # serveurs MCP globaux de l'utilisateur (~/.claude.json), hors de portee
+    # de --setting-sources "" (qui ne filtre que settings.json). Chaque
+    # serveur connecte a temps ajoute ses propres tools -- et donc son propre
+    # bloc cache_control mis en cache independamment -- a la requete, une
+    # source de blocs variable et non liee a notre contenu (mesure reelle :
+    # ank log TASK-321b) qui pouvait depasser la limite API de 4. Sans
+    # --mcp-config, --strict-mcp-config n'utilise aucun serveur MCP.
+    run = fake_run(json.dumps(RECORDED_CLAUDE_CLI_OK))
+    llm.ask("vision", "p", [], COLOR_SCHEMA, config=make_config())
+    cmd = run.calls[0]["cmd"]
+    assert "--strict-mcp-config" in cmd
+
+
 def test_claude_cli_resolves_npm_cmd_shim_to_its_exe_directly(monkeypatch, tmp_path):
     # Arborescence npm sous Windows : claude.cmd a cote de
     # node_modules/@anthropic-ai/claude-code/bin/claude.exe.

@@ -7,6 +7,7 @@ Commande construite :
            --tools ""
            [--json-schema <schema JSON compact>]
            --system-prompt <court> --setting-sources "" --no-session-persistence
+           --strict-mcp-config
 
 Le prompt passe par stdin, pas par argv : une transcription de 2-3 h depasse
 la limite de ligne de commande de Windows (32 767 caracteres).
@@ -59,21 +60,30 @@ On ne pose jamais plus d'un bloc ``cache_control`` par message, quel que soit
 l'usage (images comprises, jamais marquees) : l'API en refuse plus de 4, et
 claude -p en pose deja pour son propre compte.
 
-Limite de blocs cache_control (TASK-746c, reclasse par TASK-f89f). Meme avec
-un seul bloc a nous, l'appel peut recevoir un 400 "A maximum of 4 blocks with
-cache_control may be provided" -- jamais du a nos propres blocs (verifie :
-toujours un seul). TASK-746c l'avait classe transitoire (retente en file)
-apres l'avoir observe intermittent sur un juge opus rejoue a l'identique.
-Releve de nouveau en reel (TASK-f89f, jury_spectateur, video 7VaA8XUKrAY) :
-un appel isole du role touche ne le reproduit pas, mais 2 des meneurs de
-vague 1 de clipper.jury lances en parallele (un par modele configure,
-``_waves``) suffisent a le declencher sur l'un des deux, modele et role
-variables d'un essai a l'autre -- une course cote CLI entre processus
-``claude -p`` concurrents, hors de notre controle et non liee au contenu
-envoye. Puisque le mecanisme n'est pas garanti par un simple rejeu et que
-requeuer une video en attente pour cette seule cause consomme du quota sans
-certitude, ce 400 est desormais un echec explicite (LLMError), jamais
-transitoire (ADR-ad2e) : ``_is_transient`` ne le reconnait plus au texte.
+Limite de blocs cache_control (TASK-746c, reclasse par TASK-f89f, cause
+supprimee par TASK-321b). Meme avec un seul bloc a nous, l'appel pouvait
+recevoir un 400 "A maximum of 4 blocks with cache_control may be provided"
+-- jamais du a nos propres blocs (verifie : toujours un seul). Cause reelle
+(TASK-321b, mesuree via ``claude -p --debug api --debug-file``) : sans
+``--strict-mcp-config``, ``claude -p`` charge par defaut les serveurs MCP
+*globaux* de l'utilisateur (``~/.claude.json``, ex. Gmail/Calendar/Drive/
+Canva/TinyPages/Docs) -- ``--setting-sources ""`` et ``--no-session-
+persistence`` ne filtrent que ``settings.json`` (user/project/local), pas
+``mcpServers`` qui est une autre surface de config. Ces serveurs se
+connectent de facon asynchrone (constate : certains terminent leur connexion
+plus d'une seconde APRES que la requete API soit deja partie) ; les blocs
+``tools`` que le CLI joint a la requete -- et met en cache independamment
+par groupe de serveur -- dependent donc d'une course entre l'envoi de la
+requete et la connexion de chaque serveur, plus variable sous charge
+(plusieurs ``claude -p`` paralleles), ce qui correspond a l'intermittence
+liee au parallelisme relevee par TASK-f89f (jamais liee au role/modele/
+contenu envoye, comme mesure alors). Fix : ``--strict-mcp-config`` sans
+``--mcp-config`` fait n'utiliser aucun serveur MCP (verifie : 0 serveur dans
+le debug log, appel reussi, cache toujours partage), sans toucher a
+l'authentification OAuth (contrairement a ``--bare``, qui exige une cle API).
+Le 400 residuel eventuel (si jamais un autre 5e bloc apparaissait) reste un
+echec explicite (LLMError), jamais transitoire (ADR-ad2e) : ``_is_transient``
+ne le reconnait pas au texte.
 
 Sortie. Avec --output-format json (sans image) : un objet unique ``{"type":
 "result", "subtype": "success", "is_error": bool, "api_error_status":
@@ -222,6 +232,7 @@ class ClaudeCLIBackend:
             "--system-prompt", SYSTEM_PROMPT,
             "--setting-sources", "",
             "--no-session-persistence",
+            "--strict-mcp-config",
         ]
         return cmd
 
