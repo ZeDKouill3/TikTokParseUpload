@@ -224,24 +224,30 @@ def _is_isolated_punct(text: str) -> bool:
     return bool(stripped) and not any(c.isalnum() for c in stripped)
 
 
-def _units(words: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+def _units(words: list[dict[str, Any]], gap_s: float) -> list[list[dict[str, Any]]]:
     """Mots au sens du regroupement : un jeton qui commence par une apostrophe
     ou un trait d'union colle ("'a", "-tu") reste avec le mot precedent, de
     meme qu'une ponctuation isolee (" ?", " !", " :", " ;", " »", TASK-4826),
     qui rejoint l'unite du mot d'avant (jamais la sienne propre : elle ne
     peut donc jamais ouvrir un groupe, une ligne ni un Dialogue) et est omise
-    si rien ne la precede dans le clip. Mutation en place (pas de copie) :
-    l'identite du dict reste stable pour l'indexation par id() de l'emphase
-    en aval (_render_letterbox)."""
+    si rien ne la precede dans le clip. Rejoindre suppose un vrai enchainement :
+    si l'ecart avant le jeton depasse ``gap_s`` (faster-whisper coupe parfois
+    une elision en deux jetons avec un silence au milieu, TASK-c492), le jeton
+    colle reste dans sa propre unite au lieu de rejoindre celle d'avant, et la
+    ponctuation isolee est omise plutot que rattachee a travers le silence.
+    Mutation en place (pas de copie) : l'identite du dict reste stable pour
+    l'indexation par id() de l'emphase en aval (_render_letterbox)."""
     units: list[list[dict[str, Any]]] = []
     for w in words:
+        prev_end = units[-1][-1]["end"] if units else None
+        reachable = prev_end is not None and w["start"] - prev_end <= gap_s
         if _is_isolated_punct(w["word"]):
-            if not units:
+            if not reachable:
                 continue
             stripped = w["word"].strip()
             w["word"] = _PUNCT_SPACE_BEFORE.get(stripped, "") + stripped
             units[-1].append(w)
-        elif units and w["word"].startswith(_GLUED_PREFIXES):
+        elif reachable and w["word"].startswith(_GLUED_PREFIXES):
             units[-1].append(w)
         else:
             units.append([w])
@@ -257,7 +263,7 @@ def _group_words(
     D'abord coupe en segments aux ecarts de plus de ``gap_s`` entre deux mots
     consecutifs (TASK-9ee7 : un silence ne doit jamais rester a l'interieur
     d'un groupe), chaque segment ensuite regroupe par lots comme ci-dessus."""
-    units = _units(words)
+    units = _units(words, gap_s)
     groups: list[list[dict[str, Any]]] = []
 
     def batch(segment: list[list[dict[str, Any]]]) -> None:
@@ -716,9 +722,9 @@ def _render_positioned(
     hold_s = float(settings["hold_s"])
 
     placements: list[tuple[list[list[list[dict[str, Any]]]], int]] = []
-    for group in _group_words(words, int(settings["min_words_per_group"]), style.max_words_per_group,
-                              float(settings["gap_s"])):
-        placements.extend(_place(_units(group), size, box, style, where))
+    gap_s = float(settings["gap_s"])
+    for group in _group_words(words, int(settings["min_words_per_group"]), style.max_words_per_group, gap_s):
+        placements.extend(_place(_units(group, gap_s), size, box, style, where))
     # borne par le debut du placement suivant (TASK-9ee7 : un placement, pas
     # seulement un groupe, car un groupe trop large pour la zone est lui-meme
     # decoupe en plusieurs placements a des instants differents par _place).
@@ -810,9 +816,9 @@ def _render_split(
     hold_s = float(settings["hold_s"])
 
     items: list[tuple[list[list[list[dict[str, Any]]]], int]] = []
-    for group in _group_words(words, int(settings["min_words_per_group"]), style.max_words_per_group,
-                              float(settings["gap_s"])):
-        items.extend(_place(_units(group), size, box, style, where))
+    gap_s = float(settings["gap_s"])
+    for group in _group_words(words, int(settings["min_words_per_group"]), style.max_words_per_group, gap_s):
+        items.extend(_place(_units(group, gap_s), size, box, style, where))
     # borne (par ligne, la granularite deja affichee ici) par le debut de la
     # ligne suivante, toutes places/groupes confondus (TASK-9ee7).
     line_starts = [lu[0][0]["start"] for lines, _em in items for lu in lines]
