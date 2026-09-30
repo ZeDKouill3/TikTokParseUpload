@@ -1707,7 +1707,12 @@ def _check_answer(answer: dict[str, Any], plan: _Plan) -> None:
     unknown = [i for i in ignore if i not in ids]
     if unknown:
         raise llm.SchemaError(f"ignore : visage(s) {unknown} inconnu(s) (visages du plan : {ids})")
-    if answer["layout"] != "facecam_gameplay":
+    if answer["layout"] != "facecam_gameplay" and ids:
+        # Sans visage detecte (ids vide), la question posee au modele n'a
+        # aucune reponse valable possible (single() ignore de toute facon
+        # ``face`` quand plan.tracks est vide, aucun id ne peut y correspondre) :
+        # ce n'est pas une valeur de secours (ADR-ad2e), juste une contrainte
+        # qui ne s'applique qu'en presence d'au moins un visage a choisir.
         face = answer["face"]
         if face is not None and face not in ids:
             raise llm.SchemaError(f"visage #{face} inconnu (visages du plan : {ids})")
