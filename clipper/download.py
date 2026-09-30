@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
+import time
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
 import yt_dlp
+
+log = logging.getLogger(__name__)
 
 CONFIG_DEFAULTS: dict[str, object] = {
     "cookies_file": None,
@@ -92,11 +96,43 @@ def _build_meta(info: dict[str, Any], url: str) -> dict[str, Any]:
     }
 
 
+def _format_speed(bytes_per_second: float | None) -> str:
+    if not bytes_per_second:
+        return "?"
+    return f"{bytes_per_second / 1_000_000:.1f} Mo/s"
+
+
+def _progress_hook(video_id: str) -> Callable[[dict[str, Any]], None]:
+    """Journalise la progression du telechargement (pourcentage, debit) :
+    DEBUG a chaque evenement yt-dlp, INFO au plus toutes les 30 s ou tous les
+    10 % (done_criteria de TASK-8abc)."""
+    last: dict[str, float] = {"pct": 0.0, "t": time.monotonic()}
+
+    def hook(d: dict[str, Any]) -> None:
+        if d.get("status") != "downloading":
+            return
+        total = d.get("total_bytes") or d.get("total_bytes_estimate")
+        downloaded = d.get("downloaded_bytes")
+        speed = _format_speed(d.get("speed"))
+        if not total or downloaded is None:
+            log.debug("%s : telechargement, %s octets telecharges (%s)", video_id, downloaded, speed)
+            return
+        pct = downloaded / total * 100
+        log.debug("%s : telechargement %.1f%% (%s)", video_id, pct, speed)
+        now = time.monotonic()
+        if pct >= 100.0 - 1e-9 or pct - last["pct"] >= 10.0 or now - last["t"] >= 30.0:
+            last["pct"], last["t"] = pct, now
+            log.info("%s : telechargement %.1f%% (%s)", video_id, pct, speed)
+
+    return hook
+
+
 def _ydl_opts(
     video_dir: Path,
     cookies_file: str | Path | None,
     cookies_from_browser: str | None,
     js_runtimes: str | None,
+    video_id: str,
 ) -> dict[str, Any]:
     opts: dict[str, Any] = {
         "format": _FORMAT,
@@ -105,6 +141,7 @@ def _ydl_opts(
         "postprocessors": [{"key": "SponsorBlock", "categories": ["all"]}],
         "quiet": True,
         "noprogress": True,
+        "progress_hooks": [_progress_hook(video_id)],
     }
     if cookies_file:
         opts["cookiefile"] = str(cookies_file)
@@ -141,7 +178,7 @@ def download(
         return json.loads(meta_file.read_text(encoding="utf-8"))
 
     video_dir.mkdir(parents=True, exist_ok=True)
-    opts = _ydl_opts(video_dir, cookies_file, cookies_from_browser, js_runtimes)
+    opts = _ydl_opts(video_dir, cookies_file, cookies_from_browser, js_runtimes, video_id)
     with ydl_factory(opts) as ydl:
         info = ydl.extract_info(url, download=True)
 

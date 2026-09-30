@@ -18,7 +18,10 @@ def build_parser() -> argparse.ArgumentParser:
         description="Pipeline de clips verticaux sous-titres a partir de videos YouTube ou VOD Twitch longues",
     )
     parser.add_argument("--config", default=None, help="Fichier de configuration (defaut : config.toml)")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Journal detaille des etapes")
+    parser.add_argument(
+        "-v", "--verbose", action="count", default=0,
+        help="Journal detaille des etapes (-v : progression ; -vv : detail)",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("run", help="Traite une video : jusqu'a la revue (review) ou jusqu'au bout (auto)")
@@ -177,9 +180,12 @@ def _run_with_progress(action, video_id: str, config, force: bool) -> dict:
     return state
 
 
+_VERBOSITY_LEVELS = {0: logging.WARNING, 1: logging.INFO}
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING,
+    logging.basicConfig(level=_VERBOSITY_LEVELS.get(args.verbose, logging.DEBUG),
                         format="%(asctime)s %(levelname)s %(message)s")
 
     from clipper import download, pipeline

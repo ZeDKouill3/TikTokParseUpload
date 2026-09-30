@@ -64,9 +64,11 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
+import logging
 import math
 import re
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -74,6 +76,8 @@ import cv2
 import numpy as np
 
 from clipper import llm
+
+log = logging.getLogger(__name__)
 
 CONFIG_DEFAULTS: dict[str, object] = {
     "expected_width": 1080,
@@ -575,6 +579,23 @@ def _write_json(path: Path, data: dict[str, Any]) -> None:
     tmp.replace(path)
 
 
+def _progress_gate(total: int) -> Any:
+    """Ferme une fonction ``gate(i)`` (i de 1 a ``total``) qui dit si le clip
+    ``i`` doit etre annonce a INFO : au plus toutes les 30 s ou tous les 10 %
+    (toujours le dernier). Done_criteria de TASK-8abc."""
+    last: dict[str, float] = {"i": 0, "t": time.monotonic()}
+    step = max(1, math.ceil(total * 0.1)) if total else 1
+
+    def gate(i: int) -> bool:
+        now = time.monotonic()
+        if i >= total or i - last["i"] >= step or now - last["t"] >= 30.0:
+            last["i"], last["t"] = i, now
+            return True
+        return False
+
+    return gate
+
+
 def check_clip(
     json_path: Path,
     frames_dir: Path,
@@ -683,6 +704,9 @@ def run(
         pending.append(json_path)
 
     errors: dict[Path, Exception] = {}
+    total = len(pending)
+    gate = _progress_gate(total)
+    done_count = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as pool:
         futures = {
             pool.submit(
@@ -691,11 +715,19 @@ def run(
             ): json_path
             for json_path in pending
         }
+        starts = {future: time.monotonic() for future in futures}
         for future in concurrent.futures.as_completed(futures):
+            json_path = futures[future]
             try:
                 future.result()
             except Exception as exc:  # aucune perte silencieuse (ADR-ad2e)
-                errors[futures[future]] = exc
+                errors[json_path] = exc
+                continue
+            elapsed = time.monotonic() - starts[future]
+            done_count += 1
+            log.debug("qa clip %d/%d (%s) en %.1fs", done_count, total, json_path.stem, elapsed)
+            if gate(done_count):
+                log.info("qa clip %d/%d (%s) en %.1fs", done_count, total, json_path.stem, elapsed)
 
     if errors:
         first = next(json_path for json_path in pending if json_path in errors)
