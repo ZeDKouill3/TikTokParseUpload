@@ -5,7 +5,7 @@ slug: tiktok-rep-res-r-els-de-tiktok-studio-fen-tres-c
 title: "TikTok : repères réels de TikTok Studio, fenêtres connues, programmation par les sélecteurs date/heure, connexion par un Chrome normal"
 created: 2026-10-01T15:52:09Z
 author: nicoc@zedk_ordi
-status: open
+status: in_progress
 scope:
   - clipper/assets/tiktok_selectors.toml
   - clipper/tiktok.py
@@ -20,7 +20,7 @@ criteria_by: creator
 verify: [tests]
 method: diagnose
 schema: 4
-version: 1
+version: 2
 ---
 
 Relevé réel de TikTok Studio (FR, 2026-10-01, page https://www.tiktok.com/tiktokstudio/upload?from=webapp, un seul cadre), complété par un ancien script de l'utilisateur.
