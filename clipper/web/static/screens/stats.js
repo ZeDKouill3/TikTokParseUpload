@@ -15,7 +15,20 @@ const STATS_DECISIONS = { approved: "Approuvé", accepted: "Accepté", adjusted:
 const STATS_CLIPS_PAGE_SIZE = 50; // « Résultats par clip » : 50 lignes à la fois, puis « Afficher plus »
 const STATS_QA = { passed: { label: "QA réussie", cls: "ok" }, rejected: { label: "QA refusée", cls: "bad" } };
 
-const statsUi = { data: null, error: null, loading: null, dirty: false, at: 0, preset: "30", since: "", until: "", shown: STATS_CLIPS_PAGE_SIZE };
+const STATS_NO_CHANNEL = "__none__"; // valeur de ?channel= pour « Sans chaîne » (voir clipper/web/app.py)
+// Colonnes triables du tableau « Résultats par clip » : clé -> valeur comparée (null = « pas de donnée », toujours en bas).
+const STATS_SORTS = {
+  clip: (c) => (c.screen_title || c.clip_id || "").toLowerCase(),
+  channel: (c) => (c.channel || "").toLowerCase() || null,
+  qa: (c) => c.qa_status || null,
+  decision: (c) => c.human_decision || null,
+  views: (c) => (c.stats ? c.stats.views : null),
+  retention: (c) => (c.stats ? c.stats.retention_3s : null),
+  full: (c) => (c.stats ? c.stats.watched_full : null),
+  shares: (c) => (c.stats ? c.stats.shares : null),
+};
+
+const statsUi = { data: null, error: null, loading: null, dirty: false, at: 0, preset: "30", since: "", until: "", shown: STATS_CLIPS_PAGE_SIZE, channel: "", sort: { key: null, dir: "asc" } };
 
 const statsMoney = (usd) => `${fr(usd, 2)} $`;
 const statsPct = (fraction) => `${fr(fraction * 100, 0)} %`;
@@ -42,6 +55,7 @@ function loadStats() {
   const params = new URLSearchParams();
   if (statsUi.since) params.set("since", statsUi.since);
   if (statsUi.until) params.set("until", statsUi.until);
+  if (statsUi.channel) params.set("channel", statsUi.channel);
   statsUi.loading = (async () => {
     try {
       statsUi.data = await api("/api/stats?" + params.toString());
@@ -100,6 +114,27 @@ function statsMoreCount(total, shown) {
   return Math.max(0, Math.min(STATS_CLIPS_PAGE_SIZE, total - shown));
 }
 
+/* Trie les clips en place par la colonne choisie (clic sur l'en-tête) ; sans tri, l'ordre du serveur. */
+function statsSortInPlace(clips) {
+  const { key, dir } = statsUi.sort;
+  if (!key) return;
+  const value = STATS_SORTS[key];
+  const sign = dir === "desc" ? -1 : 1;
+  clips.sort((a, b) => {
+    const x = value(a), y = value(b);
+    if (x === null && y === null) return 0;
+    if (x === null) return 1;
+    if (y === null) return -1;
+    return (typeof x === "string" ? x.localeCompare(y, "fr") : x - y) * sign;
+  });
+}
+
+function statsHead(key, label, right) {
+  const on = statsUi.sort.key === key;
+  const ariaSort = on ? (statsUi.sort.dir === "desc" ? "descending" : "ascending") : "none";
+  return `<th class="${right ? "r " : ""}" aria-sort="${ariaSort}"><button type="button" class="th-sort" data-stats-sort="${key}">${label}${on ? (statsUi.sort.dir === "desc" ? " ▼" : " ▲") : ""}</button></th>`;
+}
+
 function statsClipRow(c) {
   const qa = STATS_QA[c.qa_status] || { label: c.qa_status || "QA inconnue", cls: "pending" };
   const issues = c.issues && c.issues.length ? `<div class="li-sub muted">${esc(c.issues.map(statsIssueText).join(" · "))}</div>` : "";
@@ -110,7 +145,8 @@ function statsClipRow(c) {
   const cells = s
     ? `<td class="r num">${esc(fr(s.views))}</td><td class="r num">${esc(statsPct(s.retention_3s))}</td><td class="r num">${esc(statsPct(s.watched_full))}</td><td class="r num">${esc(fr(s.shares))}</td>`
     : `<td class="r muted" colspan="4">aucune mesure importée</td>`;
-  return `<tr><td><div class="stats-clip-title">${esc(c.screen_title || c.clip_id)}</div><div class="li-sub muted mono">${esc(c.video_id)}/${esc(c.clip_id)}${c.channel ? ` · ${esc(c.channel)}` : ""}</div></td>
+  return `<tr><td><div class="stats-clip-title">${esc(c.screen_title || c.clip_id)}</div><div class="li-sub muted mono">${esc(c.video_id)}/${esc(c.clip_id)}</div></td>
+    <td>${c.channel ? esc(c.channel) : `<span class="muted">sans chaîne</span>`}</td>
     <td><span class="chip ${qa.cls}">${esc(qa.label)}</span>${issues}</td><td>${decision}</td>${cells}</tr>`;
 }
 
@@ -120,7 +156,7 @@ function statsClipsBlock(data) {
   const more = next
     ? `<div class="panel-pad"><button type="button" class="btn btn-ghost" data-stats-more>Afficher plus (${next} sur ${data.clips.length - statsUi.shown} restants)</button></div>` : "";
   const table = data.clips.length
-    ? `<div class="table-scroll"><table class="table"><thead><tr><th>Clip</th><th>Contrôle qualité</th><th>Décision</th><th class="r">Vues</th><th class="r">Rétention 3 s</th><th class="r">Vu en entier</th><th class="r">Partages</th></tr></thead>
+    ? `<div class="table-scroll"><table class="table"><thead><tr>${statsHead("clip", "Clip")}${statsHead("channel", "Chaîne")}${statsHead("qa", "Contrôle qualité")}${statsHead("decision", "Décision")}${statsHead("views", "Vues", true)}${statsHead("retention", "Rétention 3 s", true)}${statsHead("full", "Vu en entier", true)}${statsHead("shares", "Partages", true)}</tr></thead>
         <tbody>${data.clips.slice(0, statsUi.shown).map(statsClipRow).join("")}</tbody></table></div>${more}`
     : `<p class="muted stats-empty">Aucun clip rendu sur cette période.</p>`;
   const orphans = unmatched.length
@@ -168,8 +204,16 @@ function statsCountsBlock(data) {
       `<div class="stats-count"><b class="num">${esc(fr(n))}</b><span class="chip ${chip[status] || "pending"}">${esc(STATS_STATUS_LABELS[status] || status)}</span></div>`).join("")}</div></section>`;
 }
 
+function statsChannelFilter() {
+  const names = (store.channels || []).slice();
+  if (statsUi.channel && statsUi.channel !== STATS_NO_CHANNEL && !names.includes(statsUi.channel)) names.push(statsUi.channel);
+  const opt = (value, label) => `<option value="${esc(value)}"${statsUi.channel === value ? " selected" : ""}>${esc(label)}</option>`;
+  return `<select class="input" data-stats-channel aria-label="Filtrer par chaîne">${opt("", "Toutes les chaînes")}${opt(STATS_NO_CHANNEL, "Sans chaîne")}${names.map((n) => opt(n, n)).join("")}</select>`;
+}
+
 function statsToolbar() {
   return `<div class="stats-toolbar">
+    ${statsChannelFilter()}
     <div class="seg" role="group" aria-label="Période">${STATS_PRESETS.map(([id, label]) =>
       `<button type="button" data-stats-preset="${id}" class="${statsUi.preset === id ? "on" : ""}">${label}</button>`).join("")}</div>
     <div class="stats-range"><label>Du <input class="input" type="date" data-stats-since value="${esc(statsUi.since)}"></label>
@@ -193,6 +237,17 @@ async function statsImport(file) {
 }
 
 function statsWire(body) {
+  $("[data-stats-channel]", body).onchange = (e) => {
+    statsUi.channel = e.target.value;
+    statsUi.shown = STATS_CLIPS_PAGE_SIZE;
+    loadStats();
+  };
+  $$("[data-stats-sort]", body).forEach((b) => (b.onclick = () => {
+    const key = b.dataset.statsSort;
+    statsUi.sort = statsUi.sort.key === key ? { key, dir: statsUi.sort.dir === "asc" ? "desc" : "asc" } : { key, dir: "asc" };
+    statsUi.shown = STATS_CLIPS_PAGE_SIZE;
+    renderCurrent();
+  }));
   const moreButton = $("[data-stats-more]", body);
   if (moreButton) moreButton.onclick = () => { statsUi.shown += STATS_CLIPS_PAGE_SIZE; renderCurrent(); };
   $$("[data-stats-preset]", body).forEach((b) => (b.onclick = () => {
@@ -229,6 +284,7 @@ Screens.stats = {
         ? emptyState("circle-alert", "Chargement impossible", String(statsUi.error.message || statsUi.error))
         : `<div class="skeleton skeleton-line"></div><div class="skeleton skeleton-card"></div><div class="skeleton skeleton-card"></div>`;
     } else {
+      statsSortInPlace(data.clips);
       content = `<div class="stats-grid">${statsClipsBlock(data)}${statsCostBlock(data)}${statsStepsBlock(data)}${statsCountsBlock(data)}</div>`;
     }
     body.innerHTML = statsToolbar() + content;

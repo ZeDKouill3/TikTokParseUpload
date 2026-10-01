@@ -60,9 +60,22 @@ function videoRow(video) {
   </div>`;
 }
 
+/* Vignette d'une video source (GET /media/source/<id>/thumbnail, extraite par le pipeline) :
+   image paresseuse ; si la source manque (404) ou l'extraction echoue, l'image est remplacee
+   par une vignette neutre « pas d'image » (ecouteur d'erreur ci-dessous). */
+function videoThumb(videoId) {
+  return `<span class="job-thumb"><img loading="lazy" decoding="async" alt="" src="/media/source/${encodeURIComponent(videoId)}/thumbnail"><span class="job-thumb-none">pas d'image</span></span>`;
+}
+
+// Les erreurs de chargement ne remontent pas : on les ecoute en phase de capture.
+document.addEventListener("error", (e) => {
+  const box = e.target instanceof HTMLImageElement ? e.target.closest(".job-thumb") : null;
+  if (box) box.classList.add("empty");
+}, true);
+
 function queueRow(entry, index) {
   return `<div class="list-item" data-queue="${esc(entry.video_id)}">
-    <span class="when num">${index + 1}</span>
+    <span class="when num">${index + 1}</span>${videoThumb(entry.video_id)}
     <div class="li-main grow"><div class="li-title">${esc(entry.video_id)}</div>
       <div class="li-sub muted">${esc(entry.action === "render" ? "rendu" : "traitement complet")}${entry.channel ? ` · ${esc(entry.channel)}` : ""}</div></div>
     ${index > 0 ? `<button type="button" class="btn btn-xs" data-front="${esc(entry.video_id)}">Passer en tête</button>` : ""}

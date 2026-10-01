@@ -340,6 +340,14 @@ function setUsagesFromDom(root) {
 
 function setWire(root) {
   root.onclick = (e) => {
+    // Lien de section : on défile jusqu'à elle ; le hash ne change pas, le routeur n'est jamais sollicité.
+    const link = e.target.closest("a[data-set-nav]");
+    if (link) {
+      e.preventDefault();
+      const section = document.getElementById(`set-${link.dataset.setNav}`);
+      if (section) section.scrollIntoView({ behavior: "smooth", block: "start" });
+      return;
+    }
     const t = e.target.closest("button");
     if (!t) return;
     if (t.hasAttribute("data-set-save")) setSave(root);

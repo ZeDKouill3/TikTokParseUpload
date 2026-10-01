@@ -2427,3 +2427,22 @@ def test_thumbnail_missing_mp4_is_a_render_error(tmp_path):
 
     with pytest.raises(render_step.RenderError, match="introuvable"):
         render_step.thumbnail(tmp_path / "absent.mp4", tmp_path / "t.jpg")
+
+
+def test_thumbnail_seek_argument_overrides_the_configured_seek(tmp_path, monkeypatch):
+    from clipper import render as render_step
+
+    mp4 = tmp_path / "v.mp4"
+    mp4.write_bytes(b"mp4")
+    seen = []
+    monkeypatch.setattr(render_step, "_exec_ffmpeg", lambda cmd, cwd, out: (seen.append(list(cmd)), Path(out).write_bytes(b"\xff\xd8")))
+
+    render_step.thumbnail(mp4, tmp_path / "t.jpg", seek=12.5)
+
+    assert seen[0][seen[0].index("-ss") + 1] == "12.500000"
+
+
+def test_video_thumbnail_seek_ratio_default_is_ten_percent():
+    from clipper.render import CONFIG_DEFAULTS
+
+    assert CONFIG_DEFAULTS["video_thumbnail_seek_ratio"] == 0.1

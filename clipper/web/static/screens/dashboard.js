@@ -65,6 +65,7 @@ function dashRunningRow(video) {
   const pct = progress ? Math.round(progress.fraction * 100) : null;
   const eta = progress && progress.eta_s != null ? ` · reste ${fr(Math.ceil(progress.eta_s / 60))} min` : "";
   return `<div class="job" data-video="${esc(video.video_id)}">
+    ${videoThumb(video.video_id)}
     <div class="job-main" style="min-width:0">
       <div class="job-title">${esc(video.video_id)}</div>
       <div class="job-meta"><span class="mono">${esc(video.source_url || "")}</span>${video.channel ? `<span class="tag">${esc(video.channel)}</span>` : ""}</div>
@@ -78,11 +79,16 @@ function dashRunningRow(video) {
 
 function dashProblemRow(video, kind) {
   const retry = video.retry_at ? `<div class="li-sub">Reprise prévue le ${esc(dashDate(video.retry_at))}</div>` : "";
-  return `<div class="list-item dash-problem" data-video="${esc(video.video_id)}">
+  const id = esc(video.video_id);
+  return `<div class="list-item dash-problem" data-video="${id}">
     <span class="chip ${kind === "failed" ? "failed" : "queued"}">${kind === "failed" ? "Échec" : "En attente"}</span>
-    <div class="li-main"><a class="li-title" href="#/videos" style="display:block">${esc(video.video_id)}</a>
-      <div class="li-sub">${video.channel ? `${esc(video.channel)} · ` : ""}étape ${esc((STEP_LABELS[video.step] || video.step || "—").toLowerCase())}</div>
+    ${videoThumb(video.video_id)}
+    <div class="li-main"><a class="li-title" href="#/videos/${encodeURIComponent(video.video_id)}" style="display:block">${esc(video.title || video.video_id)}</a>
+      <div class="li-sub">${video.title && video.title !== video.video_id ? `<span class="mono">${id}</span> · ` : ""}${video.channel ? `${esc(video.channel)} · ` : ""}étape ${esc((STEP_LABELS[video.step] || video.step || "—").toLowerCase())}</div>
       <p class="reason ${kind === "failed" ? "bad" : ""}">${esc(video.reason || "Aucune raison journalisée.")}</p>${retry}</div>
+    <div class="row wrap dash-problem-actions">
+      <button type="button" class="btn btn-xs" data-retry-video="${id}" data-from-step="${esc(video.step || "")}">Relancer</button>
+      <button type="button" class="btn btn-xs btn-ghost" data-dismiss-video="${id}">Retirer</button></div>
   </div>`;
 }
 

@@ -362,10 +362,11 @@ def _dashboard_videos(config: Config) -> dict[str, Any]:
         })
 
     def problem(status: str) -> list[dict[str, Any]]:
+        # Une video « retiree » (dismissed_at) sort des echecs et des compteurs.
         return [
-            {"video_id": s["video_id"], "channel": s.get("channel"), "step": _current_step(s),
-             "reason": s.get("reason"), "retry_at": s.get("retry_at")}
-            for s in states if s.get("status") == status
+            {"video_id": s["video_id"], "title": _enrich(s, config)["title"], "channel": s.get("channel"),
+             "step": _current_step(s), "reason": s.get("reason"), "retry_at": s.get("retry_at")}
+            for s in states if s.get("status") == status and not s.get("dismissed_at")
         ]
 
     return {"running": running, "failed": problem("failed"), "queued": problem("queued")}
@@ -1074,6 +1075,14 @@ def _png_from_multipart(content_type: str, body: bytes) -> bytes:
 # ----------------------------------------------------------------
 
 _STATS_STEP_ORDER = tuple(pipeline.STEPS)
+# Valeur de ?channel= pour « Sans chaine » (video sans chaine) ; absent = toutes les chaines.
+_STATS_NO_CHANNEL = "__none__"
+
+
+def _stats_channel_ok(channel: str | None, wanted: str | None) -> bool:
+    if wanted is None:
+        return True
+    return channel is None if wanted == _STATS_NO_CHANNEL else channel == wanted
 
 
 def _stats_bound(name: str, value: str | None, *, end_of_day: bool) -> datetime | None:
@@ -1136,12 +1145,16 @@ def _stats_outcomes(config: Config) -> list[dict[str, Any]]:
         raise HTTPException(status_code=500, detail=f"{path.name} illisible : {exc}") from exc
 
 
-def _stats_clips(config: Config, lower: datetime | None, upper: datetime | None) -> dict[str, Any]:
+def _stats_clips(config: Config, lower: datetime | None, upper: datetime | None,
+                 wanted: str | None = None) -> dict[str, Any]:
     """Un element par sidecar de output/ cree dans la periode, joint aux resultats
     d'outcomes (qa du sidecar, decision humaine, mesure de plateforme la plus
     recente). Le CSV de plateforme ne porte que ``clip_id`` : une mesure n'est
     rattachee que si un seul clip porte cet id, sinon elle est rendue a part
-    (``stats_unmatched``) avec la raison, jamais attribuee au hasard."""
+    (``stats_unmatched``) avec la raison, jamais attribuee au hasard. ``wanted``
+    ne garde que les clips des videos de cette chaine (``__none__`` : sans
+    chaine) ; les mesures non rattachees n'ont pas de chaine et ne sont rendues
+    que sans filtre."""
     journal = _stats_outcomes(config)
     feedback_path = Path(str(config.section("feedback")["journal_path"]))
     decisions: dict[tuple[str, Any], str] = {}
@@ -1172,6 +1185,9 @@ def _stats_clips(config: Config, lower: datetime | None, upper: datetime | None)
 
     clips = []
     for video_id, clip_id, sidecar in sidecars:
+        channel = _channel_of(video_id, config)
+        if not _stats_channel_ok(channel, wanted):
+            continue
         if not _stats_in_period(sidecar.get("created_at"), lower, upper, f"sidecar {video_id}/{clip_id}"):
             continue
         qa = sidecar.get("qa") or {}
@@ -1182,14 +1198,14 @@ def _stats_clips(config: Config, lower: datetime | None, upper: datetime | None)
         found = measures.get(clip_id) if holders[clip_id] == 1 else None
         clips.append({
             "video_id": video_id, "clip_id": clip_id, "moment_id": moment_id,
-            "channel": _channel_of(video_id, config), "screen_title": sidecar.get("screen_title"),
+            "channel": channel, "screen_title": sidecar.get("screen_title"),
             "created_at": sidecar.get("created_at"),
             "qa_status": qa.get("status"), "issues": qa.get("issues"),
             "human_decision": decision, "decision_source": source if decision is not None else None,
             "stats": max(found)[2] if found else None,
         })
     unmatched = []
-    for clip_id in sorted(measures):
+    for clip_id in sorted(measures) if wanted is None else []:
         if holders.get(clip_id, 0) == 1:
             continue
         reason = (f"le clip {clip_id} existe dans plusieurs vidéos : le CSV n'a pas de video_id"
@@ -1198,13 +1214,16 @@ def _stats_clips(config: Config, lower: datetime | None, upper: datetime | None)
     return {"clips": clips, "stats_unmatched": unmatched}
 
 
-def _stats_llm_cost(config: Config, lower: datetime | None, upper: datetime | None) -> dict[str, Any]:
+def _stats_llm_cost(config: Config, lower: datetime | None, upper: datetime | None,
+                    wanted: str | None = None) -> dict[str, Any]:
     """Couts de workspace/*/llm_usage.jsonl dans la periode : par video, par usage
     et par jour (UTC) ; les appels sans cout rapporte sont comptes a part."""
     cost: dict[str, Any] = {"total": 0.0, "unreported_calls": 0, "by_video": {}, "by_usage": {}, "by_day": {}}
     root = Path(config.workspace_dir)
     for path in sorted(root.glob("*/llm_usage.jsonl")) if root.is_dir() else []:
         video_id = path.parent.name
+        if not _stats_channel_ok(_channel_of(video_id, config), wanted):
+            continue
         for number, entry in enumerate(_stats_read_jsonl(path), start=1):
             where = f"{video_id}/{path.name} ligne {number}"
             stamp = entry.get("recorded_at") or entry.get("timestamp")
@@ -1230,13 +1249,16 @@ def _stats_llm_cost(config: Config, lower: datetime | None, upper: datetime | No
     return cost
 
 
-def _stats_steps_and_counts(config: Config, lower: datetime | None, upper: datetime | None) -> dict[str, Any]:
+def _stats_steps_and_counts(config: Config, lower: datetime | None, upper: datetime | None,
+                            wanted: str | None = None) -> dict[str, Any]:
     """Videos dont ``updated_at`` tombe dans la periode : comptes par statut, et
     duree moyenne / derniere (fin la plus recente) de chaque etape sur les videos done."""
     counts = {status: 0 for status in _VIDEO_STATUSES}
     samples: dict[str, list[tuple[str, float]]] = {}
     for state in _list_states(config):
         video_id = state.get("video_id", "?")
+        if not _stats_channel_ok(state.get("channel"), wanted):
+            continue
         if not _stats_in_period(state.get("updated_at"), lower, upper, f"pipeline.json de {video_id}"):
             continue
         status = state.get("status")
@@ -1257,12 +1279,13 @@ def _stats_steps_and_counts(config: Config, lower: datetime | None, upper: datet
     return {"steps": steps, "counts": counts}
 
 
-def _stats(config: Config, since: str | None, until: str | None) -> dict[str, Any]:
+def _stats(config: Config, since: str | None, until: str | None, channel: str | None = None) -> dict[str, Any]:
     lower, upper = _stats_period(since, until)
-    return {"period": {"since": since or None, "until": until or None},
-            **_stats_clips(config, lower, upper),
-            "llm_cost": _stats_llm_cost(config, lower, upper),
-            **_stats_steps_and_counts(config, lower, upper)}
+    wanted = channel or None
+    return {"period": {"since": since or None, "until": until or None}, "channel": wanted,
+            **_stats_clips(config, lower, upper, wanted),
+            "llm_cost": _stats_llm_cost(config, lower, upper, wanted),
+            **_stats_steps_and_counts(config, lower, upper, wanted)}
 
 
 def _stats_csv_from_multipart(content_type: str, body: bytes) -> bytes:
@@ -1578,8 +1601,28 @@ def create_app(config: Config | None = None) -> FastAPI:
         _validate_video_id(video_id)
         if body.from_step not in pipeline.STEPS:
             raise HTTPException(status_code=400, detail=f"etape inconnue : {body.from_step!r}")
+        if (Path(config.workspace_dir) / video_id / pipeline.STATE_FILE).is_file():
+            pipeline.restore_video(video_id, config=config)  # relancer = ne plus etre « retiree »
         force_steps = list(pipeline.STEPS[pipeline.STEPS.index(body.from_step):])
         return _enqueue(video_id, _channel_of(video_id, config), "render", force_steps, config)
+
+    @app.post("/api/videos/{video_id}/dismiss")
+    def dismiss_video(video_id: str) -> dict[str, Any]:
+        """Sort la video des echecs et des compteurs sans effacer son dossier
+        (``dismissed_at`` dans pipeline.json) ; reversible par /restore."""
+        _validate_video_id(video_id)
+        try:
+            return _enrich(pipeline.dismiss_video(video_id, config=config), config)
+        except pipeline.PipelineError as exc:
+            raise HTTPException(status_code=404 if "aucun etat" in str(exc) else 409, detail=str(exc)) from exc
+
+    @app.post("/api/videos/{video_id}/restore")
+    def restore_video(video_id: str) -> dict[str, Any]:
+        _validate_video_id(video_id)
+        try:
+            return _enrich(pipeline.restore_video(video_id, config=config), config)
+        except pipeline.PipelineError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.get("/api/videos/{video_id}/events")
     def video_events(video_id: str, since: str | None = None) -> list[dict[str, Any]]:
@@ -1853,8 +1896,8 @@ def create_app(config: Config | None = None) -> FastAPI:
     # ----------------------------------------------------------------
 
     @app.get("/api/stats")
-    def stats(since: str | None = None, until: str | None = None) -> dict[str, Any]:
-        return _stats(config, since, until)
+    def stats(since: str | None = None, until: str | None = None, channel: str | None = None) -> dict[str, Any]:
+        return _stats(config, since, until, channel)
 
     @app.post("/api/stats/import")
     async def stats_import(request: Request) -> dict[str, Any]:
@@ -1916,6 +1959,18 @@ def create_app(config: Config | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail=f"identifiant invalide : {video_id!r}")
         path = _safe_video_file(Path(config.workspace_dir) / video_id, video_id)
         return FileResponse(path, media_type="video/mp4")
+
+    @app.get("/media/source/{video_id}/thumbnail")
+    def media_source_thumbnail(video_id: str) -> FileResponse:
+        # Le web ne traite jamais de video (ADR-09ad) : pipeline.video_thumbnail extrait et met en cache.
+        if not _SAFE_ID.fullmatch(video_id):
+            raise HTTPException(status_code=404, detail=f"identifiant invalide : {video_id!r}")
+        _safe_video_file(Path(config.workspace_dir) / video_id, video_id)  # 404 si la source n'existe pas
+        try:
+            path = pipeline.video_thumbnail(config, video_id)
+        except pipeline.PipelineError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return FileResponse(path, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=3600"})
 
     @app.get("/media/clip/{video_id}/{clip_id}")
     def media_clip(video_id: str, clip_id: str) -> FileResponse:

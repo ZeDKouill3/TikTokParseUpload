@@ -133,6 +133,9 @@ CONFIG_DEFAULTS: dict[str, object] = {
     # image, largeur maximale en pixels, prise à thumbnail_seek secondes.
     "thumbnail_width": 360,
     "thumbnail_seek": 0.5,
+    # Vignette d'une vidéo source (liste Vidéos, tableau de bord) : image prise
+    # à cette fraction de la durée de la source (0.1 = 10 %).
+    "video_thumbnail_seek_ratio": 0.1,
     "blur_radius": 20,
     "blur_power": 2,
     # Le fond flou (fallback_blur) est calculé sur une image réduite d'un
@@ -1172,16 +1175,18 @@ def _exec_ffmpeg(cmd: list[str], cwd: Path, out_path: Path) -> None:
         raise RenderError(f"ffmpeg a echoue pour {out_path} : {proc.stderr.decode(errors='replace').strip()}")
 
 
-def thumbnail(mp4: Path, target: Path, *, config: Any = None, ffmpeg_bin: str = "ffmpeg") -> Path:
+def thumbnail(mp4: Path, target: Path, *, config: Any = None, ffmpeg_bin: str = "ffmpeg",
+              seek: float | None = None) -> Path:
     """Extrait une seule image JPEG de ``mp4`` vers ``target`` (largeur
     ``[render] thumbnail_width`` au plus, jamais agrandie). Ecrit puis remplace
-    atomiquement ; ``RenderError`` si le mp4 manque ou si ffmpeg echoue."""
+    atomiquement ; ``RenderError`` si le mp4 manque ou si ffmpeg echoue.
+    ``seek`` (secondes) remplace ``[render] thumbnail_seek``."""
     mp4, target = Path(mp4), Path(target)
     if not mp4.is_file():
         raise RenderError(f"clip introuvable : {mp4}")
     settings = {**CONFIG_DEFAULTS, **(config.section("render") if config is not None else {})}
     width = int(settings["thumbnail_width"])
-    seek = float(settings["thumbnail_seek"])
+    seek = float(settings["thumbnail_seek"]) if seek is None else float(seek)
     if width < 1 or seek < 0:
         raise RenderError(f"[render] thumbnail_width >= 1 et thumbnail_seek >= 0 exiges, recu {width} et {seek}")
     target.parent.mkdir(parents=True, exist_ok=True)
