@@ -1162,3 +1162,11 @@ input[type="color"] { width: 36px; height: 36px; padding: 2px; border-radius: va
   .vscreen .fstep { min-height: 44px; }
   .vscreen .vrow { padding: 16px; }
 }
+/* ---------- Tableau de bord (TASK-aad3) ---------- */
+.dash { display: flex; flex-direction: column; gap: 32px; }
+.dash .panel > .list-item .kpi-value { font-size: 28px; margin-top: 0; }
+.dash .panel > .list-item .reason { margin-top: 0; flex: 1; }
+.dash .panel > .list-item.dash-problem { align-items: flex-start; padding-top: 16px; padding-bottom: 16px; }
+.dash .panel > .list-item.dash-problem .chip { margin-top: 2px; }
+.dash .dash-problem .reason { margin-top: 8px; }
+.dash .job { grid-template-columns: minmax(0, 1fr) auto; }

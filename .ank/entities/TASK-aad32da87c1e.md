@@ -5,7 +5,7 @@ slug: web-tableau-de-bord-en-cours-file-checs-attente
 title: "web : tableau de bord (en cours, file, échecs/attente, VOD à confirmer, clips à valider, prochaines publications, coût LLM, matériel)"
 created: 2026-09-30T20:43:36Z
 author: w-plan-web
-status: in_progress
+status: done
 scope:
   - clipper/web/app.py
   - clipper/web/static/**
@@ -16,8 +16,15 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/b577a89bf0e0@114bd19
+    tree: scope/eec83edabd95
+    criteria: 37278c75dccf
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 3
+version: 4
 ---
 
 SPEC-c100 E1, T2, T8. Le coût LLM vient du journal llm_usage.jsonl que pipeline écrit déjà (voir pipeline._usage_summary) ; l'agrégation vit dans clipper/web/app.py (lecture de fichiers, pas de logique LLM). L'état matériel lit clipper.gpu et, si torch.cuda est disponible, la mémoire utilisée ; sinon 'CPU' sans erreur.
