@@ -1428,3 +1428,14 @@ input[type="color"] { width: 36px; height: 36px; padding: 2px; border-radius: va
   .stats-bar { grid-template-columns: minmax(0, 1fr); gap: 4px; }
 }
 .vscreen .vhead .job-thumb { flex: none; }
+
+/* ---------- Modèle de chaîne (création) et aides repliées ---------- */
+.chan-models { border: 0; padding: 0; margin: 0; display: grid; gap: 8px; }
+.chan-models legend { font-size: 13px; font-weight: 500; padding: 0; margin-bottom: 8px; }
+.chan-model { display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--r-md, 8px); cursor: pointer; }
+.chan-model:has(input:checked) { border-color: var(--accent); }
+.chan-model input { margin-top: 3px; }
+.chan-model .hint { display: block; }
+.chan-help, .set-help { margin-top: 2px; }
+.chan-help > summary, .set-help > summary { cursor: pointer; font-size: 12px; color: var(--faint); }
+.chan-help > p, .set-help > p { margin: 4px 0 0; }

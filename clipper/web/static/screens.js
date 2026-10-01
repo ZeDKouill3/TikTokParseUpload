@@ -64,7 +64,7 @@ function videoRow(video) {
    image paresseuse ; si la source manque (404) ou l'extraction echoue, l'image est remplacee
    par une vignette neutre « pas d'image » (ecouteur d'erreur ci-dessous). */
 function videoThumb(videoId) {
-  return `<span class="job-thumb"><img loading="lazy" decoding="async" alt="" src="/media/source/${encodeURIComponent(videoId)}/thumbnail"><span class="job-thumb-none">pas d'image</span></span>`;
+  return `<span class="job-thumb"><img loading="lazy" decoding="async" alt="" width="96" height="54" src="/media/source/${encodeURIComponent(videoId)}/thumbnail"><span class="job-thumb-none">pas d'image</span></span>`;
 }
 
 // Les erreurs de chargement ne remontent pas : on les ecoute en phase de capture.

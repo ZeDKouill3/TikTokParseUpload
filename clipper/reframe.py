@@ -95,6 +95,7 @@ CONFIG_DEFAULTS: dict[str, object] = {
     # Mise en page : "letterbox" (zoom fixe, sans visage suivi, défaut) ou
     # "crop" (suivi de visage, option figée, voir le reste de ce module).
     "format": "letterbox",
+    # Format du clip : "letterbox" (par défaut) ou "stream_auto" (facecam en haut, jeu en bas).
     # Format letterbox seulement (SPEC-8257, succède à SPEC-3a88) :
     # "letterbox" (défaut) ou "stream_auto" = clip en stream (facecam fixe
     # agrandie en haut, jeu en bas) si la vidéo a une facecam et que son
@@ -102,6 +103,7 @@ CONFIG_DEFAULTS: dict[str, object] = {
     # des images clés du clip, sinon letterbox (raison journalisée). Voir
     # detect_facecam et _clip_facecam.
     "layout": "letterbox",
+    # Part des images clés où un visage doit rester au même endroit pour repérer la facecam.
     # Localisation de la facecam (une fois par vidéo, SPEC-8257 règle 1) :
     # visage à la même position (centre à moins de facecam_tolerance px) sur
     # au moins facecam_localize_min_share des images clés de scenes.json,
@@ -113,7 +115,8 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "facecam_localize_min_share": 0.1,
     "facecam_tolerance": 40,
     "facecam_max_area": 0.25,
-    # detect_facecam seulement (TASK-493f184c4ce1) : au plus ce nombre
+    # Nombre maximal d'images clés examinées pour chercher la facecam.
+    # Pour detect_facecam seulement (TASK-493f184c4ce1) : au plus ce nombre
     # d'images clés examinées (image entière + 4 coins agrandis), a
     # intervalles réguliers sur toute la durée de la vidéo (indices
     # équirépartis, bornes comprises) quand scenes.json en fournit plus ;
@@ -132,6 +135,7 @@ CONFIG_DEFAULTS: dict[str, object] = {
     # sur le visage, qui en occupe cette part de la hauteur. Repli quand les
     # bords réels de l'incrustation ne sont pas trouvés (voir plus bas).
     "stream_face_height": 0.5,
+    # Tolérance sur la position des bords de l'incrustation de la facecam.
     # Bords réels de l'incrustation (TASK-6404), cherchés de part et d'autre
     # du visage stable plutôt que devinés depuis sa seule taille : première
     # position, en s'éloignant du visage, où le gradient moyen (colonne pour
@@ -150,6 +154,7 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "facecam_edge_search_ratio": 3.0,
     "facecam_edge_min_gradient": 30.0,
     "facecam_edge_min_share": 0.8,
+    # Part des images clés d'un clip où la facecam doit être présente pour garder l'agencement stream.
     # Présence de la facecam par clip (SPEC-8257 règle 2) : un clip reste en
     # stream si le rectangle de la facecam (déjà localisé) y est présent et
     # vivant sur au moins facecam_clip_min_share de ses images clés, SANS
@@ -189,6 +194,7 @@ CONFIG_DEFAULTS: dict[str, object] = {
     # (titre d'écran au-dessus) ; le jeu occupe tout le bas.
     "stream_camera_ratio": 0.4,
     "stream_top": 440,
+    # Agencement des clips en stream : "top" (par défaut) ou "split".
     # Agencement d'un clip déjà en stream (SPEC-76dc) : n'intervient qu'après
     # les règles 1/2 ci-dessus (aucun effet sur le choix stream/letterbox
     # lui-meme). "top" (défaut, comportement inchangé) = SPEC-3a88 ci-dessus.
@@ -196,6 +202,7 @@ CONFIG_DEFAULTS: dict[str, object] = {
     # badge de chaîne optionnel, sous-titres à deux couleurs (voir
     # clipper.subtitles split_*).
     "stream_variant": "top",
+    # Zone de la webcam en haut du clip, en pixels du canevas 1080x1920, pour l'agencement split.
     # Zones de sortie de l'agencement split (SPEC-76dc), en pixels du canevas
     # 1080x1920 : webcam agrandie en haut, jeu en bas pleine largeur. Chacune
     # est recadrée (jamais étirée) au ratio de son rectangle dest ; doivent

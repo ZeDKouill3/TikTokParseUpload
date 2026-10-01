@@ -103,6 +103,7 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "outline_color": "&H00000000&",   # noir
     "emphasis_color": "&H0000A5FF&",  # orange : mots d'emphase
     "emphasis": True,
+    # Affiche les sous-titres en majuscules en format letterbox.
     # Format letterbox (SPEC-6127, maquette validée) : texte dans la zone
     # text_zones.subtitles du plan de recadrage.
     "letterbox_uppercase": True,
@@ -115,13 +116,16 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "letterbox_line_height": 1.15,
     "letterbox_outline": 7,
     "letterbox_max_words_per_group": 8,
+    # Décalage, en pixels, entre la vidéo et la première ligne de sous-titres.
     # Décalage (px) entre le haut de la zone subtitles et la première ligne
     # (TASK-ea6e : les sous-titres étaient trop collés à la vidéo sans lui).
     "letterbox_offset_y": 28,
+    # Nombre de clips dont les sous-titres sont générés en même temps ; 1 = un clip après l'autre.
     # Clips générés en même temps par l'étape subtitles de clipper.pipeline
     # (TASK-ce6e : un appel LLM d'emphase par clip) ; 1 = un clip après
     # l'autre. Lu par le pipeline, jamais passé à generate.
     "parallel": 4,
+    # Durée maximale, en secondes, pendant laquelle des sous-titres restent à l'écran après le dernier mot.
     # TASK-9ee7 : rien à l'écran pendant les silences. hold_s : un groupe de
     # mots reste affiché au plus ce temps après la fin de son dernier mot
     # (borne par le début du groupe suivant, si plus proche). gap_s : un
@@ -132,6 +136,7 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "hold_s": 0.3,
     "gap_s": 0.6,
     "max_word_s": 1.5,
+    # Police des sous-titres de l'agencement stream split.
     # Style de l'agencement stream split (SPEC-76dc, generate(style="split")) :
     # deux couleurs seulement (texte, mot en cours), jamais d'appel LLM
     # d'emphase (chaque mot est "en cours" à son propre instant). Couleurs au
@@ -146,6 +151,7 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "split_current_word_color": "#9146FF",
     "split_outline_color": "black",
     "split_outline": 10,
+    # Ajoute une ombre au texte des sous-titres de l'agencement stream split ; désactivé par défaut.
     # Sans ombre par défaut (style de référence sans ombre, SPEC-76dc).
     "split_shadow_enabled": False,
     "split_shadow_color": "black",

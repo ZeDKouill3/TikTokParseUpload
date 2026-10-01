@@ -59,7 +59,7 @@ function clipCard(c) {
   const s = clipStatus(c);
   const warn = c.qa_status === "rejected" ? "bad" : (c.issues && c.issues.length ? "warn" : "");
   return `<div class="clip" data-clip="${esc(clipKey(c))}" tabindex="0" role="button" aria-label="Ouvrir le clip ${esc(c.screen_title || c.clip_id)}">
-    <div class="clip-poster"><img loading="lazy" decoding="async" src="${esc(c.thumbnail_url)}" alt="" tabindex="-1"><div class="shade"></div>
+    <div class="clip-poster"><img loading="lazy" decoding="async" width="270" height="480" src="${esc(c.thumbnail_url)}" alt="" tabindex="-1"><div class="shade"></div>
       <div class="top"><span class="pill-dark ${s.cls}">${esc(s.label)}</span>${c.parts_total > 1 ? `<span class="pill-dark">${esc(c.part)}/${esc(c.parts_total)}</span>` : ""}</div>
       <span class="play">${icon("play")}</span>
       <div class="bottom"><span class="num">${c.duration != null ? esc(clipSeconds(c.duration)) : ""}</span><span class="grow"></span>
