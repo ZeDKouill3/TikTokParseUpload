@@ -127,6 +127,10 @@ _AFTER_REVIEW = "captions"
 EXIT_QUEUED = 75  # EX_TEMPFAIL
 
 STATE_FILE = "pipeline.json"
+# Fichier de la vignette de la video source (thumbnails/), a cote de celles des clips.
+SOURCE_THUMBNAIL = "_source.jpg"
+# Statuts qu'on peut « retirer » des echecs du tableau de bord.
+DISMISSIBLE_STATUSES = ("failed", "queued")
 REVIEW_FILE = "review.json"
 EVENTS_FILE = "events.jsonl"
 
@@ -535,6 +539,37 @@ def clip_thumbnail(config: Config, video_id: str, clip_id: str) -> Path:
         render_step.thumbnail(mp4, target, config=config)
     except render_step.RenderError as exc:
         raise PipelineError(f"miniature du clip {video_id}/{clip_id} impossible : {exc}") from exc
+    os.utime(target, ns=(mtime_ns, mtime_ns))
+    return target
+
+
+def video_thumbnail(config: Config, video_id: str) -> Path:
+    """Vignette JPEG (<= ``[render] thumbnail_width`` px) de la video source
+    workspace/<video_id>/<video_id>.mp4, prise a ``[render]
+    video_thumbnail_seek_ratio`` de sa duree (meta.json), en cache sous
+    workspace/<video_id>/thumbnails/ : une seule extraction, reutilisee tant
+    que la source garde la meme date de modification. Meme schema que
+    ``clip_thumbnail`` ; le web ne traite jamais de video (ADR-09ad)."""
+    video_dir = Path(config.workspace_dir) / video_id
+    mp4 = video_dir / f"{video_id}.mp4"
+    if not mp4.is_file():
+        raise PipelineError(f"video source introuvable : {mp4}")
+    mtime_ns = mp4.stat().st_mtime_ns
+    target = video_dir / "thumbnails" / SOURCE_THUMBNAIL
+    if target.is_file() and target.stat().st_mtime_ns == mtime_ns:
+        return target
+    meta = video_dir / "meta.json"
+    duration = _read_json(meta).get("duration") if meta.is_file() else None
+    if not isinstance(duration, (int, float)) or isinstance(duration, bool) or duration <= 0:
+        raise PipelineError(
+            f"vignette de {video_id} impossible : duree de la source inconnue "
+            f"({meta} absent ou sans duree valide)"
+        )
+    ratio = float({**render_step.CONFIG_DEFAULTS, **config.section("render")}["video_thumbnail_seek_ratio"])
+    try:
+        render_step.thumbnail(mp4, target, config=config, seek=duration * ratio)
+    except render_step.RenderError as exc:
+        raise PipelineError(f"vignette de la video {video_id} impossible : {exc}") from exc
     os.utime(target, ns=(mtime_ns, mtime_ns))
     return target
 
@@ -966,6 +1001,7 @@ def _start(
     ``force_steps`` (sans ``force``) ne remet a pending, et ne force, que
     l'etape nommee la plus en amont et toutes celles qui la suivent dans
     STEPS (SPEC-74e9 §3.3) : les precedentes restent ``done``."""
+    state.pop("dismissed_at", None)  # une relance reprend la video : elle n'est plus « retiree »
     if force:
         forced = set(STEPS)
         for step in state["steps"].values():
@@ -1040,6 +1076,31 @@ def render(
     )
 
 
+def dismiss_video(video_id: str, *, config: Config | None = None) -> dict[str, Any]:
+    """Retire une video en echec ou en attente de reprise des echecs et des
+    compteurs du tableau de bord : pose ``dismissed_at`` dans son pipeline.json
+    (reversible par ``restore_video``). Le dossier workspace n'est pas touche."""
+    config = config or load_config()
+    state = load_state(video_id, config=config)
+    if state.get("status") not in DISMISSIBLE_STATUSES:
+        raise PipelineError(
+            f"{video_id} est {state.get('status')!r} : seule une video en echec (failed) "
+            "ou en attente de reprise (queued) peut etre retiree"
+        )
+    state["dismissed_at"] = _iso(_now())
+    save_state(state, config=config)
+    return state
+
+
+def restore_video(video_id: str, *, config: Config | None = None) -> dict[str, Any]:
+    """Annule ``dismiss_video`` : la video reapparait dans les echecs."""
+    config = config or load_config()
+    state = load_state(video_id, config=config)
+    if state.pop("dismissed_at", None) is not None:
+        save_state(state, config=config)
+    return state
+
+
 def queued(*, config: Config | None = None) -> list[dict[str, Any]]:
     """Etats des videos en file d'attente, par retry_at croissant."""
     config = config or load_config()
@@ -1047,7 +1108,7 @@ def queued(*, config: Config | None = None) -> list[dict[str, Any]]:
     states = []
     for path in sorted(root.glob(f"*/{STATE_FILE}")) if root.is_dir() else []:
         state = json.loads(path.read_text(encoding="utf-8"))
-        if state["status"] == "queued":
+        if state["status"] == "queued" and not state.get("dismissed_at"):
             states.append(state)
     return sorted(states, key=lambda s: s["retry_at"])
 

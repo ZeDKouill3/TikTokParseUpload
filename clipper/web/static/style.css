@@ -395,6 +395,13 @@ kbd {
 .job:first-child { border-top: 0; }
 .job-thumb { width: 96px; aspect-ratio: 16 / 9; border-radius: 6px; overflow: hidden; background: var(--surface-3); position: relative; }
 .job-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.job-thumb .job-thumb-none { display: none; position: absolute; inset: 0; place-items: center; font-size: 11px; color: var(--faint); }
+.job-thumb.empty img { display: none; }
+.job-thumb.empty .job-thumb-none { display: grid; }
+.list-item .job-thumb { width: 72px; flex: none; }
+.dash-problem-actions { margin-left: auto; flex: none; gap: 8px; }
+.th-sort { all: unset; cursor: pointer; font: inherit; color: inherit; white-space: nowrap; }
+.th-sort:hover, .th-sort:focus-visible { color: var(--text); }
 .job-thumb .dur { position: absolute; right: 4px; bottom: 4px; font-family: var(--font-mono); font-size: 10px; background: rgba(0,0,0,0.75); color: #fff; padding: 0 4px; border-radius: 3px; }
 .job-title { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .job-meta { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); margin-top: 4px; flex-wrap: wrap; }
@@ -1132,7 +1139,7 @@ input[type="color"] { width: 36px; height: 36px; padding: 2px; border-radius: va
 }
 .vscreen .vfilters { padding: 16px 24px 0; margin-bottom: 8px; }
 .vscreen .vfilters .input-ico .input { width: 260px; }
-.vscreen .vrow { grid-template-columns: minmax(0, 1fr) auto; color: inherit; text-decoration: none; }
+.vscreen .vrow { grid-template-columns: 96px minmax(0, 1fr) auto; color: inherit; text-decoration: none; }
 .vscreen .vrow .reason { margin-top: 10px; }
 .vscreen .vback { margin: 16px 24px 0; }
 .vscreen .vhead { display: flex; gap: 16px; align-items: flex-start; justify-content: space-between; flex-wrap: wrap; padding: 16px 24px; }
@@ -1418,3 +1425,4 @@ input[type="color"] { width: 36px; height: 36px; padding: 2px; border-radius: va
   .stats-import { margin-left: 0; }
   .stats-bar { grid-template-columns: minmax(0, 1fr); gap: 4px; }
 }
+.vscreen .vhead .job-thumb { flex: none; }

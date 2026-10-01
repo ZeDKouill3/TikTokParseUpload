@@ -3890,3 +3890,253 @@ def test_stats_clip_pagination_reveals_50_more_rows_per_click():
     script = "const STATS_CLIPS_PAGE_SIZE = 50;\n" + js[start:end] + "\nconsole.log(JSON.stringify([statsMoreCount(120, 50), statsMoreCount(120, 100), statsMoreCount(30, 50)]));"
     out = subprocess.run(["node", "-e", script], capture_output=True, text=True, check=True).stdout
     assert json.loads(out) == [50, 20, 0]
+
+
+# --------------------------------------------------------------------------
+# TASK-c0ef : console v2, quatrieme tour
+# --------------------------------------------------------------------------
+
+
+def _static(*parts) -> str:
+    return STATIC.joinpath(*parts).read_text(encoding="utf-8")
+
+
+def test_settings_section_links_scroll_instead_of_being_read_as_a_screen():
+    settings = _static("screens", "settings.js")
+    app = _static("app.js")
+
+    # Les liens gardent leur ancre, mais un clic fait defiler sans changer de hash...
+    assert 'href="#set-${id}"' in settings
+    assert "scrollIntoView" in settings and "preventDefault()" in settings
+    assert "data-set-nav" in settings
+    # ...et le routeur n'interprete jamais « #set-xxx » comme un ecran (retour au tableau de bord).
+    route = app[app.index("function route()"):app.index("function renderCurrent")]
+    assert 'startsWith("set-")' in route and "scrollIntoView" in route
+
+
+def _write_meta_title(tmp_path, video_id, title):
+    meta = tmp_path / "workspace" / video_id
+    meta.mkdir(parents=True, exist_ok=True)
+    (meta / "meta.json").write_text(json.dumps({"video_id": video_id, "title": title}), encoding="utf-8")
+
+
+def test_dashboard_problem_rows_carry_the_video_title_or_the_id(tmp_path, isolated_cwd):
+    _write_state(tmp_path, "aaaaaaaaaaa", status="failed", reason="ffmpeg a echoue")
+    _write_state(tmp_path, "bbbbbbbbbbb", status="queued", reason="quota", retry_at="2026-01-02T08:00:00+00:00")
+    _write_meta_title(tmp_path, "aaaaaaaaaaa", "Mon direct du soir")
+
+    data = _dashboard(tmp_path)
+
+    assert data["failed"][0]["title"] == "Mon direct du soir"
+    assert data["queued"][0]["title"] == "bbbbbbbbbbb"  # pas de titre : l'identifiant
+
+
+def test_dismiss_removes_a_failed_video_from_the_dashboard_without_deleting_its_workspace(tmp_path, isolated_cwd):
+    _write_state(tmp_path, "aaaaaaaaaaa", status="failed", reason="ffmpeg a echoue")
+    (tmp_path / "workspace" / "aaaaaaaaaaa" / "keep.txt").write_text("x", encoding="utf-8")
+    c = client(tmp_path)
+
+    resp = c.post("/api/videos/aaaaaaaaaaa/dismiss")
+
+    assert resp.status_code == 200 and resp.json()["dismissed_at"]
+    assert _dashboard(tmp_path)["failed"] == []
+    assert (tmp_path / "workspace" / "aaaaaaaaaaa" / "keep.txt").read_text(encoding="utf-8") == "x"
+    detail = c.get("/api/videos/aaaaaaaaaaa").json()
+    assert detail["dismissed_at"] and detail["status"] == "failed"  # l'etat reste lisible, explicite
+
+    back = c.post("/api/videos/aaaaaaaaaaa/restore")
+    assert back.status_code == 200 and "dismissed_at" not in back.json()
+    assert [v["video_id"] for v in _dashboard(tmp_path)["failed"]] == ["aaaaaaaaaaa"]
+
+
+def test_dismiss_also_clears_a_queued_video_from_the_counters(tmp_path, isolated_cwd):
+    _write_state(tmp_path, "bbbbbbbbbbb", status="queued", reason="quota", retry_at="2026-01-02T08:00:00+00:00")
+
+    assert client(tmp_path).post("/api/videos/bbbbbbbbbbb/dismiss").status_code == 200
+
+    assert _dashboard(tmp_path)["queued"] == []
+
+
+def test_dismiss_errors_are_explicit(tmp_path, isolated_cwd):
+    _write_state(tmp_path, "aaaaaaaaaaa", status="running")
+    c = client(tmp_path)
+
+    running = c.post("/api/videos/aaaaaaaaaaa/dismiss")
+    assert running.status_code == 409 and "echec" in running.json()["detail"]
+    missing = c.post("/api/videos/zzzzzzzzzzz/dismiss")
+    assert missing.status_code == 404 and "aucun etat" in missing.json()["detail"]
+    assert c.post("/api/videos/zzzzzzzzzzz/restore").status_code == 404
+    assert c.post("/api/videos/..%2Fx/dismiss").status_code in (404, 422)
+
+
+def test_dismissed_video_is_requeued_by_a_retry_and_reappears(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import worker
+
+    _write_state(tmp_path, "aaaaaaaaaaa", status="failed", reason="ffmpeg a echoue")
+    c = client(tmp_path)
+    c.post("/api/videos/aaaaaaaaaaa/dismiss")
+    monkeypatch.setattr(worker, "enqueue", lambda url, channel, action, force_steps, *, config=None: {
+        "id": "e1", "video_id": "aaaaaaaaaaa", "url": url, "channel": channel, "action": action,
+        "force_steps": force_steps or [], "status": "waiting"})
+
+    assert c.post("/api/videos/aaaaaaaaaaa/retry", json={"from_step": "download"}).status_code == 202
+
+    assert "dismissed_at" not in c.get("/api/videos/aaaaaaaaaaa").json()
+
+
+def test_dashboard_problem_rows_link_to_the_video_sheet_and_offer_retry_and_dismiss():
+    dash = _static("screens", "dashboard.js")
+    row = dash[dash.index("function dashProblemRow"):dash.index("function dashPublicationRow")]
+
+    assert "#/videos/${encodeURIComponent(video.video_id)}" in row and 'href="#/videos"' not in row
+    assert "video.title" in row
+    assert "data-retry-video" in row and "Relancer" in row
+    assert "data-dismiss-video" in row and "Retirer" in row
+    assert "videoThumb(" in row
+    assert "/api/videos/${encodeURIComponent(id)}/retry" in _static("app.js") or "/retry" in _static("app.js")
+    assert "/dismiss" in _static("app.js")
+
+
+def test_video_sheet_offers_the_same_retry_and_dismiss_actions():
+    videos = _static("screens", "videos.js")
+
+    assert "data-retry-video" in videos and "data-dismiss-video" in videos
+    assert "wireActions(view)" in videos  # mêmes gestionnaires (app.js) que le tableau de bord
+    assert "Relancer" in videos and "Retirer" in videos and "Rétablir" in videos
+
+
+def test_media_source_thumbnail_route_serves_the_pipeline_thumbnail(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import render
+
+    _write_state(tmp_path, THUMB_VIDEO)
+    _write_meta_duration = tmp_path / "workspace" / THUMB_VIDEO
+    (_write_meta_duration / "meta.json").write_text(json.dumps({"video_id": THUMB_VIDEO, "duration": 100}), encoding="utf-8")
+    (_write_meta_duration / f"{THUMB_VIDEO}.mp4").write_bytes(b"mp4")
+    calls = []
+
+    def fake_exec(cmd, cwd, out_path):
+        calls.append(cmd)
+        Path(out_path).write_bytes(b"\xff\xd8vthumb")
+
+    monkeypatch.setattr(render, "_exec_ffmpeg", fake_exec)
+    c = client(tmp_path)
+
+    first = c.get(f"/media/source/{THUMB_VIDEO}/thumbnail")
+    second = c.get(f"/media/source/{THUMB_VIDEO}/thumbnail")
+
+    assert first.status_code == 200 and first.content == b"\xff\xd8vthumb"
+    assert first.headers["content-type"] == "image/jpeg" and "max-age" in first.headers["cache-control"]
+    assert second.content == first.content and len(calls) == 1
+    assert calls[0][calls[0].index("-ss") + 1] == "10.000000"
+
+
+def test_media_source_thumbnail_route_errors_are_explicit(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import render
+
+    c = client(tmp_path)
+    missing = c.get(f"/media/source/{THUMB_VIDEO}/thumbnail")
+    assert missing.status_code == 404 and "introuvable" in missing.json()["detail"]
+    assert c.get("/media/source/..%2Fx/thumbnail").status_code == 404
+
+    video_dir = tmp_path / "workspace" / THUMB_VIDEO
+    video_dir.mkdir(parents=True)
+    (video_dir / f"{THUMB_VIDEO}.mp4").write_bytes(b"mp4")
+    (video_dir / "meta.json").write_text(json.dumps({"duration": 100}), encoding="utf-8")
+
+    def boom(cmd, cwd, out_path):
+        raise render.RenderError("ffmpeg introuvable (ffmpeg)")
+
+    monkeypatch.setattr(render, "_exec_ffmpeg", boom)
+    failed = c.get(f"/media/source/{THUMB_VIDEO}/thumbnail")
+    assert failed.status_code == 422 and "vignette" in failed.json()["detail"]
+
+
+def test_video_thumbnails_are_lazy_images_with_a_neutral_fallback_everywhere():
+    helper = _static("screens.js")
+    assert "function videoThumb(" in helper
+    thumb = helper[helper.index("function videoThumb("):]
+    assert '<img loading="lazy"' in thumb and "/media/source/" in thumb and "/thumbnail" in thumb
+    assert "pas d'image" in helper
+    assert '"error"' in helper and "true" in helper  # l'echec de chargement remplace l'image par la vignette neutre
+
+    for name, marker in (("dashboard.js", "function dashRunningRow"), ("dashboard.js", "function dashProblemRow")):
+        src = _static("screens", name)
+        assert "videoThumb(" in src[src.index(marker):src.index(marker) + 1800], marker
+    assert "videoThumb(" in _static("screens.js")[_static("screens.js").index("function queueRow"):_static("screens.js").index("const addVideoButton")]
+    videos = _static("screens", "videos.js")
+    assert "videoThumb(" in videos[videos.index("function listRow"):videos.index("function paintList")]
+    assert "videoThumb(" in videos[videos.index("function paintDetail"):videos.index("function wireDetail")]
+
+
+def _stats_channels(tmp_path) -> None:
+    _stats_seed(tmp_path)
+    for video_id, channel in ((STATS_A, "ma_chaine"), (STATS_B, "autre")):
+        path = tmp_path / "workspace" / video_id / "pipeline.json"
+        state = json.loads(path.read_text(encoding="utf-8"))
+        state["channel"] = channel
+        path.write_text(json.dumps(state), encoding="utf-8")
+
+
+def test_stats_channel_filter_applies_to_every_block(tmp_path, isolated_cwd):
+    _stats_channels(tmp_path)
+
+    data = _stats(tmp_path, "?channel=ma_chaine")
+
+    assert data["channel"] == "ma_chaine"
+    assert sorted((c["video_id"], c["clip_id"]) for c in data["clips"]) == [(STATS_A, "01"), (STATS_A, "02")]
+    assert set(data["llm_cost"]["by_video"]) == {STATS_A}
+    assert data["llm_cost"]["total"] == pytest.approx(1.75)
+    assert data["counts"] == {"pending": 0, "running": 0, "awaiting_review": 0, "queued": 0, "done": 1, "failed": 0}
+    assert data["steps"]["download"]["mean_s"] == pytest.approx(40)
+    assert data["stats_unmatched"] == []
+
+
+def test_stats_channel_filter_other_channel_and_no_channel(tmp_path, isolated_cwd):
+    _stats_channels(tmp_path)
+
+    other = _stats(tmp_path, "?channel=autre")
+    assert [(c["video_id"], c["clip_id"]) for c in other["clips"]] == [(STATS_B, "01")]
+    assert other["llm_cost"]["total"] == pytest.approx(2.0) and other["counts"]["done"] == 1
+
+    none = _stats(tmp_path, "?channel=__none__")
+    assert none["clips"] == [] and none["llm_cost"]["by_video"] == {}
+    assert none["counts"]["failed"] == 1 and none["counts"]["running"] == 1 and none["counts"]["done"] == 0
+
+
+def test_stats_without_channel_parameter_still_covers_everything(tmp_path, isolated_cwd):
+    _stats_channels(tmp_path)
+
+    data = _stats(tmp_path)
+
+    assert data["channel"] is None
+    assert len(data["clips"]) == 3 and data["counts"]["done"] == 2
+
+
+def test_stats_screen_filters_by_channel_and_sorts_the_clip_table_on_header_click():
+    stats = _static("screens", "stats.js")
+
+    assert "data-stats-channel" in stats and "Toutes les chaînes" in stats and "Sans chaîne" in stats
+    assert 'params.set("channel"' in stats and "__none__" in stats
+    table = stats[stats.index("function statsClipsBlock"):stats.index("function statsCostBlock")]
+    assert "statsHead(" in table and '"Chaîne"' in table
+    assert "data-stats-sort" in stats and "aria-sort" in stats
+    assert "statsSortInPlace(" in stats and "statsUi.sort" in stats
+    assert "[data-stats-sort]" in stats[stats.index("function statsWire"):]
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node absent du PATH")
+def test_stats_clip_sort_orders_by_column_with_missing_values_last():
+    js = _static("screens", "stats.js")
+    start = js.index("const STATS_SORTS")
+    end = js.index("};\n", start) + 3
+    fn_start = js.index("function statsSortInPlace")
+    fn_end = js.index("\n}\n", fn_start) + 3
+    script = (
+        js[start:end] + "const statsUi = { sort: { key: 'views', dir: 'desc' } };\n" + js[fn_start:fn_end]
+        + "\nconst clips = [{clip_id:'a', stats:{views:5}}, {clip_id:'b', stats:null}, {clip_id:'c', stats:{views:50}}];"
+        + "\nstatsSortInPlace(clips); const desc = clips.map(c => c.clip_id).join('');"
+        + "\nstatsUi.sort = { key: 'views', dir: 'asc' }; statsSortInPlace(clips);"
+        + "\nconsole.log(JSON.stringify([desc, clips.map(c => c.clip_id).join('')]));"
+    )
+    out = subprocess.run(["node", "-e", script], capture_output=True, text=True, check=True).stdout
+    assert json.loads(out) == ["cab", "acb"]
