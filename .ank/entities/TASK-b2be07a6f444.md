@@ -5,7 +5,7 @@ slug: acc-s-distant-de-bout-en-bout-serve-host-page-je
 title: accès distant de bout en bout (serve --host, page jeton, notifications navigateur) et documentation de la console v2 (GUIDE.md, README, CHANGELOG)
 created: 2026-09-30T20:44:58Z
 author: w-plan-web
-status: in_progress
+status: done
 scope:
   - clipper/__main__.py
   - clipper/web/app.py
@@ -20,8 +20,15 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/fc64ba1f84d5@4790ea0
+    tree: scope/7dec9a6f6dbb
+    criteria: 0ae5203832d6
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 3
+version: 4
 ---
 
 SPEC-c100 T5, T7 ; ADR-4f6e §5. Le jeton protège un accès sur le réseau local depuis le téléphone ; la documentation dit explicitement de ne pas exposer le port sur Internet sans reverse proxy TLS.

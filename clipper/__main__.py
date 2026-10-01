@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import importlib.resources
 import json
 import logging
@@ -64,7 +65,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("worker", help="Lance le worker seul (file state/queue.json, un enfant a la fois)")
 
-    p = sub.add_parser("serve", help="Lance l'interface web locale (FastAPI sur 127.0.0.1)")
+    p = sub.add_parser("serve", help="Lance l'interface web (FastAPI ; 127.0.0.1 par defaut, --host exige un jeton)")
+    p.add_argument(
+        "--host", default=None,
+        help="Adresse d'ecoute (defaut : [web] host de config.toml) ; hors 127.0.0.1, [web] token est exige",
+    )
     p.add_argument("--port", type=int, default=None, help="Port d'ecoute (defaut : [web] port de config.toml)")
     return parser
 
@@ -261,10 +266,20 @@ def main(argv: list[str] | None = None) -> int:
 
             from clipper.web import create_app
 
-            port = args.port if args.port is not None else config.section("web")["port"]
+            web_cfg = config.section("web")
+            port = args.port if args.port is not None else web_cfg["port"]
+            host = str(args.host if args.host is not None else web_cfg["host"])
+            if host != "127.0.0.1" and not web_cfg["token"]:
+                raise ConfigError(
+                    f"[web] token : un jeton est exige pour ecouter sur {host!r} (hors bouclage) ; "
+                    'ajoute token = "..." dans la table [web] de config.toml (ADR-4f6e §5)'
+                )
+            if host != web_cfg["host"]:
+                sections = {**config._sections, "web": {**config._sections.get("web", {}), "host": host}}
+                config = dataclasses.replace(config, _sections=sections)
             worker_proc = _popen([sys.executable, "-m", "clipper", "worker"])
             try:
-                uvicorn.run(create_app(config=config), host="127.0.0.1", port=int(port))
+                uvicorn.run(create_app(config=config), host=host, port=int(port))
             finally:
                 worker_proc.terminate()
             return 0

@@ -94,7 +94,7 @@ accélérer transcription et rendu ; sans GPU, tout tourne sur CPU.
 ```powershell
 cp config.example.toml config.toml   # mode "review" par defaut
 python -m clipper -v run <url-youtube-ou-twitch>
-python -m clipper serve              # interface web locale : http://127.0.0.1:8000
+python -m clipper serve              # console web : http://127.0.0.1:8000
 ```
 
 En mode `review`, l'interface web (ou `python -m clipper decide`) sert à
@@ -148,14 +148,20 @@ moitié activé.
   indisponible, quota, réseau) remet la vidéo en file d'attente au lieu
   d'abandonner ou de produire un résultat dégradé en silence.
 
-## Interface web
+## Interface web : Console de gestion web (v2)
 
-`python -m clipper serve` lance un serveur FastAPI local
-(`http://127.0.0.1:8000`) : coller une URL, suivre la progression étape par
-étape, revoir les moments proposés, lancer le rendu, voir les clips. La page
-est statique (HTML/CSS/JS, sans étape de build) et n'appelle que
-`clipper.pipeline` — aucune logique de traitement vidéo, audio ou LLM côté
-web.
+`python -m clipper serve` lance la console (`http://127.0.0.1:8000`) et le
+worker qui traite une file de vidéos, une à la fois. Huit écrans : Accueil,
+Vidéos, Revue des moments, Clips, Chaînes (presets en surcouche, éditeur
+d'agencement, aperçu des sous-titres), Publication (calendrier de créneaux),
+Statistiques et Réglages ; progression en temps réel, surveillance des VOD
+d'une chaîne, notifications du navigateur. La page est statique (HTML/CSS/JS,
+sans étape de build) et ne fait aucun traitement vidéo, audio ou LLM.
+
+Pour l'ouvrir depuis un téléphone du réseau local :
+`python -m clipper serve --host 0.0.0.0`, ce qui exige `[web] token` dans
+`config.toml`. Pas de TLS : ne pas exposer le port sur Internet sans reverse
+proxy TLS. Détails dans [`docs/GUIDE.md`](docs/GUIDE.md).
 
 ## Coûts et performances
 
@@ -176,7 +182,7 @@ commentaire.
 ## Documentation
 
 - [`docs/GUIDE.md`](docs/GUIDE.md) — guide utilisateur : les 12 étapes du
-  pipeline, modes, formats, configuration complète, consommation du quota
+  pipeline, modes, formats, console de gestion, configuration complète, consommation du quota
   Claude, dépannage.
 - [`AGENTS.md`](AGENTS.md) — conventions du dépôt et décisions ratifiées
   (ADR/SPEC), pour qui contribue au code.

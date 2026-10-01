@@ -229,6 +229,168 @@ lui-même n'est jamais noir : il est toujours rempli avec `badge_logo_fill`
 (ex. le fond violet déjà présent dans un logo Twitch) — réglable à une
 couleur fixe si besoin.
 
+## Console de gestion
+
+`python -m clipper serve` lance la console web (FastAPI + page statique, sans
+étape de build) et, en sous-processus, le **worker** qui traite la file. Par
+défaut : `http://127.0.0.1:8000` (`[web] port` ou `--port`). La page ne fait
+aucun traitement vidéo, audio ou LLM : elle lit `workspace/`, `output/`,
+`state/` et `presets/`, et demande le travail au worker. Fermer l'onglet, ou
+même arrêter le serveur, n'interrompt pas une vidéo en cours de traitement.
+`python -m clipper worker` lance le worker seul (sans interface).
+
+### Les 8 écrans
+
+La navigation (barre latérale, onglets en bas sur téléphone) donne :
+
+1. **Accueil** (tableau de bord) : vidéos en cours (étape, progression, durée
+   restante estimée quand le pipeline la donne), file d'attente (passer une
+   vidéo en tête, la retirer), vidéos en échec ou remises en file avec leur
+   raison, VOD « à confirmer » issues de la surveillance, clips à valider,
+   prochaines publications, coût LLM du jour et de la semaine par usage, état
+   matériel (GPU ou CPU).
+2. **Vidéos** : liste filtrable (chaîne, statut, texte) ; ajout par URL avec
+   choix de la chaîne (ou « sans chaîne » pour `config.toml` seul) ; fiche
+   avec la frise des 12 étapes, le journal suivi en direct, « relancer depuis
+   cette étape » et « annuler ».
+3. **Revue** (mode `review`) : lecteur de la source calé sur le moment, score,
+   accroche, justification du jury, bornes début/fin ajustables ; raccourcis
+   `A` (accepter), `R` (refuser), `J`/`K` (suivant/précédent), espace
+   (lecture). « Lancer le rendu » n'est actif que quand chaque moment a une
+   décision ; sinon la raison s'affiche.
+4. **Clips** : galerie 9:16 par vidéo et par chaîne, lecteur, fiche du clip
+   (titre d'écran, description, hashtags, partie N/M, `qa_status`, `issues`),
+   édition de la description et des hashtags, du titre d'écran (re-rendu),
+   approuver / refuser, re-rendre, télécharger le mp4, copier la description.
+5. **Chaînes** : liste (nom, source, surveillance, mode, prochains créneaux),
+   création et édition d'un preset par formulaire, chaque champ montrant sa
+   valeur héritée de `config.toml` tant que le preset ne la redéfinit pas ; une
+   erreur de validation s'affiche sous le champ. Deux outils : l'**éditeur
+   d'agencement** (canevas 1080×1920 : zones webcam, jeu, badge, sous-titres à
+   glisser et redimensionner sur une image clé d'une vidéo de la chaîne,
+   enregistrées dans `[reframe]` ; un agencement qui déborde ou se chevauche
+   est refusé avec le message de `reframe`) et l'**aperçu du style des
+   sous-titres** sur une phrase d'exemple, rendu par le pipeline.
+6. **Publication** : par chaîne, clips `approved` / `scheduled`, calendrier
+   hebdomadaire des créneaux (glisser-déposer sur un créneau libre),
+   télécharger, copier la description, « marquer publié », « repasser en
+   attente ». La mise en ligne reste manuelle : le dépôt ne publie rien sur
+   TikTok.
+7. **Statistiques** : par clip (résultats importés, décisions humaines, QA),
+   coûts LLM par vidéo, usage et période, durée par étape, import CSV des
+   statistiques de la plateforme.
+8. **Réglages** : `config.toml` en formulaire (mode global, dossiers, backend
+   et modèle LLM par usage, surveillance), écriture validée avant d'être
+   enregistrée ; section « Accès » (hôte, jeton masqué) en lecture seule avec
+   la commande à lancer.
+
+Toute erreur de l'API s'affiche en clair (toast et à la place de l'objet),
+jamais un tiret muet. Les actions qui ont un inverse (décision de revue,
+approbation) proposent « Annuler » pendant 5 secondes ; les autres (annuler un
+traitement, refuser une série, supprimer une chaîne) demandent confirmation.
+
+### La file de traitement
+
+Ajouter une vidéo (écran Vidéos, ou VOD confirmée) l'inscrit dans
+`state/queue.json`. Le worker traite **une vidéo à la fois**, chacune dans un
+processus enfant `python -m clipper` ; « annuler » termine ce processus.
+L'ordre est modifiable (passer en tête, retirer). Une erreur transitoire
+remet la vidéo en file avec sa raison et l'heure de reprise (`retry_at`) ;
+une erreur définitive la passe en `failed`. Le worker lit les mêmes fichiers
+`state/` que le serveur, sous verrou de fichier.
+
+### Presets de chaîne en surcouche
+
+Une chaîne est un fichier `presets/<nom>.toml` : une **surcouche** fusionnée
+clé par clé sur `config.toml`. Seules les clés redéfinies figurent dans le
+fichier ; tout le reste est hérité. La table `[channel]` (validée par
+`CONFIG_DEFAULTS` de `clipper/channel.py`) décrit la chaîne elle-même :
+`display_name`, `source_url`, `watch`, `watch_interval_s`,
+`watch_min_duration_s`, `mode`, `slots`, `timezone`, `tiktok_account`,
+`logo`. Exemple `presets/ma_chaine.toml` :
+
+```toml
+[channel]
+display_name = "ma_chaine"
+source_url = "https://www.twitch.tv/ma_chaine/videos"
+watch = true
+mode = "review"
+slots = [{ day = "mon", time = "18:00" }, { day = "thu", time = "18:00" }]
+
+[reframe]
+format = "stream_auto"
+stream_variant = "split"
+```
+
+Le nom (`ma_chaine`, minuscules, chiffres, `_` et `-`) est celui du fichier.
+Le formulaire de l'écran Chaînes lit et écrit ce même fichier ; le même
+preset s'utilise en ligne de commande avec
+`--config presets/ma_chaine.toml`.
+
+### Le dossier `state/`
+
+Tout état hors vidéo vit en fichiers JSON sous `state/`, jamais en base ni en
+mémoire seule (un redémarrage reprend où l'on en était) :
+
+- `state/queue.json` : la file de traitement ;
+- `state/watch/<chaine>.json` : surveillance (vidéos vues, VOD en attente de
+  confirmation, dernière erreur) ;
+- `state/publish/<chaine>.json` : file de publication et créneaux pris.
+
+Chemins réglables dans `[worker]`, `[watch]` et `[publish]`. Les vidéos
+elles-mêmes restent sous `workspace/<video_id>/` et `output/<video_id>/`.
+
+### Surveillance des VOD
+
+Avec `watch = true` dans `[channel]`, le worker interroge la `source_url` de
+la chaîne toutes les `watch_interval_s` secondes (rien n'est téléchargé pour
+lister). Il ignore les VOD plus courtes que `watch_min_duration_s`, les
+directs en cours et celles déjà vues. En mode `auto` les nouvelles VOD sont
+mises en file ; en mode `review` elles apparaissent « à confirmer » sur
+l'Accueil, où l'on choisit de les confirmer (mise en file) ou de les ignorer.
+Une erreur de listage est affichée (`last_error`), la chaîne reste surveillée.
+
+### Notifications
+
+Un toast s'affiche à chaque passage d'une vidéo à `done`, `failed`,
+`awaiting_review` ou `queued`. Le bouton cloche de l'en-tête active en plus
+les **notifications du navigateur** : la permission n'est demandée qu'à ce
+clic, jamais au chargement de la page, et le réglage reste local au
+navigateur (`localStorage`). Si le flux temps réel (`/api/events`) tombe, un
+bandeau « connexion perdue » apparaît et la page interroge l'API toutes les
+5 secondes.
+
+### Accès distant par jeton
+
+Par défaut la console n'écoute que sur `127.0.0.1` et n'exige rien. Pour la
+joindre depuis un téléphone du même réseau :
+
+```toml
+[web]
+token = "un-jeton-long-et-aleatoire"
+```
+
+```bash
+python -m clipper serve --host 0.0.0.0
+```
+
+`--host` (ou `[web] host`) autre que `127.0.0.1` **exige** `[web] token` :
+sans jeton, `serve` refuse de démarrer avec un message qui nomme la clé, sans
+lancer ni serveur ni worker. Avec un jeton, toute requête `/api` et `/media`
+sans jeton valide reçoit 401 ; la page, elle, se charge et affiche une saisie
+du jeton, gardé ensuite dans un cookie du navigateur (`SameSite=Strict`).
+Un script peut l'envoyer dans l'en-tête `x-clipper-token`. Le jeton ne se
+modifie pas depuis l'interface : fichier `config.toml`, puis redémarrage.
+
+Limites, à lire avant d'ouvrir le port :
+
+- **Réseau local seulement.** Un seul jeton partagé, un seul utilisateur, pas
+  de comptes ni de limitation de tentatives.
+- **Pas de TLS** : le jeton et les vidéos circulent en clair. Sur un réseau de
+  confiance seulement.
+- **N'expose jamais le port sur Internet** sans reverse proxy TLS devant
+  (Caddy, nginx...) ; sans lui, ne redirige pas le port depuis la box.
+
 ## Configuration (`config.toml`)
 
 Chaque étape (module `clipper/<etape>.py`) déclare son propre
