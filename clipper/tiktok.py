@@ -468,6 +468,12 @@ class _Flow:
             wanted = bool(self.settings[key])
             if bool(box.is_checked()) == wanted:
                 continue
+            if not box.is_enabled():
+                # TikTok desactive certaines cases selon la video (ex. duo/collage indisponibles) :
+                # restriction de TikTok, pas une page inattendue -> journalise et continue.
+                logger.warning("TikTok %s : case « %s » désactivée par TikTok pour cette vidéo, laissée telle quelle",
+                               self.account, label)
+                continue
             # Case dessinee en CSS par-dessus un input invisible : Playwright refuse check() ; un clic
             # JavaScript sur l'input declenche le meme changement que le clic de l'utilisateur.
             box.evaluate("el => el.click()")

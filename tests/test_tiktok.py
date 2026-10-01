@@ -205,6 +205,7 @@ class StudioPage(FakePage):
         # Reglages par post (apres « Afficher plus ») : etat initial de TikTok (commentaires et reutilisation
         # cochees, contenu IA coupe) ; ``toggles`` garde chaque changement d'etat, jamais un clic « de position ».
         self.options = {"comment_switch": True, "reuse_switch": True, "ai_switch": False}
+        self.disabled_options: set[str] = set()
         self.toggles: list[tuple[str, bool]] = []
         self.present |= {sel[k] for k in self.options}
         # Programmer / Maintenant : le texte du bouton final suit
@@ -331,6 +332,9 @@ class FakeToggle(FakeElement):
     def check(self, **kwargs):
         self.page.options[self.name] = True
         self.page.toggles.append((self.name, True))
+
+    def is_enabled(self):
+        return self.name not in self.page.disabled_options
 
     def evaluate(self, script):
         # clic JavaScript sur l'input (case dessinee en CSS) : bascule l'etat comme un clic utilisateur
@@ -1638,3 +1642,12 @@ def test_next_allowed_returns_the_first_time_that_respects_the_caps():
     assert tiktok.next_allowed([NOW.replace(hour=11)], NOW, settings, tz) == NOW.replace(hour=13)
     # aucun obstacle : l'heure demandee elle-meme
     assert tiktok.next_allowed([], NOW, settings, tz) == NOW
+
+
+def test_a_setting_disabled_by_tiktok_is_logged_and_skipped_not_a_stop(tmp_path, monkeypatch, caplog):
+    env = Env(tmp_path, monkeypatch, settings={"allow_reuse": True})
+    env.page.options["reuse_switch"] = False
+    env.page.disabled_options.add("reuse_switch")
+    env.publish()
+    assert env.page.options["reuse_switch"] is False  # laissee telle quelle, aucun arret
+    assert any("désactivée par TikTok" in r.getMessage() for r in caplog.records)
