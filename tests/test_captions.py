@@ -1124,3 +1124,145 @@ def test_cta_hashtag_without_a_leading_hash_is_an_explicit_error(workspace, tmp_
     with pytest.raises(CaptionsError, match="cta_hashtags"):
         run(workspace, make_config(tmp_path, cta_hashtags=["horreur"]), [answer()])
     assert not (workspace / VIDEO_ID / "captions.json").exists()
+
+
+# --------------------------------------------------------------------------
+# caption/hook_text sobres par defaut (TASK-a844), comme screen_title
+# --------------------------------------------------------------------------
+
+
+def test_caption_allow_emoji_defaults_to_false():
+    from clipper.captions import CONFIG_DEFAULTS
+
+    assert CONFIG_DEFAULTS["caption_allow_emoji"] is False
+
+
+def test_schema_caption_and_hook_text_descriptions_forbid_emoji_by_default():
+    from clipper.captions import CONFIG_DEFAULTS, response_schema
+
+    schema = response_schema(CONFIG_DEFAULTS)
+
+    caption_desc = schema["properties"]["caption"]["description"].lower()
+    hook_text_desc = schema["properties"]["hook_text"]["description"].lower()
+    assert "emoji" in caption_desc and "aucun" in caption_desc
+    assert "emoji" in hook_text_desc and "aucun" in hook_text_desc
+
+
+def test_schema_caption_and_hook_text_descriptions_allow_two_emojis_when_enabled():
+    from clipper.captions import CONFIG_DEFAULTS, response_schema
+
+    schema = response_schema({**CONFIG_DEFAULTS, "caption_allow_emoji": True})
+
+    caption_desc = schema["properties"]["caption"]["description"].lower()
+    hook_text_desc = schema["properties"]["hook_text"]["description"].lower()
+    assert "2 emoji" in caption_desc
+    assert "2 emoji" in hook_text_desc
+
+
+def test_prompt_states_the_sober_caption_rule_by_default(workspace, tmp_path):
+    write_moments(workspace, moment(0))
+    write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
+
+    fake, _ = run(workspace, make_config(tmp_path), [answer()])
+
+    prompt = fake.calls[0].prompt
+    assert "caption" in prompt and "hook_text" in prompt
+    assert "clickbait" in prompt
+
+
+def test_caption_with_an_emoji_is_refused_by_default_then_fails(workspace, tmp_path):
+    write_moments(workspace, moment(0))
+    write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
+
+    with pytest.raises(llm.SchemaError, match="aucun emoji"):
+        run(workspace, make_config(tmp_path), [answer(caption="Une legende qui donne envie \U0001F525")] * 2)
+    assert not (workspace / VIDEO_ID / "captions.json").exists()
+
+
+def test_hook_text_with_an_emoji_is_refused_by_default_then_fails(workspace, tmp_path):
+    write_moments(workspace, moment(0))
+    write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
+
+    with pytest.raises(llm.SchemaError, match="aucun emoji"):
+        run(workspace, make_config(tmp_path), [answer(hook_text="regarde ca \U0001F525")] * 2)
+    assert not (workspace / VIDEO_ID / "captions.json").exists()
+
+
+def test_refused_caption_emoji_is_sent_back_to_the_llm_with_the_error_and_repaired(workspace, tmp_path):
+    write_moments(workspace, moment(0))
+    write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
+
+    fake, _ = run(
+        workspace, make_config(tmp_path),
+        [answer(caption="Une legende \U0001F525"), answer(caption="Une legende sobre.")],
+    )
+
+    assert len(fake.calls) == 2
+    assert "aucun emoji" in fake.calls[1].prompt
+    assert by_id(read_captions(workspace), "00")["caption"] == "Une legende sobre."
+
+
+def test_caption_allow_emoji_accepts_up_to_two_emojis(workspace, tmp_path):
+    write_moments(workspace, moment(0))
+    write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
+    two_emojis = "Une legende qui donne envie \U0001F525\U0001F389"
+
+    run(workspace, make_config(tmp_path, caption_allow_emoji=True), [answer(caption=two_emojis)])
+
+    assert by_id(read_captions(workspace), "00")["caption"] == two_emojis
+
+
+def test_caption_allow_emoji_still_accepts_no_emoji_at_all(workspace, tmp_path):
+    write_moments(workspace, moment(0))
+    write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
+
+    run(
+        workspace, make_config(tmp_path, caption_allow_emoji=True),
+        [answer(caption="Une legende sobre.")],
+    )
+
+    assert by_id(read_captions(workspace), "00")["caption"] == "Une legende sobre."
+
+
+def test_caption_allow_emoji_still_refuses_three_emojis(workspace, tmp_path):
+    write_moments(workspace, moment(0))
+    write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
+    three_emojis = "Une legende \U0001F525\U0001F389\U0001F600"
+
+    with pytest.raises(llm.SchemaError, match="au plus 2 emoji"):
+        run(workspace, make_config(tmp_path, caption_allow_emoji=True), [answer(caption=three_emojis)] * 2)
+    assert not (workspace / VIDEO_ID / "captions.json").exists()
+
+
+def test_hook_text_allow_emoji_still_refuses_three_emojis(workspace, tmp_path):
+    write_moments(workspace, moment(0))
+    write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
+    three_emojis = "regarde ca \U0001F525\U0001F389\U0001F600"
+
+    with pytest.raises(llm.SchemaError, match="au plus 2 emoji"):
+        run(workspace, make_config(tmp_path, caption_allow_emoji=True), [answer(hook_text=three_emojis)] * 2)
+    assert not (workspace / VIDEO_ID / "captions.json").exists()
+
+
+def test_cta_line_with_an_emoji_is_not_checked_even_when_caption_allow_emoji_is_false(workspace, tmp_path):
+    write_moments(workspace, moment(0))
+    write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
+
+    run(
+        workspace, make_config(tmp_path, cta_line="Abonne-toi \U0001F525"),
+        [answer(caption="Une legende sobre.")],
+    )
+
+    assert by_id(read_captions(workspace), "00")["caption"] == "Une legende sobre.\nAbonne-toi \U0001F525"
+
+
+def test_caption_and_hook_text_emoji_control_leaves_hashtags_unchanged(workspace, tmp_path):
+    write_moments(workspace, moment(0))
+    write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
+
+    run(
+        workspace, make_config(tmp_path, caption_allow_emoji=True),
+        [answer(hashtags=["#un", "#deux"])],
+    )
+
+    assert by_id(read_captions(workspace), "00")["hashtags"] == ["#un", "#deux"]
