@@ -5,7 +5,7 @@ slug: comptes-comptes-de-publication-connexion-v-rifi
 title: "Comptes = comptes de publication : connexion vérifiée, case prêt à publier, compte choisi par publication (SPEC-00d1)"
 created: 2026-10-01T15:59:05Z
 author: nicoc@zedk_ordi
-status: in_progress
+status: done
 scope:
   - clipper/accounts.py
   - clipper/browser.py
@@ -26,8 +26,15 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/856661269039@9f0a4dc
+    tree: scope/22048dd8b3c9
+    criteria: facf41043ac5
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 5
+version: 6
 ---
 
 Implémente SPEC-00d1459bed03 (ratifiée 2026-10-01).
