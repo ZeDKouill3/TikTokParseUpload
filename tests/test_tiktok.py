@@ -972,6 +972,7 @@ def test_selectors_file_carries_the_real_markers_of_tiktok_studio():
     assert _sel()["popups"] == {
         "Activer les vérifications automatiques du contenu": "Annuler",
         "Nouvelles fonctionnalités d'édition ajoutées": "J'ai compris",
+        "Prévisualise ta vidéo sur ton téléphone": "J'ai compris",
     }
     assert len(_sel()["calendar"]["months"]) == 12
 

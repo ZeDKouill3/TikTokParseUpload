@@ -414,6 +414,14 @@ class _Flow:
             self.click("advanced_settings")
 
     def schedule_now(self) -> None:
+        # Video privee : TikTok grise « Maintenant » et « Programmer », « Maintenant » deja coche.
+        # Clic inutile (et impossible) quand le choix est deja fait ; grise ET non coche = arret.
+        radio = self.wait("schedule_now").query_selector(self.sel["selectors"]["radio_input"])
+        if radio is not None and radio.is_checked():
+            logger.info("TikTok %s : « Maintenant » deja choisi, aucun clic", self.account)
+            return
+        if radio is not None and not radio.is_enabled():
+            raise self.stop("unexpected_page", "« Maintenant » est grisé sans être coché : publication impossible")
         self.click("schedule_now")
 
     def schedule_later(self, target: datetime) -> tuple[datetime, str | None]:
@@ -501,6 +509,9 @@ class _Flow:
         waited = 0.0
         while True:
             self.guard()
+            if self.page.query_selector(sel["content_check_ok"]) is not None:
+                logger.info("TikTok %s : vérification de contenu sans problème constaté", self.account)
+                return
             problem = self.page.query_selector(sel["content_check_problem"])
             if problem is not None:
                 detail = " ".join(str(problem.inner_text()).split())[:150]

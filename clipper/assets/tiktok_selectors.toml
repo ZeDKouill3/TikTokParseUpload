@@ -71,6 +71,8 @@ visibility_public = "div[role='option'].Select__item[id$='option-\"0\"'], div[ro
 visibility_private = "div[role='option'].Select__item[id$='option-\"1\"'], div[role='option']:has-text('Toi uniquement')"
 # Quand publier : deux radios aux ids aleatoires, vises par libelle.
 schedule_now = "[data-e2e='schedule_container'] label:has-text('Maintenant'), [data-e2e='schedule_container'] [role='radio']:has-text('Maintenant')"
+# Bouton radio dans un libelle (Maintenant / Programmer) : coche ou grise (video privee).
+radio_input = "input[type='radio']"
 schedule_later = "[data-e2e='schedule_container'] label:has-text('Programmer'), [data-e2e='schedule_container'] [role='radio']:has-text('Programmer')"
 # Apres « Programmer » : deux champs, l'heure (valeur contenant « : ») puis la date (AAAA-MM-JJ).
 schedule_inputs = "[data-e2e='schedule_container'] input.TUXTextInputCore-input"
@@ -89,7 +91,8 @@ schedule_picker_close = "[data-e2e='schedule_container']"
 # « Aucun probleme constate » (vert) ou un probleme signale.
 content_check_running = "div:has-text('Vérification en cours')"
 content_check_ok = "div:has-text('Aucun problème constaté')"
-content_check_problem = "div:has-text('Problème constaté'), div:has-text('problème détecté')"
+# :has-text ignore la casse et cherche un fragment : « Aucun problème constaté » contient « problème constaté ».
+content_check_problem = "div:has-text('problème constaté'):not(:has-text('Aucun problème')), div:has-text('problème détecté'):not(:has-text('Aucun problème'))"
 # Bouton final UNIQUE : son texte est « Publier » (maintenant) ou « Programmer » ([labels]).
 post_button = "button[data-e2e='post_video_button']"
 # Abandon du brouillon (non utilise : un arret laisse la page telle quelle, avec sa capture).
@@ -115,7 +118,8 @@ months = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet", "ao�
 [modal]
 # Fenetres et bulles surgissantes (A VERIFIER : generique). Chacune doit etre connue ([popups]),
 # sinon arret R4. Bouton : {label} est remplace par le libelle du [popups] (sans guillemet double).
-container = "[role='dialog'], [aria-modal='true']"
+# Un menu deroulant ouvert (visibilite...) porte aussi role=dialog : il contient des role=option, exclu.
+container = "[role='dialog']:not(:has([role='option'])), [aria-modal='true']:not(:has([role='option']))"
 button = "button:has-text(\"{label}\"), [role='button']:has-text(\"{label}\")"
 
 [popups]
@@ -123,6 +127,7 @@ button = "button:has-text(\"{label}\"), [role='button']:has-text(\"{label}\")"
 # journalisees. Surtout pas « Activer » : le programme n'active rien a la place de l'utilisateur.
 "Activer les vérifications automatiques du contenu" = "Annuler"
 "Nouvelles fonctionnalités d'édition ajoutées" = "J'ai compris"
+"Prévisualise ta vidéo sur ton téléphone" = "J'ai compris"
 
 # Page Publications (SPEC-9225 R7) : une ligne = un post ; likes et commentaires sont lus dans la
 # ligne du post (celle qui contient son lien). Une valeur que la page n'affiche pas (selecteur sans
