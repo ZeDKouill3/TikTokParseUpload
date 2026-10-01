@@ -1526,3 +1526,6 @@ input[type="color"] { width: 36px; height: 36px; padding: 2px; border-radius: va
   .jr-list { max-height: 280px; }
   .jr-chart { grid-template-columns: minmax(0, 1fr); }
 }
+
+/* Etape Moments (radar du jury) : panneau sur toute la largeur, journal en dessous. */
+.step-detail.wide { grid-template-columns: minmax(0, 1fr); }

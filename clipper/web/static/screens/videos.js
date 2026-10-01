@@ -322,7 +322,7 @@
       </div>
       ${video.reason ? `<div class="banner"><p><b>${video.status === "failed" ? "Échec" : "Information"} :</b> ${esc(video.reason)}${video.retry_at ? ` · nouvelle tentative prévue ${clock(video.retry_at)}` : ""}</p></div>` : ""}
       <section class="vsection"><div class="row" style="margin-bottom:16px"><h3>Progression</h3><span class="muted vsum"></span></div>${friseHtml(video)}</section>
-      <div class="step-detail vgrid">
+      <div class="step-detail vgrid${state.step === "moments" && stepStatusOf(video, "moments") === "done" ? " wide" : ""}">
         <section class="vsection vstep-panel">${stepPanelHtml(video)}</section>
         <section class="vsection">
           <div class="panel-head"><h3>Journal</h3><span class="muted mono">workspace/${esc(video.video_id)}/events.jsonl</span><div class="right"><button type="button" class="btn btn-xs btn-ghost" data-log-copy>${icon("copy", "i-xs")}Copier</button></div></div>
