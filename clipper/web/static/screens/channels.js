@@ -205,6 +205,7 @@ function chEditHtml(ed) {
   return `<div class="chan-edit">
     <div class="toolbar"><a class="btn btn-sm btn-ghost" href="#/channels">${icon("chevron-left", "i-xs")}Toutes les chaînes</a>
       <h2 class="chan-title">${esc(c.display_name)} <span class="mono muted">${esc(ed.name)}</span></h2><span class="grow"></span>
+      <a class="btn btn-sm" href="#/channels/${encodeURIComponent(ed.name)}/layout">${icon("layers", "i-xs")}Éditeur d'agencement</a>
       <button type="button" class="btn btn-sm btn-bad" data-chan-delete>${icon("trash-2", "i-xs")}Supprimer</button>
       <button type="button" class="btn btn-primary" data-chan-save>Enregistrer</button></div>
     <p class="reason bad" data-form-error role="alert" hidden></p>

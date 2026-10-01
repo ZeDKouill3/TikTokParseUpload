@@ -2325,3 +2325,192 @@ def test_dashboard_vod_section_is_wired_to_confirm_and_ignore():
     assert "toastError" in watch_js                      # erreur affichée, jamais avalée
     assert "watchVodRow" in dash_js and "VOD à confirmer" in dash_js
     assert "TASK-7508" in css
+
+
+# --------------------------------------------------------------------------
+# Éditeur d'agencement stream split (SPEC-c100 E5, SPEC-76dc) : API + écran
+# --------------------------------------------------------------------------
+
+_LAYOUT_KEYS = ("split_webcam_dest", "split_gameplay_dest", "badge_dest", "split_subtitle_dest")
+_LAYOUT_DEFAULTS = {
+    "split_webcam_dest": {"x": 20, "y": 0, "w": 1040, "h": 640},
+    "split_gameplay_dest": {"x": 0, "y": 640, "w": 1080, "h": 1280},
+    "badge_dest": {"x": 330, "y": 590, "w": 420, "h": 100},
+    "split_subtitle_dest": {"x": 150, "y": 710, "w": 780, "h": 150},
+}
+import tomllib  # noqa: E402
+
+_JPEG = b"\xff\xd8\xff\xe0layout-test-jpeg"
+
+
+def _layout_keyframe(tmp_path, video_id, channel=CH, names=("scene0000_000.jpg",), folder="frames"):
+    _write_state(tmp_path, video_id, channel=channel)
+    frames = tmp_path / "workspace" / video_id / folder
+    frames.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        (frames / name).write_bytes(_JPEG + name.encode())
+
+
+def test_layout_keyframe_returns_a_jpeg_of_the_requested_video(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path)
+    _layout_keyframe(tmp_path, "aaaaaaaaaaa")
+    resp = client(tmp_path).get(f"/api/channels/{CH}/keyframe", params={"video_id": "aaaaaaaaaaa"})
+    assert resp.status_code == 200, resp.text
+    assert resp.headers["content-type"] == "image/jpeg"
+    assert resp.content.startswith(_JPEG)
+
+
+def test_layout_keyframe_without_video_id_takes_a_video_of_the_channel(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path)
+    _layout_keyframe(tmp_path, "bbbbbbbbbbb", channel="autre_chaine")
+    _layout_keyframe(tmp_path, "aaaaaaaaaaa", folder="scenes", names=("k1.jpg",))
+    resp = client(tmp_path).get(f"/api/channels/{CH}/keyframe")
+    assert resp.status_code == 200 and resp.content.endswith(b"k1.jpg")
+
+
+def test_layout_keyframe_404_in_french_when_no_video_has_keyframes(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path)
+    _write_state(tmp_path, "aaaaaaaaaaa", channel=CH)          # vidéo sans images clés
+    _layout_keyframe(tmp_path, "bbbbbbbbbbb", channel="autre_chaine")
+    c = client(tmp_path)
+    resp = c.get(f"/api/channels/{CH}/keyframe")
+    assert resp.status_code == 404
+    assert "image clé" in resp.json()["detail"] and CH in resp.json()["detail"]
+    resp = c.get(f"/api/channels/{CH}/keyframe", params={"video_id": "aaaaaaaaaaa"})
+    assert resp.status_code == 404 and "aaaaaaaaaaa" in resp.json()["detail"]
+    # une vidéo d'une autre chaîne n'est pas servie pour celle-ci
+    resp = c.get(f"/api/channels/{CH}/keyframe", params={"video_id": "bbbbbbbbbbb"})
+    assert resp.status_code == 404 and "bbbbbbbbbbb" in resp.json()["detail"]
+
+
+def test_layout_keyframe_refuses_unsafe_video_id_and_unknown_channel(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path)
+    c = client(tmp_path)
+    assert c.get(f"/api/channels/{CH}/keyframe", params={"video_id": "../x"}).status_code == 404
+    assert c.get("/api/channels/inconnue/keyframe").status_code == 404
+
+
+def test_get_layout_returns_spec_defaults(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path)
+    data = client(tmp_path).get(f"/api/channels/{CH}/layout").json()
+    for key in _LAYOUT_KEYS:
+        assert data[key] == _LAYOUT_DEFAULTS[key], key
+    assert data["defaults"] == _LAYOUT_DEFAULTS
+    assert data["canvas"] == {"w": 1080, "h": 1920}
+    assert data["safe"] == {"left": 150, "top": 160, "right": 930, "bottom": 1520}
+
+
+def test_get_layout_returns_the_preset_values(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path, _CH_PRESET + 'split_webcam_dest = {x = 0, y = 0, w = 1080, h = 700}\n')
+    data = client(tmp_path).get(f"/api/channels/{CH}/layout").json()
+    assert data["split_webcam_dest"] == {"x": 0, "y": 0, "w": 1080, "h": 700}
+    assert data["badge_dest"] == _LAYOUT_DEFAULTS["badge_dest"]
+
+
+def test_get_layout_unknown_channel_is_404(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path)
+    assert client(tmp_path).get("/api/channels/inconnue/layout").status_code == 404
+
+
+def test_put_layout_writes_the_keys_in_reframe_through_save_channel(tmp_path, isolated_cwd, monkeypatch):
+    _channels_setup(tmp_path)
+    from clipper import channel as channel_mod
+
+    calls = []
+    real = channel_mod.save_channel
+
+    def spy(name, data, **kwargs):
+        calls.append((name, data, kwargs))
+        return real(name, data, **kwargs)
+
+    monkeypatch.setattr(channel_mod, "save_channel", spy)
+    layout = {
+        "split_webcam_dest": {"x": 0, "y": 0, "w": 1080, "h": 700},
+        "split_gameplay_dest": {"x": 0, "y": 700, "w": 1080, "h": 1220},
+        "badge_dest": {"x": 330, "y": 640, "w": 420, "h": 100},
+        "split_subtitle_dest": {"x": 150, "y": 760, "w": 780, "h": 150},
+    }
+    resp = client(tmp_path).put(f"/api/channels/{CH}/layout", json=layout)
+
+    assert resp.status_code == 200, resp.text
+    for key in _LAYOUT_KEYS:
+        assert resp.json()[key] == layout[key]
+    assert any(n == CH and k["presets_dir"] == "presets" and d["reframe"]["badge_dest"] == layout["badge_dest"]
+               for n, d, k in calls)
+    saved = tomllib.loads((tmp_path / "presets" / f"{CH}.toml").read_text(encoding="utf-8"))
+    assert saved["reframe"]["letterbox_zoom"] == 1.5                    # le reste du preset est conservé
+    assert saved["channel"]["display_name"] == "Ma chaîne"
+    for key in _LAYOUT_KEYS:
+        assert saved["reframe"][key] == layout[key]
+    assert client(tmp_path).get(f"/api/channels/{CH}/layout").json()["badge_dest"] == layout["badge_dest"]
+
+
+@pytest.mark.parametrize("key, rect, fragment", [
+    ("split_webcam_dest", {"x": 100, "y": 0, "w": 1040, "h": 640}, "deborde"),               # sort du canevas (1140 > 1080)
+    ("split_gameplay_dest", {"x": 0, "y": 600, "w": 1080, "h": 1320}, "se chevauchent"),      # chevauche la webcam
+    ("badge_dest", {"x": 100, "y": 590, "w": 420, "h": 100}, "zone sure"),                    # hors zone sûre
+])
+def test_put_layout_invalid_is_422_with_the_load_config_detail_and_keeps_the_file(
+    tmp_path, isolated_cwd, key, rect, fragment
+):
+    _channels_setup(tmp_path)
+    path = tmp_path / "presets" / f"{CH}.toml"
+    before = path.read_text(encoding="utf-8")
+
+    resp = client(tmp_path).put(f"/api/channels/{CH}/layout", json={key: rect})
+
+    assert resp.status_code == 422, resp.text
+    detail = resp.json()["detail"]
+    assert key in detail and fragment in detail, detail
+    # même texte que celui de reframe (qui refuse, load_config ne contrôlant que les clés)
+    from clipper import reframe
+    from clipper.config import load_config
+
+    candidate = tmp_path / "candidate.toml"
+    candidate.write_text(
+        '[reframe]\nstream_variant = "split"\n'
+        + f"{key} = {{x = {rect['x']}, y = {rect['y']}, w = {rect['w']}, h = {rect['h']}}}\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(reframe.ReframeError) as err:
+        reframe._settings(load_config(candidate))
+    assert detail == str(err.value)
+    assert path.read_text(encoding="utf-8") == before
+
+
+def test_put_layout_without_any_key_or_with_bad_rect_is_422(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path)
+    c = client(tmp_path)
+    resp = c.put(f"/api/channels/{CH}/layout", json={})
+    assert resp.status_code == 422 and "split_webcam_dest" in resp.json()["detail"]
+    resp = c.put(f"/api/channels/{CH}/layout", json={"badge_dest": {"x": 1, "y": 2}})
+    assert resp.status_code == 422 and "badge_dest" in resp.json()["detail"]
+    assert c.put("/api/channels/inconnue/layout", json={"badge_dest": _LAYOUT_DEFAULTS["badge_dest"]}).status_code == 404
+
+
+def test_layout_editor_screen_is_wired_with_canvas_zones_handles_and_actions():
+    page = (STATIC / "index.html").read_text(encoding="utf-8")
+    js = (STATIC / "screens" / "layout.js").read_text(encoding="utf-8")
+    css = (STATIC / "style.css").read_text(encoding="utf-8")
+    channels = (STATIC / "screens" / "channels.js").read_text(encoding="utf-8")
+
+    assert "/static/screens/layout.js" in page
+    assert page.index("/static/screens/channels.js") < page.index("/static/screens/layout.js")
+    assert "/layout" in channels and "Éditeur d'agencement" in channels      # accès depuis la chaîne
+    # canevas 1080x1920 mis à l'échelle, quatre zones, image clé
+    assert "1080" in js and "1920" in js and "scale(" in js
+    for key in _LAYOUT_KEYS:
+        assert key in js, key
+    for label in ("Webcam", "Jeu", "Badge", "Sous-titres"):
+        assert label in js, label
+    assert "/keyframe" in js and "Aucune image clé" in js
+    # poignées, souris et toucher
+    assert "pointerdown" in js and "pointermove" in js and "setPointerCapture" in js and "hdl" in js
+    assert "touch-action" in css
+    # valeurs {x,y,w,h} éditables, réinitialiser, enregistrer (erreur du serveur affichée)
+    assert 'data-k="x"' in js or 'data-k="${' in js
+    assert "Réinitialiser aux défauts" in js and "Enregistrer" in js
+    assert 'jsonBody("PUT"' in js and "/layout" in js and "Agencement enregistré" in js
+    assert "Screens.channels" in js
+    for selector in (".ly-stage", ".ly-zone", ".ly-hdl"):
+        assert selector in css, selector
