@@ -5,15 +5,19 @@ slug: jury-confiance-de-chaque-juge-par-moment-prise-e
 title: "Jury : confiance de chaque juge par moment, prise en compte dans le débat et l'agrégation"
 created: 2026-10-01T13:18:13Z
 author: nicoc@zedk_ordi
-status: proposed
+status: accepted
 scope:
   - clipper/jury.py
   - clipper/moments.py
   - clipper/web/app.py
   - clipper/web/static/**
 references: [ADR-ff871c8eeac5, ADR-1cf0b17d48b3, ADR-ad2e562b1810, ADR-b1c17749b528]
+ratified: a17923cecae5
+verified:
+  - by: nicoc@zedk_ordi
+    at: 2026-10-01T13:22:38Z
 schema: 4
-version: 1
+version: 2
 ---
 
 ## Objet
