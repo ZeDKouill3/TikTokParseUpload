@@ -123,7 +123,9 @@ def test_get_video_detail_uses_pipeline_load_state(tmp_path, isolated_cwd, monke
     resp = client(tmp_path).get(f"/api/videos/{VIDEO_ID}")
 
     assert resp.status_code == 200
-    assert resp.json() == state
+    body = resp.json()
+    assert {k: body[k] for k in state} == state
+    assert body["clips"] == [] and body["awaiting"] == [] and body["durations"] == {}
 
 
 def test_get_video_detail_unknown_video_is_404(tmp_path, isolated_cwd, monkeypatch):
@@ -938,7 +940,7 @@ def _api_calls(js: str) -> list[tuple[str, str]]:
 
 def test_every_route_called_by_app_js_exists_in_the_app(tmp_path, isolated_cwd):
     app = create_app(config=make_config(tmp_path))
-    js = "".join(p.read_text(encoding="utf-8") for p in sorted(STATIC.glob("*.js")))
+    js = "".join(p.read_text(encoding="utf-8") for p in sorted(STATIC.rglob("*.js")))
     calls = _api_calls(js)
     assert len(calls) >= 6, calls
     missing = []
@@ -1063,6 +1065,159 @@ def test_static_assets_are_served(tmp_path, isolated_cwd):
 
 
 # --------------------------------------------------------------------------
+# TASK-157b : ecran Videos (liste filtrable, fiche, durees, journal)
+# --------------------------------------------------------------------------
+
+
+def _step(started, finished, status="done", **extra):
+    return {"status": status, "reason": None, "started_at": started, "finished_at": finished, **extra}
+
+
+def _write_meta(tmp_path, video_id, title):
+    meta = tmp_path / "workspace" / video_id / "meta.json"
+    meta.write_text(json.dumps({"video_id": video_id, "title": title}), encoding="utf-8")
+
+
+def _seed_videos(tmp_path):
+    steps_a = {
+        "download": _step("2026-09-30T10:00:00+00:00", "2026-09-30T10:00:42+00:00"),
+        "transcribe": _step("2026-09-30T10:00:42+00:00", None, status="running",
+                            progress={"fraction": 0.4, "eta_s": 90.0, "message": "segment 4/10"}),
+    }
+    _write_state(tmp_path, "aaaaaaaaaaa", status="running", channel="ma_chaine", steps=steps_a)
+    _write_meta(tmp_path, "aaaaaaaaaaa", "Grosse partie du soir")
+    _write_state(tmp_path, "bbbbbbbbbbb", status="failed", channel=None, reason="Erreur: reseau coupe")
+    _write_state(tmp_path, "ccccccccccc", status="done", channel="autre_chaine",
+                 source_url="https://example.org/video/XYZ")
+
+
+def test_list_videos_enriches_each_video_with_title_duration_and_current_step(tmp_path, isolated_cwd):
+    _seed_videos(tmp_path)
+
+    by_id = {v["video_id"]: v for v in client(tmp_path).get("/api/videos").json()}
+
+    a = by_id["aaaaaaaaaaa"]
+    assert a["channel"] == "ma_chaine" and a["status"] == "running" and a["reason"] is None
+    assert a["title"] == "Grosse partie du soir"
+    assert a["current_step"] == "transcribe"
+    assert a["durations"]["download"] == 42.0
+    assert a["durations"]["transcribe"] is None  # pas finie : pas de duree inventee
+    b = by_id["bbbbbbbbbbb"]
+    assert b["channel"] is None and b["reason"] == "Erreur: reseau coupe"
+    assert b["current_step"] == "download"  # premiere etape non terminee
+    # sans meta.json : l'identifiant sert de titre, et la raison est dite
+    assert b["title"] == "bbbbbbbbbbb"
+    assert "meta.json" in b["title_reason"]
+    assert "title_reason" not in a or a["title_reason"] is None
+
+
+def test_list_videos_filters_by_channel(tmp_path, isolated_cwd):
+    _seed_videos(tmp_path)
+    resp = client(tmp_path).get("/api/videos", params={"channel": "ma_chaine"})
+    assert [v["video_id"] for v in resp.json()] == ["aaaaaaaaaaa"]
+
+
+def test_list_videos_filters_by_status(tmp_path, isolated_cwd):
+    _seed_videos(tmp_path)
+    resp = client(tmp_path).get("/api/videos", params={"status": "failed"})
+    assert [v["video_id"] for v in resp.json()] == ["bbbbbbbbbbb"]
+
+
+def test_list_videos_unknown_status_is_400_in_french(tmp_path, isolated_cwd):
+    _seed_videos(tmp_path)
+    resp = client(tmp_path).get("/api/videos", params={"status": "bizarre"})
+    assert resp.status_code == 400
+    assert "statut" in resp.json()["detail"]
+
+
+@pytest.mark.parametrize("q, expected", [
+    ("AAAAAA", ["aaaaaaaaaaa"]),              # video_id, insensible a la casse
+    ("grosse partie", ["aaaaaaaaaaa"]),       # titre de meta.json
+    ("example.org/video", ["ccccccccccc"]),   # source_url
+    ("introuvable", []),
+])
+def test_list_videos_text_filter_matches_id_title_and_source_url(tmp_path, isolated_cwd, q, expected):
+    _seed_videos(tmp_path)
+    resp = client(tmp_path).get("/api/videos", params={"q": q})
+    assert sorted(v["video_id"] for v in resp.json()) == expected
+
+
+def test_list_videos_filters_combine(tmp_path, isolated_cwd):
+    _seed_videos(tmp_path)
+    resp = client(tmp_path).get("/api/videos", params={"channel": "ma_chaine", "status": "done"})
+    assert resp.json() == []
+
+
+def test_get_video_detail_includes_clips_awaiting_title_and_durations(tmp_path, isolated_cwd):
+    clips = [{"clip_id": "03-p2", "ready": True, "qa_status": "passed", "issues": [],
+              "mp4": "output/x/03-p2.mp4", "json": "output/x/03-p2.json"}]
+    steps = {"download": _step("2026-09-30T10:00:00+00:00", "2026-09-30T10:01:30+00:00")}
+    _write_state(tmp_path, VIDEO_ID, status="awaiting_review", awaiting=[0, 3], clips=clips, steps=steps)
+    _write_meta(tmp_path, VIDEO_ID, "Titre de la source")
+
+    body = client(tmp_path).get(f"/api/videos/{VIDEO_ID}").json()
+
+    assert body["clips"] == clips
+    assert body["awaiting"] == [0, 3]
+    assert body["durations"]["download"] == 90.0
+    assert body["title"] == "Titre de la source"
+    assert body["video_id"] == VIDEO_ID and body["steps"]["download"]["status"] == "done"
+
+
+# --- ecran videos de la page -------------------------------------------------
+
+VIDEOS_JS = STATIC / "screens" / "videos.js"
+
+
+def _videos_js(tmp_path) -> str:
+    return served(tmp_path, "/static/screens/videos.js")
+
+
+def test_index_loads_the_videos_screen_script_after_the_shell_screens(tmp_path, isolated_cwd):
+    html = served(tmp_path, "/")
+    assert html.index("/static/screens.js") < html.index("/static/screens/videos.js") < html.index("/static/app.js")
+
+
+def test_videos_screen_has_add_form_with_channel_selector_and_action(tmp_path, isolated_cwd):
+    js = _videos_js(tmp_path)
+    for needle in ('name="url"', 'name="channel"', 'name="action"', "Sans chaîne", 'api("/api/channels"',
+                   'value="run"', 'value="render"', '"/api/queue"', 'method: "POST"'):
+        assert needle in js, needle
+
+
+def test_videos_screen_lists_with_server_side_filters(tmp_path, isolated_cwd):
+    js = _videos_js(tmp_path)
+    assert "/api/videos?" in js
+    for needle in ("channel", "status", "q"):
+        assert f'.set("{needle}"' in js or f"{needle}:" in js or f'"{needle}"' in js, needle
+    assert 'name="q"' in js and 'name="filter-channel"' in js and 'name="filter-status"' in js
+
+
+def test_videos_screen_detail_has_12_step_frise_log_and_actions(tmp_path, isolated_cwd):
+    js = _videos_js(tmp_path)
+    for needle in ("class=\"frise\"", "fstep", "/api/videos/${", "/events", "clipper:event",
+                   "/retry", "/cancel", "from_step", "confirmDialog(",
+                   "Relancer depuis cette étape", "Annuler le traitement", "#/review/", "#/clips/",
+                   'class="log"', "STEP_LABELS"):
+        assert needle in js, needle
+    # la frise est faite des 12 etapes du pipeline, dans l'ordre
+    from clipper import pipeline
+    app_text = "".join(p.read_text(encoding="utf-8") for p in STATIC.glob("*.js"))
+    for step in pipeline.STEPS:
+        assert f"{step}:" in app_text, step
+
+
+def test_videos_screen_confirms_before_retry_and_cancel(tmp_path, isolated_cwd):
+    js = _videos_js(tmp_path)
+    for route in ("/retry", "/cancel"):
+        idx = js.index(route)
+        before = js[max(0, idx - 600):idx]
+        assert "confirmDialog(" in before, route
+
+
+def test_videos_screen_has_its_own_css_section(tmp_path, isolated_cwd):
+    css = served(tmp_path, "/static/style.css")
+    assert "/* ---------- Ecran Videos (TASK-157b) ---------- */" in css
 # E1 : GET /api/dashboard (TASK-aad3, SPEC-c100 E1, T2, T8)
 # --------------------------------------------------------------------------
 
@@ -1497,3 +1652,321 @@ def test_review_screen_render_button_is_blocked_while_moments_await_a_decision()
     assert "sans décision" in js  # la raison affichee
     css = (STATIC / "style.css").read_text(encoding="utf-8")
     assert ".review-layout" in css
+# Ecran Clips (TASK-3b9c) : GET /api/clips, approve/reject, PATCH, rerender
+# (publish et worker simules ; l'API ne touche jamais un mp4 ni un sidecar)
+# --------------------------------------------------------------------------
+
+CLIPS_VIDEO = "clipsvideo01"
+
+
+def _clip_sidecar(clip_id, *, part=1, parts_total=1, ready=True, qa_status="passed", issues=None, **extra):
+    return {
+        "video_id": CLIPS_VIDEO, "clip_id": clip_id, "part": part, "parts_total": parts_total,
+        "screen_title": f"Titre {clip_id}", "title": f"Titre {clip_id}", "caption": f"Description {clip_id}",
+        "hashtags": ["#ma_chaine"], "ready": ready, "layout": "letterbox", "duration": 24.0, "score": 80.0,
+        "qa": {"status": qa_status, "issues": issues or []}, **extra,
+    }
+
+
+def _write_clip(tmp_path, video_id, sidecar):
+    out_dir = tmp_path / "output" / video_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / f"{sidecar['clip_id']}.json").write_text(json.dumps(sidecar), encoding="utf-8")
+    (out_dir / f"{sidecar['clip_id']}.mp4").write_bytes(b"fake-mp4")
+
+
+def _write_publish(tmp_path, channel, entries):
+    path = tmp_path / "state" / "publish" / f"{channel}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(entries), encoding="utf-8")
+
+
+def _entry(clip_id, status, video_id=CLIPS_VIDEO, **extra):
+    return {"video_id": video_id, "clip_id": clip_id, "series_id": None, "part": None, "status": status,
+            "slot_at": None, "decided_at": None, "published_at": None, "error": None, **extra}
+
+
+def _clips_setup(tmp_path):
+    _write_state(tmp_path, CLIPS_VIDEO, channel="ma_chaine")
+    _write_state(tmp_path, "othervideo01", channel="autre")
+    _write_clip(tmp_path, CLIPS_VIDEO, _clip_sidecar("01"))
+    _write_clip(tmp_path, CLIPS_VIDEO, _clip_sidecar("02", qa_status="rejected", ready=False, issues=["sous-titres hors zone"]))
+    _write_clip(tmp_path, CLIPS_VIDEO, _clip_sidecar("03"))
+    _write_clip(tmp_path, "othervideo01", {**_clip_sidecar("01"), "video_id": "othervideo01"})
+    _write_publish(tmp_path, "ma_chaine", [
+        _entry("01", "scheduled", slot_at="2026-10-02T18:00:00+00:00"),
+        _entry("03", "failed", error="quota depasse"),
+    ])
+
+
+def test_get_clips_returns_sidecar_url_qa_and_publish_status(tmp_path, isolated_cwd):
+    _clips_setup(tmp_path)
+
+    resp = client(tmp_path).get("/api/clips", params={"video_id": CLIPS_VIDEO})
+
+    assert resp.status_code == 200
+    clips = {c["clip_id"]: c for c in resp.json()}
+    assert sorted(clips) == ["01", "02", "03"]
+    first = clips["01"]
+    assert first["video_url"] == f"/media/clip/{CLIPS_VIDEO}/01"
+    assert first["screen_title"] == "Titre 01"
+    assert first["description"] == "Description 01"
+    assert first["hashtags"] == ["#ma_chaine"]
+    assert first["part"] == 1 and first["parts_total"] == 1
+    assert first["channel"] == "ma_chaine"
+    assert first["qa_status"] == "passed" and first["issues"] == []
+    assert first["publish_status"] == "scheduled"
+    assert first["slot_at"] == "2026-10-02T18:00:00+00:00"
+    assert clips["02"]["qa_status"] == "rejected"
+    assert clips["02"]["issues"] == ["sous-titres hors zone"]
+    assert clips["02"]["publish_status"] == "à valider"
+    assert clips["03"]["publish_status"] == "failed"
+    assert clips["03"]["publish_error"] == "quota depasse"
+
+
+def test_get_clips_filters_by_channel_video_and_status(tmp_path, isolated_cwd):
+    _clips_setup(tmp_path)
+    c = client(tmp_path)
+
+    by_channel = c.get("/api/clips", params={"channel": "autre"}).json()
+    assert [(x["video_id"], x["clip_id"]) for x in by_channel] == [("othervideo01", "01")]
+    assert len(c.get("/api/clips").json()) == 4
+    by_status = c.get("/api/clips", params={"status": "à valider"}).json()
+    assert {(x["video_id"], x["clip_id"]) for x in by_status} == {(CLIPS_VIDEO, "02"), ("othervideo01", "01")}
+    assert [x["clip_id"] for x in c.get("/api/clips", params={"status": "failed", "video_id": CLIPS_VIDEO}).json()] == ["03"]
+
+
+def test_get_clips_rejects_an_unknown_status_and_an_unsafe_video_id(tmp_path, isolated_cwd):
+    c = client(tmp_path)
+    bad = c.get("/api/clips", params={"status": "bogus"})
+    assert bad.status_code == 400 and "bogus" in bad.json()["detail"]
+    assert c.get("/api/clips", params={"video_id": "../x"}).status_code == 400
+
+
+def test_get_clips_empty_output_is_an_empty_list(tmp_path, isolated_cwd):
+    assert client(tmp_path).get("/api/clips").json() == []
+
+
+def test_get_clips_corrupt_publish_file_is_a_french_error_not_a_silent_status(tmp_path, isolated_cwd):
+    _clips_setup(tmp_path)
+    (tmp_path / "state" / "publish" / "ma_chaine.json").write_text("{pas du json", encoding="utf-8")
+
+    resp = client(tmp_path).get("/api/clips")
+
+    assert resp.status_code == 500
+    assert "ma_chaine.json" in resp.json()["detail"]
+
+
+def test_approve_and_reject_call_publish(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import publish
+
+    _clips_setup(tmp_path)
+    calls = []
+    monkeypatch.setattr(publish, "approve", lambda *a, **kw: calls.append(("approve", a, kw)) or _entry("01", "scheduled"))
+    monkeypatch.setattr(publish, "reject", lambda *a, **kw: calls.append(("reject", a, kw)) or _entry("01", "rejected"))
+    c = client(tmp_path)
+
+    ok = c.post(f"/api/clips/{CLIPS_VIDEO}/01/approve")
+    no = c.post(f"/api/clips/{CLIPS_VIDEO}/01/reject")
+
+    assert ok.status_code == 200 and ok.json()["status"] == "scheduled"
+    assert no.status_code == 200 and no.json()["status"] == "rejected"
+    assert [(name, args) for name, args, _ in calls] == [
+        ("approve", (CLIPS_VIDEO, "01", "ma_chaine")), ("reject", (CLIPS_VIDEO, "01", "ma_chaine"))]
+    assert calls[0][2]["output_dir"] == tmp_path / "output"
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+def test_approve_reject_publish_error_is_409_with_detail(tmp_path, isolated_cwd, monkeypatch, action):
+    from clipper import publish
+
+    _clips_setup(tmp_path)
+
+    def boom(*a, **kw):
+        raise publish.PublishError("clip non pret pour publication : x/02")
+
+    monkeypatch.setattr(publish, action, boom)
+
+    resp = client(tmp_path).post(f"/api/clips/{CLIPS_VIDEO}/02/{action}")
+
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == "clip non pret pour publication : x/02"
+
+
+def test_approve_a_clip_of_a_video_without_channel_is_409(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import publish
+
+    _write_state(tmp_path, CLIPS_VIDEO)
+    _write_clip(tmp_path, CLIPS_VIDEO, _clip_sidecar("01"))
+    monkeypatch.setattr(publish, "approve", lambda *a, **kw: pytest.fail("publish.approve ne doit pas etre appele"))
+
+    resp = client(tmp_path).post(f"/api/clips/{CLIPS_VIDEO}/01/approve")
+
+    assert resp.status_code == 409
+    assert "chaîne" in resp.json()["detail"]
+
+
+def test_patch_caption_calls_edit_caption_and_never_writes_the_sidecar(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import publish, worker
+
+    _clips_setup(tmp_path)
+    sidecar_path = tmp_path / "output" / CLIPS_VIDEO / "02.json"
+    before = sidecar_path.read_bytes()
+    calls = []
+
+    def fake_edit(video_id, clip_id, channel, description, hashtags, **kw):
+        calls.append((video_id, clip_id, channel, description, hashtags, kw))
+        return {**_clip_sidecar("02"), "caption": description, "hashtags": hashtags, "edited_at": "2026-10-01T00:00:00+00:00"}
+
+    monkeypatch.setattr(publish, "edit_caption", fake_edit)
+    monkeypatch.setattr(worker, "enqueue", lambda *a, **kw: pytest.fail("pas de re-rendu pour un simple texte"))
+
+    resp = client(tmp_path).patch(f"/api/clips/{CLIPS_VIDEO}/02", json={"description": "Nouveau texte", "hashtags": ["#a", "#b"]})
+
+    assert resp.status_code == 200
+    assert calls[0][:5] == (CLIPS_VIDEO, "02", "ma_chaine", "Nouveau texte", ["#a", "#b"])
+    body = resp.json()
+    assert body["clip"]["description"] == "Nouveau texte"
+    assert body["clip"]["hashtags"] == ["#a", "#b"]
+    assert body["rerender"] is None
+    assert sidecar_path.read_bytes() == before
+
+
+def test_patch_publish_error_is_409(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import publish
+
+    _clips_setup(tmp_path)
+
+    def boom(*a, **kw):
+        raise publish.PublishError("edition refusee pour x/01 : statut 'scheduled'")
+
+    monkeypatch.setattr(publish, "edit_caption", boom)
+
+    resp = client(tmp_path).patch(f"/api/clips/{CLIPS_VIDEO}/01", json={"description": "x", "hashtags": []})
+
+    assert resp.status_code == 409
+    assert "scheduled" in resp.json()["detail"]
+
+
+def test_patch_with_nothing_to_change_is_400(tmp_path, isolated_cwd):
+    _clips_setup(tmp_path)
+    assert client(tmp_path).patch(f"/api/clips/{CLIPS_VIDEO}/01", json={}).status_code == 400
+
+
+def test_patch_screen_title_enqueues_a_targeted_render_after_confirmation(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import worker
+
+    _clips_setup(tmp_path)
+    calls = []
+
+    def fake_enqueue(url, channel, action, force_steps, *, config=None):
+        calls.append((url, channel, action, force_steps))
+        return {"id": "e1", "video_id": url, "channel": channel, "action": action,
+                "force_steps": force_steps, "status": "waiting"}
+
+    monkeypatch.setattr(worker, "enqueue", fake_enqueue)
+    c = client(tmp_path)
+
+    refused = c.patch(f"/api/clips/{CLIPS_VIDEO}/01", json={"screen_title": "Nouveau titre"})
+    assert refused.status_code == 409 and "confirm" in refused.json()["detail"]
+    assert calls == []
+
+    resp = c.patch(f"/api/clips/{CLIPS_VIDEO}/01", json={"screen_title": "Nouveau titre", "confirm": True})
+
+    assert resp.status_code == 202
+    assert calls == [(CLIPS_VIDEO, "ma_chaine", "render", ["render", "qa"])]
+    assert resp.json()["rerender"]["action"] == "render"
+
+
+def test_patch_caption_and_screen_title_does_both(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import publish, worker
+
+    _clips_setup(tmp_path)
+    edits, queued = [], []
+    monkeypatch.setattr(publish, "edit_caption",
+                        lambda *a, **kw: edits.append(a) or {**_clip_sidecar("01"), "caption": a[3], "hashtags": a[4]})
+    monkeypatch.setattr(worker, "enqueue", lambda url, channel, action, force_steps, *, config=None:
+                        queued.append((url, action, force_steps)) or {"id": "e", "video_id": url, "action": action})
+
+    resp = client(tmp_path).patch(f"/api/clips/{CLIPS_VIDEO}/01", json={
+        "description": "d", "hashtags": ["#x"], "screen_title": "T", "confirm": True})
+
+    assert resp.status_code == 202
+    assert edits == [(CLIPS_VIDEO, "01", "ma_chaine", "d", ["#x"])]
+    assert queued == [(CLIPS_VIDEO, "render", ["render", "qa"])]
+
+
+def test_patch_same_screen_title_does_not_rerender(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import worker
+
+    _clips_setup(tmp_path)
+    monkeypatch.setattr(worker, "enqueue", lambda *a, **kw: pytest.fail("titre inchange : pas de re-rendu"))
+
+    resp = client(tmp_path).patch(f"/api/clips/{CLIPS_VIDEO}/01", json={"screen_title": "Titre 01", "confirm": True})
+
+    assert resp.status_code == 400
+    assert "inchangé" in resp.json()["detail"]
+
+
+def test_rerender_enqueues_render_and_qa_for_the_clip(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import worker
+
+    _clips_setup(tmp_path)
+    calls = []
+    monkeypatch.setattr(worker, "enqueue", lambda url, channel, action, force_steps, *, config=None:
+                        calls.append((url, channel, action, force_steps)) or
+                        {"id": "e1", "video_id": url, "action": action, "force_steps": force_steps})
+
+    resp = client(tmp_path).post(f"/api/clips/{CLIPS_VIDEO}/01/rerender")
+
+    assert resp.status_code == 202
+    assert calls == [(CLIPS_VIDEO, "ma_chaine", "render", ["render", "qa"])]
+
+
+def test_rerender_already_queued_is_409(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import worker
+
+    _clips_setup(tmp_path)
+
+    def boom(*a, **kw):
+        raise worker.WorkerError("deja en file d'attente : x (render)")
+
+    monkeypatch.setattr(worker, "enqueue", boom)
+
+    resp = client(tmp_path).post(f"/api/clips/{CLIPS_VIDEO}/01/rerender")
+
+    assert resp.status_code == 409 and "deja en file" in resp.json()["detail"]
+
+
+def test_clip_routes_reject_unsafe_ids(tmp_path, isolated_cwd):
+    c = client(tmp_path)
+    assert c.post(f"/api/clips/{CLIPS_VIDEO}/..%2Fx/approve").status_code in (400, 404)
+    assert c.post("/api/clips/bad.id/01/approve").status_code == 400
+
+
+def test_clip_media_route_still_serves_the_mp4(tmp_path, isolated_cwd):
+    _clips_setup(tmp_path)
+    resp = client(tmp_path).get(f"/media/clip/{CLIPS_VIDEO}/01")
+    assert resp.status_code == 200 and resp.content == b"fake-mp4"
+
+
+def test_clips_screen_is_wired_with_gallery_sidecar_and_actions():
+    page = (STATIC / "index.html").read_text(encoding="utf-8")
+    js = (STATIC / "screens" / "clips.js").read_text(encoding="utf-8")
+
+    assert "/static/screens/clips.js" in page
+    assert page.index("/static/screens.js") < page.index("/static/screens/clips.js")
+    assert "Screens.clips" in js
+    assert "/api/clips" in js
+    assert "<video" in js and "controls" in js           # lecteur
+    assert "clip-poster" in js and "aspect" in (STATIC / "style.css").read_text(encoding="utf-8")
+    for label in ("Titre d'écran", "Description", "Hashtags", "Contrôle qualité", "Partie"):
+        assert label in js, label
+    for action in ("/approve", "/reject", "/rerender", "PATCH"):
+        assert action in js, action
+    assert "toute la série" in js                        # refus d'une partie
+    assert "download" in js and "video_url" in js        # lien de telechargement
+    assert "copyText" in js                              # description + hashtags
+    assert "undo" in js                                  # toast « Annuler »
+    assert "confirm: true" in js                         # re-rendu confirmé
+    assert "Aucun clip" in js                            # etat vide

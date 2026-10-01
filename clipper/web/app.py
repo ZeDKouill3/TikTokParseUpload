@@ -86,6 +86,77 @@ def _moment_transcript(video_dir: Path, start: float, end: float) -> tuple[str |
     if not path.exists():
         return None, f"{path} absent : la transcription n'est pas faite"
     return pipeline._moment_text(video_dir, start, end), None
+# Statuts valides d'une video (contrat pipeline.json) : un filtre hors de cette
+# liste est une erreur, jamais une liste vide silencieuse (ADR-ad2e).
+_VIDEO_STATUSES = ("pending", "running", "awaiting_review", "queued", "done", "failed")
+
+
+def _parse_ts(video_id: str, step: str, key: str, value: str) -> datetime:
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"horodatage illisible ({key}) pour l'etape {step} de {video_id} : {value!r}",
+        ) from exc
+
+
+def _step_durations(state: dict[str, Any]) -> dict[str, float | None]:
+    """Duree (s) de chaque etape = finished_at - started_at ; None tant que
+    l'etape n'a pas fini (aucune duree inventee)."""
+    out: dict[str, float | None] = {}
+    for name, step in (state.get("steps") or {}).items():
+        started, finished = step.get("started_at"), step.get("finished_at")
+        if started and finished:
+            video_id = state.get("video_id", "?")
+            delta = _parse_ts(video_id, name, "finished_at", finished) - _parse_ts(video_id, name, "started_at", started)
+            out[name] = delta.total_seconds()
+        else:
+            out[name] = None
+    return out
+
+
+def _current_step(state: dict[str, Any]) -> str | None:
+    steps = state.get("steps") or {}
+    for name, step in steps.items():
+        if step.get("status") == "running":
+            return name
+    for name, step in steps.items():
+        if step.get("status") != "done":
+            return name
+    return None
+
+
+def _enrich(state: dict[str, Any], config: Config) -> dict[str, Any]:
+    """Etat pipeline.json + titre (meta.json de download, sinon l'identifiant
+    avec la raison), etape courante et duree par etape."""
+    video_id = state["video_id"]
+    out = dict(state)
+    meta_path = Path(config.workspace_dir) / video_id / "meta.json"
+    title = None
+    if meta_path.exists():
+        title = _read_json(meta_path).get("title")
+        reason = None if title else f"meta.json de {video_id} sans titre"
+    else:
+        reason = f"titre inconnu : meta.json absent pour {video_id} (telechargement pas encore fait)"
+    out["title"] = title or video_id
+    out["title_reason"] = reason
+    out["current_step"] = _current_step(state)
+    out["durations"] = _step_durations(state)
+    return out
+
+
+def _matches(video: dict[str, Any], channel: str | None, status: str | None, q: str | None) -> bool:
+    if channel is not None and video.get("channel") != channel:
+        return False
+    if status is not None and video.get("status") != status:
+        return False
+    if q:
+        needle = q.lower()
+        haystack = (video["video_id"], video["title"], video.get("source_url") or "")
+        if not any(needle in text.lower() for text in haystack):
+            return False
+    return True
 
 
 def _list_moments(config: Config, video_id: str) -> list[dict[str, Any]]:
@@ -199,17 +270,6 @@ def _fill(out: dict[str, Any], fields: tuple[str, ...], label: str, build) -> No
         for name in fields:
             out[name] = None
             out[f"{name}_error"] = f"{label} illisible : {exc}"
-
-
-def _current_step(state: dict[str, Any]) -> str | None:
-    steps = state.get("steps", {})
-    for name, step in steps.items():
-        if step.get("status") == "running":
-            return name
-    for name, step in steps.items():
-        if step.get("status") != "done":
-            return name
-    return None
 
 
 def _dashboard_videos(config: Config) -> dict[str, Any]:
@@ -382,6 +442,117 @@ async def _event_stream(config: Config) -> AsyncIterator[str]:
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
 
+# --------------------------------------------------------------------------
+# Ecran Clips (SPEC-c100 E4, T4 ; SPEC-fc0c §4.5). L'API ne touche jamais un
+# mp4 ni un sidecar : le texte passe par publish.edit_caption, le rendu par la
+# file (worker.enqueue). Les statuts de publication sont ceux de
+# SPEC-fc0c §4 ; un clip absent du fichier de publication est « à valider ».
+# --------------------------------------------------------------------------
+
+_TO_VALIDATE = "à valider"
+_CLIP_STATUSES = (_TO_VALIDATE, *publish_mod.VALID_STATUSES)
+_RERENDER_STEPS = ["render", "qa"]
+
+
+def _validate_clip_id(clip_id: str) -> None:
+    if not _SAFE_ID.fullmatch(clip_id):
+        raise HTTPException(status_code=400, detail=f"identifiant de clip invalide : {clip_id!r}")
+
+
+def _publish_dir(config: Config) -> Path:
+    return Path(config.section("publish")["state_dir"])
+
+
+def _publish_entries(config: Config, channel: str | None) -> dict[tuple[str, str], dict[str, Any]]:
+    """Entrees de state/publish/<chaine>.json par (video_id, clip_id) ; un
+    fichier illisible leve une 500 en francais, jamais un statut invente."""
+    if channel is None:
+        return {}
+    path = _publish_dir(config) / f"{channel}.json"
+    if not path.is_file():
+        return {}
+    try:
+        entries = _read_json(path)
+        return {(e["video_id"], e["clip_id"]): e for e in entries}
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise HTTPException(status_code=500, detail=f"fichier de publication illisible ({path.name}) : {exc}") from exc
+
+
+def _clip_view(sidecar: dict[str, Any], channel: str | None, entry: dict[str, Any] | None) -> dict[str, Any]:
+    qa = sidecar.get("qa") or {}
+    video_id, clip_id = sidecar["video_id"], sidecar["clip_id"]
+    clip = dict(sidecar)
+    clip.update({
+        "channel": channel,
+        "description": sidecar.get("caption"),
+        "video_url": f"/media/clip/{video_id}/{clip_id}",
+        "qa_status": qa.get("status"),
+        "issues": qa.get("issues"),
+        "publish_status": entry["status"] if entry else _TO_VALIDATE,
+        "slot_at": entry.get("slot_at") if entry else None,
+        "publish_error": entry.get("error") if entry else None,
+    })
+    return clip
+
+
+def _read_clip_sidecar(config: Config, video_id: str, clip_id: str) -> dict[str, Any]:
+    path = Path(config.output_dir) / video_id / f"{clip_id}.json"
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail=f"clip introuvable : {video_id}/{clip_id}")
+    try:
+        return _read_json(path)
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=500, detail=f"sidecar illisible ({path.name}) : {exc}") from exc
+
+
+def _list_clip_views(config: Config, channel: str | None, video_id: str | None,
+                     status: str | None) -> list[dict[str, Any]]:
+    root = Path(config.output_dir)
+    if not root.is_dir():
+        return []
+    entries_by_channel: dict[str | None, dict[tuple[str, str], dict[str, Any]]] = {}
+    clips = []
+    for video_dir in sorted(p for p in root.iterdir() if p.is_dir()):
+        if video_id is not None and video_dir.name != video_id:
+            continue
+        video_channel = _channel_of(video_dir.name, config)
+        if channel is not None and video_channel != channel:
+            continue
+        if video_channel not in entries_by_channel:
+            entries_by_channel[video_channel] = _publish_entries(config, video_channel)
+        entries = entries_by_channel[video_channel]
+        for path in sorted(video_dir.glob("*.json")):
+            sidecar = _read_clip_sidecar(config, video_dir.name, path.stem)
+            clip = _clip_view(sidecar, video_channel, entries.get((video_dir.name, path.stem)))
+            if status is None or clip["publish_status"] == status:
+                clips.append(clip)
+    return clips
+
+
+def _require_channel(video_id: str, clip_id: str, config: Config) -> str:
+    channel = _channel_of(video_id, config)
+    if channel is None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"la vidéo {video_id} n'a pas de chaîne : publier {clip_id} demande une chaîne (presets/<chaîne>.toml)",
+        )
+    return channel
+
+
+def _enqueue_clip_render(video_id: str, config: Config) -> dict[str, Any]:
+    try:
+        return worker_mod.enqueue(video_id, _channel_of(video_id, config), "render", list(_RERENDER_STEPS), config=config)
+    except worker_mod.WorkerError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+class ClipPatchBody(BaseModel):
+    description: str | None = None
+    hashtags: list[str] | None = None
+    screen_title: str | None = None
+    confirm: bool = False
+
+
 class SubmitBody(BaseModel):
     url: str
 
@@ -478,15 +649,29 @@ def create_app(config: Config | None = None) -> FastAPI:
         return _enqueue(body.url, None, "run", None, config)
 
     @app.get("/api/videos")
-    def list_videos() -> list[dict[str, Any]]:
-        return _list_states(config)
+    def list_videos(channel: str | None = None, status: str | None = None,
+                    q: str | None = None) -> list[dict[str, Any]]:
+        """Liste filtrable (chaine exacte, statut, texte sur video_id / titre /
+        source_url), chaque video enrichie de son titre, de son etape courante
+        et de la duree de chaque etape (SPEC-c100 E2)."""
+        if status is not None and status not in _VIDEO_STATUSES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"statut inconnu : {status!r} (attendu : {', '.join(_VIDEO_STATUSES)})",
+            )
+        videos = [_enrich(state, config) for state in _list_states(config)]
+        return [v for v in videos if _matches(v, channel, status, q)]
 
     @app.get("/api/videos/{video_id}")
     def get_video(video_id: str) -> dict[str, Any]:
         try:
-            return pipeline.load_state(video_id, config=config)
+            state = pipeline.load_state(video_id, config=config)
         except pipeline.PipelineError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        detail = _enrich(state, config)
+        detail["clips"] = state.get("clips") or []
+        detail["awaiting"] = state.get("awaiting") or []
+        return detail
 
     @app.get("/api/videos/{video_id}/moments")
     def list_moments(video_id: str) -> list[dict[str, Any]]:
@@ -551,6 +736,78 @@ def create_app(config: Config | None = None) -> FastAPI:
             clip["video_url"] = f"/media/clip/{video_id}/{clip['clip_id']}"
             clips.append(clip)
         return clips
+
+    # ----------------------------------------------------------------
+    # Clips (SPEC-c100 E4)
+    # ----------------------------------------------------------------
+
+    @app.get("/api/clips")
+    def list_all_clips(channel: str | None = None, video_id: str | None = None,
+                       status: str | None = None) -> list[dict[str, Any]]:
+        if video_id is not None:
+            _validate_video_id(video_id)
+        if status is not None and status not in _CLIP_STATUSES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"statut inconnu : {status!r} (attendu : {', '.join(_CLIP_STATUSES)})",
+            )
+        return _list_clip_views(config, channel or None, video_id, status)
+
+    def _decide(video_id: str, clip_id: str, action: str) -> dict[str, Any]:
+        _validate_video_id(video_id)
+        _validate_clip_id(clip_id)
+        channel = _require_channel(video_id, clip_id, config)
+        kwargs: dict[str, Any] = {"output_dir": Path(config.output_dir), "state_dir": _publish_dir(config)}
+        if action == "approve":
+            kwargs["presets_dir"] = _PRESETS_DIR
+        try:
+            return getattr(publish_mod, action)(video_id, clip_id, channel, **kwargs)
+        except publish_mod.PublishError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/clips/{video_id}/{clip_id}/approve")
+    def approve_clip(video_id: str, clip_id: str) -> dict[str, Any]:
+        return _decide(video_id, clip_id, "approve")
+
+    @app.post("/api/clips/{video_id}/{clip_id}/reject")
+    def reject_clip(video_id: str, clip_id: str) -> dict[str, Any]:
+        return _decide(video_id, clip_id, "reject")
+
+    @app.post("/api/clips/{video_id}/{clip_id}/rerender", status_code=202)
+    def rerender_clip(video_id: str, clip_id: str) -> JSONResponse:
+        _validate_video_id(video_id)
+        _validate_clip_id(clip_id)
+        _read_clip_sidecar(config, video_id, clip_id)
+        return JSONResponse(_enqueue_clip_render(video_id, config), status_code=202)
+
+    @app.patch("/api/clips/{video_id}/{clip_id}")
+    def edit_clip(video_id: str, clip_id: str, body: ClipPatchBody) -> JSONResponse:
+        _validate_video_id(video_id)
+        _validate_clip_id(clip_id)
+        if body.description is None and body.hashtags is None and body.screen_title is None:
+            raise HTTPException(status_code=400, detail="rien à modifier : description, hashtags ou screen_title attendu")
+        sidecar = _read_clip_sidecar(config, video_id, clip_id)
+        retitle = body.screen_title is not None
+        if retitle and body.screen_title == sidecar.get("screen_title"):
+            raise HTTPException(status_code=400, detail="titre d'écran inchangé : rien à re-rendre")
+        if retitle and not body.confirm:
+            raise HTTPException(
+                status_code=409,
+                detail="confirmation requise (confirm: true) : changer le titre d'écran relance render puis qa pour ce clip",
+            )
+        channel = _require_channel(video_id, clip_id, config)
+        if body.description is not None or body.hashtags is not None:
+            description = body.description if body.description is not None else sidecar.get("caption")
+            hashtags = body.hashtags if body.hashtags is not None else sidecar.get("hashtags")
+            try:
+                sidecar = publish_mod.edit_caption(
+                    video_id, clip_id, channel, description, hashtags,
+                    output_dir=Path(config.output_dir), state_dir=_publish_dir(config))
+            except publish_mod.PublishError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+        entry = _enqueue_clip_render(video_id, config) if retitle else None
+        clip = _clip_view(sidecar, channel, _publish_entries(config, channel).get((video_id, clip_id)))
+        return JSONResponse({"clip": clip, "rerender": entry}, status_code=202 if retitle else 200)
 
     # ----------------------------------------------------------------
     # Chaines (SPEC-fc0c §1) et temps reel (ADR-4f6e §4)
