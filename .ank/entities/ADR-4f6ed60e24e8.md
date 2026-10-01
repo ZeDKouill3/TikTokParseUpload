@@ -5,7 +5,7 @@ slug: console-de-gestion-web-v2-worker-s-par-presets-p
 title: "Console de gestion web v2 : worker séparé, presets par chaîne en surcouche, SSE, jeton d'accès local"
 created: 2026-09-30T20:38:47Z
 author: w-plan-web
-status: accepted
+status: superseded
 scope:
   - clipper/web/**
   - clipper/config.py
@@ -18,7 +18,7 @@ verified:
   - by: nicoc@zedk_ordi
     at: 2026-09-30T21:06:50Z
 schema: 4
-version: 3
+version: 4
 ---
 
 ## Contexte
