@@ -2385,3 +2385,45 @@ def test_cta_handle_without_a_pseudo_anchor_is_an_explicit_error(tmp_path, strea
                config=make_config(title_enabled=False, cta_enabled=True, cta_handle="twitch.tv/exemple",
                                   cta_seconds=1.0))
     assert fake_ffmpeg == []
+
+
+# --------------------------------------------------------------------------
+# Miniature d'un clip rendu (TASK-dc9d)
+# --------------------------------------------------------------------------
+
+
+def test_thumbnail_defaults_live_in_render_config_defaults():
+    from clipper.render import CONFIG_DEFAULTS
+
+    assert CONFIG_DEFAULTS["thumbnail_width"] == 360
+    assert CONFIG_DEFAULTS["thumbnail_seek"] == 0.5
+
+
+def test_thumbnail_builds_one_frame_jpeg_command_and_writes_atomically(tmp_path, monkeypatch):
+    from clipper import render as render_step
+
+    mp4 = tmp_path / "clip.mp4"
+    mp4.write_bytes(b"mp4")
+    seen = []
+
+    def fake_exec(cmd, cwd, out_path):
+        seen.append((list(cmd), Path(out_path)))
+        Path(out_path).write_bytes(b"\xff\xd8jpeg")
+
+    monkeypatch.setattr(render_step, "_exec_ffmpeg", fake_exec)
+    target = tmp_path / "t" / "clip.jpg"
+
+    render_step.thumbnail(mp4, target)
+
+    cmd, out_path = seen[0]
+    assert target.read_bytes().startswith(b"\xff\xd8") and out_path != target  # tmp puis remplacement
+    assert cmd[0] == "ffmpeg" and cmd[cmd.index("-ss") + 1] == "0.500000"
+    assert cmd[cmd.index("-frames:v") + 1] == "1" and "scale='min(360,iw)':-2" in cmd[cmd.index("-vf") + 1]
+    assert not list(target.parent.glob("*.tmp"))
+
+
+def test_thumbnail_missing_mp4_is_a_render_error(tmp_path):
+    from clipper import render as render_step
+
+    with pytest.raises(render_step.RenderError, match="introuvable"):
+        render_step.thumbnail(tmp_path / "absent.mp4", tmp_path / "t.jpg")

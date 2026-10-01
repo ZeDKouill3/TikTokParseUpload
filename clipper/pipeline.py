@@ -76,6 +76,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import time
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor
@@ -517,6 +518,27 @@ def preview_subtitles(config: Config, text: str) -> bytes:
         raise PipelineError(f"apercu des sous-titres impossible : {exc}") from exc
 
 
+def clip_thumbnail(config: Config, video_id: str, clip_id: str) -> Path:
+    """Miniature JPEG (<= ``[render] thumbnail_width`` px) du clip
+    output/<video_id>/<clip_id>.mp4, en cache sous workspace/<video_id>/
+    thumbnails/ : une seule extraction, reutilisee tant que le mp4 garde la
+    meme date de modification (la miniature recoit celle du mp4). Seul point
+    d'entree de clipper.web pour les vignettes (ADR-09ad, ADR-b16b)."""
+    mp4 = Path(config.output_dir) / video_id / f"{clip_id}.mp4"
+    if not mp4.is_file():
+        raise PipelineError(f"clip introuvable : {mp4}")
+    mtime_ns = mp4.stat().st_mtime_ns
+    target = Path(config.workspace_dir) / video_id / "thumbnails" / f"{clip_id}.jpg"
+    if target.is_file() and target.stat().st_mtime_ns == mtime_ns:
+        return target
+    try:
+        render_step.thumbnail(mp4, target, config=config)
+    except render_step.RenderError as exc:
+        raise PipelineError(f"miniature du clip {video_id}/{clip_id} impossible : {exc}") from exc
+    os.utime(target, ns=(mtime_ns, mtime_ns))
+    return target
+
+
 def subtitles_zone(plan: dict[str, Any], clip_id: str) -> dict[str, Any]:
     """Zone des sous-titres d'un plan de recadrage letterbox (SPEC-6127) ou
     stream (SPEC-3a88) :
@@ -901,21 +923,28 @@ def _advance_steps(run: _Run, *, through_review: bool) -> dict[str, Any]:
 
         step = state["steps"][name]
         run.current_step = name
-        step.update(status="running", reason=None, started_at=_iso(_now()), finished_at=None)
-        save_state(state, config=config)
+        # Une etape deja "done" et non forcee se saute d'elle-meme (ADR-b16b) :
+        # elle garde la date et la duree de sa vraie premiere execution.
+        skipped = step["status"] == "done" and not run._forced(name)
+        if not skipped:
+            step.update(status="running", reason=None, started_at=_iso(_now()), finished_at=None)
+            save_state(state, config=config)
         log.info("%s : etape %s", run.video_id, name)
         t0 = time.monotonic()
         try:
             getattr(run, name)()
         except Exception as exc:  # noqa: BLE001 - toute erreur est journalisee dans l'etat
             log.debug("%s : %s", run.video_id, name, exc_info=True)
+            if skipped:
+                step["started_at"] = _iso(_now())  # l'echec date de ce passage, pas de la premiere execution
             result = _fail(run, name, exc)
             run.current_step = None
             return result
         elapsed = time.monotonic() - t0
-        step.update(status="done", finished_at=_iso(_now()))
-        step["progress"] = None
-        save_state(state, config=config)
+        if not skipped:
+            step.update(status="done", finished_at=_iso(_now()))
+            step["progress"] = None
+            save_state(state, config=config)
         log.info("%s : etape %s terminee en %.1fs", run.video_id, name, elapsed)
         run.current_step = None
 

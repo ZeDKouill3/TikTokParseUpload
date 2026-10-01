@@ -1191,3 +1191,141 @@ def test_preview_subtitles_turns_a_style_error_into_a_pipeline_error():
         pipeline.preview_subtitles(config, "Salut")
     png = pipeline.preview_subtitles(Config(mode="review", workspace_dir=Path("w"), output_dir=Path("o")), "Salut")
     assert png.startswith(b"\x89PNG")
+
+
+# --------------------------------------------------------------------------
+# Durees d'etapes : une etape sautee garde la duree de sa premiere execution
+# (TASK-dc9d)
+# --------------------------------------------------------------------------
+
+
+def _all_steps_stubbed(monkeypatch, calls):
+    from clipper import pipeline
+
+    for name in pipeline.STEPS:
+        monkeypatch.setattr(pipeline._Run, name, lambda self, _n=name: calls.append(_n), raising=True)
+    monkeypatch.setattr(pipeline, "_summary", lambda run: [])
+    monkeypatch.setattr(pipeline, "_zero_clip_reason", lambda run: "aucun clip (test)")
+
+
+def test_a_step_already_done_keeps_its_first_run_timestamps(tmp_path, monkeypatch):
+    from clipper import pipeline
+
+    config = Config(mode="auto", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output")
+    state = pipeline.new_state(VIDEO_ID, URL, "auto")
+    for name in ("download", "transcribe"):
+        state["steps"][name].update(status="done", started_at="2026-01-01T10:00:00+00:00",
+                                    finished_at="2026-01-01T10:03:20+00:00")
+    pipeline.save_state(state, config=config)
+    calls = []
+    _all_steps_stubbed(monkeypatch, calls)
+
+    result = pipeline._advance(pipeline._start(pipeline.load_state(VIDEO_ID, config=config), config, False, None),
+                               through_review=False)
+
+    assert calls[:3] == ["download", "transcribe", "scenes"]  # le module decide lui-meme de sauter
+    saved = pipeline.load_state(VIDEO_ID, config=config)
+    for name in ("download", "transcribe"):
+        step = saved["steps"][name]
+        assert step["status"] == "done"
+        assert (step["started_at"], step["finished_at"]) == ("2026-01-01T10:00:00+00:00", "2026-01-01T10:03:20+00:00")
+    assert saved["steps"]["scenes"]["started_at"] > "2026-01-01T10:03:20+00:00"  # une vraie execution est datee
+    assert result["steps"]["download"]["finished_at"] == "2026-01-01T10:03:20+00:00"
+
+
+def test_a_forced_step_is_timed_again(tmp_path, monkeypatch):
+    from clipper import pipeline
+
+    config = Config(mode="auto", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output")
+    state = pipeline.new_state(VIDEO_ID, URL, "auto")
+    for step in state["steps"].values():
+        step.update(status="done", started_at="2026-01-01T10:00:00+00:00", finished_at="2026-01-01T10:00:01+00:00")
+    pipeline.save_state(state, config=config)
+    _all_steps_stubbed(monkeypatch, [])
+
+    result = pipeline._advance(pipeline._start(pipeline.load_state(VIDEO_ID, config=config), config, False, None,
+                                               force_steps=["render"]), through_review=False)
+
+    assert result["steps"]["scenes"]["started_at"] == "2026-01-01T10:00:00+00:00"
+    assert result["steps"]["render"]["started_at"] > "2026-01-01T10:00:01+00:00"
+    assert result["steps"]["qa"]["started_at"] > "2026-01-01T10:00:01+00:00"
+
+
+# --------------------------------------------------------------------------
+# Miniatures de clips (TASK-dc9d) : seul point d'entree du web (ADR-09ad)
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def thumb_env(tmp_path, monkeypatch):
+    """Un mp4 factice sous output/ et un ffmpeg simule qui note ses appels."""
+    from clipper import render as render_step
+
+    out = tmp_path / "output" / VIDEO_ID
+    out.mkdir(parents=True)
+    mp4 = out / "01.mp4"
+    mp4.write_bytes(b"mp4")
+    calls = []
+
+    def fake_exec(cmd, cwd, out_path):
+        calls.append(list(cmd))
+        Path(out_path).write_bytes(b"\xff\xd8jpeg")
+
+    monkeypatch.setattr(render_step, "_exec_ffmpeg", fake_exec)
+    config = Config(mode="review", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output")
+    return config, mp4, calls
+
+
+def test_clip_thumbnail_extracts_one_jpeg_at_most_360px_wide(thumb_env):
+    from clipper import pipeline
+
+    config, mp4, calls = thumb_env
+
+    thumb = pipeline.clip_thumbnail(config, VIDEO_ID, "01")
+
+    assert thumb.read_bytes().startswith(b"\xff\xd8")
+    assert thumb.suffix == ".jpg" and thumb.is_relative_to(config.workspace_dir)
+    assert len(calls) == 1
+    cmd = calls[0]
+    assert str(mp4.resolve()) in cmd and cmd[cmd.index("-frames:v") + 1] == "1"
+    assert "min(360,iw)" in cmd[cmd.index("-vf") + 1]
+
+
+def test_clip_thumbnail_is_reused_until_the_mp4_changes(thumb_env):
+    import os
+
+    from clipper import pipeline
+
+    config, mp4, calls = thumb_env
+    first = pipeline.clip_thumbnail(config, VIDEO_ID, "01")
+    assert pipeline.clip_thumbnail(config, VIDEO_ID, "01") == first
+    assert len(calls) == 1  # une seule extraction
+
+    stat = mp4.stat()
+    os.utime(mp4, ns=(stat.st_atime_ns, stat.st_mtime_ns + 5_000_000_000))  # re-rendu : mtime change
+    pipeline.clip_thumbnail(config, VIDEO_ID, "01")
+    assert len(calls) == 2
+    pipeline.clip_thumbnail(config, VIDEO_ID, "01")
+    assert len(calls) == 2
+
+
+def test_clip_thumbnail_without_the_mp4_is_a_pipeline_error(thumb_env):
+    from clipper import pipeline
+
+    config, mp4, calls = thumb_env
+    with pytest.raises(pipeline.PipelineError, match="introuvable"):
+        pipeline.clip_thumbnail(config, VIDEO_ID, "99")
+    assert not calls
+
+
+def test_clip_thumbnail_turns_an_ffmpeg_failure_into_a_pipeline_error(thumb_env, monkeypatch):
+    from clipper import pipeline, render as render_step
+
+    config, mp4, calls = thumb_env
+
+    def boom(cmd, cwd, out_path):
+        raise render_step.RenderError("ffmpeg a echoue pour x")
+
+    monkeypatch.setattr(render_step, "_exec_ffmpeg", boom)
+    with pytest.raises(pipeline.PipelineError, match="miniature.*ffmpeg a echoue"):
+        pipeline.clip_thumbnail(config, VIDEO_ID, "01")
