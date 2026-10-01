@@ -146,12 +146,26 @@ function accBrowserState(a) {
   return `<div class="li-sub muted" data-acc-browser-state>Profil du navigateur : ${b.present ? `<b>présent</b>${when}` : "<b>absent</b> (jamais connecté)"}</div>`;
 }
 
+/* Après « Se connecter » : la console revérifie la connexion à la fermeture de la fenêtre ; on relit l'écran
+   jusqu'à ce que le compte soit prêt (ou 10 min), sans quitter l'écran Comptes. */
+const ACC_WATCH_MS = 4000;
+const ACC_WATCH_MAX = 150;
+function accWatchLogin(id, n = 0) {
+  setTimeout(async () => {
+    if (currentScreen !== "accounts" || n >= ACC_WATCH_MAX) return;
+    await accLoad();
+    const a = accUi.list.find((x) => x.id === id);
+    if (a && !a.ready_to_publish) accWatchLogin(id, n + 1);
+  }, ACC_WATCH_MS);
+}
+
 async function accBrowserLogin(account, button) {
   button.disabled = true;
   try {
     await api(`/api/accounts/${encodeURIComponent(account.id)}/browser/login`, jsonBody("POST", {}));
     toast({ kind: "ok", title: "Navigateur ouvert", body: `Connecte-toi à la main dans la fenêtre Chrome, puis ferme-la (${account.label}).` });
     await accLoad();
+    accWatchLogin(account.id);
   } catch (err) {
     toastError("Ouverture du navigateur impossible", err);
   } finally {
@@ -176,12 +190,17 @@ function accLoginState(a) {
   return `<div class="li-sub" data-acc-login><span class="chip ${s.cls}">TikTok : ${esc(s.label)}</span><span class="muted">${when}</span></div>${err}`;
 }
 
+/* « Prêt à publier » est un état (SPEC-e500 R3) : case en lecture seule, jamais cochée à la main. Cliquer
+   dessus quand le compte n'est pas prêt lance « Se connecter » ; après un arrêt R4, « J'ai réglé le problème »
+   revérifie la connexion et efface l'arrêt. */
 function accReadyBox(a) {
-  const blocked = !a.ready_to_publish && a.ready_blocked_reason;
+  const reason = !a.ready_to_publish ? a.ready_blocked_reason : "";
+  const state = a.ready_to_publish ? "Prêt à publier : connexion TikTok vérifiée" : "Pas prêt à publier";
   return `<div class="li-sub acc-ready" data-acc-ready-cell>
-    <label class="acc-check"><input type="checkbox" data-acc-ready="${esc(a.id)}"${a.ready_to_publish ? " checked" : ""}${blocked ? " disabled" : ""}> Prêt à publier</label>
-    ${blocked ? `<span class="muted" data-acc-ready-reason>${esc(a.ready_blocked_reason)}</span>` : ""}
-    ${a.ready_note ? `<span class="bad" data-acc-ready-note>${esc(a.ready_note)}</span>` : ""}</div>`;
+    <label class="acc-check"><input type="checkbox" data-acc-ready="${esc(a.id)}" aria-readonly="true"${a.ready_to_publish ? " checked" : ""} title="${esc(state)}${a.ready_to_publish ? "" : " : clique pour te connecter"}"> Prêt à publier</label>
+    ${reason ? `<span class="muted" data-acc-ready-reason>${esc(reason)}</span>` : ""}
+    ${a.ready_note ? `<span class="bad" data-acc-ready-note>${esc(a.ready_note)}</span>` : ""}
+    ${a.r4_halt ? `<button type="button" class="btn btn-xs" data-acc-resolve="${esc(a.id)}">${icon("check", "i-xs")}J'ai réglé le problème</button>` : ""}</div>`;
 }
 
 function accPosts(a) {
@@ -198,12 +217,14 @@ function accLastFailure(a) {
   return `<div class="li-sub bad" data-acc-failure>Dernier échec (${esc(f.channel)}, ${esc(f.clip_id)}) : ${esc(f.reason || "raison inconnue")}${capture}</div>`;
 }
 
-async function accSetReady(box) {
-  box.disabled = true;
+async function accResolve(account, button) {
+  button.disabled = true;
   try {
-    await api(`/api/accounts/${encodeURIComponent(box.dataset.accReady)}/ready`, jsonBody("PUT", { ready: box.checked }));
+    const out = await api(`/api/accounts/${encodeURIComponent(account.id)}/resolve`, jsonBody("POST", {}));
+    toast({ kind: out.ready_to_publish ? "ok" : "warn", title: out.ready_to_publish ? "Compte prêt à publier" : "Arrêt effacé",
+            body: out.ready_to_publish ? account.label : `${account.label} : ${out.ready_note || "connexion à refaire (Se connecter)"}` });
   } catch (err) {
-    toastError("Case « prêt à publier » refusée", err);
+    toastError("Vérification impossible", err);
   }
   await accLoad();
 }
@@ -274,7 +295,12 @@ function accWireList(body) {
   }));
   $$("[data-acc-browser-login]", body).forEach((b) => (b.onclick = () => accBrowserLogin(find(b.dataset.accBrowserLogin), b)));
   $$("[data-acc-stats]", body).forEach((b) => (b.onclick = () => accRefreshStats(find(b.dataset.accStats), b)));
-  $$("[data-acc-ready]", body).forEach((b) => (b.onchange = () => accSetReady(b)));
+  $$("[data-acc-ready]", body).forEach((b) => (b.onclick = (e) => {
+    e.preventDefault();  // lecture seule : jamais de coche à la main
+    const account = find(b.dataset.accReady);
+    if (!account.ready_to_publish) accBrowserLogin(account, b);
+  }));
+  $$("[data-acc-resolve]", body).forEach((b) => (b.onclick = () => accResolve(find(b.dataset.accResolve), b)));
   $$("[data-acc-edit]", body).forEach((b) => (b.onclick = () => accOpenForm(find(b.dataset.accEdit))));
   $$("[data-acc-delete]", body).forEach((b) => (b.onclick = async () => {
     const account = find(b.dataset.accDelete);

@@ -943,8 +943,8 @@ def _pub_worker(config, publisher, login=None):
 
 
 def _recheck(account=ACCOUNT):
-    """L'utilisateur recoche « pret a publier » (decoche apres un arret R4, SPEC-00d1 R3)."""
-    accounts_mod.set_ready(Config(mode="review", workspace_dir=Path("workspace"), output_dir=Path("output")), account, True)
+    """L'utilisateur clique « J'ai regle le probleme » apres un arret R4 : la case suit la connexion (SPEC-e500 R3)."""
+    accounts_mod.clear_halt(Config(mode="review", workspace_dir=Path("workspace"), output_dir=Path("output")), account)
 
 
 def _ago(**kw):

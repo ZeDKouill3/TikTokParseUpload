@@ -8,10 +8,11 @@ vers un fichier, une variable ou la memoire. Aucun message d'erreur, aucune
 trace ni aucun journal ne porte un mot de passe : les exceptions de keyring
 sont remplacees par un message maison, jamais recopiees.
 
-Compte de publication (SPEC-00d1) : en plus, l'etat de connexion TikTok verifie par l'appelant
-(``login`` : never | connected | expired, jamais lu ici : aucun import d'une autre etape) et la case
-« pret a publier », cochable seulement si la connexion verifiee est ``connected`` ; elle se decoche
-d'elle-meme (journal + ``ready_note``) quand la session expire ou apres un arret R4.
+Compte de publication (SPEC-e500 R3) : en plus, l'etat de connexion TikTok verifie par l'appelant
+(``login`` : never | connected | expired, jamais lu ici : aucun import d'une autre etape), l'arret R4
+en attente (``r4_halt``) et la case « pret a publier », qui n'est PAS un choix : elle est calculee
+(connexion verifiee ET aucun arret R4 en attente), cochee et decochee d'elle-meme avec journal +
+``ready_note`` ; un arret R4 ne s'efface que par ``clear_halt`` (« J'ai regle le probleme »).
 
 Module d'etape isole : n'importe aucune autre etape (ADR-b16b) ; la route web
 passe par ici, le generateur de mot de passe aussi (secrets, CSPRNG).
@@ -192,7 +193,8 @@ def _public(account: dict[str, Any]) -> dict[str, Any]:
     out.update(has_password=bool(account.get("has_password")),
                created_at=account.get("created_at"), updated_at=account.get("updated_at"),
                ready_to_publish=bool(account.get("ready_to_publish")),
-               ready_note=account.get("ready_note"), login=account.get("login"))
+               ready_note=account.get("ready_note"), login=account.get("login"),
+               r4_halt=account.get("r4_halt"))
     return out
 
 
@@ -314,20 +316,42 @@ def get_password(config: Config, account_id: str) -> str:
 
 
 def ready_blocked_reason(account: dict[str, Any]) -> str | None:
-    """Pourquoi la case « pret a publier » ne peut pas etre cochee (None : elle peut l'etre)."""
+    """Pourquoi le compte n'est pas « pret a publier » (None : il l'est) : connexion TikTok non verifiee
+    ou expiree, ou arret R4 en attente (R3)."""
     login = account.get("login") or {}
-    if login.get("state") == "connected":
-        return None
     if login.get("state") == "expired":
         return "session TikTok expirée : reconnecte-toi (Se connecter)"
-    return "connexion TikTok non vérifiée : clique sur Se connecter, connecte-toi à la main puis ferme la fenêtre"
+    if login.get("state") != "connected":
+        return "connexion TikTok non vérifiée : clique sur Se connecter, connecte-toi à la main puis ferme la fenêtre"
+    halt = account.get("r4_halt")
+    if halt:
+        return (f"arrêt de publication en attente ({halt.get('reason') or 'raison inconnue'}) : "
+                "règle le problème puis clique sur « J'ai réglé le problème »")
+    return None
+
+
+def _sync_ready(account: dict[str, Any], account_id: str) -> str | None:
+    """Recalcule ``ready_to_publish`` depuis ``login`` et ``r4_halt`` (R3), journalise chaque changement avec sa
+    raison. Rend ``"checked"``, ``"unchecked"`` ou None (inchange). L'appelant ecrit le fichier."""
+    reason = ready_blocked_reason(account)
+    if reason is None and not account.get("ready_to_publish"):
+        account.update(ready_to_publish=True, ready_note=None)
+        logger.info("compte %s : « prêt à publier » coché automatiquement : connexion TikTok vérifiée, "
+                    "aucun arrêt en attente", account_id)
+        return "checked"
+    if reason is not None and account.get("ready_to_publish"):
+        account.update(ready_to_publish=False, ready_note=f"décoché automatiquement le {_now()} : {reason}")
+        logger.warning("compte %s : « prêt à publier » décoché (%s)", account_id, reason)
+        return "unchecked"
+    return None
 
 
 def record_login(config: Config, account_id: str, observed: dict[str, Any]) -> dict[str, Any]:
-    """Enregistre la connexion verifiee (``{"state", "checked_at", "expires_at"}``, R2). Un cookie de session
-    disparu d'un compte qui etait connecte vaut « expired ». Quand l'etat n'est plus ``connected``, la case
-    « pret a publier » se decoche (R3) : journal, ``ready_note`` et ``auto_unchecked`` True dans la reponse
-    (l'appelant en fait un evenement console)."""
+    """Enregistre la connexion verifiee (``{"state", "checked_at", "expires_at"}``, R2) et recalcule la case
+    « pret a publier » (R3) : cochee quand la connexion est verifiee et qu'aucun arret R4 n'attend, decochee
+    sinon (journal, ``ready_note``). Un cookie de session disparu d'un compte qui etait connecte vaut
+    « expired ». La reponse porte ``auto_checked`` / ``auto_unchecked`` (l'appelant fait du decochage un
+    evenement console)."""
     state = observed.get("state") if isinstance(observed, dict) else None
     if state not in LOGIN_STATES:
         raise AccountsError(f"état de connexion invalide : {state!r} (attendu : {' | '.join(LOGIN_STATES)})")
@@ -339,51 +363,49 @@ def record_login(config: Config, account_id: str, observed: dict[str, Any]) -> d
             state = "expired"  # Chrome a purge le cookie expire : le compte etait connecte
         login = {"state": state, "checked_at": observed.get("checked_at") or _now(),
                  "expires_at": observed.get("expires_at")}
-        unchecked = False
-        if state != "connected" and account.get("ready_to_publish"):
-            reason = ready_blocked_reason({"login": login})
-            account.update(ready_to_publish=False, ready_note=f"décoché automatiquement le {_now()} : {reason}")
-            unchecked = True
-            logger.warning("compte %s : « prêt à publier » décoché (%s)", account_id, state)
-        if login != account.get("login") or unchecked:
-            account["login"] = login
+        changed = login != account.get("login")
+        account["login"] = login
+        change = _sync_ready(account, account_id)
+        if changed or change:
             _write(config, accounts)
-        out = _public({**account, "login": login})
-    out["auto_unchecked"] = unchecked
+        out = _public(account)
+    out.update(auto_checked=change == "checked", auto_unchecked=change == "unchecked")
     return out
 
 
-def set_ready(config: Config, account_id: str, ready: Any) -> dict[str, Any]:
-    """Coche ou decoche « pret a publier » (R3) ; cocher exige une connexion verifiee (``record_login``
-    juste avant), sinon ``AccountsError`` avec la raison."""
-    if not isinstance(ready, bool):
-        raise AccountsError("ready : un booléen est attendu")
-    with _lock:
-        accounts = _read(config)
-        account = _find(accounts, account_id)
-        if ready:
-            reason = ready_blocked_reason(account)
-            if reason is not None:
-                raise AccountsError(f"« prêt à publier » refusé pour le compte {account_id} : {reason}")
-        account.update(ready_to_publish=ready, ready_note=None)
-        account["updated_at"] = _now()
-        _write(config, accounts)
-    logger.info("compte %s : prêt à publier = %s", account_id, ready)
-    return _public(account)
-
-
 def uncheck_ready(config: Config, account_id: str, reason: str) -> bool:
-    """Decoche « pret a publier » apres un arret R4 (captcha, verification...), journalise, avec la raison
-    affichee dans ``ready_note`` ; rend True si la case etait cochee."""
+    """Enregistre un arret R4 (captcha, verification...) : la case se decoche et reste decochee, avec la
+    raison affichee, tant que ``clear_halt`` n'a pas ete appele ; rend True si la case etait cochee."""
     with _lock:
         accounts = _read(config)
         account = _find(accounts, account_id)
-        if not account.get("ready_to_publish"):
-            return False
-        account.update(ready_to_publish=False, ready_note=f"décoché automatiquement le {_now()} : {reason}")
+        was_ready = bool(account.get("ready_to_publish"))
+        if not account.get("r4_halt"):  # un arret deja en attente garde sa raison d'origine
+            account["r4_halt"] = {"reason": reason, "at": _now()}
+        account.update(ready_to_publish=False,
+                       ready_note=f"décoché automatiquement le {_now()} : {reason}" if was_ready else account.get("ready_note"))
         _write(config, accounts)
-    logger.warning("compte %s : « prêt à publier » décoché (%s)", account_id, reason)
-    return True
+    logger.warning("compte %s : arrêt de publication enregistré (%s)%s", account_id, reason,
+                   ", « prêt à publier » décoché" if was_ready else "")
+    return was_ready
+
+
+def clear_halt(config: Config, account_id: str) -> dict[str, Any]:
+    """« J'ai regle le probleme » (R3) : efface l'arret R4 en attente ; la case suit alors la derniere connexion
+    verifiee (l'appelant la revérifie juste avant). Journalise l'effacement."""
+    with _lock:
+        accounts = _read(config)
+        account = _find(accounts, account_id)
+        halt = account.pop("r4_halt", None)
+        change = _sync_ready(account, account_id)
+        if halt or change:
+            account["updated_at"] = _now()
+            _write(config, accounts)
+        out = _public(account)
+    if halt:
+        logger.info("compte %s : arrêt de publication effacé par l'utilisateur (%s)", account_id, halt.get("reason"))
+    out.update(auto_checked=change == "checked", auto_unchecked=change == "unchecked")
+    return out
 
 
 # ---------------------------------------------------------------- generateur
