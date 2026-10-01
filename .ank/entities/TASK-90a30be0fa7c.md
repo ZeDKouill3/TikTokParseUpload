@@ -5,7 +5,7 @@ slug: comptes-cran-de-carnet-des-comptes-coffre-de-l-o
 title: "Comptes : écran de carnet des comptes (coffre de l'OS), boutons Copier, générateur de mot de passe (SPEC-6fa4)"
 created: 2026-10-01T12:19:17Z
 author: nicoc@zedk_ordi
-status: in_progress
+status: done
 scope:
   - clipper/accounts.py
   - clipper/web/app.py
@@ -19,8 +19,15 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/057e8b42e501@c4867c8
+    tree: scope/0c779c38255d
+    criteria: 7354fc29a975
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 2
+version: 3
 ---
 
 Implémente SPEC-6fa409556e34 (ratifiée 2026-10-01) : module clipper/accounts.py + routes /api/accounts* + écran Comptes (section Configuration de la barre latérale). Dépendance keyring à ajouter à pyproject.toml.

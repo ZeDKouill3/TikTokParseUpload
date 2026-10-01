@@ -1,9 +1,9 @@
-/* Coquille de la console : routeur par hash (8 ecrans), client d'API avec
+/* Coquille de la console : routeur par hash (9 ecrans), client d'API avec
    jeton, temps reel SSE avec repli sur polling, theme, notifications, ajout
    de video. Les ecrans eux-memes vivent dans screens.js. */
 "use strict";
 
-const SCREEN_IDS = ["dashboard", "videos", "review", "clips", "channels", "publish", "stats", "settings"];
+const SCREEN_IDS = ["dashboard", "videos", "review", "clips", "channels", "publish", "stats", "accounts", "settings"];
 const POLL_MS = 5000;
 const THEME_KEY = "clipper-theme";
 const NOTIF_KEY = "clipper-notifications";

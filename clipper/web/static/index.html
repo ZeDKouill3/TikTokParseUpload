@@ -8,6 +8,7 @@
 <link rel="icon" type="image/svg+xml" href="/static/logo.svg">
 <link rel="stylesheet" href="/static/fonts.css">
 <link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/static/screens/accounts.css">
 <script>
   // Theme avant le premier rendu : choix memorise, sinon preference du systeme.
   (function () {
@@ -39,6 +40,7 @@
       <div class="nav-group">Configuration</div>
       <a href="#/channels" data-screen="channels"><span data-icon="tv"></span><span>Chaînes</span><span class="count" data-count-for="channels" hidden></span></a>
       <a href="#/stats" data-screen="stats"><span data-icon="chart-column"></span><span>Statistiques</span><span class="count" data-count-for="stats" hidden></span></a>
+      <a href="#/accounts" data-screen="accounts"><span data-icon="lock"></span><span>Comptes</span><span class="count" data-count-for="accounts" hidden></span></a>
       <a href="#/settings" data-screen="settings"><span data-icon="settings"></span><span>Réglages</span><span class="count" data-count-for="settings" hidden></span></a>
     </nav>
   </aside>
@@ -106,6 +108,13 @@
       </div>
       <div class="panel" data-body><div class="skeleton skeleton-line"></div><div class="skeleton skeleton-card"></div></div>
     </section>
+    <section class="screen" id="screen-accounts" data-title="Comptes" hidden>
+      <div class="page-head reveal">
+        <div class="titles"><div class="eyebrow">Configuration</div><h1>Comptes</h1><p class="sub">Les comptes des plateformes : mots de passe dans le coffre de l'OS, copie en un clic, générateur.</p></div>
+        <div class="actions" data-actions></div>
+      </div>
+      <div class="panel" data-body><div class="skeleton skeleton-line"></div><div class="skeleton skeleton-card"></div></div>
+    </section>
     <section class="screen" id="screen-settings" data-title="Réglages" hidden>
       <div class="page-head reveal">
         <div class="titles"><div class="eyebrow">Configuration</div><h1>Réglages</h1><p class="sub">La configuration globale et l'accès à la console.</p></div>
@@ -153,6 +162,7 @@
 <script src="/static/screens/publish.js"></script>
 <script src="/static/screens/settings.js"></script>
 <script src="/static/screens/stats.js"></script>
+<script src="/static/screens/accounts.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>

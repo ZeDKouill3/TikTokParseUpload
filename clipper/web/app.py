@@ -13,6 +13,7 @@ import csv
 import hashlib
 import importlib
 import inspect
+import ipaddress
 import json
 import os
 import re
@@ -29,8 +30,10 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse as _PlainJSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
+from clipper import accounts as accounts_mod
 from clipper import channel as channel_mod
 from clipper import gpu as gpu_mod
 from clipper import outcomes as outcomes_mod
@@ -1365,6 +1368,76 @@ class LayoutBody(BaseModel):
     split_subtitle_dest: dict[str, Any] | None = None
 
 
+# --------------------------------------------------------------------------
+# Comptes (SPEC-6fa4) : carnet local, mots de passe dans le coffre de l'OS
+# (clipper.accounts). Routes /api/accounts* reservees au PC (R3), sans CORS,
+# ecritures en JSON seulement ; le corps est lu a la main pour qu'aucune
+# erreur de validation ne recopie un mot de passe (R4).
+# --------------------------------------------------------------------------
+
+_ACCOUNTS_PREFIX = "/api/accounts"
+_ACCOUNTS_HOSTS = ("127.0.0.1", "localhost")
+_WRITE_METHODS = ("POST", "PUT", "PATCH", "DELETE")
+
+
+def _is_accounts_path(path: str) -> bool:
+    return path == _ACCOUNTS_PREFIX or path.startswith(_ACCOUNTS_PREFIX + "/")
+
+
+def _is_loopback_client(host: str | None) -> bool:
+    try:
+        addr = ipaddress.ip_address(host or "")
+    except ValueError:
+        return False
+    mapped = getattr(addr, "ipv4_mapped", None)
+    return (mapped or addr).is_loopback
+
+
+_LOCAL_HOST_HEADER = re.compile(r"(?:127\.0\.0\.1|localhost)(?::\d{1,5})?", re.IGNORECASE)
+
+
+def _is_local_host_header(value: str | None) -> bool:
+    return bool(value) and _LOCAL_HOST_HEADER.fullmatch(value) is not None
+
+
+def _accounts_guard(request: Request) -> JSONResponse | None:
+    """Refus 403 hors PC (adresse non bouclage ou Host etranger, meme avec jeton), 415 sans JSON."""
+    client = request.client.host if request.client else None
+    if not _is_loopback_client(client):
+        return JSONResponse(
+            {"detail": "les comptes ne sont accessibles que depuis le PC qui héberge la console (adresse cliente hors bouclage)"},
+            status_code=403,
+        )
+    if not _is_local_host_header(request.headers.get("host")):
+        return JSONResponse(
+            {"detail": "les comptes ne sont accessibles que via 127.0.0.1 ou localhost (en-tête Host refusé)"},
+            status_code=403,
+        )
+    if request.method in _WRITE_METHODS and request.headers.get("content-type", "").split(";")[0].strip().lower() != "application/json":
+        return JSONResponse({"detail": "corps JSON exigé (Content-Type: application/json)"}, status_code=415)
+    return None
+
+
+async def _accounts_json(request: Request) -> Any:
+    try:
+        return json.loads(await request.body())
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="corps JSON invalide") from exc
+
+
+def _accounts_call(fn, *args, **kwargs) -> Any:
+    try:
+        return fn(*args, **kwargs)
+    except accounts_mod.AccountNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from None
+    except accounts_mod.VaultUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from None
+    except accounts_mod.AccountsError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    except ConfigError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from None
+
+
 def create_app(config: Config | None = None) -> FastAPI:
     config = config or load_config()
     web_cfg = config.section("web")
@@ -1390,6 +1463,17 @@ def create_app(config: Config | None = None) -> FastAPI:
             supplied = request.headers.get(_TOKEN_HEADER) or request.cookies.get(_TOKEN_COOKIE)
             if supplied != token:
                 return JSONResponse({"detail": "jeton d'acces manquant ou invalide"}, status_code=401)
+        return await call_next(request)
+
+    @app.middleware("http")
+    async def _accounts_only_local(request: Request, call_next):
+        if _is_accounts_path(request.url.path):
+            refusal = _accounts_guard(request)
+            if refusal is not None:
+                return refusal
+            response = await call_next(request)
+            response.headers["Cache-Control"] = "no-store"
+            return response
         return await call_next(request)
 
     @app.middleware("http")
@@ -1819,6 +1903,47 @@ def create_app(config: Config | None = None) -> FastAPI:
     async def stats_import(request: Request) -> dict[str, Any]:
         data = _stats_csv_from_multipart(request.headers.get("content-type", ""), await request.body())
         return {"imported": _stats_import(config, data)}
+
+    # ----------------------------------------------------------------
+    # Comptes (SPEC-6fa4)
+    # ----------------------------------------------------------------
+
+    @app.get("/api/accounts")
+    async def accounts_list() -> list[dict[str, Any]]:
+        return await run_in_threadpool(_accounts_call, accounts_mod.list_accounts, config)
+
+    @app.post("/api/accounts", status_code=201)
+    async def accounts_add(request: Request) -> dict[str, Any]:
+        return await run_in_threadpool(_accounts_call, accounts_mod.add_account, config, await _accounts_json(request))
+
+    @app.post("/api/accounts/generate")
+    async def accounts_generate(request: Request) -> dict[str, str]:
+        body = await _accounts_json(request)
+        if not isinstance(body, dict) or set(body) - {"length", "symbols", "avoid_ambiguous"}:
+            raise HTTPException(status_code=422, detail="corps invalide : length, symbols, avoid_ambiguous attendus")
+        if not all(isinstance(body.get(k, False), bool) for k in ("symbols", "avoid_ambiguous")):
+            raise HTTPException(status_code=422, detail="symbols et avoid_ambiguous : un booléen est attendu")
+        password = _accounts_call(
+            accounts_mod.generate_password, config, body.get("length"),
+            symbols=body.get("symbols", False), avoid_ambiguous=body.get("avoid_ambiguous", False),
+        )
+        return {"password": password}
+
+    @app.put("/api/accounts/{account_id}")
+    async def accounts_update(account_id: str, request: Request) -> dict[str, Any]:
+        return await run_in_threadpool(
+            _accounts_call, accounts_mod.update_account, config, account_id, await _accounts_json(request)
+        )
+
+    @app.delete("/api/accounts/{account_id}", status_code=204)
+    async def accounts_delete(account_id: str) -> Response:
+        await run_in_threadpool(_accounts_call, accounts_mod.delete_account, config, account_id)
+        return Response(status_code=204)
+
+    @app.get("/api/accounts/{account_id}/password")
+    async def accounts_password(account_id: str) -> dict[str, str]:
+        password = await run_in_threadpool(_accounts_call, accounts_mod.get_password, config, account_id)
+        return {"password": password}
 
     @app.get("/api/events")
     def events_stream() -> StreamingResponse:
