@@ -96,6 +96,11 @@ def _list_moments(config: Config, video_id: str) -> list[dict[str, Any]]:
     return out
 
 
+def _validate_video_id(video_id: str) -> None:
+    if not _SAFE_ID.fullmatch(video_id):
+        raise HTTPException(status_code=400, detail=f"identifiant video invalide : {video_id!r}")
+
+
 def _channel_of(video_id: str, config: Config) -> str | None:
     try:
         state = pipeline.load_state(video_id, config=config)
@@ -238,6 +243,7 @@ def create_app(config: Config | None = None) -> FastAPI:
 
     @app.post("/api/queue/{video_id}/front")
     def queue_front(video_id: str) -> dict[str, Any]:
+        _validate_video_id(video_id)
         try:
             worker_mod.move_to_front(video_id, config=config)
         except worker_mod.WorkerError as exc:
@@ -246,6 +252,7 @@ def create_app(config: Config | None = None) -> FastAPI:
 
     @app.delete("/api/queue/{video_id}")
     def queue_remove(video_id: str) -> dict[str, Any]:
+        _validate_video_id(video_id)
         try:
             worker_mod.remove(video_id, config=config)
         except worker_mod.WorkerError as exc:
@@ -288,10 +295,12 @@ def create_app(config: Config | None = None) -> FastAPI:
     def start_render(video_id: str) -> JSONResponse:
         """Remet la video en file, action 'render' (ADR-4f6e §1 : jamais
         pipeline.render dans ce processus)."""
+        _validate_video_id(video_id)
         return _enqueue(video_id, _channel_of(video_id, config), "render", None, config)
 
     @app.post("/api/videos/{video_id}/cancel")
     def cancel_video(video_id: str) -> dict[str, Any]:
+        _validate_video_id(video_id)
         try:
             worker_mod.Worker(config=config).cancel(video_id)
         except worker_mod.WorkerError as exc:
@@ -300,6 +309,7 @@ def create_app(config: Config | None = None) -> FastAPI:
 
     @app.post("/api/videos/{video_id}/retry", status_code=202)
     def retry_video(video_id: str, body: RetryBody) -> JSONResponse:
+        _validate_video_id(video_id)
         if body.from_step not in pipeline.STEPS:
             raise HTTPException(status_code=400, detail=f"etape inconnue : {body.from_step!r}")
         force_steps = list(pipeline.STEPS[pipeline.STEPS.index(body.from_step):])
@@ -307,6 +317,7 @@ def create_app(config: Config | None = None) -> FastAPI:
 
     @app.get("/api/videos/{video_id}/events")
     def video_events(video_id: str, since: str | None = None) -> list[dict[str, Any]]:
+        _validate_video_id(video_id)
         path = Path(config.workspace_dir) / video_id / pipeline.EVENTS_FILE
         if not path.exists():
             return []

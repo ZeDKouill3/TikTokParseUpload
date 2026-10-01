@@ -690,6 +690,20 @@ def test_video_events_no_journal_yet_is_an_empty_list(tmp_path, isolated_cwd):
     assert resp.json() == []
 
 
+def test_video_events_rejects_path_traversal(tmp_path, isolated_cwd):
+    # "..%2F..%2Fsecret" (comme test_media_clip_rejects_path_traversal) : pas
+    # de normalisation cote client httpx (le "/" reste encode), contrairement
+    # a un ".." nu qui serait resolu avant l'envoi et, ici, retomberait sur
+    # /api/events (flux SSE infini) au lieu d'exercer la validation serveur.
+    resp = client(tmp_path).get("/api/videos/..%2F..%2Fsecret/events")
+    assert resp.status_code in (400, 404)
+
+
+def test_cancel_rejects_path_traversal(tmp_path, isolated_cwd):
+    resp = client(tmp_path).post("/api/videos/..%2F..%2Fsecret/cancel")
+    assert resp.status_code in (400, 404)
+
+
 # --------------------------------------------------------------------------
 # N : GET /api/channels - channel.list_channels (SPEC-fc0c §1)
 # --------------------------------------------------------------------------
