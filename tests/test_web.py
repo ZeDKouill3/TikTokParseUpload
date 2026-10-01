@@ -1970,3 +1970,263 @@ def test_clips_screen_is_wired_with_gallery_sidecar_and_actions():
     assert "undo" in js                                  # toast « Annuler »
     assert "confirm: true" in js                         # re-rendu confirmé
     assert "Aucun clip" in js                            # etat vide
+
+
+# --------------------------------------------------------------------------
+# Ecran Chaines (SPEC-c100 E5, SPEC-fc0c §1) : API par chaine + page
+# --------------------------------------------------------------------------
+
+CH = "ma_chaine"
+_CH_PRESET = (
+    '[channel]\ndisplay_name = "Ma chaîne"\nwatch = true\n'
+    'slots = [{day = "mon", time = "18:30"}, {day = "thu", time = "12:00"}]\n'
+    '\n[reframe]\nletterbox_zoom = 1.5\n'
+)
+
+
+def _channels_setup(tmp_path, preset=_CH_PRESET, name=CH):
+    (tmp_path / "config.toml").write_text('mode = "review"\n[render]\ncrf = 18\n', encoding="utf-8")
+    (tmp_path / "presets").mkdir(exist_ok=True)
+    (tmp_path / "presets" / f"{name}.toml").write_text(preset, encoding="utf-8")
+
+
+def test_get_channel_returns_raw_effective_and_documented_defaults(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path)
+    data = client(tmp_path).get(f"/api/channels/{CH}").json()
+
+    assert data["name"] == CH
+    # ce que le preset redéfinit, tel quel (rien d'hérité)
+    assert data["raw"]["channel"]["display_name"] == "Ma chaîne"
+    assert data["raw"]["reframe"] == {"letterbox_zoom": 1.5}
+    assert "render" not in data["raw"]
+    # valeurs effectives : preset > config.toml > CONFIG_DEFAULTS
+    assert data["effective"]["reframe"]["letterbox_zoom"] == 1.5
+    assert data["effective"]["render"]["crf"] == 18          # hérité de config.toml
+    assert data["effective"]["render"]["max_fps"] == 30       # hérité de CONFIG_DEFAULTS
+    assert data["effective"]["channel"]["mode"] == "review"   # mode global
+    assert data["effective"]["channel"]["timezone"] == "Europe/Paris"
+    # les sections du formulaire sont toutes là
+    for section in ("channel", "reframe", "render", "subtitles", "moments"):
+        assert section in data["defaults"], section
+    # défaut + commentaire de la ligne précédente dans le source
+    fps = data["defaults"]["render"]["max_fps"]
+    assert fps["default"] == 30 and "Cadence de sortie" in fps["comment"]
+    assert data["defaults"]["render"]["crf"]["comment"] == ""     # pas de commentaire : vide, pas inventé
+    assert data["defaults"]["channel"]["watch_interval_s"]["default"] == 1800
+
+
+def test_get_channel_comments_come_from_source_without_importing_values(tmp_path, isolated_cwd):
+    from clipper.web import app as web_app
+
+    comments = web_app._defaults_documentation("moments")
+    assert "Grille de notation" in comments["rubric_path"]["comment"]
+    assert "jamais de repli" in comments["rubric_path"]["comment"]    # bloc de commentaires entier
+    assert comments["rubric_path"]["default"] == "rubric.toml"
+
+
+def test_get_channel_unknown_is_404_and_invalid_name_422(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path)
+    c = client(tmp_path)
+    assert c.get("/api/channels/autre").status_code == 404
+    assert "autre" in c.get("/api/channels/autre").json()["detail"]
+    assert c.get("/api/channels/Bad.Name").status_code == 422
+
+
+def test_get_channel_without_config_toml_says_so(tmp_path, isolated_cwd):
+    (tmp_path / "presets").mkdir()
+    (tmp_path / "presets" / f"{CH}.toml").write_text("[channel]\n", encoding="utf-8")
+    resp = client(tmp_path).get(f"/api/channels/{CH}")
+    assert resp.status_code == 422 and "config.toml" in resp.json()["detail"]
+
+
+def test_put_channel_saves_through_save_channel(tmp_path, isolated_cwd, monkeypatch):
+    _channels_setup(tmp_path)
+    from clipper import channel as channel_mod
+
+    calls = []
+    real = channel_mod.save_channel
+
+    def spy(name, data, **kwargs):
+        calls.append((name, data, kwargs))
+        return real(name, data, **kwargs)
+
+    monkeypatch.setattr(channel_mod, "save_channel", spy)
+    preset = {"channel": {"display_name": "Autre", "mode": "auto"}, "render": {"crf": 22}}
+    resp = client(tmp_path).put(f"/api/channels/{CH}", json={"preset": preset})
+
+    assert resp.status_code == 200, resp.text
+    assert any(n == CH and d == preset and k["presets_dir"] == "presets" for n, d, k in calls)
+    assert resp.json()["raw"] == preset
+    assert resp.json()["effective"]["channel"]["mode"] == "auto"
+    assert "crf = 22" in (tmp_path / "presets" / f"{CH}.toml").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("preset, section, key", [
+    ({"reframe": {"zzz": 1}}, "reframe", "zzz"),                            # clé inconnue (ConfigError)
+    ({"channel": {"mode": "turbo"}}, "channel", "mode"),                    # mode invalide
+    ({"channel": {"slots": [{"day": "xx", "time": "18:30"}]}}, "channel", "slots"),
+    ({"channel": {"watch_interval_s": "vite"}}, "channel", "watch_interval_s"),   # mauvais type
+    ({"channel": {"timezone": "Mars/Olympus"}}, "channel", "timezone"),
+    ({"render": {"crf": True}}, "render", "crf"),                           # bool n'est pas un entier
+])
+def test_put_channel_invalid_is_422_naming_section_and_key_and_keeps_the_file(
+    tmp_path, isolated_cwd, preset, section, key
+):
+    _channels_setup(tmp_path)
+    path = tmp_path / "presets" / f"{CH}.toml"
+    before = path.read_text(encoding="utf-8")
+
+    resp = client(tmp_path).put(f"/api/channels/{CH}", json={"preset": preset})
+
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert f"[{section}]" in detail and key in detail, detail
+    assert path.read_text(encoding="utf-8") == before
+
+
+def test_put_channel_config_error_from_save_channel_is_422(tmp_path, isolated_cwd, monkeypatch):
+    _channels_setup(tmp_path)
+    from clipper import channel as channel_mod
+    from clipper.config import ConfigError
+
+    def boom(*args, **kwargs):
+        raise ConfigError("cle(s) inconnue(s) dans la section [render]: zzz")
+
+    monkeypatch.setattr(channel_mod, "save_channel", boom)
+    resp = client(tmp_path).put(f"/api/channels/{CH}", json={"preset": {"channel": {}}})
+    assert resp.status_code == 422 and "[render]" in resp.json()["detail"] and "zzz" in resp.json()["detail"]
+
+
+def test_put_channel_unknown_is_404_and_keeps_the_channel_table(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path)
+    c = client(tmp_path)
+    assert c.put("/api/channels/autre", json={"preset": {"channel": {}}}).status_code == 404
+    # un preset sans [channel] n'est plus une chaîne : le serveur garde la table
+    assert c.put(f"/api/channels/{CH}", json={"preset": {"render": {"crf": 20}}}).status_code == 200
+    assert c.get("/api/channels").json() == [CH]
+
+
+def test_post_channel_creates_a_preset(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path)
+    c = client(tmp_path)
+    resp = c.post("/api/channels", json={"name": "nouvelle", "preset": {"channel": {"source_url": "https://exemple.test/c"}}})
+
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["raw"]["channel"]["source_url"] == "https://exemple.test/c"
+    assert (tmp_path / "presets" / "nouvelle.toml").is_file()
+    assert c.get("/api/channels").json() == [CH, "nouvelle"]
+    # sans preset : une chaîne vide mais valide (la table [channel] existe)
+    assert c.post("/api/channels", json={"name": "vide"}).status_code == 201
+    assert "vide" in c.get("/api/channels").json()
+
+
+def test_post_channel_invalid_name_is_422_existing_is_409_bad_preset_422(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path)
+    c = client(tmp_path)
+    for bad in ("Ma Chaine", "../x", "", "a" * 41):
+        resp = c.post("/api/channels", json={"name": bad})
+        assert resp.status_code == 422, bad
+        assert "nom" in resp.json()["detail"]
+    assert c.post("/api/channels", json={"name": CH}).status_code == 409
+    resp = c.post("/api/channels", json={"name": "autre", "preset": {"render": {"zzz": 1}}})
+    assert resp.status_code == 422 and "zzz" in resp.json()["detail"]
+    assert not (tmp_path / "presets" / "autre.toml").exists()
+
+
+def test_delete_channel_requires_confirm(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path)
+    c = client(tmp_path)
+    path = tmp_path / "presets" / f"{CH}.toml"
+
+    refused = c.delete(f"/api/channels/{CH}")
+    assert refused.status_code == 409 and "confirm" in refused.json()["detail"]
+    assert c.delete(f"/api/channels/{CH}?confirm=false").status_code == 409
+    assert path.exists()
+
+    ok = c.delete(f"/api/channels/{CH}?confirm=true")
+    assert ok.status_code == 200 and ok.json() == {"name": CH, "deleted": True}
+    assert not path.exists()
+    assert c.delete(f"/api/channels/{CH}?confirm=true").status_code == 404
+
+
+def test_channel_slots_returns_the_next_ten_slots(tmp_path, isolated_cwd):
+    from datetime import datetime, timezone
+
+    _channels_setup(tmp_path)
+    data = client(tmp_path).get(f"/api/channels/{CH}/slots").json()
+
+    slots = [datetime.fromisoformat(s) for s in data["slots"]]
+    assert len(slots) == 10 and slots == sorted(slots)
+    assert all(s > datetime.now(timezone.utc) for s in slots)
+    assert {(s.weekday(), s.strftime("%H:%M")) for s in slots} == {(0, "18:30"), (3, "12:00")}
+    assert data["timezone"] == "Europe/Paris" and data["reason"] is None
+
+
+def test_channel_slots_without_slots_says_why(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path, preset="[channel]\n")
+    data = client(tmp_path).get(f"/api/channels/{CH}/slots").json()
+    assert data["slots"] == [] and "créneau" in data["reason"]
+    assert client(tmp_path).get("/api/channels/autre/slots").status_code == 404
+
+
+def _multipart(filename: str, content: bytes, field: str = "file") -> tuple[bytes, str]:
+    boundary = "----clipperTest"
+    body = (
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"{field}\"; filename=\"{filename}\"\r\n"
+        f"Content-Type: image/png\r\n\r\n"
+    ).encode() + content + f"\r\n--{boundary}--\r\n".encode()
+    return body, f"multipart/form-data; boundary={boundary}"
+
+
+_PNG = b"\x89PNG\r\n\x1a\n" + b"0" * 32
+
+
+def test_channel_logo_multipart_upload_writes_presets_png(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path)
+    body, ctype = _multipart("logo.png", _PNG)
+    resp = client(tmp_path).post(f"/api/channels/{CH}/logo", content=body, headers={"content-type": ctype})
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"name": CH, "logo": f"presets/{CH}.png"}
+    assert (tmp_path / "presets" / f"{CH}.png").read_bytes() == _PNG
+
+
+def test_channel_logo_refuses_non_png_and_missing_file(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path)
+    c = client(tmp_path)
+    body, ctype = _multipart("logo.png", b"GIF89a-pas-un-png")
+    resp = c.post(f"/api/channels/{CH}/logo", content=body, headers={"content-type": ctype})
+    assert resp.status_code == 422 and "PNG" in resp.json()["detail"]
+    body, ctype = _multipart("logo.png", _PNG, field="autre")
+    assert c.post(f"/api/channels/{CH}/logo", content=body, headers={"content-type": ctype}).status_code == 422
+    assert c.post(f"/api/channels/{CH}/logo", content=b"x", headers={"content-type": "text/plain"}).status_code == 422
+    body, ctype = _multipart("logo.png", _PNG)
+    assert c.post("/api/channels/autre/logo", content=body, headers={"content-type": ctype}).status_code == 404
+    assert not (tmp_path / "presets" / f"{CH}.png").exists()
+
+
+def test_channels_screen_is_wired_with_list_form_inheritance_and_toast():
+    page = (STATIC / "index.html").read_text(encoding="utf-8")
+    js = (STATIC / "screens" / "channels.js").read_text(encoding="utf-8")
+    css = (STATIC / "style.css").read_text(encoding="utf-8")
+
+    assert "/static/screens/channels.js" in page
+    assert page.index("/static/screens.js") < page.index("/static/screens/channels.js")
+    assert "Screens.channels" in js
+    # liste : nom, source, surveillance, mode, prochains créneaux
+    for label in ("source_url", "Surveillance", "Mode", "Prochains créneaux", "/slots"):
+        assert label in js, label
+    # formulaire par sections
+    for section in ("channel", "reframe", "render", "subtitles", "moments"):
+        assert f'"{section}"' in js, section
+    for title in ("Agencement", "Titre", "Sous-titres", "Grille"):
+        assert title in js, title
+    # valeur héritée grisée + « redéfinir », erreur au champ, enregistrement avec toast
+    assert "redéfinir" in js and "inherited" in js and "data-redefine" in js
+    assert "field-error" in js
+    assert "jsonBody(\"PUT\"" in js and "jsonBody(\"POST\"" in js
+    assert 'method: "DELETE"' in js and "confirm=true" in js and "confirmDialog" in js
+    assert "toast(" in js and "Chaîne enregistrée" in js
+    assert "Aucune chaîne" in js                       # état vide
+    assert "FormData" in js and "/logo" in js          # envoi du logo
+    assert ".chan-" in css and ".inherited" in css

@@ -7,12 +7,21 @@ processus ; le traitement passe toujours par la file (clipper.worker)."""
 
 from __future__ import annotations
 
+import ast
 import asyncio
+import importlib
+import inspect
 import json
+import os
 import re
+import tempfile
+import tomllib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from email.parser import BytesParser
+from email.policy import HTTP as _EMAIL_HTTP
 from typing import Any, AsyncIterator
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -24,7 +33,7 @@ from clipper import gpu as gpu_mod
 from clipper import pipeline
 from clipper import publish as publish_mod
 from clipper import worker as worker_mod
-from clipper.config import Config, load_config
+from clipper.config import Config, ConfigError, _section_defaults, load_config
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 # Video/clip ids sont soit des ids YouTube (11 caracteres alphanumeriques),
@@ -546,6 +555,166 @@ def _enqueue_clip_render(video_id: str, config: Config) -> dict[str, Any]:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
+# --------------------------------------------------------------------------
+# Ecran Chaines (SPEC-c100 E5, SPEC-fc0c §1) : un preset de chaine est un
+# fichier presets/<nom>.toml ; l'API le lit/ecrit uniquement par
+# clipper.channel (save_channel : relu et valide avant remplacement).
+# --------------------------------------------------------------------------
+
+_BASE_CONFIG = "config.toml"
+# Sections du formulaire : [channel], agencement, titre/CTA/badge, sous-titres,
+# moments/grille. Les autres tables d'un preset sont conservees telles quelles.
+_CHANNEL_FORM_SECTIONS = ("channel", "reframe", "render", "subtitles", "moments")
+_NEXT_SLOTS = 10
+_LOGO_MAX_BYTES = 5 * _MIB
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+_TYPE_NAMES = {bool: "booléen", int: "entier", float: "nombre", str: "texte", list: "liste"}
+
+
+def _comment_above(lines: list[str], lineno: int) -> str:
+    """Bloc de lignes de commentaire collees juste au-dessus de la ligne
+    ``lineno`` (1-based) du source, sans le « # » ; vide s'il n'y en a pas."""
+    block: list[str] = []
+    index = lineno - 2
+    while index >= 0 and lines[index].strip().startswith("#"):
+        block.insert(0, lines[index].strip().lstrip("#").strip())
+        index -= 1
+    return " ".join(part for part in block if part)
+
+
+def _defaults_documentation(section: str) -> dict[str, dict[str, Any]]:
+    """CONFIG_DEFAULTS de clipper.<section> : pour chaque cle, son defaut et le
+    commentaire place au-dessus dans le source (inspect.getsource + ast : le
+    source n'est lu que pour ses commentaires, jamais evalue)."""
+    defaults = _section_defaults(section)
+    module = importlib.import_module(f"clipper.{section}")
+    lines = inspect.getsource(module).splitlines()
+    comments: dict[str, str] = {}
+    for node in ast.walk(ast.parse("\n".join(lines))):
+        targets = [node.target] if isinstance(node, ast.AnnAssign) else getattr(node, "targets", [])
+        if not any(isinstance(t, ast.Name) and t.id == "CONFIG_DEFAULTS" for t in targets):
+            continue
+        if isinstance(node.value, ast.Dict):
+            for key in node.value.keys:
+                if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                    comments[key.value] = _comment_above(lines, key.lineno)
+    return {key: {"default": value, "comment": comments.get(key, "")} for key, value in defaults.items()}
+
+
+def _check_preset_types(preset: dict[str, Any]) -> None:
+    """Chaque valeur d'une section a le type de son defaut dans CONFIG_DEFAULTS
+    (booleen, entier, nombre, texte, liste) : erreur « [section] cle : ... »
+    nommant le champ, jamais une conversion silencieuse (ADR-ad2e)."""
+    for section, table in preset.items():
+        if not isinstance(table, dict):
+            continue
+        defaults = _section_defaults(section)
+        for key, value in table.items():
+            if key not in defaults:
+                continue  # cle inconnue : refusee par load_config, qui la nomme
+            kind = next((t for t in (bool, int, float, str, list) if type(defaults[key]) is t), None)
+            if kind is None:
+                continue
+            ok = (
+                isinstance(value, bool) if kind is bool
+                else isinstance(value, (int, float)) and not isinstance(value, bool) if kind is float
+                else isinstance(value, kind) and not isinstance(value, bool)
+            )
+            if not ok:
+                raise ConfigError(f"[{section}] {key} : {_TYPE_NAMES[kind]} attendu, reçu {value!r}")
+    timezone_name = (preset.get("channel") or {}).get("timezone")
+    if timezone_name:
+        try:
+            ZoneInfo(timezone_name)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ConfigError(f"[channel] timezone : fuseau horaire inconnu ({timezone_name!r})") from exc
+
+
+def _validate_preset(name: str, preset: dict[str, Any]) -> None:
+    """Valide ``preset`` comme save_channel puis load_channel le feront, dans un
+    dossier temporaire : le fichier reel n'est touche que si tout passe
+    (SPEC-fc0c 1.5). load_channel ajoute les regles de [channel] (mode,
+    creneaux) que save_channel ne controle pas."""
+    _check_preset_types(preset)
+    with tempfile.TemporaryDirectory() as tmp:
+        channel_mod.save_channel(name, preset, presets_dir=tmp, base=_BASE_CONFIG)
+        channel_mod.load_channel(name, presets_dir=tmp, base=_BASE_CONFIG)
+
+
+def _check_channel_name(name: str) -> None:
+    if not channel_mod.NAME_RE.match(name):
+        raise HTTPException(
+            status_code=422,
+            detail=f"nom de chaîne invalide : {name!r} (attendu : lettres minuscules, chiffres, _ ou -, 1 à 40 caractères)",
+        )
+
+
+def _channel_preset_path(name: str) -> Path:
+    _check_channel_name(name)
+    path = Path(_PRESETS_DIR) / f"{name}.toml"
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail=f"chaîne inconnue : {name!r}")
+    return path
+
+
+def _load_channel(name: str) -> tuple[Config, dict[str, Any]]:
+    _channel_preset_path(name)
+    try:
+        return channel_mod.load_channel(name, presets_dir=_PRESETS_DIR, base=_BASE_CONFIG)
+    except channel_mod.ChannelError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ConfigError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+def _channel_detail(name: str) -> dict[str, Any]:
+    """Preset brut (ce qu'il redefinit), valeurs effectives (preset > config.toml
+    > CONFIG_DEFAULTS) et documentation des defauts, section par section."""
+    config, channel = _load_channel(name)
+    path = _channel_preset_path(name)
+    try:
+        raw = tomllib.loads(path.read_text(encoding="utf-8"))
+        effective = {s: channel if s == "channel" else config.section(s) for s in _CHANNEL_FORM_SECTIONS}
+        defaults = {s: _defaults_documentation(s) for s in _CHANNEL_FORM_SECTIONS}
+    except (OSError, tomllib.TOMLDecodeError, ConfigError) as exc:
+        raise HTTPException(status_code=422, detail=f"preset illisible ({path.name}) : {exc}") from exc
+    return {"name": name, "raw": raw, "effective": effective, "defaults": defaults}
+
+
+def _save_channel_preset(name: str, preset: dict[str, Any]) -> None:
+    if "channel" not in preset:
+        preset = {**preset, "channel": {}}  # sans [channel], le preset ne serait plus une chaine
+    try:
+        _validate_preset(name, preset)
+        channel_mod.save_channel(name, preset, presets_dir=_PRESETS_DIR, base=_BASE_CONFIG)
+    except ConfigError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+def _png_from_multipart(content_type: str, body: bytes) -> bytes:
+    """Contenu du champ « file » d'un POST multipart (stdlib, sans dependance)."""
+    if not content_type.lower().startswith("multipart/form-data"):
+        raise HTTPException(status_code=422, detail="envoi multipart/form-data attendu (champ « file », image PNG)")
+    message = BytesParser(policy=_EMAIL_HTTP).parsebytes(
+        b"Content-Type: " + content_type.encode("latin-1") + b"\r\n\r\n" + body)
+    for part in message.iter_parts() if message.is_multipart() else []:
+        if part.get_param("name", header="content-disposition") == "file":
+            data = part.get_payload(decode=True) or b""
+            if not data.startswith(_PNG_SIGNATURE):
+                raise HTTPException(status_code=422, detail="le logo doit être une image PNG")
+            return data
+    raise HTTPException(status_code=422, detail="champ « file » absent de l'envoi multipart")
+
+
+class ChannelBody(BaseModel):
+    preset: dict[str, Any]
+
+
+class ChannelCreateBody(BaseModel):
+    name: str
+    preset: dict[str, Any] | None = None
+
+
 class ClipPatchBody(BaseModel):
     description: str | None = None
     hashtags: list[str] | None = None
@@ -816,6 +985,61 @@ def create_app(config: Config | None = None) -> FastAPI:
     @app.get("/api/channels")
     def list_channels_route() -> list[str]:
         return channel_mod.list_channels(_PRESETS_DIR)
+
+    @app.post("/api/channels", status_code=201)
+    def create_channel(body: ChannelCreateBody) -> dict[str, Any]:
+        _check_channel_name(body.name)
+        if (Path(_PRESETS_DIR) / f"{body.name}.toml").exists():
+            raise HTTPException(status_code=409, detail=f"la chaîne {body.name!r} existe déjà")
+        Path(_PRESETS_DIR).mkdir(parents=True, exist_ok=True)
+        _save_channel_preset(body.name, body.preset or {"channel": {}})
+        return _channel_detail(body.name)
+
+    @app.get("/api/channels/{name}")
+    def get_channel(name: str) -> dict[str, Any]:
+        return _channel_detail(name)
+
+    @app.put("/api/channels/{name}")
+    def put_channel(name: str, body: ChannelBody) -> dict[str, Any]:
+        _channel_preset_path(name)
+        _save_channel_preset(name, body.preset)
+        return _channel_detail(name)
+
+    @app.delete("/api/channels/{name}")
+    def delete_channel_route(name: str, confirm: bool = False) -> dict[str, Any]:
+        _check_channel_name(name)
+        if not confirm:
+            raise HTTPException(
+                status_code=409,
+                detail=f"confirmation requise (confirm=true) : supprimer la chaîne {name!r} efface son preset",
+            )
+        try:
+            channel_mod.delete_channel(name, presets_dir=_PRESETS_DIR)
+        except channel_mod.ChannelError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        Path(_PRESETS_DIR, f"{name}.png").unlink(missing_ok=True)
+        return {"name": name, "deleted": True}
+
+    @app.get("/api/channels/{name}/slots")
+    def channel_slots(name: str) -> dict[str, Any]:
+        _config, channel = _load_channel(name)
+        slots = channel_mod.next_slots(channel, datetime.now(timezone.utc), _NEXT_SLOTS)
+        return {
+            "name": name, "timezone": channel["timezone"], "slots": [s.isoformat() for s in slots],
+            "reason": None if channel["slots"] else "aucun créneau défini dans [channel].slots",
+        }
+
+    @app.post("/api/channels/{name}/logo")
+    async def upload_channel_logo(name: str, request: Request) -> dict[str, Any]:
+        _channel_preset_path(name)
+        data = _png_from_multipart(request.headers.get("content-type", ""), await request.body())
+        if len(data) > _LOGO_MAX_BYTES:
+            raise HTTPException(status_code=422, detail=f"logo trop lourd (maximum {_LOGO_MAX_BYTES // _MIB} Mo)")
+        target = Path(_PRESETS_DIR) / f"{name}.png"
+        tmp = target.with_name(f"{target.name}.{os.getpid()}.tmp")
+        tmp.write_bytes(data)
+        os.replace(tmp, target)
+        return {"name": name, "logo": f"{_PRESETS_DIR}/{name}.png"}
 
     @app.get("/api/events")
     def events_stream() -> StreamingResponse:
