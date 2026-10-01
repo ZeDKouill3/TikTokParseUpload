@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from clipper import browser, __main__ as cli
+from clipper.config import Config
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -145,54 +146,131 @@ def test_profile_status_absent_then_present(cwd):
 # ------------------------------------------------------------------ ouverture / connexion
 
 
-def test_login_opens_visible_persistent_chrome_on_login_page_and_waits_for_close(cwd, monkeypatch):
-    context, chromium, pw = fake_playwright(monkeypatch)
+class FakeProc:
+    """Le Chrome normal lance en sous-processus : ``wait`` rend la main a la fermeture."""
 
-    browser.login("ab12cd")
+    def __init__(self, release=None):
+        self.release, self.waited = release, False
 
-    (user_dir, kwargs), = chromium.launches
-    assert user_dir.replace("\\", "/").endswith("state/browser/ab12cd")
-    assert kwargs["channel"] == "chrome"
-    assert kwargs["headless"] is False
-    assert context.page.calls == [("goto", "https://www.tiktok.com/login")]
-    assert context.events == [("close", 0)]  # attend la fermeture de la fenetre, sans delai
-    assert pw.stopped is True
+    def wait(self, timeout=None):
+        if self.release is not None:
+            self.release.wait(5)
+        self.waited = True
+        return 0
+
+
+def fake_chrome(monkeypatch, tmp_path, proc=None):
+    """Chrome present (``[browser] chrome_path`` -> faux binaire) ; Playwright interdit : la connexion
+    ne doit jamais le toucher (TikTok refuse un Chrome pilote). Rend (liste des lancements, chemin, proc)."""
+    exe = tmp_path / "chrome-fake"
+    exe.write_text("#!/bin/sh\n", encoding="utf-8")
+    launches: list[tuple] = []
+    proc = proc or FakeProc()
+
+    def popen(args, **kwargs):
+        launches.append((list(args), kwargs))
+        return proc
+
+    monkeypatch.setattr(browser, "_popen", popen)
+    monkeypatch.setattr(browser, "_active", {})
+    browser.use_playwright(lambda: pytest.fail("la connexion ne doit jamais passer par Playwright"))
+    config = Config(mode="review", workspace_dir=tmp_path / "w", output_dir=tmp_path / "o",
+                    _sections={"browser": {"chrome_path": str(exe)}})
+    return launches, config, proc
+
+
+def test_login_launches_a_normal_chrome_subprocess_on_the_profile_and_waits_for_it_to_close(cwd, monkeypatch):
+    launches, config, proc = fake_chrome(monkeypatch, cwd)
+
+    browser.login("ab12cd", config=config)
+
+    (args, _kwargs), = launches
+    assert args[0] == config.section("browser")["chrome_path"]
+    user_dir = [a for a in args if a.startswith("--user-data-dir=")]
+    assert len(user_dir) == 1
+    assert user_dir[0].split("=", 1)[1].replace("\\", "/").endswith("state/browser/ab12cd")
+    assert "--no-first-run" in args
+    assert args[-1] == "https://www.tiktok.com/login"  # [browser] login_url par defaut
+    assert proc.waited is True  # attend la fermeture de la fenetre
+    # un Chrome normal : aucun drapeau de pilotage (c'est ce que TikTok refuse a la connexion)
+    assert not [a for a in args if "remote-debugging" in a or "enable-automation" in a or "headless" in a]
 
 
 def test_login_accepts_another_url(cwd, monkeypatch):
-    context, _chromium, _pw = fake_playwright(monkeypatch)
+    launches, config, _proc = fake_chrome(monkeypatch, cwd)
 
-    browser.login("ab12cd", "https://accounts.google.com/ServiceLogin?service=youtube")
+    browser.login("ab12cd", "https://accounts.google.com/ServiceLogin?service=youtube", config=config)
 
-    assert context.page.calls == [("goto", "https://accounts.google.com/ServiceLogin?service=youtube")]
-
-
-@pytest.mark.parametrize("bad", ["file:///etc/passwd", "javascript:alert(1)", "tiktok.com", ""])
-def test_login_refuses_non_http_urls(cwd, monkeypatch, bad):
-    fake_playwright(monkeypatch)
-    with pytest.raises(browser.BrowserError, match="URL invalide"):
-        browser.login("ab12cd", bad)
+    assert launches[0][0][-1] == "https://accounts.google.com/ServiceLogin?service=youtube"
 
 
-def test_login_never_types_anything(cwd, monkeypatch):
-    context, _c, _p = fake_playwright(monkeypatch)
+def test_login_never_uses_playwright_even_when_chrome_is_missing(cwd, monkeypatch):
+    fake_chrome(monkeypatch, cwd)
+    config = Config(mode="review", workspace_dir=cwd / "w", output_dir=cwd / "o",
+                    _sections={"browser": {"chrome_path": str(cwd / "absent")}})
 
-    browser.login("ab12cd")
-
-    assert [c[0] for c in context.page.calls] == ["goto"]
-    source = (ROOT / "clipper" / "browser.py").read_text(encoding="utf-8")
-    for forbidden in (".fill(", ".type(", ".press(", ".press_sequentially(", ".keyboard"):
-        assert forbidden not in source
+    with pytest.raises(browser.BrowserError):  # et le faux Playwright (pytest.fail) n'a pas ete touche
+        browser.login("ab12cd", config=config)
 
 
-def test_missing_chrome_is_an_explicit_french_error_with_install_command(cwd, monkeypatch):
-    fake_playwright(monkeypatch, error=NO_CHROME)
+def test_login_refuses_non_http_urls(cwd, monkeypatch):
+    launches, config, _proc = fake_chrome(monkeypatch, cwd)
+    for bad in ("javascript:alert(1)", "file:///etc/passwd", "tiktok.com", ""):
+        with pytest.raises(browser.BrowserError, match="URL"):
+            browser.login("ab12cd", bad, config=config)
+    assert launches == []
+
+
+def test_missing_chrome_is_an_explicit_french_error_never_a_fallback(cwd, monkeypatch):
+    launches, _config, _proc = fake_chrome(monkeypatch, cwd)
+    monkeypatch.setattr(browser.shutil, "which", lambda name: None)
+    monkeypatch.setattr(browser, "_chrome_candidates", lambda: [])
 
     with pytest.raises(browser.BrowserError) as err:
         browser.login("ab12cd")
 
-    message = str(err.value)
-    assert "Chrome" in message and "playwright install chrome" in message
+    assert "Chrome est introuvable" in str(err.value) and "chrome_path" in str(err.value)
+    assert launches == []
+
+
+def test_a_configured_chrome_path_that_does_not_exist_is_an_explicit_error(cwd, monkeypatch):
+    launches, _config, _proc = fake_chrome(monkeypatch, cwd)
+    config = Config(mode="review", workspace_dir=cwd / "w", output_dir=cwd / "o",
+                    _sections={"browser": {"chrome_path": str(cwd / "pas-chrome.exe")}})
+
+    with pytest.raises(browser.BrowserError, match="pas-chrome.exe"):
+        browser.login("ab12cd", config=config)
+    assert launches == []
+
+
+def test_chrome_is_found_on_the_path_when_no_chrome_path_is_set(cwd, monkeypatch):
+    fake_chrome(monkeypatch, cwd)
+    exe = cwd / "google-chrome"
+    exe.write_text("x", encoding="utf-8")
+    monkeypatch.setattr(browser.shutil, "which", lambda name: str(exe) if name == "google-chrome" else None)
+
+    assert browser.find_chrome() == exe
+
+
+def test_chrome_that_cannot_be_started_is_an_explicit_error(cwd, monkeypatch):
+    _launches, config, _proc = fake_chrome(monkeypatch, cwd)
+
+    def boom(args, **kwargs):
+        raise OSError("accès refusé")
+
+    monkeypatch.setattr(browser, "_popen", boom)
+    with pytest.raises(browser.BrowserError, match="accès refusé"):
+        browser.login("ab12cd", config=config)
+
+
+def test_the_playwright_context_still_reports_a_missing_chrome_for_publishing(cwd, monkeypatch):
+    fake_playwright(monkeypatch, error=NO_CHROME)
+
+    with pytest.raises(browser.BrowserError) as err:
+        with browser._open_context("ab12cd", headless=False):
+            pass
+
+    assert "Chrome" in str(err.value) and "playwright install chrome" in str(err.value)
 
 
 def test_missing_playwright_is_an_explicit_error_with_install_command(cwd, monkeypatch):
@@ -201,7 +279,8 @@ def test_missing_playwright_is_an_explicit_error_with_install_command(cwd, monke
     browser.use_playwright(None)
 
     with pytest.raises(browser.BrowserError) as err:
-        browser.login("ab12cd")
+        with browser._open_context("ab12cd", headless=False):
+            pass
 
     assert "playwright" in str(err.value) and "uv pip install" in str(err.value)
 
@@ -210,31 +289,33 @@ def test_other_launch_error_is_reported_not_swallowed(cwd, monkeypatch):
     fake_playwright(monkeypatch, error="profil verrouille par un autre processus")
 
     with pytest.raises(browser.BrowserError, match="profil verrouille"):
-        browser.login("ab12cd")
+        with browser._open_context("ab12cd", headless=False):
+            pass
 
 
-def test_start_login_returns_once_window_is_open_and_refuses_a_second_one(cwd, monkeypatch):
+def test_start_login_returns_once_chrome_is_started_and_refuses_a_second_one(cwd, monkeypatch):
     release = threading.Event()
-    context, _c, pw = fake_playwright(monkeypatch)
-    context.wait_for_event = lambda name, timeout=None: release.wait(5)
+    _launches, config, proc = fake_chrome(monkeypatch, cwd, FakeProc(release))
 
-    browser.start_login("ab12cd")
+    browser.start_login("ab12cd", config=config)
     with pytest.raises(browser.BrowserError, match="deja ouverte|déjà ouverte"):
-        browser.start_login("ab12cd")
+        browser.start_login("ab12cd", config=config)
     release.set()
     for _ in range(100):
         if "ab12cd" not in browser._active:
             break
         threading.Event().wait(0.02)
     assert "ab12cd" not in browser._active
-    assert pw.stopped is True
+    assert proc.waited is True
 
 
-def test_start_login_surfaces_launch_error(cwd, monkeypatch):
-    fake_playwright(monkeypatch, error=NO_CHROME)
+def test_start_login_surfaces_a_missing_chrome(cwd, monkeypatch):
+    fake_chrome(monkeypatch, cwd)
+    config = Config(mode="review", workspace_dir=cwd / "w", output_dir=cwd / "o",
+                    _sections={"browser": {"chrome_path": str(cwd / "absent")}})
 
-    with pytest.raises(browser.BrowserError, match="playwright install chrome"):
-        browser.start_login("ab12cd")
+    with pytest.raises(browser.BrowserError, match="Chrome"):
+        browser.start_login("ab12cd", config=config)
     assert "ab12cd" not in browser._active
 
 
@@ -398,6 +479,9 @@ def test_readme_documents_tiktok_publishing_and_youtube_cookies():
     assert "à la main" in tiktok and "jamais" in tiktok          # connexion manuelle, aucun identifiant saisi
     assert "Risques" in tiktok and "captcha" in tiktok.lower() and "arrêt" in tiktok
     assert "cookies_profile" in cookies and "cookies_from_browser" in cookies
+    # connexion par un Chrome normal en sous-processus, jamais par Playwright (TASK-d90f)
+    assert "Chrome normal" in tiktok and "chrome_path" in tiktok
+    assert "refus" in tiktok.lower() or "refuse" in tiktok.lower()
 
 
 def test_browser_section_resolves_through_clipper_config(tmp_path):

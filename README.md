@@ -169,7 +169,8 @@ proxy TLS. Détails dans [`docs/GUIDE.md`](docs/GUIDE.md).
 La publication passe par un **vrai Chrome visible** piloté par Playwright, avec
 un profil par compte rangé dans `state/browser/<compte>/` (ignoré par git,
 jamais copié hors de `state/`). Le programme ne saisit **jamais** ton
-identifiant ni ton mot de passe : tu te connectes à la main, une fois.
+identifiant ni ton mot de passe : tu te connectes à la main, une fois, dans un
+**Chrome normal** (voir ci-dessous).
 
 1. **Relier un compte** — dans la console, écran **Comptes**, ajoute le compte
    TikTok (libellé, plateforme) ; dans l'écran **Chaînes**, ouvre la chaîne et
@@ -178,14 +179,20 @@ identifiant ni ton mot de passe : tu te connectes à la main, une fois.
 2. **Se connecter une fois** — bouton **Se connecter dans le navigateur** du
    compte (console ouverte sur `127.0.0.1`/`localhost` seulement), ou
    `python -m clipper browser login <compte>` (`--url` pour une autre page,
-   TikTok par défaut). Chrome s'ouvre sur la page de connexion : connecte-toi,
-   puis ferme la fenêtre. L'écran Comptes affiche l'état du profil (absent ou
-   présent, avec la date).
-3. **Prérequis** — Google Chrome installé et la dépendance `playwright`
-   (installée par `tools/setup.ps1` ou `uv pip install -e ".[test]"`). Sans
-   Chrome ou sans Playwright, la commande échoue avec un message qui donne la
-   commande à lancer (`playwright install chrome`) : aucun navigateur de
-   remplacement n'est utilisé.
+   TikTok par défaut). Un **Chrome normal** (lancé comme un programme
+   ordinaire, sur le profil du compte, jamais par Playwright) s'ouvre sur la
+   page de connexion : connecte-toi, puis ferme la fenêtre. La connexion ne
+   passe pas par Playwright parce que TikTok refuse un Chrome piloté (faux
+   message « Nombre maximal de tentatives atteint ») ; une fois connecté,
+   Playwright réutilise la session du profil pour publier. L'écran Comptes
+   affiche l'état du profil (absent ou présent, avec la date).
+3. **Prérequis** — Google Chrome installé (trouvé dans le `PATH` ou aux
+   emplacements usuels ; sinon règle `[browser] chrome_path = "C:\\...\\chrome.exe"`
+   dans `config.toml`) et la dépendance `playwright` (installée par
+   `tools/setup.ps1` ou `uv pip install -e ".[test]"`). Sans Chrome, la
+   connexion échoue avec un message explicite ; sans Playwright, la publication
+   échoue avec la commande à lancer (`playwright install chrome`) : aucun
+   navigateur de remplacement n'est utilisé.
 
 **Risques assumés** : piloter TikTok par un navigateur n'est pas prévu par ses
 conditions d'utilisation ; le compte peut subir un captcha, une vérification
@@ -213,9 +220,27 @@ inattendue) met le clip en `failed` avec la raison et une capture d'écran sous
 `state/browser/<compte>/captures/`, arrête les publications de ce compte et
 notifie la console : bouton **Réessayer** dans l'écran Publication. Les
 sélecteurs de la page TikTok Studio vivent dans
-`clipper/assets/tiktok_selectors.toml` (valeurs **à vérifier sur la vraie
-page**, avec `CLIPPER_TIKTOK_REAL=1 pytest tests/integration/test_tiktok_real.py`,
-qui publie en privé sur un compte de test).
+`clipper/assets/tiktok_selectors.toml` : relevés sur la vraie page d'envoi le
+2026-10-01 (l'en-tête du fichier dit ce qui est vérifié en réel, et ce qui ne
+l'est pas : la confirmation après publication) ; à confirmer avec
+`CLIPPER_TIKTOK_REAL=1 pytest tests/integration/test_tiktok_real.py`, qui
+publie en privé sur un compte de test.
+
+Détails du pilotage de TikTok Studio :
+
+- la légende (pré-remplie du nom du fichier) est vidée puis tapée touche par
+  touche ;
+- en mode `scheduled`, la date et l'heure se règlent par les sélecteurs de
+  TikTok (calendrier, flèches de mois, liste des heures) ; les minutes sont
+  arrondies au pas proposé par TikTok (journalisé, noté dans l'entrée) ;
+- avant le clic final, le programme attend le résultat de la **vérification de
+  contenu** de TikTok : « Aucun problème constaté » → il continue ; problème
+  signalé ou délai `[tiktok] content_check_timeout_s` (900 s par défaut)
+  dépassé → arrêt explicite, rien n'est publié ;
+- les fenêtres connues (`[popups]` du fichier : « Activer les vérifications
+  automatiques du contenu ? » → **Annuler**, « Nouvelles fonctionnalités
+  d'édition ajoutées » → **J'ai compris**) sont fermées et journalisées ; toute
+  autre fenêtre modale est un arrêt, jamais un clic au hasard.
 
 Rythme (`[tiktok]`, étude `docs/tiktok-cadence.md` §3.1) : délais aléatoires
 entre actions, plafond de posts par jour et écart minimal par compte ; un

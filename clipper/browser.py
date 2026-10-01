@@ -1,9 +1,11 @@
 """Profils de navigateur persistants par compte (ADR-1a58, SPEC-9225 R1, R8).
 
-Un profil Playwright vit dans ``state/browser/<compte>/`` (ignore par git, jamais
-copie hors de ``state/``). « Se connecter » ouvre le vrai Chrome visible sur ce
-profil : l'utilisateur se connecte a la main, aucune fonction d'ici ne saisit
-d'identifiant ni de mot de passe. Les cookies YouTube d'un profil s'exportent
+Un profil vit dans ``state/browser/<compte>/`` (ignore par git, jamais copie hors de
+``state/``). « Se connecter » lance un Chrome NORMAL en sous-processus sur ce profil
+(jamais Playwright : TikTok refuse la connexion d'un Chrome pilote) et attend sa
+fermeture ; l'utilisateur se connecte a la main, aucune fonction d'ici ne saisit
+d'identifiant ni de mot de passe. Playwright reutilise ensuite la session du profil
+pour publier et lire les statistiques (``_open_context``). Les cookies YouTube d'un profil s'exportent
 vers ``cookies.txt`` (format Netscape) pour yt-dlp.
 
 Pas de repli (ADR-ad2e) : Playwright ou Chrome absent, profil absent, aucun
@@ -18,6 +20,8 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shutil
+import subprocess
 import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -35,6 +39,8 @@ CONFIG_DEFAULTS: dict[str, object] = {
     # Domaines dont les cookies sortent du profil vers cookies.txt (yt-dlp) ;
     # les autres cookies du profil (TikTok...) ne sont jamais exportes.
     "cookie_domains": ["youtube.com", "google.com"],
+    # Chemin de chrome.exe pour « se connecter » ; vide = detection (PATH, emplacements usuels).
+    "chrome_path": "",
     # Delai (s) pour que la fenetre s'ouvre quand la console la demande.
     "launch_timeout_s": 60,
 }
@@ -49,6 +55,7 @@ _ACCOUNT_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 _NETSCAPE_HEADER = "# Netscape HTTP Cookie File"
 
 _override: Callable[[], Any] | None = None
+_popen: Callable[..., Any] = subprocess.Popen  # remplace par les tests : aucun vrai Chrome
 _lock = threading.Lock()
 _active: dict[str, Any] = {}  # comptes dont la fenetre de connexion est ouverte
 
@@ -156,29 +163,69 @@ def _login_url(url: str | None, config: Config | None) -> str:
     return value
 
 
+def _chrome_candidates() -> list[Path]:
+    """Emplacements usuels d'un Google Chrome installe (Windows, macOS, Linux)."""
+    found = []
+    for var in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
+        root = os.environ.get(var)
+        if root:
+            found.append(Path(root) / "Google" / "Chrome" / "Application" / "chrome.exe")
+    found += [Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+              Path("/opt/google/chrome/chrome")]
+    return found
+
+
+def find_chrome(config: Config | None = None) -> Path:
+    """Le Chrome normal a lancer pour la connexion : ``[browser] chrome_path`` s'il est regle (introuvable
+    = erreur, pas de repli), sinon le PATH puis les emplacements usuels ; sinon ``BrowserError``."""
+    configured = str(_settings(config)["chrome_path"]).strip()
+    if configured:
+        path = Path(configured)
+        if not path.is_file():
+            raise BrowserError(f"Chrome introuvable : [browser] chrome_path = {configured!r} n'existe pas")
+        return path
+    for name in ("chrome", "google-chrome", "google-chrome-stable"):
+        found = shutil.which(name)
+        if found:
+            return Path(found)
+    for candidate in _chrome_candidates():
+        if candidate.is_file():
+            return candidate
+    raise BrowserError(
+        "Chrome est introuvable : installe Google Chrome (https://www.google.com/chrome), "
+        "ou renseigne [browser] chrome_path dans config.toml avec le chemin de chrome.exe"
+    )
+
+
 def login(
     account: str, url: str | None = None, *, config: Config | None = None,
     on_open: Callable[[], None] | None = None,
 ) -> None:
-    """Ouvre le profil du compte, visible, sur la page de connexion, et attend que la
-    fenetre soit fermee. L'utilisateur se connecte lui-meme."""
+    """Lance un Chrome normal en sous-processus sur le profil du compte, page de connexion, et attend
+    sa fermeture. L'utilisateur se connecte lui-meme ; aucun pilotage, aucun drapeau d'automatisation
+    (TikTok refuse la connexion d'un Chrome lance par Playwright)."""
     validate_account(account)
     target = _login_url(url, config)
-    with _open_context(account, headless=False) as context:
-        page = context.pages[0] if context.pages else context.new_page()
-        page.goto(target)
-        if on_open is not None:
-            on_open()
-        context.wait_for_event("close", timeout=0)
+    chrome = find_chrome(config)
+    directory = profile_dir(account)
+    directory.mkdir(parents=True, exist_ok=True)
+    try:
+        process = _popen([str(chrome), f"--user-data-dir={directory.resolve()}", "--no-first-run", target])
+    except OSError as exc:
+        raise BrowserError(f"Chrome n'a pas pu être lancé ({chrome}) : {exc}") from None
+    if on_open is not None:
+        on_open()
+    process.wait()
 
 
 def start_login(
     account: str, url: str | None = None, *, config: Config | None = None,
 ) -> None:
-    """``login`` dans un fil, pour la console : rend la main une fois la fenetre ouverte
-    (ou leve ``BrowserError`` si elle n'a pas pu s'ouvrir). Une seule fenetre par profil."""
+    """``login`` dans un fil, pour la console : rend la main une fois Chrome lance
+    (ou leve ``BrowserError`` s'il n'a pas pu l'etre). Une seule fenetre par profil."""
     validate_account(account)
     _login_url(url, config)
+    find_chrome(config)
     timeout = float(_settings(config)["launch_timeout_s"])
     ready = threading.Event()
     failure: list[BrowserError] = []

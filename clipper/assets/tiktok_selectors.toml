@@ -4,10 +4,19 @@
 # clipper/tiktok.py n'en contient aucun. Un changement de page TikTok se corrige
 # ici, sans toucher la logique.
 #
-# A VERIFIER SUR LA VRAIE PAGE : toutes les valeurs ci-dessous sont plausibles
-# (d'apres la structure connue de TikTok Studio) mais n'ont PAS ete validees sur
-# la vraie page. Le test reel (CLIPPER_TIKTOK_REAL=1, tests/integration/
-# test_tiktok_real.py) sert a les confirmer avant tout usage.
+# VERIFIE EN REEL (releve de TikTok Studio FR, 2026-10-01, page d'envoi, un seul cadre,
+# TASK-d90f) : champ fichier, fin d'envoi (conteneur d'etat contenant « Importe »), legende
+# (editeur Draft.js), « Afficher plus », visibilite (liste deroulante + id d'option),
+# Maintenant / Programmer (radios, vises par libelle), champs heure et date, calendrier,
+# selecteur d'heure, bouton final unique post_video_button (« Publier » ou « Programmer »),
+# bouton d'abandon, et les deux fenetres surgissantes vues au premier envoi.
+#
+# A VERIFIER SUR LA VRAIE PAGE (jamais vu en reel) : la confirmation apres publication
+# (success_marker, post_link), la fenetre / bulle generique (modal.container), le texte du
+# bloc « Verification de contenu simple » quand il signale un probleme (content_check_problem),
+# le clic hors du champ qui ferme les selecteurs (schedule_picker_close), et toute la page des
+# statistiques ([stats], SPEC-9225 R7). Le test reel (CLIPPER_TIKTOK_REAL=1, tests/integration/
+# test_tiktok_real.py) sert a les confirmer.
 #
 # Un selecteur est une chaine CSS/Playwright. Une liste (captcha, verification,
 # connexion) est un ensemble de signes : un seul present suffit a arreter.
@@ -30,28 +39,74 @@ stats_url_prefix = "https://www.tiktok.com/tiktokstudio/content"
 login_url_markers = ["/login"]
 
 [selectors]
+# Zone de depot et bouton « Selectionner une video » (informatif : l'envoi passe par le champ fichier).
+select_video_container = "[data-e2e='select_video_container']"
+select_video_button = "button[data-e2e='select_video_button']"
 # Champ fichier (cache : attendu « attached », pas « visible »).
 file_input = "input[type='file']"
-# Marque la fin de l'envoi du mp4 (apparait une fois la video traitee).
-upload_done = "div[data-e2e='upload_status_success'], .upload-stage-success"
-# Editeur de legende (contenteditable), legende + hashtags.
-caption_editor = "div[data-e2e='caption_container'] div[contenteditable='true'], .public-DraftEditor-content"
-# Menu « Qui peut regarder cette video » et ses options.
-visibility_dropdown = "div[data-e2e='privacy_container'] button, [data-e2e='privacy_select']"
-visibility_public = "[data-e2e='privacy_option_public'], div[role='option']:has-text('Tout le monde')"
-visibility_private = "[data-e2e='privacy_option_private'], div[role='option']:has-text('Seulement moi')"
-# Programmation : interrupteur « Programmer », champs date et heure.
-schedule_toggle = "[data-e2e='schedule_radio'], label:has-text('Programmer')"
-schedule_date_input = "[data-e2e='schedule_date_input'], input[placeholder*='date' i]"
-schedule_time_input = "[data-e2e='schedule_time_input'], input[placeholder*='heure' i]"
-# Bouton final : « Publier » (immediat) ou « Programmer » (programme).
+# Fin de l'envoi du mp4 : le conteneur d'etat affiche « Importe ».
+upload_done = "[data-e2e='upload_status_container']:has-text('Importé')"
+# Editeur de legende (Draft.js, contenteditable), pre-rempli du nom du fichier : vide puis
+# tape touche par touche (jamais fill).
+caption_editor = "[data-e2e='caption_container'] [contenteditable='true']"
+# « Afficher plus » : deplie les parametres (clique seulement si la visibilite est repliee).
+advanced_settings = "[data-e2e='advanced_settings_container']"
+# Menu « Qui peut regarder cette video » ; options par id (0 Tout le monde, 2 Ami(e)s,
+# 1 Toi uniquement = prive), le texte en secours.
+visibility_dropdown = "[data-e2e='video_visibility_container'] button[role='combobox']"
+visibility_public = "div[role='option'].Select__item[id$='option-\"0\"'], div[role='option']:has-text('Tout le monde')"
+visibility_private = "div[role='option'].Select__item[id$='option-\"1\"'], div[role='option']:has-text('Toi uniquement')"
+# Quand publier : deux radios aux ids aleatoires, vises par libelle.
+schedule_now = "[data-e2e='schedule_container'] label:has-text('Maintenant'), [data-e2e='schedule_container'] [role='radio']:has-text('Maintenant')"
+schedule_later = "[data-e2e='schedule_container'] label:has-text('Programmer'), [data-e2e='schedule_container'] [role='radio']:has-text('Programmer')"
+# Apres « Programmer » : deux champs, l'heure (valeur contenant « : ») puis la date (AAAA-MM-JJ).
+schedule_inputs = "[data-e2e='schedule_container'] input.TUXTextInputCore-input"
+# Calendrier : titres du mois et de l'annee, fleches (la 1re = mois precedent, la 2e = suivant),
+# jours cliquables (texte exact).
+calendar_month_title = "span.month-title"
+calendar_year_title = "span.year-title"
+calendar_arrow = "span.arrow"
+calendar_day = "span.day.valid"
+# Selecteur d'heure : colonne des heures (left) et des minutes (right), texte exact.
+timepicker_hour = "span.tiktok-timepicker-option-text.tiktok-timepicker-left"
+timepicker_minute = "span.tiktok-timepicker-option-text.tiktok-timepicker-right"
+# Fermeture des selecteurs : clic hors du champ (coin du bloc « Quand publier », a l'ecart des radios).
+schedule_picker_close = "[data-e2e='schedule_container']"
+# Bloc « Verification de contenu simple » : « Verification en cours... » puis
+# « Aucun probleme constate » (vert) ou un probleme signale.
+content_check_running = "div:has-text('Vérification en cours')"
+content_check_ok = "div:has-text('Aucun problème constaté')"
+content_check_problem = "div:has-text('Problème constaté'), div:has-text('problème détecté')"
+# Bouton final UNIQUE : son texte est « Publier » (maintenant) ou « Programmer » ([labels]).
 post_button = "button[data-e2e='post_video_button']"
-schedule_button = "button[data-e2e='schedule_video_button']"
-# Confirmation apres envoi (boite « Video envoyee » / « Programmee »).
-success_marker = "[data-e2e='post_success_modal'], div:has-text('Video envoyee')"
+# Abandon du brouillon (non utilise : un arret laisse la page telle quelle, avec sa capture).
+discard_button = "button[data-e2e='discard_post_button']"
+# Confirmation apres publication (boite « Video envoyee » / « Programmee ») : JAMAIS VUE EN REEL.
+success_marker = "[data-e2e='post_success_modal'], div:has-text('Vidéo envoyée')"
 # Lien vers la video publiee, dans la confirmation (attribut href) ; absent pour un
-# post programme (pas encore d'adresse publique).
+# post programme (pas encore d'adresse publique). JAMAIS VU EN REEL.
 post_link = "[data-e2e='post_success_modal'] a[href*='/video/']"
+
+[labels]
+# Texte du bouton final selon le mode ; un autre texte = page inattendue, arret.
+post_now = "Publier"
+post_scheduled = "Programmer"
+
+[calendar]
+# Noms des mois affiches par le calendrier (langue de TikTok Studio : francais), janvier a decembre.
+months = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août", "septembre", "octobre", "novembre", "décembre"]
+
+[modal]
+# Fenetres et bulles surgissantes (A VERIFIER : generique). Chacune doit etre connue ([popups]),
+# sinon arret R4. Bouton : {label} est remplace par le libelle du [popups] (sans guillemet double).
+container = "[role='dialog'], [aria-modal='true']"
+button = "button:has-text(\"{label}\"), [role='button']:has-text(\"{label}\")"
+
+[popups]
+# Fenetres connues : fragment du texte de la fenetre -> bouton a cliquer. Elles sont fermees et
+# journalisees. Surtout pas « Activer » : le programme n'active rien a la place de l'utilisateur.
+"Activer les vérifications automatiques du contenu" = "Annuler"
+"Nouvelles fonctionnalités d'édition ajoutées" = "J'ai compris"
 
 # A VERIFIER SUR LA VRAIE PAGE (pages de statistiques, SPEC-9225 R7) : comme ci-dessus,
 # ces selecteurs sont plausibles mais n'ont PAS ete valides sur la vraie page TikTok
