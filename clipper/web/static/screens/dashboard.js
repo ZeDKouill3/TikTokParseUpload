@@ -86,15 +86,6 @@ function dashProblemRow(video, kind) {
   </div>`;
 }
 
-function dashVodRow(vod) {
-  const minutes = vod.duration_s != null ? ` · ${fr(Math.round(vod.duration_s / 60))} min` : "";
-  return `<div class="list-item" data-vod="${esc(vod.video_id)}">
-    <div class="li-main"><div class="li-title">${esc(vod.title || vod.video_id)}</div>
-      <div class="li-sub">${esc(vod.channel)}${minutes} · repérée le ${esc(dashDate(vod.found_at))}</div></div>
-    <a class="btn btn-xs btn-ghost" href="${esc(vod.url)}" target="_blank" rel="noopener">Voir la VOD</a>
-  </div>`;
-}
-
 function dashPublicationRow(entry) {
   return `<a class="list-item" href="#/publish" data-clip="${esc(entry.clip_id)}">
     <div class="when num">${esc(dashDate(entry.slot_at))}</div>
@@ -169,7 +160,7 @@ Screens.dashboard = {
           ${dashSection("failed", "triangle-alert", "Échecs", dashList(data, "failed", "Aucun échec : rien à relancer.", (v) => dashProblemRow(v, "failed")))}
           ${dashSection("queued", "hourglass", "En attente de reprise", dashList(data, "queued", "Aucune vidéo en attente de reprise.", (v) => dashProblemRow(v, "queued")))}
           ${dashSection("queue", "list-filter", "File d'attente", queueContent)}
-          ${dashSection("watch_pending", "eye", "VOD à confirmer", dashList(data, "watch_pending", "Aucune VOD à confirmer.", dashVodRow))}
+          ${dashSection("watch_pending", "eye", "VOD à confirmer", dashList(data, "watch_pending", "Aucune VOD à confirmer.", watchVodRow))}
         </div>
         <div class="stack">
           ${dashSection("clips_to_review", "clapperboard", "Clips à valider", clips)}
@@ -178,5 +169,6 @@ Screens.dashboard = {
           ${dashSection("hardware", "cpu", "Matériel", dashHardwareContent(data))}
         </div>
       </div>`;
+    wireWatch(body);
   },
 };

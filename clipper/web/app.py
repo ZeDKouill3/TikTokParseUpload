@@ -23,6 +23,7 @@ from clipper import channel as channel_mod
 from clipper import gpu as gpu_mod
 from clipper import pipeline
 from clipper import publish as publish_mod
+from clipper import watch as watch_mod
 from clipper import worker as worker_mod
 from clipper.config import Config, load_config
 
@@ -202,6 +203,11 @@ def _validate_video_id(video_id: str) -> None:
         raise HTTPException(status_code=400, detail=f"identifiant video invalide : {video_id!r}")
 
 
+def _validate_channel_name(channel: str) -> None:
+    if not channel_mod.NAME_RE.match(channel):
+        raise HTTPException(status_code=400, detail=f"nom de chaîne invalide : {channel!r}")
+
+
 def _channel_of(video_id: str, config: Config) -> str | None:
     try:
         state = pipeline.load_state(video_id, config=config)
@@ -255,7 +261,6 @@ def _scan_watched(workspace_root: Path, state_root: Path) -> list[tuple[Path, st
 # jamais un 0 ou une liste vide muets (ADR-ad2e).
 # --------------------------------------------------------------------------
 
-_WATCH_DIR = Path("state") / "watch"
 _NEXT_PUBLICATIONS = 5
 _COST_WEEK_DAYS = 7
 _MIB = 1024 * 1024
@@ -294,9 +299,10 @@ def _dashboard_videos(config: Config) -> dict[str, Any]:
     return {"running": running, "failed": problem("failed"), "queued": problem("queued")}
 
 
-def _dashboard_watch() -> dict[str, Any]:
+def _dashboard_watch(config: Config) -> dict[str, Any]:
     pending: list[dict[str, Any]] = []
-    for path in sorted(_WATCH_DIR.glob("*.json")) if _WATCH_DIR.is_dir() else []:
+    watch_dir = Path(config.section("watch")["state_dir"])
+    for path in sorted(watch_dir.glob("*.json")) if watch_dir.is_dir() else []:
         try:
             pending.extend({**vod, "channel": path.stem} for vod in _read_json(path)["pending"])
         except (ValueError, KeyError, TypeError) as exc:
@@ -405,7 +411,7 @@ def _dashboard(config: Config) -> dict[str, Any]:
     queue_path = _queue_path(config)
     _fill(out, ("queue",), f"file d'attente ({queue_path.name})",
           lambda: {"queue": _read_json(queue_path) if queue_path.exists() else []})
-    _fill(out, ("watch_pending",), "surveillance (state/watch)", _dashboard_watch)
+    _fill(out, ("watch_pending",), "surveillance (state/watch)", lambda: _dashboard_watch(config))
     _fill(out, ("clips_to_review",), "clips a valider", lambda: _dashboard_clips_to_review(config))
     _fill(out, ("next_publications",), "publications (state/publish)", lambda: _dashboard_next_publications(config))
     _fill(out, ("llm_cost",), "journal llm_usage.jsonl", lambda: _dashboard_llm_cost(config))
@@ -808,6 +814,30 @@ def create_app(config: Config | None = None) -> FastAPI:
         entry = _enqueue_clip_render(video_id, config) if retitle else None
         clip = _clip_view(sidecar, channel, _publish_entries(config, channel).get((video_id, clip_id)))
         return JSONResponse({"clip": clip, "rerender": entry}, status_code=202 if retitle else 200)
+
+    # ----------------------------------------------------------------
+    # Surveillance : VOD a confirmer (SPEC-fc0c §5.3)
+    # ----------------------------------------------------------------
+
+    @app.post("/api/watch/{channel}/{video_id}/confirm", status_code=202)
+    def watch_confirm(channel: str, video_id: str) -> JSONResponse:
+        _validate_channel_name(channel)
+        _validate_video_id(video_id)
+        try:
+            entry = watch_mod.confirm(channel, video_id, config=config)
+        except watch_mod.WatchError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return JSONResponse(entry, status_code=202)
+
+    @app.post("/api/watch/{channel}/{video_id}/ignore")
+    def watch_ignore(channel: str, video_id: str) -> dict[str, Any]:
+        _validate_channel_name(channel)
+        _validate_video_id(video_id)
+        try:
+            watch_mod.ignore(channel, video_id, config=config)
+        except watch_mod.WatchError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"channel": channel, "video_id": video_id, "ignored": True}
 
     # ----------------------------------------------------------------
     # Chaines (SPEC-fc0c §1) et temps reel (ADR-4f6e §4)
