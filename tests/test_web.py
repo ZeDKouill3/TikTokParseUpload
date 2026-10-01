@@ -2325,3 +2325,185 @@ def test_dashboard_vod_section_is_wired_to_confirm_and_ignore():
     assert "toastError" in watch_js                      # erreur affichée, jamais avalée
     assert "watchVodRow" in dash_js and "VOD à confirmer" in dash_js
     assert "TASK-7508" in css
+
+
+# --------------------------------------------------------------------------
+# Ecran Reglages (SPEC-c100 E8, ADR-4f6e §2 et §5) : config.toml en formulaire
+# --------------------------------------------------------------------------
+
+import tomllib  # noqa: E402
+
+_SET_TOML = (
+    '# commentaire a perdre\nmode = "review"\n'
+    '[llm]\nbackend = "claude-cli"\n'
+    '[web]\nport = 8123\ntoken = "secret-tres-long"\n'
+    '[render]\ncrf = 18\n'
+)
+
+
+def _settings_setup(tmp_path, text=_SET_TOML):
+    (tmp_path / "config.toml").write_text(text, encoding="utf-8")
+    return tmp_path / "config.toml"
+
+
+def sclient(tmp_path) -> TestClient:
+    """Serveur démarré avec la config lue dans config.toml (comme 'serve')."""
+    from clipper.config import load_config
+
+    path = tmp_path / "config.toml"
+    return TestClient(create_app(config=load_config(path) if path.exists() else make_config(tmp_path)))
+
+
+def test_get_settings_returns_effective_values_and_documented_defaults_per_section(tmp_path, isolated_cwd):
+    _settings_setup(tmp_path)
+    data = sclient(tmp_path).get("/api/settings").json()
+
+    assert data["raw"]["mode"] == "review" and data["raw"]["web"]["port"] == 8123
+    assert data["effective"]["mode"] == "review"
+    assert data["effective"]["workspace_dir"] == "workspace"          # défaut de config.DEFAULTS
+    assert data["effective"]["web"]["port"] == 8123
+    assert data["effective"]["web"]["sse_poll_interval_s"] == 1.0     # défaut du module
+    assert data["effective"]["worker"]["poll_interval_s"] == 2
+    assert data["effective"]["llm"]["backend"] == "claude-cli"
+    assert data["effective"]["llm"]["usages"]["moments"] == {"model": "strong"}
+    for section in ("llm", "web", "worker"):
+        assert section in data["defaults"], section
+    # même mécanisme que l'écran Chaînes : défaut + commentaire du source
+    assert data["defaults"]["web"]["port"]["default"] == 8000
+    assert "Hote et port" in data["defaults"]["web"]["host"]["comment"]
+    assert "reponse refusee" in data["defaults"]["llm"]["repair_attempts"]["comment"]
+    assert set(data["backends"]) == {"claude-cli", "claude-api", "ollama"}
+    assert data["modes"] == ["review", "auto"]
+    assert data["comments_lost"] is True                              # le fichier contient un commentaire
+
+
+def test_get_settings_never_returns_the_token(tmp_path, isolated_cwd):
+    _settings_setup(tmp_path)
+    resp = sclient(tmp_path).get("/api/settings")
+    assert "secret-tres-long" not in resp.text
+    access = resp.json()["access"]
+    assert access["host"] == "127.0.0.1" and access["port"] == 8123
+    assert access["token_set"] is True and access["token"] != "secret-tres-long" and set(access["token"]) == {"•"}
+    assert access["command"] == "python -m clipper serve --port 8123"
+
+
+def test_get_settings_without_config_toml_shows_defaults_and_no_comment_warning(tmp_path, isolated_cwd):
+    data = sclient(tmp_path).get("/api/settings").json()
+    assert data["exists"] is False and data["comments_lost"] is False
+    assert data["effective"]["mode"] == "review" and data["effective"]["web"]["port"] == 8000
+    assert data["access"]["token_set"] is False and data["access"]["token"] is None
+
+
+def test_put_settings_writes_through_write_config_keeping_other_sections_and_the_token(
+        tmp_path, isolated_cwd, monkeypatch):
+    path = _settings_setup(tmp_path)
+    from clipper import config as config_mod
+    from clipper.web import app as web_app
+
+    calls = []
+    real = config_mod.write_config
+    monkeypatch.setattr(web_app, "write_config", lambda *a, **k: (calls.append((a, k)), real(*a, **k))[1])
+
+    body = {"settings": {
+        "mode": "auto", "output_dir": "sorties",
+        "llm": {"backend": "ollama", "repair_attempts": 2, "usages": {"moments": {"model": "fast"}}},
+        "web": {"port": 9001, "host": "127.0.0.1", "sse_poll_interval_s": 2.0},
+        "worker": {"poll_interval_s": 5},
+    }}
+    resp = sclient(tmp_path).put("/api/settings", json=body)
+
+    assert resp.status_code == 200, resp.text
+    assert len(calls) == 1 and Path(calls[0][0][0]) == Path("config.toml")
+    written = tomllib.loads(path.read_text(encoding="utf-8"))
+    assert written["mode"] == "auto" and written["output_dir"] == "sorties"
+    assert written["llm"]["backend"] == "ollama" and written["llm"]["usages"] == {"moments": {"model": "fast"}}
+    assert written["web"]["port"] == 9001
+    assert written["web"]["token"] == "secret-tres-long"             # le jeton n'est jamais touché
+    assert written["render"] == {"crf": 18}                          # section hors formulaire conservée
+    assert "commentaire" not in path.read_text(encoding="utf-8")     # commentaires perdus (ADR-4f6e §2)
+    assert resp.json()["effective"]["mode"] == "auto" and resp.json()["comments_lost"] is False
+
+
+@pytest.mark.parametrize("settings, fragment", [
+    ({"mode": "manuel"}, "mode"),
+    ({"workspace_dir": 5}, "workspace_dir"),
+    ({"llm": {"backend": "inconnu"}}, "inconnu"),
+    ({"llm": {"usages": {"moments": {"backend": "nope"}}}}, "nope"),
+    ({"llm": {"repair_attempts": "deux"}}, "repair_attempts"),
+    ({"web": {"port": "x"}}, "port"),
+    ({"web": {"port": 70000}}, "port"),
+    ({"web": {"zzz": 1}}, "zzz"),
+    ({"worker": {"queue_path": 3}}, "queue_path"),
+    ({"web": {"host": "0.0.0.0", "token": "autre"}}, "jeton"),
+    ({"web": {"host": "0.0.0.0"}}, "jeton"),    # hors bouclage sans jeton : serve refuserait de démarrer
+    ({"render": {"crf": 1}}, "render"),         # section hors formulaire : pas éditable ici
+])
+def test_put_settings_refused_value_is_422_with_detail_and_keeps_the_file(
+        tmp_path, isolated_cwd, settings, fragment):
+    path = _settings_setup(tmp_path, _SET_TOML.replace('token = "secret-tres-long"\n', ""))
+    before = path.read_bytes()
+
+    resp = sclient(tmp_path).put("/api/settings", json={"settings": settings})
+
+    assert resp.status_code == 422
+    assert fragment in resp.json()["detail"]
+    assert path.read_bytes() == before                               # fichier intact
+    assert not list(tmp_path.glob("config.toml.*"))                  # pas de .tmp qui traîne
+
+
+def test_put_settings_load_config_refusal_is_422_and_keeps_the_file(tmp_path, isolated_cwd):
+    path = _settings_setup(tmp_path)
+    before = path.read_bytes()
+    resp = sclient(tmp_path).put("/api/settings", json={"settings": {"mode": "auto", "llm": {"zzz": 1}}})
+    assert resp.status_code == 422 and path.read_bytes() == before
+
+
+def test_put_settings_mode_and_backend_are_read_by_the_next_queue_entries(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import worker
+
+    _settings_setup(tmp_path)
+    seen = []
+
+    def fake_enqueue(url, channel, action, force_steps, *, config=None):
+        seen.append((config.mode, config.section("llm")["backend"]))
+        return {"id": "e1", "video_id": VIDEO_ID, "url": url, "channel": channel, "action": action,
+                "force_steps": [], "status": "waiting"}
+
+    monkeypatch.setattr(worker, "enqueue", fake_enqueue)
+    c = sclient(tmp_path)
+    c.post("/api/queue", json={"url": URL, "action": "run"})
+    assert c.put("/api/settings", json={"settings": {"mode": "auto", "llm": {"backend": "ollama"}}}).status_code == 200
+    c.post("/api/queue", json={"url": URL, "action": "run"})
+
+    assert seen == [("review", "claude-cli"), ("auto", "ollama")]
+
+
+def test_put_settings_web_changes_ask_for_a_restart_and_do_not_change_the_running_access(tmp_path, isolated_cwd):
+    _settings_setup(tmp_path)
+    c = sclient(tmp_path)
+    assert c.get("/api/settings").json()["restart_required"] is False
+    data = c.put("/api/settings", json={"settings": {"web": {"port": 9001}}}).json()
+    assert data["restart_required"] is True
+    assert data["access"]["port"] == 8123                            # l'écoute en cours ne change pas
+
+
+def test_settings_screen_is_wired_with_sections_access_and_comment_warning():
+    page = (STATIC / "index.html").read_text(encoding="utf-8")
+    js = (STATIC / "screens" / "settings.js").read_text(encoding="utf-8")
+    css = (STATIC / "style.css").read_text(encoding="utf-8")
+
+    assert "/static/screens/settings.js" in page
+    assert page.index("/static/screens.js") < page.index("/static/screens/settings.js") < page.index("/static/app.js")
+    assert "Screens.settings" in js and 'api("/api/settings"' in js
+    assert 'jsonBody("PUT"' in js and "toast(" in js
+    # formulaire par sections
+    for title in ("Général", "Dossiers", "LLM", "Serveur web", "Worker", "Accès"):
+        assert title in js, title
+    for key in ("mode", "workspace_dir", "output_dir", "backend", "repair_attempts", "usages", "models"):
+        assert key in js, key
+    # section Accès en lecture seule : hôte, port, jeton masqué, commande serve
+    assert "token_set" in js and "access.command" in js and "access.host" in js and "access.port" in js
+    assert "redémarrage" in js
+    # avertissement avant la première écriture
+    assert "commentaires du fichier perdus" in js and "comments_lost" in js
+    assert "field-error" in js and "set-" in css
