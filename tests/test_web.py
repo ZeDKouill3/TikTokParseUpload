@@ -2325,3 +2325,248 @@ def test_dashboard_vod_section_is_wired_to_confirm_and_ignore():
     assert "toastError" in watch_js                      # erreur affichée, jamais avalée
     assert "watchVodRow" in dash_js and "VOD à confirmer" in dash_js
     assert "TASK-7508" in css
+
+
+# --------------------------------------------------------------------------
+# Ecran Publication (TASK-503d, SPEC-c100 E6, SPEC-fc0c §4) : GET /api/publish,
+# move / published / unschedule (publish simulé ou state/ temporaire)
+# --------------------------------------------------------------------------
+
+PUB_WEEK = "2026-10-05"                       # lundi ; créneaux : lun 18:30, jeu 12:00 (Europe/Paris, +02:00)
+PUB_MON = "2026-10-05T18:30:00+02:00"
+PUB_THU = "2026-10-08T12:00:00+02:00"
+PUB_NEXT_MON = "2026-10-12T18:30:00+02:00"
+
+
+def _publish_setup(tmp_path, entries=None, *, slots=True):
+    preset = ('[channel]\ndisplay_name = "Ma chaîne"\ntiktok_account = "@ma_chaine"\n'
+              + ('slots = [{day = "mon", time = "18:30"}, {day = "thu", time = "12:00"}]\n' if slots else ""))
+    _channels_setup(tmp_path, preset)
+    _write_state(tmp_path, CLIPS_VIDEO, channel="ma_chaine")
+    for clip_id in ("01", "02", "03", "04", "05", "06"):
+        _write_clip(tmp_path, CLIPS_VIDEO, _clip_sidecar(clip_id))
+    _write_publish(tmp_path, "ma_chaine", entries if entries is not None else [])
+
+
+def _get_publish(tmp_path, **params):
+    params = {"channel": "ma_chaine", "week": PUB_WEEK, **params}
+    return client(tmp_path).get("/api/publish", params=params)
+
+
+def test_get_publish_returns_week_slots_with_clip_or_free(tmp_path, isolated_cwd):
+    _publish_setup(tmp_path, [_entry("01", "scheduled", slot_at=PUB_THU)])
+
+    resp = _get_publish(tmp_path)
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["channel"] == "ma_chaine" and data["timezone"] == "Europe/Paris"
+    assert data["tiktok_account"] == "@ma_chaine"
+    assert data["week_start"] == "2026-10-05" and data["week_end"] == "2026-10-11"
+    assert [s["slot_at"] for s in data["slots"]] == [PUB_MON, PUB_THU]
+    mon, thu = data["slots"]
+    assert mon["clip"] is None and mon["free"] is True
+    assert thu["free"] is False
+    assert (thu["clip"]["clip_id"], thu["clip"]["publish_status"]) == ("01", "scheduled")
+    assert thu["clip"]["video_url"] == f"/media/clip/{CLIPS_VIDEO}/01"      # télécharger
+    assert thu["clip"]["description"] == "Description 01" and thu["clip"]["hashtags"] == ["#ma_chaine"]
+
+
+def test_get_publish_lists_approved_without_slot_and_published_failed_of_the_week(tmp_path, isolated_cwd):
+    _publish_setup(tmp_path, [
+        _entry("01", "approved"),
+        _entry("02", "published", slot_at=PUB_MON, published_at="2026-10-05T18:40:00+02:00"),
+        _entry("03", "failed", slot_at=PUB_THU, error="quota depasse"),
+        _entry("04", "published", slot_at="2026-09-28T18:30:00+02:00", published_at="2026-09-28T19:00:00+02:00"),
+        _entry("05", "rejected"),
+    ])
+
+    data = _get_publish(tmp_path).json()
+
+    assert [c["clip_id"] for c in data["unscheduled"]] == ["01"]
+    assert sorted((c["clip_id"], c["publish_status"]) for c in data["done"]) == [("02", "published"), ("03", "failed")]
+    assert [s["clip"]["clip_id"] for s in data["slots"]] == ["02", "03"]     # leur créneau les affiche
+    assert next(c for c in data["done"] if c["clip_id"] == "03")["publish_error"] == "quota depasse"
+
+
+def test_get_publish_week_is_taken_from_the_requested_week_and_defaults_to_this_one(tmp_path, isolated_cwd):
+    _publish_setup(tmp_path, [_entry("01", "scheduled", slot_at=PUB_NEXT_MON)])
+
+    this = _get_publish(tmp_path).json()
+    nxt = _get_publish(tmp_path, week="2026-10-14").json()                 # un mercredi : on tombe sur sa semaine
+    now = client(tmp_path).get("/api/publish", params={"channel": "ma_chaine"}).json()
+
+    assert all(s["clip"] is None for s in this["slots"])
+    assert nxt["week_start"] == "2026-10-12"
+    assert nxt["slots"][0]["slot_at"] == PUB_NEXT_MON and nxt["slots"][0]["clip"]["clip_id"] == "01"
+    assert now["week_start"] <= now["week_end"] and len(now["slots"]) == 2
+
+
+def test_get_publish_channel_without_slots_says_why(tmp_path, isolated_cwd):
+    _publish_setup(tmp_path, [_entry("01", "approved")], slots=False)
+
+    data = _get_publish(tmp_path).json()
+
+    assert data["slots"] == [] and "créneau" in data["reason"]
+    assert [c["clip_id"] for c in data["unscheduled"]] == ["01"]            # « sans créneau »
+
+
+def test_get_publish_errors_are_french(tmp_path, isolated_cwd):
+    _publish_setup(tmp_path)
+    c = client(tmp_path)
+
+    assert c.get("/api/publish").status_code == 400                         # chaîne obligatoire
+    assert "chaîne" in c.get("/api/publish").json()["detail"]
+    assert c.get("/api/publish", params={"channel": "inconnue"}).status_code == 404
+    assert c.get("/api/publish", params={"channel": "Bad Name"}).status_code in (400, 422)
+    bad = c.get("/api/publish", params={"channel": "ma_chaine", "week": "demain"})
+    assert bad.status_code == 400 and "week" in bad.json()["detail"]
+
+
+def test_get_publish_corrupt_publish_file_is_a_500_not_an_empty_week(tmp_path, isolated_cwd):
+    _publish_setup(tmp_path)
+    (tmp_path / "state" / "publish" / "ma_chaine.json").write_text("{pas du json", encoding="utf-8")
+
+    resp = _get_publish(tmp_path)
+
+    assert resp.status_code == 500 and "publication" in resp.json()["detail"]
+
+
+def test_publish_move_calls_publish_move_with_the_slot(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import publish
+
+    _publish_setup(tmp_path)
+    calls = []
+    monkeypatch.setattr(publish, "move", lambda *a, **kw: calls.append((a, kw)) or _entry("01", "scheduled", slot_at=PUB_THU))
+
+    resp = client(tmp_path).post(f"/api/publish/{CLIPS_VIDEO}/01/move", json={"slot_at": PUB_THU})
+
+    assert resp.status_code == 200 and resp.json()["slot_at"] == PUB_THU
+    (video_id, clip_id, channel, slot), kw = calls[0]
+    assert (video_id, clip_id, channel) == (CLIPS_VIDEO, "01", "ma_chaine")
+    assert slot.isoformat() == PUB_THU
+    assert kw["state_dir"] == Path("state/publish") and kw["presets_dir"] == "presets"
+
+
+def test_publish_move_conflict_is_409_with_detail(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import publish
+
+    _publish_setup(tmp_path)
+
+    def boom(*a, **kw):
+        raise publish.PublishError("creneau deja pris pour x/02 : y")
+
+    monkeypatch.setattr(publish, "move", boom)
+
+    resp = client(tmp_path).post(f"/api/publish/{CLIPS_VIDEO}/02/move", json={"slot_at": PUB_THU})
+
+    assert resp.status_code == 409 and resp.json()["detail"] == "creneau deja pris pour x/02 : y"
+
+
+def test_publish_move_validates_input(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import publish
+
+    _publish_setup(tmp_path)
+    monkeypatch.setattr(publish, "move", lambda *a, **kw: pytest.fail("publish.move ne doit pas être appelé"))
+    c = client(tmp_path)
+
+    naive = c.post(f"/api/publish/{CLIPS_VIDEO}/01/move", json={"slot_at": "2026-10-08T12:00:00"})
+    junk = c.post(f"/api/publish/{CLIPS_VIDEO}/01/move", json={"slot_at": "jeudi midi"})
+    unsafe = c.post(f"/api/publish/{CLIPS_VIDEO}/..%2Fx/move", json={"slot_at": PUB_THU})
+    nochan = client(tmp_path).post("/api/publish/othervideo01/01/move", json={"slot_at": PUB_THU})
+
+    assert naive.status_code == 422 and "fuseau" in naive.json()["detail"]
+    assert junk.status_code == 422 and "slot_at" in junk.json()["detail"]
+    assert unsafe.status_code in (400, 404)
+    assert nochan.status_code == 409 and "chaîne" in nochan.json()["detail"]
+
+
+def test_publish_move_end_to_end_on_a_temporary_state(tmp_path, isolated_cwd):
+    _publish_setup(tmp_path, [_entry("01", "scheduled", slot_at=PUB_MON), _entry("02", "approved")])
+    c = client(tmp_path)
+
+    ok = c.post(f"/api/publish/{CLIPS_VIDEO}/02/move", json={"slot_at": PUB_THU})
+    taken = c.post(f"/api/publish/{CLIPS_VIDEO}/02/move", json={"slot_at": PUB_MON})
+
+    assert ok.status_code == 200 and ok.json()["status"] == "scheduled"
+    assert taken.status_code == 409 and "pris" in taken.json()["detail"]
+    saved = json.loads((tmp_path / "state" / "publish" / "ma_chaine.json").read_text(encoding="utf-8"))
+    assert {e["clip_id"]: e["slot_at"] for e in saved} == {"01": PUB_MON, "02": PUB_THU}
+
+
+def test_publish_published_and_unschedule_call_publish(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import publish
+
+    _publish_setup(tmp_path)
+    calls = []
+    monkeypatch.setattr(publish, "mark_published", lambda *a, **kw: calls.append(("mark_published", a, kw)) or _entry("01", "published"))
+    monkeypatch.setattr(publish, "unschedule", lambda *a, **kw: calls.append(("unschedule", a, kw)) or _entry("01", "approved"))
+    c = client(tmp_path)
+
+    done = c.post(f"/api/publish/{CLIPS_VIDEO}/01/published")
+    back = c.post(f"/api/publish/{CLIPS_VIDEO}/01/unschedule")
+
+    assert done.status_code == 200 and done.json()["status"] == "published"
+    assert back.status_code == 200 and back.json()["status"] == "approved"
+    assert [(n, a) for n, a, _ in calls] == [
+        ("mark_published", (CLIPS_VIDEO, "01", "ma_chaine")), ("unschedule", (CLIPS_VIDEO, "01", "ma_chaine"))]
+    assert all(kw["state_dir"] == Path("state/publish") for _, _, kw in calls)
+
+
+@pytest.mark.parametrize("action", ["published", "unschedule"])
+def test_publish_published_unschedule_error_is_409_with_detail(tmp_path, isolated_cwd, monkeypatch, action):
+    from clipper import publish
+
+    _publish_setup(tmp_path)
+
+    def boom(*a, **kw):
+        raise publish.PublishError("clip absent de la file de publication : x/06")
+
+    monkeypatch.setattr(publish, "mark_published" if action == "published" else "unschedule", boom)
+
+    resp = client(tmp_path).post(f"/api/publish/{CLIPS_VIDEO}/06/{action}")
+
+    assert resp.status_code == 409 and resp.json()["detail"] == "clip absent de la file de publication : x/06"
+
+
+def test_publish_published_and_unschedule_end_to_end(tmp_path, isolated_cwd):
+    _publish_setup(tmp_path, [_entry("01", "scheduled", slot_at=PUB_MON), _entry("02", "scheduled", slot_at=PUB_THU)])
+    c = client(tmp_path)
+
+    assert c.post(f"/api/publish/{CLIPS_VIDEO}/01/published").json()["status"] == "published"
+    back = c.post(f"/api/publish/{CLIPS_VIDEO}/02/unschedule").json()
+    again = c.post(f"/api/publish/{CLIPS_VIDEO}/01/published")             # déjà publié : refusé
+
+    assert back["status"] == "approved" and back["slot_at"] is None
+    assert again.status_code == 409
+
+
+def test_publish_screen_is_wired_with_calendar_queue_and_actions():
+    page = (STATIC / "index.html").read_text(encoding="utf-8")
+    js = (STATIC / "screens" / "publish.js").read_text(encoding="utf-8")
+    css = (STATIC / "style.css").read_text(encoding="utf-8")
+
+    assert "/static/screens/publish.js" in page
+    assert page.index("/static/screens.js") < page.index("/static/screens/publish.js") < page.index("/static/app.js")
+    assert "Screens.publish" in js
+    assert "/api/publish" in js and "/move" in js and "/published" in js and "/unschedule" in js
+    assert "pub-channel" in js and "<select" in js                         # sélecteur de chaîne
+    assert "tiktok_account" in js                                          # compte cible affiché
+    assert "week" in js and "Semaine précédente" in js and "Semaine suivante" in js
+    assert "cal-c" in js and "data-slot-at" in js and "slot_at" in js      # calendrier hebdomadaire des créneaux
+    assert "unscheduled" in js and "À publier" in js                       # file des approuvés sans créneau
+    for ev in ("dragstart", "dragover", "drop"):                            # glisser-déposer à la souris
+        assert ev in js, ev
+    for ev in ("touchstart", "touchmove", "touchend"):                      # et au toucher
+        assert ev in js, ev
+    for label in ("Planifié", "Publié", "Échec", "Approuvé"):               # badges de statut
+        assert label in js, label
+    assert "download" in js and "video_url" in js                          # télécharger
+    assert "copyText" in js                                                # copier la description
+    assert "Marquer publié" in js and "confirmDialog" in js                # confirmation
+    assert "Repasser en attente" in js
+    assert "undo" in js                                                    # toast « Annuler »
+    assert "toastError" in js                                              # un conflit 409 s'affiche
+    assert "Rien à publier" in js                                          # état vide
+    for sel in (".cal", ".cal-c", ".post", ".queue", "TASK-503d"):
+        assert sel in css, sel

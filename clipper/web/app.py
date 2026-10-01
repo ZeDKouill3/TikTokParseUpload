@@ -16,7 +16,7 @@ import os
 import re
 import tempfile
 import tomllib
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from email.parser import BytesParser
 from email.policy import HTTP as _EMAIL_HTTP
@@ -985,6 +985,42 @@ def create_app(config: Config | None = None) -> FastAPI:
         return JSONResponse({"clip": clip, "rerender": entry}, status_code=202 if retitle else 200)
 
     # ----------------------------------------------------------------
+    # Publication (SPEC-c100 E6, SPEC-fc0c §4) : tout passe par clipper.publish
+    # ----------------------------------------------------------------
+
+    @app.get("/api/publish")
+    def publish_week(channel: str | None = None, week: str | None = None) -> dict[str, Any]:
+        if not channel:
+            raise HTTPException(status_code=400, detail="paramètre channel obligatoire : choisis une chaîne")
+        return _publish_week_view(config, channel, week)
+
+    def _publish_action(video_id: str, clip_id: str, action: str, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        _validate_video_id(video_id)
+        _validate_clip_id(clip_id)
+        channel = _require_channel(video_id, clip_id, config)
+        try:
+            return getattr(publish_mod, action)(video_id, clip_id, channel, *args, state_dir=_publish_dir(config), **kwargs)
+        except publish_mod.PublishError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except channel_mod.ChannelError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ConfigError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/publish/{video_id}/{clip_id}/move")
+    def publish_move(video_id: str, clip_id: str, body: PublishMoveBody) -> dict[str, Any]:
+        slot_at = _publish_parse_slot(body.slot_at)
+        return _publish_action(video_id, clip_id, "move", slot_at, presets_dir=_PRESETS_DIR, base=_BASE_CONFIG)
+
+    @app.post("/api/publish/{video_id}/{clip_id}/published")
+    def publish_mark_published(video_id: str, clip_id: str) -> dict[str, Any]:
+        return _publish_action(video_id, clip_id, "mark_published")
+
+    @app.post("/api/publish/{video_id}/{clip_id}/unschedule")
+    def publish_unschedule(video_id: str, clip_id: str) -> dict[str, Any]:
+        return _publish_action(video_id, clip_id, "unschedule")
+
+    # ----------------------------------------------------------------
     # Surveillance : VOD a confirmer (SPEC-fc0c §5.3)
     # ----------------------------------------------------------------
 
@@ -1094,3 +1130,104 @@ def create_app(config: Config | None = None) -> FastAPI:
         return FileResponse(path, media_type="video/mp4")
 
     return app
+
+
+# --------------------------------------------------------------------------
+# Ecran Publication (SPEC-c100 E6, SPEC-fc0c §4) : vue d'une semaine de
+# creneaux d'une chaine. Les creneaux viennent de channel.next_slots, les
+# entrees de state/publish/<chaine>.json, les clips des sidecars ; l'API
+# n'invente aucun statut (une entree sans sidecar est signalee `missing`).
+# --------------------------------------------------------------------------
+
+
+class PublishMoveBody(BaseModel):
+    slot_at: str
+
+
+def _publish_parse_slot(value: str) -> datetime:
+    try:
+        slot = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=f"slot_at invalide : {value!r} (attendu : date ISO avec fuseau)") from exc
+    if slot.tzinfo is None:
+        raise HTTPException(status_code=422, detail=f"slot_at sans fuseau horaire : {value!r} (attendu : date ISO avec décalage, ex. +02:00)")
+    return slot
+
+
+def _publish_week_start(week: str | None, tz: ZoneInfo) -> date:
+    if not week:
+        day = datetime.now(tz).date()
+    else:
+        try:
+            day = date.fromisoformat(week)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"paramètre week invalide : {week!r} (attendu : AAAA-MM-JJ)") from exc
+    return day - timedelta(days=day.weekday())
+
+
+def _publish_entry_instant(entry: dict[str, Any], key: str) -> datetime | None:
+    value = entry.get(key)
+    if value is None:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"fichier de publication illisible : {key} invalide pour {entry.get('video_id')}/{entry.get('clip_id')} ({value!r})",
+        ) from exc
+
+
+def _publish_clip_view(clips: dict[tuple[str, str], dict[str, Any]], channel: str, entry: dict[str, Any]) -> dict[str, Any]:
+    clip = clips.get((entry["video_id"], entry["clip_id"]))
+    if clip is not None:
+        return clip
+    return {
+        "video_id": entry["video_id"], "clip_id": entry["clip_id"], "channel": channel, "missing": True,
+        "publish_status": entry["status"], "slot_at": entry.get("slot_at"), "publish_error": entry.get("error"),
+        "screen_title": None, "description": None, "hashtags": [], "video_url": None,
+    }
+
+
+def _publish_week_view(config: Config, channel_name: str, week: str | None) -> dict[str, Any]:
+    _config, channel = _load_channel(channel_name)
+    tz = ZoneInfo(str(channel["timezone"]))
+    monday = _publish_week_start(week, tz)
+    start = datetime.combine(monday, time(0, 0), tzinfo=tz)
+    end = datetime.combine(monday + timedelta(days=7), time(0, 0), tzinfo=tz)
+
+    entries = _publish_entries(config, channel_name)
+    clips = {(c["video_id"], c["clip_id"]): c for c in _list_clip_views(config, channel_name, None, None)}
+    by_slot: dict[datetime, dict[str, Any]] = {}
+    unscheduled, done = [], []
+    for entry in entries.values():
+        slot = _publish_entry_instant(entry, "slot_at")
+        published = _publish_entry_instant(entry, "published_at")
+        if slot is not None and entry["status"] in ("scheduled", "published", "failed"):
+            by_slot[slot] = entry
+        if entry["status"] == "approved" and slot is None:
+            unscheduled.append(_publish_clip_view(clips, channel_name, entry))
+        elif entry["status"] in ("published", "failed"):
+            when = published or slot
+            if when is not None and start <= when < end:
+                done.append(_publish_clip_view(clips, channel_name, entry))
+
+    slots = []
+    if channel["slots"]:
+        seen: set[datetime] = set()
+        for slot in channel_mod.next_slots(channel, start - timedelta(microseconds=1), len(channel["slots"]) + 1):
+            if slot >= end or slot in seen:
+                continue
+            seen.add(slot)
+            entry = by_slot.get(slot)
+            slots.append({
+                "slot_at": slot.isoformat(),
+                "clip": _publish_clip_view(clips, channel_name, entry) if entry is not None else None,
+                "free": entry is None,
+            })
+    return {
+        "channel": channel_name, "timezone": str(channel["timezone"]), "tiktok_account": channel["tiktok_account"],
+        "week_start": monday.isoformat(), "week_end": (monday + timedelta(days=6)).isoformat(),
+        "slots": slots, "unscheduled": unscheduled, "done": done,
+        "reason": None if channel["slots"] else "aucun créneau défini dans [channel].slots",
+    }
