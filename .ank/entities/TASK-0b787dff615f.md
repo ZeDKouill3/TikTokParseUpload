@@ -5,7 +5,7 @@ slug: tiktok-publication-imm-diate-ou-programm-e-par-l
 title: "TikTok : publication immédiate ou programmée par le worker, arrêt sûr, plafonds (SPEC-9225 R3-R6, R9)"
 created: 2026-10-01T14:19:57Z
 author: nicoc@zedk_ordi
-status: in_progress
+status: done
 scope:
   - clipper/tiktok.py
   - clipper/assets/tiktok_selectors.toml
@@ -24,8 +24,15 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/c54c7dea7129@9742d9c
+    tree: scope/44667b04e1ae
+    criteria: b69adb2c843d
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 3
+version: 4
 ---
 
 Deuxième tâche de SPEC-922573c1e68f : publication. S'appuie sur clipper.browser (TASK-e522).
