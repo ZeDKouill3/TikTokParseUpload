@@ -160,13 +160,14 @@
     const eta = progress && progress.eta_s != null ? ` · reste ${esc(fr(Math.ceil(progress.eta_s / 60)))} min` : "";
     const where = cur ? `<span>${esc(STEP_LABELS[cur] || cur)}${pct != null ? ` · ${pct} %${eta}` : ""}</span>` : `<span>toutes les étapes terminées</span>`;
     return `<a class="job vrow" href="#/videos/${encodeURIComponent(video.video_id)}" data-video="${esc(video.video_id)}">
+      ${videoThumb(video.video_id)}
       <div style="min-width:0">
         <div class="job-title">${esc(video.title)}</div>
         <div class="job-meta"><span class="mono">${esc(video.video_id)}</span>${video.channel ? `<span class="tag">${esc(video.channel)}</span>` : `<span class="muted">sans chaîne</span>`}${where}</div>
         <div style="margin-top:10px">${segs(video)}</div>
         ${video.reason ? `<p class="reason ${video.status === "failed" ? "bad" : ""}">${esc(video.reason)}</p>` : ""}
       </div>
-      <div class="job-side">${statusChip(video.status)}</div>
+      <div class="job-side">${statusChip(video.status)}${video.dismissed_at ? `<span class="chip pending plain">retirée</span>` : ""}</div>
     </a>`;
   }
 
@@ -278,6 +279,7 @@
     view.innerHTML = `
       ${backLink()}
       <div class="vhead">
+        ${videoThumb(video.video_id)}
         <div style="min-width:0">
           <h2 class="vtitle">${esc(video.title)}</h2>
           ${video.title_reason ? `<p class="muted vsub">${esc(video.title_reason)}</p>` : ""}
@@ -287,6 +289,9 @@
           ${review ? `<a class="btn btn-primary" href="#/review/${enc}">${icon("sparkles")}Revoir les moments${(video.awaiting || []).length ? ` (${video.awaiting.length})` : ""}</a>` : ""}
           ${(video.clips || []).length ? `<a class="btn" href="#/clips/${enc}">${icon("clapperboard")}Voir les ${video.clips.length} clips</a>` : ""}
           ${video.status === "running" ? `<button type="button" class="btn btn-bad" data-cancel-video>${icon("ban")}Annuler le traitement</button>` : ""}
+          ${(video.status === "failed" || video.status === "queued") && !video.dismissed_at ? `<button type="button" class="btn" data-retry-video="${esc(video.video_id)}" data-from-step="${esc(video.current_step || "")}">${icon("rotate-ccw")}Relancer</button>
+            <button type="button" class="btn btn-ghost" data-dismiss-video="${esc(video.video_id)}">Retirer</button>` : ""}
+          ${video.dismissed_at ? `<span class="chip pending plain">retirée des échecs</span> <button type="button" class="btn" data-restore-video="${esc(video.video_id)}">Rétablir</button>` : ""}
         </div>
       </div>
       ${video.reason ? `<div class="banner"><p><b>${video.status === "failed" ? "Échec" : "Information"} :</b> ${esc(video.reason)}${video.retry_at ? ` · nouvelle tentative prévue ${clock(video.retry_at)}` : ""}</p></div>` : ""}
@@ -308,6 +313,7 @@
   }
 
   function wireDetail(view, video) {
+    wireActions(view); // Relancer / Retirer / Rétablir : mêmes gestionnaires que le tableau de bord
     $$("[data-step]", view).forEach((b) => (b.onclick = () => { state.step = b.dataset.step; paintDetail(); }));
     const retry = $("[data-retry]", view);
     if (retry) retry.onclick = () => retryFrom(video, retry.dataset.retry);

@@ -1329,3 +1329,161 @@ def test_clip_thumbnail_turns_an_ffmpeg_failure_into_a_pipeline_error(thumb_env,
     monkeypatch.setattr(render_step, "_exec_ffmpeg", boom)
     with pytest.raises(pipeline.PipelineError, match="miniature.*ffmpeg a echoue"):
         pipeline.clip_thumbnail(config, VIDEO_ID, "01")
+
+
+# --------------------------------------------------------------------------
+# Vignettes des videos (TASK-c0ef) : seul point d'entree du web (ADR-09ad)
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def vthumb_env(tmp_path, monkeypatch):
+    """workspace/<id>/<id>.mp4 + meta.json (duree 200 s) et un ffmpeg simule."""
+    import json
+
+    from clipper import render as render_step
+
+    video_dir = tmp_path / "workspace" / VIDEO_ID
+    video_dir.mkdir(parents=True)
+    mp4 = video_dir / f"{VIDEO_ID}.mp4"
+    mp4.write_bytes(b"mp4")
+    (video_dir / "meta.json").write_text(json.dumps({"video_id": VIDEO_ID, "duration": 200}), encoding="utf-8")
+    calls = []
+
+    def fake_exec(cmd, cwd, out_path):
+        calls.append(list(cmd))
+        Path(out_path).write_bytes(b"\xff\xd8jpeg")
+
+    monkeypatch.setattr(render_step, "_exec_ffmpeg", fake_exec)
+    config = Config(mode="review", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output")
+    return config, mp4, calls
+
+
+def test_video_thumbnail_extracts_one_jpeg_at_ten_percent_of_the_duration(vthumb_env):
+    from clipper import pipeline
+
+    config, mp4, calls = vthumb_env
+
+    thumb = pipeline.video_thumbnail(config, VIDEO_ID)
+
+    assert thumb.read_bytes().startswith(b"\xff\xd8") and thumb.suffix == ".jpg"
+    assert thumb.is_relative_to(config.workspace_dir)
+    cmd = calls[0]
+    assert str(mp4.resolve()) in cmd and cmd[cmd.index("-frames:v") + 1] == "1"
+    assert cmd[cmd.index("-ss") + 1] == "20.000000"  # 10 % de 200 s
+    assert "min(360,iw)" in cmd[cmd.index("-vf") + 1]
+
+
+def test_video_thumbnail_is_reused_until_the_source_changes(vthumb_env):
+    import os
+
+    from clipper import pipeline
+
+    config, mp4, calls = vthumb_env
+    first = pipeline.video_thumbnail(config, VIDEO_ID)
+    assert pipeline.video_thumbnail(config, VIDEO_ID) == first
+    assert len(calls) == 1
+
+    stat = mp4.stat()
+    os.utime(mp4, ns=(stat.st_atime_ns, stat.st_mtime_ns + 5_000_000_000))
+    pipeline.video_thumbnail(config, VIDEO_ID)
+    assert len(calls) == 2
+    pipeline.video_thumbnail(config, VIDEO_ID)
+    assert len(calls) == 2
+
+
+def test_video_thumbnail_without_the_source_is_a_pipeline_error(vthumb_env):
+    from clipper import pipeline
+
+    config, mp4, calls = vthumb_env
+    mp4.unlink()
+    with pytest.raises(pipeline.PipelineError, match="introuvable"):
+        pipeline.video_thumbnail(config, VIDEO_ID)
+    assert not calls
+
+
+def test_video_thumbnail_without_a_known_duration_is_an_explicit_error(vthumb_env):
+    from clipper import pipeline
+
+    config, mp4, calls = vthumb_env
+    (mp4.parent / "meta.json").unlink()
+    with pytest.raises(pipeline.PipelineError, match="duree.*meta.json"):
+        pipeline.video_thumbnail(config, VIDEO_ID)
+    assert not calls
+
+
+def test_video_thumbnail_turns_an_ffmpeg_failure_into_a_pipeline_error(vthumb_env, monkeypatch):
+    from clipper import pipeline, render as render_step
+
+    config, mp4, calls = vthumb_env
+
+    def boom(cmd, cwd, out_path):
+        raise render_step.RenderError("ffmpeg a echoue pour x")
+
+    monkeypatch.setattr(render_step, "_exec_ffmpeg", boom)
+    with pytest.raises(pipeline.PipelineError, match="vignette.*ffmpeg a echoue"):
+        pipeline.video_thumbnail(config, VIDEO_ID)
+
+
+# --------------------------------------------------------------------------
+# Retirer une video des echecs (TASK-c0ef) : etat explicite, reversible
+# --------------------------------------------------------------------------
+
+
+def _dismiss_state(config, status, **extra):
+    from clipper import pipeline
+
+    state = pipeline.new_state(VIDEO_ID, "https://example.test/v", "review")
+    state.update(status=status, reason="ffmpeg a echoue", **extra)
+    pipeline.save_state(state, config=config)
+    return state
+
+
+def test_dismiss_marks_a_failed_video_without_touching_its_workspace(tmp_path):
+    from clipper import pipeline
+
+    config = Config(mode="review", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output")
+    _dismiss_state(config, "failed")
+    (tmp_path / "workspace" / VIDEO_ID / "keep.txt").write_text("x", encoding="utf-8")
+
+    state = pipeline.dismiss_video(VIDEO_ID, config=config)
+
+    assert state["dismissed_at"] and state["status"] == "failed"
+    assert pipeline.load_state(VIDEO_ID, config=config)["dismissed_at"] == state["dismissed_at"]
+    assert (tmp_path / "workspace" / VIDEO_ID / "keep.txt").read_text(encoding="utf-8") == "x"
+
+
+def test_dismiss_refuses_a_video_that_is_neither_failed_nor_queued(tmp_path):
+    from clipper import pipeline
+
+    config = Config(mode="review", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output")
+    _dismiss_state(config, "running")
+    with pytest.raises(pipeline.PipelineError, match="failed|queued|echec"):
+        pipeline.dismiss_video(VIDEO_ID, config=config)
+
+
+def test_restore_undoes_dismiss_and_unknown_video_is_an_error(tmp_path):
+    from clipper import pipeline
+
+    config = Config(mode="review", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output")
+    _dismiss_state(config, "failed")
+    pipeline.dismiss_video(VIDEO_ID, config=config)
+
+    state = pipeline.restore_video(VIDEO_ID, config=config)
+
+    assert "dismissed_at" not in state
+    assert "dismissed_at" not in pipeline.load_state(VIDEO_ID, config=config)
+    with pytest.raises(pipeline.PipelineError, match="aucun etat"):
+        pipeline.dismiss_video("zzzzzzzzzzz", config=config)
+
+
+def test_a_dismissed_queued_video_is_not_resumed(tmp_path):
+    from clipper import pipeline
+
+    config = Config(mode="review", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output")
+    _dismiss_state(config, "queued", retry_at="2026-01-01T00:00:00+00:00")
+    assert [s["video_id"] for s in pipeline.queued(config=config)] == [VIDEO_ID]
+
+    pipeline.dismiss_video(VIDEO_ID, config=config)
+
+    assert pipeline.queued(config=config) == []

@@ -173,7 +173,16 @@ function connectEvents() {
 
 /* ---------- Routeur par hash ---------- */
 function route() {
-  const id = (location.hash.replace(/^#\/?/, "").split(/[/?]/)[0]) || "dashboard";
+  const hashId = (location.hash.replace(/^#\/?/, "").split(/[/?]/)[0]) || "dashboard";
+  // « #set-xxx » est l'ancre d'une section de Réglages, jamais un écran : on défile jusqu'à
+  // elle (sans quitter l'écran), et seulement si Réglages n'est pas encore affiché on l'ouvre.
+  const anchor = hashId.startsWith("set-") ? hashId : null;
+  const id = anchor ? "settings" : hashId;
+  if (anchor && currentScreen === "settings") {
+    const target = document.getElementById(anchor);
+    if (target) target.scrollIntoView();
+    return;
+  }
   const screen = SCREEN_IDS.includes(id) ? id : "dashboard";
   currentScreen = screen;
   $$("#view > .screen").forEach((s) => { s.hidden = s.id !== `screen-${screen}`; });
@@ -188,6 +197,10 @@ function route() {
   window.scrollTo(0, 0);
   $(".sidebar").classList.remove("open");
   renderCurrent();
+  if (anchor) {
+    const target = document.getElementById(anchor);
+    if (target) target.scrollIntoView();
+  }
 }
 
 function renderCurrent() {
@@ -226,6 +239,9 @@ function wireActions(root) {
       toast({ kind: "ok", title: "Retirée de la file", body: id });
     } catch (err) { toastError("Impossible de retirer la vidéo", err); }
   }));
+  $$("[data-retry-video]", root).forEach((b) => (b.onclick = () => retryVideo(b.dataset.retryVideo, b.dataset.fromStep)));
+  $$("[data-dismiss-video]", root).forEach((b) => (b.onclick = () => dismissVideo(b.dataset.dismissVideo)));
+  $$("[data-restore-video]", root).forEach((b) => (b.onclick = () => restoreVideo(b.dataset.restoreVideo)));
   $$("[data-cancel]", root).forEach((b) => (b.onclick = async () => {
     const id = b.dataset.cancel;
     if (!(await confirmDialog({ title: "Annuler le traitement ?", body: `Le traitement de ${id} sera arrêté.`, confirmLabel: "Annuler le traitement" }))) return;
@@ -235,6 +251,55 @@ function wireActions(root) {
       renderCurrent();
     } catch (err) { toastError("Impossible d'annuler le traitement", err); }
   }));
+}
+
+/* ---------- Relancer / retirer une video en echec (tableau de bord et fiche video) ---------- */
+async function afterVideoAction(id) {
+  await Promise.all([reloadVideo(id), loadQueue()]);
+  // le tableau de bord, la liste et la fiche se rafraichissent comme sur un evenement serveur
+  document.dispatchEvent(new CustomEvent("clipper:event", { detail: { kind: "video", id } }));
+  renderCurrent();
+  updateCounts();
+}
+
+async function retryVideo(id, step) {
+  if (!step || !STEP_LABELS[step]) {
+    toastError("Relance impossible", new Error(`étape inconnue pour ${id} : ouvre sa fiche et choisis l'étape à relancer.`));
+    return;
+  }
+  const ok = await confirmDialog({
+    title: `Relancer depuis « ${STEP_LABELS[step]} » ?`,
+    body: `${id} repart de cette étape (et des suivantes). Les clips déjà rendus de cette vidéo seront remplacés.`,
+    confirmLabel: "Relancer", danger: false,
+  });
+  if (!ok) return;
+  try {
+    await api(`/api/videos/${encodeURIComponent(id)}/retry`, jsonBody("POST", { from_step: step }));
+    toast({ kind: "ok", title: "Relance mise en file", body: `${id} : depuis « ${STEP_LABELS[step]} »` });
+    await afterVideoAction(id);
+  } catch (err) { toastError("Relance impossible", err); }
+}
+
+async function dismissVideo(id) {
+  const ok = await confirmDialog({
+    title: "Retirer des échecs ?",
+    body: `${id} sort des échecs et des compteurs. Son dossier est conservé : tu peux la rétablir depuis sa fiche.`,
+    confirmLabel: "Retirer",
+  });
+  if (!ok) return;
+  try {
+    await api(`/api/videos/${encodeURIComponent(id)}/dismiss`, { method: "POST" });
+    toast({ kind: "ok", title: "Vidéo retirée des échecs", body: id });
+    await afterVideoAction(id);
+  } catch (err) { toastError("Impossible de retirer la vidéo", err); }
+}
+
+async function restoreVideo(id) {
+  try {
+    await api(`/api/videos/${encodeURIComponent(id)}/restore`, { method: "POST" });
+    toast({ kind: "ok", title: "Vidéo rétablie", body: id });
+    await afterVideoAction(id);
+  } catch (err) { toastError("Impossible de rétablir la vidéo", err); }
 }
 
 /* ---------- Ajout de video ---------- */
