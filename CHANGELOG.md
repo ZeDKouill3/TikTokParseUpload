@@ -4,6 +4,29 @@ Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/).
 Ce dépôt n'utilise pas (encore) de versionnage sémantique strict : la
 version 0.1.0 est une pré-version, avant tout tag ou publication.
 
+## [Non publié]
+
+### Ajouté
+
+- Console de gestion web v2 (`python -m clipper serve`, `clipper/web/`) :
+  huit écrans (Accueil, Vidéos, Revue, Clips, Chaînes, Publication,
+  Statistiques, Réglages), temps réel par SSE avec repli sur polling,
+  utilisable sur téléphone (ADR-4f6e, SPEC-c100).
+- Worker séparé (`python -m clipper worker`, lancé par `serve`) : file
+  `state/queue.json`, une vidéo à la fois dans un processus enfant,
+  annulation, reprise au redémarrage.
+- Chaînes : presets `presets/<nom>.toml` en surcouche de `config.toml`,
+  éditeur d'agencement visuel, aperçu du style des sous-titres.
+- Surveillance des VOD d'une chaîne (`[channel] watch`) avec confirmation des
+  VOD en mode `review`, et publication par créneaux hebdomadaires
+  (`state/publish/`).
+- Accès distant : `serve --host` hors `127.0.0.1` exige `[web] token` (refus
+  de démarrer sinon) ; page de saisie du jeton, cookie, 401 sur `/api` et
+  `/media`. Réseau local seulement, pas de TLS.
+- Notifications du navigateur (permission demandée depuis un réglage local,
+  jamais au chargement) sur `done`, `failed`, `awaiting_review`, `queued`.
+- `docs/GUIDE.md` : section « Console de gestion ».
+
 ## [0.1.0] - 2026-09-30
 
 Première pré-version : pipeline complet YouTube/VOD Twitch -> clips TikTok

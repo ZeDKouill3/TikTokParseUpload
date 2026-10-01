@@ -3243,3 +3243,141 @@ def test_style_css_braces_are_balanced():
     # Une accolade manquante avale tout le CSS qui suit (écrans Surveillance, Statistiques).
     css = re.sub(r"/\*.*?\*/", "", (STATIC / "style.css").read_text(encoding="utf-8"), flags=re.S)
     assert css.count("{") == css.count("}")
+
+
+# --------------------------------------------------------------------------
+# Acces distant de bout en bout (SPEC-c100 T5, T7 ; ADR-4f6e §5)
+# --------------------------------------------------------------------------
+
+
+def _serve_setup(tmp_path, monkeypatch, web_toml: str = ""):
+    import uvicorn
+
+    from clipper import __main__ as cli
+
+    (tmp_path / "config.toml").write_text(
+        f'mode = "review"\n{web_toml}',
+        encoding="utf-8",
+    )
+    runs: list[tuple] = []
+    spawned: list[list[str]] = []
+
+    class _Proc:
+        def terminate(self) -> None:
+            spawned.append(["terminate"])
+
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kw: runs.append((app, kw)))
+    monkeypatch.setattr(cli, "_popen", lambda cmd, *a, **kw: spawned.append(cmd) or _Proc())
+    return cli, runs, spawned
+
+
+def test_cli_serve_host_without_token_refuses_to_start_and_names_the_key(
+    tmp_path, isolated_cwd, monkeypatch, capsys
+):
+    cli, runs, spawned = _serve_setup(tmp_path, monkeypatch)
+
+    assert cli.main(["serve", "--host", "0.0.0.0"]) == 1
+
+    err = capsys.readouterr().err
+    assert "[web] token" in err and "0.0.0.0" in err and "jeton" in err
+    assert runs == [] and spawned == []  # ni serveur ni worker lancés
+
+
+def test_cli_serve_host_from_config_without_token_also_refuses(tmp_path, isolated_cwd, monkeypatch, capsys):
+    cli, runs, _ = _serve_setup(tmp_path, monkeypatch, '[web]\nhost = "0.0.0.0"\n')
+
+    assert cli.main(["serve"]) == 1
+    assert "[web] token" in capsys.readouterr().err
+    assert runs == []
+
+
+def test_cli_serve_host_with_token_runs_uvicorn_on_the_requested_host(tmp_path, isolated_cwd, monkeypatch):
+    cli, runs, _ = _serve_setup(tmp_path, monkeypatch, '[web]\ntoken = "secret-de-test"\n')
+
+    assert cli.main(["serve", "--host", "0.0.0.0", "--port", "9100"]) == 0
+
+    app, kwargs = runs[0]
+    assert kwargs["host"] == "0.0.0.0" and kwargs["port"] == 9100
+    # l'application appliquée est bien protégée par le jeton
+    assert TestClient(app).get("/api/queue").status_code == 401
+
+
+def test_cli_serve_host_loopback_needs_no_token(tmp_path, isolated_cwd, monkeypatch):
+    cli, runs, _ = _serve_setup(tmp_path, monkeypatch)
+
+    assert cli.main(["serve", "--host", "127.0.0.1"]) == 0
+    assert runs[0][1]["host"] == "127.0.0.1"
+
+
+def test_page_served_without_cookie_shows_the_token_entry_and_api_is_401(tmp_path, isolated_cwd):
+    config = _config_with_web(tmp_path, host="0.0.0.0", token="secret")
+    test_client = TestClient(create_app(config=config))
+
+    page = test_client.get("/")
+    assert page.status_code == 200
+    assert 'id="token-view"' in page.text and 'id="token-form"' in page.text
+    assert test_client.get("/api/videos").status_code == 401
+    assert test_client.get("/api/videos", headers={"x-clipper-token": "secret"}).status_code == 200
+
+
+def test_browser_notification_permission_is_asked_only_from_the_local_setting(tmp_path, isolated_cwd):
+    js = served(tmp_path, "/static/app.js")
+    assert js.count("requestPermission(") == 1
+    start = js.index("async function toggleNotifications")
+    assert js.index("requestPermission(") > start  # dans le basculement du réglage
+    boot = js[js.index("(function boot()"):]
+    assert "requestPermission" not in boot  # jamais au chargement
+    assert "localStorage" in js and "clipper-notifications" in js  # réglage local au navigateur
+    # on ne notifie que si le réglage est actif ET la permission accordée
+    assert 'notificationsOn() && typeof Notification !== "undefined" && Notification.permission === "granted"' in js
+    for status in ("done", "failed", "awaiting_review", "queued"):
+        assert f"{status}: {{" in js, status
+
+
+_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _console_section() -> str:
+    guide = (_ROOT / "docs" / "GUIDE.md").read_text(encoding="utf-8")
+    start = guide.index("## Console de gestion")
+    end = guide.find("\n## ", start + 1)
+    return guide[start:end if end != -1 else None]
+
+
+def test_guide_console_section_covers_screens_queue_presets_state_watch_and_remote_access():
+    section = _console_section()
+    for screen in ("Accueil", "Vidéos", "Revue", "Clips", "Chaînes", "Publication", "Statistiques", "Réglages"):
+        assert screen in section, screen
+    assert "Les 8 écrans" in section
+    for needle in (
+        "state/queue.json", "state/watch/", "state/publish/",   # file et state/
+        "surcouche", "presets/ma_chaine.toml",                  # presets en surcouche + exemple
+        "watch = true", "à confirmer",                          # surveillance
+        "[web] token", "--host", "401",                         # accès distant par jeton
+        "Réseau local seulement", "Pas de TLS", "reverse proxy TLS",   # limites
+        "notifications du navigateur",
+    ):
+        assert needle in section, needle
+
+
+def test_readme_and_changelog_mention_the_console_v2():
+    readme = (_ROOT / "README.md").read_text(encoding="utf-8")
+    changelog = (_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    assert "Console de gestion web (v2)" in readme and "--host 0.0.0.0" in readme
+    assert "Console de gestion web v2" in changelog and "[web] token" in changelog
+
+
+def test_console_docs_example_preset_is_valid(tmp_path, isolated_cwd):
+    import re
+
+    from clipper import channel
+
+    section = _console_section()
+    block = re.search(r"```toml\n(\[channel\].*?)```", section, re.S).group(1)
+    (tmp_path / "config.toml").write_text('mode = "review"\n', encoding="utf-8")
+    (tmp_path / "presets").mkdir()
+    (tmp_path / "presets" / "ma_chaine.toml").write_text(block, encoding="utf-8")
+
+    _config, chan = channel.load_channel("ma_chaine")
+
+    assert chan["display_name"] == "ma_chaine" and chan["watch"] is True
