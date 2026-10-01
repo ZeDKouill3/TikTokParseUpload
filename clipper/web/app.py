@@ -230,6 +230,27 @@ def _matches(video: dict[str, Any], channel: str | None, status: str | None, q: 
     return True
 
 
+def _jury_confidence(scored: dict[str, Any]) -> tuple[int | float | None, dict[str, Any] | None]:
+    """(confiance agrégée, dernière confiance de chaque juge) d'un moment de
+    moments.json (SPEC-73d0 R4) ; (None, None) s'il n'est pas passé par le
+    jury : aucune valeur n'est inventée."""
+    jury = scored.get("jury")
+    if not jury or "confidence" not in jury:
+        return None, None
+    latest: dict[str, Any] = {}
+    for rnd in jury["trace"]["rounds"]:
+        latest.update({name: j["confidence"] for name, j in rnd["judges"].items()})
+    return jury["confidence"], latest
+
+
+def _moments_jury_confidences(config: Config, video_id: str) -> dict[Any, tuple[Any, Any]]:
+    """moment_id -> _jury_confidence, pour les moments de la vidéo qui en ont une."""
+    path = Path(config.workspace_dir) / video_id / "moments.json"
+    if not path.exists():
+        return {}
+    return {m["id"]: _jury_confidence(m) for m in _read_json(path)["moments"]}
+
+
 def _list_moments(config: Config, video_id: str) -> list[dict[str, Any]]:
     video_dir = Path(config.workspace_dir) / video_id
     parts_path = video_dir / "parts.json"
@@ -248,6 +269,7 @@ def _list_moments(config: Config, video_id: str) -> list[dict[str, Any]]:
     for moment_id, part in sorted(parts_by_id.items()):
         scored = scores_by_id.get(moment_id, {})
         transcript, transcript_error = _moment_transcript(video_dir, part["start"], part["end"])
+        confidence, judge_confidences = _jury_confidence(scored)
         out.append({
             "id": moment_id,
             "start": part["start"],
@@ -258,6 +280,8 @@ def _list_moments(config: Config, video_id: str) -> list[dict[str, Any]]:
             "score": scored.get("final_score"),
             "justification": scored.get("justification"),
             "hook_text": scored.get("hook_text"),
+            "confidence": confidence,
+            "judge_confidences": judge_confidences,
             "decision": decisions.get(str(moment_id)),
             "preview_url": f"/media/source/{video_id}",
             "transcript": transcript,
@@ -565,8 +589,11 @@ def _clip_publish_status(sidecar: dict[str, Any], entry: dict[str, Any] | None) 
     return _TO_VALIDATE if sidecar.get("ready") is True else _NOT_READY
 
 
-def _clip_view(sidecar: dict[str, Any], channel: str | None, entry: dict[str, Any] | None) -> dict[str, Any]:
+def _clip_view(sidecar: dict[str, Any], channel: str | None, entry: dict[str, Any] | None,
+               jury: dict[Any, tuple[Any, Any]] | None = None) -> dict[str, Any]:
+    """``jury`` : moment_id -> confiance du jury (voir _moments_jury_confidences)."""
     qa = sidecar.get("qa") or {}
+    jury_confidence, jury_judges = (jury or {}).get(sidecar.get("moment_id"), (None, None))
     video_id, clip_id = sidecar["video_id"], sidecar["clip_id"]
     clip = dict(sidecar)
     clip.update({
@@ -577,6 +604,8 @@ def _clip_view(sidecar: dict[str, Any], channel: str | None, entry: dict[str, An
         "qa_status": qa.get("status"),
         "issues": qa.get("issues"),
         "publish_status": _clip_publish_status(sidecar, entry),
+        "jury_confidence": jury_confidence,
+        "jury_judge_confidences": jury_judges,
         "slot_at": entry.get("slot_at") if entry else None,
         "publish_error": entry.get("error") if entry else None,
     })
@@ -617,8 +646,11 @@ def _iter_clips(config: Config, channel: str | None, video_id: str | None
 def _list_clip_views(config: Config, channel: str | None, video_id: str | None,
                      status: str | None) -> list[dict[str, Any]]:
     clips = []
-    for _video, video_channel, sidecar, entry in _iter_clips(config, channel, video_id):
-        clip = _clip_view(sidecar, video_channel, entry)
+    jury_by_video: dict[str, dict[Any, tuple[Any, Any]]] = {}
+    for video, video_channel, sidecar, entry in _iter_clips(config, channel, video_id):
+        if video not in jury_by_video:
+            jury_by_video[video] = _moments_jury_confidences(config, video)
+        clip = _clip_view(sidecar, video_channel, entry, jury_by_video[video])
         if status is None or clip["publish_status"] == status:
             clips.append(clip)
     return clips
@@ -1722,7 +1754,8 @@ def create_app(config: Config | None = None) -> FastAPI:
             except publish_mod.PublishError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
         entry = _enqueue_clip_render(video_id, config) if retitle else None
-        clip = _clip_view(sidecar, channel, _publish_entries(config, channel).get((video_id, clip_id)))
+        clip = _clip_view(sidecar, channel, _publish_entries(config, channel).get((video_id, clip_id)),
+                          _moments_jury_confidences(config, video_id))
         return JSONResponse({"clip": clip, "rerender": entry}, status_code=202 if retitle else 200)
 
     # ----------------------------------------------------------------

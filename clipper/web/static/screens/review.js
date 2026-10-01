@@ -207,7 +207,7 @@ function rvPaintList(body) {
     return `<button type="button" class="m-item ${i === rv.cur ? "on" : ""} ${esc(name || "")}" data-moment="${i}">
       <span class="score ${x.score >= 80 ? "hi" : x.score >= 70 ? "mid" : ""}">${x.score == null ? "–" : fr(x.score)}</span>
       <span style="min-width:0"><span class="m-hook" style="display:block">${esc(x.hook_text || `Moment ${x.id}`)}</span>
-        <span class="m-meta"><span class="mono">${esc(rvClock(b.start))}</span><span>${fr(b.end - b.start)} s</span>${x.parts_total > 1 ? `<span>${x.parts_total} parties</span>` : ""}${chip}</span></span>
+        <span class="m-meta"><span class="mono">${esc(rvClock(b.start))}</span><span>${fr(b.end - b.start)} s</span>${x.confidence != null ? `<span title="Confiance du jury">confiance ${fr(x.confidence)} %</span>` : ""}${x.parts_total > 1 ? `<span>${x.parts_total} parties</span>` : ""}${chip}</span></span>
     </button>`;
   }).join("");
   $$("[data-moment]", body).forEach((b) => (b.onclick = () => { rvGo(+b.dataset.moment); rvPaintMoment(body); }));
@@ -300,6 +300,8 @@ function rvPaintMoment(body) {
       <div><div class="section-title" style="margin:0">Justification du jury</div><div class="muted" style="font-size:12px">moment #${m.id}${m.parts_total > 1 ? ` · ${m.parts_total} parties` : ""}</div></div>
       <span class="grow"></span><div class="big-num" style="font-size:44px">${m.score == null ? "–" : fr(m.score)}<small>/100</small></div></div>
     ${m.justification ? `<p class="judge-why" style="font-size:14px;color:var(--text-2)">${esc(m.justification)}</p>` : `<p class="reason bad">justification : aucune donnée pour ce moment.</p>`}
+    <div class="field-label" style="margin:16px 0 4px">Confiance du jury</div>
+    <div id="rv-confidence">${juryConfidenceHtml(m.confidence, m.judge_confidences)}</div>
     ${m.hook_text ? `<div class="field-label" style="margin:16px 0 4px">Accroche proposée</div><p>${esc(m.hook_text)}</p>` : ""}`;
   const media = $("#rv-media", body);
   const start = () => { media.currentTime = d.start; };

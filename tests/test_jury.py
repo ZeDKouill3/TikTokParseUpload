@@ -16,6 +16,8 @@ from clipper.config import Config
 from clipper.llm import claude_cli
 from clipper.llm.fake import FakeBackend
 
+DEFAULT_CONFIDENCE = 80
+
 JUDGES = ["retention", "spectateur", "monteur", "avocat", "conformite"]
 
 # Grille reduite : score = (3 x hook + 1 x standalone) / 4 x 10.
@@ -63,8 +65,10 @@ class ScriptedJury:
     notes[round][juge][id] = note (tous criteres) ou dict critere -> note.
     Un tour absent du script reprend les notes du tour 1."""
 
-    def __init__(self, notes, veto=None, raw=None, barrier=None):
+    def __init__(self, notes, veto=None, raw=None, barrier=None, confidence=None):
         self.notes = notes
+        # (round, juge, id) -> confiance ; absent : DEFAULT_CONFIDENCE.
+        self.confidence = confidence or {}
         self.veto = veto or {}  # (round, id) -> raison, pour le juge conformite
         self.raw = raw or {}  # (round, juge) -> reponse brute (str/dict)
         self.barrier = barrier
@@ -96,7 +100,8 @@ class ScriptedJury:
             cid = cid_of(text)
             note = table[cid]
             scores = note if isinstance(note, dict) else {c: note for c in RUBRIC["criteria"]}
-            item = {"ref": ref, "argument": f"ARG-{judge}-r{rnd}-{cid}", "scores": scores}
+            conf = self.confidence.get((rnd, judge, cid), DEFAULT_CONFIDENCE)
+            item = {"ref": ref, "argument": f"ARG-{judge}-r{rnd}-{cid}", "scores": scores, "confidence": conf}
             # Le schema (partage par tout le modele, TASK-b0fa) dit si veto
             # et veto_reason sont attendus dans la reponse, pas le nom du
             # juge : seul conformite (le juge a veto) fixe une raison via
@@ -493,9 +498,275 @@ def test_trace_holds_notes_and_arguments_per_judge_and_round():
         "scores": {"hook": 7, "standalone": 7},
         "score": 70.0,
         "argument": "ARG-monteur-r1-secret-id-0",
+        "confidence": DEFAULT_CONFIDENCE,
     }
     assert first["judges"]["conformite"]["veto"] is False
     assert [j["name"] for j in result["judges"]] == JUDGES
+
+
+# --------------------------------------------------------------------------
+# Confiance par juge (SPEC-73d0)
+# --------------------------------------------------------------------------
+
+
+def consensus(value=7):
+    return uniform({"secret-id-0": value, "secret-id-1": value, "secret-id-2": value})
+
+
+def test_schema_requires_confidence_integer_0_100_in_both_rounds():
+    script = ScriptedJury({1: split_notes()})
+    run(script)
+    for rnd in (0, 1):  # tour 1 puis tour 2
+        for request in [c for c in script_requests(script, rnd)]:
+            item = request.schema["properties"]["candidates"]["items"]
+            assert "confidence" in item["required"]
+            assert item["properties"]["confidence"]["type"] == "integer"
+            assert item["properties"]["confidence"]["minimum"] == 0
+            assert item["properties"]["confidence"]["maximum"] == 100
+
+
+def script_requests(script, rnd):
+    """Requetes du tour ``rnd`` (0 : tour 1, 1 : tour 2) : on relit les
+    schemas via un FakeBackend dedie."""
+    fake = FakeBackend([script] * 12)
+    with llm.use_backend(fake):
+        jury.deliberate(candidates(), RUBRIC, config=make_config())
+    per_judge = defaultdict(list)
+    for request in fake.calls:
+        per_judge[request.usage].append(request)
+    return [requests[rnd] for requests in per_judge.values()]
+
+
+@pytest.mark.parametrize("bad", [None, -1, 101, 55.5, "80", True])
+def test_missing_or_out_of_bounds_confidence_is_an_invalid_answer(bad):
+    script = ScriptedJury({1: consensus()})
+
+    def broken(request):
+        answer = script(request)
+        if request.usage == "jury_monteur":
+            if bad is None:
+                del answer["candidates"][0]["confidence"]
+            else:
+                answer["candidates"][0]["confidence"] = bad
+        return answer
+
+    fake = FakeBackend([broken] * 12)
+    with llm.use_backend(fake), pytest.raises(llm.SchemaError):
+        jury.deliberate(candidates(), RUBRIC, config=make_config())
+
+
+def test_invalid_confidence_in_round_two_is_invalid_too():
+    script = ScriptedJury({1: split_notes()})
+
+    def broken(request):
+        answer = script(request)
+        if request.usage == "jury_monteur" and "## Debat" in request.prompt:
+            del answer["candidates"][0]["confidence"]
+        return answer
+
+    fake = FakeBackend([broken] * 12)
+    with llm.use_backend(fake), pytest.raises(llm.SchemaError):
+        jury.deliberate(candidates(), RUBRIC, config=make_config())
+
+
+def test_invalid_confidence_is_dropped_by_quorum_like_other_fields():
+    script = ScriptedJury({1: consensus()})
+
+    def broken(request):
+        answer = script(request)
+        if request.usage == "jury_monteur":
+            answer["candidates"][0]["confidence"] = 101
+        return answer
+
+    fake = FakeBackend([broken] * 12)
+    with llm.use_backend(fake):
+        result = jury.deliberate(candidates(), RUBRIC, config=make_config(jury_table={"quorum": 4}))
+    assert [f["judge"] for f in result["failed"]] == ["monteur"]
+
+
+def test_defaults_for_confidence_settings():
+    assert jury.CONFIG_DEFAULTS["debate_confidence_below"] == 40
+    assert jury.CONFIG_DEFAULTS["min_confidence_weight"] == 0.2
+
+
+def test_low_confidence_of_one_judge_triggers_the_debate_without_score_gap():
+    script = ScriptedJury({1: consensus()}, confidence={(1, "avocat", "secret-id-1"): 39})
+    result, fake = run(script)
+    assert result["debated"] == ["secret-id-1"]
+    assert len(fake.calls) == 10
+    assert by_id(result)["secret-id-0"]["debated"] is False
+
+
+def test_confidence_at_the_threshold_does_not_trigger_the_debate():
+    script = ScriptedJury({1: consensus()}, confidence={(1, "avocat", "secret-id-1"): 40})
+    result, fake = run(script)
+    assert result["debated"] == []
+    assert len(fake.calls) == 5
+
+
+def test_debate_confidence_threshold_is_configurable():
+    script = ScriptedJury({1: consensus()}, confidence={(1, "avocat", "secret-id-1"): 39})
+    result, _ = run(script, config=make_config(jury_table={"debate_confidence_below": 30}))
+    assert result["debated"] == []
+    script = ScriptedJury({1: consensus()}, confidence={(1, "avocat", "secret-id-1"): 55})
+    result, _ = run(script, config=make_config(jury_table={"debate_confidence_below": 60}))
+    assert result["debated"] == ["secret-id-1"]
+
+
+def test_score_gap_still_triggers_the_debate_with_high_confidence():
+    script = ScriptedJury({1: split_notes()})
+    result, _ = run(script)
+    assert result["debated"] == ["secret-id-1"]
+
+
+def test_weighted_median_with_confidence_numeric_case():
+    # hook : 2 (conf 100), 8 (conf 20), 8 (conf 20), 8 (conf 20), 8 (conf 20)
+    # poids 1, .2 x4 : total 1.8, moitie .9 : cumul 2 -> 1 > .9 => mediane 2
+    # (sans confiance : mediane 8).
+    table = {j: {"secret-id-0": {"hook": 8, "standalone": 5}} for j in JUDGES}
+    table["avocat"] = {"secret-id-0": {"hook": 2, "standalone": 5}}
+    conf = {(1, j, "secret-id-0"): 20 for j in JUDGES}
+    conf[(1, "avocat", "secret-id-0")] = 100
+    script = ScriptedJury({1: table}, confidence=conf)
+    config = make_config(jury_table={"threshold": 100, "debate_confidence_below": 0})
+    result, _ = run(script, cands=candidates(1), config=config)
+    assert result["candidates"][0]["scores"] == {"hook": 2, "standalone": 5}
+
+
+def test_confidence_weight_is_floored_by_min_confidence_weight():
+    # avocat conf 0 plancher .2 ; les 4 autres conf 100 (poids 1) : 2 reste minoritaire.
+    table = {j: {"secret-id-0": {"hook": 8, "standalone": 5}} for j in JUDGES}
+    table["avocat"] = {"secret-id-0": {"hook": 2, "standalone": 5}}
+    conf = {(1, j, "secret-id-0"): 100 for j in JUDGES}
+    conf[(1, "avocat", "secret-id-0")] = 0
+    script = ScriptedJury({1: table}, confidence=conf)
+    config = make_config(jury_table={"threshold": 100, "debate_confidence_below": 0})
+    result, _ = run(script, cands=candidates(1), config=config)
+    assert result["candidates"][0]["scores"]["hook"] == 8
+
+    # 2 juges a 9 sans confiance contre 3 a 1 sûrs (un script par appel : il est a etat).
+    def hook(config, nines):
+        table = {j: {"secret-id-0": {"hook": 9 if j in nines else 1, "standalone": 5}} for j in JUDGES}
+        conf = {(1, j, "secret-id-0"): 0 if j in nines else 100 for j in JUDGES}
+        result, _ = run(ScriptedJury({1: table}, confidence=conf), cands=candidates(1), config=config)
+        return result["candidates"][0]["scores"]["hook"]
+
+    base = {"threshold": 100, "debate_confidence_below": 0}
+    two, three = ("retention", "spectateur"), ("retention", "spectateur", "monteur")
+    # plancher .2 : les 9 pesent .4 (ou .6) contre 3 (ou 2) -> 1
+    assert hook(make_config(jury_table={**base, "min_confidence_weight": 0.2}), two) == 1
+    assert hook(make_config(jury_table={**base, "min_confidence_weight": 0.2}), three) == 1
+    # plancher 1 : poids egaux, 3 juges a 9 sur 5 -> 9 ; 2 sur 5 -> 1
+    assert hook(make_config(jury_table={**base, "min_confidence_weight": 1}), three) == 9
+    assert hook(make_config(jury_table={**base, "min_confidence_weight": 1}), two) == 1
+    # plancher .7 : 3 x .7 = 2.1 contre 2 x 1 -> 9 l'emporte
+    assert hook(make_config(jury_table={**base, "min_confidence_weight": 0.7}), three) == 9
+
+
+def test_weighted_median_is_deterministic():
+    table = {j: {"secret-id-0": {"hook": n * 2, "standalone": n}} for n, j in enumerate(JUDGES, 1)}
+    conf = {(1, j, "secret-id-0"): 10 * n for n, j in enumerate(JUDGES, 1)}
+    config = make_config(jury_table={"threshold": 100, "debate_confidence_below": 0})
+    first = run(ScriptedJury({1: table}, confidence=conf), cands=candidates(1), config=config)[0]
+    second = run(ScriptedJury({1: table}, confidence=conf), cands=candidates(1), config=config)[0]
+    assert first == second
+
+
+def test_confidence_multiplies_calibration_weight(tmp_path):
+    weights = tmp_path / "w.json"
+    weights.write_text(
+        json.dumps({"judges": {"retention": {"weight": 3.0}, "spectateur": {"weight": 1.0}, "monteur": {"weight": 1.0},
+                               "avocat": {"weight": 1.0}, "conformite": {"weight": 1.0}}}),
+        encoding="utf-8",
+    )
+    # retention 9 (poids 3 x conf 1.0 = 3) contre 4 juges a 1 (conf .5 -> .5 chacun = 2) : 9 l'emporte.
+    table = {j: {"secret-id-0": {"hook": 9 if j == "retention" else 1, "standalone": 5}} for j in JUDGES}
+    conf = {(1, j, "secret-id-0"): 100 if j == "retention" else 50 for j in JUDGES}
+    config = Config(
+        mode="auto", workspace_dir=Path("workspace"), output_dir=Path("output"),
+        _sections={"jury": {"threshold": 100, "debate_confidence_below": 0}, "jury_calibration": {"weights_path": str(weights)}},
+    )
+    result, _ = run(ScriptedJury({1: table}, confidence=conf), cands=candidates(1), config=config)
+    assert result["candidates"][0]["scores"]["hook"] == 9
+    # confiance de retention a 20 (poids 3 x .2 = .6 < 2) : 1 l'emporte.
+    conf[(1, "retention", "secret-id-0")] = 20
+    result, _ = run(ScriptedJury({1: table}, confidence=conf), cands=candidates(1), config=config)
+    assert result["candidates"][0]["scores"]["hook"] == 1
+
+
+@pytest.mark.parametrize("confidence", [0, 20, 55, 100])
+def test_equal_confidences_give_the_same_scores_as_the_plain_median(confidence):
+    notes = {
+        "retention": {"hook": 9, "standalone": 2},
+        "spectateur": {"hook": 8, "standalone": 4},
+        "monteur": {"hook": 3, "standalone": 6},
+        "avocat": {"hook": 7, "standalone": 5},
+        "conformite": {"hook": 6, "standalone": 10},
+    }
+    table = {j: {"secret-id-0": notes[j]} for j in JUDGES}
+    conf = {(1, j, "secret-id-0"): confidence for j in JUDGES}
+    config = make_config(jury_table={"threshold": 100, "debate_confidence_below": 0})
+    c = run(ScriptedJury({1: table}, confidence=conf), cands=candidates(1), config=config)[0]["candidates"][0]
+    assert c["scores"] == {"hook": 7, "standalone": 5}
+    assert c["score"] == 65.0
+
+
+def test_equal_confidences_with_an_even_number_of_judges_average_the_middle_values():
+    judges = {"conformite": {"enabled": False}}
+    notes = {j: {"hook": n, "standalone": n} for n, j in enumerate(["retention", "spectateur", "monteur", "avocat"], 1)}
+    table = {j: {"secret-id-0": notes[j]} for j in notes}
+    table["conformite"] = {"secret-id-0": 5}
+    conf = {(1, j, "secret-id-0"): 70 for j in JUDGES}
+    config = make_config(jury_table={"threshold": 100, "debate_confidence_below": 0, "judges": judges})
+    c = run(ScriptedJury({1: table}, confidence=conf), cands=candidates(1), config=config)[0]["candidates"][0]
+    assert c["scores"] == {"hook": 2.5, "standalone": 2.5}
+
+
+def test_journal_keeps_each_judges_confidence_per_round_and_the_aggregate():
+    # secret-id-1 : debat (avocat conf 30 au tour 1, 90 au tour 2).
+    conf = {(1, "avocat", "secret-id-1"): 30}
+    for j in JUDGES:
+        conf[(2, j, "secret-id-1")] = {"retention": 60, "spectateur": 70, "monteur": 80, "avocat": 90, "conformite": 100}[j]
+    script = ScriptedJury({1: consensus()}, confidence=conf)
+    result, _ = run(script)
+    c = by_id(result)["secret-id-1"]
+    r1, r2 = c["trace"]["rounds"]
+    assert r1["judges"]["avocat"]["confidence"] == 30
+    assert r1["judges"]["retention"]["confidence"] == DEFAULT_CONFIDENCE
+    assert [r2["judges"][j]["confidence"] for j in JUDGES] == [60, 70, 80, 90, 100]
+    # confiance agregee : mediane des confiances finales (tour 2)
+    assert c["confidence"] == 80
+    # candidat non debattu : confiances du tour 1
+    assert by_id(result)["secret-id-0"]["confidence"] == DEFAULT_CONFIDENCE
+    json.dumps(result)
+
+
+def test_result_records_the_confidence_settings():
+    result, _ = run(ScriptedJury({1: consensus()}))
+    assert result["debate_confidence_below"] == 40
+    assert result["min_confidence_weight"] == 0.2
+
+
+@pytest.mark.parametrize(
+    "table",
+    [
+        {"debate_confidence_below": -1},
+        {"debate_confidence_below": 101},
+        {"debate_confidence_below": "40"},
+        {"min_confidence_weight": 0},
+        {"min_confidence_weight": 1.5},
+        {"min_confidence_weight": "0.2"},
+    ],
+)
+def test_invalid_confidence_settings_are_refused(table):
+    with pytest.raises(jury.JuryError):
+        run(ScriptedJury({1: consensus()}), config=make_config(jury_table=table))
+
+
+def test_round_two_prompt_recalls_the_judges_round_one_confidence():
+    script = ScriptedJury({1: consensus()}, confidence={(1, "avocat", "secret-id-1"): 31})
+    run(script)
+    assert "confiance 31" in script.prompts["avocat"][1].lower()
 
 
 # --------------------------------------------------------------------------
