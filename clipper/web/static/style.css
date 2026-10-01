@@ -1458,3 +1458,16 @@ input[type="color"] { width: 36px; height: 36px; padding: 2px; border-radius: va
 /* Ecran Clips : marge interieure du panneau (onglets et vignettes plus colles aux bords). */
 #screen-clips [data-body] { padding: 20px 24px 24px; }
 @media (max-width: 900px) { #screen-clips [data-body] { padding: 16px; } }
+
+/* Formulaire « Nouvelle publication » (SPEC-1ed3) */
+.pub-form { width: min(720px, calc(100vw - 24px)); }
+.pub-form .modal-body { max-height: min(70vh, 640px); overflow-y: auto; }
+.pubf-clips { display: flex; flex-direction: column; gap: 6px; max-height: 240px; overflow-y: auto; padding: 4px; border: 1px solid var(--line, rgba(127,127,127,.25)); border-radius: 10px; }
+.pubf-clip { display: flex; align-items: center; gap: 10px; text-align: left; padding: 6px 8px; border-radius: 8px; border: 1px solid transparent; background: transparent; color: inherit; cursor: pointer; font: inherit; }
+.pubf-clip.on { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, transparent); }
+.pubf-clip-main { display: flex; flex-direction: column; flex: 1; min-width: 0; font-size: 13px; }
+.pubf-clip-main b, .pubf-clip-main span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pubf-clip .mini-clip { width: 32px; flex: none; }
+.pub-post-row { align-items: center; gap: 12px; flex-wrap: wrap; }
+.pub-post-row .li-sub.warn { color: var(--warn, #b7791f); }
+.pub-post-row .li-sub.bad { color: var(--bad, #c53030); }

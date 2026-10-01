@@ -580,9 +580,7 @@ def _publish_dir(config: Config) -> Path:
 def _publish_entries(config: Config, channel: str | None) -> dict[tuple[str, str], dict[str, Any]]:
     """Entrees de state/publish/<chaine>.json par (video_id, clip_id) ; un
     fichier illisible leve une 500 en francais, jamais un statut invente."""
-    if channel is None:
-        return {}
-    path = _publish_dir(config) / f"{channel}.json"
+    path = _publish_dir(config) / f"{channel or publish_mod.NO_CHANNEL}.json"  # sans chaine : file _sans_chaine
     if not path.is_file():
         return {}
     try:
@@ -610,7 +608,9 @@ def _tiktok_fields(entry: dict[str, Any] | None, video_id: str, clip_id: str) ->
     ``failed`` (avec capture et raison) ; None sans entree ou refusee."""
     entry = entry or {}
     status = entry.get("status")
-    if status in ("approved", "scheduled"):
+    if entry.get("in_progress_since") and status in ("approved", "scheduled"):
+        tiktok_status = "in_progress"  # le worker pilote TikTok : ni modifiable ni annulable
+    elif status in ("approved", "scheduled"):
         tiktok_status = "pending"
     elif status == "published":
         tiktok_status = "scheduled_on_tiktok" if entry.get("tiktok_state") == "scheduled_on_tiktok" else "published"
@@ -623,6 +623,8 @@ def _tiktok_fields(entry: dict[str, Any] | None, video_id: str, clip_id: str) ->
         "post_url": entry.get("post_url"), "post_id": entry.get("post_id"), "post_note": entry.get("post_note"),
         "tiktok_publish_at": entry.get("tiktok_publish_at"), "postponed_reason": entry.get("postponed_reason"),
         "account": entry.get("account"), "waiting_reason": entry.get("waiting_reason"),
+        "publish_mode": entry.get("publish_mode"), "post_options": entry.get("post_options") or {},
+        "editable": status in ("approved", "scheduled", "failed") and not entry.get("in_progress_since"),
         "capture_url": f"/api/publish/{video_id}/{clip_id}/capture" if entry.get("capture") else None,
     }
 
@@ -695,9 +697,13 @@ def _list_clip_views(config: Config, channel: str | None, video_id: str | None,
     return clips
 
 
-def _require_channel(video_id: str, clip_id: str, config: Config) -> str:
+def _require_channel(video_id: str, clip_id: str, config: Config, *, or_no_channel: bool = False) -> str:
+    """La chaîne d'une vidéo (409 sans chaîne). ``or_no_channel`` : une vidéo sans chaîne rend la file
+    ``_sans_chaine`` de ses publications pilotées (SPEC-1ed3 R3 : le compte suffit) — réessayer, capture."""
     channel = _channel_of(video_id, config)
     if channel is None:
+        if or_no_channel:
+            return publish_mod.NO_CHANNEL
         raise HTTPException(
             status_code=409,
             detail=f"la vidéo {video_id} n'a pas de chaîne : publier {clip_id} demande une chaîne (presets/<chaîne>.toml)",
@@ -1693,6 +1699,22 @@ def _account_resolve(config: Config, account_id: str) -> dict[str, Any]:
     return out
 
 
+class _LimitRefused(Exception):
+    """Plafond du compte depasse : 409 avec la raison et la prochaine heure possible (SPEC-1ed3 R4)."""
+
+    def __init__(self, detail: str, next_at: str | None) -> None:
+        super().__init__(detail)
+        self.detail, self.next_at = detail, next_at
+
+
+def _publication_settings(config: Config) -> dict[str, Any]:
+    """Reglages [tiktok] valides (plafonds, fenetre de programmation, reglages par defaut d'un post)."""
+    try:
+        return tiktok_mod.get_settings(config)
+    except tiktok_mod.TikTokError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
 def _publish_accounts(config: Config) -> list[dict[str, Any]]:
     """Comptes proposes a la publication : id, libelle, pret ou non (aucun secret, lisible hors du PC)."""
     return [{"id": a["id"], "label": a["label"], "ready_to_publish": a["ready_to_publish"]}
@@ -2022,7 +2044,7 @@ def create_app(config: Config | None = None) -> FastAPI:
     def _publish_action(video_id: str, clip_id: str, action: str, *args: Any, **kwargs: Any) -> dict[str, Any]:
         _validate_video_id(video_id)
         _validate_clip_id(clip_id)
-        channel = _require_channel(video_id, clip_id, config)
+        channel = _require_channel(video_id, clip_id, config, or_no_channel=action == "retry")
         try:
             return getattr(publish_mod, action)(video_id, clip_id, channel, *args, state_dir=_publish_dir(config), **kwargs)
         except publish_mod.PublishError as exc:
@@ -2065,13 +2087,115 @@ def create_app(config: Config | None = None) -> FastAPI:
     def publish_mode(video_id: str, clip_id: str, body: PublishModeBody) -> dict[str, Any]:
         return _publish_action(video_id, clip_id, "set_mode", body.mode)
 
+    # ----------------------------------------------------------------
+    # Publication pilotee (SPEC-1ed3) : formulaire « Nouvelle publication », suivi, modification, annulation
+    # ----------------------------------------------------------------
+
+    def _publication_call(fn, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return fn(*args, **kwargs)
+        except publish_mod.LimitError as exc:
+            raise _LimitRefused(str(exc), exc.next_at.isoformat() if exc.next_at else None) from exc
+        except publish_mod.PublishError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except channel_mod.ChannelError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (ConfigError, tiktok_mod.TikTokError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.exception_handler(_LimitRefused)
+    async def _publication_limit_handler(request: Request, exc: _LimitRefused) -> JSONResponse:
+        # un plafond depasse rend aussi la prochaine heure possible ({"detail": texte, "next_at": date ISO})
+        return JSONResponse({"detail": exc.detail, "next_at": exc.next_at}, status_code=409)
+
+    def _publication_scope() -> dict[str, Any]:
+        return {"output_dir": Path(config.output_dir), "state_dir": _publish_dir(config),
+                "presets_dir": _PRESETS_DIR, "base": _BASE_CONFIG,
+                "settings": _publication_settings(config)}
+
+    def _publication_view(channel: str, entry: dict[str, Any]) -> dict[str, Any]:
+        video_id, clip_id = entry["video_id"], entry["clip_id"]
+        video_channel = None if channel == publish_mod.NO_CHANNEL else channel
+        sidecar = _read_clip_sidecar(config, video_id, clip_id)
+        return _clip_view(sidecar, video_channel, entry)
+
+    @app.get("/api/publications")
+    def list_publications() -> dict[str, Any]:
+        """Toutes les entrees de publication (chaines et videos sans chaine) avec leur statut, plus ce qu'il faut
+        au formulaire : comptes (prets ou non), reglages par defaut, limites de programmation de TikTok."""
+        settings = _publication_settings(config)
+        rows = []
+        try:
+            found = publish_mod.all_entries(state_dir=_publish_dir(config), presets_dir=_PRESETS_DIR)
+        except publish_mod.PublishError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        for channel, entry in found:
+            if entry["status"] == "rejected":
+                continue
+            try:
+                rows.append(_publication_view(channel, entry))
+            except HTTPException:
+                rows.append(_publish_clip_view({}, channel, entry))
+        rows.sort(key=lambda r: r.get("slot_at") or "", reverse=True)
+        return {
+            "publications": rows,
+            "accounts": _publish_accounts(config),
+            "defaults": {
+                "options": {key: settings[key] for key in ("visibility", "allow_comments", "allow_reuse",
+                                                            "ai_generated", "content_check")},
+                "schedule_max_days": settings["schedule_max_days"],
+                "schedule_min_minutes": settings["schedule_min_minutes"],
+            },
+        }
+
+    @app.post("/api/publications", status_code=201)
+    def create_publication(body: PublicationBody) -> dict[str, Any]:
+        _validate_video_id(body.video_id)
+        _validate_clip_id(body.clip_id)
+        account = _require_ready_account(config, body.account)
+        publish_at = _publish_parse_slot(body.publish_at) if body.publish_at else None
+        channel = _channel_of(body.video_id, config)
+        entry = _publication_call(
+            publish_mod.create_post, body.video_id, body.clip_id, channel, account=account, mode=body.mode,
+            publish_at=publish_at, options=body.options, caption=body.description, hashtags=body.hashtags,
+            **_publication_scope())
+        return _publication_view(channel or publish_mod.NO_CHANNEL, entry)
+
+    @app.patch("/api/publications/{video_id}/{clip_id}")
+    def update_publication(video_id: str, clip_id: str, body: PublicationPatchBody) -> dict[str, Any]:
+        _validate_video_id(video_id)
+        _validate_clip_id(clip_id)
+        sent = body.model_fields_set
+        changes: dict[str, Any] = {}
+        if "account" in sent and body.account is not None:
+            changes["account"] = _require_ready_account(config, body.account)
+        if "mode" in sent and body.mode is not None:
+            changes["mode"] = body.mode
+        if "publish_at" in sent:
+            changes["publish_at"] = _publish_parse_slot(body.publish_at) if body.publish_at else None
+        if "options" in sent and body.options is not None:
+            changes["options"] = body.options
+        channel = _channel_of(video_id, config)
+        entry = _publication_call(
+            publish_mod.update_post, video_id, clip_id, channel, caption=body.description, hashtags=body.hashtags,
+            **changes, **_publication_scope())
+        return _publication_view(channel or publish_mod.NO_CHANNEL, entry)
+
+    @app.delete("/api/publications/{video_id}/{clip_id}", status_code=204)
+    def cancel_publication(video_id: str, clip_id: str) -> Response:
+        _validate_video_id(video_id)
+        _validate_clip_id(clip_id)
+        _publication_call(publish_mod.cancel_post, video_id, clip_id, _channel_of(video_id, config),
+                          state_dir=_publish_dir(config))
+        return Response(status_code=204)
+
     @app.get("/api/publish/{video_id}/{clip_id}/capture")
     def publish_capture(video_id: str, clip_id: str) -> FileResponse:
         """Capture d'ecran d'un arret sur (SPEC-9225 R4) : seulement un .png sous
         state/browser/<compte>/captures/, jamais un chemin lu ailleurs."""
         _validate_video_id(video_id)
         _validate_clip_id(clip_id)
-        channel = _require_channel(video_id, clip_id, config)
+        channel = _require_channel(video_id, clip_id, config, or_no_channel=True)
         entry = _publish_entries(config, channel).get((video_id, clip_id))
         captured = entry.get("capture") if entry else None
         if not captured:
@@ -2406,6 +2530,27 @@ class AccountBody(BaseModel):
 
 class PublishModeBody(BaseModel):
     mode: str | None = None
+
+
+class PublicationBody(BaseModel):
+    """Formulaire « Nouvelle publication » (SPEC-1ed3 R1, R2)."""
+    video_id: str
+    clip_id: str
+    account: str
+    mode: str
+    publish_at: str | None = None
+    options: dict[str, Any] | None = None
+    description: str | None = None
+    hashtags: list[str] | None = None
+
+
+class PublicationPatchBody(BaseModel):
+    account: str | None = None
+    mode: str | None = None
+    publish_at: str | None = None
+    options: dict[str, Any] | None = None
+    description: str | None = None
+    hashtags: list[str] | None = None
 
 
 def _publish_parse_slot(value: str) -> datetime:

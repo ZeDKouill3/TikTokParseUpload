@@ -831,3 +831,332 @@ def test_waiting_reason_is_set_once_and_cleared_by_publishing_failing_or_changin
     assert publish.list_entries("ma_chaine")[2]["waiting_reason"] is None
     with pytest.raises(publish.PublishError, match="absent de la file"):
         publish.set_waiting_reason("vid1", "99", "ma_chaine", "x")
+
+
+# --------------------------------------------------------------------------
+# SPEC-1ed3 : publication pilotee (create_post / update_post / cancel_post)
+# --------------------------------------------------------------------------
+
+NOW = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
+
+
+def _post(isolated_cwd, clip="03", channel="ma_chaine", **kwargs):
+    from clipper import publish
+
+    kwargs.setdefault("account", "compte1")
+    kwargs.setdefault("mode", "immediate")
+    kwargs.setdefault("now", NOW)
+    return publish.create_post("vid1", clip, channel, **kwargs)
+
+
+def _setup(cwd, preset=True, **sidecar):
+    _write_config(cwd)
+    if preset:
+        _write_preset(cwd, "ma_chaine")
+    _write_sidecar(cwd, "vid1", "03", **sidecar)
+
+
+def test_create_post_now_approves_implicitly_and_is_due_right_away(isolated_cwd):
+    _setup(isolated_cwd)
+
+    entry = _post(isolated_cwd)
+
+    assert entry["status"] == "scheduled"  # approbation implicite : jamais une etape « approved » a part
+    assert entry["publish_mode"] == "immediate"
+    assert entry["account"] == "compte1"
+    assert entry["slot_at"] == NOW.isoformat()  # due tout de suite
+    assert entry["decided_at"] == NOW.isoformat() and entry["manual"] is True
+    assert _read_state(isolated_cwd, "ma_chaine") == [entry]
+
+
+def test_create_post_scheduled_keeps_the_date_mode_and_post_options(isolated_cwd):
+    _setup(isolated_cwd)
+    when = datetime(2026, 10, 3, 18, 30, tzinfo=timezone.utc)
+    options = {"visibility": "friends", "allow_comments": False, "allow_reuse": True,
+               "ai_generated": True, "content_check": "wait"}
+
+    entry = _post(isolated_cwd, mode="scheduled", publish_at=when, options=options)
+
+    assert entry["slot_at"] == when.isoformat() and entry["publish_mode"] == "scheduled"
+    assert entry["post_options"] == options
+
+
+def test_a_video_without_channel_is_publishable_the_account_is_enough(isolated_cwd):
+    from clipper import publish
+
+    _setup(isolated_cwd, preset=False)
+
+    entry = _post(isolated_cwd, channel=None)
+
+    assert entry["status"] == "scheduled" and entry["account"] == "compte1"
+    assert _read_state(isolated_cwd, publish.NO_CHANNEL) == [entry]
+    assert publish.list_entries(publish.NO_CHANNEL) == [entry]
+
+
+def test_a_channel_without_slots_is_publishable_slots_are_never_required(isolated_cwd):
+    _setup(isolated_cwd)  # preset sans [[channel.slots]]
+    assert _post(isolated_cwd)["slot_at"] is not None
+
+
+def test_create_post_refuses_a_clip_not_ready_or_unknown(isolated_cwd):
+    from clipper import publish
+
+    _setup(isolated_cwd, ready=False)
+    with pytest.raises(publish.PublishError, match="non prêt|non pret"):
+        _post(isolated_cwd)
+    with pytest.raises(publish.PublishError, match="introuvable"):
+        _post(isolated_cwd, clip="99")
+
+
+@pytest.mark.parametrize("status", ["rejected", "published"])
+def test_create_post_refuses_rejected_and_published_clips(isolated_cwd, status):
+    from clipper import publish
+
+    _setup(isolated_cwd)
+    publish.approve("vid1", "03", "ma_chaine")
+    path = _state_file(isolated_cwd, "ma_chaine")
+    entries = json.loads(path.read_text(encoding="utf-8"))
+    entries[0]["status"] = status
+    path.write_text(json.dumps(entries), encoding="utf-8")
+
+    with pytest.raises(publish.PublishError, match=status):
+        _post(isolated_cwd)
+
+
+def test_create_post_accepts_a_clip_approved_the_old_way(isolated_cwd):
+    from clipper import publish
+
+    _setup(isolated_cwd)
+    publish.approve("vid1", "03", "ma_chaine")
+
+    entry = _post(isolated_cwd)
+
+    assert entry["status"] == "scheduled"
+    assert len(_read_state(isolated_cwd, "ma_chaine")) == 1  # remplace l'entree, pas de doublon
+
+
+def test_create_post_refuses_a_clip_already_in_the_queue(isolated_cwd):
+    from clipper import publish
+
+    _setup(isolated_cwd)
+    _post(isolated_cwd)
+    with pytest.raises(publish.PublishError, match="déjà"):
+        _post(isolated_cwd)
+
+
+def test_private_and_scheduled_is_refused_explicitly(isolated_cwd):
+    from clipper import publish
+
+    _setup(isolated_cwd)
+    with pytest.raises(publish.PublishError, match="privée.*programmée|programmée.*privée"):
+        _post(isolated_cwd, mode="scheduled", publish_at=datetime(2026, 10, 3, 9, 0, tzinfo=timezone.utc),
+              options={"visibility": "private"})
+    assert _read_state(isolated_cwd, "ma_chaine") == []
+    # privee + maintenant : permis
+    assert _post(isolated_cwd, options={"visibility": "private"})["post_options"]["visibility"] == "private"
+
+
+@pytest.mark.parametrize("kwargs, message", [
+    ({"mode": "scheduled"}, "date"),
+    ({"mode": "scheduled", "publish_at": datetime(2026, 10, 3, 9, 0)}, "fuseau"),
+    ({"mode": "scheduled", "publish_at": datetime(2026, 9, 30, 9, 0, tzinfo=timezone.utc)}, "passé"),
+    ({"mode": "scheduled", "publish_at": datetime(2026, 10, 1, 12, 5, tzinfo=timezone.utc)}, "15 minutes"),
+    ({"mode": "demain"}, "mode"),
+    ({"account": ""}, "compte"),
+    ({"options": {"visibility": "secret"}}, "visibility"),
+])
+def test_create_post_refuses_invalid_input_in_french(isolated_cwd, kwargs, message):
+    from clipper import publish
+
+    _setup(isolated_cwd)
+    with pytest.raises(publish.PublishError, match=message):
+        _post(isolated_cwd, **kwargs)
+    assert _read_state(isolated_cwd, "ma_chaine") == []
+
+
+def test_a_date_beyond_the_tiktok_window_is_accepted_and_kept(isolated_cwd):
+    _setup(isolated_cwd)
+    far = NOW.replace(month=11, day=20)  # > 10 jours : Clipper la garde
+
+    assert _post(isolated_cwd, mode="scheduled", publish_at=far)["slot_at"] == far.isoformat()
+
+
+def test_daily_cap_is_refused_with_the_reason_and_the_next_possible_time(isolated_cwd):
+    from clipper import publish, tiktok
+
+    _setup(isolated_cwd)
+    _write_sidecar(isolated_cwd, "vid1", "04")
+    settings = {**tiktok.CONFIG_DEFAULTS, "max_posts_per_day": 1, "min_gap_minutes": 0}
+    _post(isolated_cwd, settings=settings)
+
+    with pytest.raises(publish.LimitError) as err:
+        _post(isolated_cwd, clip="04", settings=settings)
+
+    assert "plafond de 1 publication" in str(err.value)
+    assert "prochaine heure possible" in str(err.value)
+    # lendemain 00:00 (fuseau de la chaine : Europe/Paris) : 2026-10-01 22:00 UTC
+    assert err.value.next_at == datetime(2026, 10, 1, 22, 0, tzinfo=timezone.utc)
+    assert len(_read_state(isolated_cwd, "ma_chaine")) == 1  # rien n'est ecrit, aucun report silencieux
+
+
+def test_min_gap_is_refused_and_the_next_time_respects_the_gap(isolated_cwd):
+    from clipper import publish, tiktok
+
+    _setup(isolated_cwd)
+    _write_sidecar(isolated_cwd, "vid1", "04")
+    settings = {**tiktok.CONFIG_DEFAULTS, "max_posts_per_day": 5, "min_gap_minutes": 120}
+    _post(isolated_cwd, settings=settings)
+
+    with pytest.raises(publish.LimitError, match="écart minimal") as err:
+        _post(isolated_cwd, clip="04", settings=settings, now=NOW.replace(minute=30))
+
+    assert err.value.next_at == NOW.replace(hour=14)
+    # a l'heure proposee, la creation passe
+    ok = _post(isolated_cwd, clip="04", settings=settings, now=NOW.replace(minute=30),
+               mode="scheduled", publish_at=err.value.next_at)
+    assert ok["slot_at"] == err.value.next_at.isoformat()
+
+
+def test_caps_count_the_accounts_posts_across_channels_and_pending_entries(isolated_cwd):
+    from clipper import publish, tiktok
+
+    _setup(isolated_cwd, preset=False)
+    _write_sidecar(isolated_cwd, "vid1", "04")
+    settings = {**tiktok.CONFIG_DEFAULTS, "max_posts_per_day": 1, "min_gap_minutes": 0}
+    _post(isolated_cwd, channel=None, settings=settings)  # compte1, file « sans chaine »
+    _write_preset(isolated_cwd, "ma_chaine")
+
+    with pytest.raises(publish.LimitError):  # meme compte, autre fichier de file
+        _post(isolated_cwd, clip="04", settings=settings)
+    assert _post(isolated_cwd, clip="04", settings=settings, account="compte2")["account"] == "compte2"
+
+
+def test_update_post_changes_time_account_options_and_revalidates(isolated_cwd):
+    from clipper import publish
+
+    _setup(isolated_cwd)
+    _post(isolated_cwd)
+    when = datetime(2026, 10, 4, 10, 0, tzinfo=timezone.utc)
+
+    entry = publish.update_post(
+        "vid1", "03", "ma_chaine", now=NOW, account="compte2", mode="scheduled", publish_at=when,
+        options={"visibility": "friends", "ai_generated": True})
+
+    assert (entry["account"], entry["publish_mode"], entry["slot_at"]) == ("compte2", "scheduled", when.isoformat())
+    assert entry["post_options"] == {"visibility": "friends", "ai_generated": True}
+    assert entry["waiting_reason"] is None
+    with pytest.raises(publish.PublishError, match="privée"):
+        publish.update_post("vid1", "03", "ma_chaine", now=NOW, options={"visibility": "private"})
+    assert _read_state(isolated_cwd, "ma_chaine") == [entry]
+
+
+def test_update_post_keeps_the_own_entry_out_of_the_cap(isolated_cwd):
+    from clipper import publish, tiktok
+
+    _setup(isolated_cwd)
+    settings = {**tiktok.CONFIG_DEFAULTS, "max_posts_per_day": 1, "min_gap_minutes": 0}
+    _post(isolated_cwd, settings=settings)
+    publish.update_post("vid1", "03", "ma_chaine", now=NOW, settings=settings, options={"allow_comments": False})
+
+
+def test_update_post_rewrites_the_caption_and_hashtags_in_the_sidecar(isolated_cwd):
+    from clipper import publish
+
+    _setup(isolated_cwd)
+    _post(isolated_cwd, caption="Nouvelle legende", hashtags=["#a", "#b"])
+    sidecar = _read_sidecar(isolated_cwd, "vid1", "03")
+    assert sidecar["caption"] == "Nouvelle legende" and sidecar["hashtags"] == ["#a", "#b"]
+    publish.update_post("vid1", "03", "ma_chaine", now=NOW, caption="Encore", hashtags=["#c"])
+    assert _read_sidecar(isolated_cwd, "vid1", "03")["caption"] == "Encore"
+
+
+def test_cancel_post_removes_the_entry_and_the_clip_is_to_validate_again(isolated_cwd):
+    from clipper import publish
+
+    _setup(isolated_cwd)
+    _post(isolated_cwd)
+
+    publish.cancel_post("vid1", "03", "ma_chaine")
+
+    assert _read_state(isolated_cwd, "ma_chaine") == []
+
+
+def test_an_entry_in_progress_can_be_neither_edited_nor_cancelled(isolated_cwd):
+    from clipper import publish
+
+    _setup(isolated_cwd)
+    _post(isolated_cwd)
+    entry = publish.mark_in_progress("vid1", "03", "ma_chaine", now=NOW)
+    assert entry["in_progress_since"] == NOW.isoformat()
+
+    with pytest.raises(publish.PublishError, match="en cours"):
+        publish.update_post("vid1", "03", "ma_chaine", now=NOW, account="compte2")
+    with pytest.raises(publish.PublishError, match="en cours"):
+        publish.cancel_post("vid1", "03", "ma_chaine")
+    with pytest.raises(publish.PublishError, match="en cours"):
+        publish.unschedule("vid1", "03", "ma_chaine")
+
+
+def test_a_published_entry_can_be_neither_edited_nor_cancelled(isolated_cwd):
+    from clipper import publish
+
+    _setup(isolated_cwd)
+    _post(isolated_cwd)
+    publish.mark_published("vid1", "03", "ma_chaine", now=NOW)
+
+    with pytest.raises(publish.PublishError, match="publi"):
+        publish.update_post("vid1", "03", "ma_chaine", now=NOW, account="compte2")
+    with pytest.raises(publish.PublishError, match="publi"):
+        publish.cancel_post("vid1", "03", "ma_chaine")
+
+
+def test_an_entry_scheduled_on_tiktok_is_not_cancelled_from_clipper(isolated_cwd):
+    from clipper import publish
+
+    _setup(isolated_cwd)
+    _post(isolated_cwd)
+    publish.mark_published("vid1", "03", "ma_chaine", now=NOW, tiktok_state="scheduled_on_tiktok",
+                           post_url=None, post_id=None, publish_at=NOW.isoformat(), account="compte1")
+    with pytest.raises(publish.PublishError, match="TikTok Studio"):
+        publish.cancel_post("vid1", "03", "ma_chaine")
+
+
+def test_in_progress_is_cleared_on_success_and_failure(isolated_cwd):
+    from clipper import publish
+
+    _setup(isolated_cwd)
+    _post(isolated_cwd)
+    publish.mark_in_progress("vid1", "03", "ma_chaine", now=NOW)
+    failed = publish.mark_failed("vid1", "03", "ma_chaine", "raison", now=NOW)
+    assert failed["in_progress_since"] is None
+    publish.retry("vid1", "03", "ma_chaine")
+    publish.mark_in_progress("vid1", "03", "ma_chaine", now=NOW)
+    done = publish.mark_published("vid1", "03", "ma_chaine", now=NOW)
+    assert done["in_progress_since"] is None
+
+
+def test_interrupted_entries_are_failed_with_an_explicit_reason(isolated_cwd):
+    from clipper import publish
+
+    _setup(isolated_cwd)
+    _post(isolated_cwd)
+    publish.mark_in_progress("vid1", "03", "ma_chaine", now=NOW)
+
+    assert publish.fail_interrupted("ma_chaine", now=NOW) == 1
+
+    entry = _read_state(isolated_cwd, "ma_chaine")[0]
+    assert entry["status"] == "failed" and "interrompue" in entry["error"] and entry["halted"] is False
+    assert publish.fail_interrupted("ma_chaine", now=NOW) == 0
+
+
+def test_all_entries_lists_every_channel_and_the_no_channel_file(isolated_cwd):
+    from clipper import publish
+
+    _setup(isolated_cwd)
+    _write_sidecar(isolated_cwd, "vid1", "04")
+    _post(isolated_cwd)
+    _post(isolated_cwd, clip="04", channel=None, account="compte2")
+
+    found = publish.all_entries()
+
+    assert sorted((c, e["clip_id"]) for c, e in found) == [(publish.NO_CHANNEL, "04"), ("ma_chaine", "03")]

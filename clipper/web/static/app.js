@@ -61,13 +61,16 @@ async function api(path, options, replayed) {
     return api(path, options, true);
   }
   if (!resp.ok) {
-    let detail = resp.statusText;
+    let detail = resp.statusText, payload = null;
     try {
-      detail = (await resp.json()).detail || detail;
+      payload = await resp.json();
+      detail = payload.detail || detail;
     } catch (err) {
       // reponse sans corps JSON : on garde le statusText.
     }
-    throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+    const failure = new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+    failure.body = payload; // champs en plus du detail (ex. next_at : prochaine heure possible d'une publication)
+    throw failure;
   }
   if (resp.status === 204) return null;
   return resp.json();

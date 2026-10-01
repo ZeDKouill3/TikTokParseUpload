@@ -291,6 +291,19 @@ class Worker:
         self._entry: dict[str, Any] | None = None
         self._last_beat: float | None = None
         self._recover_orphans()
+        self._recover_interrupted_publications()
+
+    def _recover_interrupted_publications(self) -> None:
+        """Une publication restee « en cours » d'un worker arrete en plein pilotage devient un echec explicite
+        et reessayable (SPEC-1ed3 R5), jamais bloquee en « en cours »."""
+        try:
+            watch = self.config.section("watch")
+            state_dir = self.config.section("publish")["state_dir"]
+            for name in [*channel_mod.list_channels(watch["presets_dir"]), publish_mod.NO_CHANNEL]:
+                if publish_mod.fail_interrupted(name, state_dir=state_dir):
+                    log.warning("%s : publication interrompue par l'arrêt du worker, passée en échec", name)
+        except (publish_mod.PublishError, channel_mod.ChannelError, ConfigError, OSError, ValueError) as exc:
+            log.error("reprise des publications interrompues impossible : %s", exc)
 
     def _beat(self) -> None:
         """Écrit ``{pid, at}`` dans ``heartbeat_path`` si ``heartbeat_interval_s``
@@ -424,8 +437,9 @@ class Worker:
         paths = {"state_dir": self.config.section("publish")["state_dir"],
                  "presets_dir": watch["presets_dir"], "base": watch["base_config"]}
         due = []
-        for name in channel_mod.list_channels(paths["presets_dir"]):
-            _config, channel = channel_mod.load_channel(name, presets_dir=paths["presets_dir"], base=paths["base"])
+        # la file des videos sans chaine (SPEC-1ed3 R3) est lue comme celle d'une chaine sans creneau ni compte
+        for name in [*channel_mod.list_channels(paths["presets_dir"]), publish_mod.NO_CHANNEL]:
+            channel = publish_mod.channel_settings(name, paths["presets_dir"], paths["base"])
             for entry in publish_mod.list_entries(name, state_dir=paths["state_dir"]):
                 if entry["status"] != "scheduled" or not entry["slot_at"]:
                     continue
@@ -448,7 +462,9 @@ class Worker:
         where = {"channel": name, "video_id": video_id, "clip_id": clip_id}
         if not account:
             self._fail(entry, name, f"chaîne {name} sans compte TikTok relié : renseigne [channel] tiktok_account "
-                       "dans son preset", halted=False, account=None, state_dir=paths["state_dir"])
+                       "dans son preset" if name != publish_mod.NO_CHANNEL else
+                       "aucun compte de publication choisi : modifie la publication et choisis un compte prêt à publier",
+                       halted=False, account=None, state_dir=paths["state_dir"])
             return False
         if not self._account_ready(entry, name, account, paths["state_dir"]):
             return False
@@ -459,6 +475,12 @@ class Worker:
         times = publish_mod.account_publish_times(account, **scope)
         tz = ZoneInfo(str(channel["timezone"]))
         blocked = tiktok.check_limits(times, slot if mode == "scheduled" else now, settings, tz)
+        if blocked is not None and entry.get("manual"):
+            # publication pilotee depuis l'ecran Publication : le plafond a deja ete verifie au formulaire ; s'il
+            # est depasse depuis, l'entree attend avec la raison, jamais reportee ni deplacee (SPEC-1ed3 R4)
+            self._wait(entry, name, account, f"{blocked} : la publication attend, modifie son heure ou annule-la",
+                       paths["state_dir"])
+            return False
         if blocked is not None:
             moved = publish_mod.postpone(
                 video_id, clip_id, name, blocked, now=now,
@@ -475,8 +497,10 @@ class Worker:
         try:
             clip = tiktok.clip_payload(publish_mod.read_sidecar(self.config.output_dir, video_id, clip_id),
                                        self.config.output_dir)
+            extra = {"options": entry["post_options"]} if entry.get("post_options") else {}
+            publish_mod.mark_in_progress(video_id, clip_id, name, state_dir=paths["state_dir"])
             result = self.publisher(clip, account, mode=mode, schedule_at=slot if mode == "scheduled" else None,
-                                    config=self.config, on_tick=self._beat)
+                                    config=self.config, on_tick=self._beat, **extra)
         except tiktok.TikTokStop as stop:
             self._fail(entry, name, stop.reason, halted=True, account=account, capture=stop.capture,
                        state_dir=paths["state_dir"])
