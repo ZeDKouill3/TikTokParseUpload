@@ -11,6 +11,11 @@ d'ecran sous ``state/browser/<compte>/captures/``). Jamais de resolution de capt
 jamais de clic de repli, jamais d'identifiant saisi : seuls la legende, la date et
 l'heure de programmation sont remplis.
 
+Fenetres surgissantes : celles du ``[popups]`` du toml (texte -> bouton) sont fermees et
+journalisees ; toute autre fenetre modale est un arret R4. Avant le clic final, la
+verification de contenu de TikTok doit conclure « Aucun probleme constate » (probleme ou
+delai ``content_check_timeout_s`` = arret R4, code ``content_check``).
+
 Tous les selecteurs et adresses vivent dans ``clipper/assets/tiktok_selectors.toml``
 (R5) ; aucun n'est ecrit ici. Rythme (R6) : delais aleatoires bornes entre actions,
 plafonds par compte (``check_limits``). Pas d'etape : bibliotheque (ADR-b16b), la
@@ -50,6 +55,9 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "schedule_min_minutes": 15,        # avance minimale native de TikTok Studio
     "action_timeout_s": 30,            # attente d'un element de la page
     "upload_timeout_s": 300,           # attente de la fin de l'envoi du mp4
+    "content_check_timeout_s": 900,    # attente du resultat de la verification de contenu (~10 min)
+    "poll_interval_s": 5,              # pas d'attente entre deux lectures de la verification
+    "type_delay_ms": 50,               # delai entre deux touches de la legende
     "events_path": "state/tiktok/events.json",
     "stats_interval_h": 24,            # releve periodique des statistiques par le worker (R7)
     "stats_dir": "state/stats/tiktok",  # un releve par compte : <stats_dir>/<compte>.json
@@ -61,10 +69,14 @@ BACKENDS = ("browser", "api")
 MAX_EVENTS = 50
 SELECTORS_PATH = Path(__file__).parent / "assets" / "tiktok_selectors.toml"
 REQUIRED_SELECTORS = (
-    "file_input", "upload_done", "caption_editor", "visibility_dropdown", "visibility_public",
-    "visibility_private", "schedule_toggle", "schedule_date_input", "schedule_time_input",
-    "post_button", "schedule_button", "success_marker", "post_link",
+    "file_input", "upload_done", "caption_editor", "advanced_settings", "visibility_dropdown",
+    "visibility_public", "visibility_private", "schedule_now", "schedule_later", "schedule_inputs",
+    "calendar_month_title", "calendar_year_title", "calendar_arrow", "calendar_day", "timepicker_hour",
+    "timepicker_minute", "schedule_picker_close", "content_check_running", "content_check_ok",
+    "content_check_problem", "post_button", "discard_button", "success_marker", "post_link",
 )
+MAX_POPUP_ROUNDS = 5   # fenetres successives fermees par un meme controle avant d'abandonner
+MAX_MONTH_STEPS = 24   # fleches du calendrier cliquees au plus avant d'abandonner
 REQUIRED_STATS_SELECTORS = ("row", "post_link", "views", "likes", "comments", "shares", "avg_watch", "watched_full")
 _DETECT_KINDS = ("captcha", "verification", "login")
 _COUNTS = ("views", "likes", "comments", "shares")
@@ -94,7 +106,8 @@ def get_settings(config: Config | None) -> dict[str, Any]:
             raise TikTokError(f"[tiktok] {key} invalide : {settings[key]!r} (attendu : {' | '.join(allowed)})")
     for key, minimum in (("max_posts_per_day", 1), ("min_gap_minutes", 0), ("min_action_delay_s", 0),
                          ("max_action_delay_s", 0), ("schedule_max_days", 1), ("schedule_min_minutes", 0),
-                         ("action_timeout_s", 1), ("upload_timeout_s", 1)):
+                         ("action_timeout_s", 1), ("upload_timeout_s", 1), ("content_check_timeout_s", 1),
+                         ("poll_interval_s", 1), ("type_delay_ms", 0)):
         value = settings[key]
         if isinstance(value, bool) or not isinstance(value, (int, float)) or value < minimum:
             raise TikTokError(f"[tiktok] {key} invalide : {value!r} (un nombre >= {minimum} est attendu)")
@@ -136,6 +149,18 @@ def load_selectors(path: str | Path | None = None) -> dict[str, Any]:
         need("selectors", key, str)
     for key in _DETECT_KINDS:
         need("detect", key, list)
+    need("labels", "post_now", str)
+    need("labels", "post_scheduled", str)
+    need("modal", "container", str)
+    need("modal", "button", str)
+    months = data.get("calendar", {}).get("months")
+    if not (isinstance(months, list) and len(months) == 12 and all(isinstance(m, str) and m for m in months)):
+        raise TikTokError(f"fichier de sélecteurs TikTok ({target.name}) : [calendar] months manquant ou invalide (12 noms de mois attendus)")
+    popups = data.get("popups")
+    if not (isinstance(popups, dict) and popups and all(
+            isinstance(k, str) and k and isinstance(v, str) and v and '"' not in v for k, v in popups.items())):
+        raise TikTokError(f"fichier de sélecteurs TikTok ({target.name}) : [popups] manquant ou invalide "
+                          f"(texte de la fenêtre -> libellé du bouton, sans guillemet double)")
     need("urls", "stats", str)
     need("expect", "stats_url_prefix", str)
     for key in REQUIRED_STATS_SELECTORS:
@@ -288,7 +313,7 @@ class _Flow:
         logger.error("TikTok %s : %s", self.account, reason)
         return TikTokStop(code, reason, capture)
 
-    def guard(self) -> None:
+    def guard(self, modals: bool = True) -> None:
         url = str(self.page.url)
         if any(marker in url for marker in self.sel["expect"]["login_url_markers"]):
             raise self.stop("login", f"connexion expirée : reconnecte le compte {self.account} (page : {url})")
@@ -298,6 +323,29 @@ class _Flow:
             for css in self.sel["detect"][code]:
                 if self.page.query_selector(css) is not None:
                     raise self.stop(code, label)
+        if modals:
+            self.close_popups()
+
+    def close_popups(self) -> None:
+        """Ferme les fenetres connues (``[popups]`` : texte -> bouton) et le journalise ; toute autre
+        fenetre modale est un arret R4 (jamais de clic de repli)."""
+        known = self.sel["popups"]
+        for _ in range(MAX_POPUP_ROUNDS):
+            shown = [m for m in self.page.query_selector_all(self.sel["modal"]["container"]) if m.is_visible()]
+            if not shown:
+                return
+            for modal in shown:
+                text = " ".join(str(modal.inner_text()).split())
+                fragment = next((f for f in known if f.casefold() in text.casefold()), None)
+                if fragment is None:
+                    raise self.stop("unexpected_page", f"fenêtre inattendue : {text[:150]!r}")
+                label = known[fragment]
+                button = modal.query_selector(self.sel["modal"]["button"].format(label=label))
+                if button is None:
+                    raise self.stop("element_missing", f"fenêtre connue « {fragment} » sans son bouton « {label} »")
+                button.click()
+                logger.info("TikTok %s : fenêtre connue « %s » fermée par « %s »", self.account, fragment, label)
+        raise self.stop("unexpected_page", f"fenêtres surgissantes qui reviennent après {MAX_POPUP_ROUNDS} fermetures")
 
     # -- actions
     def pause(self) -> None:
@@ -308,8 +356,8 @@ class _Flow:
             self.on_tick()
 
     def wait(self, name: str, *, timeout_key: str = "action_timeout_s", state: str | None = None,
-             table: str = "selectors") -> Any:
-        self.guard()
+             table: str = "selectors", modals: bool = True) -> Any:
+        self.guard(modals)
         timeout = float(self.settings[timeout_key])
         try:
             element = self.page.wait_for_selector(self.sel[table][name], timeout=timeout * 1000, state=state)
@@ -325,8 +373,141 @@ class _Flow:
         self.wait(name).click()
         self.pause()
 
-    def fill(self, name: str, text: str) -> None:
-        self.wait(name).fill(text)
+    def all(self, name: str) -> list[Any]:
+        """Tous les elements d'un selecteur, une fois le premier apparu."""
+        self.wait(name)
+        return list(self.page.query_selector_all(self.sel["selectors"][name]))
+
+    def type_caption(self, text: str) -> None:
+        """L'editeur Draft.js est pre-rempli du nom du fichier : clic, tout selectionner, effacer, puis
+        une touche a la fois (``fill`` n'est pas pris en compte par l'editeur)."""
+        self.wait("caption_editor").click()
+        keyboard = self.page.keyboard
+        keyboard.press("Control+A")
+        keyboard.press("Backspace")
+        for char in text:
+            keyboard.type(char, delay=int(self.settings["type_delay_ms"]))
+        self.pause()
+
+    def expand_settings(self) -> None:
+        """« Afficher plus » seulement si les parametres sont repliees (visibilite non affichee)."""
+        dropdown = self.page.query_selector(self.sel["selectors"]["visibility_dropdown"])
+        if dropdown is None or not dropdown.is_visible():
+            self.click("advanced_settings")
+
+    def schedule_now(self) -> None:
+        self.click("schedule_now")
+
+    def schedule_later(self, target: datetime) -> tuple[datetime, str | None]:
+        """Programmation par les champs de TikTok : Programmer, date (calendrier), heure (selecteur).
+        Rend l'instant reellement programme (minutes arrondies au pas propose) et une note ou None."""
+        local = target.astimezone()
+        self.click("schedule_later")
+        if len(self.all("schedule_inputs")) != 2 or ":" not in str(self.field(0).input_value()):
+            raise self.stop("unexpected_page", "champs de programmation inattendus : l'heure (valeur avec « : »), "
+                                               "puis la date, sont attendus")
+        self.field(1).click()
+        self.pause()
+        self.pick_date(local)
+        self.click("schedule_picker_close")
+        self.field(0).click()
+        self.pause()
+        minute = self.pick_time(local)
+        self.click("schedule_picker_close")
+        effective = local.replace(minute=minute, second=0, microsecond=0) if minute != local.minute else local
+        shown = (str(self.field(1).input_value()).strip(), str(self.field(0).input_value()).strip())
+        expected = (effective.strftime("%Y-%m-%d"), effective.strftime("%H:%M"))
+        if shown != expected:
+            raise self.stop("unexpected_page", f"programmation non prise en compte : {shown[0]} {shown[1]} affiché, "
+                                               f"{expected[0]} {expected[1]} attendu")
+        note = None
+        if minute != local.minute:
+            note = f"minutes arrondies au pas proposé par TikTok : {local.minute:02d} -> {minute:02d}"
+            logger.warning("TikTok %s : %s (heure demandée %s)", self.account, note, local.strftime("%H:%M"))
+        return effective, note
+
+    def field(self, index: int) -> Any:
+        """Champ de programmation (0 heure, 1 date), relu a chaque fois : la page les redessine."""
+        fields = self.page.query_selector_all(self.sel["selectors"]["schedule_inputs"])
+        if len(fields) != 2:
+            raise self.stop("unexpected_page", f"{len(fields)} champ(s) de programmation affiché(s), 2 attendus")
+        return fields[index]
+
+    def pick_date(self, target: datetime) -> None:
+        months = [m.casefold() for m in self.sel["calendar"]["months"]]
+        for _ in range(MAX_MONTH_STEPS + 1):
+            month_text = str(self.wait("calendar_month_title").inner_text()).strip()
+            year_text = str(self.wait("calendar_year_title").inner_text()).strip()
+            if month_text.casefold() not in months or not year_text.isdigit():
+                raise self.stop("unexpected_page", f"mois affiché illisible dans le calendrier : {month_text!r} {year_text!r}")
+            gap = (target.year - int(year_text)) * 12 + target.month - (months.index(month_text.casefold()) + 1)
+            if gap == 0:
+                break
+            arrows = self.all("calendar_arrow")
+            if len(arrows) < 2:
+                raise self.stop("element_missing", "flèches du calendrier absentes (2 attendues : précédent, suivant)")
+            arrows[1 if gap > 0 else 0].click()
+            self.pause()
+        else:
+            raise self.stop("unexpected_page", f"mois cible {target.year}-{target.month:02d} introuvable dans le calendrier")
+        for day in self.all("calendar_day"):
+            if str(day.inner_text()).strip() == str(target.day):
+                day.click()
+                self.pause()
+                return
+        raise self.stop("element_missing", f"jour {target.day} absent du calendrier ({target.strftime('%Y-%m')})")
+
+    def pick_time(self, target: datetime) -> int:
+        """Clique l'heure et la minute ; rend la minute choisie (la plus proche de la demandee
+        parmi celles que TikTok propose)."""
+        for option in self.all("timepicker_hour"):
+            if str(option.inner_text()).strip().isdigit() and int(str(option.inner_text()).strip()) == target.hour:
+                option.click()
+                self.pause()
+                break
+        else:
+            raise self.stop("element_missing", f"heure {target.hour:02d} absente du sélecteur d'heure")
+        offered = {int(t): o for o in self.all("timepicker_minute") if (t := str(o.inner_text()).strip()).isdigit()}
+        if not offered:
+            raise self.stop("element_missing", "minutes absentes du sélecteur d'heure")
+        minute = min(offered, key=lambda m: (abs(m - target.minute), m))
+        offered[minute].click()
+        self.pause()
+        return minute
+
+    def await_content_check(self) -> None:
+        """Avant le clic final : attend « Aucun probleme constate ». Probleme signale ou delai depasse :
+        arret R4 (code ``content_check``), jamais de publication d'un contenu non verifie."""
+        sel = self.sel["selectors"]
+        timeout, interval = float(self.settings["content_check_timeout_s"]), float(self.settings["poll_interval_s"])
+        waited = 0.0
+        while True:
+            self.guard()
+            problem = self.page.query_selector(sel["content_check_problem"])
+            if problem is not None:
+                detail = " ".join(str(problem.inner_text()).split())[:150]
+                raise self.stop("content_check", "vérification de contenu : problème signalé par TikTok"
+                                + (f" ({detail})" if detail else ""))
+            if self.page.query_selector(sel["content_check_ok"]) is not None:
+                logger.info("TikTok %s : vérification de contenu sans problème constaté", self.account)
+                return
+            if waited >= timeout:
+                raise self.stop("content_check", f"vérification de contenu non terminée après {timeout:g} s "
+                                                 f"([tiktok] content_check_timeout_s)")
+            self.page.wait_for_timeout(interval * 1000)
+            waited += interval
+            if self.on_tick is not None:
+                self.on_tick()
+
+    def post(self, mode: str) -> None:
+        """Le bouton final unique ; son texte doit correspondre au mode, sinon la page n'est pas dans l'etat voulu."""
+        button = self.wait("post_button")
+        expected = self.sel["labels"]["post_scheduled" if mode == "scheduled" else "post_now"]
+        label = " ".join(str(button.inner_text()).split())
+        if label != expected:
+            raise self.stop("unexpected_page", f"bouton final « {label} » au lieu de « {expected} » : "
+                                               f"la page n'est pas en mode {mode}")
+        button.click()
         self.pause()
 
     def run(self, clip: dict[str, Any], mode: str, schedule_at: datetime | None) -> dict[str, Any]:
@@ -342,21 +523,22 @@ class _Flow:
         self.wait("upload_done", timeout_key="upload_timeout_s")
         self.pause()
 
-        self.fill("caption_editor", " ".join([clip["caption"], *clip["hashtags"]]))
+        self.type_caption(" ".join([clip["caption"], *clip["hashtags"]]))
+        self.expand_settings()
         self.click("visibility_dropdown")
         self.click("visibility_" + str(self.settings["visibility"]))
 
+        effective, note = schedule_at, None
         if mode == "scheduled":
-            local = schedule_at.astimezone()
-            self.click("schedule_toggle")
-            self.fill("schedule_date_input", local.strftime("%Y-%m-%d"))
-            self.fill("schedule_time_input", local.strftime("%H:%M"))
-            self.click("schedule_button")
+            effective, note = self.schedule_later(schedule_at)
         else:
-            self.click("post_button")
+            self.schedule_now()
 
-        self.wait("success_marker")
-        return self.result(mode, schedule_at)
+        self.await_content_check()
+        self.post(mode)
+
+        self.wait("success_marker", modals=False)  # la confirmation peut etre une fenetre : pas de controle de fenetre
+        return self.result(mode, schedule_at, effective, note)
 
     def stats(self) -> list[dict[str, Any]]:
         """Releve les lignes de la liste des contenus (R7) : lecture seule, aucun clic."""
@@ -392,22 +574,24 @@ class _Flow:
                                 f"valeur illisible dans la ligne {number} ({key}) : {text!r}") from None
         return post
 
-    def result(self, mode: str, schedule_at: datetime | None) -> dict[str, Any]:
+    def result(self, mode: str, schedule_at: datetime | None, effective: datetime | None = None,
+               rounding: str | None = None) -> dict[str, Any]:
         url = None
         link = self.page.query_selector(self.sel["selectors"]["post_link"])
         if link is not None:
             url = link.get_attribute("href") or None
         match = _POST_ID.search(url) if url else None
-        note = None
+        notes = [rounding] if rounding else []
         if url is None:
-            note = ("post programmé : son adresse publique n'existe pas encore" if mode == "scheduled"
-                    else "lien du post introuvable dans la confirmation TikTok : à vérifier à la main")
+            notes.append("post programmé : son adresse publique n'existe pas encore" if mode == "scheduled"
+                         else "lien du post introuvable dans la confirmation TikTok : à vérifier à la main")
+        when = (effective if rounding else schedule_at) if mode == "scheduled" else self.now
         return {
             "post_url": url,
             "post_id": match.group(1) if match else None,
             "state": "scheduled_on_tiktok" if mode == "scheduled" else "published",
-            "publish_at": (schedule_at if mode == "scheduled" else self.now).isoformat(),
-            "note": note,
+            "publish_at": when.isoformat(),
+            "note": " ; ".join(notes) or None,
         }
 
 

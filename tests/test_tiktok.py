@@ -34,8 +34,10 @@ def _sel() -> dict:
 
 
 class FakeElement:
-    def __init__(self, page, selector, href=None):
+    def __init__(self, page, selector, href=None, text="", value=None, on_click=None, visible=True):
         self.page, self.selector, self.href = page, selector, href
+        self.text, self.value, self.on_click, self.visible = text, value, on_click, visible
+        self.children: dict[str, "FakeElement"] = {}
 
     def click(self, **kwargs):
         self.page.calls.append(("click", self.selector))
@@ -43,6 +45,8 @@ class FakeElement:
             raise RuntimeError("Target page, context or browser has been closed")
         for added in self.page.after_click.get(self.selector, ()):
             self.page.present.add(added)
+        if self.on_click is not None:
+            self.on_click()
 
     def fill(self, text, **kwargs):
         self.page.calls.append(("fill", self.selector, text))
@@ -50,15 +54,64 @@ class FakeElement:
     def get_attribute(self, name):
         return self.href if name == "href" else None
 
+    def inner_text(self):
+        return self.text() if callable(self.text) else self.text
+
+    def input_value(self):
+        return self.value() if callable(self.value) else self.value
+
+    def is_visible(self):
+        return self.visible and self.selector not in self.page.hidden
+
+    def query_selector(self, selector):
+        return self.children.get(selector)
+
+
+class FakeKeyboard:
+    def __init__(self, page):
+        self.page = page
+
+    def press(self, key, **kwargs):
+        self.page.calls.append(("press", key))
+
+    def type(self, text, **kwargs):
+        self.page.calls.append(("type", text))
+
+
+class FakeModal(FakeElement):
+    """Une fenetre surgissante : un bouton par libelle ; le clic la ferme."""
+
+    def __init__(self, page, text, labels):
+        super().__init__(page, _sel()["modal"]["container"], text=text)
+        self.labels = list(labels)
+        template = _sel()["modal"]["button"]
+        for label in labels:
+            self.children[template.format(label=label)] = FakeElement(
+                page, template.format(label=label), on_click=lambda label=label: self.close(label))
+
+    def close(self, label):
+        self.page.modals.remove(self)
+        self.page.popups_closed.append(label)
+
 
 class FakePage:
     """``present`` : selecteurs actuellement affiches ; ``redirect`` : adresse
-    reelle apres goto ; ``after_click`` : selecteur clique -> selecteurs qui apparaissent."""
+    reelle apres goto ; ``after_click`` : selecteur clique -> selecteurs qui apparaissent ;
+    ``texts`` / ``lists`` : texte d'un selecteur, elements d'un query_selector_all ;
+    ``timeline`` : une fonction par ``wait_for_timeout`` (l'etat de la page evolue)."""
 
     def __init__(self, present, *, redirect=None, link=LINK, screenshot_error=None):
         self.present = set(present)
         self.redirect, self.link, self.screenshot_error = redirect, link, screenshot_error
         self.after_click: dict[str, list[str]] = {}
+        self.texts: dict[str, str] = {}
+        self.lists: dict[str, list[FakeElement]] = {}
+        self.hidden: set[str] = set()
+        self.modals: list[FakeModal] = []
+        self.popups_closed: list[str] = []
+        self.timeline: list = []
+        self.waits = 0
+        self.keyboard = FakeKeyboard(self)
         self.fail_click = False
         self.url = "about:blank"
         self.calls: list[tuple] = []
@@ -67,14 +120,29 @@ class FakePage:
         self.calls.append(("goto", url))
         self.url = self.redirect or url
 
+    def make(self, selector):
+        return FakeElement(self, selector, href=self.link, text=self.texts.get(selector, ""))
+
     def query_selector(self, selector):
-        return FakeElement(self, selector, href=self.link) if selector in self.present else None
+        return self.make(selector) if selector in self.present else None
+
+    def query_selector_all(self, selector):
+        if selector == _sel()["modal"]["container"]:
+            return list(self.modals)
+        return list(self.lists.get(selector, []))
 
     def wait_for_selector(self, selector, timeout=None, state=None):
         self.calls.append(("wait", selector))
         if selector not in self.present:
             raise TimeoutError(f"Timeout {timeout}ms exceeded waiting for {selector}")
-        return FakeElement(self, selector, href=self.link)
+        return self.make(selector)
+
+    def wait_for_timeout(self, ms):
+        self.calls.append(("poll", ms))
+        step = self.timeline[self.waits] if self.waits < len(self.timeline) else None
+        self.waits += 1
+        if step is not None:
+            step()
 
     def set_input_files(self, selector, path, **kwargs):
         self.calls.append(("upload", selector, str(path)))
@@ -90,6 +158,9 @@ class FakePage:
     def fills(self):
         return [c for c in self.calls if c[0] == "fill"]
 
+    def typed(self):
+        return [c[1] for c in self.calls if c[0] == "type"]
+
 
 class FakeContext:
     def __init__(self, page):
@@ -99,21 +170,128 @@ class FakeContext:
         return self.page
 
 
-def _happy_present(selectors=None) -> set[str]:
-    return set((selectors or _sel())["selectors"].values())
+MONTHS = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août", "septembre", "octobre",
+          "novembre", "décembre"]
+
+
+class StudioPage(FakePage):
+    """TikTok Studio simule : repliement des parametres, visibilite, Maintenant/Programmer, calendrier
+    (mois navigable par fleches), selecteur d'heure, verification de contenu, bouton final unique."""
+
+    def __init__(self, *, folded=False, calendar=(2026, 10), minute_step=5, check="ok", **kwargs):
+        super().__init__(set(), **kwargs)
+        sel = _sel()["selectors"]
+        self.s = sel
+        self.cal = list(calendar)
+        self.time_value, self.date_value = "10:00", "2026-10-01"
+        self.mode = "now"
+        self.posted: list[str] = []
+        self.arrows: list[str] = []
+        self.present |= {sel[k] for k in ("file_input", "upload_done", "caption_editor", "advanced_settings",
+                                          "visibility_public", "visibility_private", "schedule_now",
+                                          "schedule_later", "post_button", "discard_button", "schedule_picker_close")}
+        if folded:
+            self.present.add(sel["advanced_settings"])
+            self.after_click[sel["advanced_settings"]] = [sel["visibility_dropdown"]]
+        else:
+            self.present.add(sel["visibility_dropdown"])
+        self.after_click[sel["post_button"]] = [sel["success_marker"], sel["post_link"]]
+        self.set_check(check)
+        # Programmer / Maintenant : le texte du bouton final suit
+        self.on_click = {sel["schedule_later"]: self.choose_scheduled, sel["schedule_now"]: self.choose_now}
+        self.texts[sel["post_button"]] = _sel()["labels"]["post_now"]
+        self.time_el = FakeElement(self, sel["schedule_inputs"], value=lambda: self.time_value,
+                                   on_click=lambda: self.open("time"))
+        self.date_el = FakeElement(self, sel["schedule_inputs"], value=lambda: self.date_value,
+                                   on_click=lambda: self.open("date"))
+        self.minute_step = minute_step
+
+    # -- verification de contenu
+    def set_check(self, check):
+        sel = self.s
+        for key in ("content_check_running", "content_check_ok", "content_check_problem"):
+            self.present.discard(sel[key])
+        self.present.add({"ok": sel["content_check_ok"], "running": sel["content_check_running"],
+                          "problem": sel["content_check_problem"]}[check])
+
+    # -- elements
+    def make(self, selector):
+        sel = self.s
+        if selector == sel["post_button"]:
+            return FakeElement(self, selector, text=self.texts[selector], on_click=lambda: self.posted.append(self.mode))
+        if selector == sel["calendar_month_title"]:
+            return FakeElement(self, selector, text=lambda: MONTHS[self.cal[1] - 1])
+        if selector == sel["calendar_year_title"]:
+            return FakeElement(self, selector, text=lambda: str(self.cal[0]))
+        if selector == sel["schedule_picker_close"]:
+            return FakeElement(self, selector, on_click=self.close_pickers)
+        element = super().make(selector)
+        element.on_click = self.on_click.get(selector)
+        return element
+
+    def choose_scheduled(self):
+        self.mode = "scheduled"
+        self.texts[self.s["post_button"]] = _sel()["labels"]["post_scheduled"]
+        self.present.add(self.s["schedule_inputs"])
+
+    def choose_now(self):
+        self.mode = "now"
+        self.texts[self.s["post_button"]] = _sel()["labels"]["post_now"]
+
+    def open(self, which):
+        sel = self.s
+        names = (("calendar_month_title", "calendar_year_title", "calendar_arrow", "calendar_day") if which == "date"
+                 else ("timepicker_hour", "timepicker_minute"))
+        self.present |= {sel[k] for k in names}
+
+    def close_pickers(self):
+        sel = self.s
+        for key in ("calendar_month_title", "calendar_year_title", "calendar_arrow", "calendar_day",
+                    "timepicker_hour", "timepicker_minute"):
+            self.present.discard(sel[key])
+
+    def query_selector_all(self, selector):
+        sel = self.s
+        if selector == sel["schedule_inputs"]:
+            return [self.time_el, self.date_el] if selector in self.present else []
+        if selector == sel["calendar_arrow"] and selector in self.present:
+            return [FakeElement(self, selector, on_click=lambda: self.arrow(-1)),
+                    FakeElement(self, selector, on_click=lambda: self.arrow(+1))]
+        if selector == sel["calendar_day"] and selector in self.present:
+            return [FakeElement(self, selector, text=str(d), on_click=lambda d=d: self.pick_day(d))
+                    for d in range(1, 31)]
+        if selector == sel["timepicker_hour"] and selector in self.present:
+            return [FakeElement(self, selector, text=f"{h:02d}", on_click=lambda h=h: self.pick_time(hour=h))
+                    for h in range(24)]
+        if selector == sel["timepicker_minute"] and selector in self.present:
+            return [FakeElement(self, selector, text=f"{m:02d}", on_click=lambda m=m: self.pick_time(minute=m))
+                    for m in range(0, 60, self.minute_step)]
+        return super().query_selector_all(selector)
+
+    def arrow(self, delta):
+        self.arrows.append("next" if delta > 0 else "prev")
+        index = self.cal[0] * 12 + self.cal[1] - 1 + delta
+        self.cal = [index // 12, index % 12 + 1]
+
+    def pick_day(self, day):
+        self.date_value = f"{self.cal[0]}-{self.cal[1]:02d}-{day:02d}"
+
+    def pick_time(self, hour=None, minute=None):
+        h, m = self.time_value.split(":")
+        self.time_value = f"{hour if hour is not None else int(h):02d}:{minute if minute is not None else int(m):02d}"
 
 
 class Env:
-    """Une publication complete contre une fausse page."""
+    """Une publication complete contre un TikTok Studio simule."""
 
     def __init__(self, tmp_path, monkeypatch, *, remove=(), detect=None, page_kwargs=None, settings=None):
         monkeypatch.chdir(tmp_path)
-        present = _happy_present()
+        self.page = StudioPage(**(page_kwargs or {}))
         for name in remove:
-            present.discard(_sel()["selectors"][name])
+            self.page.present.discard(_sel()["selectors"][name])
+            self.page.after_click.pop(_sel()["selectors"][name], None)
         for kind in (detect or ()):
-            present.add(_sel()["detect"][kind][0])
-        self.page = FakePage(present, **(page_kwargs or {}))
+            self.page.present.add(_sel()["detect"][kind][0])
         self.opened: list[tuple] = []
         self.sleeps: list[float] = []
         self.ticks = 0
@@ -187,31 +365,115 @@ def test_immediate_publish_uploads_mp4_with_caption_and_hashtags_and_returns_the
     assert env.opened == [("ma_chaine", False)]  # navigateur visible (ADR-1a58)
     assert env.page.calls[0] == ("goto", _sel()["urls"]["upload"])
     assert ("upload", sel["file_input"], str(env.mp4)) in env.page.calls
-    assert env.page.fills() == [("fill", sel["caption_editor"], "Ma legende #un #deux")]
-    assert env.page.clicks() == [sel["visibility_dropdown"], sel["visibility_public"], sel["post_button"]]
+    assert ("wait", sel["upload_done"]) in env.page.calls  # fin d'envoi : conteneur « Importé »
+    assert env.page.clicks() == [sel["caption_editor"], sel["visibility_dropdown"], sel["visibility_public"],
+                                 sel["schedule_now"], sel["post_button"]]
+    assert env.page.posted == ["now"]  # un seul bouton final
     assert result == {"post_url": LINK, "post_id": "7300000000000000001", "state": "published",
                       "publish_at": NOW.isoformat(), "note": None}
+
+
+def test_the_caption_is_cleared_then_typed_one_character_at_a_time_never_filled(env):
+    env.publish()
+
+    keys = [c for c in env.page.calls if c[0] in ("press", "type")]
+    text = "Ma legende #un #deux"
+    assert keys[:2] == [("press", "Control+A"), ("press", "Backspace")]  # pre-rempli du nom du fichier : vide
+    assert keys[2:] == [("type", ch) for ch in text]
+    assert env.page.fills() == []  # pas de fill sur l'editeur Draft.js
+    first_click = env.page.calls.index(("click", _sel()["selectors"]["caption_editor"]))
+    assert first_click < env.page.calls.index(("press", "Control+A"))
 
 
 def test_private_visibility_selects_the_private_option(tmp_path, monkeypatch):
     env = Env(tmp_path, monkeypatch, settings={"visibility": "private"})
     env.publish()
     sel = _sel()["selectors"]
-    assert env.page.clicks() == [sel["visibility_dropdown"], sel["visibility_private"], sel["post_button"]]
+    assert env.page.clicks() == [sel["caption_editor"], sel["visibility_dropdown"], sel["visibility_private"],
+                                 sel["schedule_now"], sel["post_button"]]
 
 
-def test_scheduled_publish_fills_the_date_and_clicks_schedule(env):
-    when = NOW + timedelta(days=2)
+def test_folded_settings_are_expanded_with_show_more_only_when_needed(tmp_path, monkeypatch):
+    sel = _sel()["selectors"]
+    folded = Env(tmp_path, monkeypatch, page_kwargs={"folded": True})
+    folded.publish()
+    assert folded.page.clicks()[:2] == [sel["caption_editor"], sel["advanced_settings"]]
+
+    open_ = Env(tmp_path, monkeypatch)
+    open_.publish()
+    assert sel["advanced_settings"] not in open_.page.clicks()
+
+
+def test_visibility_options_are_targeted_by_option_id_with_the_text_as_fallback():
+    sel = _sel()["selectors"]
+    for key, option_id, text in (("visibility_public", '0', "Tout le monde"), ("visibility_private", '1', "Toi uniquement")):
+        assert f"option-\"{option_id}\"" in sel[key] and text in sel[key]
+    assert "video_visibility_container" in sel["visibility_dropdown"] and "combobox" in sel["visibility_dropdown"]
+
+
+def test_scheduled_publish_sets_the_time_and_date_through_the_pickers(env):
+    when = (NOW + timedelta(days=2)).astimezone().replace(hour=15, minute=30, second=0, microsecond=0)
     result = env.publish("scheduled", when)
 
     sel = _sel()["selectors"]
-    local = when.astimezone()
-    assert env.page.clicks() == [sel["visibility_dropdown"], sel["visibility_public"],
-                                 sel["schedule_toggle"], sel["schedule_button"]]
-    assert ("fill", sel["schedule_date_input"], local.strftime("%Y-%m-%d")) in env.page.fills()
-    assert ("fill", sel["schedule_time_input"], local.strftime("%H:%M")) in env.page.fills()
+    assert env.page.clicks() == [sel["caption_editor"], sel["visibility_dropdown"], sel["visibility_public"],
+                                 sel["schedule_later"], sel["schedule_inputs"], sel["calendar_day"],
+                                 sel["schedule_picker_close"], sel["schedule_inputs"], sel["timepicker_hour"],
+                                 sel["timepicker_minute"], sel["schedule_picker_close"], sel["post_button"]]
+    assert env.page.fills() == []
+    assert (env.page.date_value, env.page.time_value) == (when.strftime("%Y-%m-%d"), "15:30")
+    assert env.page.posted == ["scheduled"]  # le meme bouton, devenu « Programmer »
+    assert env.page.arrows == []  # meme mois : aucune fleche
     assert result["state"] == "scheduled_on_tiktok"
-    assert result["publish_at"] == when.isoformat()
+    assert result["publish_at"] == when.isoformat() and result["note"] is None
+
+
+@pytest.mark.parametrize("start, target_days, arrows", [
+    ((2026, 10), 35, ["next"]),                 # 5 novembre : un mois plus tard
+    ((2027, 1), 35, ["prev", "prev"]),          # le calendrier affiche janvier 2027 : deux fleches arriere
+    ((2026, 11), 35, []),
+])
+def test_scheduled_publish_navigates_months_with_the_arrows_to_the_target_month(tmp_path, monkeypatch, start, target_days, arrows):
+    env = Env(tmp_path, monkeypatch, page_kwargs={"calendar": start}, settings={"schedule_max_days": 40})
+    when = (NOW + timedelta(days=target_days)).astimezone().replace(hour=9, minute=15, second=0, microsecond=0)
+
+    env.publish("scheduled", when)
+
+    assert env.page.arrows == arrows
+    assert env.page.date_value == when.strftime("%Y-%m-%d")
+    assert env.page.time_value == "09:15"
+
+
+def test_scheduled_minutes_are_rounded_to_the_step_offered_by_tiktok_and_logged(tmp_path, monkeypatch, caplog):
+    env = Env(tmp_path, monkeypatch, page_kwargs={"minute_step": 15})
+    when = (NOW + timedelta(days=2)).astimezone().replace(hour=12, minute=7, second=0, microsecond=0)
+
+    with caplog.at_level("WARNING"):
+        result = env.publish("scheduled", when)
+
+    assert env.page.time_value == "12:00"
+    assert "07" in caplog.text and "00" in caplog.text and "arrondi" in caplog.text
+    assert result["publish_at"] == when.replace(minute=0).isoformat()  # l'instant reellement programme
+    assert "arrondi" in result["note"]
+
+
+def test_a_hidden_or_wrong_schedule_field_is_an_unexpected_page_stop_not_a_guess(tmp_path, monkeypatch):
+    env = Env(tmp_path, monkeypatch)
+    env.page.time_value = "pas une heure"  # le premier champ n'est pas l'heure (« : » attendu)
+    with pytest.raises(tiktok.TikTokStop) as stop:
+        env.publish("scheduled", NOW + timedelta(days=2))
+    assert stop.value.code == "unexpected_page" and "heure" in str(stop.value)
+    assert env.page.posted == []
+
+
+def test_the_final_button_label_must_match_the_mode(tmp_path, monkeypatch):
+    env = Env(tmp_path, monkeypatch)
+    env.page.on_click[_sel()["selectors"]["schedule_now"]] = lambda: env.page.texts.__setitem__(
+        _sel()["selectors"]["post_button"], "Programmer")  # la page est restee sur « Programmer »
+    with pytest.raises(tiktok.TikTokStop) as stop:
+        env.publish()
+    assert stop.value.code == "unexpected_page" and "Publier" in str(stop.value)
+    assert env.page.posted == []
 
 
 def test_scheduled_beyond_schedule_max_days_is_refused_before_opening_the_browser(env):
@@ -239,7 +501,8 @@ def test_unknown_mode_missing_mp4_and_empty_account_are_refused(env):
 
 
 def test_missing_post_link_is_recorded_with_a_note_not_invented(tmp_path, monkeypatch):
-    env = Env(tmp_path, monkeypatch, remove=("post_link",))
+    env = Env(tmp_path, monkeypatch)
+    env.page.after_click[_sel()["selectors"]["post_button"]] = [_sel()["selectors"]["success_marker"]]
     result = env.publish()
     assert result["post_url"] is None and result["post_id"] is None
     assert "lien" in result["note"]
@@ -262,6 +525,7 @@ def test_clip_payload_reads_mp4_caption_and_hashtags_from_the_sidecar(tmp_path):
     ("login_marker", {"page_kwargs": {"redirect": "https://www.tiktok.com/login?redirect=x"}}, "login", "connexion expirée"),
     ("login_form", {"detect": ["login"]}, "login", "connexion expirée"),
     ("missing_element", {"remove": ["caption_editor"]}, "element_missing", "caption_editor"),
+    ("content_check_failed", {"page_kwargs": {"check": "problem"}}, "content_check", "problème"),
     ("unexpected_page", {"page_kwargs": {"redirect": "https://www.tiktok.com/error"}}, "unexpected_page", "page inattendue"),
 ])
 def test_r4_stops_immediately_with_a_screenshot_and_never_acts_blindly(tmp_path, monkeypatch, case, kwargs, code, words):
@@ -285,8 +549,6 @@ def test_r4_captcha_appearing_mid_flow_stops_before_the_post_click(tmp_path, mon
     env = Env(tmp_path, monkeypatch)
     sel = _sel()
     env.page.after_click[sel["selectors"]["visibility_dropdown"]] = [sel["detect"]["captcha"][0]]
-    env.config = Config(mode="review", workspace_dir=Path("w"), output_dir=Path("o"),
-                        _sections={"tiktok": {"visibility": "private"}})
 
     with pytest.raises(tiktok.TikTokStop) as stop:
         env.publish()
@@ -311,16 +573,145 @@ def test_r4_a_failed_screenshot_is_stated_in_the_reason(tmp_path, monkeypatch):
     assert "capture d'écran impossible" in str(stop.value) and "disque plein" in str(stop.value)
 
 
-def test_only_the_caption_and_schedule_fields_are_ever_filled_never_credentials(tmp_path, monkeypatch):
+def test_only_the_caption_and_the_schedule_pickers_are_ever_typed_never_credentials(tmp_path, monkeypatch):
     for kwargs in ({"detect": ["login"]}, {"detect": ["captcha"]}, {}):
         env = Env(tmp_path, monkeypatch, **kwargs)
         try:
-            env.publish()
+            env.publish("scheduled", NOW + timedelta(days=2))
         except tiktok.TikTokStop:
             pass
-        sel = _sel()["selectors"]
-        allowed = {sel["caption_editor"], sel["schedule_date_input"], sel["schedule_time_input"]}
-        assert {f[1] for f in env.page.fills()} <= allowed
+        assert env.page.fills() == []
+        assert "".join(env.page.typed()) in ("", "Ma legende #un #deux")  # la legende, rien d'autre
+
+
+# ---------------------------------------------------------------- verification de contenu (criteres 4 et 7)
+
+
+def test_content_check_in_progress_then_ok_waits_before_the_final_click(tmp_path, monkeypatch):
+    env = Env(tmp_path, monkeypatch, page_kwargs={"check": "running"})
+    sel = _sel()["selectors"]
+
+    def finished():
+        env.page.set_check("ok")
+
+    env.page.timeline = [lambda: None, lambda: None, finished]
+
+    result = env.publish()
+
+    assert env.page.waits == 3
+    assert env.page.posted == ["now"] and result["state"] == "published"
+    polls = [i for i, c in enumerate(env.page.calls) if c[0] == "poll"]
+    post = env.page.calls.index(("click", sel["post_button"]))
+    assert polls and max(polls) < post  # attente terminee AVANT le clic final
+    assert env.ticks >= env.page.waits  # le battement du worker continue pendant l'attente
+
+
+def test_content_check_problem_is_an_explicit_r4_failure_and_nothing_is_posted(tmp_path, monkeypatch):
+    env = Env(tmp_path, monkeypatch, page_kwargs={"check": "running"})
+    env.page.timeline = [lambda: env.page.set_check("problem")]
+
+    with pytest.raises(tiktok.TikTokStop) as stop:
+        env.publish()
+
+    assert stop.value.code == "content_check" and "problème" in str(stop.value)
+    assert stop.value.capture is not None and stop.value.capture.is_file()
+    assert env.page.posted == [] and _sel()["selectors"]["post_button"] not in env.page.clicks()
+
+
+def test_content_check_timeout_is_an_explicit_r4_failure(tmp_path, monkeypatch):
+    env = Env(tmp_path, monkeypatch, page_kwargs={"check": "running"},
+              settings={"content_check_timeout_s": 10, "poll_interval_s": 5})
+
+    with pytest.raises(tiktok.TikTokStop) as stop:
+        env.publish()
+
+    assert stop.value.code == "content_check"
+    assert "10 s" in str(stop.value) and "content_check_timeout_s" in str(stop.value)
+    assert env.page.waits == 2 and env.page.posted == []
+
+
+def test_content_check_timeout_defaults_to_900_seconds_and_is_validated(tmp_path):
+    assert tiktok.CONFIG_DEFAULTS["content_check_timeout_s"] == 900
+    for bad in (0, -1, "900", True):
+        config = Config(mode="review", workspace_dir=tmp_path, output_dir=tmp_path,
+                        _sections={"tiktok": {"content_check_timeout_s": bad}})
+        with pytest.raises(tiktok.TikTokError, match="content_check_timeout_s"):
+            tiktok.get_settings(config)
+
+
+def test_content_check_is_also_awaited_for_a_scheduled_post(tmp_path, monkeypatch):
+    env = Env(tmp_path, monkeypatch, page_kwargs={"check": "running"})
+    env.page.timeline = [lambda: env.page.set_check("ok")]
+    env.publish("scheduled", NOW + timedelta(days=2))
+    assert env.page.waits == 1 and env.page.posted == ["scheduled"]
+
+
+# ---------------------------------------------------------------- fenetres surgissantes (criteres 5 et 7)
+
+
+def test_known_popups_are_closed_with_their_button_and_logged(tmp_path, monkeypatch, caplog):
+    env = Env(tmp_path, monkeypatch)
+    env.page.modals = [
+        FakeModal(env.page, "Activer les vérifications automatiques du contenu ?\nAnnuler Activer", ["Annuler", "Activer"]),
+        FakeModal(env.page, "Nouvelles fonctionnalités d'édition ajoutées\nJ'ai compris", ["J'ai compris"]),
+    ]
+
+    with caplog.at_level("INFO"):
+        result = env.publish()
+
+    assert env.page.popups_closed == ["Annuler", "J'ai compris"]  # Annuler : jamais « Activer »
+    assert env.page.modals == []
+    assert "Activer les vérifications automatiques" in caplog.text and "Annuler" in caplog.text
+    assert "Nouvelles fonctionnalités" in caplog.text and "J'ai compris" in caplog.text
+    assert result["state"] == "published"
+
+
+def test_a_known_popup_appearing_mid_flow_is_closed_before_the_next_action(tmp_path, monkeypatch):
+    env = Env(tmp_path, monkeypatch)
+    sel = _sel()["selectors"]
+    modal = FakeModal(env.page, "Nouvelles fonctionnalités d'édition ajoutées", ["J'ai compris"])
+    env.page.on_click[sel["schedule_now"]] = lambda: env.page.modals.append(modal)
+
+    env.publish()
+
+    assert env.page.popups_closed == ["J'ai compris"] and env.page.posted == ["now"]
+
+
+def test_an_unknown_modal_window_is_an_r4_stop_and_is_never_clicked(tmp_path, monkeypatch):
+    env = Env(tmp_path, monkeypatch)
+    env.page.modals = [FakeModal(env.page, "Votre compte a été restreint\nOK", ["OK"])]
+
+    with pytest.raises(tiktok.TikTokStop) as stop:
+        env.publish()
+
+    assert stop.value.code == "unexpected_page"
+    assert "fenêtre" in str(stop.value) and "Votre compte a été restreint" in str(stop.value)
+    assert stop.value.capture is not None and stop.value.capture.is_file()
+    assert env.page.popups_closed == [] and env.page.posted == []  # jamais de clic de repli
+
+
+def test_a_known_popup_without_its_button_is_an_r4_stop(tmp_path, monkeypatch):
+    env = Env(tmp_path, monkeypatch)
+    env.page.modals = [FakeModal(env.page, "Activer les vérifications automatiques du contenu ?", ["Activer"])]
+
+    with pytest.raises(tiktok.TikTokStop) as stop:
+        env.publish()
+
+    assert stop.value.code == "element_missing" and "Annuler" in str(stop.value)
+    assert env.page.popups_closed == []  # « Activer » n'est pas le bouton prevu : pas cliqué
+
+
+def test_a_popup_that_keeps_coming_back_is_an_r4_stop(tmp_path, monkeypatch):
+    env = Env(tmp_path, monkeypatch)
+
+    class Stubborn(FakeModal):
+        def close(self, label):
+            self.page.popups_closed.append(label)  # reste affichee
+
+    env.page.modals = [Stubborn(env.page, "Nouvelles fonctionnalités d'édition ajoutées", ["J'ai compris"])]
+    with pytest.raises(tiktok.TikTokStop) as stop:
+        env.publish()
+    assert stop.value.code == "unexpected_page" and "fenêtre" in str(stop.value)
 
 
 def test_a_missing_chrome_is_a_browser_error_not_a_stop(tmp_path, monkeypatch):
@@ -397,13 +788,38 @@ def test_check_limits_caps_posts_per_day_and_enforces_the_min_gap():
 # ---------------------------------------------------------------- (5) selecteurs hors du code
 
 
-def test_selectors_file_is_marked_to_verify_and_has_every_key():
+def test_selectors_file_says_what_is_verified_for_real_and_what_is_not():
     text = SELECTORS.read_text(encoding="utf-8")
-    assert "A VERIFIER SUR LA VRAIE PAGE" in text
+    header = text.split("version =", 1)[0]
+    assert "VERIFIE EN REEL" in header and "A VERIFIER SUR LA VRAIE PAGE" in header
+    assert "confirmation apres publication" in header.lower().replace("é", "e").replace("è", "e")
     data = tomllib.loads(text)
     for key in tiktok.REQUIRED_SELECTORS:
         assert data["selectors"][key]
     assert data["urls"]["upload"].startswith("https://")
+
+
+def test_selectors_file_carries_the_real_markers_of_tiktok_studio():
+    sel = _sel()["selectors"]
+    assert "upload_status_container" in sel["upload_done"] and "Importé" in sel["upload_done"]
+    assert "caption_container" in sel["caption_editor"] and "contenteditable" in sel["caption_editor"]
+    assert "advanced_settings_container" in sel["advanced_settings"]
+    assert "schedule_container" in sel["schedule_now"] and "Maintenant" in sel["schedule_now"]
+    assert "schedule_container" in sel["schedule_later"] and "Programmer" in sel["schedule_later"]
+    assert "schedule_container" in sel["schedule_inputs"] and "TUXTextInputCore-input" in sel["schedule_inputs"]
+    assert "month-title" in sel["calendar_month_title"] and "year-title" in sel["calendar_year_title"]
+    assert "arrow" in sel["calendar_arrow"] and "day" in sel["calendar_day"] and "valid" in sel["calendar_day"]
+    assert "tiktok-timepicker-left" in sel["timepicker_hour"] and "tiktok-timepicker-right" in sel["timepicker_minute"]
+    assert sel["post_button"] == "button[data-e2e='post_video_button']"
+    assert sel["discard_button"] == "button[data-e2e='discard_post_button']"
+    assert "upload_status_success" not in str(_sel()) and "schedule_video_button" not in str(_sel())
+    assert "privacy_container" not in str(_sel()) and "schedule_radio" not in str(_sel())
+    assert _sel()["labels"] == {"post_now": "Publier", "post_scheduled": "Programmer"}
+    assert _sel()["popups"] == {
+        "Activer les vérifications automatiques du contenu": "Annuler",
+        "Nouvelles fonctionnalités d'édition ajoutées": "J'ai compris",
+    }
+    assert len(_sel()["calendar"]["months"]) == 12
 
 
 def test_missing_selector_key_or_file_is_an_explicit_error(tmp_path):
@@ -414,6 +830,19 @@ def test_missing_selector_key_or_file_is_an_explicit_error(tmp_path):
         tiktok.load_selectors(bad)
     with pytest.raises(tiktok.TikTokError, match="introuvable"):
         tiktok.load_selectors(tmp_path / "absent.toml")
+
+
+@pytest.mark.parametrize("table", ["popups", "modal", "calendar", "labels"])
+def test_a_missing_popup_modal_calendar_or_label_table_is_an_explicit_error(tmp_path, table):
+    import re
+
+    text = SELECTORS.read_text(encoding="utf-8")
+    broken = re.sub(rf"^\[{table}\]\n(?:(?!\[).*\n)*", "", text, flags=re.M)
+    assert broken != text
+    bad = tmp_path / "s.toml"
+    bad.write_text(broken, encoding="utf-8")
+    with pytest.raises(tiktok.TikTokError, match=table):
+        tiktok.load_selectors(bad)
 
 
 def test_no_selector_or_url_is_hardcoded_in_tiktok_py():
