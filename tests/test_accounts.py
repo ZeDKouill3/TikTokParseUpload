@@ -484,3 +484,318 @@ def test_accounts_screen_has_the_spec_features():
 def test_accounts_screen_never_persists_secrets_in_the_browser():
     js = (STATIC / "screens" / "accounts.js").read_text(encoding="utf-8")
     assert "localStorage" not in js and "sessionStorage" not in js
+
+
+# --------------------------------------------------------------------------
+# SPEC-00d1 R3, R6 : case « pret a publier », connexion verifiee, decochage automatique
+# --------------------------------------------------------------------------
+
+CONNECTED = {"state": "connected", "checked_at": "2026-10-01T10:00:00+00:00", "expires_at": None}
+
+
+def _login(state, at="2026-10-01T11:00:00+00:00"):
+    return {"state": state, "checked_at": at, "expires_at": None}
+
+
+def test_a_new_account_is_never_connected_and_not_ready(config, vault):
+    account = accounts.add_account(config, {"label": "Compte"})
+
+    assert account["ready_to_publish"] is False and account["login"] is None and account["ready_note"] is None
+    assert "has_password" in account  # les champs d'avant restent
+
+
+def test_ready_is_refused_without_a_verified_connection_with_the_reason(config, vault):
+    account = accounts.add_account(config, {"label": "Compte"})
+
+    with pytest.raises(accounts.AccountsError, match="connexion TikTok non vérifiée"):
+        accounts.set_ready(config, account["id"], True)
+    accounts.record_login(config, account["id"], _login("never"))
+    with pytest.raises(accounts.AccountsError, match="connexion TikTok non vérifiée"):
+        accounts.set_ready(config, account["id"], True)
+    accounts.record_login(config, account["id"], _login("expired"))
+    with pytest.raises(accounts.AccountsError, match="session TikTok expirée"):
+        accounts.set_ready(config, account["id"], True)
+    assert accounts.list_accounts(config)[0]["ready_to_publish"] is False
+
+
+def test_ready_is_accepted_once_connected_and_can_be_cleared(config, vault):
+    account = accounts.add_account(config, {"label": "Compte"})
+    accounts.record_login(config, account["id"], CONNECTED)
+
+    assert accounts.set_ready(config, account["id"], True)["ready_to_publish"] is True
+    assert accounts.list_accounts(config)[0]["ready_to_publish"] is True
+    assert accounts.set_ready(config, account["id"], False)["ready_to_publish"] is False
+
+
+def test_ready_needs_a_boolean_and_a_known_account(config, vault):
+    account = accounts.add_account(config, {"label": "Compte"})
+    with pytest.raises(accounts.AccountsError, match="booléen"):
+        accounts.set_ready(config, account["id"], "oui")
+    with pytest.raises(accounts.AccountNotFound):
+        accounts.set_ready(config, "inconnu", False)
+
+
+def test_the_ready_flag_cannot_be_set_by_the_generic_update(config, vault):
+    account = accounts.add_account(config, {"label": "Compte"})
+    accounts.record_login(config, account["id"], CONNECTED)
+
+    with pytest.raises(accounts.AccountsError, match="champ"):
+        accounts.update_account(config, account["id"], {"ready_to_publish": True})
+    with pytest.raises(accounts.AccountsError, match="champ"):
+        accounts.update_account(config, account["id"], {"login": CONNECTED})
+
+
+def test_an_expired_session_unchecks_ready_by_itself_logged_and_shown(config, vault, caplog):
+    account = accounts.add_account(config, {"label": "Compte"})
+    accounts.record_login(config, account["id"], CONNECTED)
+    accounts.set_ready(config, account["id"], True)
+
+    with caplog.at_level(logging.WARNING):
+        result = accounts.record_login(config, account["id"], _login("expired"))
+
+    assert result["auto_unchecked"] is True and result["ready_to_publish"] is False
+    assert "décoché automatiquement" in result["ready_note"] and "session TikTok expirée" in result["ready_note"]
+    assert any("prêt à publier" in r.message and account["id"] in r.message for r in caplog.records)
+    stored = accounts.list_accounts(config)[0]
+    assert stored["ready_to_publish"] is False and stored["ready_note"] == result["ready_note"]
+    assert stored["login"]["state"] == "expired"
+
+
+def test_a_vanished_session_cookie_of_a_connected_account_counts_as_expired(config, vault):
+    account = accounts.add_account(config, {"label": "Compte"})
+    accounts.record_login(config, account["id"], CONNECTED)
+    accounts.set_ready(config, account["id"], True)
+
+    result = accounts.record_login(config, account["id"], _login("never"))  # Chrome a purge le cookie expire
+
+    assert result["login"]["state"] == "expired" and result["auto_unchecked"] is True
+
+
+def test_a_still_connected_check_keeps_ready_and_unchecking_is_not_repeated(config, vault):
+    account = accounts.add_account(config, {"label": "Compte"})
+    accounts.record_login(config, account["id"], CONNECTED)
+    accounts.set_ready(config, account["id"], True)
+
+    again = accounts.record_login(config, account["id"], _login("connected", "2026-10-01T12:00:00+00:00"))
+    assert again["ready_to_publish"] is True and again["auto_unchecked"] is False
+    assert again["login"]["checked_at"] == "2026-10-01T12:00:00+00:00"
+
+    accounts.record_login(config, account["id"], _login("expired"))
+    second = accounts.record_login(config, account["id"], _login("expired"))
+    assert second["auto_unchecked"] is False  # deja decoche : pas de nouveau decochage
+
+
+def test_an_r4_stop_unchecks_ready_until_the_user_ticks_it_again(config, vault, caplog):
+    account = accounts.add_account(config, {"label": "Compte"})
+    accounts.record_login(config, account["id"], CONNECTED)
+    accounts.set_ready(config, account["id"], True)
+
+    with caplog.at_level(logging.WARNING):
+        assert accounts.uncheck_ready(config, account["id"], "arrêt de publication : captcha détecté") is True
+    stored = accounts.list_accounts(config)[0]
+    assert stored["ready_to_publish"] is False and "captcha détecté" in stored["ready_note"]
+    assert "captcha détecté" in caplog.text
+    assert accounts.uncheck_ready(config, account["id"], "encore") is False  # deja decoche
+    assert accounts.set_ready(config, account["id"], True)["ready_note"] is None  # recoche : la note disparait
+
+
+def test_record_login_rejects_an_unknown_state(config, vault):
+    account = accounts.add_account(config, {"label": "Compte"})
+    with pytest.raises(accounts.AccountsError, match="état de connexion invalide"):
+        accounts.record_login(config, account["id"], {"state": "peut-etre"})
+
+
+def test_ready_and_login_never_carry_a_password(config, vault):
+    account = accounts.add_account(config, NEW)
+    accounts.record_login(config, account["id"], CONNECTED)
+    accounts.set_ready(config, account["id"], True)
+
+    assert PWD not in Path("state/accounts.json").read_text(encoding="utf-8")
+    assert PWD not in json.dumps(accounts.list_accounts(config))
+
+
+# ---- routes : connexion verifiee a l'ouverture, case refusee, ecran Comptes
+
+
+@pytest.fixture
+def cookies():
+    """Lecture de cookies simulee : ``cookies.set(account, [...])`` ; aucun profil, aucun navigateur."""
+    from clipper import browser
+
+    class Reader:
+        def __init__(self):
+            self.by_account, self.error = {}, None
+
+        def set(self, account, rows):
+            self.by_account[account] = rows
+            profile = Path("state/browser") / account
+            profile.mkdir(parents=True, exist_ok=True)
+            (profile / "Local State").write_text("{}", encoding="utf-8")
+
+        def __call__(self, account):
+            if self.error:
+                raise browser.BrowserError(self.error)
+            return self.by_account.get(account, [])
+
+    reader = Reader()
+    browser.use_cookie_reader(reader)
+    yield reader
+    browser.use_cookie_reader(None)
+
+
+def _session(days=30, name="sessionid"):
+    from datetime import datetime, timedelta, timezone
+
+    return {"name": name, "domain": ".tiktok.com",
+            "expires": (datetime.now(timezone.utc) + timedelta(days=days)).timestamp()}
+
+
+def test_the_accounts_list_verifies_each_connection_on_opening(config, vault, cookies):
+    connected = accounts.add_account(config, {"label": "Connecté"})
+    never = accounts.add_account(config, {"label": "Jamais"})
+    expired = accounts.add_account(config, {"label": "Expiré"})
+    cookies.set(connected["id"], [_session()])
+    cookies.set(expired["id"], [_session(days=-2)])
+
+    rows = {a["label"]: a for a in local_client(config).get("/api/accounts").json()}
+
+    assert rows["Connecté"]["login"]["state"] == "connected" and rows["Connecté"]["ready_blocked_reason"] is None
+    assert rows["Connecté"]["login"]["expires_at"] and rows["Connecté"]["login"]["checked_at"]
+    assert rows["Jamais"]["login"]["state"] == "never" and "non vérifiée" in rows["Jamais"]["ready_blocked_reason"]
+    assert rows["Expiré"]["login"]["state"] == "expired" and "expirée" in rows["Expiré"]["ready_blocked_reason"]
+    assert never["id"] == rows["Jamais"]["id"]
+    assert accounts.list_accounts(config)[0]["login"]["state"] == "connected"  # enregistre
+
+
+def test_the_api_refuses_to_tick_ready_without_a_verified_connection_with_a_message(config, vault, cookies):
+    account = accounts.add_account(config, {"label": "Compte"})
+    c = local_client(config)
+
+    resp = c.put(f"/api/accounts/{account['id']}/ready", json={"ready": True})
+
+    assert resp.status_code == 422 and "prêt à publier" in resp.json()["detail"]
+    assert "connexion TikTok non vérifiée" in resp.json()["detail"]
+    assert accounts.list_accounts(config)[0]["ready_to_publish"] is False
+
+
+def test_the_api_ticks_ready_after_the_connection_is_verified_and_unticks(config, vault, cookies):
+    account = accounts.add_account(config, {"label": "Compte"})
+    cookies.set(account["id"], [_session()])
+    c = local_client(config)
+
+    ok = c.put(f"/api/accounts/{account['id']}/ready", json={"ready": True})
+    assert ok.status_code == 200 and ok.json()["ready_to_publish"] is True
+    off = c.put(f"/api/accounts/{account['id']}/ready", json={"ready": False})
+    assert off.status_code == 200 and off.json()["ready_to_publish"] is False
+
+
+def test_ticking_ready_rechecks_the_cookies_now_not_a_stale_state(config, vault, cookies):
+    account = accounts.add_account(config, {"label": "Compte"})
+    cookies.set(account["id"], [_session()])
+    c = local_client(config)
+    c.get("/api/accounts")  # etat « connecte » enregistre
+    cookies.set(account["id"], [_session(days=-1)])  # la session expire entre-temps
+
+    resp = c.put(f"/api/accounts/{account['id']}/ready", json={"ready": True})
+
+    assert resp.status_code == 422 and "expirée" in resp.json()["detail"]
+
+
+def test_ticking_ready_with_unreadable_cookies_is_refused_explicitly(config, vault, cookies):
+    account = accounts.add_account(config, {"label": "Compte"})
+    cookies.set(account["id"], [_session()])
+    cookies.error = "cookies du profil illisibles : ferme la fenêtre Chrome de ce compte"
+
+    resp = local_client(config).put(f"/api/accounts/{account['id']}/ready", json={"ready": True})
+
+    assert resp.status_code == 409 and "ferme la fenêtre Chrome" in resp.json()["detail"]
+
+
+def test_ready_route_validates_the_body_and_the_account(config, vault, cookies):
+    account = accounts.add_account(config, {"label": "Compte"})
+    c = local_client(config)
+
+    assert c.put(f"/api/accounts/{account['id']}/ready", json={"ready": "oui", "x": 1}).status_code == 422
+    assert c.put(f"/api/accounts/{account['id']}/ready", json={"ready": "oui"}).status_code == 422
+    assert c.put("/api/accounts/inconnu/ready", json={"ready": False}).status_code == 404
+    assert c.put(f"/api/accounts/{account['id']}/ready", content=b"{", headers={"Content-Type": "application/json"}).status_code == 422
+
+
+def test_ready_route_is_local_only_like_the_other_account_routes(config, vault, cookies):
+    account = accounts.add_account(config, {"label": "Compte"})
+    remote = TestClient(create_app(config=config), base_url="http://exemple.invalid", client=("203.0.113.5", 50000))
+
+    assert remote.put(f"/api/accounts/{account['id']}/ready", json={"ready": False}).status_code == 403
+
+
+def test_opening_the_screen_unticks_ready_when_the_session_expired_and_notifies_the_console(config, vault, cookies):
+    from clipper import tiktok
+
+    account = accounts.add_account(config, {"label": "Compte"})
+    cookies.set(account["id"], [_session()])
+    c = local_client(config)
+    assert c.put(f"/api/accounts/{account['id']}/ready", json={"ready": True}).status_code == 200
+    cookies.set(account["id"], [_session(days=-1)])
+
+    row = c.get("/api/accounts").json()[0]
+
+    assert row["ready_to_publish"] is False and "session TikTok expirée" in row["ready_note"]
+    assert row["ready_blocked_reason"] and "expirée" in row["ready_blocked_reason"]
+    event = tiktok.read_events(config=config)[-1]
+    assert event["level"] == "warn" and event["account"] == account["id"] and "décoché" in event["reason"]
+
+
+def test_unreadable_cookies_on_opening_keep_the_known_state_and_say_so(config, vault, cookies):
+    account = accounts.add_account(config, {"label": "Compte"})
+    cookies.set(account["id"], [_session()])
+    c = local_client(config)
+    c.put(f"/api/accounts/{account['id']}/ready", json={"ready": True})
+    cookies.error = "cookies du profil illisibles : ferme la fenêtre Chrome de ce compte"
+
+    row = c.get("/api/accounts").json()[0]
+
+    assert row["ready_to_publish"] is True  # pas de verification = pas de decochage
+    assert "ferme la fenêtre Chrome" in row["login_error"] and "non vérifiable" in row["ready_blocked_reason"]
+
+
+def test_the_accounts_screen_rows_carry_posts_of_the_day_cap_and_last_failure(config, vault, cookies):
+    from datetime import datetime, timezone
+
+    account = accounts.add_account(config, {"label": "Compte"})
+    now = datetime.now(timezone.utc)
+    Path("presets").mkdir()
+    Path("presets/ma_chaine.toml").write_text(
+        f'[channel]\ntimezone = "UTC"\ntiktok_account = "{account["id"]}"\n', encoding="utf-8")
+    Path("config.toml").write_text('mode = "review"\n', encoding="utf-8")
+    entries = [
+        {"video_id": "aaaaaaaaaaa", "clip_id": "01", "series_id": None, "part": None, "status": "published",
+         "slot_at": None, "decided_at": None, "published_at": now.isoformat(), "error": None,
+         "tiktok_publish_at": now.isoformat(), "account": account["id"]},
+        {"video_id": "aaaaaaaaaaa", "clip_id": "02", "series_id": None, "part": None, "status": "failed",
+         "slot_at": None, "decided_at": None, "published_at": None, "error": "captcha détecté",
+         "capture": "state/browser/x/captures/a.png", "failed_at": now.isoformat(), "account": account["id"]},
+    ]
+    Path("state/publish").mkdir(parents=True)
+    Path("state/publish/ma_chaine.json").write_text(json.dumps(entries), encoding="utf-8")
+
+    row = local_client(config).get("/api/accounts").json()[0]
+
+    assert (row["posts_today"], row["max_posts_per_day"]) == (1, 1)
+    failure = row["last_failure"]
+    assert failure["reason"] == "captcha détecté" and failure["clip_id"] == "02" and failure["channel"] == "ma_chaine"
+    assert failure["capture_url"] == "/api/publish/aaaaaaaaaaa/02/capture"
+
+
+def test_the_accounts_screen_is_wired_for_publication_accounts():
+    js = (STATIC / "screens" / "accounts.js").read_text(encoding="utf-8")
+
+    assert "/ready" in js and '"PUT"' in js and "data-acc-ready" in js and "Prêt à publier" in js
+    assert "ready_blocked_reason" in js and "disabled" in js           # case grisée, avec la raison
+    assert "login.state" in js or "a.login" in js                       # état de connexion
+    for label in ("jamais connecté", "connecté", "session expirée"):
+        assert label in js, label
+    assert "posts_today" in js and "max_posts_per_day" in js            # posts du jour / plafond
+    assert "last_failure" in js and "capture_url" in js                 # dernier échec avec capture
+    assert "Se connecter" in js and "/browser/login" in js
+    assert "Relever les stats" in js and "/api/stats/tiktok/refresh" in js
+    assert "ready_note" in js                                           # décochage automatique affiché

@@ -204,10 +204,12 @@ def approve(
     state_dir: str | Path | None = None,
     presets_dir: str | Path = "presets",
     base: str | Path = "config.toml",
+    account: str | None = None,
 ) -> dict[str, Any]:
     """Approuve un clip (SPEC-74e9 4.2) : entree 'approved', puis 'scheduled'
     au prochain creneau libre si la chaine en a. Leve PublishError si le
-    sidecar dit ready=false."""
+    sidecar dit ready=false. Le compte de publication (SPEC-00d1 R4) est ``account`` s'il est donne,
+    sinon celui de la chaine ([channel] tiktok_account, None s'il n'y en a pas)."""
     sidecar = _read_sidecar(output_dir, video_id, clip_id)
     if not sidecar.get("ready"):
         raise PublishError(f"clip non pret pour publication : {video_id}/{clip_id}")
@@ -228,6 +230,7 @@ def approve(
         "decided_at": _iso(now_dt),
         "published_at": None,
         "error": None,
+        "account": account or channel_dict["tiktok_account"] or None,
     }
     with _locked(path):
         entries = _load_entries(path)
@@ -381,6 +384,7 @@ def mark_published(
         entry["status"] = "published"
         entry["published_at"] = _iso(_now(now))
         entry["error"], entry["capture"], entry["halted"] = None, None, False
+        entry["waiting_reason"] = None
         if tiktok_state is not None:
             if tiktok_state not in TIKTOK_STATES:
                 raise PublishError(f"etat TikTok invalide : {tiktok_state!r} (attendu : {' | '.join(TIKTOK_STATES)})")
@@ -406,6 +410,7 @@ def mark_failed(
     capture: str | Path | None = None,
     halted: bool = False,
     state_dir: str | Path | None = None,
+    now: datetime | None = None,
 ) -> dict[str, Any]:
     """Echec d'une publication (SPEC-9225 R4) : statut ``failed`` avec la raison et la capture
     d'ecran ; ``halted`` arrete le compte tant que l'entree n'est pas reessayee (``retry``)."""
@@ -418,7 +423,8 @@ def mark_failed(
         if entry["status"] not in ("approved", "scheduled", "failed"):
             raise PublishError(f"echec impossible pour {video_id}/{clip_id} : statut {entry['status']!r}")
         entry = dict(entry)
-        entry.update(status="failed", error=reason, capture=str(capture) if capture else None, halted=halted)
+        entry.update(status="failed", error=reason, capture=str(capture) if capture else None, halted=halted,
+                     failed_at=_iso(_now(now)), waiting_reason=None)
         _upsert_entry(entries, entry)
         _save_entries(path, entries)
     return entry
@@ -480,17 +486,23 @@ def list_entries(channel: str, *, state_dir: str | Path | None = None) -> list[d
     return _load_entries(_state_path(channel, state_dir))
 
 
+def entry_account(entry: dict[str, Any], channel_account: str | None) -> str | None:
+    """Compte qui publie une entree (SPEC-00d1 R4) : celui enregistre dans l'entree ; une entree sans ce champ
+    (file d'avant R4) prend le compte de sa chaine. Jamais un autre compte en repli."""
+    return entry["account"] if "account" in entry else (channel_account or None)
+
+
 def _account_entries(
     account: str, state_dir: str | Path | None, presets_dir: str | Path, base: str | Path,
 ) -> list[tuple[str, dict[str, Any]]]:
-    """(chaine, entree) de toutes les chaines reliees a ``account`` (SPEC-9225 R2)."""
+    """(chaine, entree) de toutes les entrees publiees par ``account`` (SPEC-00d1 R4), toutes chaines."""
     found: list[tuple[str, dict[str, Any]]] = []
     try:
         names = channel_mod.list_channels(presets_dir)
         for name in names:
             _config, settings = channel_mod.load_channel(name, presets_dir=presets_dir, base=base)
-            if settings["tiktok_account"] == account:
-                found.extend((name, e) for e in _load_entries(_state_path(name, state_dir)))
+            found.extend((name, e) for e in _load_entries(_state_path(name, state_dir))
+                         if entry_account(e, settings["tiktok_account"]) == account)
     except (channel_mod.ChannelError, ConfigError) as exc:
         raise PublishError(f"chaines illisibles pour le compte {account} : {exc}") from exc
     return found
@@ -520,6 +532,71 @@ def halted_account(
         if entry["status"] == "failed" and entry.get("halted"):
             return {**entry, "channel": name}
     return None
+
+
+def last_failure(
+    account: str, *, state_dir: str | Path | None = None, presets_dir: str | Path = "presets",
+    base: str | Path = "config.toml",
+) -> dict[str, Any] | None:
+    """Le dernier echec de publication du compte (entree ``failed`` la plus recente) avec sa chaine, ou None."""
+    failed = [(name, e) for name, e in _account_entries(account, state_dir, presets_dir, base) if e["status"] == "failed"]
+    if not failed:
+        return None
+    name, entry = max(failed, key=lambda f: f[1].get("failed_at") or "")
+    return {**entry, "channel": name}
+
+
+def set_account(
+    video_id: str,
+    clip_id: str,
+    channel: str,
+    account: str,
+    *,
+    state_dir: str | Path | None = None,
+) -> dict[str, Any]:
+    """Compte de publication d'une entree (SPEC-00d1 R4), modifiable tant qu'elle n'est pas publiee. Que le compte
+    soit pret a publier est verifie par l'appelant (la console) et, a la publication, par le worker."""
+    if not isinstance(account, str) or not account:
+        raise PublishError("compte de publication manquant : un identifiant de compte est attendu")
+    path = _state_path(channel, state_dir)
+    with _locked(path):
+        entries = _load_entries(path)
+        entry = _find_entry(entries, video_id, clip_id)
+        if entry is None:
+            raise PublishError(f"clip absent de la file de publication : {video_id}/{clip_id}")
+        if entry["status"] in ("published", "rejected"):
+            raise PublishError(f"changement de compte refusé pour {video_id}/{clip_id} : statut {entry['status']!r}")
+        entry = dict(entry)
+        entry["account"] = account
+        entry["waiting_reason"] = None
+        _upsert_entry(entries, entry)
+        _save_entries(path, entries)
+    return entry
+
+
+def set_waiting_reason(
+    video_id: str,
+    clip_id: str,
+    channel: str,
+    reason: str | None,
+    *,
+    state_dir: str | Path | None = None,
+) -> bool:
+    """Raison pour laquelle une entree ``scheduled`` reste en attente sans etre tentee (compte pas pret, connexion
+    expiree ; SPEC-00d1 R4), ou None une fois levee. Rend True si la raison a change."""
+    path = _state_path(channel, state_dir)
+    with _locked(path):
+        entries = _load_entries(path)
+        entry = _find_entry(entries, video_id, clip_id)
+        if entry is None:
+            raise PublishError(f"clip absent de la file de publication : {video_id}/{clip_id}")
+        if entry.get("waiting_reason") == reason:
+            return False
+        entry = dict(entry)
+        entry["waiting_reason"] = reason
+        _upsert_entry(entries, entry)
+        _save_entries(path, entries)
+    return True
 
 
 def postpone(

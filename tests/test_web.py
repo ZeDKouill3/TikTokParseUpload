@@ -4969,3 +4969,148 @@ def test_stats_screen_has_a_tiktok_refresh_button_and_shows_the_source_of_each_f
     assert "avg_watch_s" in js and "stats_source" in js
     assert "aucune mesure" in js and "Rétention" in js
     assert "toastError" in js
+
+
+# --------------------------------------------------------------------------
+# SPEC-00d1 R4, R5 : compte choisi par publication, calendrier, validation
+# --------------------------------------------------------------------------
+
+READY = "ab12cd"
+SPARE = "ef34ab"
+
+
+def _accounts_state(tmp_path, *, ready=(READY,)):
+    rows = [{"id": READY, "label": "Compte exemple", "platform": "TikTok"},
+            {"id": SPARE, "label": "Autre compte", "platform": "TikTok"}]
+    for row in rows:
+        row["ready_to_publish"] = row["id"] in ready
+    (tmp_path / "state").mkdir(exist_ok=True)
+    (tmp_path / "state" / "accounts.json").write_text(json.dumps({"accounts": rows}), encoding="utf-8")
+
+
+def test_publish_accounts_lists_every_account_with_its_flag_and_the_channel_default(tmp_path, isolated_cwd):
+    _publish_setup(tmp_path)
+    _accounts_state(tmp_path, ready=(READY,))
+
+    data = client(tmp_path).get("/api/publish/accounts", params={"channel": "ma_chaine"}).json()
+
+    assert data["default"] == READY
+    assert data["accounts"] == [{"id": READY, "label": "Compte exemple", "ready_to_publish": True},
+                                {"id": SPARE, "label": "Autre compte", "ready_to_publish": False}]
+    assert client(tmp_path).get("/api/publish/accounts").json()["default"] is None
+    assert client(tmp_path).get("/api/publish/accounts", params={"channel": "inconnue"}).status_code == 404
+
+
+def test_publish_accounts_never_carry_a_secret_and_work_from_a_remote_console(tmp_path, isolated_cwd):
+    _publish_setup(tmp_path)
+    _accounts_state(tmp_path)
+    remote = TestClient(create_app(config=make_config(tmp_path)), base_url="http://exemple.invalid", client=("203.0.113.5", 1))
+
+    resp = remote.get("/api/publish/accounts", params={"channel": "ma_chaine"})
+
+    assert resp.status_code == 200
+    assert set(resp.json()["accounts"][0]) == {"id", "label", "ready_to_publish"}
+
+
+def test_approve_with_a_ready_account_records_it_in_the_publication_entry(tmp_path, isolated_cwd):
+    _publish_setup(tmp_path)
+    _accounts_state(tmp_path, ready=(READY, SPARE))
+
+    resp = client(tmp_path).post(f"/api/clips/{CLIPS_VIDEO}/01/approve", json={"account": SPARE})
+
+    assert resp.status_code == 200 and resp.json()["account"] == SPARE
+    entry = json.loads((tmp_path / "state" / "publish" / "ma_chaine.json").read_text(encoding="utf-8"))[0]
+    assert entry["account"] == SPARE
+
+
+def test_approve_without_a_choice_prefills_the_channel_account(tmp_path, isolated_cwd):
+    _publish_setup(tmp_path)
+    _accounts_state(tmp_path, ready=())
+
+    for body in ({}, None):
+        resp = client(tmp_path).post(f"/api/clips/{CLIPS_VIDEO}/01/approve", **({} if body is None else {"json": body}))
+        assert resp.status_code == 200 and resp.json()["account"] == READY  # prérempli, même s'il n'est pas prêt
+
+
+def test_approve_refuses_an_account_that_is_not_ready_or_unknown(tmp_path, isolated_cwd):
+    _publish_setup(tmp_path)
+    _accounts_state(tmp_path, ready=(READY,))
+    c = client(tmp_path)
+
+    not_ready = c.post(f"/api/clips/{CLIPS_VIDEO}/01/approve", json={"account": SPARE})
+    unknown = c.post(f"/api/clips/{CLIPS_VIDEO}/01/approve", json={"account": "fantome"})
+
+    assert not_ready.status_code == 409 and "non prêt à publier" in not_ready.json()["detail"]
+    assert unknown.status_code == 409 and "compte inconnu" in unknown.json()["detail"]
+    assert json.loads((tmp_path / "state" / "publish" / "ma_chaine.json").read_text(encoding="utf-8")) == []  # rien d'approuvé
+
+
+def test_publish_account_route_changes_the_account_among_the_ready_ones(tmp_path, isolated_cwd):
+    _publish_setup(tmp_path, [_entry("01", "scheduled", slot_at=PUB_THU, account=READY)])
+    _accounts_state(tmp_path, ready=(READY, SPARE))
+    c = client(tmp_path)
+
+    resp = c.post(f"/api/publish/{CLIPS_VIDEO}/01/account", json={"account": SPARE})
+
+    assert resp.status_code == 200 and resp.json()["account"] == SPARE
+    assert _get_publish(tmp_path).json()["slots"][1]["clip"]["account"] == SPARE
+
+
+def test_publish_account_route_refuses_a_not_ready_account_a_published_entry_and_a_bad_body(tmp_path, isolated_cwd):
+    _publish_setup(tmp_path, [_entry("01", "scheduled", slot_at=PUB_THU, account=READY),
+                              _entry("02", "published", published_at="2026-10-01T10:00:00+00:00", account=READY)])
+    _accounts_state(tmp_path, ready=(READY,))
+    c = client(tmp_path)
+
+    refused = c.post(f"/api/publish/{CLIPS_VIDEO}/01/account", json={"account": SPARE})
+    published = c.post(f"/api/publish/{CLIPS_VIDEO}/02/account", json={"account": READY})
+    missing = c.post(f"/api/publish/{CLIPS_VIDEO}/01/account", json={})
+
+    assert refused.status_code == 409 and "non prêt à publier" in refused.json()["detail"]
+    assert published.status_code == 409 and "changement de compte refusé" in published.json()["detail"]
+    assert missing.status_code == 409  # aucun compte donné : refusé, jamais « aucun compte »
+    entries = json.loads((tmp_path / "state" / "publish" / "ma_chaine.json").read_text(encoding="utf-8"))
+    assert entries[0]["account"] == READY
+
+
+def test_the_publication_calendar_shows_the_account_of_each_post_and_why_it_waits(tmp_path, isolated_cwd):
+    _publish_setup(tmp_path, [
+        _entry("01", "scheduled", slot_at=PUB_THU, account=SPARE,
+               waiting_reason="compte Autre compte non prêt à publier : coche « prêt à publier »"),
+        _entry("02", "approved", account=READY)])
+    _accounts_state(tmp_path, ready=(READY,))
+
+    data = _get_publish(tmp_path).json()
+
+    thu = data["slots"][1]["clip"]
+    assert thu["account"] == SPARE and "non prêt à publier" in thu["waiting_reason"]
+    assert data["unscheduled"][0]["account"] == READY and data["unscheduled"][0]["waiting_reason"] is None
+    assert [a["id"] for a in data["accounts"]] == [READY, SPARE]  # libellés et état, pour l'affichage
+    assert data["tiktok_account"] == READY  # le compte de la chaîne reste affiché
+
+
+def test_the_clips_list_carries_the_account_of_the_entry(tmp_path, isolated_cwd):
+    _clips_setup(tmp_path)
+    _write_publish(tmp_path, "ma_chaine", [_entry("01", "scheduled", slot_at="2026-10-02T18:00:00+00:00", account=SPARE)])
+
+    clips = {c["clip_id"]: c for c in client(tmp_path).get("/api/clips", params={"video_id": CLIPS_VIDEO}).json()}
+
+    assert clips["01"]["account"] == SPARE and clips["03"]["account"] is None
+
+
+def test_clips_drawer_picks_the_publication_account_among_the_ready_ones():
+    js = (STATIC / "screens" / "clips.js").read_text(encoding="utf-8")
+
+    assert "/api/publish/accounts" in js and "clip-account" in js and "Compte de publication" in js
+    assert "ready_to_publish" in js and "default" in js                 # prérempli avec le compte de la chaîne
+    assert "non prêt à publier" in js                                    # compte de la chaîne pas prêt : dit
+    assert 'jsonBody("POST", { account: chosen })' in js                  # le choix part avec l'approbation
+
+
+def test_publish_screen_shows_and_changes_the_account_of_each_post():
+    js = (STATIC / "screens" / "publish.js").read_text(encoding="utf-8")
+
+    assert "pub-acct" in js and "pubAccountLabel" in js                   # compte affiché sur chaque post
+    assert "/account" in js and "data-pub-account" in js and "Compte de publication" in js
+    assert "waiting_reason" in js and "En attente" in js                  # raison visible quand l'entrée n'est pas tentée
+    assert "ready_to_publish" in js                                       # seuls les comptes prêts sont choisissables

@@ -5,6 +5,7 @@
 .acc-pass-cell { flex: 0 1 180px; min-width: 0; overflow-wrap: anywhere; padding-top: 2px; }
 .acc-pass { letter-spacing: 0.04em; }
 .acc-actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; flex: 1 1 280px; }
+.acc-ready { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; }
 .acc-copied { color: var(--ok, inherit); }
 .acc-gen { margin-top: 24px; }
 .acc-gen-body { padding: 16px 24px 24px; display: flex; flex-direction: column; gap: 16px; }

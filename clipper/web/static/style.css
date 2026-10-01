@@ -1439,3 +1439,8 @@ input[type="color"] { width: 36px; height: 36px; padding: 2px; border-radius: va
 .chan-help, .set-help { margin-top: 2px; }
 .chan-help > summary, .set-help > summary { cursor: pointer; font-size: 12px; color: var(--faint); }
 .chan-help > p, .set-help > p { margin: 4px 0 0; }
+
+/* Compte de publication d'un post (SPEC-00d1 R5) : petit libellé sous le titre ; ambre quand le post attend son compte. */
+.post .pub-acct { font-size: 10px; color: var(--muted); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.post .pub-acct.waiting { color: var(--warn); font-weight: 600; }
+.reason.warn { border-color: var(--warn); }

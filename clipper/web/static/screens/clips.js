@@ -156,6 +156,9 @@ function clipDrawerHtml(c) {
         <div class="field"><label for="clip-tags">Hashtags</label><input class="input" id="clip-tags" value="${esc((c.hashtags || []).join(" "))}"${locked ? " disabled" : ""}>
           <span class="hint">Séparés par des espaces.</span></div>
         ${lockHint}
+        <div class="field" data-clip-account-field><label for="clip-account">Compte de publication</label>
+          <select class="input" id="clip-account" data-clip-account><option value="">Chargement…</option></select>
+          <span class="hint" data-clip-account-hint>Prérempli avec le compte de la chaîne ; seuls les comptes « prêts à publier » (écran Comptes) sont proposés.</span></div>
         <div><button type="button" class="btn btn-xs" data-save-caption${locked ? " disabled" : ""}>${icon("check", "i-xs")}Enregistrer la description et les hashtags</button></div>
         <div class="field"><span class="field-label">Contrôle qualité</span>${clipQaBlock(c)}</div>
         <div class="field"><span class="field-label">Confiance du jury</span><div data-jury-confidence>${juryConfidenceHtml(c.jury_confidence, c.jury_judge_confidences)}</div></div>
@@ -170,6 +173,27 @@ function clipDrawerHtml(c) {
       <button type="button" class="btn btn-ghost" data-copy>${icon("copy")}Copier la description</button>
       <a class="btn btn-ghost" href="${esc(c.video_url)}" download="${esc(c.clip_id)}.mp4">${icon("download")}Télécharger</a>
     </div>`;
+}
+
+/* Compte de publication (SPEC-00d1 R4) : les comptes prêts, préremplis avec celui de la chaîne. */
+async function clipFillAccounts(c, d) {
+  const select = $("#clip-account", d), hint = $("[data-clip-account-hint]", d);
+  try {
+    const out = await api(`/api/publish/accounts?channel=${encodeURIComponent(c.channel || "")}`);
+    const ready = out.accounts.filter((a) => a.ready_to_publish);
+    const known = out.accounts.find((a) => a.id === out.default);
+    const options = ready.map((a) => `<option value="${esc(a.id)}">${esc(a.label || a.id)}</option>`);
+    if (!known || !known.ready_to_publish) {
+      const name = known ? (known.label || known.id) : "aucun";
+      options.unshift(`<option value="">Compte de la chaîne : ${esc(name)} (non prêt à publier)</option>`);
+      hint.textContent = out.default ? "Le compte de la chaîne n'est pas prêt à publier : le clip restera en attente tant qu'il ne l'est pas, ou choisis un autre compte." : "Cette chaîne n'a pas de compte (tiktok_account) : choisis un compte prêt.";
+    }
+    select.innerHTML = options.join("");
+    if (known && known.ready_to_publish) select.value = known.id;
+  } catch (err) {
+    select.innerHTML = `<option value="">Comptes indisponibles</option>`;
+    hint.textContent = String(err.message || err);
+  }
 }
 
 function parseHashtags(text) {
@@ -215,9 +239,11 @@ async function openClipDrawer(key) {
         toast({ kind: "ok", title: "Re-rendu en file", body: `${c.video_id} : rendu puis contrôle qualité.` });
       } catch (err) { toastError("Impossible de relancer le rendu", err); }
     };
+    clipFillAccounts(c, d);
     $("[data-approve]", d).onclick = async () => {
+      const chosen = $("#clip-account", d).value; // vide : le compte de la chaîne (peut ne pas être prêt : le clip attend)
       try {
-        await api(clipUrl(c, "/approve"), { method: "POST" });
+        await api(clipUrl(c, "/approve"), chosen ? jsonBody("POST", { account: chosen }) : { method: "POST" });
         closeLayer();
         toast({ kind: "ok", title: "Clip approuvé", body: c.screen_title || c.clip_id });
         loadClips();

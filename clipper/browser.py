@@ -21,7 +21,9 @@ import logging
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
+import tempfile
 import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -43,6 +45,10 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "chrome_path": "",
     # Delai (s) pour que la fenetre s'ouvre quand la console la demande.
     "launch_timeout_s": 60,
+    # Etat de connexion TikTok d'un profil (SPEC-00d1 R2) : cookies lus localement, sans navigation.
+    # Un profil est connecte quand un de ces cookies de session existe, sur l'un de ces domaines.
+    "login_domains": ["tiktok.com"],
+    "login_cookies": ["sessionid", "sessionid_ss"],
 }
 
 STATE_DIR = Path("state") / "browser"
@@ -55,6 +61,7 @@ _ACCOUNT_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 _NETSCAPE_HEADER = "# Netscape HTTP Cookie File"
 
 _override: Callable[[], Any] | None = None
+_cookie_reader: Callable[[str], list[dict[str, Any]]] | None = None  # remplace par les tests : aucun vrai profil
 _popen: Callable[..., Any] = subprocess.Popen  # remplace par les tests : aucun vrai Chrome
 _lock = threading.Lock()
 _active: dict[str, Any] = {}  # comptes dont la fenetre de connexion est ouverte
@@ -68,6 +75,12 @@ def use_playwright(factory: Callable[[], Any] | None) -> None:
     """Branche une fabrique ``sync_playwright`` (tests : faux) ; None = le vrai."""
     global _override
     _override = factory
+
+
+def use_cookie_reader(reader: Callable[[str], list[dict[str, Any]]] | None) -> None:
+    """Branche une lecture de cookies (tests : simulee) ; None = la base de cookies du profil."""
+    global _cookie_reader
+    _cookie_reader = reader
 
 
 def _playwright_factory() -> Callable[[], Any]:
@@ -117,6 +130,74 @@ def profile_status(account: object) -> dict[str, Any]:
         return {"present": False, "modified_at": None}
     stamp = datetime.fromtimestamp(max(times), tz=timezone.utc).isoformat(timespec="seconds")
     return {"present": True, "modified_at": stamp}
+
+
+# ---------------------------------------------------------------- connexion TikTok (SPEC-00d1 R2)
+
+LOGIN_STATES = ("never", "connected", "expired")
+_COOKIE_FILES = (Path("Default") / "Network" / "Cookies", Path("Default") / "Cookies")
+_CHROME_EPOCH_S = 11_644_473_600  # 1601-01-01 -> 1970-01-01
+
+
+def _read_profile_cookies(account: str) -> list[dict[str, Any]]:
+    """Cookies du profil lus dans la base SQLite de Chrome (copie temporaire, lecture seule) : nom,
+    domaine, expiration (secondes Unix, -1 pour un cookie de session). Les valeurs ne sont jamais
+    lues (chiffrees par Chrome, inutiles ici) ; rien n'est lance, rien n'est envoye."""
+    directory = profile_dir(account)
+    source = next((directory / name for name in _COOKIE_FILES if (directory / name).is_file()), None)
+    if source is None:
+        return []
+    with tempfile.TemporaryDirectory(prefix="clipper-cookies-") as tmp:
+        copy = Path(tmp) / "Cookies"
+        try:
+            shutil.copyfile(source, copy)
+        except OSError as exc:
+            raise BrowserError(
+                f"cookies du profil {account} illisibles ({type(exc).__name__}) : ferme la fenêtre Chrome "
+                "de ce compte puis réessaie"
+            ) from None
+        try:
+            db = sqlite3.connect(f"file:{copy.as_posix()}?mode=ro", uri=True)
+            try:
+                rows = db.execute("SELECT host_key, name, expires_utc, is_persistent FROM cookies").fetchall()
+            finally:
+                db.close()
+        except sqlite3.Error as exc:
+            raise BrowserError(f"base de cookies du profil {account} illisible : {type(exc).__name__}") from None
+    cookies = []
+    for host, name, expires_utc, persistent in rows:
+        expires = expires_utc / 1_000_000 - _CHROME_EPOCH_S if persistent and expires_utc else -1
+        cookies.append({"domain": host, "name": name, "expires": expires})
+    return cookies
+
+
+def login_state(account: str, *, config: Config | None = None, now: datetime | None = None) -> dict[str, Any]:
+    """Etat de connexion TikTok du profil (R2), lu dans ses cookies sans naviguer :
+    ``{"state": "never" | "connected" | "expired", "checked_at": ISO UTC, "expires_at": ISO | None}``.
+    ``never`` : pas de profil ou aucun cookie de session TikTok ; ``connected`` : un cookie de session
+    non expire (``expires_at`` None pour un cookie de session du navigateur) ; ``expired`` : les cookies
+    de session TikTok sont la mais tous expires."""
+    validate_account(account)
+    settings = _settings(config)
+    domains = [str(d).lower() for d in settings["login_domains"]]
+    names = {str(n) for n in settings["login_cookies"]}
+    moment = now or datetime.now(timezone.utc)
+    stamp = moment.isoformat(timespec="seconds")
+    if not profile_status(account)["present"]:
+        return {"state": "never", "checked_at": stamp, "expires_at": None}
+    reader = _cookie_reader or _read_profile_cookies
+    session = [c for c in reader(account) if c.get("name") in names and _in_domains(str(c.get("domain", "")), domains)]
+    if not session:
+        return {"state": "never", "checked_at": stamp, "expires_at": None}
+    now_s = moment.timestamp()
+    alive = [c for c in session if float(c.get("expires") or -1) <= 0 or float(c["expires"]) > now_s]
+    if not alive:
+        return {"state": "expired", "checked_at": stamp, "expires_at": None}
+    if any(float(c.get("expires") or -1) <= 0 for c in alive):
+        return {"state": "connected", "checked_at": stamp, "expires_at": None}
+    last = max(float(c["expires"]) for c in alive)
+    return {"state": "connected", "checked_at": stamp,
+            "expires_at": datetime.fromtimestamp(last, tz=timezone.utc).isoformat(timespec="seconds")}
 
 
 # ---------------------------------------------------------------- ouverture
@@ -220,9 +301,11 @@ def login(
 
 def start_login(
     account: str, url: str | None = None, *, config: Config | None = None,
+    on_close: Callable[[], None] | None = None,
 ) -> None:
     """``login`` dans un fil, pour la console : rend la main une fois Chrome lance
-    (ou leve ``BrowserError`` s'il n'a pas pu l'etre). Une seule fenetre par profil."""
+    (ou leve ``BrowserError`` s'il n'a pas pu l'etre). Une seule fenetre par profil. ``on_close`` est
+    appele une fois la fenetre fermee (la console y verifie la connexion, SPEC-00d1 R2)."""
     validate_account(account)
     _login_url(url, config)
     find_chrome(config)
@@ -237,6 +320,14 @@ def start_login(
             failure.append(exc)
         except Exception as exc:  # noqa: BLE001
             failure.append(BrowserError(f"connexion interrompue : {type(exc).__name__}"))
+        else:
+            with _lock:
+                _active.pop(account, None)  # fenetre fermee : le profil est libre pour la verification
+            if on_close is not None:
+                try:
+                    on_close()
+                except Exception:  # noqa: BLE001 - la verification echoue seule, jamais le fil de connexion
+                    logger.exception("verification de la connexion de %s apres fermeture", account)
         finally:
             with _lock:
                 _active.pop(account, None)
