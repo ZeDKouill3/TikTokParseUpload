@@ -3,7 +3,9 @@
 Bibliotheque, pas une etape (ADR-b16b) : lit les sidecars de clip
 (output/<video_id>/<clip_id>.json, SPEC-6a47) et les creneaux de la chaine
 via clipper.channel.next_slots. Une entree par clip dans
-state/publish/<chaine>.json (liste JSON, ecriture atomique tmp+replace).
+state/publish/<chaine>.json (liste JSON, ecriture atomique tmp+replace ; chaque
+cycle lecture-modification-ecriture est sous verrou de fichier
+inter-processus, l'API web et le worker etant deux processus).
 
 Le re-rendu du titre d'ecran et l'autopost ne sont pas ici (voir la tache
 pipeline / worker).
@@ -27,6 +29,8 @@ CONFIG_DEFAULTS: dict[str, object] = {
 
 VALID_STATUSES = ("approved", "scheduled", "published", "failed", "rejected")
 _NON_EDITABLE_STATUSES = ("scheduled", "published")
+_NON_MOVABLE_STATUSES = ("rejected", "published")
+_PREVIOUS_PART_STATUSES = ("approved", "scheduled")
 _ENTRY_FIELDS = (
     "video_id", "clip_id", "series_id", "part", "status",
     "slot_at", "decided_at", "published_at", "error",
@@ -78,10 +82,11 @@ def _load_entries(path: Path) -> list[dict[str, Any]]:
 
 
 def _save_entries(path: Path, entries: list[dict[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    channel_mod.atomic_write_json(path, entries)
+
+
+def _locked(path: Path):
+    return channel_mod.file_lock(path)
 
 
 def _find_entry(entries: list[dict[str, Any]], video_id: str, clip_id: str) -> dict[str, Any] | None:
@@ -133,7 +138,10 @@ def _sibling_clip_ids(output_dir: str | Path, video_id: str, series_id: str, *, 
         clip_id = path.stem
         if clip_id == exclude:
             continue
-        sidecar = json.loads(path.read_text(encoding="utf-8"))
+        try:
+            sidecar = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise PublishError(f"sidecar de clip illisible (JSON corrompu) : {path} ({exc})") from exc
         other_series_id, _ = _series_info(video_id, clip_id, sidecar)
         if other_series_id == series_id:
             siblings.append(clip_id)
@@ -151,6 +159,29 @@ def _next_free_slot(channel: dict[str, Any], entries: list[dict[str, Any]], afte
         if len(candidates) < n:
             raise PublishError("aucun creneau disponible pour cette chaine")
         n += 1
+
+
+def _require_previous_part(
+    entries: list[dict[str, Any]], output_dir: str | Path, video_id: str,
+    clip_id: str, series_id: str, part: int,
+) -> None:
+    """La partie N>1 d'une serie ne s'approuve que si la partie N-1 est deja
+    approved ou scheduled : l'ordre des creneaux de la serie est garanti."""
+    previous = None
+    for sibling_id in _sibling_clip_ids(output_dir, video_id, series_id, exclude=clip_id):
+        _, sibling_part = _series_info(video_id, sibling_id, _read_sidecar(output_dir, video_id, sibling_id))
+        if sibling_part == part - 1:
+            previous = sibling_id
+            break
+    if previous is None:
+        raise PublishError(f"partie {part - 1} introuvable pour approuver {video_id}/{clip_id} (partie {part})")
+    entry = _find_entry(entries, video_id, previous)
+    status = entry["status"] if entry is not None else "absente de la file"
+    if entry is None or status not in _PREVIOUS_PART_STATUSES:
+        raise PublishError(
+            f"approbation refusee pour {video_id}/{clip_id} (partie {part}) : la partie {part - 1} "
+            f"({previous}) doit etre approved ou scheduled, elle est {status!r}"
+        )
 
 
 def approve(
@@ -175,7 +206,6 @@ def approve(
     _, channel_dict = channel_mod.load_channel(channel, presets_dir=presets_dir, base=base)
 
     path = _state_path(channel, state_dir)
-    entries = _load_entries(path)
     now_dt = _now(now)
 
     entry: dict[str, Any] = {
@@ -189,13 +219,17 @@ def approve(
         "published_at": None,
         "error": None,
     }
-    if channel_dict["slots"]:
-        slot = _next_free_slot(channel_dict, entries, now_dt)
-        entry["status"] = "scheduled"
-        entry["slot_at"] = _iso(slot)
+    with _locked(path):
+        entries = _load_entries(path)
+        if series_id is not None and part is not None and part > 1:
+            _require_previous_part(entries, output_dir, video_id, clip_id, series_id, part)
+        if channel_dict["slots"]:
+            slot = _next_free_slot(channel_dict, entries, now_dt)
+            entry["status"] = "scheduled"
+            entry["slot_at"] = _iso(slot)
 
-    _upsert_entry(entries, entry)
-    _save_entries(path, entries)
+        _upsert_entry(entries, entry)
+        _save_entries(path, entries)
     return entry
 
 
@@ -214,9 +248,18 @@ def reject(
     series_id, part = _series_info(video_id, clip_id, sidecar)
 
     path = _state_path(channel, state_dir)
-    entries = _load_entries(path)
     now_dt = _now(now)
+    with _locked(path):
+        entries = _load_entries(path)
+        return _reject_locked(
+            entries, path, video_id, clip_id, series_id, part, now_dt, output_dir,
+        )
 
+
+def _reject_locked(
+    entries: list[dict[str, Any]], path: Path, video_id: str, clip_id: str,
+    series_id: str | None, part: int | None, now_dt: datetime, output_dir: str | Path,
+) -> dict[str, Any]:
     def _reject_one(cid: str, series_id: str | None, part: int | None) -> dict[str, Any]:
         existing = _find_entry(entries, video_id, cid)
         entry = dict(existing) if existing is not None else {
@@ -254,12 +297,23 @@ def move(
     """Deplace un clip vers un creneau libre de la chaine (SPEC-fc0c 4.3) :
     refuse un creneau deja pris ou hors des slots de la chaine."""
     path = _state_path(channel, state_dir)
+    _, channel_dict = channel_mod.load_channel(channel, presets_dir=presets_dir, base=base)
+    with _locked(path):
+        return _move_locked(path, video_id, clip_id, slot_at, channel_dict)
+
+
+def _move_locked(
+    path: Path, video_id: str, clip_id: str, slot_at: datetime, channel_dict: dict[str, Any],
+) -> dict[str, Any]:
     entries = _load_entries(path)
     entry = _find_entry(entries, video_id, clip_id)
     if entry is None:
         raise PublishError(f"clip absent de la file de publication : {video_id}/{clip_id}")
+    if entry["status"] in _NON_MOVABLE_STATUSES:
+        raise PublishError(
+            f"deplacement refuse pour {video_id}/{clip_id} : statut {entry['status']!r}"
+        )
 
-    _, channel_dict = channel_mod.load_channel(channel, presets_dir=presets_dir, base=base)
     tz = ZoneInfo(str(channel_dict["timezone"]))
     local_slot = slot_at.astimezone(tz)
     day = _DAYS[local_slot.weekday()]
@@ -292,16 +346,22 @@ def mark_published(
 ) -> dict[str, Any]:
     """Marque un clip publie a la main (SPEC-fc0c 4.3)."""
     path = _state_path(channel, state_dir)
-    entries = _load_entries(path)
-    entry = _find_entry(entries, video_id, clip_id)
-    if entry is None:
-        raise PublishError(f"clip absent de la file de publication : {video_id}/{clip_id}")
+    with _locked(path):
+        entries = _load_entries(path)
+        entry = _find_entry(entries, video_id, clip_id)
+        if entry is None:
+            raise PublishError(f"clip absent de la file de publication : {video_id}/{clip_id}")
+        if entry["status"] != "scheduled":
+            raise PublishError(
+                f"publication manuelle refusee pour {video_id}/{clip_id} : statut {entry['status']!r} "
+                "(attendu : 'scheduled')"
+            )
 
-    entry = dict(entry)
-    entry["status"] = "published"
-    entry["published_at"] = _iso(_now(now))
-    _upsert_entry(entries, entry)
-    _save_entries(path, entries)
+        entry = dict(entry)
+        entry["status"] = "published"
+        entry["published_at"] = _iso(_now(now))
+        _upsert_entry(entries, entry)
+        _save_entries(path, entries)
     return entry
 
 
@@ -314,16 +374,17 @@ def unschedule(
 ) -> dict[str, Any]:
     """Repasse un clip programme en 'approved', sans creneau."""
     path = _state_path(channel, state_dir)
-    entries = _load_entries(path)
-    entry = _find_entry(entries, video_id, clip_id)
-    if entry is None:
-        raise PublishError(f"clip absent de la file de publication : {video_id}/{clip_id}")
+    with _locked(path):
+        entries = _load_entries(path)
+        entry = _find_entry(entries, video_id, clip_id)
+        if entry is None:
+            raise PublishError(f"clip absent de la file de publication : {video_id}/{clip_id}")
 
-    entry = dict(entry)
-    entry["status"] = "approved"
-    entry["slot_at"] = None
-    _upsert_entry(entries, entry)
-    _save_entries(path, entries)
+        entry = dict(entry)
+        entry["status"] = "approved"
+        entry["slot_at"] = None
+        _upsert_entry(entries, entry)
+        _save_entries(path, entries)
     return entry
 
 

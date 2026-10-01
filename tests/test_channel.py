@@ -275,3 +275,15 @@ def test_next_slots_uses_the_channel_timezone():
 
     assert result == [datetime(2026, 9, 28, 9, 0, tzinfo=ZoneInfo("Europe/Paris"))]
     assert result[0].utcoffset().total_seconds() == 2 * 3600
+
+
+def test_list_channels_raises_channel_error_naming_a_malformed_preset(isolated_cwd):
+    from clipper.channel import ChannelError, list_channels
+
+    presets_dir = isolated_cwd / "presets"
+    presets_dir.mkdir()
+    (presets_dir / "ok.toml").write_text("[channel]\n")
+    (presets_dir / "casse.toml").write_text("[channel\nmode = ")
+
+    with pytest.raises(ChannelError, match="casse.toml"):
+        list_channels(presets_dir)

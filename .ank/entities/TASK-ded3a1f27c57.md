@@ -5,7 +5,7 @@ slug: lot-1-web-v2-verrou-inter-processus-sur-state-pr
 title: "lot 1 web v2 : verrou inter-processus sur state/, preset de chaîne à la reprise, garde-fous de statut dans publish"
 created: 2026-10-01T08:26:34Z
 author: nicoc@zedk_ordi
-status: in_progress
+status: done
 scope:
   - clipper/worker.py
   - clipper/publish.py
@@ -21,8 +21,15 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/e6dec0da570f@2924171
+    tree: scope/4fa0dc579efb
+    criteria: 1c286d3706ed
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 2
+version: 3
 ---
 
 Relecture du lot 1 (2026-10-01) : le worker et l'API web sont deux processus (ADR-4f6e) qui réécrivent state/queue.json et state/publish/<chaine>.json sans verrou ; process_queue relance les vidéos en attente avec la config globale au lieu du preset de leur chaîne (SPEC-fc0c §1.3) ; publish.move/mark_published acceptent des statuts incohérents ; erreurs brutes sur TOML/JSON corrompu (ADR-ad2e).

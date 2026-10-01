@@ -8,6 +8,7 @@ terminaison / orphelin) au lieu de subprocess.Popen. Aucun reseau.
 from __future__ import annotations
 
 import json
+import os
 import sys
 
 import pytest
@@ -429,3 +430,43 @@ def test_main_serve_launches_worker_subprocess_and_stops_it_at_exit(tmp_path, mo
     assert exit_code == 0
     assert spawner.calls == [[sys.executable, "-m", "clipper", "worker"]]
     assert process.terminate_calls == 1
+
+
+# --------------------------------------------------------------------------
+# TASK-ded3 : verrou inter-processus sur state/queue.json
+# --------------------------------------------------------------------------
+
+
+def _enqueue_many(config, prefix, n):
+    for i in range(n):
+        worker.enqueue(f"{prefix}{i:02d}", None, "render", config=config)
+
+
+def test_enqueue_from_two_processes_loses_no_entry(tmp_path):
+    import multiprocessing
+
+    config = _config(tmp_path)
+    ctx = multiprocessing.get_context("fork" if sys.platform != "win32" else "spawn")
+    procs = [ctx.Process(target=_enqueue_many, args=(config, prefix, 20)) for prefix in ("a", "b")]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join(timeout=120)
+        assert p.exitcode == 0
+
+    ids = sorted(e["video_id"] for e in _queue(config))
+    assert ids == sorted([f"a{i:02d}" for i in range(20)] + [f"b{i:02d}" for i in range(20)])
+
+
+def test_queue_write_goes_through_a_temp_file_and_os_replace(tmp_path, monkeypatch):
+    config = _config(tmp_path)
+    replaced = []
+    real_replace = os.replace
+    monkeypatch.setattr(os, "replace", lambda src, dst: (replaced.append((str(src), str(dst))), real_replace(src, dst))[1])
+
+    worker.enqueue("AAAAAAAAAAA", None, "render", config=config)
+
+    assert len(replaced) == 1
+    src, dst = replaced[0]
+    assert src != dst and dst == str(worker._queue_path(config))
+    assert not os.path.exists(src)
