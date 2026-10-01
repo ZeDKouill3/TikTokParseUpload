@@ -16,10 +16,11 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from clipper import channel as channel_mod
+from clipper.config import ConfigError
 
 _DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 
@@ -27,6 +28,10 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "state_dir": "state/publish",
 }
 
+TIKTOK_STATES = ("published", "scheduled_on_tiktok")
+PUBLISH_MODES = ("immediate", "scheduled")
+_POSTPONE_FIRST_BATCH = 8
+_POSTPONE_MAX_SLOTS = 512
 VALID_STATUSES = ("approved", "scheduled", "published", "failed", "rejected")
 _NON_EDITABLE_STATUSES = ("scheduled", "published")
 _NON_MOVABLE_STATUSES = ("rejected", "published")
@@ -113,6 +118,11 @@ def _read_sidecar(output_dir: str | Path, video_id: str, clip_id: str) -> dict[s
     if not path.exists():
         raise PublishError(f"clip introuvable : {video_id}/{clip_id} ({path})")
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def read_sidecar(output_dir: str | Path, video_id: str, clip_id: str) -> dict[str, Any]:
+    """Le sidecar d'un clip (SPEC-6a47) ; ``PublishError`` s'il est absent."""
+    return _read_sidecar(output_dir, video_id, clip_id)
 
 
 def _write_sidecar(output_dir: str | Path, video_id: str, clip_id: str, data: dict[str, Any]) -> None:
@@ -343,8 +353,18 @@ def mark_published(
     *,
     now: datetime | None = None,
     state_dir: str | Path | None = None,
+    output_dir: str | Path = "output",
+    tiktok_state: str | None = None,
+    post_url: str | None = None,
+    post_id: str | None = None,
+    publish_at: str | None = None,
+    post_note: str | None = None,
+    account: str | None = None,
 ) -> dict[str, Any]:
-    """Marque un clip publie a la main (SPEC-74e9 4.3)."""
+    """Marque un clip publie (SPEC-74e9 4.3). A la main, sans argument de plus ; apres une
+    publication TikTok (SPEC-9225 R3), ``tiktok_state`` (``published`` | ``scheduled_on_tiktok``),
+    l'URL ou l'id du post et ``publish_at`` (l'instant ou le post est en ligne) sont enregistres
+    dans l'entree ET dans le sidecar du clip (champ ``tiktok_post``)."""
     path = _state_path(channel, state_dir)
     with _locked(path):
         entries = _load_entries(path)
@@ -360,6 +380,185 @@ def mark_published(
         entry = dict(entry)
         entry["status"] = "published"
         entry["published_at"] = _iso(_now(now))
+        entry["error"], entry["capture"], entry["halted"] = None, None, False
+        if tiktok_state is not None:
+            if tiktok_state not in TIKTOK_STATES:
+                raise PublishError(f"etat TikTok invalide : {tiktok_state!r} (attendu : {' | '.join(TIKTOK_STATES)})")
+            entry.update(tiktok_state=tiktok_state, post_url=post_url, post_id=post_id,
+                         tiktok_publish_at=publish_at, post_note=post_note)
+            sidecar = _read_sidecar(output_dir, video_id, clip_id)
+            sidecar["tiktok_post"] = {
+                "url": post_url, "id": post_id, "state": tiktok_state, "publish_at": publish_at,
+                "account": account, "note": post_note,
+            }
+            _write_sidecar(output_dir, video_id, clip_id, sidecar)
+        _upsert_entry(entries, entry)
+        _save_entries(path, entries)
+    return entry
+
+
+def mark_failed(
+    video_id: str,
+    clip_id: str,
+    channel: str,
+    reason: str,
+    *,
+    capture: str | Path | None = None,
+    halted: bool = False,
+    state_dir: str | Path | None = None,
+) -> dict[str, Any]:
+    """Echec d'une publication (SPEC-9225 R4) : statut ``failed`` avec la raison et la capture
+    d'ecran ; ``halted`` arrete le compte tant que l'entree n'est pas reessayee (``retry``)."""
+    path = _state_path(channel, state_dir)
+    with _locked(path):
+        entries = _load_entries(path)
+        entry = _find_entry(entries, video_id, clip_id)
+        if entry is None:
+            raise PublishError(f"clip absent de la file de publication : {video_id}/{clip_id}")
+        if entry["status"] not in ("approved", "scheduled", "failed"):
+            raise PublishError(f"echec impossible pour {video_id}/{clip_id} : statut {entry['status']!r}")
+        entry = dict(entry)
+        entry.update(status="failed", error=reason, capture=str(capture) if capture else None, halted=halted)
+        _upsert_entry(entries, entry)
+        _save_entries(path, entries)
+    return entry
+
+
+def retry(
+    video_id: str,
+    clip_id: str,
+    channel: str,
+    *,
+    state_dir: str | Path | None = None,
+) -> dict[str, Any]:
+    """Remet une entree ``failed`` en attente (bouton « Reessayer ») : ``scheduled`` sur son
+    creneau (``approved`` sans creneau), raison, capture et arret du compte effaces."""
+    path = _state_path(channel, state_dir)
+    with _locked(path):
+        entries = _load_entries(path)
+        entry = _find_entry(entries, video_id, clip_id)
+        if entry is None:
+            raise PublishError(f"clip absent de la file de publication : {video_id}/{clip_id}")
+        if entry["status"] != "failed":
+            raise PublishError(
+                f"reessai refuse pour {video_id}/{clip_id} : statut {entry['status']!r} (attendu : 'failed')"
+            )
+        entry = dict(entry)
+        entry.update(status="scheduled" if entry["slot_at"] else "approved", error=None, capture=None, halted=False)
+        _upsert_entry(entries, entry)
+        _save_entries(path, entries)
+    return entry
+
+
+def set_mode(
+    video_id: str,
+    clip_id: str,
+    channel: str,
+    mode: str | None,
+    *,
+    state_dir: str | Path | None = None,
+) -> dict[str, Any]:
+    """Mode de publication d'une entree (``immediate`` | ``scheduled``), ou ``None`` pour
+    retomber sur ``[tiktok] publish_mode``."""
+    if mode not in (None, *PUBLISH_MODES):
+        raise PublishError(f"mode de publication invalide : {mode!r} (attendu : {' | '.join(PUBLISH_MODES)})")
+    path = _state_path(channel, state_dir)
+    with _locked(path):
+        entries = _load_entries(path)
+        entry = _find_entry(entries, video_id, clip_id)
+        if entry is None:
+            raise PublishError(f"clip absent de la file de publication : {video_id}/{clip_id}")
+        entry = dict(entry)
+        entry["publish_mode"] = mode
+        _upsert_entry(entries, entry)
+        _save_entries(path, entries)
+    return entry
+
+
+def list_entries(channel: str, *, state_dir: str | Path | None = None) -> list[dict[str, Any]]:
+    """Les entrees de state/publish/<chaine>.json (validees)."""
+    return _load_entries(_state_path(channel, state_dir))
+
+
+def _account_entries(
+    account: str, state_dir: str | Path | None, presets_dir: str | Path, base: str | Path,
+) -> list[tuple[str, dict[str, Any]]]:
+    """(chaine, entree) de toutes les chaines reliees a ``account`` (SPEC-9225 R2)."""
+    found: list[tuple[str, dict[str, Any]]] = []
+    try:
+        names = channel_mod.list_channels(presets_dir)
+        for name in names:
+            _config, settings = channel_mod.load_channel(name, presets_dir=presets_dir, base=base)
+            if settings["tiktok_account"] == account:
+                found.extend((name, e) for e in _load_entries(_state_path(name, state_dir)))
+    except (channel_mod.ChannelError, ConfigError) as exc:
+        raise PublishError(f"chaines illisibles pour le compte {account} : {exc}") from exc
+    return found
+
+
+def account_publish_times(
+    account: str, *, state_dir: str | Path | None = None, presets_dir: str | Path = "presets",
+    base: str | Path = "config.toml",
+) -> list[datetime]:
+    """Instants des posts deja faits ou programmes du compte, toutes chaines : ``tiktok_publish_at``
+    (l'instant ou le post est en ligne), sinon ``published_at`` (publication manuelle)."""
+    times = []
+    for _name, entry in _account_entries(account, state_dir, presets_dir, base):
+        stamp = entry.get("tiktok_publish_at") or entry.get("published_at")
+        if entry["status"] == "published" and stamp:
+            times.append(datetime.fromisoformat(stamp))
+    return sorted(times)
+
+
+def halted_account(
+    account: str, *, state_dir: str | Path | None = None, presets_dir: str | Path = "presets",
+    base: str | Path = "config.toml",
+) -> dict[str, Any] | None:
+    """La premiere entree ``failed`` qui arrete le compte (R4), ou None : le worker n'y
+    publie plus rien avant son « Reessayer »."""
+    for name, entry in _account_entries(account, state_dir, presets_dir, base):
+        if entry["status"] == "failed" and entry.get("halted"):
+            return {**entry, "channel": name}
+    return None
+
+
+def postpone(
+    video_id: str,
+    clip_id: str,
+    channel: str,
+    reason: str,
+    *,
+    allowed: Callable[[datetime], str | None],
+    now: datetime | None = None,
+    state_dir: str | Path | None = None,
+    presets_dir: str | Path = "presets",
+    base: str | Path = "config.toml",
+) -> dict[str, Any]:
+    """Reporte une entree ``scheduled`` au prochain creneau libre que ``allowed`` accepte
+    (``allowed(creneau)`` rend None, ou la raison du refus : plafonds de R6) ; la raison et la
+    nouvelle date sont gardees dans ``postponed_reason``."""
+    _, channel_dict = channel_mod.load_channel(channel, presets_dir=presets_dir, base=base)
+    path = _state_path(channel, state_dir)
+    with _locked(path):
+        entries = _load_entries(path)
+        entry = _find_entry(entries, video_id, clip_id)
+        if entry is None:
+            raise PublishError(f"clip absent de la file de publication : {video_id}/{clip_id}")
+        if entry["status"] != "scheduled" or not entry["slot_at"]:
+            raise PublishError(f"report impossible pour {video_id}/{clip_id} : statut {entry['status']!r} (attendu : 'scheduled')")
+        taken = {e["slot_at"] for e in entries if e is not entry and e.get("slot_at")}
+        after = max(datetime.fromisoformat(entry["slot_at"]), _now(now))
+        slot = None
+        n = _POSTPONE_FIRST_BATCH
+        while slot is None and n <= _POSTPONE_MAX_SLOTS:
+            slot = next((c for c in channel_mod.next_slots(channel_dict, after, n)
+                         if _iso(c) not in taken and allowed(c) is None), None)
+            n *= 2
+        if slot is None:
+            raise PublishError(f"aucun créneau libre et permis pour reporter {video_id}/{clip_id} ({reason})")
+        entry = dict(entry)
+        entry["postponed_reason"] = f"{reason} : reporté du {entry['slot_at']} au {_iso(slot)}"
+        entry["slot_at"] = _iso(slot)
         _upsert_entry(entries, entry)
         _save_entries(path, entries)
     return entry

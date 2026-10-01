@@ -109,6 +109,26 @@ async function reloadVideo(id) {
   store.videos = list;
 }
 
+/* Notifications de publication TikTok (SPEC-9225 R4) : le worker ecrit un journal, l'API le
+   sert depuis `since` ; un arret (captcha, connexion expiree...) s'affiche en erreur avec sa raison. */
+let tiktokSince = new Date().toISOString(); // seuls les evenements posterieurs a l'ouverture de la page notifient
+async function notifyTikTok() {
+  try {
+    const events = await api("/api/tiktok/events?since=" + encodeURIComponent(tiktokSince));
+    if (events.length) tiktokSince = events[events.length - 1].at;
+    events.forEach((e) => {
+      const where = e.video_id ? `${e.video_id}/${e.clip_id}` : "";
+      toast({
+        kind: e.level === "error" ? "bad" : e.level === "warn" ? "warn" : "ok",
+        title: e.level === "error" ? "Publication TikTok arrêtée" : e.level === "warn" ? "Publication TikTok reportée" : "Publication TikTok",
+        body: `${where ? `${where} : ` : ""}${e.reason}`, ms: e.level === "error" ? 9000 : 5200,
+      });
+    });
+  } catch (err) {
+    toastError("Notifications TikTok illisibles", err);
+  }
+}
+
 /* Evenement SSE {kind, id, at} : recharge l'objet concerne, pas la page. Le
    battement du worker (toutes les quelques secondes) ne met a jour que son
    voyant : il ne declenche ni rechargement de donnees ni nouveau rendu. */
@@ -117,6 +137,7 @@ async function onServerEvent(event) {
     document.dispatchEvent(new CustomEvent("clipper:worker", { detail: event }));
     return;
   }
+  if (event.kind === "tiktok") await notifyTikTok();
   try {
     if (event.kind === "video") await reloadVideo(event.id);
     else if (event.kind === "queue") await loadQueue();

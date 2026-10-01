@@ -12,6 +12,11 @@ const PUB_STATUS = {
   approved: { label: "Approuvé", cls: "ok" }, scheduled: { label: "Planifié", cls: "info" },
   published: { label: "Publié", cls: "ok" }, failed: { label: "Échec", cls: "bad" },
 };
+// Statut TikTok d'une publication (SPEC-9225 R3, R4), calcule par l'API : prime sur le statut de la file.
+const PUB_TIKTOK = {
+  pending: { label: "En attente", cls: "pending" }, scheduled_on_tiktok: { label: "Programmée sur TikTok", cls: "info" },
+  published: { label: "Publiée", cls: "ok" }, failed: { label: "Échec", cls: "bad" },
+};
 const PUB_STALE_MS = 4000;
 const PUB_HOLD_MS = 250;      // appui long avant de saisir un clip au toucher
 const PUB_SLOP_PX = 8;        // mouvement tolere pendant l'appui long (sinon : defilement)
@@ -22,7 +27,7 @@ const pubUi = { channel: "", week: "", key: "", data: null, error: null, loading
 const pubKey = (c) => `${c.video_id}/${c.clip_id}`;
 const pubStatus = (c) => PUB_STATUS[c.publish_status] || { label: c.publish_status, cls: "pending" };
 const pubTitle = (c) => c.screen_title || c.title || c.clip_id;
-const pubChip = (c) => { const s = pubStatus(c); return `<span class="chip ${s.cls}">${esc(s.label)}</span>`; };
+const pubChip = (c) => { const s = PUB_TIKTOK[c.tiktok_status] || pubStatus(c); return `<span class="chip ${s.cls}">${esc(s.label)}</span>`; };
 const pubCaptionText = (c) => [c.description || "", (c.hashtags || []).join(" ")].filter(Boolean).join("\n\n");
 // Les dates de l'API sont deja dans le fuseau de la chaine : on les lit telles quelles.
 const pubDate = (iso) => iso.slice(0, 10);
@@ -121,7 +126,7 @@ function pubDone(d) {
     <div class="panel">${d.done.map((c) => `<div class="list-item pub-done" data-post="${esc(pubKey(c))}" tabindex="0" role="button">
       <div class="mini-clip">${c.video_url ? `<img loading="lazy" decoding="async" width="36" height="64" src="${esc(c.thumbnail_url)}" alt="" tabindex="-1">` : ""}</div>
       <div class="li-main grow"><div class="li-title">${esc(pubTitle(c))}</div>
-        <div class="li-sub muted">${c.publish_status === "published" ? "publié" : "échec"}${c.slot_at ? ` · ${esc(pubSlotLabel(c.slot_at))}` : ""}${c.publish_error ? ` · ${esc(c.publish_error)}` : ""}</div></div>
+        <div class="li-sub muted">${c.publish_status === "published" ? "publié" : "échec"}${c.slot_at ? ` · ${esc(pubSlotLabel(c.slot_at))}` : ""}${c.publish_error ? ` · ${esc(c.publish_error)}` : ""}${c.post_url ? ` · <a href="${esc(c.post_url)}" target="_blank" rel="noopener">voir sur TikTok</a>` : ""}</div></div>
       ${pubChip(c)}</div>`).join("")}</div>
   </section>`;
 }
@@ -137,7 +142,7 @@ function pubToolbar(channels, d) {
       <button type="button" class="btn btn-xs btn-ghost" data-week="0">Cette semaine</button></div>
     <span class="grow"></span>
     <span class="pub-account">${account}</span>
-    <div class="legend"><span><i style="background:var(--info)"></i>planifié</span><span><i style="background:var(--ok)"></i>publié</span><span><i style="background:var(--bad)"></i>échec</span></div>
+    <div class="legend"><span><i style="background:var(--info)"></i>planifié / programmé</span><span><i style="background:var(--ok)"></i>publié</span><span><i style="background:var(--bad)"></i>échec</span></div>
   </div>`;
 }
 
@@ -149,7 +154,7 @@ function pubView(body, channels) {
   else if (!d.slots.length && !d.unscheduled.length && !d.done.length) {
     content = emptyState("send", "Rien à publier", "Approuve des clips : ils apparaîtront ici avec leurs créneaux." + (d.reason ? ` Cette chaîne n'a pas de créneau : ${d.reason}.` : ""));
   } else {
-    content = `<div class="banner">${icon("info", "i-lg")}<p><b>Autopost TikTok pas encore branché.</b> Au créneau : télécharge le clip, copie la description, publie depuis l'appli, puis « Marquer publié ».</p></div>
+    content = `<div class="banner">${icon("info", "i-lg")}<p><b>Le worker publie sur TikTok au créneau</b> (compte cible ci-dessus, Chrome visible). Un arrêt (captcha, connexion expirée...) met le clip en échec avec une capture : « Réessayer » le relance. Tu peux aussi publier à la main : télécharge, copie la description, puis « Marquer publié ».</p></div>
       <div class="grid g-side pub-grid" style="align-items:start"><div class="stack">${pubQueue(d)}</div>
       <div class="stack"><section>${d.slots.length ? pubCalendar(d) : `<p class="reason">${esc(d.reason || "Aucun créneau cette semaine.")}</p>`}</section>${pubDone(d)}</div></div>`;
   }
@@ -216,6 +221,18 @@ async function pubMarkPublished(c) {
   }
 }
 
+async function pubRetry(c) {
+  try {
+    await api(`/api/publish/${pubEnc(c.video_id)}/${pubEnc(c.clip_id)}/retry`, { method: "POST" });
+    await pubLoad();
+    toast({ kind: "info", title: "Publication relancée", body: pubTitle(c), ms: 2600 });
+    return true;
+  } catch (err) {
+    toastError("Impossible de réessayer la publication", err);
+    return false;
+  }
+}
+
 async function pubUnschedule(c) {
   const slotAt = c.slot_at;
   try {
@@ -238,12 +255,16 @@ function pubDetailHtml(c) {
   const account = pubUi.data && pubUi.data.tiktok_account;
   const status = c.publish_status;
   const hint = status === "approved" ? "Glisse ce clip sur un créneau libre du calendrier pour le planifier."
-    : status === "failed" ? "La publication a échoué : repasse le clip en attente pour le replanifier." : "";
+    : status === "failed" ? "La publication s'est arrêtée : regarde la capture, règle le problème dans le navigateur du compte, puis « Réessayer » (ou repasse le clip en attente pour le replanifier)." : "";
   return `
     <div class="modal-head"><div class="row wrap" style="gap:8px">${pubChip(c)}<h2>${esc(pubTitle(c))}</h2></div>
       <p class="muted" style="margin-top:4px">${c.slot_at ? esc(pubSlotLabel(c.slot_at)) : "Sans créneau"}${account ? ` · ${esc(account)}` : ""}</p></div>
     <div class="modal-body stack" style="gap:16px">
       ${c.publish_error ? `<p class="reason bad">Publication en échec : ${esc(c.publish_error)}</p>` : ""}
+      ${c.capture_url ? `<a href="${esc(c.capture_url)}" target="_blank" rel="noopener" title="Capture d'écran de l'arrêt"><img class="pub-capture" loading="lazy" src="${esc(c.capture_url)}" alt="Capture d'écran de l'arrêt" style="max-width:100%;border-radius:8px"></a>` : ""}
+      ${c.post_url ? `<p>Publiée : <a href="${esc(c.post_url)}" target="_blank" rel="noopener">${esc(c.post_url)}</a></p>` : ""}
+      ${c.post_note ? `<p class="muted">${esc(c.post_note)}</p>` : ""}
+      ${c.postponed_reason ? `<p class="muted">Reportée : ${esc(c.postponed_reason)}</p>` : ""}
       ${hint ? `<p class="muted">${esc(hint)}</p>` : ""}
       <div class="field"><span class="field-label">Description</span><div class="pub-caption">${esc(c.description || "")}</div></div>
       <div class="hashtags">${(c.hashtags || []).map((t) => `<span class="tag">${esc(t)}</span>`).join("")}</div>
@@ -252,6 +273,7 @@ function pubDetailHtml(c) {
       <a class="btn btn-ghost" href="${esc(c.video_url)}" download="${esc(c.clip_id)}.mp4">${icon("download")}Télécharger</a>
       <button type="button" class="btn btn-ghost" data-copy>${icon("copy")}Copier la description</button>
       <span class="grow"></span>
+      ${status === "failed" ? `<button type="button" class="btn btn-primary" data-retry>${icon("rotate-ccw")}Réessayer</button>` : ""}
       ${status === "scheduled" || status === "failed" ? `<button type="button" class="btn" data-unschedule>${icon("undo-2")}Repasser en attente</button>` : ""}
       ${status === "scheduled" ? `<button type="button" class="btn btn-primary" data-published>${icon("check")}Marquer publié</button>` : ""}
     </div>`;
@@ -263,6 +285,8 @@ function pubOpenDetail(key) {
   if (c.missing) { toastError("Clip introuvable", new Error(`Le sidecar de ${c.video_id}/${c.clip_id} n'existe plus dans output/.`)); return; }
   openPanel("modal pub-modal", pubDetailHtml(c), (d) => {
     $("[data-copy]", d).onclick = () => copyText(pubCaptionText(c), "Description et hashtags");
+    const retry = $("[data-retry]", d);
+    if (retry) retry.onclick = async () => { closeLayer(); await pubRetry(c); };
     const un = $("[data-unschedule]", d);
     if (un) un.onclick = async () => { closeLayer(); await pubUnschedule(c); };
     const pub = $("[data-published]", d);

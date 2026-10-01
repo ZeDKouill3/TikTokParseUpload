@@ -846,3 +846,311 @@ def test_heartbeat_with_a_dead_pid_is_stopped_even_if_recent(tmp_path, monkeypat
     monkeypatch.setattr(worker, "_pid_alive", lambda pid: False)
 
     assert worker.read_heartbeat(config, now=now)["state"] == "stopped"
+
+
+# --------------------------------------------------------------------------
+# TASK-0b78 : le worker publie les entrees dues sur TikTok (SPEC-9225 R3, R4, R6)
+# La publication est injectee (fausse) : aucun navigateur, aucun TikTok.
+# --------------------------------------------------------------------------
+
+import logging  # noqa: E402
+
+from clipper import browser, publish, tiktok  # noqa: E402
+
+ACCOUNT = "ab12cd"
+LINK = "https://example.invalid/@ma_chaine/video/7300000000000000001"
+_WEEK = "".join(f'[[channel.slots]]\nday = "{d}"\ntime = "09:00"\n' for d in ("mon", "tue", "wed", "thu", "fri", "sat", "sun"))
+
+
+class FakePublisher:
+    """Remplace tiktok.publish : enregistre les appels, rend un resultat ou leve ``error``."""
+
+    def __init__(self, error=None, state="published"):
+        self.calls, self.error, self.state = [], error, state
+
+    def __call__(self, clip, account, *, mode, schedule_at=None, config=None, on_tick=None, **kwargs):
+        self.calls.append({"clip": clip, "account": account, "mode": mode, "schedule_at": schedule_at, "on_tick": on_tick})
+        if self.error is not None:
+            raise self.error
+        scheduled = mode == "scheduled"
+        return {"post_url": None if scheduled else LINK, "post_id": None if scheduled else "7300000000000000001",
+                "state": "scheduled_on_tiktok" if scheduled else "published",
+                "publish_at": (schedule_at if scheduled else datetime.now(timezone.utc)).isoformat(), "note": None}
+
+
+def _pub_env(tmp_path, monkeypatch, *, tiktok_settings=None, account=ACCOUNT, channels=("ma_chaine",)):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "config.toml").write_text('mode = "review"\n', encoding="utf-8")
+    (tmp_path / "state").mkdir(exist_ok=True)
+    (tmp_path / "state" / "accounts.json").write_text(
+        json.dumps({"accounts": [{"id": ACCOUNT, "label": "A"}, {"id": "ef34ab", "label": "B"}]}), encoding="utf-8")
+    presets = tmp_path / "presets"
+    presets.mkdir(exist_ok=True)
+    for i, name in enumerate(channels):
+        acc = f'tiktok_account = "{["ab12cd", "ef34ab"][i]}"\n' if account else ""
+        (presets / f"{name}.toml").write_text(f'[channel]\ntimezone = "UTC"\n{acc}{_WEEK}', encoding="utf-8")
+    return Config(
+        mode="review", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output",
+        _sections={
+            "worker": {"queue_path": str(tmp_path / "state" / "queue.json")},
+            "watch": {"presets_dir": str(presets), "base_config": str(tmp_path / "config.toml")},
+            "tiktok": tiktok_settings or {},
+        })
+
+
+def _seed(tmp_path, channel, clip_id, slot_at, *, status="scheduled", video_id="aaaaaaaaaaa", **extra):
+    out = tmp_path / "output" / video_id
+    out.mkdir(parents=True, exist_ok=True)
+    (out / f"{clip_id}.mp4").write_bytes(b"mp4")
+    (out / f"{clip_id}.json").write_text(json.dumps({
+        "video_id": video_id, "clip_id": clip_id, "caption": f"legende {clip_id}", "hashtags": ["#a", "#b"],
+        "ready": True}), encoding="utf-8")
+    path = tmp_path / "state" / "publish" / f"{channel}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    entries = json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
+    entries.append({
+        "video_id": video_id, "clip_id": clip_id, "series_id": None, "part": None, "status": status,
+        "slot_at": slot_at.isoformat() if slot_at else None, "decided_at": "2026-01-01T00:00:00+00:00",
+        "published_at": None, "error": None, **extra})
+    path.write_text(json.dumps(entries), encoding="utf-8")
+
+
+def _entries(tmp_path, channel="ma_chaine"):
+    return json.loads((tmp_path / "state" / "publish" / f"{channel}.json").read_text(encoding="utf-8"))
+
+
+def _pub_worker(config, publisher):
+    return worker.Worker(config=config, spawner=FakeSpawner(), publisher=publisher)
+
+
+def _ago(**kw):
+    return datetime.now(timezone.utc) - timedelta(**kw)
+
+
+def test_tick_publishes_a_due_immediate_entry_with_mp4_caption_and_hashtags(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1))
+    pub = FakePublisher()
+
+    _pub_worker(config, pub).tick()
+
+    assert len(pub.calls) == 1
+    call = pub.calls[0]
+    assert (call["account"], call["mode"], call["schedule_at"]) == (ACCOUNT, "immediate", None)
+    assert call["clip"] == {"video_path": tmp_path / "output" / "aaaaaaaaaaa" / "01.mp4",
+                            "caption": "legende 01", "hashtags": ["#a", "#b"]}
+    entry = _entries(tmp_path)[0]
+    assert entry["status"] == "published" and entry["tiktok_state"] == "published"
+    assert (entry["post_url"], entry["post_id"]) == (LINK, "7300000000000000001")
+    sidecar = json.loads((tmp_path / "output" / "aaaaaaaaaaa" / "01.json").read_text(encoding="utf-8"))
+    assert sidecar["tiktok_post"]["url"] == LINK and sidecar["tiktok_post"]["account"] == ACCOUNT
+    assert callable(call["on_tick"])  # le battement du worker continue pendant la publication
+
+
+def test_tick_leaves_an_immediate_entry_whose_slot_is_not_reached(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    _seed(tmp_path, "ma_chaine", "01", datetime.now(timezone.utc) + timedelta(hours=2))
+    pub = FakePublisher()
+
+    _pub_worker(config, pub).tick()
+
+    assert pub.calls == [] and _entries(tmp_path)[0]["status"] == "scheduled"
+
+
+def test_tick_ignores_entries_that_are_not_scheduled(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    for i, status in enumerate(("approved", "rejected", "published", "failed")):
+        _seed(tmp_path, "ma_chaine", f"0{i}", _ago(minutes=1), status=status)
+    pub = FakePublisher()
+
+    _pub_worker(config, pub).tick()
+
+    assert pub.calls == []
+
+
+def test_scheduled_mode_publishes_once_the_date_is_inside_the_schedule_window(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch, tiktok_settings={"publish_mode": "scheduled"})
+    inside = datetime.now(timezone.utc) + timedelta(days=3)
+    outside = datetime.now(timezone.utc) + timedelta(days=11)
+    _seed(tmp_path, "ma_chaine", "01", inside)
+    _seed(tmp_path, "ma_chaine", "02", outside)
+    pub = FakePublisher()
+    w = _pub_worker(config, pub)
+
+    w.tick()
+    w.tick()
+
+    assert [(c["mode"], c["schedule_at"]) for c in pub.calls] == [("scheduled", inside.replace(microsecond=inside.microsecond))]
+    first, second = _entries(tmp_path)
+    assert first["status"] == "published" and first["tiktok_state"] == "scheduled_on_tiktok"
+    assert first["tiktok_publish_at"] == inside.isoformat()
+    assert second["status"] == "scheduled"  # hors fenetre : attend
+
+
+def test_an_entry_publish_mode_overrides_the_config_mode(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)  # config : immediate
+    slot = datetime.now(timezone.utc) + timedelta(days=2)
+    _seed(tmp_path, "ma_chaine", "01", slot, publish_mode="scheduled")
+    pub = FakePublisher()
+
+    _pub_worker(config, pub).tick()
+
+    assert [c["mode"] for c in pub.calls] == ["scheduled"]
+
+
+def test_the_worker_publishes_one_entry_per_tick_one_account_at_a_time(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch, channels=("ma_chaine", "autre"),
+                      tiktok_settings={"max_posts_per_day": 5, "min_gap_minutes": 0})
+    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=3))
+    _seed(tmp_path, "ma_chaine", "02", _ago(minutes=2))
+    _seed(tmp_path, "autre", "03", _ago(minutes=1), video_id="bbbbbbbbbbb")
+    pub = FakePublisher()
+    w = _pub_worker(config, pub)
+
+    w.tick()
+    assert [c["clip"]["caption"] for c in pub.calls] == ["legende 01"]
+    w.tick()
+    w.tick()
+    assert [c["clip"]["caption"] for c in pub.calls] == ["legende 01", "legende 02", "legende 03"]
+    assert [c["account"] for c in pub.calls] == [ACCOUNT, ACCOUNT, "ef34ab"]
+
+
+def test_a_channel_without_a_tiktok_account_fails_explicitly_and_does_not_publish(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch, account=None)
+    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1))
+    pub = FakePublisher()
+
+    _pub_worker(config, pub).tick()
+
+    assert pub.calls == []
+    entry = _entries(tmp_path)[0]
+    assert entry["status"] == "failed"
+    assert "tiktok_account" in entry["error"] and "ma_chaine" in entry["error"]
+    events = tiktok.read_events(config=config)
+    assert events[-1]["level"] == "error" and "tiktok_account" in events[-1]["reason"]
+
+
+@pytest.mark.parametrize("code, reason", [
+    ("captcha", "captcha détecté"),
+    ("verification", "vérification de compte demandée"),
+    ("login", "connexion expirée"),
+    ("element_missing", "élément attendu absent après 30 s : caption_editor"),
+    ("unexpected_page", "page inattendue : https://exemple.invalid/erreur"),
+])
+def test_r4_a_stop_fails_the_entry_with_reason_and_capture_halts_the_account_and_notifies(tmp_path, monkeypatch, code, reason):
+    config = _pub_env(tmp_path, monkeypatch, tiktok_settings={"max_posts_per_day": 5, "min_gap_minutes": 0})
+    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=2))
+    _seed(tmp_path, "ma_chaine", "02", _ago(minutes=1))
+    capture = tmp_path / "state" / "browser" / ACCOUNT / "captures" / f"x-{code}.png"
+    pub = FakePublisher(error=tiktok.TikTokStop(code, reason, capture))
+    w = _pub_worker(config, pub)
+
+    w.tick()
+
+    first, second = _entries(tmp_path)
+    assert first["status"] == "failed" and first["error"] == reason
+    assert first["capture"] == str(capture) and first["halted"] is True
+    assert second["status"] == "scheduled"  # remise en attente, rien de publie derriere
+    event = tiktok.read_events(config=config)[-1]
+    assert (event["level"], event["account"], event["reason"], event["capture"]) == ("error", ACCOUNT, reason, str(capture))
+    assert (event["channel"], event["video_id"], event["clip_id"]) == ("ma_chaine", "aaaaaaaaaaa", "01")
+
+    pub.error = None
+    w.tick()  # compte arrete : l'entree suivante n'est pas tentee
+    assert len(pub.calls) == 1
+
+    publish.retry("aaaaaaaaaaa", "01", "ma_chaine")  # bouton Reessayer
+    w.tick()
+    assert len(pub.calls) == 2 and _entries(tmp_path)[0]["status"] == "published"
+
+
+def test_a_browser_error_fails_and_halts_a_tiktok_error_only_fails_the_entry(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=2))
+    w = _pub_worker(config, FakePublisher(error=browser.BrowserError("Chrome est introuvable")))
+    w.tick()
+    entry = _entries(tmp_path)[0]
+    assert entry["status"] == "failed" and "Chrome est introuvable" in entry["error"] and entry["halted"] is True
+
+    publish.retry("aaaaaaaaaaa", "01", "ma_chaine")
+    w.publisher = FakePublisher(error=tiktok.TikTokError("programmation refusée : trop loin"))
+    w.tick()
+    entry = _entries(tmp_path)[0]
+    assert entry["status"] == "failed" and "trop loin" in entry["error"] and entry["halted"] is False
+
+
+def test_an_unexpected_error_is_logged_and_fails_the_entry_instead_of_killing_the_worker(tmp_path, monkeypatch, caplog):
+    config = _pub_env(tmp_path, monkeypatch)
+    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1))
+
+    with caplog.at_level(logging.ERROR):
+        _pub_worker(config, FakePublisher(error=RuntimeError("boum"))).tick()
+
+    entry = _entries(tmp_path)[0]
+    assert entry["status"] == "failed" and "RuntimeError" in entry["error"] and "boum" in entry["error"]
+    assert "boum" in caplog.text
+
+
+def test_r6_posts_per_day_cap_postpones_to_the_next_free_slot_and_logs_it(tmp_path, monkeypatch, caplog):
+    config = _pub_env(tmp_path, monkeypatch)  # 1 post par jour, 480 min d'ecart
+    now = datetime.now(timezone.utc)
+    _seed(tmp_path, "ma_chaine", "00", _ago(hours=0, seconds=1), status="published",
+          tiktok_publish_at=(now - timedelta(seconds=1)).isoformat(), published_at=now.isoformat())
+    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1))
+    pub = FakePublisher()
+
+    with caplog.at_level(logging.WARNING):
+        _pub_worker(config, pub).tick()
+
+    assert pub.calls == []
+    entry = next(e for e in _entries(tmp_path) if e["clip_id"] == "01")
+    assert entry["status"] == "scheduled"
+    new_slot = datetime.fromisoformat(entry["slot_at"])
+    assert new_slot > now and new_slot.date() != now.date()
+    assert "plafond de 1 publication(s) par jour" in entry["postponed_reason"]
+    assert "reporté" in caplog.text and "01" in caplog.text
+
+
+def test_r6_min_gap_postpones_even_when_the_daily_cap_is_not_reached(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch, tiktok_settings={"max_posts_per_day": 9, "min_gap_minutes": 600})
+    now = datetime.now(timezone.utc)
+    _seed(tmp_path, "ma_chaine", "00", _ago(minutes=5), status="published",
+          tiktok_publish_at=(now - timedelta(minutes=5)).isoformat(), published_at=now.isoformat())
+    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1))
+    pub = FakePublisher()
+
+    _pub_worker(config, pub).tick()
+
+    assert pub.calls == []
+    entry = next(e for e in _entries(tmp_path) if e["clip_id"] == "01")
+    assert "600 minutes" in entry["postponed_reason"]
+    assert datetime.fromisoformat(entry["slot_at"]) >= now + timedelta(minutes=595)
+
+
+def test_r6_a_published_post_counts_for_the_account_across_channels(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    (tmp_path / "presets" / "autre.toml").write_text(
+        f'[channel]\ntimezone = "UTC"\ntiktok_account = "{ACCOUNT}"\n{_WEEK}', encoding="utf-8")
+    now = datetime.now(timezone.utc)
+    _seed(tmp_path, "autre", "00", _ago(minutes=5), status="published", video_id="bbbbbbbbbbb",
+          tiktok_publish_at=(now - timedelta(seconds=5)).isoformat(), published_at=now.isoformat())
+    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1))
+    pub = FakePublisher()
+
+    _pub_worker(config, pub).tick()
+
+    assert pub.calls == []
+
+
+def test_a_broken_publish_file_is_logged_once_and_does_not_kill_the_worker(tmp_path, monkeypatch, caplog):
+    config = _pub_env(tmp_path, monkeypatch)
+    path = tmp_path / "state" / "publish" / "ma_chaine.json"
+    path.parent.mkdir(parents=True)
+    path.write_text('[{"video_id": "x"}]', encoding="utf-8")
+    w = _pub_worker(config, FakePublisher())
+
+    with caplog.at_level(logging.ERROR):
+        w.tick()
+        w.tick()
+
+    assert caplog.text.count("publication TikTok impossible") == 1

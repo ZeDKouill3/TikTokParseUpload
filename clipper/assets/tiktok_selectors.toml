@@ -1,0 +1,68 @@
+# Selecteurs et URL de TikTok Studio (SPEC-9225 R5, ADR-1a58).
+#
+# Seul fichier ou vivent les adresses et les selecteurs de la page TikTok :
+# clipper/tiktok.py n'en contient aucun. Un changement de page TikTok se corrige
+# ici, sans toucher la logique.
+#
+# A VERIFIER SUR LA VRAIE PAGE : toutes les valeurs ci-dessous sont plausibles
+# (d'apres la structure connue de TikTok Studio) mais n'ont PAS ete validees sur
+# la vraie page. Le test reel (CLIPPER_TIKTOK_REAL=1, tests/integration/
+# test_tiktok_real.py) sert a les confirmer avant tout usage.
+#
+# Un selecteur est une chaine CSS/Playwright. Une liste (captcha, verification,
+# connexion) est un ensemble de signes : un seul present suffit a arreter.
+
+version = 1
+
+[urls]
+# Page d'envoi d'une video.
+upload = "https://www.tiktok.com/tiktokstudio/upload?from=webapp"
+
+[expect]
+# Apres l'ouverture de la page d'envoi, l'adresse courante doit commencer par ceci ;
+# sinon la page est inattendue (redirection, erreur) : arret, jamais un clic au hasard.
+upload_url_prefix = "https://www.tiktok.com/tiktokstudio/upload"
+# Fragments d'adresse qui disent « connexion expiree » (redirection vers la connexion).
+login_url_markers = ["/login"]
+
+[selectors]
+# Champ fichier (cache : attendu « attached », pas « visible »).
+file_input = "input[type='file']"
+# Marque la fin de l'envoi du mp4 (apparait une fois la video traitee).
+upload_done = "div[data-e2e='upload_status_success'], .upload-stage-success"
+# Editeur de legende (contenteditable), legende + hashtags.
+caption_editor = "div[data-e2e='caption_container'] div[contenteditable='true'], .public-DraftEditor-content"
+# Menu « Qui peut regarder cette video » et ses options.
+visibility_dropdown = "div[data-e2e='privacy_container'] button, [data-e2e='privacy_select']"
+visibility_public = "[data-e2e='privacy_option_public'], div[role='option']:has-text('Tout le monde')"
+visibility_private = "[data-e2e='privacy_option_private'], div[role='option']:has-text('Seulement moi')"
+# Programmation : interrupteur « Programmer », champs date et heure.
+schedule_toggle = "[data-e2e='schedule_radio'], label:has-text('Programmer')"
+schedule_date_input = "[data-e2e='schedule_date_input'], input[placeholder*='date' i]"
+schedule_time_input = "[data-e2e='schedule_time_input'], input[placeholder*='heure' i]"
+# Bouton final : « Publier » (immediat) ou « Programmer » (programme).
+post_button = "button[data-e2e='post_video_button']"
+schedule_button = "button[data-e2e='schedule_video_button']"
+# Confirmation apres envoi (boite « Video envoyee » / « Programmee »).
+success_marker = "[data-e2e='post_success_modal'], div:has-text('Video envoyee')"
+# Lien vers la video publiee, dans la confirmation (attribut href) ; absent pour un
+# post programme (pas encore d'adresse publique).
+post_link = "[data-e2e='post_success_modal'] a[href*='/video/']"
+
+[detect]
+# Signes de captcha (iframe/conteneur de verification).
+captcha = [
+  "#captcha-verify-container-main-page",
+  "iframe[src*='captcha']",
+  "div.captcha_verify_container",
+]
+# Signes de verification de compte (code, identite, telephone).
+verification = [
+  "[data-e2e='verify-identity']",
+  "div:has-text('Verifier votre identite')",
+]
+# Signes d'un formulaire de connexion (session expiree).
+login = [
+  "form[data-e2e='login-form']",
+  "[data-e2e='top-login-button']",
+]

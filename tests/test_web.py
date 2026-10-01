@@ -4678,3 +4678,115 @@ def test_help_details_keep_the_rest_of_the_comment_for_a_folded_block(tmp_path, 
     assert rubric["comment"].count(".") <= 2
     js = _static("screens", "channels.js") + _static("screens", "settings.js")
     assert js.count("<details class=\"chan-help\"") + js.count("<details class=\"set-help\"") >= 2
+
+
+# --------------------------------------------------------------------------
+# TASK-0b78 : statut de chaque publication TikTok dans la console (SPEC-9225 R3, R4)
+# --------------------------------------------------------------------------
+
+_CAPTURE = "state/browser/ab12cd/captures/20261005T100000-captcha.png"
+_POST = "https://example.invalid/@ma_chaine/video/7300000000000000001"
+
+
+def _tiktok_entries():
+    return [
+        _entry("01", "scheduled", slot_at=PUB_THU, postponed_reason="plafond de 1 publication(s) par jour atteint le 2026-10-05"),
+        _entry("02", "published", slot_at=PUB_MON, published_at="2026-10-05T18:40:00+02:00", tiktok_state="scheduled_on_tiktok",
+               tiktok_publish_at=PUB_MON, post_url=None, post_id=None, post_note="post programmé : son adresse publique n'existe pas encore"),
+        _entry("03", "published", slot_at=PUB_MON, published_at="2026-10-05T18:40:00+02:00", tiktok_state="published",
+               tiktok_publish_at="2026-10-05T18:40:00+02:00", post_url=_POST, post_id="7300000000000000001"),
+        _entry("04", "failed", slot_at="2026-10-06T10:00:00+02:00", error="captcha détecté", capture=_CAPTURE, halted=True),
+        _entry("05", "approved"),
+    ]
+
+
+def test_get_publish_gives_each_publication_its_tiktok_status_link_and_capture(tmp_path, isolated_cwd):
+    _publish_setup(tmp_path, _tiktok_entries())
+
+    data = _get_publish(tmp_path).json()
+    clips = {c["clip_id"]: c for c in [*data["unscheduled"], *data["done"], *(s["clip"] for s in data["slots"] if s["clip"])]}
+
+    assert clips["01"]["tiktok_status"] == "pending"
+    assert "plafond" in clips["01"]["postponed_reason"]
+    assert clips["02"]["tiktok_status"] == "scheduled_on_tiktok"
+    assert clips["03"]["tiktok_status"] == "published" and clips["03"]["post_url"] == _POST
+    assert clips["04"]["tiktok_status"] == "failed" and clips["04"]["publish_error"] == "captcha détecté"
+    assert clips["04"]["capture_url"] == f"/api/publish/{CLIPS_VIDEO}/04/capture"
+    assert clips["03"]["capture_url"] is None
+    assert clips["05"]["tiktok_status"] == "pending"
+
+
+def test_capture_is_served_from_the_browser_captures_folder_only(tmp_path, isolated_cwd):
+    _publish_setup(tmp_path, [
+        _entry("04", "failed", error="captcha", capture=_CAPTURE),
+        _entry("05", "failed", error="x", capture="../../../etc/passwd"),
+        _entry("06", "failed", error="x", capture="state/accounts.json"),
+        _entry("01", "failed", error="x"),
+    ])
+    shot = tmp_path / _CAPTURE
+    shot.parent.mkdir(parents=True)
+    shot.write_bytes(b"\x89PNG fake")
+    c = client(tmp_path)
+
+    ok = c.get(f"/api/publish/{CLIPS_VIDEO}/04/capture")
+    assert ok.status_code == 200 and ok.content == b"\x89PNG fake" and ok.headers["content-type"] == "image/png"
+    assert c.get(f"/api/publish/{CLIPS_VIDEO}/05/capture").status_code == 404   # hors de state/browser/*/captures
+    assert c.get(f"/api/publish/{CLIPS_VIDEO}/06/capture").status_code == 404
+    assert c.get(f"/api/publish/{CLIPS_VIDEO}/01/capture").status_code == 404   # pas de capture
+    assert c.get(f"/api/publish/{CLIPS_VIDEO}/..%2Fx/capture").status_code in (400, 404)
+
+
+def test_retry_puts_a_failed_publication_back_in_the_queue(tmp_path, isolated_cwd):
+    _publish_setup(tmp_path, [_entry("04", "failed", slot_at=PUB_THU, error="captcha", capture=_CAPTURE, halted=True)])
+
+    resp = client(tmp_path).post(f"/api/publish/{CLIPS_VIDEO}/04/retry")
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "scheduled" and resp.json()["error"] is None
+    saved = json.loads((tmp_path / "state" / "publish" / "ma_chaine.json").read_text(encoding="utf-8"))
+    assert saved[0]["status"] == "scheduled" and saved[0]["halted"] is False
+
+
+def test_retry_of_an_entry_that_did_not_fail_is_a_409(tmp_path, isolated_cwd):
+    _publish_setup(tmp_path, [_entry("01", "scheduled", slot_at=PUB_THU)])
+    resp = client(tmp_path).post(f"/api/publish/{CLIPS_VIDEO}/01/retry")
+    assert resp.status_code == 409 and "failed" in resp.json()["detail"]
+
+
+def test_publish_mode_of_one_entry_can_be_set(tmp_path, isolated_cwd):
+    _publish_setup(tmp_path, [_entry("01", "scheduled", slot_at=PUB_THU)])
+    c = client(tmp_path)
+
+    ok = c.post(f"/api/publish/{CLIPS_VIDEO}/01/mode", json={"mode": "scheduled"})
+    bad = c.post(f"/api/publish/{CLIPS_VIDEO}/01/mode", json={"mode": "demain"})
+
+    assert ok.status_code == 200 and ok.json()["publish_mode"] == "scheduled"
+    assert bad.status_code == 409 and "mode" in bad.json()["detail"]
+
+
+def test_tiktok_events_are_listed_since_a_date(tmp_path, isolated_cwd):
+    from clipper import tiktok
+
+    tiktok.emit_event({"level": "error", "reason": "captcha détecté"}, now=datetime(2026, 10, 5, 10, 0, tzinfo=timezone.utc))
+    tiktok.emit_event({"level": "info", "reason": "publiée"}, now=datetime(2026, 10, 5, 11, 0, tzinfo=timezone.utc))
+    c = client(tmp_path)
+
+    assert [e["reason"] for e in c.get("/api/tiktok/events").json()] == ["captcha détecté", "publiée"]
+    assert [e["reason"] for e in c.get("/api/tiktok/events", params={"since": "2026-10-05T10:00:00+00:00"}).json()] == ["publiée"]
+
+
+def test_corrupt_tiktok_events_file_is_a_500_in_french(tmp_path, isolated_cwd):
+    path = tmp_path / "state" / "tiktok" / "events.json"
+    path.parent.mkdir(parents=True)
+    path.write_text("{pas du json", encoding="utf-8")
+    resp = client(tmp_path).get("/api/tiktok/events")
+    assert resp.status_code == 500 and "événements" in resp.json()["detail"]
+
+
+def test_console_shows_tiktok_status_retry_button_and_notifications():
+    static = Path(__file__).resolve().parent.parent / "clipper" / "web" / "static"
+    publish_js = (static / "screens" / "publish.js").read_text(encoding="utf-8")
+    app_js = (static / "app.js").read_text(encoding="utf-8")
+    for label in ("En attente", "Programmée sur TikTok", "Publiée", "Échec", "Réessayer", "/retry", "capture_url", "post_url"):
+        assert label in publish_js
+    assert "/api/tiktok/events" in app_js and 'event.kind === "tiktok"' in app_js
