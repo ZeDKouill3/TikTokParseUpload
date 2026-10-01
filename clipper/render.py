@@ -129,6 +129,10 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "part_font_size": 48,
     "part_font_color": "white",
     "part_margin": 40,
+    # Miniature JPEG d'un clip rendu (galerie de l'interface web) : une seule
+    # image, largeur maximale en pixels, prise a thumbnail_seek secondes.
+    "thumbnail_width": 360,
+    "thumbnail_seek": 0.5,
     "blur_radius": 20,
     "blur_power": 2,
     # Le fond flou (fallback_blur) est calcule sur une image reduite d'un
@@ -1166,6 +1170,34 @@ def _exec_ffmpeg(cmd: list[str], cwd: Path, out_path: Path) -> None:
         raise RenderError(f"ffmpeg introuvable ({cmd[0]})") from exc
     if proc.returncode != 0:
         raise RenderError(f"ffmpeg a echoue pour {out_path} : {proc.stderr.decode(errors='replace').strip()}")
+
+
+def thumbnail(mp4: Path, target: Path, *, config: Any = None, ffmpeg_bin: str = "ffmpeg") -> Path:
+    """Extrait une seule image JPEG de ``mp4`` vers ``target`` (largeur
+    ``[render] thumbnail_width`` au plus, jamais agrandie). Ecrit puis remplace
+    atomiquement ; ``RenderError`` si le mp4 manque ou si ffmpeg echoue."""
+    mp4, target = Path(mp4), Path(target)
+    if not mp4.is_file():
+        raise RenderError(f"clip introuvable : {mp4}")
+    settings = {**CONFIG_DEFAULTS, **(config.section("render") if config is not None else {})}
+    width = int(settings["thumbnail_width"])
+    seek = float(settings["thumbnail_seek"])
+    if width < 1 or seek < 0:
+        raise RenderError(f"[render] thumbnail_width >= 1 et thumbnail_seek >= 0 exiges, recu {width} et {seek}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(f"{target.name}.{os.getpid()}.tmp")
+    cmd = [
+        ffmpeg_bin, "-y", "-loglevel", "error",
+        "-ss", f"{seek:.6f}", "-i", str(mp4.resolve()),
+        "-frames:v", "1", "-vf", f"scale='min({width},iw)':-2",
+        "-q:v", "4", "-f", "mjpeg", str(tmp.resolve()),
+    ]
+    try:
+        _exec_ffmpeg(cmd, target.parent, tmp)
+        os.replace(tmp, target)
+    finally:
+        tmp.unlink(missing_ok=True)
+    return target
 
 
 # --------------------------------------------------------------------------

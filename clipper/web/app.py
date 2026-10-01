@@ -25,7 +25,7 @@ from typing import Any, AsyncIterator
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse as _PlainJSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -63,6 +63,29 @@ _TOKEN_COOKIE = "clipper_token"
 class WebConfigError(Exception):
     """[web] host hors bouclage sans jeton configure (ADR-4f6e §5, ADR-ad2e :
     jamais d'exposition silencieuse)."""
+
+
+_ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+def _strip_ansi(value: Any) -> Any:
+    """Retire les sequences ANSI (couleurs de yt-dlp...) de toute chaine d'une
+    structure JSON : l'interface affiche du texte, jamais des codes terminal."""
+    if isinstance(value, str):
+        return _ANSI_RE.sub("", value)
+    if isinstance(value, list):
+        return [_strip_ansi(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _strip_ansi(v) for k, v in value.items()}
+    return value
+
+
+class JSONResponse(_PlainJSONResponse):
+    """Toute reponse JSON de l'API (raisons d'echec, journal, erreurs) sort
+    sans sequence ANSI."""
+
+    def render(self, content: Any) -> bytes:
+        return super().render(_strip_ansi(content))
 
 
 def _safe_video_file(directory: Path, name: str) -> Path:
@@ -401,15 +424,6 @@ def _dashboard_llm_cost(config: Config) -> dict[str, Any]:
     return {"llm_cost": cost}
 
 
-def _vram_used_mb() -> int:
-    import torch  # lourd et optionnel : charge seulement si le device est CUDA
-
-    if not torch.cuda.is_available():
-        raise RuntimeError("torch.cuda n'est pas disponible")
-    free, total = torch.cuda.mem_get_info()
-    return (total - free) // _MIB
-
-
 def _dashboard_hardware() -> dict[str, Any]:
     try:
         device = gpu_mod.get_device().type
@@ -418,9 +432,9 @@ def _dashboard_hardware() -> dict[str, Any]:
     hardware: dict[str, Any] = {"device": device, "vram_used_mb": None}
     if device != "cpu":
         try:
-            hardware["vram_used_mb"] = _vram_used_mb()
-        except Exception as exc:  # torch absent (ImportError), CUDA indisponible...
-            hardware["vram_used_mb_error"] = f"VRAM utilisée illisible (torch) : {exc}"
+            hardware["vram_used_mb"] = gpu_mod.vram_used_mb()
+        except gpu_mod.GpuError as exc:  # nvidia-smi absent ou illisible : indisponible, avec la raison
+            hardware["vram_used_mb_error"] = f"VRAM utilisée indisponible : {exc}"
     return {"hardware": hardware}
 
 
@@ -512,6 +526,7 @@ def _clip_view(sidecar: dict[str, Any], channel: str | None, entry: dict[str, An
         "channel": channel,
         "description": sidecar.get("caption"),
         "video_url": f"/media/clip/{video_id}/{clip_id}",
+        "thumbnail_url": f"/media/clip/{video_id}/{clip_id}/thumbnail",
         "qa_status": qa.get("status"),
         "issues": qa.get("issues"),
         "publish_status": entry["status"] if entry else _TO_VALIDATE,
@@ -1284,8 +1299,12 @@ def create_app(config: Config | None = None) -> FastAPI:
             f"[web] host={host!r} hors bouclage exige un jeton ([web] token) configure (ADR-4f6e §5)"
         )
 
-    app = FastAPI(title="Clipper")
+    app = FastAPI(title="Clipper", default_response_class=JSONResponse)
     app.state.config = config
+
+    @app.exception_handler(HTTPException)
+    async def _http_error(_request: Request, exc: HTTPException) -> JSONResponse:
+        return JSONResponse({"detail": exc.detail}, status_code=exc.status_code, headers=exc.headers)
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
     @app.middleware("http")
@@ -1432,6 +1451,7 @@ def create_app(config: Config | None = None) -> FastAPI:
         for path in sorted(out_dir.glob("*.json")):
             clip = _read_json(path)
             clip["video_url"] = f"/media/clip/{video_id}/{clip['clip_id']}"
+            clip["thumbnail_url"] = f"/media/clip/{video_id}/{clip['clip_id']}/thumbnail"
             clips.append(clip)
         return clips
 
@@ -1708,6 +1728,18 @@ def create_app(config: Config | None = None) -> FastAPI:
         path = _safe_video_file(Path(config.output_dir) / video_id, clip_id)
         return FileResponse(path, media_type="video/mp4")
 
+    @app.get("/media/clip/{video_id}/{clip_id}/thumbnail")
+    def media_clip_thumbnail(video_id: str, clip_id: str) -> FileResponse:
+        # Le web ne traite jamais de video (ADR-09ad) : pipeline.clip_thumbnail extrait et met en cache.
+        if not _SAFE_ID.fullmatch(video_id):
+            raise HTTPException(status_code=404, detail=f"identifiant invalide : {video_id!r}")
+        _safe_video_file(Path(config.output_dir) / video_id, clip_id)  # 404 si le clip n'existe pas
+        try:
+            path = pipeline.clip_thumbnail(config, video_id, clip_id)
+        except pipeline.PipelineError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return FileResponse(path, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=3600"})
+
     return app
 
 
@@ -1764,7 +1796,7 @@ def _publish_clip_view(clips: dict[tuple[str, str], dict[str, Any]], channel: st
     return {
         "video_id": entry["video_id"], "clip_id": entry["clip_id"], "channel": channel, "missing": True,
         "publish_status": entry["status"], "slot_at": entry.get("slot_at"), "publish_error": entry.get("error"),
-        "screen_title": None, "description": None, "hashtags": [], "video_url": None,
+        "screen_title": None, "description": None, "hashtags": [], "video_url": None, "thumbnail_url": None,
     }
 
 

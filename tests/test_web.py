@@ -1443,32 +1443,36 @@ def test_dashboard_hardware_is_cpu_without_vram_or_error(tmp_path, isolated_cwd,
     assert "hardware_error" not in data
 
 
-def _fake_torch(monkeypatch, *, available=True, free=3 * 1024**3, total=8 * 1024**3):
-    torch = types.ModuleType("torch")
-    torch.cuda = types.SimpleNamespace(is_available=lambda: available, mem_get_info=lambda: (free, total))
-    monkeypatch.setitem(sys.modules, "torch", torch)
-
-
-def test_dashboard_hardware_reads_vram_used_on_cuda(tmp_path, isolated_cwd, monkeypatch):
+def test_dashboard_hardware_reads_vram_used_on_cuda_through_clipper_gpu(tmp_path, isolated_cwd, monkeypatch):
     from clipper import gpu
 
     monkeypatch.setattr(gpu, "get_device", lambda: gpu.Device(type="cuda", compute_type="float16"))
-    _fake_torch(monkeypatch)
+    monkeypatch.setattr(gpu, "vram_used_mb", lambda: 5 * 1024)
+    monkeypatch.setitem(sys.modules, "torch", None)  # le panneau n'importe plus torch
 
     assert _dashboard(tmp_path)["hardware"] == {"device": "cuda", "vram_used_mb": 5 * 1024}
 
 
-def test_dashboard_hardware_vram_unknown_is_null_with_a_french_error(tmp_path, isolated_cwd, monkeypatch):
+def test_dashboard_hardware_vram_unknown_is_null_with_the_reason(tmp_path, isolated_cwd, monkeypatch):
     from clipper import gpu
 
+    def unavailable():
+        raise gpu.GpuError("nvidia-smi introuvable dans le PATH")
+
     monkeypatch.setattr(gpu, "get_device", lambda: gpu.Device(type="cuda", compute_type="float16"))
-    monkeypatch.setitem(sys.modules, "torch", None)  # import torch -> ImportError
+    monkeypatch.setattr(gpu, "vram_used_mb", unavailable)
+    monkeypatch.setitem(sys.modules, "torch", None)
 
     hw = _dashboard(tmp_path)["hardware"]
 
     assert hw["device"] == "cuda"
     assert hw["vram_used_mb"] is None
-    assert "torch" in hw["vram_used_mb_error"]
+    assert "nvidia-smi introuvable" in hw["vram_used_mb_error"]
+    assert "No module named" not in hw["vram_used_mb_error"] and "torch" not in hw["vram_used_mb_error"]
+
+
+def test_web_app_never_imports_torch():
+    assert "torch" not in (Path(__file__).resolve().parent.parent / "clipper" / "web" / "app.py").read_text(encoding="utf-8")
 
 
 def test_dashboard_screen_is_wired_with_every_section_and_empty_state():
@@ -3381,3 +3385,150 @@ def test_console_docs_example_preset_is_valid(tmp_path, isolated_cwd):
     _config, chan = channel.load_channel("ma_chaine")
 
     assert chan["display_name"] == "ma_chaine" and chan["watch"] is True
+
+
+# --------------------------------------------------------------------------
+# Corrections console v2 (TASK-dc9d)
+# --------------------------------------------------------------------------
+
+ANSI_ERROR = "\x1b[0;31mERROR:\x1b[0m \x1b[1mvideo indisponible\x1b[0m"
+ANSI_CLEAN = "ERROR: video indisponible"
+
+
+def test_api_strips_ansi_sequences_from_failure_reasons_and_journal(tmp_path, isolated_cwd):
+    state = _write_state(tmp_path, VIDEO_ID, status="failed", reason=ANSI_ERROR)
+    state["steps"]["download"].update(status="failed", reason=ANSI_ERROR)
+    (tmp_path / "workspace" / VIDEO_ID / "pipeline.json").write_text(json.dumps(state), encoding="utf-8")
+    (tmp_path / "workspace" / VIDEO_ID / "events.jsonl").write_text(json.dumps(
+        {"at": "2026-01-01T10:00:00+00:00", "level": "ERROR", "step": "download", "message": ANSI_ERROR}) + "\n",
+        encoding="utf-8")
+    c = client(tmp_path)
+
+    video = c.get(f"/api/videos/{VIDEO_ID}")
+    events = c.get(f"/api/videos/{VIDEO_ID}/events")
+    dashboard = c.get("/api/dashboard")
+    listing = c.get("/api/videos")
+
+    for resp in (video, events, dashboard, listing):
+        assert resp.status_code == 200
+        assert "\x1b" not in resp.text and "\\u001b" not in resp.text
+    assert video.json()["reason"] == ANSI_CLEAN
+    assert events.json()[0]["message"] == ANSI_CLEAN
+    assert dashboard.json()["failed"][0]["reason"] == ANSI_CLEAN
+
+
+def test_api_strips_ansi_sequences_from_error_details(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import pipeline
+
+    def boom(*a, **k):
+        raise pipeline.PipelineError(ANSI_ERROR)
+
+    monkeypatch.setattr(pipeline, "load_state", boom)
+
+    resp = client(tmp_path).get(f"/api/videos/{VIDEO_ID}")
+
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == ANSI_CLEAN
+
+
+def test_strip_ansi_keeps_plain_text_and_handles_nested_json():
+    from clipper.web.app import _strip_ansi
+
+    assert _strip_ansi({"a": ["\x1b[31mx\x1b[0m", 3, None], "b": "é ça [0m reste"}) == {
+        "a": ["x", 3, None], "b": "é ça [0m reste"}
+
+
+THUMB_VIDEO = "abcdefghijk"
+
+
+def test_media_clip_thumbnail_route_serves_the_pipeline_thumbnail(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import pipeline, render
+
+    out_dir = tmp_path / "output" / THUMB_VIDEO
+    out_dir.mkdir(parents=True)
+    (out_dir / "01.mp4").write_bytes(b"mp4")
+    calls = []
+
+    def fake_exec(cmd, cwd, out_path):
+        calls.append(cmd)
+        Path(out_path).write_bytes(b"\xff\xd8jpeg-bytes")
+
+    monkeypatch.setattr(render, "_exec_ffmpeg", fake_exec)
+    c = client(tmp_path)
+
+    first = c.get(f"/media/clip/{THUMB_VIDEO}/01/thumbnail")
+    second = c.get(f"/media/clip/{THUMB_VIDEO}/01/thumbnail")
+
+    assert first.status_code == 200 and first.content == b"\xff\xd8jpeg-bytes"
+    assert first.headers["content-type"] == "image/jpeg"
+    assert "max-age" in first.headers["cache-control"]
+    assert second.content == first.content and len(calls) == 1
+    assert pipeline.clip_thumbnail(make_config(tmp_path), THUMB_VIDEO, "01").is_file()
+
+
+def test_media_clip_thumbnail_route_errors_are_explicit(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import render
+
+    c = client(tmp_path)
+    assert c.get(f"/media/clip/{THUMB_VIDEO}/..%2Fx/thumbnail").status_code == 404
+    assert c.get("/media/clip/../01/thumbnail").status_code in (404, 422)
+    missing = c.get(f"/media/clip/{THUMB_VIDEO}/99/thumbnail")
+    assert missing.status_code == 404 and "introuvable" in missing.json()["detail"]
+
+    out_dir = tmp_path / "output" / THUMB_VIDEO
+    out_dir.mkdir(parents=True)
+    (out_dir / "01.mp4").write_bytes(b"mp4")
+
+    def boom(cmd, cwd, out_path):
+        raise render.RenderError("ffmpeg introuvable (ffmpeg)")
+
+    monkeypatch.setattr(render, "_exec_ffmpeg", boom)
+    failed = c.get(f"/media/clip/{THUMB_VIDEO}/01/thumbnail")
+    assert failed.status_code == 422 and "miniature" in failed.json()["detail"]
+
+
+def test_clips_gallery_uses_lazy_thumbnails_and_no_video_tag_in_the_grid():
+    js = (STATIC / "screens" / "clips.js").read_text(encoding="utf-8")
+    card = js[js.index("function clipCard"):js.index("function clipsEmpty")]
+
+    assert '<img loading="lazy"' in card and "thumbnail_url" in card
+    assert "<video" not in card
+    # la vidéo n'est chargée qu'à l'ouverture d'un clip (fiche)
+    drawer = js[js.index("function clipDrawerHtml"):]
+    assert "<video" in drawer
+    assert "CLIPS_PAGE_SIZE = 24" in js and "Afficher plus" in js
+
+
+def test_clip_views_expose_the_thumbnail_url(tmp_path, isolated_cwd):
+    _clips_setup(tmp_path)
+
+    clips = {c["clip_id"]: c for c in client(tmp_path).get("/api/clips", params={"video_id": CLIPS_VIDEO}).json()}
+
+    assert clips["01"]["thumbnail_url"] == f"/media/clip/{CLIPS_VIDEO}/01/thumbnail"
+
+
+def test_new_channel_button_opens_a_defined_and_visible_modal_panel():
+    import re
+
+    channels = (STATIC / "screens" / "channels.js").read_text(encoding="utf-8")
+    ui = (STATIC / "ui.js").read_text(encoding="utf-8")
+    css = (STATIC / "style.css").read_text(encoding="utf-8")
+    page = (STATIC / "index.html").read_text(encoding="utf-8")
+
+    assert "[data-chan-new]" in channels and "onclick = chOpenNew" in channels
+    call = re.search(r'function chOpenNew\(\) \{\s*openPanel\("([^"]+)"', channels)
+    assert call, "chOpenNew doit appeler openPanel"
+    assert "function openPanel(" in ui
+    assert page.index("/static/ui.js") < page.index("/static/screens/channels.js")
+    # classe CSS du panneau : définie, positionnée au-dessus du fond, visible une fois .show posé
+    classes = call.group(1).split()
+    assert "modal" in classes
+    rule = re.search(r"^\.modal \{([^}]*)\}", css, re.M).group(1)
+    shown = re.search(r"^\.modal\.show \{([^}]*)\}", css, re.M).group(1)
+    assert "position: fixed" in rule and "opacity: 0" in rule and "opacity: 1" in shown
+    z = lambda sel: int(re.search(rf"^{re.escape(sel)} \{{[^}}]*z-index: (\d+)", css, re.M).group(1))
+    assert z(".modal") > z(".overlay")
+    assert "classList.add(\"show\")" in ui
+    # le panneau ne dépend pas du seul requestAnimationFrame (suspendu hors écran) pour devenir visible
+    panel = ui[ui.index("function openPanel("):ui.index("document.addEventListener(\"keydown\"")]
+    assert "setTimeout(reveal" in panel and "try { onOpen(el); }" in panel

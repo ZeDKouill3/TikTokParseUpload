@@ -17,8 +17,9 @@ const CLIP_STATUS = {
 // SPEC-fc0c §4.5 : une entree scheduled/published n'est pas editable sans repasser approved.
 const CLIP_LOCKED = ["scheduled", "published"];
 const CLIPS_STALE_MS = 4000;
+const CLIPS_PAGE_SIZE = 24; // la galerie n'affiche que 24 clips a la fois (« Afficher plus »)
 
-const clipsUi = { data: null, error: null, loading: null, dirty: false, at: 0, filter: "à valider", channel: "", html: "" };
+const clipsUi = { data: null, error: null, loading: null, dirty: false, at: 0, filter: "à valider", channel: "", html: "", shown: CLIPS_PAGE_SIZE };
 
 const clipKey = (c) => `${c.video_id}/${c.clip_id}`;
 const clipUrl = (c, tail) => `/api/clips/${encodeURIComponent(c.video_id)}/${encodeURIComponent(c.clip_id)}${tail || ""}`;
@@ -57,7 +58,7 @@ function clipCard(c) {
   const s = clipStatus(c);
   const warn = c.qa_status === "rejected" ? "bad" : (c.issues && c.issues.length ? "warn" : "");
   return `<div class="clip" data-clip="${esc(clipKey(c))}" tabindex="0" role="button" aria-label="Ouvrir le clip ${esc(c.screen_title || c.clip_id)}">
-    <div class="clip-poster"><video src="${esc(c.video_url)}#t=0.5" preload="metadata" muted playsinline tabindex="-1"></video><div class="shade"></div>
+    <div class="clip-poster"><img loading="lazy" decoding="async" src="${esc(c.thumbnail_url)}" alt="" tabindex="-1"><div class="shade"></div>
       <div class="top"><span class="pill-dark ${s.cls}">${esc(s.label)}</span>${c.parts_total > 1 ? `<span class="pill-dark">${esc(c.part)}/${esc(c.parts_total)}</span>` : ""}</div>
       <span class="play">${icon("play")}</span>
       <div class="bottom"><span class="num">${c.duration != null ? esc(clipSeconds(c.duration)) : ""}</span><span class="grow"></span>
@@ -77,6 +78,9 @@ function clipsView(body) {
   const all = clipsUi.data;
   const filtered = all.filter((c) => (clipsUi.filter === "all" || c.publish_status === clipsUi.filter) && (!clipsUi.channel || c.channel === clipsUi.channel));
   const channels = Array.from(new Set(all.map((c) => c.channel).filter(Boolean))).sort();
+  const rest = filtered.length - clipsUi.shown;
+  const more = rest > 0
+    ? `<div class="row" style="justify-content:center;margin-top:24px"><button type="button" class="btn" data-clips-more>Afficher plus<span class="n">${esc(Math.min(rest, CLIPS_PAGE_SIZE))}</span></button></div>` : "";
   const count = (k) => (k === "all" ? all.length : all.filter((c) => c.publish_status === k).length);
   const html = `
     ${clipsUi.error ? `<p class="reason bad">Actualisation impossible : ${esc(clipsUi.error.message || clipsUi.error)}</p>` : ""}
@@ -85,16 +89,18 @@ function clipsView(body) {
       <span class="grow"></span>
       <select class="input" id="clips-channel" aria-label="Chaîne"><option value="">Toutes les chaînes</option>${channels.map((n) => `<option value="${esc(n)}"${n === clipsUi.channel ? " selected" : ""}>${esc(n)}</option>`).join("")}</select>
     </div>
-    ${filtered.length ? `<div class="clips">${filtered.map(clipCard).join("")}</div>` : clipsEmpty(all)}`;
+    ${filtered.length ? `<div class="clips">${filtered.slice(0, clipsUi.shown).map(clipCard).join("")}</div>${more}` : clipsEmpty(all)}`;
   if (clipsUi.html === html && body.childElementCount) return; // rien de change : on garde les vignettes en place
   clipsUi.html = html;
   body.innerHTML = html;
 }
 
 function clipsWire(body) {
-  $$("[data-filter]", body).forEach((b) => (b.onclick = () => { clipsUi.filter = b.dataset.filter; renderCurrent(); }));
+  $$("[data-filter]", body).forEach((b) => (b.onclick = () => { clipsUi.filter = b.dataset.filter; clipsUi.shown = CLIPS_PAGE_SIZE; renderCurrent(); }));
   const sel = $("#clips-channel", body);
-  if (sel) sel.onchange = () => { clipsUi.channel = sel.value; renderCurrent(); };
+  if (sel) sel.onchange = () => { clipsUi.channel = sel.value; clipsUi.shown = CLIPS_PAGE_SIZE; renderCurrent(); };
+  const more = $("[data-clips-more]", body);
+  if (more) more.onclick = () => { clipsUi.shown += CLIPS_PAGE_SIZE; renderCurrent(); };
   $$("[data-clip]", body).forEach((el) => {
     const open = () => openClipDrawer(el.dataset.clip);
     el.onclick = open;

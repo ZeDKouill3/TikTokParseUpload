@@ -59,7 +59,9 @@ let closeCurrent = null;
 function showOverlay(onClose) {
   const ov = $("#overlay");
   ov.hidden = false;
-  requestAnimationFrame(() => ov.classList.add("show"));
+  const reveal = () => ov.classList.add("show");
+  requestAnimationFrame(reveal);
+  setTimeout(reveal, 60); // requestAnimationFrame est suspendu dans un onglet masque : le fond ne doit pas rester invisible
   ov.onclick = () => closeLayer();
   closeCurrent = onClose;
 }
@@ -78,9 +80,13 @@ function openPanel(cls, html, onOpen) {
   el.innerHTML = html;
   document.body.appendChild(el);
   showOverlay(() => { el.classList.remove("show"); setTimeout(() => el.remove(), 320); });
-  requestAnimationFrame(() => requestAnimationFrame(() => el.classList.add("show")));
+  const reveal = () => el.classList.add("show");
+  requestAnimationFrame(() => requestAnimationFrame(reveal));
+  setTimeout(reveal, 80); // meme garde-fou : le panneau (opacity 0 tant que .show manque) s'affiche toujours
   $$("[data-dismiss]", el).forEach((b) => (b.onclick = closeLayer));
-  if (onOpen) onOpen(el);
+  if (onOpen) {
+    try { onOpen(el); } catch (err) { toastError("Fenêtre incomplète", err); }
+  }
   return el;
 }
 document.addEventListener("keydown", (e) => { if (e.key === "Escape" && closeCurrent) closeLayer(); });
