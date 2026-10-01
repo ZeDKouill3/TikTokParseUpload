@@ -354,8 +354,44 @@ async function restoreVideo(id) {
   } catch (err) { toastError("Impossible de rétablir la vidéo", err); }
 }
 
+/* ---------- Attribuer une chaine a une video qui n'en a pas (fiche video, erreur d'approbation) ---------- */
+function assignChannelHtml(videoId, channels) {
+  return `
+    <div class="modal-head"><h2>Attribuer une chaîne</h2><p class="muted" style="margin-top:4px">${esc(videoId)} n'a pas de chaîne : sans elle, ses clips ne peuvent être ni approuvés ni publiés. Le choix est journalisé et ne se change pas ensuite.</p></div>
+    <form id="assign-form"><div class="modal-body">
+      <div class="field"><label for="assign-channel">Chaîne</label>
+        <select class="input" id="assign-channel" name="channel" required>${channels.map((c) => `<option value="${esc(c)}">${esc(c)}</option>`).join("")}</select></div>
+    </div>
+    <div class="modal-foot"><button type="button" class="btn btn-ghost" data-dismiss>Annuler</button><button type="submit" class="btn btn-primary">Attribuer</button></div></form>`;
+}
+
+async function openAssignChannel(videoId, knownChannels) {
+  let channels = knownChannels && knownChannels.length ? knownChannels : null;
+  if (!channels) {
+    try { await loadChannels(); } catch (err) { toastError("Chaînes indisponibles", err); return; }
+    channels = store.channels || [];
+  }
+  if (!channels.length) {
+    toast({ kind: "warn", title: "Aucune chaîne", body: "Crée une chaîne dans l'écran Chaînes avant de l'attribuer à une vidéo." });
+    return;
+  }
+  openPanel("modal", assignChannelHtml(videoId, channels), (el) => {
+    $("#assign-form", el).onsubmit = async (e) => {
+      e.preventDefault();
+      const channel = $("#assign-channel", el).value;
+      closeLayer();
+      try {
+        await api(`/api/videos/${encodeURIComponent(videoId)}/channel`, jsonBody("POST", { channel }));
+        toast({ kind: "ok", title: "Chaîne attribuée", body: `${videoId} : ${channel}` });
+        await afterVideoAction(videoId);
+        if (typeof loadClips === "function") loadClips();
+      } catch (err) { toastError("Attribution impossible", err); }
+    };
+  });
+}
+
 /* ---------- Ajout de video ---------- */
-async function openAddVideo() {
+async function openAddVideo(channel) {
   try { if (store.channels === null) await loadChannels(); } catch (err) { toastError("Chaînes indisponibles", err); }
   const channels = store.channels || [];
   openPanel("modal", `
@@ -363,7 +399,7 @@ async function openAddVideo() {
     <form id="add-form"><div class="modal-body">
       <div class="field"><label for="add-url">Adresse (URL)</label><input class="input" id="add-url" name="url" type="url" required placeholder="https://…" autocomplete="off"></div>
       <div class="field"><label for="add-channel">Chaîne</label>
-        <select class="input" id="add-channel" name="channel"><option value="">Sans chaîne (config.toml)</option>${channels.map((c) => `<option value="${esc(c)}">${esc(c)}</option>`).join("")}</select>
+        <select class="input" id="add-channel" name="channel"><option value="">Sans chaîne (config.toml)</option>${channels.map((c) => `<option value="${esc(c)}"${c === channel ? " selected" : ""}>${esc(c)}</option>`).join("")}</select>
         ${channels.length ? "" : `<span class="hint">Aucune chaîne : crée-en une dans l'écran Chaînes.</span>`}</div>
     </div>
     <div class="modal-foot"><button type="button" class="btn btn-ghost" data-dismiss>Annuler</button><button type="submit" class="btn btn-primary">Mettre en file</button></div></form>`,

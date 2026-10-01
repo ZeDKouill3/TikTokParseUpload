@@ -540,8 +540,9 @@ class Worker:
             reason = f"compte {account} introuvable dans l'écran Comptes : choisis un autre compte pour cette publication"
         elif not found["ready_to_publish"]:
             why = f" ({found['ready_note']})" if found.get("ready_note") else ""
-            reason = (f"compte {found['label'] or account} non prêt à publier{why} : coche « prêt à publier » "
-                      "dans l'écran Comptes, ou choisis un autre compte")
+            label = found["label"] or account
+            reason = (f"compte {label} non prêt à publier{why} : Comptes > {label} > J'ai réglé le problème "
+                      "(la case « prêt à publier » est automatique), ou choisis un autre compte")
         else:
             return True
         self._wait(entry, channel, account, reason, state_dir)

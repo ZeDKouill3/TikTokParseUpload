@@ -47,7 +47,7 @@ document.addEventListener("clipper:worker", async () => {
 
 const dashDate = (iso) => {
   const d = new Date(iso);
-  return Number.isNaN(d.getTime()) ? String(iso) : d.toLocaleString("fr-FR", { weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+  return Number.isNaN(d.getTime()) ? String(iso) : fmtParis(iso, { weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
 };
 
 const dashMoney = (usd) => `${fr(usd, 2)} $`;
@@ -78,12 +78,12 @@ function dashRunningRow(video) {
   const pct = progress ? Math.round(progress.fraction * 100) : null;
   const eta = progress && progress.eta_s != null ? ` · reste ${fr(Math.ceil(progress.eta_s / 60))} min` : "";
   return `<div class="job" data-video="${esc(video.video_id)}">
-    ${videoThumb(video.video_id)}
+    ${videoThumb(video.video_id, video.platform_thumbnail)}
     <div class="job-main" style="min-width:0">
-      <div class="job-title">${esc(video.video_id)}</div>
+      <div class="job-title">${esc(video.title || video.video_id)}</div>
       <div class="job-meta"><span class="mono">${esc(video.source_url || "")}</span>${video.channel ? `<span class="tag">${esc(video.channel)}</span>` : ""}</div>
       <div class="job-prog"><div class="job-step"><b>${esc(STEP_LABELS[video.step] || video.step || "—")}</b>${pct != null ? `<span>${pct} %${eta}</span>` : ""}${progress && progress.message ? `<span class="muted">${esc(progress.message)}</span>` : ""}</div>
-        <div class="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct == null ? 0 : pct}"><i style="width:${pct == null ? 8 : pct}%"></i></div></div>
+        ${progressBar(pct)}</div>
     </div>
     <div class="job-side"><span class="chip running">en cours</span>
       <button type="button" class="btn btn-xs btn-ghost" data-cancel="${esc(video.video_id)}">Annuler le traitement</button></div>
@@ -95,7 +95,7 @@ function dashProblemRow(video, kind) {
   const id = esc(video.video_id);
   return `<div class="list-item dash-problem" data-video="${id}">
     <span class="chip ${kind === "failed" ? "failed" : "queued"}">${kind === "failed" ? "Échec" : "En attente"}</span>
-    ${videoThumb(video.video_id)}
+    ${videoThumb(video.video_id, video.platform_thumbnail)}
     <div class="li-main"><a class="li-title" href="#/videos/${encodeURIComponent(video.video_id)}" style="display:block">${esc(video.title || video.video_id)}</a>
       <div class="li-sub">${video.title && video.title !== video.video_id ? `<span class="mono">${id}</span> · ` : ""}${video.channel ? `${esc(video.channel)} · ` : ""}étape ${esc((STEP_LABELS[video.step] || video.step || "—").toLowerCase())}</div>
       <p class="reason ${kind === "failed" ? "bad" : ""}">${esc(video.reason || "Aucune raison journalisée.")}</p>${retry}</div>

@@ -4,6 +4,10 @@
 const $ = (sel, root) => (root || document).querySelector(sel);
 const $$ = (sel, root) => Array.from((root || document).querySelectorAll(sel));
 const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+// Toutes les heures affichees par la console sont celles de Paris (Europe/Paris : +02:00 l'ete, +01:00 l'hiver),
+// jamais le fuseau du navigateur ni un decalage fixe.
+const CLIPPER_TZ = "Europe/Paris";
+const fmtParis = (iso, opts) => new Date(iso).toLocaleString("fr-FR", Object.assign({ timeZone: CLIPPER_TZ }, opts));
 const fr = (n, d) => Number(n).toLocaleString("fr-FR", { minimumFractionDigits: d || 0, maximumFractionDigits: d || 0 });
 
 /* Confiance du jury (SPEC-73d0 R4) : agregat (mediane des confiances finales) puis
@@ -59,7 +63,12 @@ function toast(opts) {
 
 /* Erreur d'API : toast rouge portant le detail en francais envoyé par le serveur (T2). */
 function toastError(title, err) {
-  toast({ kind: "bad", title, body: err && err.message ? err.message : String(err), ms: 7000 });
+  // 409 « la vidéo n'a pas de chaîne » (approbation, publication) : le choix de la chaîne se fait depuis l'erreur.
+  const needs = err && err.body && err.body.needs_channel;
+  toast({
+    kind: "bad", title, body: err && err.message ? err.message : String(err), ms: 7000,
+    action: needs ? { label: "Attribuer une chaîne", run: () => openAssignChannel(err.body.video_id, err.body.channels) } : null,
+  });
 }
 
 /* ---------- Overlay et modale ---------- */

@@ -20,7 +20,15 @@ const CLIP_LOCKED = ["scheduled", "published"];
 const CLIPS_STALE_MS = 4000;
 const CLIPS_PAGE_SIZE = 24; // la galerie n'affiche que 24 clips a la fois (« Afficher plus »)
 
-const clipsUi = { data: null, error: null, loading: null, dirty: false, at: 0, filter: "à valider", channel: "", html: "", shown: CLIPS_PAGE_SIZE };
+const clipsUi = { data: null, error: null, loading: null, dirty: false, at: 0, filter: "à valider", channel: "", video: "", hashVideo: null, html: "", shown: CLIPS_PAGE_SIZE };
+
+/* Vidéo visée par l'adresse : #/clips/<video_id> (lien « Voir les N clips » de la fiche vidéo), sinon "". */
+const clipsHashVideo = () => decodeURIComponent((location.hash.replace(/^#\/?/, "").split("?")[0].split("/")[1] || ""));
+
+/* Clips affichés : statut, chaîne et vidéo choisis (chaque filtre vide = pas de filtre). L'ordre reçu (plus récents en haut) est gardé. */
+function clipsFiltered(all, ui) {
+  return all.filter((c) => (ui.filter === "all" || c.publish_status === ui.filter) && (!ui.channel || c.channel === ui.channel) && (!ui.video || c.video_id === ui.video));
+}
 
 const clipKey = (c) => `${c.video_id}/${c.clip_id}`;
 const clipUrl = (c, tail) => `/api/clips/${encodeURIComponent(c.video_id)}/${encodeURIComponent(c.clip_id)}${tail || ""}`;
@@ -77,17 +85,21 @@ function clipsEmpty(all) {
 
 function clipsView(body) {
   const all = clipsUi.data;
-  const filtered = all.filter((c) => (clipsUi.filter === "all" || c.publish_status === clipsUi.filter) && (!clipsUi.channel || c.channel === clipsUi.channel));
+  const filtered = clipsFiltered(all, clipsUi);
   const channels = Array.from(new Set(all.map((c) => c.channel).filter(Boolean))).sort();
+  const videos = Array.from(new Set([...all.map((c) => c.video_id), clipsUi.video].filter(Boolean))).sort();
   const rest = filtered.length - clipsUi.shown;
   const more = rest > 0
     ? `<div class="row" style="justify-content:center;margin-top:24px"><button type="button" class="btn" data-clips-more>Afficher plus<span class="n">${esc(Math.min(rest, CLIPS_PAGE_SIZE))}</span></button></div>` : "";
-  const count = (k) => (k === "all" ? all.length : all.filter((c) => c.publish_status === k).length);
+  const scoped = clipsFiltered(all, { filter: "all", channel: clipsUi.channel, video: clipsUi.video }); // les compteurs suivent les filtres vidéo et chaîne
+  const count = (k) => (k === "all" ? scoped.length : scoped.filter((c) => c.publish_status === k).length);
   const html = `
     ${clipsUi.error ? `<p class="reason bad">Actualisation impossible : ${esc(clipsUi.error.message || clipsUi.error)}</p>` : ""}
     <div class="toolbar">
       <div class="seg" id="clips-filter">${CLIP_FILTERS.map(([k, l]) => `<button type="button" data-filter="${esc(k)}" class="${k === clipsUi.filter ? "on" : ""}">${esc(l)}<span class="n">${count(k)}</span></button>`).join("")}</div>
       <span class="grow"></span>
+      <select class="input" id="clips-video" aria-label="Vidéo"><option value="">Toutes les vidéos</option>${videos.map((v) => `<option value="${esc(v)}"${v === clipsUi.video ? " selected" : ""}>${esc(v)}</option>`).join("")}</select>
+      ${clipsUi.video ? `<button type="button" class="btn btn-xs" data-clear-video aria-label="Retirer le filtre vidéo">${icon("x", "i-xs")}Vidéo : ${esc(clipsUi.video)}</button>` : ""}
       <select class="input" id="clips-channel" aria-label="Chaîne"><option value="">Toutes les chaînes</option>${channels.map((n) => `<option value="${esc(n)}"${n === clipsUi.channel ? " selected" : ""}>${esc(n)}</option>`).join("")}</select>
     </div>
     ${filtered.length ? `<div class="clips">${filtered.slice(0, clipsUi.shown).map(clipCard).join("")}</div>${more}` : clipsEmpty(all)}`;
@@ -96,7 +108,16 @@ function clipsView(body) {
   body.innerHTML = html;
 }
 
+/* Le filtre vidéo vit dans l'adresse (#/clips/<video_id>) : lien partageable, bouton Retour qui marche. */
+function clipsSetVideo(video) {
+  location.hash = video ? `#/clips/${encodeURIComponent(video)}` : "#/clips";
+}
+
 function clipsWire(body) {
+  const video = $("#clips-video", body);
+  if (video) video.onchange = () => clipsSetVideo(video.value);
+  const clear = $("[data-clear-video]", body);
+  if (clear) clear.onclick = () => clipsSetVideo("");
   $$("[data-filter]", body).forEach((b) => (b.onclick = () => { clipsUi.filter = b.dataset.filter; clipsUi.shown = CLIPS_PAGE_SIZE; renderCurrent(); }));
   const sel = $("#clips-channel", body);
   if (sel) sel.onchange = () => { clipsUi.channel = sel.value; clipsUi.shown = CLIPS_PAGE_SIZE; renderCurrent(); };
@@ -147,7 +168,7 @@ function clipDrawerHtml(c) {
         </div>
       </div>
       <div class="stack" style="gap:24px">
-        <div class="row wrap muted" style="font-size:13px;gap:8px"><span class="mono">${esc(c.video_id)}</span>${c.channel ? `<span class="tag">${esc(c.channel)}</span>` : ""}${c.parts_total > 1 ? `<span>·</span><span>partie ${esc(c.part)}/${esc(c.parts_total)}</span>` : ""}${c.slot_at ? `<span>·</span><span>créneau ${esc(new Date(c.slot_at).toLocaleString("fr-FR", { weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }))}</span>` : ""}</div>
+        <div class="row wrap muted" style="font-size:13px;gap:8px"><span class="mono">${esc(c.video_id)}</span>${c.channel ? `<span class="tag">${esc(c.channel)}</span>` : ""}${c.parts_total > 1 ? `<span>·</span><span>partie ${esc(c.part)}/${esc(c.parts_total)}</span>` : ""}${c.slot_at ? `<span>·</span><span>créneau ${esc(fmtParis(c.slot_at, { weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }))}</span>` : ""}</div>
         ${c.publish_error ? `<p class="reason bad">Publication en échec : ${esc(c.publish_error)}</p>` : ""}
         <div class="field"><label for="clip-title">Titre d'écran</label><input class="input" id="clip-title" value="${esc(c.screen_title)}"${locked ? " disabled" : ""}>
           <span class="hint">Affiché en haut du clip. Le modifier relance le rendu puis le contrôle qualité de ce clip.</span>
@@ -283,6 +304,13 @@ async function openClipDrawer(key) {
 
 Screens.clips = {
   render(body) {
+    const wanted = clipsHashVideo();
+    if (wanted !== clipsUi.hashVideo) { // l'adresse a changé : le filtre vidéo la suit (lien depuis une fiche vidéo : tous les statuts)
+      clipsUi.hashVideo = wanted;
+      clipsUi.video = wanted;
+      clipsUi.shown = CLIPS_PAGE_SIZE;
+      if (wanted) clipsUi.filter = "all";
+    }
     if (Date.now() - clipsUi.at > CLIPS_STALE_MS) loadClips();
     if (!clipsUi.data) {
       clipsUi.html = "";

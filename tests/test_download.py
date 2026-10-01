@@ -128,6 +128,7 @@ def test_download_writes_meta_json_with_full_fields(isolated_cwd):
         "chapters": info["chapters"],
         "heatmap": info["heatmap"],
         "sponsorblock_segments": info["sponsorblock_chapters"],
+        "thumbnail": info.get("thumbnail"),
     }
     assert meta == expected
 
@@ -462,3 +463,53 @@ def test_cookies_profile_not_exported_when_video_already_downloaded(isolated_cwd
 
     assert download(f"https://youtu.be/{info['id']}", workspace_dir=isolated_cwd / "workspace",
                     cookies_profile="yt01", ydl_factory=_make_fake_ydl(info, {})) == {}
+
+
+# --------------------------------------------------------------------------
+# TASK-c32b point 1 : miniature de la plateforme enregistree (YouTube, Twitch...)
+# --------------------------------------------------------------------------
+
+THUMB = "https://static-cdn.example.invalid/previews/v2887271276-preview.jpg"
+
+
+def test_download_records_the_platform_thumbnail_in_meta_json(isolated_cwd):
+    from clipper.download import download
+
+    info = {**_load_fixture("info_dict_twitch.json"), "thumbnail": THUMB}
+    workspace_dir = isolated_cwd / "workspace"
+
+    meta = download("https://www.twitch.tv/videos/2887271276", workspace_dir=workspace_dir,
+                    ydl_factory=_make_fake_ydl(info, {}))
+
+    assert meta["thumbnail"] == THUMB
+    assert json.loads((workspace_dir / "v2887271276" / "meta.json").read_text(encoding="utf-8"))["thumbnail"] == THUMB
+
+
+def test_download_keeps_the_thumbnail_even_when_the_download_fails(isolated_cwd):
+    """Echec au telechargement : meta.json n'existe pas, mais l'URL de miniature donnee par yt-dlp reste lisible."""
+    from clipper.download import download
+
+    info = {**_load_fixture("info_dict_twitch.json"), "thumbnail": THUMB}
+    workspace_dir = isolated_cwd / "workspace"
+
+    class Failing:
+        def __init__(self, opts):
+            self._opts = opts
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        def extract_info(self, url, download=True):
+            for hook in self._opts["progress_hooks"]:
+                hook({"status": "downloading", "downloaded_bytes": 10, "total_bytes": 100, "info_dict": info})
+            raise RuntimeError("HTTP 403")
+
+    with pytest.raises(RuntimeError):
+        download("https://www.twitch.tv/videos/2887271276", workspace_dir=workspace_dir, ydl_factory=Failing)
+
+    video_dir = workspace_dir / "v2887271276"
+    assert not (video_dir / "meta.json").exists()
+    assert json.loads((video_dir / "thumbnail.json").read_text(encoding="utf-8")) == {"url": THUMB}

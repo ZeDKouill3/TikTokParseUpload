@@ -25,6 +25,20 @@ VIDEO_ID = "abcdefghijk"
 URL = f"https://www.youtube.com/watch?v={VIDEO_ID}"
 
 
+
+def _node_run(script: str, *args: str) -> str:
+    """Execute un script node depuis un fichier temporaire : ``node -e <script>`` depasse la longueur
+    maximale d'une ligne de commande sous Windows (WinError 206) quand le script embarque un ecran entier.
+    ``process.argv[1]`` designe le premier argument, comme avec ``-e``."""
+    import tempfile
+    with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, encoding="utf-8") as handle:
+        handle.write("process.argv.splice(1, 1);" + chr(10) + script)
+        path = handle.name
+    try:
+        return subprocess.run(["node", path, *args], capture_output=True, text=True, encoding="utf-8", check=True).stdout
+    finally:
+        Path(path).unlink(missing_ok=True)
+
 def make_config(tmp_path) -> Config:
     return Config(mode="review", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output")
 
@@ -620,7 +634,7 @@ def test_queue_get_lists_entries(tmp_path, isolated_cwd):
     resp = client(tmp_path).get("/api/queue")
 
     assert resp.status_code == 200
-    assert resp.json() == entries
+    assert [{k: v for k, v in e.items() if k != "platform_thumbnail"} for e in resp.json()] == entries
 
 
 def test_queue_get_empty_is_an_empty_list(tmp_path, isolated_cwd):
@@ -1372,7 +1386,9 @@ def test_dashboard_queue_lists_queue_json_entries(tmp_path, isolated_cwd):
                 "force_steps": [], "enqueued_at": "2026-01-01T00:00:00+00:00", "status": "waiting", "pid": None}]
     _write_json(tmp_path / "state" / "queue.json", entries)
 
-    assert _dashboard(tmp_path)["queue"] == entries
+    queue = _dashboard(tmp_path)["queue"]
+    assert [{k: v for k, v in e.items() if k != "platform_thumbnail"} for e in queue] == entries
+    assert queue[0]["platform_thumbnail"].endswith(f"/{VIDEO_ID}/hqdefault.jpg")
 
 
 def test_dashboard_failed_and_queued_carry_reason_and_retry_at(tmp_path, isolated_cwd):
@@ -2649,7 +2665,7 @@ def test_publish_screen_is_wired_with_calendar_queue_and_actions():
         assert label in js, label
     assert "download" in js and "video_url" in js                          # télécharger
     assert "copyText" in js                                                # copier la description
-    assert "Marquer publié" in js and "confirmDialog" in js                # confirmation
+    assert "Déclarer publié" in js and "confirmDialog" in js                # confirmation
     assert "Repasser en attente" in js
     assert "undo" in js                                                    # toast « Annuler »
     assert "toastError" in js                                              # un conflit 409 s'affiche
@@ -3652,7 +3668,7 @@ def test_stats_issue_text_renders_objects_and_strings_readably(tmp_path):
     start = js.index("function statsIssueText")
     end = js.index("\n}\n", start) + 3
     script = js[start:end] + f"\nconsole.log(JSON.stringify([statsIssueText({json.dumps(_QA_ISSUE)}), statsIssueText('hors cadre')]));"
-    out = subprocess.run(["node", "-e", script], capture_output=True, text=True, encoding="utf-8", check=True).stdout
+    out = _node_run(script)
     assert json.loads(out) == ["image noire de 2 s", "hors cadre"]
 
 
@@ -3965,7 +3981,7 @@ def test_stats_clip_pagination_reveals_50_more_rows_per_click():
     start = js.index("function statsMoreCount")
     end = js.index("\n}\n", start) + 3
     script = "const STATS_CLIPS_PAGE_SIZE = 50;\n" + js[start:end] + "\nconsole.log(JSON.stringify([statsMoreCount(120, 50), statsMoreCount(120, 100), statsMoreCount(30, 50)]));"
-    out = subprocess.run(["node", "-e", script], capture_output=True, text=True, encoding="utf-8", check=True).stdout
+    out = _node_run(script)
     assert json.loads(out) == [50, 20, 0]
 
 
@@ -4215,7 +4231,7 @@ def test_stats_clip_sort_orders_by_column_with_missing_values_last():
         + "\nstatsUi.sort = { key: 'views', dir: 'asc' }; statsSortInPlace(clips);"
         + "\nconsole.log(JSON.stringify([desc, clips.map(c => c.clip_id).join('')]));"
     )
-    out = subprocess.run(["node", "-e", script], capture_output=True, text=True, encoding="utf-8", check=True).stdout
+    out = _node_run(script)
     assert json.loads(out) == ["cab", "acb"]
 
 
@@ -5396,7 +5412,7 @@ def test_the_form_lists_only_clips_to_validate_or_approved_newest_first():
         {"video_id": "v3", "clip_id": "01", "ready": False, "publish_status": "not_ready", "created_at": "2026-10-02T10:00:00"},
     ]
     script = start_key + fn + f"\nconsole.log(JSON.stringify(pubFormClips({json.dumps(clips)}).map(pubKey)));"
-    out = subprocess.run(["node", "-e", script], capture_output=True, text=True, encoding="utf-8", check=True).stdout
+    out = _node_run(script)
     assert json.loads(out) == ["v2/01", "v1/01"]  # plus recents en haut ; ni refuses, ni publies, ni deja en file
 
 
@@ -5598,7 +5614,7 @@ def _run_radar(payload, moment_index=0, round_index=None):
         "\nconst data = JSON.parse(process.argv[1]);"
         f"\nprocess.stdout.write(juryRadarSvg(data, data.moments[{moment_index}], {json.dumps(round_index)}));"
     )
-    return subprocess.run(["node", "-e", script, json.dumps(payload)], capture_output=True, text=True, encoding="utf-8", check=True).stdout
+    return _node_run(script, json.dumps(payload))
 
 
 def test_radar_js_is_wired_in_the_page_before_videos_and_has_no_external_library():
@@ -5659,7 +5675,7 @@ def test_radar_panel_shows_veto_threshold_reason_and_toggle(jury_payload):
         "\nconst ui = {key: null, round: null};"
         "\nprocess.stdout.write(JSON.stringify([juryPanelHtml(data, ui), juryPanelHtml(data, {key: data.moments[4].key, round: null})]));"
     )
-    out = subprocess.run(["node", "-e", script, json.dumps(jury_payload)], capture_output=True, text=True, encoding="utf-8", check=True).stdout
+    out = _node_run(script, json.dumps(jury_payload))
     retained, vetoed = json.loads(out)
 
     assert "data-jr-round" in retained                      # interrupteur avant / après débat (il y a eu débat)
@@ -5680,7 +5696,7 @@ def test_radar_panel_without_debate_has_no_toggle_and_unavailable_is_explicit(ju
         "\nprocess.stdout.write(JSON.stringify([juryPanelHtml(data, {key: null, round: null}),"
         " juryPanelHtml({available: false, reason: 'moments.json absent', moments: []}, {key: null, round: null})]));"
     )
-    out = subprocess.run(["node", "-e", script, json.dumps(jury_payload)], capture_output=True, text=True, encoding="utf-8", check=True).stdout
+    out = _node_run(script, json.dumps(jury_payload))
     plain, unavailable = json.loads(out)
 
     assert "data-jr-round" not in plain
@@ -5694,3 +5710,512 @@ def test_radar_css_is_themed_and_responsive():
     assert css.count("--jr-c0:") == 2                     # défini en sombre et en clair
     assert css.index("--jr-c0:", css.index('[data-theme="light"]')) > 0
     assert "@media (max-width: 900px)" in css[css.index(".vjury"):]  # mobile
+
+
+# --------------------------------------------------------------------------
+# TASK-c32b (sixième tour de la console)
+# --------------------------------------------------------------------------
+
+TWITCH_ID = "v2887271276"
+TWITCH_URL = "https://www.twitch.tv/videos/2887271276"
+TWITCH_THUMB = "https://static-cdn.example.invalid/previews/v2887271276.jpg"
+
+
+def test_a_youtube_video_gets_its_platform_thumbnail_from_its_id_without_any_file(tmp_path, isolated_cwd):
+    _write_state(tmp_path, "aaaaaaaaaaa")
+
+    video = client(tmp_path).get("/api/videos").json()[0]
+
+    assert video["platform_thumbnail"] == "https://i.ytimg.com/vi/aaaaaaaaaaa/hqdefault.jpg"
+
+
+def test_a_twitch_video_uses_the_thumbnail_recorded_by_the_download(tmp_path, isolated_cwd):
+    _write_state(tmp_path, TWITCH_ID, source_url=TWITCH_URL)
+    _write_json(tmp_path / "workspace" / TWITCH_ID / "thumbnail.json", {"url": TWITCH_THUMB})
+    c = client(tmp_path)
+
+    assert c.get(f"/api/videos/{TWITCH_ID}").json()["platform_thumbnail"] == TWITCH_THUMB
+    # meta.json (téléchargement terminé) prime sur le relevé du début du téléchargement
+    _write_json(tmp_path / "workspace" / TWITCH_ID / "meta.json", {"title": "VOD", "thumbnail": TWITCH_THUMB + "?final"})
+    assert c.get(f"/api/videos/{TWITCH_ID}").json()["platform_thumbnail"] == TWITCH_THUMB + "?final"
+
+
+def test_a_twitch_video_without_any_recorded_thumbnail_has_none_not_a_made_up_one(tmp_path, isolated_cwd):
+    _write_state(tmp_path, TWITCH_ID, source_url=TWITCH_URL)
+
+    assert client(tmp_path).get("/api/videos").json()[0]["platform_thumbnail"] is None
+
+
+def test_queue_entries_and_dashboard_rows_carry_the_platform_thumbnail(tmp_path, isolated_cwd):
+    entries = [{"id": "e1", "video_id": VIDEO_ID, "url": URL, "channel": None, "action": "run", "force_steps": [],
+                "enqueued_at": "2026-01-01T00:00:00+00:00", "status": "waiting", "pid": None},
+               {"id": "e2", "video_id": TWITCH_ID, "url": TWITCH_URL, "channel": None, "action": "run", "force_steps": [],
+                "enqueued_at": "2026-01-01T00:00:01+00:00", "status": "waiting", "pid": None}]
+    _write_json(tmp_path / "state" / "queue.json", entries)
+    _write_state(tmp_path, "bbbbbbbbbbb", status="failed", reason="403")
+    _write_state(tmp_path, "ccccccccccc", status="running")
+    c = client(tmp_path)
+
+    queue = c.get("/api/queue").json()
+    data = c.get("/api/dashboard").json()
+
+    assert [e["platform_thumbnail"] for e in queue] == [f"https://i.ytimg.com/vi/{VIDEO_ID}/hqdefault.jpg", None]
+    assert [(e["video_id"], e["id"]) for e in data["queue"]] == [(VIDEO_ID, "e1"), (TWITCH_ID, "e2")]
+    assert data["queue"][0]["platform_thumbnail"].endswith(f"/{VIDEO_ID}/hqdefault.jpg")
+    assert data["failed"][0]["platform_thumbnail"] == "https://i.ytimg.com/vi/bbbbbbbbbbb/hqdefault.jpg"
+    assert data["running"][0]["platform_thumbnail"] == "https://i.ytimg.com/vi/ccccccccccc/hqdefault.jpg"
+
+
+def test_dashboard_running_card_carries_the_title_of_the_video(tmp_path, isolated_cwd):
+    _write_state(tmp_path, "aaaaaaaaaaa", status="running")
+    _write_state(tmp_path, "bbbbbbbbbbb", status="running")
+    _write_json(tmp_path / "workspace" / "aaaaaaaaaaa" / "meta.json", {"title": "Mon titre de vidéo"})
+
+    running = {v["video_id"]: v for v in _dashboard(tmp_path)["running"]}
+
+    assert running["aaaaaaaaaaa"]["title"] == "Mon titre de vidéo"
+    assert running["bbbbbbbbbbb"]["title"] == "bbbbbbbbbbb"  # sans meta.json : l'identifiant, jamais un titre inventé
+
+
+def test_clips_are_listed_newest_first_by_sidecar_creation_date(tmp_path, isolated_cwd):
+    _write_state(tmp_path, CLIPS_VIDEO, channel="ma_chaine")
+    _write_state(tmp_path, "othervideo01", channel="autre")
+    _write_clip(tmp_path, CLIPS_VIDEO, _clip_sidecar("01", created_at="2026-09-30T10:00:00+00:00"))
+    _write_clip(tmp_path, CLIPS_VIDEO, _clip_sidecar("02", created_at="2026-10-01T10:00:00+00:00"))
+    other = _clip_sidecar("01", created_at="2026-10-01T18:00:00+00:00")
+    other["video_id"] = "othervideo01"
+    _write_clip(tmp_path, "othervideo01", other)
+
+    clips = client(tmp_path).get("/api/clips").json()
+
+    assert [(c["video_id"], c["clip_id"]) for c in clips] == [("othervideo01", "01"), (CLIPS_VIDEO, "02"), (CLIPS_VIDEO, "01")]
+    only = client(tmp_path).get("/api/clips", params={"video_id": CLIPS_VIDEO}).json()
+    assert [c["clip_id"] for c in only] == ["02", "01"]  # filtre par vidéo : seulement cette vidéo
+
+
+def test_approving_without_a_channel_says_the_channel_can_be_chosen_right_there(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path)
+    _write_state(tmp_path, CLIPS_VIDEO)
+    _write_clip(tmp_path, CLIPS_VIDEO, _clip_sidecar("01"))
+
+    resp = client(tmp_path).post(f"/api/clips/{CLIPS_VIDEO}/01/approve")
+
+    assert resp.status_code == 409
+    body = resp.json()
+    assert "n'a pas de chaîne" in body["detail"]
+    assert body["needs_channel"] is True and body["video_id"] == CLIPS_VIDEO and body["channels"] == [CH]
+
+
+def test_assigning_a_channel_to_a_video_writes_pipeline_json_and_unblocks_approval(tmp_path, isolated_cwd, caplog):
+    import logging
+
+    _channels_setup(tmp_path)
+    _write_state(tmp_path, CLIPS_VIDEO, status="done")
+    _write_clip(tmp_path, CLIPS_VIDEO, _clip_sidecar("01"))
+    c = client(tmp_path)
+
+    with caplog.at_level(logging.INFO, logger="clipper.pipeline"):
+        resp = c.post(f"/api/videos/{CLIPS_VIDEO}/channel", json={"channel": CH})
+
+    assert resp.status_code == 200 and resp.json()["channel"] == CH
+    assert json.loads((tmp_path / "workspace" / CLIPS_VIDEO / "pipeline.json").read_text(encoding="utf-8"))["channel"] == CH
+    assert any(CH in r.getMessage() for r in caplog.records)
+    assert c.get(f"/api/clips", params={"video_id": CLIPS_VIDEO}).json()[0]["channel"] == CH
+
+
+def test_assigning_a_channel_refuses_an_unknown_channel_and_a_bad_name(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path)
+    _write_state(tmp_path, CLIPS_VIDEO, status="done")
+    c = client(tmp_path)
+
+    assert c.post(f"/api/videos/{CLIPS_VIDEO}/channel", json={"channel": "fantome"}).status_code == 409
+    assert c.post(f"/api/videos/{CLIPS_VIDEO}/channel", json={"channel": "../x"}).status_code == 400
+    assert c.post("/api/videos/zzzzzzzzzzz/channel", json={"channel": CH}).status_code == 404
+
+
+def test_publication_times_are_given_in_europe_paris_in_summer_and_in_winter(tmp_path, isolated_cwd):
+    _publications_setup(tmp_path)
+    _write_publish(tmp_path, "ma_chaine", [
+        _entry("01", "scheduled", slot_at="2026-07-14T10:30:00+00:00", account=READY, publish_mode="scheduled"),
+        _entry("02", "scheduled", slot_at="2026-01-14T10:30:00+00:00", account=READY, publish_mode="scheduled"),
+        _entry("03", "published", account=READY, published_at="2026-07-14T08:00:00+00:00",
+               tiktok_state="scheduled_on_tiktok", tiktok_publish_at="2026-07-15T10:30:00Z"),
+    ])
+
+    rows = {p["clip_id"]: p for p in _publications(tmp_path)}
+
+    assert rows["01"]["slot_at_paris"] == "2026-07-14T12:30:00+02:00"   # été : UTC+2
+    assert rows["02"]["slot_at_paris"] == "2026-01-14T11:30:00+01:00"   # hiver : UTC+1
+    assert rows["03"]["tiktok_publish_at_paris"] == "2026-07-15T12:30:00+02:00"
+    assert rows["03"]["published_at_paris"] == "2026-07-14T10:00:00+02:00"
+    assert rows["01"]["published_at_paris"] is None
+
+
+def test_a_post_scheduled_on_tiktok_is_not_live_before_its_time_and_is_after(tmp_path, isolated_cwd, monkeypatch):
+    _publications_setup(tmp_path)
+    _write_publish(tmp_path, "ma_chaine", [
+        _entry("01", "published", account=READY, tiktok_state="scheduled_on_tiktok", tiktok_publish_at="2026-10-02T10:30:00+00:00"),
+        _entry("02", "published", account=READY, post_url="https://exemple.invalid/video/1"),
+    ])
+    before = datetime(2026, 10, 1, 20, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(web_app, "_now_utc", lambda: before)
+    rows = {p["clip_id"]: p for p in _publications(tmp_path)}
+    assert rows["01"]["tiktok_status"] == "scheduled_on_tiktok" and rows["01"]["tiktok_live"] is False
+    assert rows["02"]["tiktok_live"] is True
+
+    monkeypatch.setattr(web_app, "_now_utc", lambda: datetime(2026, 10, 2, 10, 30, tzinfo=timezone.utc))
+    assert {p["clip_id"]: p for p in _publications(tmp_path)}["01"]["tiktok_live"] is True
+
+
+def test_dashboard_next_publications_give_their_time_in_europe_paris(tmp_path, isolated_cwd):
+    _write_sidecar(tmp_path, "aaaaaaaaaaa", "01")
+    _write_json(tmp_path / "state" / "publish" / "ma_chaine.json",
+                [_publish_entry("aaaaaaaaaaa", "01", "scheduled", "2030-01-15T10:30:00+00:00")])
+
+    assert _dashboard(tmp_path)["next_publications"][0]["slot_at_paris"] == "2030-01-15T11:30:00+01:00"
+
+
+def test_week_view_lists_manual_posts_that_sit_between_the_channel_slots(tmp_path, isolated_cwd):
+    _publish_setup(tmp_path, [
+        _entry("01", "scheduled", slot_at=PUB_THU, publish_mode="scheduled"),
+        _entry("02", "scheduled", slot_at="2026-10-07T12:15:00+00:00", publish_mode="scheduled", account="ab12cd"),
+        _entry("03", "scheduled", slot_at="2026-10-14T12:15:00+00:00", publish_mode="scheduled"),
+    ])
+
+    data = _get_publish(tmp_path).json()
+
+    assert [c["clip_id"] for c in data["off_slot"]] == ["02"]          # ni sur un créneau, ni d'une autre semaine
+    assert data["off_slot"][0]["slot_at_paris"] == "2026-10-07T14:15:00+02:00"
+    assert [s["clip"]["clip_id"] for s in data["slots"] if s["clip"]] == ["01"]
+
+
+# --- TASK-c32b : aides pour exécuter une fonction des scripts statiques sous node ---------------------------
+
+
+def _js_def(source: str, name: str) -> str:
+    """Texte de `function name(...) {...}` ou de `const name = ...;` dans un script statique."""
+    for marker in (f"function {name}(", f"const {name} = "):
+        start = source.find(marker)
+        if start >= 0:
+            break
+    else:
+        raise AssertionError(f"{name} introuvable")
+    if marker.startswith("function"):
+        return source[start:source.index("\n}\n", start) + 3]
+    end = start
+    while True:
+        end = source.index(";\n", end) + 2
+        chunk = source[start:end]
+        if chunk.count("(") == chunk.count(")") and chunk.count("{") == chunk.count("}") and chunk.count("`") % 2 == 0:
+            return chunk
+
+
+_JS_PRELUDE = ("const esc = (s) => String(s == null ? '' : s).replace(/[&<>\"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}[c]));\n"
+               "const fr = (n, d) => Number(n).toLocaleString('fr-FR', {minimumFractionDigits: d || 0, maximumFractionDigits: d || 0});\n"
+               "const icon = (n) => `<i ${n}>`;\n")
+
+
+def _run_js(files_and_names, expr, preamble=""):
+    """Évalue `expr` (JSON.stringify de son résultat) avec les définitions extraites des scripts statiques."""
+    parts = [_JS_PRELUDE, preamble]
+    for relative, names in files_and_names:
+        source = (STATIC / relative).read_text(encoding="utf-8")
+        parts += [_js_def(source, n) for n in names]
+    script = "\n".join(parts) + f"\nconsole.log(JSON.stringify({expr}));"
+    out = _node_run(script)
+    return json.loads(out)
+
+
+_NODE = pytest.mark.skipif(shutil.which("node") is None, reason="node absent du PATH")
+
+
+@_NODE
+def test_video_thumb_tries_the_local_image_then_the_platform_one_then_the_neutral_placeholder():
+    out = _run_js([("screens.js", ["videoThumb", "thumbFallback"])], """(() => {
+      const html = videoThumb('v1', 'https://i.ytimg.com/vi/v1/hqdefault.jpg');
+      const img = { dataset: { platform: 'https://i.ytimg.com/vi/v1/hqdefault.jpg' }, src: '/media/source/v1/thumbnail' };
+      const first = thumbFallback(img), afterFirst = img.src, second = thumbFallback(img);
+      return { html, bare: videoThumb('v2'), first, afterFirst, second };
+    })()""")
+    assert 'src="/media/source/v1/thumbnail"' in out["html"] and 'data-platform="https://i.ytimg.com/vi/v1/hqdefault.jpg"' in out["html"]
+    assert "data-platform" not in out["bare"] and "pas d'image" in out["bare"]
+    assert (out["first"], out["afterFirst"], out["second"]) == ("platform", "https://i.ytimg.com/vi/v1/hqdefault.jpg", "none")
+
+
+def test_every_video_thumb_caller_passes_the_platform_thumbnail():
+    for relative in ("screens/dashboard.js", "screens/videos.js", "screens.js"):
+        js = (STATIC / relative).read_text(encoding="utf-8")
+        calls = [line for line in js.splitlines() if "videoThumb(" in line and "function videoThumb" not in line]
+        assert calls and all("platform_thumbnail" in line for line in calls), (relative, calls)
+
+
+@_NODE
+def test_progress_bar_is_indeterminate_and_visible_without_a_fraction():
+    out = _run_js([("screens.js", ["progressBar"])], "[progressBar(null), progressBar(40)]")
+    assert "indeterminate" in out[0] and "aria-valuenow" not in out[0] and "<i></i>" in out[0]
+    assert 'aria-valuenow="40"' in out[1] and "width:40%" in out[1] and "indeterminate" not in out[1]
+
+
+def test_dashboard_running_card_shows_the_video_title_and_the_bar_has_a_width():
+    js = (STATIC / "screens" / "dashboard.js").read_text(encoding="utf-8")
+    css = (STATIC / "style.css").read_text(encoding="utf-8")
+    assert "esc(video.title || video.video_id)" in js and "progressBar(pct)" in js
+    assert re.search(r"\.job-prog \.bar \{[^}]*width: \d+px", css)            # la colonne « auto » donnait 0 px
+    assert ".bar.indeterminate > i" in css and "@keyframes indeterminate" in css
+
+
+def test_thumbnail_boxes_stay_16_9_and_do_not_reuse_the_empty_state_class():
+    css = (STATIC / "style.css").read_text(encoding="utf-8")
+    js = (STATIC / "screens.js").read_text(encoding="utf-8")
+    assert ".job-thumb.no-img img" in css and ".job-thumb.empty" not in css   # `.empty` est l'état vide : 48 px de marge, vignette carrée
+    assert 'classList.add("no-img")' in js and 'classList.add("empty")' not in js
+    assert re.search(r"\.job-thumb \{[^}]*align-self: start", css)
+
+
+@_NODE
+def test_clips_screen_filters_by_video_from_the_address_and_the_filter_can_be_removed():
+    clips = [{"video_id": "v1", "clip_id": "01", "publish_status": "approved", "channel": "a"},
+             {"video_id": "v2", "clip_id": "01", "publish_status": "à valider", "channel": "a"},
+             {"video_id": "v2", "clip_id": "02", "publish_status": "published", "channel": "b"}]
+    out = _run_js([("screens/clips.js", ["clipsHashVideo", "clipsFiltered"])], f"""(() => {{
+      const all = {json.dumps(clips)};
+      const ids = (ui) => clipsFiltered(all, ui).map((c) => c.video_id + '/' + c.clip_id);
+      globalThis.location = {{ hash: '#/clips/v2' }};
+      const fromLink = clipsHashVideo();
+      globalThis.location = {{ hash: '#/clips' }};
+      return {{ fromLink, bare: clipsHashVideo(),
+        v2: ids({{ filter: 'all', channel: '', video: 'v2' }}), none: ids({{ filter: 'all', channel: '', video: '' }}),
+        v2Status: ids({{ filter: 'published', channel: '', video: 'v2' }}), v2Chan: ids({{ filter: 'all', channel: 'a', video: 'v2' }}) }};
+    }})()""")
+    assert out["fromLink"] == "v2" and out["bare"] == ""
+    assert out["v2"] == ["v2/01", "v2/02"]                                     # #/clips/v2 : seulement cette vidéo
+    assert out["none"] == ["v1/01", "v2/01", "v2/02"]                          # filtre retiré : tout, dans l'ordre reçu (plus récents en haut)
+    assert out["v2Status"] == ["v2/02"] and out["v2Chan"] == ["v2/01"]
+
+
+def test_clips_screen_has_a_video_dropdown_a_removable_chip_and_follows_the_address():
+    js = (STATIC / "screens" / "clips.js").read_text(encoding="utf-8")
+    assert 'id="clips-video"' in js and "data-clear-video" in js
+    assert "clipsSetVideo" in js and 'location.hash = video ? `#/clips/${encodeURIComponent(video)}` : "#/clips"' in js
+    assert "clipsUi.hashVideo" in js and 'clipsUi.filter = "all"' in js          # le lien « Voir les N clips » montre tous les statuts
+    route = (STATIC / "app.js").read_text(encoding="utf-8")
+    assert 'split(/[/?]/)[0]' in route                                           # #/clips/<id> reste l'écran Clips
+
+
+@_NODE
+def test_assign_channel_dialog_lists_the_channels_and_posts_through_the_api():
+    out = _run_js([("app.js", ["assignChannelHtml"])], "assignChannelHtml('SRzMOzqN-ZM', ['ma_chaine', 'autre'])")
+    assert 'id="assign-form"' in out and "SRzMOzqN-ZM" in out
+    assert '<option value="ma_chaine">ma_chaine</option>' in out and '<option value="autre">autre</option>' in out
+    app = (STATIC / "app.js").read_text(encoding="utf-8")
+    assert "/api/videos/${encodeURIComponent(videoId)}/channel" in app and 'jsonBody("POST", { channel })' in app
+
+
+def test_video_page_offers_assign_channel_and_the_approval_error_offers_it_too():
+    videos = (STATIC / "screens" / "videos.js").read_text(encoding="utf-8")
+    ui = (STATIC / "ui.js").read_text(encoding="utf-8")
+    assert "data-assign-channel" in videos and "Attribuer une chaîne" in videos and "!video.channel" in videos
+    assert "openAssignChannel(videoId)" in videos or "openAssignChannel(video.video_id)" in videos
+    # l'erreur 409 « pas de chaîne » (needs_channel) devient un toast avec le bouton de choix
+    assert "needs_channel" in ui and "openAssignChannel(err.body.video_id, err.body.channels)" in ui
+    assert "failure.body = payload" in (STATIC / "app.js").read_text(encoding="utf-8")
+
+
+_CHAN_DETAIL = {"raw": {"channel": {"display_name": "Ma chaîne"}, "reframe": {"letterbox_zoom": 1.5}},
+                "effective": {"channel": {"slots": [{"day": "mon", "time": "18:30"}], "tiktok_account": ""}}}
+
+
+@_NODE
+def test_channel_card_actions_build_the_preset_to_save_without_touching_the_rest():
+    out = _run_js([("screens/channels.js", ["chPresetWithChannel", "chSlotsWith"])], f"""(() => {{
+      const detail = {json.dumps(_CHAN_DETAIL)};
+      const withRawSlots = {json.dumps({**_CHAN_DETAIL, "raw": {"channel": {"slots": [{"day": "tue", "time": "09:00"}]}}})};
+      return {{ account: chPresetWithChannel(detail, 'tiktok_account', 'ab12cd'), fromEffective: chSlotsWith(detail, 'fri', '20:00'),
+        fromRaw: chSlotsWith(withRawSlots, 'fri', '20:00'), untouched: JSON.stringify(detail.raw) }};
+    }})()""")
+    assert out["account"] == {"channel": {"display_name": "Ma chaîne", "tiktok_account": "ab12cd"}, "reframe": {"letterbox_zoom": 1.5}}
+    assert out["fromEffective"] == [{"day": "mon", "time": "18:30"}, {"day": "fri", "time": "20:00"}]
+    assert out["fromRaw"] == [{"day": "tue", "time": "09:00"}, {"day": "fri", "time": "20:00"}]
+    assert json.loads(out["untouched"]) == _CHAN_DETAIL["raw"]        # la copie n'a pas modifié le détail du serveur
+
+
+def test_channel_card_has_direct_actions_and_channel_fields_are_editable_without_redefine():
+    js = (STATIC / "screens" / "channels.js").read_text(encoding="utf-8")
+    for marker in ("data-chan-add-slot", "data-chan-account", "data-chan-queue", "Ajouter un créneau", "Compte TikTok",
+                   "Mettre une vidéo en file pour cette chaîne", "openAddVideo(b.dataset.chanQueue)"):
+        assert marker in js
+    # [channel] : jamais « redéfinir » ni champ grisé (disabled) ; les autres sections gardent l'héritage
+    assert "const chIsDirect = (section) => section === \"channel\"" in js
+    assert "const redefined = direct || key in raw" in js and "const state = direct ? \"\"" in js
+    assert "chEnsureDraft" in js
+    app = (STATIC / "app.js").read_text(encoding="utf-8")
+    assert "async function openAddVideo(channel)" in app and '${c === channel ? " selected" : ""}' in app
+
+
+@_NODE
+def test_a_channel_field_is_rendered_enabled_without_redefine_while_other_sections_stay_inherited():
+    detail = {"raw": {}, "effective": {"channel": {"mode": "review", "display_name": "x"}, "render": {"crf": 18}}}
+    out = _run_js([("screens/channels.js", ["chIsDirect", "chSame", "chKind", "chField", "chControl", "chSlotsEditor", "chRubricEditor",
+                                           "chAccountEditor", "chRubricLabel"])], f"""(() => {{
+      const ed = {{ draft: {{ channel: {{}}, render: {{}} }}, detail: {json.dumps(detail)} }};
+      globalThis.CHAN_DAYS = []; globalThis.CHAN_MODES = [['review', 'review'], ['auto', 'auto']]; globalThis.CHAN_RUBRICS = [];
+      globalThis.CHAN_RUBRIC_CUSTOM = 'custom'; globalThis.chAccounts = {{ list: null, error: '' }};
+      return {{ mode: chField('channel', 'mode', {{ default: 'review' }}, ed), crf: chField('render', 'crf', {{ default: 23 }}, ed) }};
+    }})()""")
+    assert "data-redefine" not in out["mode"] and " disabled" not in out["mode"] and "direct" in out["mode"]
+    assert "data-redefine" in out["crf"] and " disabled" in out["crf"] and "inherited" in out["crf"]
+
+
+def test_week_slots_carry_their_time_in_europe_paris(tmp_path, isolated_cwd):
+    _publish_setup(tmp_path, [])
+
+    slots = _get_publish(tmp_path).json()["slots"]
+
+    assert [s["slot_at_paris"] for s in slots] == [PUB_MON, PUB_THU]  # été : +02:00, jamais un décalage fixe
+
+
+# --- Écran Publication (TASK-c32b points 6, 8, 10, 11) : le fichier entier est évalué sous node avec des bouchons ---------
+
+_PUB_STUBS = """
+globalThis.document = { addEventListener() {} };
+const Screens = {}; let currentScreen = null; const store = {};
+const $ = () => null; const $$ = () => [];
+const emptyState = (i, t, x) => `<empty>${t} ${x}</empty>`;
+const renderCurrent = () => {}; const api = async () => ({}); const toast = () => {}; const toastError = () => {};
+"""
+
+
+def _run_publish(expr):
+    source = (STATIC / "screens" / "publish.js").read_text(encoding="utf-8")
+    script = _JS_PRELUDE + _PUB_STUBS + source + f"\nconsole.log(JSON.stringify({expr}));"
+    out = _node_run(script)
+    return json.loads(out)
+
+
+@_NODE
+def test_publication_screen_formats_every_time_in_europe_paris_summer_and_winter():
+    out = _run_publish("""({
+      summer: pubLocalInput('2026-07-14T10:30:00+00:00'), winter: pubLocalInput('2026-01-14T10:30:00+00:00'),
+      summerBack: pubParisInstant('2026-07-14T12:30').toISOString(), winterBack: pubParisInstant('2026-01-14T11:30').toISOString(),
+      whenSummer: pubWhen('2026-10-02T10:30:00+00:00'), whenWinter: pubWhen('2026-01-02T10:30:00+00:00'),
+      dstDay: pubParisInstant('2026-03-29T12:00').toISOString(),
+    })""")
+    assert out["summer"] == "2026-07-14T12:30" and out["winter"] == "2026-01-14T11:30"          # UTC+2 l'été, UTC+1 l'hiver
+    assert out["summerBack"] == "2026-07-14T10:30:00.000Z" and out["winterBack"] == "2026-01-14T10:30:00.000Z"
+    assert "12:30" in out["whenSummer"] and "11:30" in out["whenWinter"]                       # jamais le décalage du navigateur
+    assert out["dstDay"] == "2026-03-29T10:00:00.000Z"                                         # jour du passage à l'heure d'été
+
+
+@_NODE
+def test_a_post_scheduled_on_tiktok_is_not_shown_published_before_its_time():
+    out = _run_publish("""(() => {
+      const base = { publish_status: 'published', tiktok_status: 'scheduled_on_tiktok', tiktok_publish_at: '2026-10-02T10:30:00+00:00',
+        slot_at_paris: '2026-10-01T22:55:00+02:00', published_at_paris: '2026-10-01T22:55:00+02:00' };
+      const future = { ...base, tiktok_live: false }, past = { ...base, tiktok_live: true };
+      return { futureChip: pubChip(future), pastChip: pubChip(past), futureLine: pubDoneLine(future), pastLine: pubDoneLine(past) };
+    })()""")
+    assert "Programmée sur TikTok" in out["futureChip"] and "Publiée" not in out["futureChip"]
+    assert "Publiée" in out["pastChip"]
+    assert out["futureLine"].startswith("programmée sur TikTok, en ligne le") and "12:30" in out["futureLine"]   # 10:30 UTC = 12:30 à Paris
+    assert out["futureLine"].count("publié") == 0
+    assert out["pastLine"].startswith("publié · ")
+
+
+@_NODE
+def test_finished_posts_leave_the_ongoing_list_and_an_approved_one_without_moment_says_why():
+    out = _run_publish("""({
+      ongoing: ['approved', 'scheduled', 'failed', 'published'].map((s) => pubIsOngoing({ publish_status: s })),
+      old: pubNeedsMoment({ publish_status: 'approved', publish_mode: null, slot_at: null }),
+      planned: pubNeedsMoment({ publish_status: 'approved', publish_mode: 'immediate', slot_at: '2026-10-01T10:00:00+00:00' }),
+      row: pubPostRow({ video_id: 'v', clip_id: '01', publish_status: 'approved', publish_mode: null, slot_at: null, editable: true, screen_title: 'T' }),
+    })""")
+    assert out["ongoing"] == [True, True, True, False]            # publiée / programmée sur TikTok : plus dans la liste en cours
+    assert out["old"] is True and out["planned"] is False
+    assert "choisis Maintenant ou une date (Modifier)" in out["row"]
+
+
+@_NODE
+def test_publication_layout_puts_the_calendar_in_the_main_column_next_to_the_list_with_one_no_slot_message():
+    week = {"channel": "ma_chaine", "timezone": "Europe/Paris", "tiktok_account": "ab12cd", "week_start": "2026-10-05", "week_end": "2026-10-11",
+            "slots": [{"slot_at": "2026-10-05T18:30:00+02:00", "slot_at_paris": "2026-10-05T18:30:00+02:00", "clip": None, "free": True}],
+            "unscheduled": [{"video_id": "v", "clip_id": "01", "publish_status": "approved", "screen_title": "T", "video_url": "/m", "thumbnail_url": "/t"}],
+            "done": [], "off_slot": [{"video_id": "v", "clip_id": "02", "publish_status": "scheduled", "screen_title": "Manuel", "slot_at": "2026-10-07T12:15:00+00:00",
+                                      "slot_at_paris": "2026-10-07T14:15:00+02:00", "video_url": "/m", "thumbnail_url": "/t"}],
+            "accounts": [], "reason": None}
+    empty = {**week, "slots": [], "off_slot": [], "unscheduled": [{**week["unscheduled"][0]}], "reason": "aucun créneau défini dans [channel].slots"}
+    out = _run_publish(f"""(() => {{
+      pubUi.channel = 'ma_chaine';
+      const withSlots = pubLayoutHtml(['ma_chaine'], {json.dumps(week)}, pubPostsSection());
+      const noSlots = pubLayoutHtml(['ma_chaine'], {json.dumps(empty)}, pubPostsSection());
+      const noChannel = pubLayoutHtml([], null, pubPostsSection());
+      return {{ withSlots, noSlots, noChannel }};
+    }})()""")
+    html = out["withSlots"]
+    grid = html[html.index('class="grid g-side pub-grid"'):]
+    assert grid.index("data-pub-new") < grid.index('id="pub-cal"')                  # Nouvelle publication et liste à gauche, calendrier à droite, dans la même grille
+    assert 'id="pub-queue"' in grid and "data-publish-now" in grid                   # clips à publier : Publier maintenant
+    assert "14:15" in grid and "Manuel" in grid                                      # une publication manuelle entre les créneaux est au calendrier, à l'heure de Paris
+    assert out["noSlots"].lower().count("aucun créneau") == 1                        # le message n'apparaît qu'une fois
+    assert 'id="pub-cal"' not in out["noSlots"] and "data-pub-new" in out["noSlots"]
+    assert "Aucune chaîne" in out["noChannel"] and "data-pub-new" in out["noChannel"]
+
+
+def test_publication_help_texts_describe_optional_slots_and_the_new_publication_flow():
+    js = (STATIC / "screens" / "publish.js").read_text(encoding="utf-8")
+    help_text = js[js.index("const PUB_HELP"):js.index("/* Zone principale")]
+    assert "Nouvelle publication" in help_text and "facultatifs" in help_text
+    for stale in ("télécharge, copie", "Marquer publié", "créneaux obligatoires", "télécharger + copier"):
+        assert stale not in js, stale
+    assert "Glisse un clip sur un créneau libre du calendrier pour le planifier" not in js
+
+
+@_NODE
+def test_publish_now_and_the_renamed_declaration_of_a_post_made_outside_clipper():
+    out = _run_publish("""({
+      approved: pubDetailHtml({ video_id: 'v', clip_id: '01', publish_status: 'approved', screen_title: 'T', video_url: '/m', hashtags: [] }),
+      scheduled: pubDetailHtml({ video_id: 'v', clip_id: '01', publish_status: 'scheduled', screen_title: 'T', video_url: '/m', hashtags: [] }),
+    })""")
+    assert "data-publish-now" in out["approved"] and "Publier maintenant" in out["approved"]
+    assert "data-publish-now" not in out["scheduled"]
+    assert "Déclarer publié (hors Clipper)" in out["scheduled"] and "Marquer publié" not in out["scheduled"]
+    assert "déjà publié toi-même, hors de Clipper" in out["scheduled"]                # expliqué
+    js = (STATIC / "screens" / "publish.js").read_text(encoding="utf-8")
+    assert "pubOpenForm({ video_id, clip_id })" in js and "Déclarer ce clip comme publié ?" in js
+
+
+def test_no_static_script_formats_a_time_without_the_europe_paris_zone():
+    """Toutes les heures affichées sont celles de Paris : aucun toLocale*String sans fuseau, aucun décalage fixe."""
+    for path in sorted(STATIC.rglob("*.js")):
+        js = "\n".join(line for line in path.read_text(encoding="utf-8").splitlines() if not line.lstrip().startswith(("//", "/*", "*")))
+        for match in re.finditer(r"toLocale(?:Time|Date)?String\(([^;]*)", js):
+            line = match.group(0).split("\n")[0]
+            if "minimumFractionDigits" in line or "timeZone" in line:
+                continue
+            assert False, f"{path.name} : heure sans fuseau : {line[:120]}"
+        assert "getTimezoneOffset" not in js and "+01:00" not in js and "+02:00" not in js, path.name
+    assert 'const CLIPPER_TZ = "Europe/Paris"' in (STATIC / "ui.js").read_text(encoding="utf-8")
+
+
+def test_every_panel_screen_keeps_its_content_off_the_edges():
+    """Un écran dont [data-body] garde le cadre d'un panneau a une marge intérieure ; sinon le cadre est retiré
+    (les panneaux sont alors à l'intérieur) ou ses lignes portent leur propre marge (liste des vidéos)."""
+    page = (STATIC / "index.html").read_text(encoding="utf-8")
+    css = "\n".join(p.read_text(encoding="utf-8") for p in [STATIC / "style.css", *sorted((STATIC / "screens").glob("*.css"))])
+    own_margin = {"videos"}  # .vadd, .vfilters et .job portent 16-24 px de marge
+    screens = re.findall(r'<section class="screen" id="screen-(\w+)".*?<div class="([^"]*)" data-body', page, re.S)
+    assert {name for name, _ in screens} == {"dashboard", "videos", "review", "clips", "publish", "channels", "stats", "accounts", "settings"}
+    for name, classes in screens:
+        if "panel" not in classes.split() or name in own_margin:
+            continue
+        rules = re.findall(r"(?:#screen-%s|\.screen\[id=\"screen-%s\"\]) \[data-body\] \{([^}]*)\}" % (name, name), css)
+        assert any("padding" in r or "background: none" in r for r in rules), f"screen-{name} : contenu collé aux bords"
+
+
+def test_stats_lists_the_clips_newest_first(tmp_path, isolated_cwd):
+    _write_state(tmp_path, "aaaaaaaaaaa", channel="ma_chaine")
+    for clip_id, created in (("01", "2026-09-30T10:00:00+00:00"), ("02", "2026-10-01T10:00:00+00:00"), ("03", "2026-09-29T10:00:00+00:00")):
+        _write_full_sidecar(tmp_path, "aaaaaaaaaaa", clip_id, qa={"status": "passed", "issues": []}, created_at=created)
+
+    clips = _stats(tmp_path, "?since=2026-09-01&until=2026-10-31")["clips"]
+
+    assert [c["clip_id"] for c in clips] == ["02", "01", "03"]

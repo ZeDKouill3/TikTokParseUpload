@@ -39,7 +39,7 @@
 
   const clock = (iso) => {
     const d = new Date(iso);
-    return Number.isNaN(d.getTime()) ? esc(iso) : d.toLocaleTimeString("fr-FR");
+    return Number.isNaN(d.getTime()) ? esc(iso) : d.toLocaleTimeString("fr-FR", { timeZone: CLIPPER_TZ });
   };
 
   /* ---------- Structure fixe de l'ecran ---------- */
@@ -161,7 +161,7 @@
     const eta = progress && progress.eta_s != null ? ` · reste ${esc(fr(Math.ceil(progress.eta_s / 60)))} min` : "";
     const where = cur ? `<span>${esc(STEP_LABELS[cur] || cur)}${pct != null ? ` · ${pct} %${eta}` : ""}</span>` : `<span>toutes les étapes terminées</span>`;
     return `<a class="job vrow" href="#/videos/${encodeURIComponent(video.video_id)}" data-video="${esc(video.video_id)}">
-      ${videoThumb(video.video_id)}
+      ${videoThumb(video.video_id, video.platform_thumbnail)}
       <div style="min-width:0">
         <div class="job-title">${esc(video.title)}</div>
         <div class="job-meta"><span class="mono">${esc(video.video_id)}</span>${video.channel ? `<span class="tag">${esc(video.channel)}</span>` : `<span class="muted">sans chaîne</span>`}${where}</div>
@@ -305,7 +305,7 @@
     view.innerHTML = `
       ${backLink()}
       <div class="vhead">
-        ${videoThumb(video.video_id)}
+        ${videoThumb(video.video_id, video.platform_thumbnail)}
         <div style="min-width:0">
           <h2 class="vtitle">${esc(video.title)}</h2>
           ${video.title_reason ? `<p class="muted vsub">${esc(video.title_reason)}</p>` : ""}
@@ -314,6 +314,7 @@
         <div class="vactions">
           ${review ? `<a class="btn btn-primary" href="#/review/${enc}">${icon("sparkles")}Revoir les moments${(video.awaiting || []).length ? ` (${video.awaiting.length})` : ""}</a>` : ""}
           ${(video.clips || []).length ? `<a class="btn" href="#/clips/${enc}">${icon("clapperboard")}Voir les ${video.clips.length} clips</a>` : ""}
+          ${!video.channel && video.status !== "running" ? `<button type="button" class="btn" data-assign-channel="${esc(video.video_id)}">${icon("tv")}Attribuer une chaîne</button>` : ""}
           ${video.status === "running" ? `<button type="button" class="btn btn-bad" data-cancel-video>${icon("ban")}Annuler le traitement</button>` : ""}
           ${(video.status === "failed" || video.status === "queued") && !video.dismissed_at ? `<button type="button" class="btn" data-retry-video="${esc(video.video_id)}" data-from-step="${esc(video.current_step || "")}">${icon("rotate-ccw")}Relancer</button>
             <button type="button" class="btn btn-ghost" data-dismiss-video="${esc(video.video_id)}">Retirer</button>` : ""}
@@ -348,6 +349,8 @@
     if (retry) retry.onclick = () => retryFrom(video, retry.dataset.retry);
     const cancel = $("[data-cancel-video]", view);
     if (cancel) cancel.onclick = () => cancelVideo(video);
+    const assign = $("[data-assign-channel]", view);
+    if (assign) assign.onclick = () => openAssignChannel(video.video_id);
     $("[data-log-copy]", view).onclick = () => copyText(state.events.map((e) => `${e.at} ${e.level} ${e.step || ""} ${e.message}`).join("\n"), "Journal");
   }
 

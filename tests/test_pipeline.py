@@ -1487,3 +1487,62 @@ def test_a_dismissed_queued_video_is_not_resumed(tmp_path):
     pipeline.dismiss_video(VIDEO_ID, config=config)
 
     assert pipeline.queued(config=config) == []
+
+
+# --------------------------------------------------------------------------
+# TASK-c32b point 5 : attribuer une chaine a une video traitee sans chaine
+# --------------------------------------------------------------------------
+
+
+def _channel_preset(tmp_path, name="ma_chaine"):
+    presets = tmp_path / "presets"
+    presets.mkdir(exist_ok=True)
+    (presets / f"{name}.toml").write_text('[channel]\ndisplay_name = "Ma chaîne"\n', encoding="utf-8")
+    return presets
+
+
+def _unassigned_state(tmp_path, status="done", **extra):
+    from clipper import pipeline
+
+    config = Config(mode="review", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output")
+    state = pipeline.new_state(VIDEO_ID, "https://example.test/v", "review")
+    state.update(status=status, **extra)
+    pipeline.save_state(state, config=config)
+    return config
+
+
+def test_set_channel_writes_the_channel_and_journals_it(tmp_path, caplog):
+    import logging
+
+    from clipper import pipeline
+
+    config = _unassigned_state(tmp_path)
+    presets = _channel_preset(tmp_path)
+
+    with caplog.at_level(logging.INFO, logger="clipper.pipeline"):
+        state = pipeline.set_channel(VIDEO_ID, "ma_chaine", config=config, presets_dir=presets)
+
+    assert state["channel"] == "ma_chaine"
+    assert pipeline.load_state(VIDEO_ID, config=config)["channel"] == "ma_chaine"
+    assert any(VIDEO_ID in r.getMessage() and "ma_chaine" in r.getMessage() for r in caplog.records)
+
+
+def test_set_channel_refuses_an_unknown_channel_a_running_video_or_an_already_assigned_one(tmp_path):
+    from clipper import pipeline
+
+    presets = _channel_preset(tmp_path)
+    _channel_preset(tmp_path, "autre")
+    config = _unassigned_state(tmp_path)
+    with pytest.raises(pipeline.PipelineError, match="chaîne inconnue"):
+        pipeline.set_channel(VIDEO_ID, "fantome", config=config, presets_dir=presets)
+    with pytest.raises(pipeline.PipelineError, match="aucun etat"):
+        pipeline.set_channel("zzzzzzzzzzz", "ma_chaine", config=config, presets_dir=presets)
+    assert pipeline.load_state(VIDEO_ID, config=config)["channel"] is None
+
+    config = _unassigned_state(tmp_path, status="running")
+    with pytest.raises(pipeline.PipelineError, match="en cours"):
+        pipeline.set_channel(VIDEO_ID, "ma_chaine", config=config, presets_dir=presets)
+
+    config = _unassigned_state(tmp_path, channel="autre")
+    with pytest.raises(pipeline.PipelineError, match="déjà la chaîne « autre »"):
+        pipeline.set_channel(VIDEO_ID, "ma_chaine", config=config, presets_dir=presets)

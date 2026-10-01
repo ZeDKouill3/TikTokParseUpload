@@ -372,6 +372,8 @@ kbd {
   background-image: linear-gradient(115deg, transparent 0 35%, rgba(255,255,255,0.28) 50%, transparent 65% 100%);
   background-size: 200% 100%; animation: sheen 1.8s linear infinite;
 }
+.bar.indeterminate > i { width: 38%; animation: indeterminate 1.4s ease-in-out infinite; background-image: none; transition: none; }  /* etape sans fraction : barre qui va et vient */
+@keyframes indeterminate { 0% { transform: translateX(-100%); } 100% { transform: translateX(263%); } }
 .bar.done > i { background: var(--ok); animation: none; }
 .bar.failed > i { background: var(--bad); animation: none; }
 @keyframes sheen { from { background-position: 150% 0; } to { background-position: -50% 0; } }
@@ -400,8 +402,9 @@ kbd {
 .job-thumb { width: 96px; aspect-ratio: 16 / 9; border-radius: 6px; overflow: hidden; background: var(--surface-3); position: relative; }
 .job-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .job-thumb .job-thumb-none { display: none; position: absolute; inset: 0; place-items: center; font-size: 11px; color: var(--faint); }
-.job-thumb.empty img { display: none; }
-.job-thumb.empty .job-thumb-none { display: grid; }
+.job-thumb { display: block; align-self: start; flex: none; }  /* 16:9 partout, jamais etire par la grille ou la ligne */
+.job-thumb.no-img img { display: none; }
+.job-thumb.no-img .job-thumb-none { display: grid; }
 .list-item .job-thumb { width: 72px; flex: none; }
 .dash-problem-actions { margin-left: auto; flex: none; gap: 8px; }
 .th-sort { all: unset; cursor: pointer; font: inherit; color: inherit; white-space: nowrap; }
@@ -411,6 +414,7 @@ kbd {
 .job-meta { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); margin-top: 4px; flex-wrap: wrap; }
 .job-meta .dot { width: 3px; height: 3px; border-radius: 50%; background: var(--faint); }
 .job-prog { margin-top: 12px; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: center; }
+.job-prog .bar { width: 180px; max-width: 100%; }  /* colonne « auto » : sans largeur propre la barre faisait 0 px (invisible) */
 .job-step { font-size: 13px; color: var(--text-2); display: flex; gap: 8px; align-items: baseline; }
 .job-step b { color: var(--text); font-weight: 600; }
 .job-side { display: flex; flex-direction: column; align-items: flex-end; gap: 8px; }
@@ -1101,6 +1105,7 @@ input[type="color"] { width: 36px; height: 36px; padding: 2px; border-radius: va
   *, *::before, *::after { animation-duration: 1ms !important; animation-iteration-count: 1 !important; transition-duration: 1ms !important; }
   .reveal { animation: none; }
   .bar > i { transition: none; }
+  .bar.indeterminate > i { animation: none; width: 38%; margin-inline: auto; }  /* mouvement reduit : segment fixe, toujours visible */
 }
 
 /* ---------- Coquille : ecrans, bandeau de connexion, jeton, cibles tactiles ---------- */
@@ -1270,11 +1275,13 @@ input[type="color"] { width: 36px; height: 36px; padding: 2px; border-radius: va
 .legend { display: flex; gap: 16px; flex-wrap: wrap; font-size: 12px; color: var(--muted); }
 .legend span { display: inline-flex; align-items: center; gap: 6px; }
 .legend i { width: 10px; height: 10px; border-radius: 3px; }
-.pub-pad { padding: 16px 24px 24px; }
+.screen[id="screen-publish"] [data-body] { background: none; border: 0; box-shadow: none; }  /* comme Revue, Chaînes et Statistiques : les panneaux sont a l'interieur */
+.pub-pad { padding: 0; }
 .pub-toolbar { gap: 12px 16px; }
 .pub-toolbar .legend { flex: 0 1 auto; }
 .pub-account { font-size: 13px; }
-.pub-grid { grid-template-columns: 300px minmax(0, 1fr); }
+.pub-grid { grid-template-columns: 360px minmax(0, 1fr); }
+.pub-side, .pub-main { min-width: 0; }
 .cal { display: grid; grid-template-columns: 64px repeat(7, minmax(0, 1fr)); border: 1px solid var(--line); border-radius: var(--r-lg); overflow: hidden; background: var(--surface); }
 .cal-h { padding: 12px 8px; border-bottom: 1px solid var(--line); border-left: 1px solid var(--line); text-align: center; }
 .cal-h:first-child { border-left: 0; }
@@ -1311,7 +1318,6 @@ input[type="color"] { width: 36px; height: 36px; padding: 2px; border-radius: va
 .pub-done .mini-clip { width: 28px; }
 .pub-caption { white-space: pre-wrap; font-size: 14px; color: var(--text-2); padding: 12px; border: 1px solid var(--line); border-radius: var(--r-md, 8px); background: var(--surface-2); max-height: 40vh; overflow: auto; }
 @media (max-width: 900px) {
-  .pub-pad { padding: 12px 16px 16px; }
   .pub-grid { grid-template-columns: minmax(0, 1fr); }
   .cal { grid-template-columns: 48px repeat(7, minmax(84px, 1fr)); }
   .cal-wrap { overflow-x: auto; margin: 0 -16px; padding: 0 16px; }
@@ -1472,7 +1478,10 @@ input[type="color"] { width: 36px; height: 36px; padding: 2px; border-radius: va
 .pubf-clip-main { display: flex; flex-direction: column; flex: 1; min-width: 0; font-size: 13px; }
 .pubf-clip-main b, .pubf-clip-main span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pubf-clip .mini-clip { width: 32px; flex: none; }
-.pub-post-row { align-items: center; gap: 12px; flex-wrap: wrap; }
+.pub-post-row { align-items: flex-start; gap: 8px 12px; flex-wrap: wrap; }
+.pub-post-row .li-main { flex: 1 1 160px; min-width: 0; overflow-wrap: anywhere; }
+.pub-post-row > .chip { order: 2; } .pub-post-row > .row { order: 3; flex: 1 0 100%; }
+.cal-c.manual { background: color-mix(in srgb, var(--info) 6%, transparent); }
 .pub-post-row .li-sub.warn { color: var(--warn, #b7791f); }
 .pub-post-row .li-sub.bad { color: var(--bad, #c53030); }
 
@@ -1529,3 +1538,8 @@ input[type="color"] { width: 36px; height: 36px; padding: 2px; border-radius: va
 
 /* Etape Moments (radar du jury) : panneau sur toute la largeur, journal en dessous. */
 .step-detail.wide { grid-template-columns: minmax(0, 1fr); }
+
+/* ---------- Tour 6 : actions directes sur la carte d'une chaîne ---------- */
+.ch-actions { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; }
+.ch-actions .btn { justify-content: flex-start; }
+.chan-field.direct .chan-head { margin-bottom: 4px; }
