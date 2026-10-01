@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ctypes
 import json
+import logging
 import os
 import sys
 import time
@@ -22,7 +23,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 from clipper import channel as channel_mod
-from clipper.config import Config, load_config
+from clipper.config import Config, ConfigError, load_config
+
+log = logging.getLogger(__name__)
 
 CONFIG_DEFAULTS: dict[str, object] = {
     "poll_interval_s": 2,
@@ -189,13 +192,21 @@ class Worker:
     """Boucle sur ``state/queue.json``, un enfant a la fois (ADR-fb9b).
     ``spawner`` (defaut ``subprocess.Popen``) est injecte dans les tests."""
 
-    def __init__(self, *, config: Config | None = None, spawner: Callable[[list[str]], Any] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        config: Config | None = None,
+        spawner: Callable[[list[str]], Any] | None = None,
+        watch_lister: Callable[[str], list[dict[str, Any]]] | None = None,
+    ) -> None:
         if spawner is None:
             import subprocess
 
             spawner = subprocess.Popen
         self.config = config or load_config()
         self.spawner = spawner
+        self.watch_lister = watch_lister
+        self._logged_watch_errors: set[str] = set()
         self._path = _queue_path(self.config)
         self._process: Any | None = None
         self._entry: dict[str, Any] | None = None
@@ -221,7 +232,10 @@ class Worker:
         """Une iteration : termine l'entree si l'enfant courant a fini,
         sinon lance la tete de file si aucun enfant ne vit, sinon reprend
         les videos ``queued`` dont ``retry_at`` est passe (SPEC-fc0c
-        §2.3-2.4)."""
+        §2.3-2.4). La surveillance des chaines echues passe d'abord, enfant
+        en cours ou non (SPEC-fc0c §5.1)."""
+        self._watch_channels()
+
         if self._process is not None:
             if self._process.poll() is None:
                 return
@@ -233,6 +247,30 @@ class Worker:
         from clipper import pipeline
 
         pipeline.process_queue(config=self.config)
+
+    def _watch_channels(self) -> None:
+        """Appelle ``watch.check`` pour chaque chaine ``watch = true`` dont
+        ``checked_at + watch_interval_s`` est passe. Un preset ou un etat
+        illisible est journalise une fois (ADR-ad2e : jamais ignore en
+        silence) et ne tue pas le worker."""
+        from clipper import watch
+
+        section = self.config.section("watch")
+        now = datetime.now(timezone.utc)
+        try:
+            names = channel_mod.list_channels(section["presets_dir"])
+            for name in names:
+                _config, settings = channel_mod.load_channel(
+                    name, presets_dir=section["presets_dir"], base=section["base_config"])
+                if not settings["watch"]:
+                    continue
+                if watch.is_due(name, settings["watch_interval_s"], now, config=self.config):
+                    watch.check(name, now, lister=self.watch_lister, config=self.config)
+        except (channel_mod.ChannelError, ConfigError, watch.WatchError) as exc:
+            message = str(exc)
+            if message not in self._logged_watch_errors:
+                self._logged_watch_errors.add(message)
+                log.error("surveillance des chaines impossible : %s", message)
 
     def _launch_head(self) -> bool:
         """Lance la tete de file ``waiting`` ; le cycle relecture-lancement-

@@ -470,3 +470,115 @@ def test_queue_write_goes_through_a_temp_file_and_os_replace(tmp_path, monkeypat
     src, dst = replaced[0]
     assert src != dst and dst == str(worker._queue_path(config))
     assert not os.path.exists(src)
+
+
+# --------------------------------------------------------------------------
+# (5) surveillance des chaines (TASK-7508, SPEC-fc0c §5)
+# --------------------------------------------------------------------------
+
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+
+class _WatchLister:
+    def __init__(self):
+        self.calls: list[str] = []
+
+    def __call__(self, source_url: str) -> list[dict]:
+        self.calls.append(source_url)
+        return [{"video_id": VIDEO_A, "url": URL_A, "title": "Direct", "duration_s": 7200,
+                 "published_at": "2026-01-01T20:00:00+00:00"}]
+
+
+def _watch_env(tmp_path, channels: dict[str, tuple[bool, int]]) -> Config:
+    """Un preset par chaine ``nom -> (watch, watch_interval_s)``, un config.toml de base."""
+    presets = tmp_path / "presets"
+    presets.mkdir()
+    base = tmp_path / "config.toml"
+    base.write_text('mode = "review"\n', encoding="utf-8")
+    for name, (on, interval) in channels.items():
+        (presets / f"{name}.toml").write_text(
+            f'[channel]\nsource_url = "https://example.test/{name}/videos"\nwatch = {str(on).lower()}\n'
+            f"watch_interval_s = {interval}\nmode = \"review\"\n", encoding="utf-8")
+    return Config(
+        mode="review",
+        workspace_dir=tmp_path / "workspace",
+        output_dir=tmp_path / "output",
+        _sections={
+            "worker": {"queue_path": str(tmp_path / "state" / "queue.json")},
+            "watch": {"state_dir": str(tmp_path / "state" / "watch"),
+                      "presets_dir": str(presets), "base_config": str(base)},
+        },
+    )
+
+
+def _write_watch_state(tmp_path, name: str, checked_at: datetime | None) -> None:
+    path = tmp_path / "state" / "watch" / f"{name}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"checked_at": checked_at.isoformat() if checked_at else None,
+                                "seen": [], "pending": [], "last_error": None}), encoding="utf-8")
+
+
+def test_tick_checks_watched_channel_whose_interval_has_elapsed(tmp_path):
+    config = _watch_env(tmp_path, {"ma_chaine": (True, 1800)})
+    _write_watch_state(tmp_path, "ma_chaine", datetime.now(timezone.utc) - timedelta(seconds=1801))
+    lister = _WatchLister()
+
+    worker.Worker(config=config, spawner=FakeSpawner(), watch_lister=lister).tick()
+
+    assert lister.calls == ["https://example.test/ma_chaine/videos"]
+    state = json.loads((tmp_path / "state" / "watch" / "ma_chaine.json").read_text(encoding="utf-8"))
+    assert [v["video_id"] for v in state["pending"]] == [VIDEO_A]
+
+
+def test_tick_checks_a_watched_channel_never_checked(tmp_path):
+    config = _watch_env(tmp_path, {"ma_chaine": (True, 1800)})
+    lister = _WatchLister()
+
+    worker.Worker(config=config, spawner=FakeSpawner(), watch_lister=lister).tick()
+
+    assert len(lister.calls) == 1
+
+
+def test_tick_skips_a_channel_checked_within_its_interval(tmp_path):
+    config = _watch_env(tmp_path, {"ma_chaine": (True, 1800)})
+    _write_watch_state(tmp_path, "ma_chaine", datetime.now(timezone.utc) - timedelta(seconds=600))
+    lister = _WatchLister()
+
+    worker.Worker(config=config, spawner=FakeSpawner(), watch_lister=lister).tick()
+
+    assert lister.calls == []
+
+
+def test_tick_skips_channels_with_watch_false(tmp_path):
+    config = _watch_env(tmp_path, {"ma_chaine": (False, 1800)})
+    lister = _WatchLister()
+
+    worker.Worker(config=config, spawner=FakeSpawner(), watch_lister=lister).tick()
+
+    assert lister.calls == []
+
+
+def test_tick_checks_watched_channels_even_while_a_child_runs(tmp_path):
+    config = _watch_env(tmp_path, {"ma_chaine": (True, 1800)})
+    _write_queue(config, [{"id": "e1", "video_id": VIDEO_B, "url": URL_B, "channel": None, "action": "run",
+                           "force_steps": [], "enqueued_at": "2026-01-01T00:00:00+00:00",
+                           "status": "waiting", "pid": None}])
+    lister = _WatchLister()
+    w = worker.Worker(config=config, spawner=FakeSpawner(), watch_lister=lister)
+    w.tick()  # lance l'enfant, premier check
+    _write_watch_state(tmp_path, "ma_chaine", datetime.now(timezone.utc) - timedelta(seconds=1801))
+
+    w.tick()  # l'enfant vit toujours
+
+    assert len(lister.calls) == 2
+
+
+def test_tick_logs_a_broken_preset_instead_of_crashing(tmp_path, caplog):
+    config = _watch_env(tmp_path, {"ma_chaine": (True, 1800)})
+    (tmp_path / "presets" / "cassee.toml").write_text("[channel\n", encoding="utf-8")
+    lister = _WatchLister()
+
+    with caplog.at_level("ERROR"):
+        worker.Worker(config=config, spawner=FakeSpawner(), watch_lister=lister).tick()
+
+    assert "cassee" in caplog.text

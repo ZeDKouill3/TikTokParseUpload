@@ -1228,4 +1228,11 @@ input[type="color"] { width: 36px; height: 36px; padding: 2px; border-radius: va
   .chan-fields { grid-template-columns: minmax(0, 1fr); padding: 16px; }
   .chan-sec > summary { padding: 12px 16px; }
   .chan-field .btn, .chan-slot .input, .chan-slot .icon-btn { min-height: 44px; }
+/* ---------- Surveillance : VOD à confirmer (TASK-7508) ---------- */
+.watch-vod .watch-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.watch-vod .btn:disabled { opacity: 0.45; cursor: not-allowed; }
+@media (max-width: 900px) {
+  .watch-vod { flex-wrap: wrap; }
+  .watch-vod .watch-actions { width: 100%; justify-content: flex-end; }
+  .watch-vod .btn-xs { min-height: 44px; }
 }

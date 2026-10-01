@@ -2230,3 +2230,98 @@ def test_channels_screen_is_wired_with_list_form_inheritance_and_toast():
     assert "Aucune chaîne" in js                       # état vide
     assert "FormData" in js and "/logo" in js          # envoi du logo
     assert ".chan-" in css and ".inherited" in css
+# Surveillance : VOD à confirmer (TASK-7508, SPEC-fc0c §5, SPEC-c100)
+# --------------------------------------------------------------------------
+
+WATCH_VOD_A = "ddddddddddd"
+WATCH_VOD_B = "eeeeeeeeeee"
+
+
+def _watch_setup(tmp_path) -> None:
+    vods = [{"video_id": v, "url": f"https://youtu.be/{v}", "title": f"Direct {v}", "duration_s": 7200,
+             "published_at": "2026-01-01T20:00:00+00:00", "found_at": "2026-01-02T01:00:00+00:00"}
+            for v in (WATCH_VOD_A, WATCH_VOD_B)]
+    _write_json(tmp_path / "state" / "watch" / "ma_chaine.json",
+                {"checked_at": "2026-01-02T01:00:00+00:00", "seen": [], "pending": vods, "last_error": None})
+
+
+def _watch_state(tmp_path) -> dict:
+    return json.loads((tmp_path / "state" / "watch" / "ma_chaine.json").read_text(encoding="utf-8"))
+
+
+def test_watch_confirm_enqueues_the_vod_and_removes_it_from_pending(tmp_path, isolated_cwd):
+    _watch_setup(tmp_path)
+
+    resp = client(tmp_path).post(f"/api/watch/ma_chaine/{WATCH_VOD_A}/confirm")
+
+    assert resp.status_code == 202
+    assert resp.json()["video_id"] == WATCH_VOD_A
+    queue = json.loads((tmp_path / "state" / "queue.json").read_text(encoding="utf-8"))
+    assert [(e["video_id"], e["action"], e["channel"]) for e in queue] == [(WATCH_VOD_A, "run", "ma_chaine")]
+    state = _watch_state(tmp_path)
+    assert [v["video_id"] for v in state["pending"]] == [WATCH_VOD_B]
+    assert WATCH_VOD_A in state["seen"]
+    assert [v["video_id"] for v in _dashboard(tmp_path)["watch_pending"]] == [WATCH_VOD_B]
+
+
+def test_watch_ignore_marks_the_vod_seen_without_enqueueing(tmp_path, isolated_cwd):
+    _watch_setup(tmp_path)
+
+    resp = client(tmp_path).post(f"/api/watch/ma_chaine/{WATCH_VOD_B}/ignore")
+
+    assert resp.status_code == 200
+    assert not (tmp_path / "state" / "queue.json").exists()
+    state = _watch_state(tmp_path)
+    assert [v["video_id"] for v in state["pending"]] == [WATCH_VOD_A]
+    assert state["seen"] == [WATCH_VOD_B]
+
+
+@pytest.mark.parametrize("action", ["confirm", "ignore"])
+def test_watch_unknown_vod_is_a_404_with_a_french_detail(tmp_path, isolated_cwd, action):
+    _watch_setup(tmp_path)
+
+    resp = client(tmp_path).post(f"/api/watch/ma_chaine/zzzzzzzzzzz/{action}")
+
+    assert resp.status_code == 404
+    assert "zzzzzzzzzzz" in resp.json()["detail"]
+    assert len(_watch_state(tmp_path)["pending"]) == 2
+
+
+@pytest.mark.parametrize("action", ["confirm", "ignore"])
+def test_watch_invalid_channel_name_is_a_400(tmp_path, isolated_cwd, action):
+    resp = client(tmp_path).post(f"/api/watch/Ma%20Chaine/{WATCH_VOD_A}/{action}")
+    assert resp.status_code == 400
+
+
+@pytest.mark.parametrize("action", ["confirm", "ignore"])
+def test_watch_channel_without_state_file_is_a_404(tmp_path, isolated_cwd, action):
+    resp = client(tmp_path).post(f"/api/watch/ma_chaine/{WATCH_VOD_A}/{action}")
+    assert resp.status_code == 404
+
+
+def test_watch_confirm_with_a_vod_already_waiting_in_the_queue_is_not_an_error(tmp_path, isolated_cwd):
+    _watch_setup(tmp_path)
+    c = client(tmp_path)
+    c.post("/api/queue", json={"url": f"https://youtu.be/{WATCH_VOD_A}", "action": "run"})
+
+    resp = c.post(f"/api/watch/ma_chaine/{WATCH_VOD_A}/confirm")
+
+    assert resp.status_code == 202
+    assert len(json.loads((tmp_path / "state" / "queue.json").read_text(encoding="utf-8"))) == 1
+
+
+def test_dashboard_vod_section_is_wired_to_confirm_and_ignore():
+    page = (STATIC / "index.html").read_text(encoding="utf-8")
+    watch_js = (STATIC / "screens" / "watch.js").read_text(encoding="utf-8")
+    dash_js = (STATIC / "screens" / "dashboard.js").read_text(encoding="utf-8")
+    css = (STATIC / "style.css").read_text(encoding="utf-8")
+
+    assert "/static/screens/watch.js" in page
+    assert page.index("/static/screens.js") < page.index("/static/screens/watch.js") < page.index("/static/app.js")
+    assert "/confirm" in watch_js and "/ignore" in watch_js
+    assert 'method: "POST"' in watch_js
+    assert "Confirmer" in watch_js and "Ignorer" in watch_js and "Voir la VOD" in watch_js
+    assert "confirmDialog" in watch_js                   # ignorer : confirmation
+    assert "toastError" in watch_js                      # erreur affichée, jamais avalée
+    assert "watchVodRow" in dash_js and "VOD à confirmer" in dash_js
+    assert "TASK-7508" in css
