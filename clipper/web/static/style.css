@@ -1445,3 +1445,7 @@ input[type="color"] { width: 36px; height: 36px; padding: 2px; border-radius: va
 .post .pub-acct { font-size: 10px; color: var(--muted); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .post .pub-acct.waiting { color: var(--warn); font-weight: 600; }
 .reason.warn { border-color: var(--warn); }
+
+/* Ecran Clips : marge interieure du panneau (onglets et vignettes plus colles aux bords). */
+#screen-clips [data-body] { padding: 20px 24px 24px; }
+@media (max-width: 900px) { #screen-clips [data-body] { padding: 16px; } }
