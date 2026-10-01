@@ -1,0 +1,81 @@
+# Grille de notation gaming (SPEC-9216), livree avec le paquet a cote de la
+# grille standard (clipper/assets/rubric.toml, SPEC-0eec). Choisie par chaine
+# dans le preset : [moments] rubric_path = "builtin:gaming".
+#
+# Meme forme et meme validation (load_rubric) que la grille standard. Ce qui
+# change : sur un stream de jeu l'emotion du streamer compte plus que
+# l'information (emotion = 4, value = 0, trend = 0), les clips sont plus
+# courts (30 a 90 s) et le seuil de retenue est plus bas (min_score = 45).
+# Le reste (bonus, exclusions, tolerance, min/max_parts) est identique a la
+# grille standard.
+#
+# Score final 0-100 = moyenne des notes (0-10) ponderee par `weight` (un
+# critere a weight = 0 est note mais hors moyenne), x10, plus un bonus de
+# signaux mesures plafonne a [bonus] max_total.
+# Retenus : les moments dont le score final >= min_score, avec un plafond
+# souple : au plus max_moments_per_hour moments par heure de video source
+# (plafond = arrondi superieur de max_moments_per_hour x duree en heures, au
+# moins 1), pris par score decroissant ; un moment dont le score atteint
+# always_keep_score est toujours retenu, meme au-dela du plafond, et compte
+# dans le plafond.
+
+min_score = 45
+max_moments_per_hour = 6
+always_keep_score = 70
+
+# Mots-cles tendance (critere trend) : aucun pour le gaming, trend est a poids 0.
+trend_keywords = []
+
+# Chaque critere : poids dans la moyenne et question posee au LLM.
+[criteria.hook]
+weight = 3
+question = "La 1re phrase du clip arrete-t-elle le scroll (affirmation choc, question, surprise, conflit, revelation) ?"
+
+[criteria.standalone]
+weight = 2
+question = "Le clip est-il comprehensible sans le reste de la video (pas de reference a ce qui precede) ?"
+
+[criteria.payoff]
+weight = 3
+question = "L'arc est-il complet, avec une fin sur punchline ou revelation ? En multi-parties, chaque partie finit-elle sur un suspense ?"
+
+[criteria.emotion]
+weight = 4
+question = "Y a-t-il rire, cri, sursaut, peur, rage, victoire ou defaite, retournement de situation, ou reaction forte au jeu ou au chat ?"
+
+[criteria.value]
+weight = 0
+question = "Le clip apporte-t-il une info, un leak, un avis tranche, une theorie ou une controverse ?"
+
+[criteria.trend]
+weight = 0
+question = "Le clip touche-t-il les mots-cles tendance listes ?"
+
+# Durees en secondes : clips gaming plus courts que la grille standard.
+[durations]
+# Histoire complete qui tient en un clip unique.
+single_min = 30
+single_max = 90
+# Long passage fort (une affaire entiere, typiquement 5 a 15 min) : serie de
+# min_parts a max_parts parties de part_min a part_max qui se suivent.
+part_min = 30
+part_max = 90
+min_parts = 2
+max_parts = 12
+# Marge acceptee apres recalage des bornes sur des frontieres de phrase.
+tolerance = 3
+
+# Bonus des signaux mesures, en points sur 100, plafonne a max_total.
+[bonus]
+max_total = 10
+# x valeur moyenne (0-1) de la courbe YouTube "most replayed" sur le moment.
+replayed = 5
+# x min(1, pics d'energie audio dans le moment / audio_peaks_full).
+audio_peaks = 3
+audio_peaks_full = 3
+# Si une image cle du moment est marquee "striking" par l'etape vision.
+visual = 2
+
+# Regle 2 : segments exclus d'office.
+[exclusions]
+sponsorblock_categories = ["sponsor", "intro", "outro", "selfpromo"]

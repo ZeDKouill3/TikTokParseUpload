@@ -109,7 +109,9 @@ CONFIG_DEFAULTS: dict[str, object] = {
     # "jury" (clipper.jury, ADR-ff87). En mode auto, le jury note toujours.
     "selection": "single",
     # Grille de notation (SPEC-0eec), relative au dossier courant. "builtin"
-    # : grille embarquée dans le paquet (clipper/assets/rubric.toml), utile
+    # : grille standard embarquée dans le paquet (clipper/assets/rubric.toml),
+    # "builtin:gaming" : grille gaming embarquée (rubric-gaming.toml, SPEC-9216 ;
+    # un "builtin:<nom>" inconnu est une erreur), utile
     # sans fichier local (ex. juste après installation de la wheel, avant
     # 'clipper init'). Toute autre valeur est un chemin utilisé tel quel ;
     # fichier absent = erreur explicite (voir resolve_rubric_path), jamais de
@@ -162,17 +164,27 @@ def _number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
-_BUILTIN_RUBRIC = "builtin"
+# Grilles embarquees (SPEC-9216 R1) : valeur de [moments] rubric_path -> fichier
+# de clipper/assets. Toute autre valeur est un chemin de fichier.
+_BUILTIN_RUBRICS = {
+    "builtin": "rubric.toml",
+    "builtin:gaming": "rubric-gaming.toml",
+}
 
 
 def resolve_rubric_path(value: str) -> Path:
-    """Resout [moments] rubric_path : "builtin" -> grille embarquee dans le
-    paquet (clipper/assets/rubric.toml) ; toute autre valeur est un chemin
-    utilise tel quel, relatif au dossier courant si non absolu. Un fichier
-    absent est une MomentsError explicite (load_rubric), jamais de repli
-    silencieux (ADR-ad2e)."""
-    if value == _BUILTIN_RUBRIC:
-        return importlib.resources.files("clipper").joinpath("assets", "rubric.toml")
+    """Resout [moments] rubric_path : "builtin" -> grille standard embarquee
+    (clipper/assets/rubric.toml), "builtin:gaming" -> grille gaming
+    (clipper/assets/rubric-gaming.toml) ; un "builtin:<nom>" inconnu est une
+    MomentsError qui liste les grilles disponibles, jamais un repli sur la
+    grille standard (ADR-ad2e). Toute autre valeur est un chemin utilise tel
+    quel, relatif au dossier courant si non absolu ; un fichier absent est une
+    MomentsError explicite (load_rubric)."""
+    if value in _BUILTIN_RUBRICS:
+        return importlib.resources.files("clipper").joinpath("assets", _BUILTIN_RUBRICS[value])
+    if value.startswith("builtin:"):
+        available = ", ".join(f'"{name}"' for name in _BUILTIN_RUBRICS)
+        raise MomentsError(f'grille embarquee inconnue : "{value}" (grilles disponibles : {available})')
     return Path(value)
 
 
