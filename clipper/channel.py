@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import json
+import os
 import re
+import sys
+import time
 import tomllib
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any, Iterator
 from zoneinfo import ZoneInfo
 
 from clipper.config import Config, ConfigError, VALID_MODES, load_config, write_config
@@ -27,7 +33,69 @@ CONFIG_DEFAULTS: dict[str, object] = {
 
 
 class ChannelError(Exception):
-    """Invalid channel name, or an unknown channel referenced by name."""
+    """Invalid channel name, an unknown channel referenced by name, or a
+    malformed preset file."""
+
+
+# Verrou de fichier inter-processus (stdlib seulement) : le worker et l'API
+# web sont deux processus (ADR-4f6e) qui reecrivent les memes fichiers
+# state/. Un cycle lecture-modification-ecriture se fait sous
+# ``file_lock(path)``, l'ecriture elle-meme par ``atomic_write_json``.
+_REPLACE_ATTEMPTS = 5
+_REPLACE_DELAY_S = 0.05
+_LOCK_POLL_S = 0.01
+
+
+@contextmanager
+def file_lock(path: str | Path) -> Iterator[None]:
+    """Verrou exclusif inter-processus sur ``<path>.lock`` (fcntl.flock sous
+    Linux/macOS, msvcrt.locking sous Windows), bloquant jusqu'a obtention,
+    libere en sortie meme sur exception."""
+    lock_path = Path(str(path) + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as handle:
+        if sys.platform == "win32":
+            import msvcrt
+
+            handle.seek(0)
+            while True:
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    time.sleep(_LOCK_POLL_S)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def atomic_write_json(path: str | Path, data: Any) -> None:
+    """Ecrit ``data`` en JSON dans un fichier temporaire du meme dossier puis
+    ``os.replace`` (jamais de fichier a moitie ecrit). Sous Windows, le
+    remplacement est reessaye si un lecteur tient encore le fichier ouvert."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    for attempt in range(_REPLACE_ATTEMPTS):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if attempt == _REPLACE_ATTEMPTS - 1:
+                tmp.unlink(missing_ok=True)
+                raise
+            time.sleep(_REPLACE_DELAY_S)
 
 
 def _preset_path(presets_dir: str | Path, name: str) -> Path:
@@ -47,8 +115,11 @@ def list_channels(presets_dir: str | Path) -> list[str]:
     is skipped, its name never checked (SPEC-fc0c 1.4)."""
     names = []
     for path in Path(presets_dir).glob("*.toml"):
-        with path.open("rb") as f:
-            data = tomllib.load(f)
+        try:
+            with path.open("rb") as f:
+                data = tomllib.load(f)
+        except tomllib.TOMLDecodeError as exc:
+            raise ChannelError(f"preset TOML invalide : {path} ({exc})") from exc
         if "channel" in data:
             name = path.stem
             _validate_name(name)

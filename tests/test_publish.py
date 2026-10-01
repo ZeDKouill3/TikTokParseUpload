@@ -20,6 +20,9 @@ def _write_preset(cwd: Path, name: str, body: str = "[channel]\n") -> Path:
     return path
 
 
+_SLOT_PRESET = '[channel]\ntimezone = "UTC"\n[[channel.slots]]\nday = "mon"\ntime = "09:00"\n'
+
+
 def _write_sidecar(
     cwd: Path,
     video_id: str,
@@ -281,7 +284,7 @@ def test_mark_published_sets_status_and_published_at(isolated_cwd):
     from clipper import publish
 
     _write_config(isolated_cwd)
-    _write_preset(isolated_cwd, "ma_chaine")
+    _write_preset(isolated_cwd, "ma_chaine", _SLOT_PRESET)  # avec creneau : scheduled
     _write_sidecar(isolated_cwd, "vid1", "03")
     publish.approve("vid1", "03", "ma_chaine")
     now = datetime(2026, 9, 28, 12, 0, tzinfo=timezone.utc)
@@ -350,7 +353,7 @@ def test_edit_caption_refuses_on_a_published_entry(isolated_cwd):
     from clipper import publish
 
     _write_config(isolated_cwd)
-    _write_preset(isolated_cwd, "ma_chaine")
+    _write_preset(isolated_cwd, "ma_chaine", _SLOT_PRESET)  # avec creneau : scheduled
     _write_sidecar(isolated_cwd, "vid1", "03")
     publish.approve("vid1", "03", "ma_chaine")
     publish.mark_published("vid1", "03", "ma_chaine")
@@ -437,3 +440,136 @@ def test_invalid_entry_missing_a_field_raises_publish_error_naming_it(isolated_c
 
     with pytest.raises(publish.PublishError, match="series_id"):
         publish.list_pending("ma_chaine")
+
+
+# --------------------------------------------------------------------------
+# TASK-ded3 : verrou, statuts coherents, ordre des parties, JSON corrompu
+# --------------------------------------------------------------------------
+
+
+def _approve_many(cwd, prefix, n):
+    import os
+
+    from clipper import publish
+
+    os.chdir(cwd)
+    for i in range(n):
+        publish.approve(f"{prefix}vid", f"{i:02d}", "ma_chaine")
+
+
+def test_approve_from_two_processes_loses_no_entry(isolated_cwd):
+    import multiprocessing
+    import sys
+
+    _write_config(isolated_cwd)
+    _write_preset(isolated_cwd, "ma_chaine")
+    for prefix in ("a", "b"):
+        for i in range(20):
+            _write_sidecar(isolated_cwd, f"{prefix}vid", f"{i:02d}")
+    ctx = multiprocessing.get_context("fork" if sys.platform != "win32" else "spawn")
+    procs = [ctx.Process(target=_approve_many, args=(isolated_cwd, prefix, 20)) for prefix in ("a", "b")]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join(timeout=120)
+        assert p.exitcode == 0
+
+    keys = {(e["video_id"], e["clip_id"]) for e in _read_state(isolated_cwd, "ma_chaine")}
+    assert len(keys) == 40
+
+
+def _seed_entry(cwd, status, clip_id="03"):
+    _write_config(cwd)
+    _write_preset(
+        cwd, "ma_chaine",
+        '[channel]\ntimezone = "UTC"\n[[channel.slots]]\nday = "mon"\ntime = "09:00"\n',
+    )
+    _write_sidecar(cwd, "vid1", clip_id)
+    state = _state_file(cwd, "ma_chaine")
+    state.parent.mkdir(parents=True, exist_ok=True)
+    state.write_text(json.dumps([{
+        "video_id": "vid1", "clip_id": clip_id, "series_id": None, "part": None,
+        "status": status, "slot_at": None, "decided_at": "2026-09-28T00:00:00+00:00",
+        "published_at": None, "error": None,
+    }]), encoding="utf-8")
+
+
+@pytest.mark.parametrize("status", ["rejected", "published"])
+def test_move_refuses_a_rejected_or_published_entry(isolated_cwd, status):
+    from clipper import publish
+
+    _seed_entry(isolated_cwd, status)
+    slot = datetime(2026, 10, 5, 9, 0, tzinfo=timezone.utc)
+
+    with pytest.raises(publish.PublishError, match=status):
+        publish.move("vid1", "03", "ma_chaine", slot)
+
+
+@pytest.mark.parametrize("status", ["approved", "rejected", "published", "failed"])
+def test_mark_published_requires_a_scheduled_entry(isolated_cwd, status):
+    from clipper import publish
+
+    _seed_entry(isolated_cwd, status)
+
+    with pytest.raises(publish.PublishError, match="scheduled"):
+        publish.mark_published("vid1", "03", "ma_chaine")
+
+
+def test_mark_published_accepts_a_scheduled_entry(isolated_cwd):
+    from clipper import publish
+
+    _seed_entry(isolated_cwd, "scheduled")
+
+    assert publish.mark_published("vid1", "03", "ma_chaine")["status"] == "published"
+
+
+def _series(cwd):
+    _write_config(cwd)
+    _write_preset(cwd, "ma_chaine")
+    _write_sidecar(cwd, "vid1", "03-p1", part=1, parts_total=3)
+    _write_sidecar(cwd, "vid1", "03-p2", part=2, parts_total=3)
+    _write_sidecar(cwd, "vid1", "03-p3", part=3, parts_total=3)
+
+
+def test_approve_part_n_refuses_when_previous_part_was_never_approved(isolated_cwd):
+    from clipper import publish
+
+    _series(isolated_cwd)
+
+    with pytest.raises(publish.PublishError, match="03-p1"):
+        publish.approve("vid1", "03-p2", "ma_chaine")
+    assert _read_state(isolated_cwd, "ma_chaine") == []
+
+
+def test_approve_part_n_refuses_when_previous_part_is_rejected(isolated_cwd):
+    from clipper import publish
+
+    _series(isolated_cwd)
+    publish.approve("vid1", "03-p1", "ma_chaine")
+    state = _state_file(isolated_cwd, "ma_chaine")
+    entries = json.loads(state.read_text(encoding="utf-8"))
+    entries[0]["status"] = "rejected"
+    state.write_text(json.dumps(entries), encoding="utf-8")
+
+    with pytest.raises(publish.PublishError, match="03-p1"):
+        publish.approve("vid1", "03-p2", "ma_chaine")
+
+
+def test_approve_part_n_accepts_when_previous_part_is_approved(isolated_cwd):
+    from clipper import publish
+
+    _series(isolated_cwd)
+    publish.approve("vid1", "03-p1", "ma_chaine")
+    publish.approve("vid1", "03-p2", "ma_chaine")
+
+    assert publish.approve("vid1", "03-p3", "ma_chaine")["part"] == 3
+
+
+def test_sibling_clip_ids_raises_publish_error_on_corrupt_json(isolated_cwd):
+    from clipper import publish
+
+    _write_sidecar(isolated_cwd, "vid1", "03-p1", part=1, parts_total=2)
+    (isolated_cwd / "output" / "vid1" / "03-p2.json").write_text("{pas du json", encoding="utf-8")
+
+    with pytest.raises(publish.PublishError, match="03-p2.json"):
+        publish._sibling_clip_ids(isolated_cwd / "output", "vid1", "vid1:03", exclude="03-p1")

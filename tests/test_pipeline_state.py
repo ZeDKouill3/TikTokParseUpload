@@ -231,3 +231,69 @@ def test_force_steps_with_an_unknown_step_name_is_a_clear_error(tmp_path):
     state = pipeline.new_state(VIDEO_ID, URL, "auto")
     with pytest.raises(pipeline.PipelineError, match="inconnue_etape"):
         pipeline._start(state, config, False, None, force_steps=["inconnue_etape"])
+
+
+# --------------------------------------------------------------------------
+# TASK-ded3 : process_queue relance avec le preset de la chaine (SPEC-fc0c §1.3)
+# --------------------------------------------------------------------------
+
+
+def _queued_state(config: Config, channel: str | None) -> None:
+    state = pipeline.new_state(VIDEO_ID, URL, "auto", channel=channel)
+    state.update(status="queued", reason="quota", retry_at="2000-01-01T00:00:00+00:00")
+    pipeline.save_state(state, config=config)
+
+
+def _record_start(monkeypatch):
+    seen = []
+
+    def fake_start(state, config, force, step_options, **kw):
+        seen.append(config)
+        return object()
+
+    monkeypatch.setattr(pipeline, "_start", fake_start)
+    monkeypatch.setattr(pipeline, "_advance", lambda run, *, through_review: {"video_id": VIDEO_ID})
+    return seen
+
+
+def test_process_queue_resumes_with_the_channel_preset_mode(tmp_path, monkeypatch):
+    from clipper import channel as channel_mod
+
+    config = _config(tmp_path)  # mode global : auto
+    _queued_state(config, "ma_chaine")
+    preset_config = Config(mode="auto", workspace_dir=config.workspace_dir, output_dir=config.output_dir)
+    monkeypatch.setattr(
+        channel_mod, "load_channel",
+        lambda name, **kw: (preset_config, {"mode": "review"}) if name == "ma_chaine" else pytest.fail(name),
+    )
+    seen = _record_start(monkeypatch)
+
+    pipeline.process_queue(config=config)
+
+    assert [c.mode for c in seen] == ["review"]  # le mode de la chaine, pas le global
+
+
+def test_process_queue_without_channel_keeps_the_global_config(tmp_path, monkeypatch):
+    config = _config(tmp_path)
+    _queued_state(config, None)
+    seen = _record_start(monkeypatch)
+
+    pipeline.process_queue(config=config)
+
+    assert seen == [config]
+
+
+def test_process_queue_vanished_channel_logs_and_keeps_the_video_waiting(tmp_path, monkeypatch, caplog):
+    config = _config(tmp_path)
+    _queued_state(config, "disparue")
+    seen = _record_start(monkeypatch)
+    monkeypatch.chdir(tmp_path)  # aucun presets/disparue.toml ici
+
+    with caplog.at_level(logging.ERROR, logger="clipper"):
+        out = pipeline.process_queue(config=config)
+
+    assert out == [] and seen == []  # jamais de repli sur la config globale
+    assert "disparue" in caplog.text
+    state = pipeline.load_state(VIDEO_ID, config=config)
+    assert state["status"] == "queued"
+    assert "disparue" in state["reason"]

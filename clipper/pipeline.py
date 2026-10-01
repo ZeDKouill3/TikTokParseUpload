@@ -80,6 +80,7 @@ import time
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from dataclasses import replace as dataclass_replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -87,6 +88,7 @@ from typing import Any
 from clipper import (
     audio,
     captions,
+    channel as channel_mod,
     download,
     feedback,
     llm,
@@ -100,7 +102,7 @@ from clipper import (
     transcribe,
     vision,
 )
-from clipper.config import Config, load_config
+from clipper.config import Config, ConfigError, load_config
 
 log = logging.getLogger(__name__)
 
@@ -1013,15 +1015,37 @@ def process_queue(
     step_options: dict[str, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Reprend chaque video en file dont ``retry_at`` est passe ; renvoie
-    leurs nouveaux etats."""
+    leurs nouveaux etats. Une video rattachee a une chaine repart avec le
+    preset de cette chaine, son mode compris (SPEC-fc0c §1.3), pas avec la
+    config globale : si la chaine a disparu ou son preset est invalide,
+    l'erreur est journalisee, gardee dans ``reason`` et la video reste en
+    attente (ADR-ad2e, aucun repli sur la config globale)."""
     config = config or load_config()
     now = now or _now()
     out = []
     for state in queued(config=config):
         if datetime.fromisoformat(state["retry_at"]) > now:
             continue
-        out.append(_advance(_start(state, config, False, step_options), through_review=True))
+        run_config = config
+        if state.get("channel") is not None:
+            try:
+                run_config = _channel_config(state["channel"])
+            except (channel_mod.ChannelError, ConfigError) as exc:
+                reason = f"chaine {state['channel']!r} inutilisable a la reprise : {exc}"
+                if state.get("reason") != reason:
+                    log.error("%s : %s", state["video_id"], reason)
+                    state["reason"] = reason
+                    save_state(state, config=config)
+                continue
+        out.append(_advance(_start(state, run_config, False, step_options), through_review=True))
     return out
+
+
+def _channel_config(name: str) -> Config:
+    """Config du preset de la chaine ``name``, dont le mode est celui de la
+    chaine (``[channel].mode``, a defaut le mode global)."""
+    preset_config, channel = channel_mod.load_channel(name)
+    return dataclass_replace(preset_config, mode=str(channel["mode"]))
 
 
 def watch_queue(*, config: Config | None = None, interval: float = 60.0) -> None:
