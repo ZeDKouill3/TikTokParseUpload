@@ -933,8 +933,8 @@ def test_app_js_notifies_on_video_status_changes(tmp_path, isolated_cwd):
 
 def _api_calls(js: str) -> list[tuple[str, str]]:
     calls = []
-    for m in re.finditer(r"""api\(\s*["`](/api[^"`?]*)[^"`]*["`]\s*(?:,\s*\{\s*method:\s*"(\w+)")?""", js):
-        calls.append((m.group(2) or "GET", re.sub(r"\$\{[^}]*\}", "x", m.group(1))))
+    for m in re.finditer(r"""api\(\s*["`](/api[^"`?]*)[^"`]*["`]\s*(?:,\s*(?:\{\s*method:\s*"(\w+)"|jsonBody\(\s*"(\w+)"))?""", js):
+        calls.append((m.group(2) or m.group(3) or "GET", re.sub(r"\$\{[^}]*\}", "x", m.group(1))))
     return calls
 
 
