@@ -266,6 +266,79 @@ def _moments_jury_confidences(config: Config, video_id: str) -> dict[Any, tuple[
     return {m["id"]: _jury_confidence(m) for m in _read_json(path)["moments"]}
 
 
+def _jury_rounds(jury: dict[str, Any]) -> list[dict[str, Any]]:
+    """Tours du jury, cumules : chaque tour donne l'etat de tous les juges
+    (un juge absent du tour 2 garde ses notes du tour 1, ``revised`` False)."""
+    latest: dict[str, Any] = {}
+    out = []
+    for rnd in jury["trace"]["rounds"]:
+        latest = {**latest, **rnd["judges"]}
+        out.append({"round": rnd["round"], "judges": {
+            name: {**j, "revised": name in rnd["judges"]} for name, j in latest.items()}})
+    return out
+
+
+def _jury_reason(moment: dict[str, Any], reject_reason: str | None, threshold: Any) -> tuple[str, str]:
+    """(categorie, raison) de la retenue ou du rejet d'un moment : lue dans
+    moments.json, jamais devinee ; une raison de rejet inconnue reste « autre »."""
+    if reject_reason is None:
+        if moment.get("exploration"):
+            return "exploration", "clip d'exploration : non retenu par la grille, pris pour apprendre ce que le jury sous-estime"
+        return "retenu", f"score final {moment['final_score']} au moins égal au seuil {threshold}"
+    if reject_reason.startswith("veto "):
+        return "veto", reject_reason
+    if "< min_score" in reject_reason:
+        return "score", reject_reason
+    if "plafond" in reject_reason:
+        return "plafond", reject_reason
+    return "autre", reject_reason
+
+
+def _jury_view(config: Config, video_id: str) -> dict[str, Any]:
+    """Moments retenus puis non retenus avec le detail du jury (lecture seule)."""
+    path = Path(config.workspace_dir) / video_id / "moments.json"
+    empty: dict[str, Any] = {"video_id": video_id, "available": False, "reason": None, "moments": []}
+    if not path.exists():
+        return {**empty, "reason": f"moments.json absent pour {video_id} (étape Moments pas encore faite)"}
+    try:
+        data = _read_json(path)
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=500, detail=f"moments.json illisible pour {video_id} : {exc}") from exc
+    rubric = data.get("rubric") or {}
+    if "weights" not in rubric:
+        return {**empty, "reason": f"moments.json de {video_id} sans grille (rubric.weights)"}
+    if not any("jury" in m for m in [*data.get("moments", []), *data.get("rejected", [])]):
+        return {**empty, "reason": f"moments.json de {video_id} sans jury (selection : {data.get('selection', 'inconnue')})"}
+    threshold = rubric.get("min_score")
+    rows = [(m, None, f"kept-{i}") for i, m in enumerate(data.get("moments", []))]
+    rows += [(m, m.get("reason") or "rejeté sans raison dans moments.json", f"rejected-{i}")
+             for i, m in enumerate(data.get("rejected", []))]
+    moments = []
+    for m, reject_reason, key in rows:
+        jury = m.get("jury")
+        if not jury:
+            continue
+        kind, reason = _jury_reason(m, reject_reason, threshold)
+        moments.append({
+            "key": key, "id": m.get("id"), "retained": reject_reason is None,
+            "start": m["start"], "end": m["end"], "format": m.get("format"),
+            "scores": m.get("scores"), "final_score": m.get("final_score"),
+            "jury_score": jury.get("score"), "confidence": jury.get("confidence"),
+            "veto": jury.get("veto"), "debated": bool(jury.get("debated")),
+            "proposer_scores": (jury.get("proposer") or {}).get("scores"),
+            "rounds": _jury_rounds(jury),
+            "reason_kind": kind, "reason": reason,
+            "justification": m.get("justification"), "hook_text": m.get("hook_text"),
+        })
+    return {
+        "video_id": video_id, "available": True, "reason": None,
+        "criteria": [{"name": n, "weight": w} for n, w in rubric["weights"].items()],
+        "threshold": threshold, "selection": data.get("selection"),
+        "exploration": data.get("exploration"), "judges": (data.get("jury") or {}).get("judges", []),
+        "moments": moments,
+    }
+
+
 def _list_moments(config: Config, video_id: str) -> list[dict[str, Any]]:
     video_dir = Path(config.workspace_dir) / video_id
     parts_path = video_dir / "parts.json"
@@ -1872,6 +1945,12 @@ def create_app(config: Config | None = None) -> FastAPI:
     @app.get("/api/videos/{video_id}/moments")
     def list_moments(video_id: str) -> list[dict[str, Any]]:
         return _list_moments(config, video_id)
+
+    @app.get("/api/videos/{video_id}/jury")
+    def get_jury(video_id: str) -> dict[str, Any]:
+        """Detail du jury par moment pour le radar de la fiche video (lecture seule)."""
+        _validate_video_id(video_id)
+        return _jury_view(config, video_id)
 
     @app.post("/api/videos/{video_id}/moments/{moment_id}/decide")
     def decide_moment(video_id: str, moment_id: int, body: DecideBody) -> dict[str, Any]:
