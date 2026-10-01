@@ -5,7 +5,7 @@ slug: comptes-pr-t-publier-automatique-selon-la-connex
 title: "Comptes : « prêt à publier » automatique selon la connexion vérifiée (SPEC-e500 R3)"
 created: 2026-10-01T21:43:02Z
 author: nicoc@zedk_ordi
-status: in_progress
+status: done
 scope:
   - clipper/accounts.py
   - clipper/browser.py
@@ -19,8 +19,15 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/a5a3964d8996@8c67d8b
+    tree: scope/8f5ba7a57ac8
+    criteria: 84a00ace7e65
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 2
+version: 3
 ---
 
 Implémente la nouvelle R3 de SPEC-e500759ebe68 (ratifiée 2026-10-01, successeur de SPEC-00d1) : aujourd'hui la case est cochée à la main (PUT /api/accounts/{id}/ready).
