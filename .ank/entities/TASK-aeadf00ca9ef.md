@@ -5,7 +5,7 @@ slug: statistiques-tableau-de-bord-tiktok-par-compte-v
 title: "Statistiques : tableau de bord TikTok par compte (vue d'ensemble, liste des vidéos, fiche de stats par vidéo) (SPEC-86fe)"
 created: 2026-10-01T22:24:23Z
 author: nicoc@zedk_ordi
-status: open
+status: in_progress
 scope:
   - clipper/tiktok.py
   - clipper/assets/tiktok_selectors.toml
@@ -22,7 +22,7 @@ criteria_by: creator
 verify: [tests]
 method: tdd
 schema: 4
-version: 3
+version: 4
 ---
 
 Implémente SPEC-86fea5620c7f (ratifiée 2026-10-01). Maquette validée : docs/maquette-stats/index.html (reprendre sa mise en page dans la vraie console). Repères réels déjà relevés (FR) : page Données analytiques du compte https://www.tiktok.com/tiktokstudio/analytics : bouton période « 7 derniers jours », tuiles en boutons « Vues de la vidéo -- 0 (--) », « Vues du profil », « J'aime », « Commentaires », « Partages » (valeur puis évolution entre parenthèses) ; Publications /tiktokstudio/content : tableau « Contenu (Créé le) | Politique de confidentialité | Vues | J'aime | Commentaires | Actions », lien du post a[href*='/video/'] (/@<compte>/video/<id>, texte = légende) ; analyse d'un post /tiktokstudio/analytics/<id>?qa_enter_from=analytics : cartes [data-tt='VideoOverviewPage_VideoMetricsCard_FlexItem'] « libellé | valeur » (Vues de vidéo, Temps de lecture total 0h:00m:00s, Temps de visionnage moyen 0s, A regardé toute la vidéo 0%, Nouveaux followers) ; onglets /viewers (Total des spectateurs, Types : récurrents/nouveaux, followers/non followers, Âge, Sexe, Lieux) et /engagement (J'aime dans le temps, Mots les plus utilisés dans les commentaires) ; « en cours de traitement » ou « dès 100 vues » = null. Le relevé existant (fetch_stats, SPEC-9225 R7) est à étendre, pas à doubler.
