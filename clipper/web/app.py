@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import csv
 import importlib
 import inspect
 import json
@@ -24,17 +25,27 @@ from typing import Any, AsyncIterator
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from clipper import channel as channel_mod
 from clipper import gpu as gpu_mod
+from clipper import outcomes as outcomes_mod
 from clipper import pipeline
 from clipper import publish as publish_mod
+from clipper import reframe as reframe_mod
 from clipper import watch as watch_mod
 from clipper import worker as worker_mod
-from clipper.config import Config, ConfigError, _section_defaults, load_config
+from clipper.config import (
+    DEFAULTS as _CONFIG_FLAT_DEFAULTS,
+    VALID_MODES,
+    Config,
+    ConfigError,
+    _section_defaults,
+    load_config,
+    write_config,
+)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 # Video/clip ids sont soit des ids YouTube (11 caracteres alphanumeriques),
@@ -687,6 +698,39 @@ def _channel_detail(name: str) -> dict[str, Any]:
     return {"name": name, "raw": raw, "effective": effective, "defaults": defaults}
 
 
+def _subspreview_config(name: str, draft: str | None) -> Config:
+    """Config effective de la chaine pour l'apercu des sous-titres. Avec
+    ``draft`` (JSON ``{"subtitles": {...}, "reframe": {...}}`` : les tables du
+    formulaire pas encore enregistrees), le preset est recompose avec ces
+    tables puis relu par save_channel/load_channel dans un dossier temporaire
+    (heritage compris, comme a l'enregistrement) ; le fichier reel n'est
+    jamais touche."""
+    config, _channel = _load_channel(name)
+    if not draft:
+        return config
+    try:
+        tables = json.loads(draft)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=422, detail=f"draft : JSON invalide ({exc})") from exc
+    if not isinstance(tables, dict) or any(not isinstance(v, dict) for v in tables.values()):
+        raise HTTPException(status_code=422, detail="draft : attendu un objet {section: {cle: valeur}}")
+    if set(tables) - {"subtitles", "reframe"}:
+        raise HTTPException(status_code=422, detail="draft : seules les sections subtitles et reframe sont admises")
+    preset = tomllib.loads(_channel_preset_path(name).read_text(encoding="utf-8"))
+    for section, table in tables.items():
+        if table:
+            preset[section] = table
+        else:
+            preset.pop(section, None)
+    try:
+        _check_preset_types(preset)
+        with tempfile.TemporaryDirectory() as tmp:
+            channel_mod.save_channel(name, preset, presets_dir=tmp, base=_BASE_CONFIG)
+            return channel_mod.load_channel(name, presets_dir=tmp, base=_BASE_CONFIG)[0]
+    except ConfigError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
 def _save_channel_preset(name: str, preset: dict[str, Any]) -> None:
     if "channel" not in preset:
         preset = {**preset, "channel": {}}  # sans [channel], le preset ne serait plus une chaine
@@ -696,6 +740,247 @@ def _save_channel_preset(name: str, preset: dict[str, Any]) -> None:
     except ConfigError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+
+# --------------------------------------------------------------------------
+# Ecran Reglages (SPEC-c100 E8, ADR-4f6e §2 et §5) : config.toml en formulaire.
+# L'ecriture passe par config.write_config (relu par load_config avant le
+# remplacement atomique) ; le jeton [web] token n'est jamais lu ni ecrit par
+# l'interface : il se change dans le fichier, puis redemarrage.
+# --------------------------------------------------------------------------
+
+_SETTINGS_FLAT = tuple(_CONFIG_FLAT_DEFAULTS)
+_SETTINGS_SECTIONS = ("llm", "web", "worker")
+_SETTINGS_TOKEN_MASK = "•" * 8
+_SETTINGS_QUOTED = re.compile(r'"(?:[^"\\]|\\.)*"|\'[^\']*\'')
+
+
+def _settings_read_raw() -> tuple[dict[str, Any], bool, str]:
+    path = Path(_BASE_CONFIG)
+    if not path.is_file():
+        return {}, False, ""
+    try:
+        text = path.read_text(encoding="utf-8")
+        return tomllib.loads(text), True, text
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise HTTPException(status_code=422, detail=f"{_BASE_CONFIG} illisible : {exc}") from exc
+
+
+def _settings_has_comments(text: str) -> bool:
+    return any("#" in _SETTINGS_QUOTED.sub("", line) for line in text.splitlines())
+
+
+def _settings_without_token(web: dict[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in web.items() if k != "token"}
+
+
+def _settings_access(web_cfg: dict[str, Any]) -> dict[str, Any]:
+    """Acces tel que le serveur en cours l'applique (lecture seule) : l'hote et
+    le port ne changent qu'au redemarrage, le jeton n'est jamais renvoye."""
+    host, port, token = str(web_cfg["host"]), int(web_cfg["port"]), str(web_cfg["token"])
+    command = f"python -m clipper serve --port {port}"
+    if host != _LOOPBACK_HOST:
+        command = f"python -m clipper serve --host {host} --port {port}"
+    return {
+        "host": host, "port": port, "loopback": host == _LOOPBACK_HOST,
+        "token_set": bool(token), "token": _SETTINGS_TOKEN_MASK if token else None, "command": command,
+    }
+
+
+def _settings_detail(running_web: dict[str, Any]) -> dict[str, Any]:
+    """Valeurs effectives de config.toml (relu a chaque appel), brut du fichier
+    et CONFIG_DEFAULTS commentes des sections du formulaire."""
+    raw, exists, text = _settings_read_raw()
+    try:
+        config = load_config(_BASE_CONFIG) if exists else load_config()
+        effective: dict[str, Any] = {"mode": config.mode, "workspace_dir": str(config.workspace_dir),
+                                     "output_dir": str(config.output_dir)}
+        defaults: dict[str, Any] = {
+            "general": {k: {"default": v, "comment": ""} for k, v in _CONFIG_FLAT_DEFAULTS.items()},
+        }
+        from clipper import llm as llm_mod
+
+        for section in _SETTINGS_SECTIONS:
+            # [llm] est fusionne en profondeur avec ses defauts par clipper.llm : meme vue ici
+            effective[section] = llm_mod._settings(config) if section == "llm" else config.section(section)
+            defaults[section] = _defaults_documentation(section)
+    except ConfigError as exc:
+        raise HTTPException(status_code=422, detail=f"{_BASE_CONFIG} invalide : {exc}") from exc
+    file_web = effective["web"]
+    effective["web"] = _settings_without_token(file_web)
+    defaults["web"].pop("token", None)
+    if "web" in raw:
+        raw = {**raw, "web": _settings_without_token(raw["web"])}
+    restart = any(file_web[k] != running_web[k] for k in ("host", "port", "token"))
+    return {
+        "path": _BASE_CONFIG, "exists": exists, "comments_lost": _settings_has_comments(text),
+        "raw": raw, "effective": effective, "defaults": defaults,
+        "modes": list(VALID_MODES), "backends": list(llm_mod._BACKENDS),
+        "access": _settings_access(running_web), "restart_required": restart,
+    }
+
+
+def _settings_check_llm(llm: dict[str, Any]) -> None:
+    from clipper import llm as llm_mod
+
+    known = " | ".join(llm_mod._BACKENDS)
+
+    def backend(value: Any, where: str) -> None:
+        if value not in llm_mod._BACKENDS:
+            raise ConfigError(f"[llm] {where} : backend inconnu {value!r} (attendu : {known})")
+
+    if "backend" in llm:
+        backend(llm["backend"], "backend")
+    usages = llm.get("usages", {})
+    if not isinstance(usages, dict):
+        raise ConfigError("[llm] usages : table attendue")
+    for usage, table in usages.items():
+        if not isinstance(table, dict) or not all(isinstance(v, str) for v in table.values()):
+            raise ConfigError(f"[llm] usages.{usage} : table de textes attendue (backend, model)")
+        unknown = set(table) - {"backend", "model"}
+        if unknown:
+            raise ConfigError(f"[llm] usages.{usage} : cle(s) inconnue(s) {', '.join(sorted(unknown))}")
+        if "backend" in table:
+            backend(table["backend"], f"usages.{usage}.backend")
+    for key, value in llm.items():
+        if isinstance(_section_defaults("llm").get(key), dict) and key != "usages":
+            models = value.get("models", {}) if isinstance(value, dict) else None
+            if not isinstance(models, dict) or not all(isinstance(m, str) and m for m in models.values()):
+                raise ConfigError(f"[llm] {key}.models : table niveau -> nom de modele (textes non vides) attendue")
+
+
+def _settings_merge(raw: dict[str, Any], settings: dict[str, Any]) -> dict[str, Any]:
+    """Ce que le formulaire controle (mode, dossiers, [llm], [web], [worker])
+    remplace le fichier ; le reste (autres sections) et le jeton sont conserves."""
+    unknown = set(settings) - set(_SETTINGS_FLAT) - set(_SETTINGS_SECTIONS)
+    if unknown:
+        raise ConfigError(
+            f"{', '.join(sorted(unknown))} : non modifiable depuis les réglages "
+            f"(éditable : {', '.join((*_SETTINGS_FLAT, *_SETTINGS_SECTIONS))})"
+        )
+    for key in _SETTINGS_FLAT:
+        if key in settings and not (isinstance(settings[key], str) and settings[key].strip()):
+            raise ConfigError(f"{key} : texte non vide attendu, reçu {settings[key]!r}")
+    for section in _SETTINGS_SECTIONS:
+        if section in settings and not isinstance(settings[section], dict):
+            raise ConfigError(f"[{section}] : table attendue")
+    _check_preset_types({s: settings[s] for s in _SETTINGS_SECTIONS if s in settings})
+    web = settings.get("web", {})
+    if "token" in web:
+        raise ConfigError("[web] token : le jeton ne se modifie pas depuis l'interface (fichier + redémarrage)")
+    if "llm" in settings:
+        _settings_check_llm(settings["llm"])
+    port = web.get("port")
+    if port is not None and not 1 <= port <= 65535:
+        raise ConfigError(f"[web] port : entre 1 et 65535 attendu, reçu {port!r}")
+    data = {k: v for k, v in raw.items()}
+    for key in _SETTINGS_FLAT:
+        if key in settings:
+            data[key] = settings[key]
+    for section in _SETTINGS_SECTIONS:
+        if section in settings:
+            data[section] = dict(settings[section])
+    token = raw.get("web", {}).get("token", "")
+    if "web" in settings and token:
+        data["web"]["token"] = token
+    final_web = data.get("web", {})
+    if final_web.get("host", _section_defaults("web")["host"]) != _LOOPBACK_HOST and not final_web.get("token"):
+        raise ConfigError(
+            "[web] host hors bouclage : un jeton ([web] token) est exigé, à écrire dans config.toml "
+            "(sinon 'serve' refuserait de démarrer, ADR-4f6e §5)"
+        )
+    return data
+
+
+class SettingsBody(BaseModel):
+    settings: dict[str, Any]
+
+# Editeur d'agencement stream split (SPEC-c100 E5, SPEC-76dc) : memes cles et
+# memes validations que [reframe] (c'est reframe qui refuse, pas le JS).
+# L'image cle est un fichier deja produit par l'etape scenes.
+# --------------------------------------------------------------------------
+
+_LAYOUT_KEYS = ("split_webcam_dest", "split_gameplay_dest", "badge_dest", "split_subtitle_dest")
+_LAYOUT_KEYFRAME_DIRS = ("frames", "scenes")  # frames/ : sortie de clipper.scenes
+
+
+def _layout_keyframes(config: Config, video_id: str) -> list[Path]:
+    video_dir = Path(config.workspace_dir) / video_id
+    return sorted(p for d in _LAYOUT_KEYFRAME_DIRS for p in (video_dir / d).glob("*.jpg") if p.is_file())
+
+
+def _layout_keyframe_path(config: Config, name: str, video_id: str | None) -> Path:
+    """Image cle du milieu d'une video de la chaine (celle demandee, sinon la
+    premiere qui en a) : 404 en francais si aucune n'existe."""
+    if video_id is not None:
+        if not _SAFE_ID.fullmatch(video_id):
+            raise HTTPException(status_code=404, detail=f"identifiant invalide : {video_id!r}")
+        if _channel_of(video_id, config) != name:
+            raise HTTPException(status_code=404, detail=f"la vidéo {video_id!r} n'appartient pas à la chaîne {name!r}")
+        frames = _layout_keyframes(config, video_id)
+        if not frames:
+            raise HTTPException(status_code=404, detail=f"aucune image clé pour la vidéo {video_id!r} (étape scenes non faite)")
+        return frames[len(frames) // 2]
+    for state in sorted(_list_states(config), key=lambda s: s["video_id"]):
+        if state.get("channel") == name and _SAFE_ID.fullmatch(state["video_id"]):
+            frames = _layout_keyframes(config, state["video_id"])
+            if frames:
+                return frames[len(frames) // 2]
+    raise HTTPException(
+        status_code=404,
+        detail=f"aucune image clé : aucune vidéo de la chaîne {name!r} n'a passé l'étape scenes",
+    )
+
+
+def _layout_view(name: str) -> dict[str, Any]:
+    """Rectangles effectifs (preset > config.toml > defauts SPEC-76dc), defauts,
+    canevas et zone sure, tels que reframe les lit."""
+    config, _channel = _load_channel(name)
+    reframe = config.section("reframe")
+    defaults = _section_defaults("reframe")
+    return {
+        "name": name,
+        **{key: reframe[key] for key in _LAYOUT_KEYS},
+        "defaults": {key: defaults[key] for key in _LAYOUT_KEYS},
+        "canvas": {"w": reframe["output_width"], "h": reframe["output_height"]},
+        "safe": {"left": reframe["safe_left"], "top": reframe["safe_top"],
+                 "right": reframe["safe_right"], "bottom": reframe["safe_bottom"]},
+    }
+
+
+def _layout_check_geometry(name: str, preset: dict[str, Any]) -> None:
+    """Fait relire ``preset`` (stream_variant force a "split") par reframe :
+    load_config ne controle que les cles, c'est reframe._settings qui refuse un
+    rectangle hors canevas, chevauchant ou hors zone sure. Son message est
+    renvoye tel quel (ReframeError)."""
+    candidate = {**preset, "reframe": {**preset["reframe"], "stream_variant": "split"}}
+    _check_preset_types(candidate)
+    with tempfile.TemporaryDirectory() as tmp:
+        channel_mod.save_channel(name, candidate, presets_dir=tmp, base=_BASE_CONFIG)
+        config, _channel = channel_mod.load_channel(name, presets_dir=tmp, base=_BASE_CONFIG)
+    try:
+        reframe_mod._settings(config)
+    except reframe_mod.ReframeError as exc:
+        raise ConfigError(str(exc)) from exc
+
+
+def _layout_save(name: str, body: dict[str, Any]) -> None:
+    """Ecrit les rectangles dans [reframe] du preset par save_channel, apres
+    avoir verifie la geometrie comme reframe la verifiera au rendu : l'editeur
+    ne laisse jamais passer un agencement que reframe refuserait."""
+    given = {key: body[key] for key in _LAYOUT_KEYS if body.get(key) is not None}
+    if not given:
+        raise HTTPException(status_code=422, detail=f"aucun rectangle à enregistrer (attendu : {', '.join(_LAYOUT_KEYS)})")
+    path = _channel_preset_path(name)
+    try:
+        preset = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise HTTPException(status_code=422, detail=f"preset illisible ({path.name}) : {exc}") from exc
+    preset["reframe"] = {**preset.get("reframe", {}), **given}
+    try:
+        _layout_check_geometry(name, preset)
+    except ConfigError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    _save_channel_preset(name, preset)
 
 def _png_from_multipart(content_type: str, body: bytes) -> bytes:
     """Contenu du champ « file » d'un POST multipart (stdlib, sans dependance)."""
@@ -710,6 +995,237 @@ def _png_from_multipart(content_type: str, body: bytes) -> bytes:
                 raise HTTPException(status_code=422, detail="le logo doit être une image PNG")
             return data
     raise HTTPException(status_code=422, detail="champ « file » absent de l'envoi multipart")
+
+
+# ----------------------------------------------------------------
+# Statistiques (SPEC-c100 E7, TASK-7d86)
+# ----------------------------------------------------------------
+
+_STATS_STEP_ORDER = tuple(pipeline.STEPS)
+
+
+def _stats_bound(name: str, value: str | None, *, end_of_day: bool) -> datetime | None:
+    """Borne de periode « AAAA-MM-JJ » ou horodatage ISO 8601 (UTC si sans fuseau)."""
+    if not value:
+        return None
+    try:
+        bound = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"date invalide pour {name} : {value!r} (attendu AAAA-MM-JJ ou horodatage ISO 8601)",
+        ) from exc
+    if end_of_day and len(value) == 10:
+        bound = bound.replace(hour=23, minute=59, second=59, microsecond=999999)
+    return bound if bound.tzinfo else bound.replace(tzinfo=timezone.utc)
+
+
+def _stats_period(since: str | None, until: str | None) -> tuple[datetime | None, datetime | None]:
+    lower = _stats_bound("since", since, end_of_day=False)
+    upper = _stats_bound("until", until, end_of_day=True)
+    if lower is not None and upper is not None and lower > upper:
+        raise HTTPException(status_code=422, detail=f"periode inversee : since={since!r} est apres until={until!r}")
+    return lower, upper
+
+
+def _stats_in_period(stamp: str | None, lower: datetime | None, upper: datetime | None, where: str) -> bool:
+    if lower is None and upper is None:
+        return True
+    if not stamp:
+        raise HTTPException(status_code=500, detail=f"horodatage absent ({where}) : impossible de le placer dans la periode")
+    try:
+        moment = datetime.fromisoformat(stamp)
+    except ValueError as exc:
+        raise HTTPException(status_code=500, detail=f"horodatage illisible ({where}) : {stamp!r}") from exc
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return (lower is None or moment >= lower) and (upper is None or moment <= upper)
+
+
+def _stats_read_jsonl(path: Path) -> list[dict[str, Any]]:
+    if not path.is_file():
+        return []
+    entries = []
+    for number, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not raw.strip():
+            continue
+        try:
+            entries.append(json.loads(raw))
+        except ValueError as exc:
+            raise HTTPException(status_code=500, detail=f"{path.name} ligne {number} illisible : {exc}") from exc
+    return entries
+
+
+def _stats_outcomes(config: Config) -> list[dict[str, Any]]:
+    path = Path(str(config.section("outcomes")["journal_path"]))
+    try:
+        return outcomes_mod.read(path)
+    except (ValueError, KeyError, TypeError) as exc:
+        raise HTTPException(status_code=500, detail=f"{path.name} illisible : {exc}") from exc
+
+
+def _stats_clips(config: Config, lower: datetime | None, upper: datetime | None) -> dict[str, Any]:
+    """Un element par sidecar de output/ cree dans la periode, joint aux resultats
+    d'outcomes (qa du sidecar, decision humaine, mesure de plateforme la plus
+    recente). Le CSV de plateforme ne porte que ``clip_id`` : une mesure n'est
+    rattachee que si un seul clip porte cet id, sinon elle est rendue a part
+    (``stats_unmatched``) avec la raison, jamais attribuee au hasard."""
+    journal = _stats_outcomes(config)
+    feedback_path = Path(str(config.section("feedback")["journal_path"]))
+    decisions: dict[tuple[str, Any], str] = {}
+    for entry in _stats_read_jsonl(feedback_path):
+        try:
+            decisions[(entry["video_id"], entry["moment"]["id"])] = entry["decision"]
+        except (KeyError, TypeError) as exc:
+            raise HTTPException(status_code=500, detail=f"{feedback_path.name} : entree sans video_id/moment/decision ({exc})") from exc
+    results: dict[tuple[Any, Any], Any] = {}
+    measures: dict[str, list[tuple[str, int, dict[str, Any]]]] = {}
+    for index, entry in enumerate(journal):
+        if entry.get("kind") == "result":
+            if entry.get("human_decision") is not None:
+                results[(entry["video_id"], entry["clip_id"])] = entry["human_decision"]
+        elif entry.get("kind") == "stats":
+            stats = entry["stats"]
+            measures.setdefault(entry["clip_id"], []).append((str(stats.get("date")), index, stats))
+
+    root = Path(config.output_dir)
+    sidecars: list[tuple[str, str, dict[str, Any]]] = []
+    for video_dir in sorted(p for p in root.iterdir() if p.is_dir()) if root.is_dir() else []:
+        for path in sorted(video_dir.glob("*.json")):
+            sidecar = _read_clip_sidecar(config, video_dir.name, path.stem)
+            sidecars.append((video_dir.name, path.stem, sidecar))
+    holders: dict[str, int] = {}
+    for _, clip_id, _ in sidecars:
+        holders[clip_id] = holders.get(clip_id, 0) + 1
+
+    clips = []
+    for video_id, clip_id, sidecar in sidecars:
+        if not _stats_in_period(sidecar.get("created_at"), lower, upper, f"sidecar {video_id}/{clip_id}"):
+            continue
+        qa = sidecar.get("qa") or {}
+        moment_id = sidecar.get("moment_id")
+        decision, source = results.get((video_id, clip_id)), "outcomes"
+        if decision is None:
+            decision, source = decisions.get((video_id, moment_id)), "feedback"
+        found = measures.get(clip_id) if holders[clip_id] == 1 else None
+        clips.append({
+            "video_id": video_id, "clip_id": clip_id, "moment_id": moment_id,
+            "channel": _channel_of(video_id, config), "screen_title": sidecar.get("screen_title"),
+            "created_at": sidecar.get("created_at"),
+            "qa_status": qa.get("status"), "issues": qa.get("issues"),
+            "human_decision": decision, "decision_source": source if decision is not None else None,
+            "stats": max(found)[2] if found else None,
+        })
+    unmatched = []
+    for clip_id in sorted(measures):
+        if holders.get(clip_id, 0) == 1:
+            continue
+        reason = (f"le clip {clip_id} existe dans plusieurs vidéos : le CSV n'a pas de video_id"
+                  if holders.get(clip_id) else f"aucun clip {clip_id} dans {config.output_dir}")
+        unmatched.append({"clip_id": clip_id, "reason": reason, "stats": max(measures[clip_id])[2]})
+    return {"clips": clips, "stats_unmatched": unmatched}
+
+
+def _stats_llm_cost(config: Config, lower: datetime | None, upper: datetime | None) -> dict[str, Any]:
+    """Couts de workspace/*/llm_usage.jsonl dans la periode : par video, par usage
+    et par jour (UTC) ; les appels sans cout rapporte sont comptes a part."""
+    cost: dict[str, Any] = {"total": 0.0, "unreported_calls": 0, "by_video": {}, "by_usage": {}, "by_day": {}}
+    root = Path(config.workspace_dir)
+    for path in sorted(root.glob("*/llm_usage.jsonl")) if root.is_dir() else []:
+        video_id = path.parent.name
+        for number, entry in enumerate(_stats_read_jsonl(path), start=1):
+            where = f"{video_id}/{path.name} ligne {number}"
+            stamp = entry.get("recorded_at") or entry.get("timestamp")
+            if not _stats_in_period(stamp, lower, upper, where):
+                continue
+            try:
+                usage = entry["usage"]
+                day = datetime.fromisoformat(stamp).astimezone(timezone.utc).date().isoformat()
+            except (KeyError, TypeError, ValueError) as exc:
+                raise HTTPException(status_code=500, detail=f"{where} : {exc}") from exc
+            video = cost["by_video"].setdefault(video_id, {"cost": 0.0, "calls": 0, "unreported_calls": 0})
+            video["calls"] += 1
+            amount = entry.get("cost_usd")
+            if amount is None:
+                video["unreported_calls"] += 1
+                cost["unreported_calls"] += 1
+                continue
+            video["cost"] += amount
+            cost["total"] += amount
+            cost["by_usage"][usage] = cost["by_usage"].get(usage, 0.0) + amount
+            cost["by_day"][day] = cost["by_day"].get(day, 0.0) + amount
+    cost["by_day"] = dict(sorted(cost["by_day"].items()))
+    return cost
+
+
+def _stats_steps_and_counts(config: Config, lower: datetime | None, upper: datetime | None) -> dict[str, Any]:
+    """Videos dont ``updated_at`` tombe dans la periode : comptes par statut, et
+    duree moyenne / derniere (fin la plus recente) de chaque etape sur les videos done."""
+    counts = {status: 0 for status in _VIDEO_STATUSES}
+    samples: dict[str, list[tuple[str, float]]] = {}
+    for state in _list_states(config):
+        video_id = state.get("video_id", "?")
+        if not _stats_in_period(state.get("updated_at"), lower, upper, f"pipeline.json de {video_id}"):
+            continue
+        status = state.get("status")
+        if status not in counts:
+            raise HTTPException(status_code=500, detail=f"statut inconnu {status!r} dans le pipeline.json de {video_id}")
+        counts[status] += 1
+        if status != "done":
+            continue
+        for name, seconds in _step_durations(state).items():
+            if seconds is not None:
+                samples.setdefault(name, []).append((state["steps"][name]["finished_at"], seconds))
+    steps = {}
+    for name in sorted(samples, key=lambda n: _STATS_STEP_ORDER.index(n) if n in _STATS_STEP_ORDER else len(_STATS_STEP_ORDER)):
+        durations = [seconds for _, seconds in samples[name]]
+        steps[name] = {"mean_s": sum(durations) / len(durations),
+                       "last_s": max(samples[name], key=lambda s: _parse_ts("?", name, "finished_at", s[0]))[1],
+                       "count": len(durations)}
+    return {"steps": steps, "counts": counts}
+
+
+def _stats(config: Config, since: str | None, until: str | None) -> dict[str, Any]:
+    lower, upper = _stats_period(since, until)
+    return {"period": {"since": since or None, "until": until or None},
+            **_stats_clips(config, lower, upper),
+            "llm_cost": _stats_llm_cost(config, lower, upper),
+            **_stats_steps_and_counts(config, lower, upper)}
+
+
+def _stats_csv_from_multipart(content_type: str, body: bytes) -> bytes:
+    """Contenu du champ « file » d'un POST multipart (stdlib, sans dependance)."""
+    if not content_type.lower().startswith("multipart/form-data"):
+        raise HTTPException(status_code=422, detail="envoi multipart/form-data attendu (champ « file », fichier CSV)")
+    message = BytesParser(policy=_EMAIL_HTTP).parsebytes(
+        b"Content-Type: " + content_type.encode("latin-1") + b"\r\n\r\n" + body)
+    for part in message.iter_parts() if message.is_multipart() else []:
+        if part.get_param("name", header="content-disposition") == "file":
+            return part.get_payload(decode=True) or b""
+    raise HTTPException(status_code=422, detail="champ « file » absent de l'envoi multipart")
+
+
+def _stats_import(config: Config, data: bytes) -> int:
+    """Importe le CSV via clipper.outcomes ; en cas d'echec le journal est remis
+    tel qu'il etait (import_stats ecrit ligne a ligne : pas d'import partiel)."""
+    try:
+        data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(status_code=422, detail=f"le CSV doit être encodé en UTF-8 : {exc}") from exc
+    journal = Path(str(config.section("outcomes")["journal_path"]))
+    size = journal.stat().st_size if journal.exists() else None
+    with tempfile.TemporaryDirectory() as tmp:
+        csv_path = Path(tmp) / "stats.csv"
+        csv_path.write_bytes(data)
+        try:
+            return len(outcomes_mod.import_stats(csv_path, path=journal))
+        except (outcomes_mod.OutcomesError, ValueError, KeyError, TypeError, csv.Error) as exc:
+            if size is None:
+                journal.unlink(missing_ok=True)
+            elif journal.stat().st_size != size:
+                with journal.open("r+b") as f:
+                    f.truncate(size)
+            raise HTTPException(status_code=422, detail=f"import du CSV impossible : {exc}") from exc
 
 
 class ChannelBody(BaseModel):
@@ -748,6 +1264,13 @@ class DecideBody(BaseModel):
     start: float | None = None
     end: float | None = None
     comment: str | None = None
+
+
+class LayoutBody(BaseModel):
+    split_webcam_dest: dict[str, Any] | None = None
+    split_gameplay_dest: dict[str, Any] | None = None
+    badge_dest: dict[str, Any] | None = None
+    split_subtitle_dest: dict[str, Any] | None = None
 
 
 def create_app(config: Config | None = None) -> FastAPI:
@@ -1095,6 +1618,15 @@ def create_app(config: Config | None = None) -> FastAPI:
             "reason": None if channel["slots"] else "aucun créneau défini dans [channel].slots",
         }
 
+    @app.get("/api/channels/{name}/subtitles-preview")
+    def channel_subtitles_preview(name: str, text: str = "", draft: str | None = None) -> Response:
+        config = _subspreview_config(name, draft)
+        try:
+            png = pipeline.preview_subtitles(config, text)
+        except pipeline.PipelineError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return Response(png, media_type="image/png", headers={"Cache-Control": "no-store"})
+
     @app.post("/api/channels/{name}/logo")
     async def upload_channel_logo(name: str, request: Request) -> dict[str, Any]:
         _channel_preset_path(name)
@@ -1106,6 +1638,53 @@ def create_app(config: Config | None = None) -> FastAPI:
         tmp.write_bytes(data)
         os.replace(tmp, target)
         return {"name": name, "logo": f"{_PRESETS_DIR}/{name}.png"}
+
+    # ----------------------------------------------------------------
+    # Reglages (SPEC-c100 E8) : config.toml, relu a chaque requete
+    # ----------------------------------------------------------------
+
+    @app.get("/api/settings")
+    def get_settings() -> dict[str, Any]:
+        return _settings_detail(web_cfg)
+
+    @app.put("/api/settings")
+    def put_settings(body: SettingsBody) -> dict[str, Any]:
+        nonlocal config
+        raw, _exists, _text = _settings_read_raw()
+        try:
+            write_config(_BASE_CONFIG, _settings_merge(raw, body.settings))
+            config = load_config(_BASE_CONFIG)  # les entrees de file suivantes lisent le nouveau mode/backend
+        except ConfigError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=f"valeur non enregistrable : {exc}") from exc
+        app.state.config = config
+        return _settings_detail(web_cfg)
+    @app.get("/api/channels/{name}/keyframe")
+    def channel_keyframe(name: str, video_id: str | None = None) -> FileResponse:
+        _channel_preset_path(name)
+        return FileResponse(_layout_keyframe_path(config, name, video_id), media_type="image/jpeg")
+
+    @app.get("/api/channels/{name}/layout")
+    def get_channel_layout(name: str) -> dict[str, Any]:
+        return _layout_view(name)
+
+    @app.put("/api/channels/{name}/layout")
+    def put_channel_layout(name: str, body: LayoutBody) -> dict[str, Any]:
+        _layout_save(name, body.model_dump())
+        return _layout_view(name)
+    # ----------------------------------------------------------------
+    # Statistiques (SPEC-c100 E7)
+    # ----------------------------------------------------------------
+
+    @app.get("/api/stats")
+    def stats(since: str | None = None, until: str | None = None) -> dict[str, Any]:
+        return _stats(config, since, until)
+
+    @app.post("/api/stats/import")
+    async def stats_import(request: Request) -> dict[str, Any]:
+        data = _stats_csv_from_multipart(request.headers.get("content-type", ""), await request.body())
+        return {"imported": _stats_import(config, data)}
 
     @app.get("/api/events")
     def events_stream() -> StreamingResponse:

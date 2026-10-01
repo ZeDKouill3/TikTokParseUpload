@@ -2570,3 +2570,676 @@ def test_publish_screen_is_wired_with_calendar_queue_and_actions():
     assert "Rien à publier" in js                                          # état vide
     for sel in (".cal", ".cal-c", ".post", ".queue", "TASK-503d"):
         assert sel in css, sel
+# Ecran Reglages (SPEC-c100 E8, ADR-4f6e §2 et §5) : config.toml en formulaire
+# --------------------------------------------------------------------------
+
+import tomllib  # noqa: E402
+
+_SET_TOML = (
+    '# commentaire a perdre\nmode = "review"\n'
+    '[llm]\nbackend = "claude-cli"\n'
+    '[web]\nport = 8123\ntoken = "secret-tres-long"\n'
+    '[render]\ncrf = 18\n'
+)
+
+
+def _settings_setup(tmp_path, text=_SET_TOML):
+    (tmp_path / "config.toml").write_text(text, encoding="utf-8")
+    return tmp_path / "config.toml"
+
+
+def sclient(tmp_path) -> TestClient:
+    """Serveur démarré avec la config lue dans config.toml (comme 'serve')."""
+    from clipper.config import load_config
+
+    path = tmp_path / "config.toml"
+    return TestClient(create_app(config=load_config(path) if path.exists() else make_config(tmp_path)))
+
+
+def test_get_settings_returns_effective_values_and_documented_defaults_per_section(tmp_path, isolated_cwd):
+    _settings_setup(tmp_path)
+    data = sclient(tmp_path).get("/api/settings").json()
+
+    assert data["raw"]["mode"] == "review" and data["raw"]["web"]["port"] == 8123
+    assert data["effective"]["mode"] == "review"
+    assert data["effective"]["workspace_dir"] == "workspace"          # défaut de config.DEFAULTS
+    assert data["effective"]["web"]["port"] == 8123
+    assert data["effective"]["web"]["sse_poll_interval_s"] == 1.0     # défaut du module
+    assert data["effective"]["worker"]["poll_interval_s"] == 2
+    assert data["effective"]["llm"]["backend"] == "claude-cli"
+    assert data["effective"]["llm"]["usages"]["moments"] == {"model": "strong"}
+    for section in ("llm", "web", "worker"):
+        assert section in data["defaults"], section
+    # même mécanisme que l'écran Chaînes : défaut + commentaire du source
+    assert data["defaults"]["web"]["port"]["default"] == 8000
+    assert "Hote et port" in data["defaults"]["web"]["host"]["comment"]
+    assert "reponse refusee" in data["defaults"]["llm"]["repair_attempts"]["comment"]
+    assert set(data["backends"]) == {"claude-cli", "claude-api", "ollama"}
+    assert data["modes"] == ["review", "auto"]
+    assert data["comments_lost"] is True                              # le fichier contient un commentaire
+
+
+def test_get_settings_never_returns_the_token(tmp_path, isolated_cwd):
+    _settings_setup(tmp_path)
+    resp = sclient(tmp_path).get("/api/settings")
+    assert "secret-tres-long" not in resp.text
+    access = resp.json()["access"]
+    assert access["host"] == "127.0.0.1" and access["port"] == 8123
+    assert access["token_set"] is True and access["token"] != "secret-tres-long" and set(access["token"]) == {"•"}
+    assert access["command"] == "python -m clipper serve --port 8123"
+
+
+def test_get_settings_without_config_toml_shows_defaults_and_no_comment_warning(tmp_path, isolated_cwd):
+    data = sclient(tmp_path).get("/api/settings").json()
+    assert data["exists"] is False and data["comments_lost"] is False
+    assert data["effective"]["mode"] == "review" and data["effective"]["web"]["port"] == 8000
+    assert data["access"]["token_set"] is False and data["access"]["token"] is None
+
+
+def test_put_settings_writes_through_write_config_keeping_other_sections_and_the_token(
+        tmp_path, isolated_cwd, monkeypatch):
+    path = _settings_setup(tmp_path)
+    from clipper import config as config_mod
+    from clipper.web import app as web_app
+
+    calls = []
+    real = config_mod.write_config
+    monkeypatch.setattr(web_app, "write_config", lambda *a, **k: (calls.append((a, k)), real(*a, **k))[1])
+
+    body = {"settings": {
+        "mode": "auto", "output_dir": "sorties",
+        "llm": {"backend": "ollama", "repair_attempts": 2, "usages": {"moments": {"model": "fast"}}},
+        "web": {"port": 9001, "host": "127.0.0.1", "sse_poll_interval_s": 2.0},
+        "worker": {"poll_interval_s": 5},
+    }}
+    resp = sclient(tmp_path).put("/api/settings", json=body)
+
+    assert resp.status_code == 200, resp.text
+    assert len(calls) == 1 and Path(calls[0][0][0]) == Path("config.toml")
+    written = tomllib.loads(path.read_text(encoding="utf-8"))
+    assert written["mode"] == "auto" and written["output_dir"] == "sorties"
+    assert written["llm"]["backend"] == "ollama" and written["llm"]["usages"] == {"moments": {"model": "fast"}}
+    assert written["web"]["port"] == 9001
+    assert written["web"]["token"] == "secret-tres-long"             # le jeton n'est jamais touché
+    assert written["render"] == {"crf": 18}                          # section hors formulaire conservée
+    assert "commentaire" not in path.read_text(encoding="utf-8")     # commentaires perdus (ADR-4f6e §2)
+    assert resp.json()["effective"]["mode"] == "auto" and resp.json()["comments_lost"] is False
+
+
+@pytest.mark.parametrize("settings, fragment", [
+    ({"mode": "manuel"}, "mode"),
+    ({"workspace_dir": 5}, "workspace_dir"),
+    ({"llm": {"backend": "inconnu"}}, "inconnu"),
+    ({"llm": {"usages": {"moments": {"backend": "nope"}}}}, "nope"),
+    ({"llm": {"repair_attempts": "deux"}}, "repair_attempts"),
+    ({"web": {"port": "x"}}, "port"),
+    ({"web": {"port": 70000}}, "port"),
+    ({"web": {"zzz": 1}}, "zzz"),
+    ({"worker": {"queue_path": 3}}, "queue_path"),
+    ({"web": {"host": "0.0.0.0", "token": "autre"}}, "jeton"),
+    ({"web": {"host": "0.0.0.0"}}, "jeton"),    # hors bouclage sans jeton : serve refuserait de démarrer
+    ({"render": {"crf": 1}}, "render"),         # section hors formulaire : pas éditable ici
+])
+def test_put_settings_refused_value_is_422_with_detail_and_keeps_the_file(
+        tmp_path, isolated_cwd, settings, fragment):
+    path = _settings_setup(tmp_path, _SET_TOML.replace('token = "secret-tres-long"\n', ""))
+    before = path.read_bytes()
+
+    resp = sclient(tmp_path).put("/api/settings", json={"settings": settings})
+
+    assert resp.status_code == 422
+    assert fragment in resp.json()["detail"]
+    assert path.read_bytes() == before                               # fichier intact
+    assert not list(tmp_path.glob("config.toml.*"))                  # pas de .tmp qui traîne
+
+
+def test_put_settings_load_config_refusal_is_422_and_keeps_the_file(tmp_path, isolated_cwd):
+    path = _settings_setup(tmp_path)
+    before = path.read_bytes()
+    resp = sclient(tmp_path).put("/api/settings", json={"settings": {"mode": "auto", "llm": {"zzz": 1}}})
+    assert resp.status_code == 422 and path.read_bytes() == before
+
+
+def test_put_settings_mode_and_backend_are_read_by_the_next_queue_entries(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import worker
+
+    _settings_setup(tmp_path)
+    seen = []
+
+    def fake_enqueue(url, channel, action, force_steps, *, config=None):
+        seen.append((config.mode, config.section("llm")["backend"]))
+        return {"id": "e1", "video_id": VIDEO_ID, "url": url, "channel": channel, "action": action,
+                "force_steps": [], "status": "waiting"}
+
+    monkeypatch.setattr(worker, "enqueue", fake_enqueue)
+    c = sclient(tmp_path)
+    c.post("/api/queue", json={"url": URL, "action": "run"})
+    assert c.put("/api/settings", json={"settings": {"mode": "auto", "llm": {"backend": "ollama"}}}).status_code == 200
+    c.post("/api/queue", json={"url": URL, "action": "run"})
+
+    assert seen == [("review", "claude-cli"), ("auto", "ollama")]
+
+
+def test_put_settings_web_changes_ask_for_a_restart_and_do_not_change_the_running_access(tmp_path, isolated_cwd):
+    _settings_setup(tmp_path)
+    c = sclient(tmp_path)
+    assert c.get("/api/settings").json()["restart_required"] is False
+    data = c.put("/api/settings", json={"settings": {"web": {"port": 9001}}}).json()
+    assert data["restart_required"] is True
+    assert data["access"]["port"] == 8123                            # l'écoute en cours ne change pas
+
+
+def test_settings_screen_is_wired_with_sections_access_and_comment_warning():
+    page = (STATIC / "index.html").read_text(encoding="utf-8")
+    js = (STATIC / "screens" / "settings.js").read_text(encoding="utf-8")
+    css = (STATIC / "style.css").read_text(encoding="utf-8")
+
+    assert "/static/screens/settings.js" in page
+    assert page.index("/static/screens.js") < page.index("/static/screens/settings.js") < page.index("/static/app.js")
+    assert "Screens.settings" in js and 'api("/api/settings"' in js
+    assert 'jsonBody("PUT"' in js and "toast(" in js
+    # formulaire par sections
+    for title in ("Général", "Dossiers", "LLM", "Serveur web", "Worker", "Accès"):
+        assert title in js, title
+    for key in ("mode", "workspace_dir", "output_dir", "backend", "repair_attempts", "usages", "models"):
+        assert key in js, key
+    # section Accès en lecture seule : hôte, port, jeton masqué, commande serve
+    assert "token_set" in js and "access.command" in js and "access.host" in js and "access.port" in js
+    assert "redémarrage" in js
+    # avertissement avant la première écriture
+    assert "commentaires du fichier perdus" in js and "comments_lost" in js
+    assert "field-error" in js and "set-" in css
+# Éditeur d'agencement stream split (SPEC-c100 E5, SPEC-76dc) : API + écran
+# --------------------------------------------------------------------------
+
+_LAYOUT_KEYS = ("split_webcam_dest", "split_gameplay_dest", "badge_dest", "split_subtitle_dest")
+_LAYOUT_DEFAULTS = {
+    "split_webcam_dest": {"x": 20, "y": 0, "w": 1040, "h": 640},
+    "split_gameplay_dest": {"x": 0, "y": 640, "w": 1080, "h": 1280},
+    "badge_dest": {"x": 330, "y": 590, "w": 420, "h": 100},
+    "split_subtitle_dest": {"x": 150, "y": 710, "w": 780, "h": 150},
+}
+import tomllib  # noqa: E402
+
+_JPEG = b"\xff\xd8\xff\xe0layout-test-jpeg"
+
+
+def _layout_keyframe(tmp_path, video_id, channel=CH, names=("scene0000_000.jpg",), folder="frames"):
+    _write_state(tmp_path, video_id, channel=channel)
+    frames = tmp_path / "workspace" / video_id / folder
+    frames.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        (frames / name).write_bytes(_JPEG + name.encode())
+
+
+def test_layout_keyframe_returns_a_jpeg_of_the_requested_video(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path)
+    _layout_keyframe(tmp_path, "aaaaaaaaaaa")
+    resp = client(tmp_path).get(f"/api/channels/{CH}/keyframe", params={"video_id": "aaaaaaaaaaa"})
+    assert resp.status_code == 200, resp.text
+    assert resp.headers["content-type"] == "image/jpeg"
+    assert resp.content.startswith(_JPEG)
+
+
+def test_layout_keyframe_without_video_id_takes_a_video_of_the_channel(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path)
+    _layout_keyframe(tmp_path, "bbbbbbbbbbb", channel="autre_chaine")
+    _layout_keyframe(tmp_path, "aaaaaaaaaaa", folder="scenes", names=("k1.jpg",))
+    resp = client(tmp_path).get(f"/api/channels/{CH}/keyframe")
+    assert resp.status_code == 200 and resp.content.endswith(b"k1.jpg")
+
+
+def test_layout_keyframe_404_in_french_when_no_video_has_keyframes(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path)
+    _write_state(tmp_path, "aaaaaaaaaaa", channel=CH)          # vidéo sans images clés
+    _layout_keyframe(tmp_path, "bbbbbbbbbbb", channel="autre_chaine")
+    c = client(tmp_path)
+    resp = c.get(f"/api/channels/{CH}/keyframe")
+    assert resp.status_code == 404
+    assert "image clé" in resp.json()["detail"] and CH in resp.json()["detail"]
+    resp = c.get(f"/api/channels/{CH}/keyframe", params={"video_id": "aaaaaaaaaaa"})
+    assert resp.status_code == 404 and "aaaaaaaaaaa" in resp.json()["detail"]
+    # une vidéo d'une autre chaîne n'est pas servie pour celle-ci
+    resp = c.get(f"/api/channels/{CH}/keyframe", params={"video_id": "bbbbbbbbbbb"})
+    assert resp.status_code == 404 and "bbbbbbbbbbb" in resp.json()["detail"]
+
+
+def test_layout_keyframe_refuses_unsafe_video_id_and_unknown_channel(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path)
+    c = client(tmp_path)
+    assert c.get(f"/api/channels/{CH}/keyframe", params={"video_id": "../x"}).status_code == 404
+    assert c.get("/api/channels/inconnue/keyframe").status_code == 404
+
+
+def test_get_layout_returns_spec_defaults(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path)
+    data = client(tmp_path).get(f"/api/channels/{CH}/layout").json()
+    for key in _LAYOUT_KEYS:
+        assert data[key] == _LAYOUT_DEFAULTS[key], key
+    assert data["defaults"] == _LAYOUT_DEFAULTS
+    assert data["canvas"] == {"w": 1080, "h": 1920}
+    assert data["safe"] == {"left": 150, "top": 160, "right": 930, "bottom": 1520}
+
+
+def test_get_layout_returns_the_preset_values(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path, _CH_PRESET + 'split_webcam_dest = {x = 0, y = 0, w = 1080, h = 700}\n')
+    data = client(tmp_path).get(f"/api/channels/{CH}/layout").json()
+    assert data["split_webcam_dest"] == {"x": 0, "y": 0, "w": 1080, "h": 700}
+    assert data["badge_dest"] == _LAYOUT_DEFAULTS["badge_dest"]
+
+
+def test_get_layout_unknown_channel_is_404(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path)
+    assert client(tmp_path).get("/api/channels/inconnue/layout").status_code == 404
+
+
+def test_put_layout_writes_the_keys_in_reframe_through_save_channel(tmp_path, isolated_cwd, monkeypatch):
+    _channels_setup(tmp_path)
+    from clipper import channel as channel_mod
+
+    calls = []
+    real = channel_mod.save_channel
+
+    def spy(name, data, **kwargs):
+        calls.append((name, data, kwargs))
+        return real(name, data, **kwargs)
+
+    monkeypatch.setattr(channel_mod, "save_channel", spy)
+    layout = {
+        "split_webcam_dest": {"x": 0, "y": 0, "w": 1080, "h": 700},
+        "split_gameplay_dest": {"x": 0, "y": 700, "w": 1080, "h": 1220},
+        "badge_dest": {"x": 330, "y": 640, "w": 420, "h": 100},
+        "split_subtitle_dest": {"x": 150, "y": 760, "w": 780, "h": 150},
+    }
+    resp = client(tmp_path).put(f"/api/channels/{CH}/layout", json=layout)
+
+    assert resp.status_code == 200, resp.text
+    for key in _LAYOUT_KEYS:
+        assert resp.json()[key] == layout[key]
+    assert any(n == CH and k["presets_dir"] == "presets" and d["reframe"]["badge_dest"] == layout["badge_dest"]
+               for n, d, k in calls)
+    saved = tomllib.loads((tmp_path / "presets" / f"{CH}.toml").read_text(encoding="utf-8"))
+    assert saved["reframe"]["letterbox_zoom"] == 1.5                    # le reste du preset est conservé
+    assert saved["channel"]["display_name"] == "Ma chaîne"
+    for key in _LAYOUT_KEYS:
+        assert saved["reframe"][key] == layout[key]
+    assert client(tmp_path).get(f"/api/channels/{CH}/layout").json()["badge_dest"] == layout["badge_dest"]
+
+
+@pytest.mark.parametrize("key, rect, fragment", [
+    ("split_webcam_dest", {"x": 100, "y": 0, "w": 1040, "h": 640}, "deborde"),               # sort du canevas (1140 > 1080)
+    ("split_gameplay_dest", {"x": 0, "y": 600, "w": 1080, "h": 1320}, "se chevauchent"),      # chevauche la webcam
+    ("badge_dest", {"x": 100, "y": 590, "w": 420, "h": 100}, "zone sure"),                    # hors zone sûre
+])
+def test_put_layout_invalid_is_422_with_the_load_config_detail_and_keeps_the_file(
+    tmp_path, isolated_cwd, key, rect, fragment
+):
+    _channels_setup(tmp_path)
+    path = tmp_path / "presets" / f"{CH}.toml"
+    before = path.read_text(encoding="utf-8")
+
+    resp = client(tmp_path).put(f"/api/channels/{CH}/layout", json={key: rect})
+
+    assert resp.status_code == 422, resp.text
+    detail = resp.json()["detail"]
+    assert key in detail and fragment in detail, detail
+    # même texte que celui de reframe (qui refuse, load_config ne contrôlant que les clés)
+    from clipper import reframe
+    from clipper.config import load_config
+
+    candidate = tmp_path / "candidate.toml"
+    candidate.write_text(
+        '[reframe]\nstream_variant = "split"\n'
+        + f"{key} = {{x = {rect['x']}, y = {rect['y']}, w = {rect['w']}, h = {rect['h']}}}\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(reframe.ReframeError) as err:
+        reframe._settings(load_config(candidate))
+    assert detail == str(err.value)
+    assert path.read_text(encoding="utf-8") == before
+
+
+def test_put_layout_without_any_key_or_with_bad_rect_is_422(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path)
+    c = client(tmp_path)
+    resp = c.put(f"/api/channels/{CH}/layout", json={})
+    assert resp.status_code == 422 and "split_webcam_dest" in resp.json()["detail"]
+    resp = c.put(f"/api/channels/{CH}/layout", json={"badge_dest": {"x": 1, "y": 2}})
+    assert resp.status_code == 422 and "badge_dest" in resp.json()["detail"]
+    assert c.put("/api/channels/inconnue/layout", json={"badge_dest": _LAYOUT_DEFAULTS["badge_dest"]}).status_code == 404
+
+
+def test_layout_editor_screen_is_wired_with_canvas_zones_handles_and_actions():
+    page = (STATIC / "index.html").read_text(encoding="utf-8")
+    js = (STATIC / "screens" / "layout.js").read_text(encoding="utf-8")
+    css = (STATIC / "style.css").read_text(encoding="utf-8")
+    channels = (STATIC / "screens" / "channels.js").read_text(encoding="utf-8")
+
+    assert "/static/screens/layout.js" in page
+    assert page.index("/static/screens/channels.js") < page.index("/static/screens/layout.js")
+    assert "/layout" in channels and "Éditeur d'agencement" in channels      # accès depuis la chaîne
+    # canevas 1080x1920 mis à l'échelle, quatre zones, image clé
+    assert "1080" in js and "1920" in js and "scale(" in js
+    for key in _LAYOUT_KEYS:
+        assert key in js, key
+    for label in ("Webcam", "Jeu", "Badge", "Sous-titres"):
+        assert label in js, label
+    assert "/keyframe" in js and "Aucune image clé" in js
+    # poignées, souris et toucher
+    assert "pointerdown" in js and "pointermove" in js and "setPointerCapture" in js and "hdl" in js
+    assert "touch-action" in css
+    # valeurs {x,y,w,h} éditables, réinitialiser, enregistrer (erreur du serveur affichée)
+    assert 'data-k="x"' in js or 'data-k="${' in js
+    assert "Réinitialiser aux défauts" in js and "Enregistrer" in js
+    assert 'jsonBody("PUT"' in js and "/layout" in js and "Agencement enregistré" in js
+    assert "Screens.channels" in js
+    for selector in (".ly-stage", ".ly-zone", ".ly-hdl"):
+        assert selector in css, selector
+# Aperçu du style des sous-titres (TASK-dd3f, SPEC-c100 E5)
+# --------------------------------------------------------------------------
+
+
+def test_subtitles_preview_returns_a_png_rendered_by_the_pipeline(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import pipeline
+
+    _channels_setup(tmp_path)
+    seen = []
+    monkeypatch.setattr(pipeline, "preview_subtitles",
+                        lambda config, text: seen.append((config.section("subtitles"), text)) or b"\x89PNG\r\n\x1a\nxx")
+
+    resp = client(tmp_path).get(f"/api/channels/{CH}/subtitles-preview", params={"text": "Salut à tous"})
+
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "image/png"
+    assert resp.content.startswith(b"\x89PNG")
+    assert seen and seen[0][1] == "Salut à tous"
+
+
+def test_subtitles_preview_renders_a_real_png_with_the_preset_style(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path, preset=_CH_PRESET + '\n[subtitles]\nletterbox_font_size = 50\n')
+    resp = client(tmp_path).get(f"/api/channels/{CH}/subtitles-preview", params={"text": "Salut"})
+    assert resp.status_code == 200 and resp.content.startswith(b"\x89PNG")
+
+
+def test_subtitles_preview_with_an_unsaved_draft_uses_the_draft_style(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import pipeline
+
+    _channels_setup(tmp_path)
+    seen = []
+    monkeypatch.setattr(pipeline, "preview_subtitles",
+                        lambda config, text: seen.append((config.section("subtitles"), config.section("reframe"))) or b"\x89PNG\r\n\x1a\n")
+    draft = json.dumps({"subtitles": {"letterbox_outline": 11}, "reframe": {"stream_variant": "split"}})
+
+    resp = client(tmp_path).get(f"/api/channels/{CH}/subtitles-preview", params={"text": "Salut", "draft": draft})
+
+    assert resp.status_code == 200
+    assert seen[0][0]["letterbox_outline"] == 11 and seen[0][1]["stream_variant"] == "split"
+    # le preset enregistré n'a pas bougé
+    assert "letterbox_outline" not in (tmp_path / "presets" / f"{CH}.toml").read_text(encoding="utf-8")
+
+
+def test_subtitles_preview_invalid_style_is_422_with_detail(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path, preset=_CH_PRESET + '\n[subtitles]\nsplit_text_color = "caca"\n')
+    c = client(tmp_path)
+    # le style effectif est celui du format split : la couleur invalide est rendue
+    draft = json.dumps({"reframe": {"stream_variant": "split"}, "subtitles": {"split_text_color": "caca"}})
+    resp = c.get(f"/api/channels/{CH}/subtitles-preview", params={"text": "Salut", "draft": draft})
+    assert resp.status_code == 422
+    assert "couleur" in resp.json()["detail"]
+
+
+def test_subtitles_preview_unknown_channel_404_and_bad_draft_422(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path)
+    c = client(tmp_path)
+    assert c.get("/api/channels/inconnue/subtitles-preview", params={"text": "x"}).status_code == 404
+    bad = c.get(f"/api/channels/{CH}/subtitles-preview", params={"text": "x", "draft": "{pas du json"})
+    assert bad.status_code == 422 and "draft" in bad.json()["detail"]
+    empty = c.get(f"/api/channels/{CH}/subtitles-preview", params={"text": "  "})
+    assert empty.status_code == 422 and "texte" in empty.json()["detail"]
+
+
+def test_channels_screen_previews_subtitles_style_with_a_300ms_debounce():
+    js = (STATIC / "screens" / "channels.js").read_text(encoding="utf-8")
+    css = (STATIC / "style.css").read_text(encoding="utf-8")
+    shot = (STATIC / "screens" / "chan-subtitles-preview.js")
+    page = (STATIC / "index.html").read_text(encoding="utf-8")
+    prev = shot.read_text(encoding="utf-8")
+
+    assert "/static/screens/chan-subtitles-preview.js" in page
+    assert page.index("/static/screens/channels.js") < page.index("/static/screens/chan-subtitles-preview.js")
+    assert "/subtitles-preview" in prev and "PREVIEW_DELAY_MS = 300" in prev
+    assert "setTimeout" in prev and "clearTimeout" in prev
+    assert "draft: JSON.stringify" in prev   # brouillon non enregistré envoyé tel quel
+    assert ".chan-preview" in css
+    assert "chSubsPreview" in js          # point d'accroche dans l'écran chaînes
+# TASK-7d86 : ecran Statistiques (GET /api/stats, POST /api/stats/import)
+# --------------------------------------------------------------------------
+
+STATS_A, STATS_B, STATS_C, STATS_D = "aaaaaaaaaaa", "bbbbbbbbbbb", "ccccccccccc", "ddddddddddd"
+STATS_CSV = (
+    "clip_id,views,retention_3s,watched_full,shares,date\n"
+    "02,1200,0.61,0.22,14,2026-09-25\n"
+)
+
+
+def _stats_jsonl(path: Path, lines) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8")
+
+
+def _stats_seed(tmp_path) -> None:
+    def steps(download, render, finished):
+        return {
+            "download": _step(f"{finished}T10:00:00+00:00", f"{finished}T10:00:{download:02d}+00:00"),
+            "render": _step(f"{finished}T10:05:00+00:00", f"{finished}T10:{5 + render // 60:02d}:{render % 60:02d}+00:00"),
+        }
+    _write_state(tmp_path, STATS_A, status="done", updated_at="2026-09-10T12:00:00+00:00",
+                 steps=steps(40, 100, "2026-09-10"))
+    _write_state(tmp_path, STATS_B, status="done", updated_at="2026-08-01T12:00:00+00:00",
+                 steps=steps(20, 200, "2026-08-01"))
+    _write_state(tmp_path, STATS_C, status="failed", updated_at="2026-09-12T12:00:00+00:00")
+    _write_state(tmp_path, STATS_D, status="running", updated_at="2026-09-15T12:00:00+00:00")
+    _write_sidecar(tmp_path, STATS_A, "01", moment_id=1, created_at="2026-09-10T12:00:00+00:00",
+                   qa={"status": "passed", "issues": []})
+    _write_sidecar(tmp_path, STATS_A, "02", moment_id=2, created_at="2026-09-20T12:00:00+00:00",
+                   qa={"status": "rejected", "issues": ["sous-titres hors cadre"]})
+    _write_sidecar(tmp_path, STATS_B, "01", moment_id=1, created_at="2026-08-01T12:00:00+00:00",
+                   qa={"status": "passed", "issues": []})
+    _stats_jsonl(tmp_path / "state" / "outcomes.jsonl", [
+        {"kind": "result", "video_id": STATS_A, "clip_id": "01", "moment_id": 1,
+         "qa": {"status": "passed", "issues": []}, "human_decision": "approved",
+         "recorded_at": "2026-09-11T08:00:00+00:00"},
+        {"kind": "stats", "video_id": None, "clip_id": "02", "moment_id": None,
+         "stats": {"views": 900, "retention_3s": 0.5, "watched_full": 0.2, "shares": 3, "date": "2026-09-22"},
+         "recorded_at": "2026-09-22T08:00:00+00:00"},
+        {"kind": "stats", "video_id": None, "clip_id": "02", "moment_id": None,
+         "stats": {"views": 1200, "retention_3s": 0.61, "watched_full": 0.22, "shares": 14, "date": "2026-09-25"},
+         "recorded_at": "2026-09-25T08:00:00+00:00"},
+        {"kind": "stats", "video_id": None, "clip_id": "01", "moment_id": None,
+         "stats": {"views": 50, "retention_3s": 0.4, "watched_full": 0.1, "shares": 0, "date": "2026-09-25"},
+         "recorded_at": "2026-09-25T08:00:00+00:00"},
+    ])
+    _stats_jsonl(tmp_path / "state" / "feedback.jsonl", [
+        {"video_id": STATS_A, "moment": {"id": 2}, "texte_moment": "t", "decision": "adjusted",
+         "commentaire": None, "horodatage": "2026-09-19T08:00:00+00:00"},
+        {"video_id": STATS_A, "moment": {"id": 1}, "texte_moment": "t", "decision": "rejected",
+         "commentaire": None, "horodatage": "2026-09-09T08:00:00+00:00"},
+    ])
+
+    def usage(usage_name, cost, when):
+        return {"recorded_at": f"{when}T12:00:00+00:00", "usage": usage_name, "model": "m",
+                "input_tokens": 10, "output_tokens": 5, "cache_read_tokens": 0, "cost_usd": cost, "duration_s": 1.0}
+    _stats_jsonl(tmp_path / "workspace" / STATS_A / "llm_usage.jsonl", [
+        usage("moments", 0.5, "2026-09-10"), usage("jury", 0.25, "2026-09-10"),
+        usage("moments", 1.0, "2026-09-20"), usage("jury", None, "2026-09-20"),
+    ])
+    _stats_jsonl(tmp_path / "workspace" / STATS_B / "llm_usage.jsonl", [usage("moments", 2.0, "2026-08-01")])
+
+
+def _stats(tmp_path, query=""):
+    resp = client(tmp_path).get(f"/api/stats{query}")
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+def test_stats_empty_state_has_explicit_empty_blocks(tmp_path, isolated_cwd):
+    data = _stats(tmp_path)
+
+    assert data["clips"] == [] and data["stats_unmatched"] == []
+    assert data["llm_cost"] == {"total": 0.0, "unreported_calls": 0, "by_video": {}, "by_usage": {}, "by_day": {}}
+    assert data["steps"] == {}
+    assert data["counts"] == {s: 0 for s in ("pending", "running", "awaiting_review", "queued", "done", "failed")}
+
+
+def test_stats_clips_join_sidecar_outcomes_and_human_decision(tmp_path, isolated_cwd):
+    _stats_seed(tmp_path)
+
+    data = _stats(tmp_path, "?since=2026-09-01&until=2026-09-30")
+    clips = {(c["video_id"], c["clip_id"]): c for c in data["clips"]}
+
+    assert sorted(clips) == [(STATS_A, "01"), (STATS_A, "02")]      # le clip d'août est hors période
+    one, two = clips[(STATS_A, "01")], clips[(STATS_A, "02")]
+    assert one["screen_title"] == "Titre 01" and one["moment_id"] == 1
+    assert one["qa_status"] == "passed" and one["issues"] == []
+    assert one["human_decision"] == "approved" and one["decision_source"] == "outcomes"
+    assert one["stats"] is None                                       # clip_id « 01 » existe dans 2 vidéos
+    assert two["qa_status"] == "rejected" and two["issues"] == ["sous-titres hors cadre"]
+    assert two["human_decision"] == "adjusted" and two["decision_source"] == "feedback"
+    assert two["stats"] == {"views": 1200, "retention_3s": 0.61, "watched_full": 0.22, "shares": 14,
+                            "date": "2026-09-25"}                    # la mesure la plus récente
+    assert [u["clip_id"] for u in data["stats_unmatched"]] == ["01"]
+    assert "plusieurs vidéos" in data["stats_unmatched"][0]["reason"]
+
+
+def test_stats_without_period_covers_everything(tmp_path, isolated_cwd):
+    _stats_seed(tmp_path)
+
+    data = _stats(tmp_path)
+
+    assert len(data["clips"]) == 3
+    assert data["llm_cost"]["total"] == pytest.approx(3.75)
+
+
+def test_stats_llm_cost_per_video_usage_and_day(tmp_path, isolated_cwd):
+    _stats_seed(tmp_path)
+
+    cost = _stats(tmp_path, "?since=2026-09-01&until=2026-09-30")["llm_cost"]
+
+    assert cost["total"] == pytest.approx(1.75)
+    assert cost["unreported_calls"] == 1                              # jamais compté pour 0
+    assert cost["by_usage"] == {"moments": pytest.approx(1.5), "jury": pytest.approx(0.25)}
+    assert cost["by_day"] == {"2026-09-10": pytest.approx(0.75), "2026-09-20": pytest.approx(1.0)}
+    assert list(cost["by_video"]) == [STATS_A]
+    assert cost["by_video"][STATS_A] == {"cost": pytest.approx(1.75), "calls": 4, "unreported_calls": 1}
+
+
+def test_stats_steps_mean_and_last_duration_on_done_videos(tmp_path, isolated_cwd):
+    _stats_seed(tmp_path)
+
+    steps = _stats(tmp_path)["steps"]
+
+    assert steps["download"] == {"mean_s": pytest.approx(30.0), "last_s": pytest.approx(40.0), "count": 2}
+    assert steps["render"] == {"mean_s": pytest.approx(150.0), "last_s": pytest.approx(100.0), "count": 2}
+    assert "transcribe" not in steps                                   # étape jamais terminée : pas de durée inventée
+    period = _stats(tmp_path, "?since=2026-09-01")["steps"]
+    assert period["download"]["count"] == 1 and period["download"]["mean_s"] == pytest.approx(40.0)
+
+
+def test_stats_counts_videos_by_status(tmp_path, isolated_cwd):
+    _stats_seed(tmp_path)
+
+    counts = _stats(tmp_path)["counts"]
+    assert counts == {"pending": 0, "running": 1, "awaiting_review": 0, "queued": 0, "done": 2, "failed": 1}
+    assert _stats(tmp_path, "?until=2026-08-31")["counts"]["done"] == 1
+
+
+@pytest.mark.parametrize("query", ["?since=hier", "?until=2026-13-45", "?since=2026-09-30&until=2026-09-01"])
+def test_stats_invalid_period_is_a_422_with_detail(tmp_path, isolated_cwd, query):
+    resp = client(tmp_path).get(f"/api/stats{query}")
+    assert resp.status_code == 422
+    assert resp.json()["detail"]
+
+
+def test_stats_unreadable_journal_is_a_500_naming_the_file(tmp_path, isolated_cwd):
+    (tmp_path / "state").mkdir()
+    (tmp_path / "state" / "outcomes.jsonl").write_text("{pas du json\n", encoding="utf-8")
+
+    resp = client(tmp_path).get("/api/stats")
+
+    assert resp.status_code == 500
+    assert "outcomes.jsonl" in resp.json()["detail"]
+
+
+def _stats_post(tmp_path, content, name="stats.csv", field="file"):
+    return client(tmp_path).post("/api/stats/import", files={field: (name, content, "text/csv")})
+
+
+def test_stats_import_calls_outcomes_import_stats_and_returns_the_row_count(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import outcomes
+
+    seen = {}
+    real = outcomes.import_stats
+
+    def spy(csv_path, *, path=None):
+        seen["text"] = Path(csv_path).read_text(encoding="utf-8")
+        seen["path"] = path
+        return real(csv_path, path=path)
+
+    monkeypatch.setattr(outcomes, "import_stats", spy)
+
+    resp = _stats_post(tmp_path, STATS_CSV.encode("utf-8"))
+
+    assert resp.status_code == 200
+    assert resp.json() == {"imported": 1}
+    assert seen["text"] == STATS_CSV
+    assert Path(seen["path"]) == Path("state/outcomes.jsonl")
+    journal = [json.loads(line) for line in (tmp_path / "state" / "outcomes.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert journal[0]["kind"] == "stats" and journal[0]["stats"]["views"] == 1200
+
+
+def test_stats_import_missing_column_is_a_422_with_detail_and_writes_nothing(tmp_path, isolated_cwd):
+    resp = _stats_post(tmp_path, b"clip_id,views\n01,10\n")
+
+    assert resp.status_code == 422
+    assert "colonne" in resp.json()["detail"] and "shares" in resp.json()["detail"]
+    assert not (tmp_path / "state" / "outcomes.jsonl").exists()
+
+
+def test_stats_import_bad_row_leaves_the_journal_untouched(tmp_path, isolated_cwd):
+    _stats_jsonl(tmp_path / "state" / "outcomes.jsonl", [{"kind": "result", "recorded_at": "2026-09-01T00:00:00+00:00"}])
+    before = (tmp_path / "state" / "outcomes.jsonl").read_bytes()
+    bad = STATS_CSV + "03,beaucoup,0.5,0.2,1,2026-09-26\n"
+
+    resp = _stats_post(tmp_path, bad.encode("utf-8"))
+
+    assert resp.status_code == 422 and resp.json()["detail"]
+    assert (tmp_path / "state" / "outcomes.jsonl").read_bytes() == before
+
+
+def test_stats_import_requires_a_multipart_file_field(tmp_path, isolated_cwd):
+    assert client(tmp_path).post("/api/stats/import", json={"x": 1}).status_code == 422
+    assert _stats_post(tmp_path, STATS_CSV.encode("utf-8"), field="autre").status_code == 422
+    assert _stats_post(tmp_path, b"\xff\xfe\x00").status_code == 422
+
+
+def test_stats_screen_shows_four_blocks_period_and_import():
+    page = (STATIC / "index.html").read_text(encoding="utf-8")
+    js = (STATIC / "screens" / "stats.js").read_text(encoding="utf-8")
+    css = (STATIC / "style.css").read_text(encoding="utf-8")
+
+    assert "/static/screens/stats.js" in page
+    assert page.index("/static/screens.js") < page.index("/static/screens/stats.js") < page.index("/static/app.js")
+    assert "Screens.stats" in js and "/api/stats" in js and "/api/stats/import" in js
+    assert "since" in js and "until" in js and 'type="file"' in js and "FormData" in js
+    for block in ("Résultats par clip", "Coûts du modèle", "Durée par étape", "Vidéos par statut"):
+        assert block in js
+    for field in ("llm_cost", "by_video", "by_usage", "by_day", "steps", "counts", "stats_unmatched"):
+        assert field in js
+    assert "toastError" in js                              # erreur d'API affichée, jamais avalée
+    assert "TASK-7d86" in css
+
+
+def test_style_css_braces_are_balanced():
+    # Une accolade manquante avale tout le CSS qui suit (écrans Surveillance, Statistiques).
+    css = re.sub(r"/\*.*?\*/", "", (STATIC / "style.css").read_text(encoding="utf-8"), flags=re.S)
+    assert css.count("{") == css.count("}")
