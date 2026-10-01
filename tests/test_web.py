@@ -933,8 +933,8 @@ def test_app_js_notifies_on_video_status_changes(tmp_path, isolated_cwd):
 
 def _api_calls(js: str) -> list[tuple[str, str]]:
     calls = []
-    for m in re.finditer(r"""api\(\s*["`](/api[^"`?]*)[^"`]*["`]\s*(?:,\s*\{\s*method:\s*"(\w+)")?""", js):
-        calls.append((m.group(2) or "GET", re.sub(r"\$\{[^}]*\}", "x", m.group(1))))
+    for m in re.finditer(r"""api\(\s*["`](/api[^"`?]*)[^"`]*["`]\s*(?:,\s*(?:\{\s*method:\s*"(\w+)"|jsonBody\(\s*"(\w+)"))?""", js):
+        calls.append((m.group(2) or m.group(3) or "GET", re.sub(r"\$\{[^}]*\}", "x", m.group(1))))
     return calls
 
 
@@ -1493,6 +1493,165 @@ def test_dashboard_screen_is_wired_with_every_section_and_empty_state():
 
 
 # --------------------------------------------------------------------------
+# Revue des moments v2 (TASK-6e75) : API enrichie, ecran review, rendu en file
+# --------------------------------------------------------------------------
+
+
+TRANSCRIPT_JSON = {
+    "segments": [
+        {"start": 2.0, "end": 12.0, "words": [
+            {"word": " GTA", "start": 2.0, "end": 3.0},
+            {"word": " six", "start": 3.0, "end": 4.0},
+            {"word": " arrive", "start": 4.0, "end": 12.0},
+        ]},
+        {"start": 40.0, "end": 60.0, "words": [
+            {"word": " Autre", "start": 40.0, "end": 50.0},
+            {"word": " moment", "start": 50.0, "end": 60.0},
+        ]},
+        {"start": 100.0, "end": 101.0, "words": [{"word": " hors", "start": 100.0, "end": 101.0}]},
+    ],
+}
+
+
+def _write_review_sources(tmp_path, *, transcript=True, meta=True):
+    _write_moments_fixtures(tmp_path)
+    video_dir = tmp_path / "workspace" / VIDEO_ID
+    if transcript:
+        (video_dir / "transcript.json").write_text(json.dumps(TRANSCRIPT_JSON), encoding="utf-8")
+    if meta:
+        (video_dir / "meta.json").write_text(json.dumps({"video_id": VIDEO_ID, "duration": 3600}), encoding="utf-8")
+
+
+def test_list_moments_carries_the_transcript_of_each_moment(tmp_path, isolated_cwd):
+    _write_review_sources(tmp_path)
+
+    moments = {m["id"]: m for m in client(tmp_path).get(f"/api/videos/{VIDEO_ID}/moments").json()}
+
+    assert moments[0]["transcript"] == "GTA six arrive"
+    assert moments[1]["transcript"] == "Autre moment"
+
+
+def test_list_moments_carries_the_source_duration(tmp_path, isolated_cwd):
+    _write_review_sources(tmp_path)
+
+    moments = client(tmp_path).get(f"/api/videos/{VIDEO_ID}/moments").json()
+
+    assert all(m["source_duration"] == 3600 for m in moments)
+
+
+def test_list_moments_transcript_reuses_the_pipeline_helper(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import pipeline
+
+    _write_review_sources(tmp_path)
+    calls = []
+
+    def fake_moment_text(video_dir, start, end):
+        calls.append((video_dir.name, start, end))
+        return f"texte {start}-{end}"
+
+    monkeypatch.setattr(pipeline, "_moment_text", fake_moment_text)
+
+    moments = client(tmp_path).get(f"/api/videos/{VIDEO_ID}/moments").json()
+
+    assert calls == [(VIDEO_ID, 2.0, 26.0), (VIDEO_ID, 40.0, 60.0)]
+    assert moments[0]["transcript"] == "texte 2.0-26.0"
+
+
+def test_list_moments_missing_transcript_is_reported_not_hidden(tmp_path, isolated_cwd):
+    _write_review_sources(tmp_path, transcript=False)
+
+    resp = client(tmp_path).get(f"/api/videos/{VIDEO_ID}/moments")
+
+    assert resp.status_code == 200
+    first = resp.json()[0]
+    assert first["transcript"] is None
+    assert "transcript.json" in first["transcript_error"]
+
+
+def test_list_moments_missing_source_duration_is_reported_not_hidden(tmp_path, isolated_cwd):
+    _write_review_sources(tmp_path, meta=False)
+
+    first = client(tmp_path).get(f"/api/videos/{VIDEO_ID}/moments").json()[0]
+
+    assert first["source_duration"] is None
+    assert "meta.json" in first["source_duration_error"]
+
+
+def test_render_route_does_not_use_background_tasks():
+    source = (Path(__file__).resolve().parent.parent / "clipper" / "web" / "app.py").read_text(encoding="utf-8")
+    assert "BackgroundTasks" not in source
+    assert "background_tasks" not in source
+
+
+def _review_js() -> str:
+    return (STATIC / "screens" / "review.js").read_text(encoding="utf-8")
+
+
+def test_review_screen_is_wired_after_screens_js():
+    page = (STATIC / "index.html").read_text(encoding="utf-8")
+
+    assert "/static/screens/review.js" in page
+    assert page.index("/static/screens.js") < page.index("/static/screens/review.js")
+    assert "Screens.review" in _review_js()
+
+
+def test_review_screen_has_a_player_locked_on_the_selected_moment():
+    js = _review_js()
+
+    assert "<video" in js
+    assert "preview_url" in js
+    assert "currentTime" in js
+    assert "timeupdate" in js  # le lecteur reste dans [debut, fin] du moment
+
+
+def test_review_screen_has_a_timeline_with_handles_bound_to_numeric_fields():
+    js = _review_js()
+
+    assert 'data-handle="start"' in js and 'data-handle="end"' in js
+    assert "pointerdown" in js
+    assert 'type="number"' in js
+    assert 'data-field="start"' in js and 'data-field="end"' in js
+    assert "source_duration" in js
+
+
+def test_review_screen_shows_the_jury_justification_and_transcript():
+    js = _review_js()
+
+    assert "justification" in js
+    assert "transcript" in js
+
+
+def test_review_screen_sends_decisions_to_decide_with_an_undo_toast():
+    js = _review_js()
+
+    assert "/decide" in js
+    for decision in ("accepted", "rejected", "adjusted"):
+        assert decision in js
+    assert "undo:" in js  # toast 'Annuler'
+    assert "previous" in js  # renvoie la decision precedente
+
+
+def test_review_screen_has_keyboard_shortcuts_documented_in_the_screen():
+    js = _review_js()
+
+    assert 'addEventListener("keydown"' in js
+    for key in ('"a"', '"r"', '"j"', '"k"', '" "'):
+        assert key in js, key
+    assert "<kbd>A</kbd>" in js and "<kbd>R</kbd>" in js
+    assert "<kbd>J</kbd>" in js and "<kbd>K</kbd>" in js
+    assert "<kbd>Espace</kbd>" in js
+
+
+def test_review_screen_render_button_is_blocked_while_moments_await_a_decision():
+    js = _review_js()
+
+    assert "awaiting" in js
+    assert "/api/videos/${" in js or "/api/videos/" in js
+    assert "/render" in js
+    assert "disabled" in js
+    assert "sans décision" in js  # la raison affichee
+    css = (STATIC / "style.css").read_text(encoding="utf-8")
+    assert ".review-layout" in css
 # Ecran Clips (TASK-3b9c) : GET /api/clips, approve/reject, PATCH, rerender
 # (publish et worker simules ; l'API ne touche jamais un mp4 ni un sidecar)
 # --------------------------------------------------------------------------

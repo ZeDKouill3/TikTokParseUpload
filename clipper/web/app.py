@@ -67,6 +67,25 @@ def _read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _source_duration(video_dir: Path) -> tuple[float | None, str | None]:
+    """Duree de la source (meta.json de l'etape download) ; sinon (None, raison)
+    : une donnee introuvable est affichee, jamais remplacee par une valeur."""
+    path = video_dir / "meta.json"
+    if not path.exists():
+        return None, f"{path} absent : le telechargement n'est pas termine"
+    duration = _read_json(path).get("duration")
+    if not isinstance(duration, (int, float)) or duration <= 0:
+        return None, f"duree de la source inconnue dans {path}"
+    return duration, None
+
+
+def _moment_transcript(video_dir: Path, start: float, end: float) -> tuple[str | None, str | None]:
+    """Texte du moment via pipeline._moment_text (pas de logique dupliquee) ;
+    sinon (None, raison)."""
+    path = video_dir / "transcript.json"
+    if not path.exists():
+        return None, f"{path} absent : la transcription n'est pas faite"
+    return pipeline._moment_text(video_dir, start, end), None
 # Statuts valides d'une video (contrat pipeline.json) : un filtre hors de cette
 # liste est une erreur, jamais une liste vide silencieuse (ADR-ad2e).
 _VIDEO_STATUSES = ("pending", "running", "awaiting_review", "queued", "done", "failed")
@@ -152,9 +171,12 @@ def _list_moments(config: Config, video_id: str) -> list[dict[str, Any]]:
     review_path = video_dir / "review.json"
     decisions = _read_json(review_path)["decisions"] if review_path.exists() else {}
 
+    source_duration, duration_error = _source_duration(video_dir)
+
     out = []
     for moment_id, part in sorted(parts_by_id.items()):
         scored = scores_by_id.get(moment_id, {})
+        transcript, transcript_error = _moment_transcript(video_dir, part["start"], part["end"])
         out.append({
             "id": moment_id,
             "start": part["start"],
@@ -167,6 +189,10 @@ def _list_moments(config: Config, video_id: str) -> list[dict[str, Any]]:
             "hook_text": scored.get("hook_text"),
             "decision": decisions.get(str(moment_id)),
             "preview_url": f"/media/source/{video_id}",
+            "transcript": transcript,
+            "transcript_error": transcript_error,
+            "source_duration": source_duration,
+            "source_duration_error": duration_error,
         })
     return out
 
@@ -244,17 +270,6 @@ def _fill(out: dict[str, Any], fields: tuple[str, ...], label: str, build) -> No
         for name in fields:
             out[name] = None
             out[f"{name}_error"] = f"{label} illisible : {exc}"
-
-
-def _current_step(state: dict[str, Any]) -> str | None:
-    steps = state.get("steps", {})
-    for name, step in steps.items():
-        if step.get("status") == "running":
-            return name
-    for name, step in steps.items():
-        if step.get("status") != "done":
-            return name
-    return None
 
 
 def _dashboard_videos(config: Config) -> dict[str, Any]:

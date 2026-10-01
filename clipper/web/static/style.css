@@ -1171,6 +1171,19 @@ input[type="color"] { width: 36px; height: 36px; padding: 2px; border-radius: va
 .dash .dash-problem .reason { margin-top: 8px; }
 .dash .job { grid-template-columns: minmax(0, 1fr) auto; }
 
+/* ---------- Revue des moments v2 (TASK-6e75) ---------- */
+.screen[id="screen-review"] [data-body] { background: none; border: 0; box-shadow: none; }
+.rv-bar { display: flex; align-items: flex-start; gap: 16px; margin-bottom: 24px; flex-wrap: wrap; }
+.rv-pick { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+.rv-pick .input { min-width: 180px; }
+.rv-gate { display: flex; flex-direction: column; align-items: flex-end; gap: 8px; max-width: 420px; }
+.rv-gate .reason { margin-top: 0; }
+.rv-gate .btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.player video { width: 100%; height: 100%; object-fit: contain; display: block; background: #000; }
+.rv-num { height: 32px; width: 96px; padding: 0 8px; font-family: var(--font-mono); font-size: 13px; }
+.decide .btn:disabled { opacity: 0.45; cursor: not-allowed; }
+#rv-list .m-item { cursor: pointer; }
+.sel-range .grip:focus-visible { outline: 2px solid var(--text); outline-offset: 2px; }
 /* ---------- Ecran Clips (TASK-3b9c) ---------- */
 .clip-poster video, .phone video { width: 100%; height: 100%; object-fit: cover; display: block; background: #000; }
 .parts button.part { background: none; color: inherit; font: inherit; font-size: 12px; cursor: pointer; }
