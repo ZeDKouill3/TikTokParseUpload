@@ -536,6 +536,15 @@ input[type="color"] { width: 36px; height: 36px; padding: 2px; border-radius: va
   content: ""; position: absolute; width: 36px; height: 36px; border-radius: 50%; border: 2px solid var(--accent);
   animation: ping 1.8s var(--ease-out) infinite;
 }
+/* Trait de l'etape en cours vers la suivante : segment orange qui glisse en continu (choix utilisateur, variante B). */
+.fstep.running::after {
+  content: ""; position: absolute; left: 50%; width: 100%; top: 17px; height: 2px; z-index: 0; pointer-events: none;
+  background: linear-gradient(90deg, transparent, var(--accent), transparent) no-repeat;
+  background-size: 35% 100%; animation: step-slide 1.2s linear infinite;
+}
+.fstep.running:last-child::after { display: none; }
+@keyframes step-slide { from { background-position: -60% 0; } to { background-position: 160% 0; } }
+@media (prefers-reduced-motion: reduce) { .fstep.running::after { animation: none; background: var(--accent); opacity: .5; } }
 .fstep.failed .node { border-color: var(--bad); background: var(--bad); color: #fff; }
 .fstep.queued .node { border-color: var(--warn); color: var(--warn); }
 .fstep.review .node { border-color: var(--info); background: var(--info-soft); color: var(--info); }
