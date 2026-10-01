@@ -1,0 +1,596 @@
+<!DOCTYPE html>
+<html lang="fr" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Clipper · Statistiques TikTok (maquette)</title>
+<meta name="theme-color" content="#0f0f0d">
+<link rel="icon" type="image/svg+xml" href="../maquette-web-v2/img/logo.svg">
+<!-- Style repris de la maquette console : css, polices et icones par chemins relatifs, aucun réseau. -->
+<link rel="stylesheet" href="../maquette-web-v2/css/fonts.css">
+<link rel="stylesheet" href="../maquette-web-v2/css/style.css">
+<script>
+  try {
+    var t = localStorage.getItem("clipper-maquette-theme");
+    if (t) document.documentElement.dataset.theme = t;
+  } catch (e) { /* stockage indisponible : sombre par défaut */ }
+  if (/[?&]shot=1/.test(location.hash)) document.documentElement.classList.add("shot");
+</script>
+<style>
+  /* Ajouts propres à l'écran Statistiques ; tout le reste vient de style.css. */
+  .seg { max-width: 100%; overflow-x: auto; scrollbar-width: none; }
+  .reason { display: flex; gap: 8px; align-items: flex-start; }
+  .reason .i { margin-top: 2px; color: var(--muted); }
+  .drawer[hidden], .overlay[hidden] { display: none; }
+  .demo-bar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 8px 12px; margin-bottom: 24px;
+    border: 1px dashed var(--line-2); border-radius: var(--r); font-size: 12px; color: var(--muted); }
+  .demo-bar b { font-family: var(--font-mono); font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--faint); }
+  .ctl { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 24px; }
+  .ctl .acct { display: flex; flex-direction: column; gap: 4px; min-width: 220px; }
+  .ctl .acct .input { width: 100%; font-weight: 600; }
+  .linked { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-2); padding: 0 12px; height: 36px;
+    border: 1px solid var(--line); border-radius: var(--r); background: var(--surface); }
+  .linked .i { color: var(--muted); }
+  .linked.none { color: var(--muted); border-style: dashed; }
+  .scan { margin-left: auto; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .scan-when { font-size: 13px; color: var(--muted); text-align: right; line-height: 1.3; }
+  .scan-when b { color: var(--text); font-weight: 600; }
+  .spin { animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .tabs button.on { box-shadow: inset 0 -2px 0 var(--accent); }
+  .tabs button .n { font-family: var(--font-cond); font-weight: 600; color: var(--faint); }
+
+  .banner { display: flex; align-items: center; gap: 12px; padding: 12px 16px; margin-bottom: 24px; border-radius: var(--r);
+    background: var(--accent-soft); border: 1px solid var(--accent-line); font-size: 14px; }
+  .banner .bar { flex: 1; min-width: 80px; max-width: 280px; }
+  .banner .i { color: var(--accent); }
+
+  .kpi-btn { text-align: left; width: 100%; cursor: pointer; }
+  .kpi-btn[aria-pressed="true"] { background: var(--surface-2); box-shadow: inset 0 -2px 0 var(--accent); }
+  .kpi-btn[aria-pressed="true"] .kpi-label { color: var(--text); }
+  .delta { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; font-weight: 600; margin-top: 4px; }
+  .delta.up { color: var(--ok); } .delta.down { color: var(--bad); } .delta.flat { color: var(--muted); }
+  .delta small { color: var(--muted); font-weight: 500; }
+  @media (hover: hover) and (pointer: fine) { .kpi-btn:hover { background: var(--surface-2); } }
+
+  .chart-wrap { position: relative; padding: 16px 24px 8px; }
+  .chart { width: 100%; height: 260px; position: relative; touch-action: pan-y; }
+  .chart svg { display: block; width: 100%; height: 100%; overflow: visible; }
+  .chart .ax { stroke: var(--line); } .chart .grid-l { stroke: var(--line); stroke-dasharray: 2 4; }
+  .chart text { fill: var(--muted); font-size: 11px; font-family: var(--font-mono); }
+  .chart .ln { fill: none; stroke: var(--accent); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+  .chart .ln.prev { stroke: var(--faint); stroke-width: 1.5; stroke-dasharray: 4 4; }
+  .chart .ar { fill: url(#grad); }
+  .chart .gapband { fill: var(--surface-3); opacity: 0.55; }
+  .chart .cur-l { stroke: var(--text-2); stroke-width: 1; }
+  .chart .cur-d { fill: var(--accent); stroke: var(--surface); stroke-width: 2; }
+  .tip { position: absolute; z-index: 3; pointer-events: none; padding: 8px 12px; border-radius: var(--r); background: var(--surface-3);
+    border: 1px solid var(--line-2); box-shadow: var(--shadow-pop); font-size: 12px; white-space: nowrap; transform: translate(-50%, -100%); }
+  .tip b { display: block; font-family: var(--font-cond); font-size: 20px; line-height: 1.1; }
+  .tip span { color: var(--muted); }
+  .legend { display: flex; gap: 16px; flex-wrap: wrap; padding: 0 24px 16px; font-size: 12px; color: var(--muted); }
+  .legend i { display: inline-block; width: 16px; height: 0; border-top: 2px solid var(--accent); vertical-align: middle; margin-right: 8px; }
+  .legend i.prev { border-top: 2px dashed var(--faint); }
+  .legend i.gap { height: 10px; border: 0; background: var(--surface-3); border-radius: 2px; width: 16px; }
+  .note { font-size: 12px; color: var(--muted); display: flex; gap: 8px; align-items: flex-start; }
+  .note .i { margin-top: 2px; flex: none; }
+
+  .ptable th button { font: inherit; color: inherit; text-transform: inherit; letter-spacing: inherit; display: inline-flex; align-items: center; gap: 4px; }
+  .ptable th.r button { flex-direction: row-reverse; }
+  .ptable th[aria-sort] button { color: var(--text); }
+  .ptable th .arr { color: var(--accent); width: 12px; text-align: center; }
+  .ptable tbody tr { cursor: pointer; }
+  .ptable tbody tr:focus-visible { outline-offset: -2px; }
+  .ptable td.c-cap { max-width: 340px; }
+  .ptable .cap { font-weight: 600; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; line-height: 1.3; }
+  .ptable .vis { font-size: 12px; color: var(--muted); margin-top: 4px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .ptable td.r { font-family: var(--font-cond); font-size: 17px; font-weight: 600; white-space: nowrap; }
+  .ptable td.dim { color: var(--faint); }
+  .ptable td.c-date { white-space: nowrap; color: var(--text-2); font-size: 13px; }
+  .thumb-p { width: 40px; aspect-ratio: 9 / 16; border-radius: 4px; position: relative; overflow: hidden; flex: none; border: 1px solid var(--line-2); }
+  .thumb-p::after { content: ""; position: absolute; inset: auto 0 0 0; height: 30%; background: linear-gradient(transparent, rgba(0,0,0,.55)); }
+  .thumb-p i { position: absolute; left: 12%; right: 12%; top: 62%; height: 3px; border-radius: 2px; background: rgba(255,255,255,.85); z-index: 1; }
+  .thumb-p.proc { background: var(--surface-3) !important; }
+  .sort-m { display: none; }
+  .pager-note { padding: 12px 24px; border-top: 1px solid var(--line); font-size: 12px; color: var(--muted); display: flex; gap: 8px; align-items: center; }
+
+  .figs { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: var(--r-lg); overflow: hidden; }
+  .fig { background: var(--surface); padding: 12px 16px; }
+  .fig .l { font-size: 12px; color: var(--muted); }
+  .fig .v { font-family: var(--font-cond); font-weight: 700; font-size: 28px; line-height: 1.15; font-variant-numeric: tabular-nums; }
+  .fig .v small { font-size: 14px; color: var(--muted); font-weight: 500; margin-left: 2px; }
+  .src-row { display: grid; grid-template-columns: 120px minmax(0, 1fr) 52px; align-items: center; gap: 12px; font-size: 13px; padding: 4px 0; }
+  .src-row .bar > i { animation: none; background: var(--accent); }
+  .src-row b { font-family: var(--font-cond); font-size: 16px; text-align: right; }
+  .poster-big { width: 100%; max-width: 240px; aspect-ratio: 9 / 16; border-radius: var(--r-lg); border: 1px solid var(--line-2); position: relative; overflow: hidden; display: flex; align-items: flex-end; padding: 16px; color: #fff; }
+  .poster-big::after { content: ""; position: absolute; inset: 0; background: linear-gradient(transparent 45%, rgba(0,0,0,.65)); }
+  .poster-big span { position: relative; z-index: 1; font-weight: 700; font-size: 15px; line-height: 1.25; }
+  .dlinks { display: flex; flex-direction: column; gap: 8px; margin-top: 16px; max-width: 240px; }
+  .dlinks .btn { justify-content: flex-start; }
+  .dlinks .btn span { overflow: hidden; text-overflow: ellipsis; }
+  .empty .btn { margin-top: 8px; }
+  .card-skel { height: 24px; }
+
+  @media (max-width: 1280px) { .kpis { grid-template-columns: repeat(5, minmax(0, 1fr)); } .kpi { border-top: 0 !important; border-left: 1px solid var(--line) !important; } .kpi:first-child { border-left: 0 !important; } }
+  @media (max-width: 1080px) { .kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); } .kpi { border-left: 1px solid var(--line) !important; } .kpi:nth-child(3n+1) { border-left: 0 !important; } .kpi:nth-child(n+4) { border-top: 1px solid var(--line) !important; } .kpi:last-child { grid-column: auto; } }
+  @media (max-width: 900px) {
+    .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .kpi { border-left: 1px solid var(--line) !important; border-top: 1px solid var(--line) !important; }
+    .kpi:nth-child(odd) { border-left: 0 !important; } .kpi:nth-child(-n+2) { border-top: 0 !important; }
+    .kpi:last-child { grid-column: 1 / -1; border-left: 0 !important; }
+    .ctl .acct { min-width: 0; flex: 1 1 100%; }
+    .scan { margin-left: 0; width: 100%; justify-content: space-between; }
+    .scan-when { text-align: left; }
+    .chart-wrap { padding: 12px 8px 4px; } .legend { padding: 0 16px 12px; }
+    .chart { height: 220px; }
+    .figs { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .poster-big { max-width: 150px; }
+  }
+  @media (max-width: 720px) {
+    .sort-m { display: flex; gap: 8px; padding: 12px 16px; border-bottom: 1px solid var(--line); }
+    .sort-m select { flex: 1; }
+    .ptable thead { display: none; }
+    .ptable, .ptable tbody { display: block; }
+    .ptable tr { display: grid; grid-template-columns: 48px repeat(3, minmax(0, 1fr)); gap: 4px 8px; padding: 12px 16px; border-bottom: 1px solid var(--line); align-items: baseline; }
+    .ptable tr:last-child { border-bottom: 0; }
+    .ptable td { display: block; padding: 0; border: 0; }
+    .ptable td.c-thumb { grid-row: 1 / span 5; grid-column: 1; align-self: start; }
+    .ptable td.c-cap { grid-column: 2 / -1; max-width: none; }
+    .ptable td.c-date { grid-column: 2 / -1; }
+    .ptable td.r { text-align: left; font-size: 17px; }
+    .ptable td.r::before { content: attr(data-l); display: block; font-family: var(--font); font-size: 11px; font-weight: 500; color: var(--muted); }
+    .tip { white-space: normal; }
+  }
+  @media (max-width: 520px) { .figs { grid-template-columns: repeat(2, minmax(0, 1fr)); } .src-row { grid-template-columns: 96px minmax(0, 1fr) 48px; } }
+</style>
+</head>
+<body>
+<div class="app" id="app">
+
+  <aside class="sidebar" id="sidebar" aria-label="Navigation principale">
+    <a class="brand" href="../maquette-web-v2/index.html#/tableau">
+      <img src="../maquette-web-v2/img/logo.svg" alt="" width="32" height="32">
+      <span class="brand-name">Clipper</span>
+      <span class="brand-env">local</span>
+    </a>
+    <nav class="nav" id="nav"></nav>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <button class="icon-btn only-mobile" id="btn-menu" aria-label="Menu" type="button"></button>
+      <div class="crumbs"><span>Configuration</span><span class="sep">/</span><span class="cur">Statistiques</span></div>
+      <div class="top-actions" style="margin-left:auto">
+        <button class="icon-btn" id="btn-theme" aria-label="Changer de thème" type="button"></button>
+      </div>
+    </header>
+
+    <main class="view" id="view" tabindex="-1">
+
+      <div class="page-head">
+        <div class="titles">
+          <div class="eyebrow">Statistiques TikTok</div>
+          <h1>Statistiques</h1>
+          <p class="sub">Chiffres relevés sur TikTok Studio, compte par compte. Rien n'est importé à la main : tout vient du relevé automatique.</p>
+        </div>
+      </div>
+
+      <div class="demo-bar" role="group" aria-label="États à montrer">
+        <b>Maquette</b><span>États à montrer :</span>
+        <div class="seg" id="seg-demo"></div>
+      </div>
+
+      <section class="ctl" aria-label="Compte et période">
+        <div class="acct field">
+          <label for="sel-acct">Compte TikTok</label>
+          <select class="input" id="sel-acct"></select>
+        </div>
+        <div class="linked" id="linked"></div>
+        <div class="field">
+          <span class="field-label" id="lbl-period">Période</span>
+          <div class="seg" id="seg-period" role="group" aria-labelledby="lbl-period"></div>
+        </div>
+        <div class="scan">
+          <div class="scan-when" id="scan-when"></div>
+          <button class="btn btn-primary" id="btn-scan" type="button"></button>
+        </div>
+      </section>
+
+      <div id="banner"></div>
+
+      <div class="tabs" id="tabs" role="tablist" aria-label="Sections"></div>
+      <div id="pane" role="tabpanel"></div>
+    </main>
+  </div>
+
+  <nav class="tabbar" id="tabbar" aria-label="Navigation mobile"></nav>
+</div>
+
+<div class="toasts" id="toasts" aria-live="polite"></div>
+<div class="overlay" id="overlay" hidden></div>
+<aside class="drawer" id="drawer" hidden role="dialog" aria-modal="true" aria-labelledby="drawer-title"></aside>
+
+<script src="../maquette-web-v2/js/icons.js"></script>
+<script>
+"use strict";
+/* ================= Données factices (compte neutre « ma_chaine ») ================= */
+const NOW = new Date(2026, 9, 1, 16, 5);
+const DAY = 86400000;
+const METRICS = [
+  { id: "views",   label: "Vues de vidéo",  icon: "eye" },
+  { id: "profile", label: "Vues du profil", icon: "user" },
+  { id: "likes",   label: "J'aime",         icon: "heart" },
+  { id: "comments",label: "Commentaires",   icon: "message-square" },
+  { id: "shares",  label: "Partages",       icon: "share" },
+];
+ICONS.share = '<circle cx="18" cy="5" r="3" /><circle cx="6" cy="12" r="3" /><circle cx="18" cy="19" r="3" /><line x1="8.59" x2="15.42" y1="13.51" y2="17.49" /><line x1="15.41" x2="8.59" y1="6.51" y2="10.49" />';
+
+function rng(seed) { let s = seed >>> 0; return () => ((s = (s * 1664525 + 1013904223) >>> 0) / 4294967296); }
+
+/* 120 jours (60 + 60 de la période précédente) ; la dernière valeur est « aujourd'hui ». */
+function series(seed, base, ratio, noise) {
+  const r = rng(seed), out = [];
+  for (let i = 0; i < 120; i++) {
+    const wave = 1 + 0.25 * Math.sin(i / 3.2) + (i > 100 ? 0.15 : 0);
+    const spike = (i === 112 || i === 97 || i === 70) ? 2.6 : 1;
+    out.push(Math.max(0, Math.round(base * ratio * wave * spike * (1 - noise / 2 + r() * noise))));
+  }
+  return out;
+}
+const POST_COLORS = [["#2b5876", "#4e4376"], ["#6a3093", "#a044ff"], ["#134e5e", "#71b280"], ["#8e2de2", "#4a00e0"], ["#cb2d3e", "#ef473a"],
+  ["#1f4037", "#99f2c8"], ["#3a1c71", "#d76d77"], ["#0f2027", "#2c5364"], ["#c31432", "#240b36"], ["#41295a", "#2f0743"], ["#42275a", "#734b6d"], ["#355c7d", "#c06c84"]];
+
+function mkPost(id, cap, ago, hh, vis, views, likes, com, shares, dur, full, newF, clip, vid, vtitle, ci, extra) {
+  const d = new Date(NOW.getTime() - ago * DAY); d.setHours(hh, (id.charCodeAt(id.length - 1) * 7) % 60, 0, 0);
+  return Object.assign({ id, cap, date: d, vis, views, likes, comments: com, shares, dur, full, newF, clip, vid, vtitle, ci }, extra || {});
+}
+const ACCOUNTS = [
+  { id: "clips", handle: "@ma_chaine.clips", linked: { name: "ma_chaine", platform: "Twitch" }, scan: new Date(NOW - 2 * 3600000 - 12 * 60000), scans: 187, never: false,
+    base: { views: 9200, profile: 1300, likes: 720, comments: 38, shares: 61 }, seed: 11,
+    posts: [
+      mkPost("7400000000000000001", "Le moment où tout bascule dans le couloir #horreur #gaming", 0, 15, "Public", null, null, null, null, 31, 0, 0, "mdj-0929-c07", "mdj-0929", "VOD du 29/09 · St. Amelia, partie 3", 0, { processing: true }),
+      mkPost("7400000000000000002", "Je ne m'attendais pas à ça #lethalcompany #twitch", 1, 18, "Public", 12480, 1090, 61, 112, 38, 34, 41, "mdj-0929-c04", "mdj-0929", "VOD du 29/09 · St. Amelia, partie 3", 1),
+      mkPost("7400000000000000003", "Le chat avait raison depuis le début #twitch #clip", 2, 12, "Public", 48210, 4390, 238, 604, 44, 41, 180, "mdj-0928-c02", "mdj-0928", "VOD du 28/09 · St. Amelia, partie 2", 2),
+      mkPost("7400000000000000004", "Speedrun raté en 3 secondes #fail #gaming", 3, 18, "Public", 8920, 612, 27, 49, 24, 52, 12, "mdj-0927-c09", "mdj-0927", "VOD du 27/09 · Just Chatting + Lethal Company", 3),
+      mkPost("7400000000000000005", "Cette porte ne devait pas s'ouvrir #horreur", 4, 12, "Public", 3150, 288, 11, 20, 52, 22, 3, "mdj-0927-c03", "mdj-0927", "VOD du 27/09 · Just Chatting + Lethal Company", 4),
+      mkPost("7400000000000000006", "Réaction en direct au dernier twist #narratif #gaming", 6, 18, "Public", 27650, 2710, 154, 388, 47, 38, 96, "mdj-0925-c05", "mdj-0925", "VOD du 25/09 · St. Amelia, partie 1", 5),
+      mkPost("7400000000000000007", "Mon pire jump scare de la semaine #horreur", 8, 12, "Public", 15370, 1380, 72, 131, 29, 47, 40, "mdj-0923-c01", "mdj-0923", "VOD du 23/09 · Soirée horreur", 6),
+      mkPost("7400000000000000008", "Le plan parfait (qui ne marche pas) #lethalcompany", 11, 18, "Public", 6740, 531, 33, 52, 41, 29, 9, "mdj-0920-c06", "mdj-0920", "VOD du 20/09 · Lethal Company", 7),
+      mkPost("7400000000000000009", "Quand le chat prend le contrôle #twitch", 14, 12, "Public", 2210, 164, 7, 9, 36, 31, 2, "mdj-0917-c02", "mdj-0917", "VOD du 17/09 · Just Chatting", 8),
+      mkPost("7400000000000000010", "Fin de partie inattendue #gaming", 19, 18, "Amis", 880, 61, 3, 4, 33, 26, 0, "mdj-0912-c08", "mdj-0912", "VOD du 12/09 · Soirée narrative", 9),
+      mkPost("7400000000000000011", "Clip d'essai, format split #test", 24, 12, "Privé", 64, 5, 0, 0, 22, 45, 0, "mdj-0907-c01", "mdj-0907", "VOD du 07/09 · Test format", 10),
+      mkPost("7400000000000000012", "Premier extrait de la saison #horreur #gaming", 33, 18, "Public", 19840, 1820, 96, 251, 42, 39, 71, "mdj-0829-c03", "mdj-0829", "VOD du 29/08 · St. Amelia, partie 0", 11),
+    ] },
+  { id: "extraits", handle: "@ma_chaine.extraits", linked: { name: "ma_chaine", platform: "Twitch" }, scan: new Date(NOW - 26 * 3600000), scans: 61, never: false,
+    base: { views: 2100, profile: 340, likes: 160, comments: 9, shares: 14 }, seed: 29,
+    posts: [
+      mkPost("7500000000000000001", "Les meilleurs moments de la semaine #compilation", 2, 19, "Public", 5320, 402, 18, 41, 58, 33, 14, "mdj-0928-c05", "mdj-0928", "VOD du 28/09 · St. Amelia, partie 2", 2),
+      mkPost("7500000000000000002", "Le fou rire du chat #twitch", 7, 19, "Public", 1740, 120, 6, 8, 27, 49, 4, "mdj-0924-c01", "mdj-0924", "VOD du 24/09 · Just Chatting", 3),
+      mkPost("7500000000000000003", "Toute l'histoire en 40 secondes #narratif", 15, 19, "Public", 940, 71, 2, 5, 40, 30, 1, "mdj-0916-c03", "mdj-0916", "VOD du 16/09 · Soirée narrative", 5),
+    ] },
+  { id: "tests", handle: "@ma_chaine.tests", linked: null, scan: null, scans: 0, never: true,
+    base: { views: 40, profile: 12, likes: 3, comments: 0.3, shares: 0.2 }, seed: 53,
+    posts: [
+      mkPost("7600000000000000001", "Essai de publication automatique #test", 1, 14, "Privé", 38, 3, 0, 0, 20, 55, 0, "mdj-0929-c01", "mdj-0929", "VOD du 29/09 · St. Amelia, partie 3", 10),
+    ] },
+];
+ACCOUNTS.forEach((a) => { a.series = {}; METRICS.forEach((m) => { a.series[m.id] = series(a.seed + m.id.length, a.base[m.id], 1, 0.6); }); });
+
+/* ================= Utilitaires ================= */
+const $ = (s, r) => (r || document).querySelector(s);
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const nf = new Intl.NumberFormat("fr-FR");
+const fmt = (n) => (n == null ? "—" : nf.format(Math.round(n)));
+const p2 = (n) => String(n).padStart(2, "0");
+const dm = (d) => p2(d.getDate()) + "/" + p2(d.getMonth() + 1);
+const dmh = (d) => dm(d) + " · " + p2(d.getHours()) + ":" + p2(d.getMinutes());
+const mmss = (s) => Math.floor(s / 60) + ":" + p2(Math.round(s % 60));
+const pct = (x, dec) => (dec === 0 ? Math.round(x) : x.toFixed(1).replace(".", ",")) + " %";
+function rel(d) {
+  const m = Math.round((NOW - d) / 60000);
+  if (m < 1) return "à l'instant";
+  if (m < 60) return "il y a " + m + " min";
+  if (m < 1440) return "il y a " + Math.floor(m / 60) + " h";
+  return "il y a " + Math.floor(m / 1440) + " j";
+}
+function toast(kind, title, body) {
+  const el = document.createElement("div");
+  el.className = "toast " + kind;
+  el.innerHTML = `<div class="t-ico">${icon(kind === "ok" ? "circle-check" : "info")}</div><div><div class="t-title">${esc(title)}</div><div class="t-body">${esc(body)}</div></div>`;
+  $("#toasts").appendChild(el);
+  setTimeout(() => { el.classList.add("out"); setTimeout(() => el.remove(), 260); }, 4200);
+}
+
+/* ================= Calculs ================= */
+const S = { acct: "clips", period: 28, tab: "vue", metric: "views", demo: "normal", sort: { key: "date", dir: -1 }, q: "", open: null, scanning: false, step: 0 };
+const acct = () => ACCOUNTS.find((a) => a.id === S.acct);
+const eff = () => (acct().never ? "empty" : S.demo);
+
+function totals(a, id, n) {
+  const s = a.series[id], len = s.length;
+  const cur = s.slice(len - n).reduce((x, y) => x + y, 0);
+  const prev = s.slice(len - 2 * n, len - n).reduce((x, y) => x + y, 0);
+  return { cur, prev, delta: prev ? ((cur - prev) / prev) * 100 : null };
+}
+/* Retention : part de spectateurs encore présents à t. Le temps moyen en est l'intégrale. */
+function retention(p) {
+  const tau = p.dur * 0.22, f = p.full, pts = [];
+  for (let t = 0; t <= p.dur; t++) pts.push({ t, v: f + (100 - f) * Math.exp(-t / tau) });
+  return pts;
+}
+const avgWatch = (p) => retention(p).reduce((s, q) => s + q.v / 100, 0) - 0.5;
+const SOURCES = [["Pour toi", 0.74], ["Abonnés", 0.12], ["Profil", 0.06], ["Recherche", 0.04], ["Son", 0.03], ["Autre", 0.01]];
+
+/* ================= Graphique SVG (courbe par jour, rétention) ================= */
+function lineChart(el, cfg) {
+  const W = Math.max(280, el.clientWidth), H = el.clientHeight || 260, L = 44, R = 12, T = 12, B = 26;
+  const n = cfg.labels.length, all = cfg.series.flatMap((s) => s.values).filter((v) => v != null);
+  const rawMax = cfg.max != null ? cfg.max : Math.max(1, ...all);
+  const step = Math.pow(10, Math.floor(Math.log10(rawMax / 4))), nice = [1, 2, 2.5, 5, 10].map((k) => k * step).find((k) => rawMax / k <= 4) || step * 10;
+  const top = cfg.max != null ? cfg.max : Math.ceil(rawMax / nice) * nice;
+  const x = (i) => L + (n === 1 ? 0 : (i / (n - 1)) * (W - L - R)), y = (v) => T + (1 - v / top) * (H - T - B);
+  let g = `<defs><linearGradient id="grad" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--accent)" stop-opacity=".28"/><stop offset="1" stop-color="var(--accent)" stop-opacity="0"/></linearGradient></defs>`;
+  for (let v = 0; v <= top + 1e-6; v += top / 4) g += `<line class="grid-l" x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}"/><text x="${L - 8}" y="${y(v) + 4}" text-anchor="end">${cfg.fy(v)}</text>`;
+  (cfg.gaps || []).forEach((i) => { g += `<rect class="gapband" x="${x(i) - (W - L - R) / (n - 1) / 2}" y="${T}" width="${(W - L - R) / (n - 1)}" height="${H - T - B}"/>`; });
+  const every = Math.max(1, Math.ceil(n / (W < 500 ? 5 : 8)));
+  cfg.labels.forEach((l, i) => { if ((i % every === 0 && (n - 1 - i >= every * 0.7 || i === 0)) || i === n - 1) g += `<text x="${x(i)}" y="${H - 6}" text-anchor="${i === 0 ? "start" : i === n - 1 ? "end" : "middle"}">${l}</text>`; });
+  cfg.series.slice().reverse().forEach((s) => {
+    let d = "", seg = [];
+    const flush = () => { if (seg.length) { d += "M" + seg.map((i) => `${x(i).toFixed(1)} ${y(s.values[i]).toFixed(1)}`).join("L"); } seg = []; };
+    s.values.forEach((v, i) => { if (v == null) flush(); else seg.push(i); }); flush();
+    if (s.area) { const f = s.values.findIndex((v) => v != null); g += `<path class="ar" d="M${x(f)} ${H - B}L${s.values.map((v, i) => (v == null ? null : `${x(i).toFixed(1)} ${y(v).toFixed(1)}`)).filter(Boolean).join("L")}L${x(n - 1)} ${H - B}Z"/>`; }
+    g += `<path class="ln ${s.cls || ""}" d="${d}"/>`;
+  });
+  g += `<line class="cur-l" id="cl" y1="${T}" y2="${H - B}" style="display:none"/><circle class="cur-d" id="cd" r="5" style="display:none"/>`;
+  el.innerHTML = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(cfg.aria)}">${g}</svg><div class="tip" hidden></div>`;
+  const svg = el.firstChild, tip = el.lastChild, cl = svg.querySelector("#cl"), cd = svg.querySelector("#cd");
+  function show(ev) {
+    const r = svg.getBoundingClientRect(), px = ((ev.clientX - r.left) / r.width) * W;
+    const i = Math.min(n - 1, Math.max(0, Math.round(((px - L) / (W - L - R)) * (n - 1))));
+    const v = cfg.series[0].values[i];
+    cl.setAttribute("x1", x(i)); cl.setAttribute("x2", x(i)); cl.style.display = "";
+    if (v != null) { cd.setAttribute("cx", x(i)); cd.setAttribute("cy", y(v)); cd.style.display = ""; } else cd.style.display = "none";
+    tip.innerHTML = cfg.tip(i); tip.hidden = false;
+    const tx = (x(i) / W) * r.width; tip.style.left = Math.min(r.width - 70, Math.max(70, tx)) + "px"; tip.style.top = (v != null ? (y(v) / H) * r.height - 12 : 40) + "px";
+  }
+  svg.addEventListener("pointermove", show); svg.addEventListener("pointerdown", show);
+  svg.addEventListener("pointerleave", () => { cl.style.display = "none"; cd.style.display = "none"; tip.hidden = true; });
+}
+
+/* ================= Rendu ================= */
+function renderControls() {
+  const a = acct(), st = eff();
+  $("#sel-acct").innerHTML = ACCOUNTS.map((x) => `<option value="${x.id}"${x.id === S.acct ? " selected" : ""}>${esc(x.handle)}</option>`).join("");
+  $("#linked").className = "linked" + (a.linked ? "" : " none");
+  $("#linked").innerHTML = a.linked
+    ? `${icon("link", "i-sm")}<span>Chaîne Clipper liée : <b>${esc(a.linked.name)}</b> · ${esc(a.linked.platform)}</span>`
+    : `${icon("link", "i-sm")}<span>Aucune chaîne Clipper liée</span>`;
+  $("#seg-period").innerHTML = `<span class="thumb"></span>` + [7, 28, 60].map((n) => `<button type="button" data-p="${n}" class="${n === S.period ? "on" : ""}" aria-pressed="${n === S.period}">${n} jours</button>`).join("");
+  const when = S.scanning ? "Relevé en cours…" : a.scan ? `Dernier relevé : <b>${dmh(a.scan)}</b> · ${rel(a.scan)}` : "Dernier relevé : <b>jamais</b>";
+  $("#scan-when").innerHTML = when + (a.scan && !S.scanning ? `<br><span class="faint">${a.scans} relevés enregistrés</span>` : "");
+  $("#btn-scan").disabled = S.scanning;
+  $("#btn-scan").innerHTML = S.scanning ? `${icon("refresh-cw", "spin")}Relevé en cours` : `${icon("refresh-cw")}Relever maintenant`;
+  $("#seg-demo").innerHTML = `<span class="thumb"></span>` + [["normal", "Normal"], ["empty", "Aucun relevé"], ["scanning", "Relevé en cours"], ["noposts", "Aucune publication"]]
+    .map(([k, l]) => `<button type="button" data-d="${k}" class="${S.demo === k ? "on" : ""}" aria-pressed="${S.demo === k}">${l}</button>`).join("");
+  placeThumbs();
+  const steps = ["Compte (Données analytiques)", "Publications", "Détail des nouveaux posts", "Enregistrement"];
+  const scanning = S.scanning || st === "scanning";
+  $("#banner").innerHTML = scanning
+    ? `<div class="banner" role="status">${icon("refresh-cw", "spin")}<div><b>Relevé de ${esc(a.handle)} en cours</b><br><span class="muted">Étape ${Math.min(4, S.scanning ? S.step + 1 : 2)}/4 · ${steps[Math.min(3, S.scanning ? S.step : 1)]}. Les chiffres affichés sont ceux du dernier relevé.</span></div><div class="bar"><i style="width:${S.scanning ? (S.step + 1) * 25 : 50}%"></i></div></div>`
+    : "";
+  $("#tabs").innerHTML = [["vue", "Vue d'ensemble", null], ["publications", "Publications", st === "empty" || st === "noposts" ? 0 : a.posts.length]]
+    .map(([k, l, c]) => `<button type="button" role="tab" id="tab-${k}" data-t="${k}" class="${S.tab === k ? "on" : ""}" aria-selected="${S.tab === k}">${l}${c != null ? ` <span class="n">${c}</span>` : ""}</button>`).join("");
+}
+function placeThumbs() {
+  document.querySelectorAll(".seg").forEach((seg) => {
+    const on = seg.querySelector("button.on"), th = seg.querySelector(".thumb");
+    if (on && th) { th.style.left = on.offsetLeft + "px"; th.style.width = on.offsetWidth + "px"; }
+  });
+}
+function emptyState(ic, title, text, btn) {
+  return `<div class="panel"><div class="empty"><div class="empty-art">${icon(ic)}</div><h3>${title}</h3><p>${text}</p>${btn || ""}</div></div>`;
+}
+const scanBtn = `<button class="btn btn-primary" type="button" data-act="scan">${icon("refresh-cw")}Relever maintenant</button>`;
+
+function renderOverview() {
+  const a = acct(), st = eff(), n = S.period, m = METRICS.find((x) => x.id === S.metric);
+  if (st === "empty") return emptyState("inbox", `Aucun relevé pour ${esc(a.handle)}`, "Clipper n'a encore rien relevé sur TikTok Studio pour ce compte. Le premier relevé remplit les tuiles et démarre les courbes par jour.", scanBtn);
+  const T5 = METRICS.map((x) => ({ x, t: totals(a, x.id, n) }));
+  const tiles = T5.map(({ x, t }) => {
+    const up = t.delta > 0.05, down = t.delta < -0.05;
+    const dl = t.delta == null ? `<span class="delta flat">—</span>` : `<span class="delta ${up ? "up" : down ? "down" : "flat"}">${up ? "▲" : down ? "▼" : "■"} ${(t.delta > 0 ? "+" : "") + t.delta.toFixed(1).replace(".", ",")} % <small>vs ${n} j précédents</small></span>`;
+    return `<button class="kpi kpi-btn" type="button" data-m="${x.id}" aria-pressed="${x.id === S.metric}"><div class="kpi-label">${icon(x.icon)}${x.label}</div><div class="kpi-value">${fmt(t.cur)}</div>${dl}</button>`;
+  }).join("");
+  const mt = T5.find((o) => o.x.id === S.metric).t;
+  return `
+    <div class="kpis" id="kpis">${tiles}</div>
+    <div class="panel" style="margin-top:24px">
+      <div class="panel-head"><h2>${m.label} par jour</h2><div class="right"><span class="muted" style="font-size:13px">${n} derniers jours · ${fmt(mt.cur)} au total</span></div></div>
+      <div class="toolbar" style="margin:16px 24px 0"><div class="seg" id="seg-metric" role="group" aria-label="Métrique de la courbe"><span class="thumb"></span>${METRICS.map((x) => `<button type="button" data-m="${x.id}" class="${x.id === S.metric ? "on" : ""}" aria-pressed="${x.id === S.metric}">${x.label}</button>`).join("")}</div></div>
+      <div class="chart-wrap"><div class="chart" id="chart"></div></div>
+      <div class="legend"><span><i></i>${n} derniers jours</span><span><i class="prev"></i>${n} jours précédents</span><span><i class="gap"></i>Jour sans relevé</span></div>
+      <div class="pager-note"><span class="note">${icon("info", "i-xs")}<span>Les tuiles viennent du dernier relevé de la page Données analytiques. La courbe est reconstituée à partir de nos relevés horodatés successifs : un jour sans relevé reste vide au lieu d'être inventé.</span></span></div>
+    </div>`;
+}
+function drawChart() {
+  const el = $("#chart"); if (!el) return;
+  const a = acct(), n = S.period, s = a.series[S.metric], len = s.length, m = METRICS.find((x) => x.id === S.metric);
+  const gapAt = (i) => i % 17 === 5 && i >= 60; // jours où aucun relevé n'est passé (démo)
+  const cur = s.slice(len - n).map((v, i) => (gapAt(len - n + i) ? null : v));
+  const prev = s.slice(len - 2 * n, len - n);
+  const labels = cur.map((_, i) => dm(new Date(NOW.getTime() - (n - 1 - i) * DAY)));
+  const gaps = cur.map((v, i) => (v == null ? i : -1)).filter((i) => i >= 0);
+  lineChart(el, { labels, series: [{ values: cur, area: true }, { values: prev, cls: "prev" }], gaps, fy: (v) => (v >= 1000 ? Math.round(v / 100) / 10 + " k" : String(Math.round(v * 10) / 10)).replace(".", ","), aria: `${m.label} par jour sur ${n} jours`,
+    tip: (i) => `<span>${labels[i]}</span><b>${cur[i] == null ? "Pas de relevé" : fmt(cur[i])}</b><span>${cur[i] == null ? "" : "Période précédente : " + fmt(prev[i])}</span>` });
+}
+
+const cmp = { date: (p) => p.date.getTime(), views: (p) => p.views, likes: (p) => p.likes, comments: (p) => p.comments, shares: (p) => p.shares, avg: (p) => avgWatch(p), full: (p) => p.full, cap: (p) => p.cap.toLowerCase() };
+function sortedPosts() {
+  const a = acct(), k = S.sort.key, d = S.sort.dir, q = S.q.trim().toLowerCase();
+  return a.posts.filter((p) => !q || p.cap.toLowerCase().includes(q)).sort((x, y) => {
+    if (x.processing !== y.processing && k !== "date") return x.processing ? 1 : -1; // en cours de traitement : toujours en bas sauf tri par date
+    const u = cmp[k](x), v = cmp[k](y);
+    return (u < v ? -1 : u > v ? 1 : 0) * d;
+  });
+}
+const COLS = [["thumb", "", false], ["cap", "Légende", false], ["date", "Date", false], ["views", "Vues", true], ["likes", "J'aime", true], ["comments", "Commentaires", true], ["shares", "Partages", true], ["avg", "Temps moyen", true], ["full", "% vu en entier", true]];
+function renderPosts() {
+  const a = acct(), st = eff();
+  if (st === "empty") return emptyState("inbox", `Aucune publication relevée pour ${esc(a.handle)}`, "Les publications apparaissent après le premier relevé de la page Contenu de TikTok Studio.", scanBtn);
+  if (st === "noposts") return emptyState("film", "Aucune publication sur ce compte", `Le relevé est à jour (${rel(a.scan)}), mais TikTok Studio ne liste aucune vidéo pour ${esc(a.handle)}. Publie un clip depuis Clipper : il apparaîtra ici au relevé suivant.`,
+    `<a class="btn" href="../maquette-web-v2/index.html#/publication">${icon("send")}Aller à Publication</a>`);
+  const rows = sortedPosts();
+  const head = COLS.map(([k, l, r]) => k === "thumb" ? `<th aria-label="Vignette" style="width:56px"></th>`
+    : `<th class="${r ? "r" : ""}" ${S.sort.key === k ? `aria-sort="${S.sort.dir > 0 ? "ascending" : "descending"}"` : ""}><button type="button" data-s="${k}">${l}<span class="arr" aria-hidden="true">${S.sort.key === k ? (S.sort.dir > 0 ? "▲" : "▼") : ""}</span></button></th>`).join("");
+  const body = rows.map((p) => {
+    const poster = `style="background:linear-gradient(160deg,${POST_COLORS[p.ci][0]},${POST_COLORS[p.ci][1]})"`;
+    const nums = p.processing ? ["—", "—", "—", "—", "—", "—"] : [fmt(p.views), fmt(p.likes), fmt(p.comments), fmt(p.shares), mmss(avgWatch(p)), pct(p.full, 0)];
+    const lab = ["Vues", "J'aime", "Commentaires", "Partages", "Temps moyen", "% vu en entier"];
+    return `<tr class="clickable" tabindex="0" role="button" data-id="${p.id}" aria-label="Détail : ${esc(p.cap)}">
+      <td class="c-thumb"><div class="thumb-p ${p.processing ? "proc" : ""}" ${p.processing ? "" : poster}><i></i></div></td>
+      <td class="c-cap"><div class="cap">${esc(p.cap)}</div><div class="vis">${p.processing ? `<span class="chip warn">En cours de traitement</span>` : `<span class="chip plain ${p.vis === "Public" ? "ok" : ""}">${p.vis}</span>`}</div></td>
+      <td class="c-date">${dmh(p.date)}</td>
+      ${nums.map((v, i) => `<td class="r ${p.processing ? "dim" : ""}" data-l="${lab[i]}">${v}</td>`).join("")}
+    </tr>`;
+  }).join("");
+  return `<div class="panel">
+    <div class="panel-head"><h2>Publications de ${esc(a.handle)}</h2><div class="right"><span class="input-ico"><span class="i-wrap">${icon("search")}</span><input class="input" id="q" type="search" placeholder="Filtrer par légende" value="${esc(S.q)}" aria-label="Filtrer par légende" style="width:220px"></span></div></div>
+    <div class="sort-m"><select class="input" id="sort-m" aria-label="Trier par">${COLS.filter((c) => c[0] !== "thumb").map(([k, l]) => `<option value="${k}"${S.sort.key === k ? " selected" : ""}>Trier : ${l}</option>`).join("")}</select><button class="btn" type="button" id="dir-m" aria-label="Inverser le tri">${S.sort.dir > 0 ? "▲" : "▼"}</button></div>
+    <div style="overflow-x:auto"><table class="table ptable"><thead><tr>${head}</tr></thead><tbody>${rows.length ? body : `<tr><td colspan="9" class="muted" style="text-align:center;padding:32px">Aucune légende ne contient « ${esc(S.q)} ».</td></tr>`}</tbody></table></div>
+    <div class="pager-note">${icon("info", "i-xs")}<span>${rows.length} publication${rows.length > 1 ? "s" : ""} · cliquer une ligne ouvre le détail du post. Les posts en cours de traitement sont relevés à nouveau au prochain passage.</span></div>
+  </div>`;
+}
+
+function render() {
+  renderControls();
+  $("#pane").setAttribute("aria-labelledby", "tab-" + S.tab);
+  $("#pane").innerHTML = S.tab === "vue" ? renderOverview() : renderPosts();
+  if (S.tab === "vue") drawChart();
+  placeThumbs();
+  const hash = "#/" + S.tab + (S.open ? "/" + S.open : "");
+  if (location.hash !== hash) history.replaceState(null, "", hash);
+}
+
+/* ================= Détail d'un post ================= */
+let lastFocus = null;
+function openPost(id) {
+  const p = acct().posts.find((x) => x.id === id); if (!p) return;
+  S.open = id; lastFocus = document.activeElement;
+  const dr = $("#drawer"), ov = $("#overlay");
+  const grad = `style="background:linear-gradient(160deg,${POST_COLORS[p.ci][0]},${POST_COLORS[p.ci][1]})"`;
+  const links = `<div class="dlinks">
+      <a class="btn" href="https://www.tiktok.com/@${esc(acct().handle.slice(1))}/video/${p.id}" target="_blank" rel="noopener noreferrer">${icon("external-link")}<span>Ouvrir sur TikTok</span></a>
+      <a class="btn" href="../maquette-web-v2/index.html#/clips?f=all&open=${p.clip}">${icon("clapperboard")}<span>Voir le clip dans Clipper</span></a>
+      <a class="btn" href="../maquette-web-v2/index.html#/videos/${p.vid}">${icon("film")}<span>Vidéo source : ${esc(p.vtitle)}</span></a></div>`;
+  let right;
+  if (p.processing) {
+    right = `<div class="stack"><div class="reason">${icon("hourglass", "i-sm")}<span><b>TikTok traite encore cette vidéo.</b> Les chiffres arrivent en général dans l'heure qui suit la publication. Clipper la relèvera au prochain passage (≈ 30 min).</span></div>
+      <div class="figs">${["Vues de vidéo", "Temps de lecture total", "Temps de visionnage moyen", "A regardé toute la vidéo", "Nouveaux followers", "J'aime"].map((l) => `<div class="fig"><div class="l">${l}</div><div class="skel card-skel" style="margin-top:8px;width:60%"></div></div>`).join("")}</div>
+      <div class="panel panel-pad"><div class="section-title">${icon("activity")}Taux de rétention</div><div class="skel" style="height:160px"></div></div></div>`;
+  } else {
+    const avg = avgWatch(p), totalH = (p.views * avg) / 3600;
+    const figs = [["Vues de vidéo", fmt(p.views), ""], ["Temps de lecture total", totalH >= 1 ? fmt(totalH) : "<1", " h"], ["Temps de visionnage moyen", mmss(avg), ""], ["A regardé toute la vidéo", pct(p.full, 1), ""], ["Nouveaux followers", fmt(p.newF), ""], ["J'aime", fmt(p.likes), ""], ["Commentaires", fmt(p.comments), ""], ["Partages", fmt(p.shares), ""], ["Durée", mmss(p.dur), ""]];
+    const src = p.views >= 100
+      ? SOURCES.map(([l, w]) => `<div class="src-row"><span>${l}</span><div class="bar"><i style="width:${w * 100}%"></i></div><b>${Math.round(w * 100)} %</b></div>`).join("")
+      : `<div class="reason">${icon("lock", "i-sm")}<span>Sources de trafic <b>disponibles dès 100 vues</b>. Ce post en compte ${fmt(p.views)} : TikTok n'affiche pas encore la répartition.</span></div>`;
+    right = `<div class="stack">
+      <div class="figs">${figs.map(([l, v, u]) => `<div class="fig"><div class="l">${l}</div><div class="v">${v}${u ? `<small>${u}</small>` : ""}</div></div>`).join("")}</div>
+      <div class="panel"><div class="panel-head"><h2>Taux de rétention</h2><div class="right muted" style="font-size:13px">Part des spectateurs encore présents</div></div><div class="chart-wrap"><div class="chart" id="chart-ret" style="height:200px"></div></div></div>
+      <div class="panel panel-pad"><div class="section-title">${icon("trending-up")}Sources de trafic</div>${src}</div></div>`;
+  }
+  dr.innerHTML = `<div class="drawer-head"><h2 id="drawer-title">${esc(p.cap)}</h2><button class="icon-btn" id="dr-close" type="button" aria-label="Fermer">${icon("x")}</button></div>
+    <div class="drawer-body"><div><div class="poster-big" ${p.processing ? 'style="background:var(--surface-3)"' : grad}><span>${p.processing ? "Vignette en cours de génération" : esc(p.cap.split("#")[0].trim())}</span></div>
+      <div class="muted" style="font-size:13px;margin-top:12px">Publié le ${dmh(p.date)} · <span class="chip plain ${p.vis === "Public" ? "ok" : ""}">${p.vis}</span></div>${links}</div>${right}</div>`;
+  ov.hidden = false; dr.hidden = false;
+  requestAnimationFrame(() => { ov.classList.add("show"); dr.classList.add("show"); const c = $("#chart-ret"); if (c) drawRet(p, c); $("#dr-close").focus(); });
+  if (location.hash !== "#/publications/" + id) history.replaceState(null, "", "#/publications/" + id);
+}
+function drawRet(p, el) {
+  const pts = retention(p);
+  lineChart(el, { labels: pts.map((q) => mmss(q.t)), series: [{ values: pts.map((q) => q.v), area: true }], max: 100, fy: (v) => Math.round(v) + " %", aria: "Taux de rétention",
+    tip: (i) => `<span>à ${mmss(pts[i].t)}</span><b>${Math.round(pts[i].v)} %</b><span>des spectateurs</span>` });
+}
+function closePost() {
+  const dr = $("#drawer"), ov = $("#overlay");
+  S.open = null; dr.classList.remove("show"); ov.classList.remove("show");
+  setTimeout(() => { if (!S.open) { dr.hidden = true; ov.hidden = true; } }, 240);
+  history.replaceState(null, "", "#/" + S.tab);
+  if (lastFocus && document.contains(lastFocus)) lastFocus.focus();
+}
+
+/* ================= Relevé simulé ================= */
+function scanNow() {
+  if (S.scanning) return;
+  S.scanning = true; S.step = 0; render();
+  const tick = setInterval(() => {
+    S.step++;
+    if (S.step >= 4) {
+      clearInterval(tick); S.scanning = false;
+      const a = acct(); a.scan = new Date(NOW.getTime()); a.scans++; a.never = false;
+      if (S.demo === "empty" || S.demo === "scanning") S.demo = "normal";
+      render(); toast("ok", "Relevé terminé", `${a.handle} : ${a.posts.length} publication${a.posts.length > 1 ? "s" : ""} et 5 indicateurs mis à jour.`);
+    } else render();
+  }, document.documentElement.classList.contains("shot") ? 50 : 900);
+}
+
+/* ================= Navigation, événements ================= */
+const NAV = [
+  { g: "Production" }, ["tableau", "Tableau de bord", "layout-dashboard"], ["videos", "Vidéos", "film"], ["revue", "Revue", "sparkles"], ["clips", "Clips", "clapperboard"], ["publication", "Publication", "send"],
+  { g: "Configuration" }, ["chaines", "Chaînes", "tv"], ["stats", "Statistiques", "chart-column"], ["reglages", "Réglages", "settings"],
+];
+$("#nav").innerHTML = NAV.map((n) => n.g ? `<div class="nav-group">${n.g}</div>` : `<a href="${n[0] === "stats" ? "#/vue" : "../maquette-web-v2/index.html#/" + n[0]}" class="${n[0] === "stats" ? "active" : ""}"${n[0] === "stats" ? ' aria-current="page"' : ""}>${icon(n[2])}${n[1]}</a>`).join("");
+$("#tabbar").innerHTML = [["tableau", "Tableau", "layout-dashboard"], ["videos", "Vidéos", "film"], ["revue", "Revue", "sparkles"], ["clips", "Clips", "clapperboard"], ["publication", "Publication", "send"]]
+  .map(([k, l, ic]) => `<a href="../maquette-web-v2/index.html#/${k}">${icon(ic, "i-lg")}${l}</a>`).join("");
+$("#btn-menu").innerHTML = icon("menu");
+function setTheme(t) {
+  document.documentElement.dataset.theme = t; $("#btn-theme").innerHTML = icon(t === "light" ? "moon" : "sun");
+  $('meta[name="theme-color"]').content = t === "light" ? "#f4f2ec" : "#0e0e0c";
+  try { localStorage.setItem("clipper-maquette-theme", t); } catch (e) { /* stockage indisponible */ }
+}
+setTheme(document.documentElement.dataset.theme || "dark");
+$("#btn-theme").addEventListener("click", () => { setTheme(document.documentElement.dataset.theme === "light" ? "dark" : "light"); if (S.tab === "vue") drawChart(); });
+$("#btn-menu").addEventListener("click", () => { $("#sidebar").classList.toggle("open"); });
+document.addEventListener("click", (e) => { if (!e.target.closest("#sidebar, #btn-menu")) $("#sidebar").classList.remove("open"); });
+
+$("#sel-acct").addEventListener("change", (e) => { S.acct = e.target.value; S.q = ""; render(); });
+$("#seg-period").addEventListener("click", (e) => { const b = e.target.closest("button[data-p]"); if (b) { S.period = +b.dataset.p; render(); } });
+$("#seg-demo").addEventListener("click", (e) => { const b = e.target.closest("button[data-d]"); if (b) { S.demo = b.dataset.d; render(); } });
+$("#btn-scan").addEventListener("click", scanNow);
+$("#tabs").addEventListener("click", (e) => { const b = e.target.closest("button[data-t]"); if (b) { S.tab = b.dataset.t; render(); } });
+$("#tabs").addEventListener("keydown", (e) => { if (e.key === "ArrowRight" || e.key === "ArrowLeft") { S.tab = S.tab === "vue" ? "publications" : "vue"; render(); $("#tab-" + S.tab).focus(); } });
+$("#pane").addEventListener("click", (e) => {
+  const m = e.target.closest("button[data-m]"); if (m) { S.metric = m.dataset.m; render(); return; }
+  if (e.target.closest("[data-act=scan]")) { scanNow(); return; }
+  const s = e.target.closest("button[data-s]");
+  if (s) { const k = s.dataset.s; S.sort = S.sort.key === k ? { key: k, dir: -S.sort.dir } : { key: k, dir: k === "cap" ? 1 : -1 }; render(); const nb = $(`button[data-s="${k}"]`); if (nb) nb.focus(); return; }
+  if (e.target.closest("#dir-m")) { S.sort.dir *= -1; render(); return; }
+  const tr = e.target.closest("tr[data-id]"); if (tr) openPost(tr.dataset.id);
+});
+$("#pane").addEventListener("keydown", (e) => { const tr = e.target.closest("tr[data-id]"); if (tr && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); openPost(tr.dataset.id); } });
+$("#pane").addEventListener("change", (e) => { if (e.target.id === "sort-m") { S.sort = { key: e.target.value, dir: e.target.value === "cap" ? 1 : -1 }; render(); } });
+$("#pane").addEventListener("input", (e) => { if (e.target.id === "q") { S.q = e.target.value; const pos = e.target.selectionStart; render(); const q = $("#q"); q.focus(); q.setSelectionRange(pos, pos); } });
+$("#overlay").addEventListener("click", closePost);
+$("#drawer").addEventListener("click", (e) => { if (e.target.closest("#dr-close")) closePost(); });
+document.addEventListener("keydown", (e) => {
+  if (S.open && e.key === "Escape") { closePost(); return; }
+  if (S.open && e.key === "Tab") { // le focus reste dans le panneau
+    const f = [...$("#drawer").querySelectorAll("a[href],button")]; if (!f.length) return;
+    const first = f[0], last = f[f.length - 1];
+    if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); } else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+  }
+});
+let rz; window.addEventListener("resize", () => { clearTimeout(rz); rz = setTimeout(() => { placeThumbs(); if (S.tab === "vue") drawChart(); const c = $("#chart-ret"); if (c && S.open) drawRet(acct().posts.find((x) => x.id === S.open), c); }, 120); });
+
+/* Hash initial : #/vue, #/publications, #/publications/<id> ; ?demo=empty|scanning|noposts, ?acct=tests */
+(function init() {
+  const h = location.hash.replace(/^#\/?/, "").split("?")[0].split("/");
+  if (h[0] === "publications") S.tab = "publications";
+  const dq = location.hash.match(/[?&]demo=(\w+)/), aq = location.hash.match(/[?&]acct=(\w+)/), pq = location.hash.match(/[?&]period=(\d+)/);
+  if (dq) S.demo = dq[1]; if (aq && ACCOUNTS.some((a) => a.id === aq[1])) S.acct = aq[1]; if (pq && [7, 28, 60].includes(+pq[1])) S.period = +pq[1];
+  render();
+  if (h[0] === "publications" && h[1]) openPost(h[1]);
+  if (document.fonts && document.fonts.ready) document.fonts.ready.then(() => { placeThumbs(); });
+})();
+</script>
+</body>
+</html>
