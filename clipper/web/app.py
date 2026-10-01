@@ -2,7 +2,7 @@
 du paquet). Appelee par ``python -m clipper serve`` et par les tests
 (clipper.web.app.create_app avec un pipeline/worker simules).
 
-ADR-4f6e §1 : cette API n'appelle jamais pipeline.run/render dans son propre
+ADR-35b7 §1 : cette API n'appelle jamais pipeline.run/render dans son propre
 processus ; le traitement passe toujours par la file (clipper.worker)."""
 
 from __future__ import annotations
@@ -10,11 +10,13 @@ from __future__ import annotations
 import ast
 import asyncio
 import csv
+import hashlib
 import importlib
 import inspect
 import json
 import os
 import re
+import sys
 import tempfile
 import tomllib
 from datetime import date, datetime, time, timedelta, timezone
@@ -61,7 +63,7 @@ _TOKEN_COOKIE = "clipper_token"
 
 
 class WebConfigError(Exception):
-    """[web] host hors bouclage sans jeton configure (ADR-4f6e §5, ADR-ad2e :
+    """[web] host hors bouclage sans jeton configure (ADR-35b7 §5, ADR-ad2e :
     jamais d'exposition silencieuse)."""
 
 
@@ -169,6 +171,28 @@ def _current_step(state: dict[str, Any]) -> str | None:
         if step.get("status") != "done":
             return name
     return None
+
+
+def _pipeline_created_at(path: Path) -> tuple[datetime, str]:
+    """Date de creation de ``path`` et sa source : ``pipeline_json_created``
+    (date de naissance du fichier, ou ctime sous Windows) ; sur un systeme qui
+    n'en expose pas, ``pipeline_json_mtime`` le dit au lieu de le taire."""
+    info = path.stat()
+    birth = getattr(info, "st_birthtime", None)
+    if birth is None and sys.platform == "win32":
+        birth = info.st_ctime
+    if birth is not None:
+        return datetime.fromtimestamp(birth, timezone.utc), "pipeline_json_created"
+    return datetime.fromtimestamp(info.st_mtime, timezone.utc), "pipeline_json_mtime"
+
+
+def _added_at(state: dict[str, Any], config: Config) -> tuple[str, str]:
+    """Date d'ajout d'une video et sa source : ``enqueued_at`` si elle est
+    passee par la file, sinon la date de creation de son pipeline.json."""
+    if state.get("enqueued_at"):
+        return state["enqueued_at"], "enqueued_at"
+    when, source = _pipeline_created_at(Path(config.workspace_dir) / state["video_id"] / pipeline.STATE_FILE)
+    return when.isoformat(), source
 
 
 def _enrich(state: dict[str, Any], config: Config) -> dict[str, Any]:
@@ -461,7 +485,7 @@ def _dashboard(config: Config) -> dict[str, Any]:
 
 async def _event_stream(config: Config) -> AsyncIterator[str]:
     """Scrute workspace/*/pipeline.json et state/**/*.json par mtime,
-    sans broker (ADR-4f6e §4) ; un evenement {kind, id, at} par changement,
+    sans broker (ADR-35b7 §4) ; un evenement {kind, id, at} par changement,
     jamais pour l'etat deja vu a la connexion."""
     interval = float(config.section("web")["sse_poll_interval_s"])
     workspace_root = Path(config.workspace_dir)
@@ -489,10 +513,10 @@ async def _event_stream(config: Config) -> AsyncIterator[str]:
 
 
 # --------------------------------------------------------------------------
-# Ecran Clips (SPEC-c100 E4, T4 ; SPEC-fc0c §4.5). L'API ne touche jamais un
+# Ecran Clips (SPEC-c100 E4, T4 ; SPEC-74e9 §4.5). L'API ne touche jamais un
 # mp4 ni un sidecar : le texte passe par publish.edit_caption, le rendu par la
 # file (worker.enqueue). Les statuts de publication sont ceux de
-# SPEC-fc0c §4 ; un clip absent du fichier de publication est « à valider ».
+# SPEC-74e9 §4 ; un clip absent du fichier de publication est « à valider ».
 # --------------------------------------------------------------------------
 
 _TO_VALIDATE = "à valider"
@@ -614,7 +638,7 @@ def _enqueue_clip_render(video_id: str, config: Config) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------
-# Ecran Chaines (SPEC-c100 E5, SPEC-fc0c §1) : un preset de chaine est un
+# Ecran Chaines (SPEC-c100 E5, SPEC-74e9 §1) : un preset de chaine est un
 # fichier presets/<nom>.toml ; l'API le lit/ecrit uniquement par
 # clipper.channel (save_channel : relu et valide avant remplacement).
 # --------------------------------------------------------------------------
@@ -691,7 +715,7 @@ def _check_preset_types(preset: dict[str, Any]) -> None:
 def _validate_preset(name: str, preset: dict[str, Any]) -> None:
     """Valide ``preset`` comme save_channel puis load_channel le feront, dans un
     dossier temporaire : le fichier reel n'est touche que si tout passe
-    (SPEC-fc0c 1.5). load_channel ajoute les regles de [channel] (mode,
+    (SPEC-74e9 1.5). load_channel ajoute les regles de [channel] (mode,
     creneaux) que save_channel ne controle pas."""
     _check_preset_types(preset)
     with tempfile.TemporaryDirectory() as tmp:
@@ -783,7 +807,7 @@ def _save_channel_preset(name: str, preset: dict[str, Any]) -> None:
 
 
 # --------------------------------------------------------------------------
-# Ecran Reglages (SPEC-c100 E8, ADR-4f6e §2 et §5) : config.toml en formulaire.
+# Ecran Reglages (SPEC-c100 E8, ADR-35b7 §2 et §5) : config.toml en formulaire.
 # L'ecriture passe par config.write_config (relu par load_config avant le
 # remplacement atomique) ; le jeton [web] token n'est jamais lu ni ecrit par
 # l'interface : il se change dans le fichier, puis redemarrage.
@@ -931,7 +955,7 @@ def _settings_merge(raw: dict[str, Any], settings: dict[str, Any]) -> dict[str, 
     if final_web.get("host", _section_defaults("web")["host"]) != _LOOPBACK_HOST and not final_web.get("token"):
         raise ConfigError(
             "[web] host hors bouclage : un jeton ([web] token) est exigé, à écrire dans config.toml "
-            "(sinon 'serve' refuserait de démarrer, ADR-4f6e §5)"
+            "(sinon 'serve' refuserait de démarrer, ADR-35b7 §5)"
         )
     return data
 
@@ -1326,7 +1350,7 @@ def create_app(config: Config | None = None) -> FastAPI:
     enforce_auth = host != _LOOPBACK_HOST
     if enforce_auth and not token:
         raise WebConfigError(
-            f"[web] host={host!r} hors bouclage exige un jeton ([web] token) configure (ADR-4f6e §5)"
+            f"[web] host={host!r} hors bouclage exige un jeton ([web] token) configure (ADR-35b7 §5)"
         )
 
     app = FastAPI(title="Clipper", default_response_class=JSONResponse)
@@ -1345,16 +1369,28 @@ def create_app(config: Config | None = None) -> FastAPI:
                 return JSONResponse({"detail": "jeton d'acces manquant ou invalide"}, status_code=401)
         return await call_next(request)
 
+    @app.middleware("http")
+    async def _revalidate_static(request: Request, call_next):
+        response = await call_next(request)
+        if request.url.path == "/" or request.url.path.startswith("/static/"):
+            response.headers["Cache-Control"] = "no-cache"  # revalidation par ETag, 304 conserve
+        return response
+
     @app.get("/")
-    def index() -> FileResponse:
-        return FileResponse(STATIC_DIR / "index.html")
+    def index(request: Request) -> Response:
+        page = STATIC_DIR / "index.html"
+        info = page.stat()
+        etag = '"' + hashlib.md5(f"{info.st_mtime}-{info.st_size}".encode()).hexdigest() + '"'
+        if request.headers.get("if-none-match") == etag:
+            return Response(status_code=304, headers={"ETag": etag})
+        return FileResponse(page, headers={"ETag": etag})
 
     @app.get("/api/dashboard")
     def dashboard() -> dict[str, Any]:
         return _dashboard(config)
 
     # ----------------------------------------------------------------
-    # File de traitement (SPEC-fc0c §2)
+    # File de traitement (SPEC-74e9 §2)
     # ----------------------------------------------------------------
 
     @app.post("/api/queue", status_code=202)
@@ -1406,8 +1442,12 @@ def create_app(config: Config | None = None) -> FastAPI:
                 status_code=400,
                 detail=f"statut inconnu : {status!r} (attendu : {', '.join(_VIDEO_STATUSES)})",
             )
-        videos = [_enrich(state, config) for state in _list_states(config)]
-        videos.sort(key=lambda v: v.get("enqueued_at") or "", reverse=True)  # la plus récemment ajoutée en haut
+        videos = []
+        for state in _list_states(config):
+            video = _enrich(state, config)
+            video["added_at"], video["added_at_source"] = _added_at(state, config)
+            videos.append(video)
+        videos.sort(key=lambda v: datetime.fromisoformat(v["added_at"]), reverse=True)  # la plus récemment ajoutée en haut
         return [v for v in videos if _matches(v, channel, status, q)]
 
     @app.get("/api/videos/{video_id}")
@@ -1435,7 +1475,7 @@ def create_app(config: Config | None = None) -> FastAPI:
 
     @app.post("/api/videos/{video_id}/render", status_code=202)
     def start_render(video_id: str) -> JSONResponse:
-        """Remet la video en file, action 'render' (ADR-4f6e §1 : jamais
+        """Remet la video en file, action 'render' (ADR-35b7 §1 : jamais
         pipeline.render dans ce processus)."""
         _validate_video_id(video_id)
         return _enqueue(video_id, _channel_of(video_id, config), "render", None, config)
@@ -1559,7 +1599,7 @@ def create_app(config: Config | None = None) -> FastAPI:
         return JSONResponse({"clip": clip, "rerender": entry}, status_code=202 if retitle else 200)
 
     # ----------------------------------------------------------------
-    # Publication (SPEC-c100 E6, SPEC-fc0c §4) : tout passe par clipper.publish
+    # Publication (SPEC-c100 E6, SPEC-74e9 §4) : tout passe par clipper.publish
     # ----------------------------------------------------------------
 
     @app.get("/api/publish")
@@ -1595,7 +1635,7 @@ def create_app(config: Config | None = None) -> FastAPI:
         return _publish_action(video_id, clip_id, "unschedule")
 
     # ----------------------------------------------------------------
-    # Surveillance : VOD a confirmer (SPEC-fc0c §5.3)
+    # Surveillance : VOD a confirmer (SPEC-74e9 §5.3)
     # ----------------------------------------------------------------
 
     @app.post("/api/watch/{channel}/{video_id}/confirm", status_code=202)
@@ -1619,7 +1659,7 @@ def create_app(config: Config | None = None) -> FastAPI:
         return {"channel": channel, "video_id": video_id, "ignored": True}
 
     # ----------------------------------------------------------------
-    # Chaines (SPEC-fc0c §1) et temps reel (ADR-4f6e §4)
+    # Chaines (SPEC-74e9 §1) et temps reel (ADR-35b7 §4)
     # ----------------------------------------------------------------
 
     @app.get("/api/channels")
@@ -1775,7 +1815,7 @@ def create_app(config: Config | None = None) -> FastAPI:
 
 
 # --------------------------------------------------------------------------
-# Ecran Publication (SPEC-c100 E6, SPEC-fc0c §4) : vue d'une semaine de
+# Ecran Publication (SPEC-c100 E6, SPEC-74e9 §4) : vue d'une semaine de
 # creneaux d'une chaine. Les creneaux viennent de channel.next_slots, les
 # entrees de state/publish/<chaine>.json, les clips des sidecars ; l'API
 # n'invente aucun statut (une entree sans sidecar est signalee `missing`).

@@ -1,4 +1,4 @@
-/* Ecran « Chaînes » (SPEC-c100 E5, SPEC-fc0c §1). Liste des chaînes (nom,
+/* Ecran « Chaînes » (SPEC-c100 E5, SPEC-74e9 §1). Liste des chaînes (nom,
    source, surveillance, mode, prochains créneaux) et formulaire d'un preset par
    sections. Le serveur fournit pour chaque section le preset brut (ce qui est
    redéfini), les valeurs effectives et les CONFIG_DEFAULTS commentés : un champ

@@ -1,4 +1,4 @@
-"""File de publication par chaine (SPEC-fc0c 4, ADR-4f6e 3).
+"""File de publication par chaine (SPEC-74e9 4, ADR-35b7 3).
 
 Bibliotheque, pas une etape (ADR-b16b) : lit les sidecars de clip
 (output/<video_id>/<clip_id>.json, SPEC-6a47) et les creneaux de la chaine
@@ -195,7 +195,7 @@ def approve(
     presets_dir: str | Path = "presets",
     base: str | Path = "config.toml",
 ) -> dict[str, Any]:
-    """Approuve un clip (SPEC-fc0c 4.2) : entree 'approved', puis 'scheduled'
+    """Approuve un clip (SPEC-74e9 4.2) : entree 'approved', puis 'scheduled'
     au prochain creneau libre si la chaine en a. Leve PublishError si le
     sidecar dit ready=false."""
     sidecar = _read_sidecar(output_dir, video_id, clip_id)
@@ -243,7 +243,7 @@ def reject(
     state_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     """Rejette un clip ; si c'est une partie d'une serie, rejette aussi
-    toutes les autres parties (SPEC-fc0c 4.2)."""
+    toutes les autres parties (SPEC-74e9 4.2)."""
     sidecar = _read_sidecar(output_dir, video_id, clip_id)
     series_id, part = _series_info(video_id, clip_id, sidecar)
 
@@ -294,7 +294,7 @@ def move(
     presets_dir: str | Path = "presets",
     base: str | Path = "config.toml",
 ) -> dict[str, Any]:
-    """Deplace un clip vers un creneau libre de la chaine (SPEC-fc0c 4.3) :
+    """Deplace un clip vers un creneau libre de la chaine (SPEC-74e9 4.3) :
     refuse un creneau deja pris ou hors des slots de la chaine."""
     path = _state_path(channel, state_dir)
     _, channel_dict = channel_mod.load_channel(channel, presets_dir=presets_dir, base=base)
@@ -344,7 +344,7 @@ def mark_published(
     now: datetime | None = None,
     state_dir: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Marque un clip publie a la main (SPEC-fc0c 4.3)."""
+    """Marque un clip publie a la main (SPEC-74e9 4.3)."""
     path = _state_path(channel, state_dir)
     with _locked(path):
         entries = _load_entries(path)
@@ -400,7 +400,7 @@ def edit_caption(
     state_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     """Reecrit la legende (champ sidecar 'caption') et les hashtags, avec
-    edited_at (SPEC-fc0c 4.5). Refuse sur une entree scheduled/published."""
+    edited_at (SPEC-74e9 4.5). Refuse sur une entree scheduled/published."""
     path = _state_path(channel, state_dir)
     entries = _load_entries(path)
     entry = _find_entry(entries, video_id, clip_id)
@@ -425,7 +425,7 @@ def list_pending(
     state_dir: str | Path | None = None,
 ) -> list[dict[str, Any]]:
     """Clips ready=true des videos de cette chaine, absents du fichier de
-    publication (SPEC-fc0c 4.4)."""
+    publication (SPEC-74e9 4.4)."""
     path = _state_path(channel, state_dir)
     entries = _load_entries(path)
     known = {(entry["video_id"], entry["clip_id"]) for entry in entries}

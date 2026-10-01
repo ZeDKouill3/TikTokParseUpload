@@ -1,4 +1,4 @@
-/* Ecran « Publication » (SPEC-c100 E6, SPEC-fc0c §4). Lit GET /api/publish?channel=&week= :
+/* Ecran « Publication » (SPEC-c100 E6, SPEC-74e9 §4). Lit GET /api/publish?channel=&week= :
    les creneaux de la semaine (avec le clip planifie ou libres), la file des clips
    approuves sans creneau et les publies / en echec de la semaine. Un clip se glisse
    (souris ou appui long au toucher) vers un creneau libre : POST .../move. En attendant

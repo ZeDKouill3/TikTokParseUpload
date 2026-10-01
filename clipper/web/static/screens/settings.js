@@ -1,4 +1,4 @@
-/* Écran « Réglages » (SPEC-c100 E8, ADR-4f6e §2 et §5). config.toml en
+/* Écran « Réglages » (SPEC-c100 E8, ADR-35b7 §2 et §5). config.toml en
    formulaire : Général (mode), Dossiers, LLM (backend, modèles par niveau et
    par usage), Serveur web, Worker ; section Accès en lecture seule. Le serveur
    fournit le brut du fichier, les valeurs effectives et les CONFIG_DEFAULTS
@@ -215,10 +215,10 @@ function setWorker() {
 
 function setAccess() {
   const access = setUi.data.access;
-  const restart = setUi.data.restart_required
+  const restart = setUi.data.restart_required && !access.differs_from_config
     ? `<p class="reason" role="status">Le fichier a un hôte, un port ou un jeton différent de ceux de ce serveur : un redémarrage de « serve » est nécessaire pour les appliquer.</p>` : "";
   const differs = access.differs_from_config
-    ? `<p class="reason" role="status">Ce serveur écoute sur ${esc(access.host)}:${esc(access.port)} (« serve --host/--port »), pas sur ${esc(access.config_host)}:${esc(access.config_port)} comme le dit ${esc(setUi.data.path)}. Les valeurs ci-dessous sont celles du serveur en cours.</p>` : "";
+    ? `<p class="reason" role="status">Ce serveur écoute sur ${esc(access.host)}:${esc(access.port)} (« serve --host/--port »), pas sur ${esc(access.config_host)}:${esc(access.config_port)} comme le dit ${esc(setUi.data.path)}. Les valeurs ci-dessous sont celles du serveur en cours ; le fichier ne s'appliquera qu'au prochain « serve » lancé sans --host/--port.</p>` : "";
   return `<section class="panel" id="set-access"><div class="panel-head"><h2>Accès</h2><span class="chip pending plain">lecture seule</span></div><div class="panel-pad">
     ${differs}${restart}
     <dl class="kv set-access">

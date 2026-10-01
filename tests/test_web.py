@@ -11,13 +11,14 @@ import json
 import os
 import shutil
 import subprocess
-from datetime import timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
 from clipper.config import Config
+from clipper.web import app as web_app
 from clipper.web import create_app
 
 VIDEO_ID = "abcdefghijk"
@@ -3675,6 +3676,19 @@ def test_settings_screen_shows_the_real_access_and_the_difference():
     assert "differs_from_config" in js and "config_port" in js
 
 
+def test_settings_access_shows_a_single_notice_when_the_running_server_differs_from_config_toml():
+    js = (STATIC / "screens" / "settings.js").read_text(encoding="utf-8")
+    start = js.index("function setAccess()")
+    body = js[start:js.index("\n}\n", start)]
+
+    # l'avis « redémarrage » n'est affiché que si l'avis d'écart (hôte/port) ne l'est pas déjà
+    assert "restart_required && !access.differs_from_config" in body
+    # l'avis d'écart dit les deux valeurs et quand le fichier s'appliquera
+    assert "access.host" in body and "access.port" in body and "config_host" in body and "config_port" in body
+    assert "au prochain « serve » lancé sans --host/--port" in body
+    assert "un redémarrage de « serve » est nécessaire" in body  # avis conservé pour un jeton seul
+
+
 def _fresh_heartbeat(tmp_path, **fields):
     beat = {"pid": os.getpid(), "at": datetime.now(timezone.utc).isoformat(), **fields}
     _write_json(tmp_path / "state" / "worker.json", beat)
@@ -3786,6 +3800,72 @@ def test_videos_are_listed_most_recently_added_first(tmp_path, isolated_cwd):
     ids = [v["video_id"] for v in client(tmp_path).get("/api/videos").json()]
 
     assert ids == ["ccccccccccc", "bbbbbbbbbbb", "aaaaaaaaaaa"]
+
+
+def _drop_enqueued_at(tmp_path, video_id):
+    path = tmp_path / "workspace" / video_id / "pipeline.json"
+    state = json.loads(path.read_text(encoding="utf-8"))
+    del state["enqueued_at"]
+    path.write_text(json.dumps(state), encoding="utf-8")
+
+
+def test_videos_without_enqueued_at_are_sorted_by_pipeline_json_creation_date(tmp_path, isolated_cwd, monkeypatch):
+    _write_state(tmp_path, "aaaaaaaaaaa")
+    _write_state(tmp_path, "bbbbbbbbbbb")
+    _write_state(tmp_path, "ccccccccccc", enqueued_at="2026-09-02T10:00:00+00:00")
+    for video_id in ("aaaaaaaaaaa", "bbbbbbbbbbb"):
+        _drop_enqueued_at(tmp_path, video_id)
+    created = {"aaaaaaaaaaa": "2026-09-03T10:00:00+00:00", "bbbbbbbbbbb": "2026-09-01T10:00:00+00:00"}
+    monkeypatch.setattr(
+        web_app, "_pipeline_created_at",
+        lambda path: (datetime.fromisoformat(created[path.parent.name]), "pipeline_json_created"),
+    )
+
+    videos = client(tmp_path).get("/api/videos").json()
+
+    assert [v["video_id"] for v in videos] == ["aaaaaaaaaaa", "ccccccccccc", "bbbbbbbbbbb"]
+    by_id = {v["video_id"]: v for v in videos}
+    assert by_id["ccccccccccc"]["added_at"] == "2026-09-02T10:00:00+00:00"
+    assert by_id["ccccccccccc"]["added_at_source"] == "enqueued_at"
+    assert by_id["aaaaaaaaaaa"]["added_at"] == "2026-09-03T10:00:00+00:00"
+    assert by_id["aaaaaaaaaaa"]["added_at_source"] == "pipeline_json_created"
+    assert all(v["added_at"] for v in videos)
+
+
+def test_pipeline_created_at_reads_the_real_file(tmp_path):
+    path = tmp_path / "pipeline.json"
+    path.write_text("{}", encoding="utf-8")
+
+    when, source = web_app._pipeline_created_at(path)
+
+    assert when.tzinfo is not None and source in {"pipeline_json_created", "pipeline_json_mtime"}
+    assert abs((datetime.now(timezone.utc) - when).total_seconds()) < 60
+
+
+def test_static_files_are_always_revalidated(tmp_path, isolated_cwd):
+    c = client(tmp_path)
+    for url in ("/", "/static/app.js", "/static/screens/videos.js"):
+        resp = c.get(url)
+        assert resp.status_code == 200, url
+        assert resp.headers["cache-control"] == "no-cache", url
+        etag = resp.headers["etag"]
+        again = c.get(url, headers={"If-None-Match": etag})
+        assert again.status_code == 304, url
+        assert again.headers["cache-control"] == "no-cache", url
+
+
+def test_no_retired_adr_or_spec_citation_remains_under_clipper():
+    root = Path(web_app.__file__).resolve().parents[1]
+    offenders = []
+    for path in root.rglob("*"):
+        if not path.is_file() or "__pycache__" in path.parts or path.suffix in {".woff", ".woff2", ".png", ".ico"}:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        offenders += [f"{path.relative_to(root)} : {old}" for old in ("ADR-4f6e", "SPEC-fc0c") if old in text]
+    assert offenders == []
 
 
 def test_videos_screen_keeps_the_server_order(tmp_path):

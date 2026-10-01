@@ -132,7 +132,7 @@ EVENTS_FILE = "events.jsonl"
 
 # Etapes qui savent mesurer leur avancement clip par clip (reframe, render) ou
 # par unite traitee, et recoivent donc un rappel progress(fraction, eta_s,
-# message) dans step_options (SPEC-fc0c §3.1) : voir _ProgressWriter.
+# message) dans step_options (SPEC-74e9 §3.1) : voir _ProgressWriter.
 _PROGRESS_STEPS = ("transcribe", "subtitles", "reframe", "render")
 # Ecriture de pipeline.json au plus une fois par ce delai par appel de progress.
 _PROGRESS_MIN_INTERVAL_S = 2.0
@@ -353,7 +353,7 @@ class _Run:
 
     def _target_clips(self) -> list[dict[str, Any]]:
         """``clips()`` restreint a ``clip_filter`` (render cible d'un seul
-        clip, SPEC-fc0c §4.5) ; identique a ``clips()`` sinon. N'affecte que
+        clip, SPEC-74e9 §4.5) ; identique a ``clips()`` sinon. N'affecte que
         les boucles clip par clip (reframe/subtitles/render/qa), jamais le
         resume final (_summary), qui reste sur l'ensemble des clips."""
         clips = self.clips()
@@ -491,7 +491,7 @@ class _Run:
         if not self.clips():
             return
         if self.clip_filter is not None:
-            # Cible un seul clip (SPEC-fc0c §4.5, re-rendu apres edition du
+            # Cible un seul clip (SPEC-74e9 §4.5, re-rendu apres edition du
             # titre d'ecran) : controle direct par qa.check_clip, jamais
             # qa.run qui parcourt tout output/<video_id>/.
             settings = self.config.section("qa")
@@ -839,7 +839,7 @@ class _EventsHandler(logging.Handler):
     """Ecrit chaque enregistrement INFO+ emis par le logger ``clipper`` (donc
     par toute etape, y compris les transitions deja journalisees par
     _advance_steps a ce niveau) comme une ligne JSON dans
-    workspace/<video_id>/events.jsonl (SPEC-fc0c §3.2), jamais tronque."""
+    workspace/<video_id>/events.jsonl (SPEC-74e9 §3.2), jamais tronque."""
 
     def __init__(self, path: Path, run: _Run):
         super().__init__(level=logging.INFO)
@@ -965,7 +965,7 @@ def _start(
     """``force`` remet toutes les etapes a pending et les force toutes.
     ``force_steps`` (sans ``force``) ne remet a pending, et ne force, que
     l'etape nommee la plus en amont et toutes celles qui la suivent dans
-    STEPS (SPEC-fc0c §3.3) : les precedentes restent ``done``."""
+    STEPS (SPEC-74e9 §3.3) : les precedentes restent ``done``."""
     if force:
         forced = set(STEPS)
         for step in state["steps"].values():
@@ -1000,7 +1000,7 @@ def run(
 
     ``step_options`` : arguments supplementaires par etape (injection pour
     les tests, ex. ``{"download": {"ydl_factory": ...}}``). ``channel`` :
-    chaine dont le preset a servi (SPEC-fc0c §3.1), gardee dans l'etat."""
+    chaine dont le preset a servi (SPEC-74e9 §3.1), gardee dans l'etat."""
     config = config or load_config()
     try:
         video_id = download.extract_video_id(url)
@@ -1029,7 +1029,7 @@ def render(
     """Reprend une video deja lancee jusqu'au bout (captions .. qa) ; en mode
     review, exige une decision pour chaque moment (PipelineError sinon).
     ``clips`` restreint reframe/subtitles/render/qa a ces clip_id (render
-    cible, SPEC-fc0c §4.5) ; le resume final reste sur tous les clips."""
+    cible, SPEC-74e9 §4.5) ; le resume final reste sur tous les clips."""
     config = config or load_config()
     state = load_state(video_id, config=config)
     if channel is not None:
@@ -1060,7 +1060,7 @@ def process_queue(
 ) -> list[dict[str, Any]]:
     """Reprend chaque video en file dont ``retry_at`` est passe ; renvoie
     leurs nouveaux etats. Une video rattachee a une chaine repart avec le
-    preset de cette chaine, son mode compris (SPEC-fc0c §1.3), pas avec la
+    preset de cette chaine, son mode compris (SPEC-74e9 §1.3), pas avec la
     config globale : si la chaine a disparu ou son preset est invalide,
     l'erreur est journalisee, gardee dans ``reason`` et la video reste en
     attente (ADR-ad2e, aucun repli sur la config globale)."""

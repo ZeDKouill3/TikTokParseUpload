@@ -1,10 +1,10 @@
-"""Worker separe du serveur HTTP (ADR-4f6e §1) : boucle sur la file
-``state/queue.json`` (SPEC-fc0c §2) et lance chaque video dans un processus
+"""Worker separe du serveur HTTP (ADR-35b7 §1) : boucle sur la file
+``state/queue.json`` (SPEC-74e9 §2) et lance chaque video dans un processus
 enfant ``python -m clipper <action> <url|id>``, un seul a la fois
 (ADR-fb9b). N'importe que clipper.pipeline, clipper.channel et
 clipper.config : jamais clipper.web, jamais une etape (ADR-b16b).
 
-Entree de file (SPEC-fc0c §2.1) : {id, video_id, url, channel | null,
+Entree de file (SPEC-74e9 §2.1) : {id, video_id, url, channel | null,
 action ("run" | "render"), force_steps, enqueued_at, status ("waiting" |
 "running"), pid | null}.
 """
@@ -102,7 +102,7 @@ def _write_queue(path: Path, entries: list[dict[str, Any]]) -> None:
 def _locked(path: Path):
     """Verrou inter-processus sur la file : tout cycle lecture-modification-
     ecriture de state/queue.json se fait dedans (le worker et l'API web sont
-    deux processus, ADR-4f6e)."""
+    deux processus, ADR-35b7)."""
     return channel_mod.file_lock(path)
 
 
@@ -114,11 +114,11 @@ def enqueue(
     *,
     config: Config | None = None,
 ) -> dict[str, Any]:
-    """Ajoute une entree a la file (SPEC-fc0c §2.1), ecriture atomique.
+    """Ajoute une entree a la file (SPEC-74e9 §2.1), ecriture atomique.
     ``url`` est l'URL source pour ``action="run"``, le video_id pour
     ``action="render"`` (deja lance, pas d'URL a resoudre). Refuse un
     doublon deja ``waiting`` pour le meme video_id et la meme action
-    (SPEC-fc0c §2.2)."""
+    (SPEC-74e9 §2.2)."""
     if action == "run":
         # clipper.download est une etape (ADR-b16b) : le worker n'importe
         # que clipper.pipeline, qui l'importe deja pour l'enchainement des
@@ -155,7 +155,7 @@ def enqueue(
 
 def move_to_front(video_id: str, *, config: Config | None = None) -> None:
     """Passe l'entree ``waiting`` de ``video_id`` en tete des entrees en
-    attente, sans toucher l'entree ``running`` (SPEC-fc0c §2.2)."""
+    attente, sans toucher l'entree ``running`` (SPEC-74e9 §2.2)."""
     config = config or load_config()
     path = _queue_path(config)
     with _locked(path):
@@ -181,7 +181,7 @@ def move_to_front(video_id: str, *, config: Config | None = None) -> None:
 
 def remove(video_id: str, *, config: Config | None = None) -> None:
     """Retire l'entree ``waiting`` de ``video_id``, sans toucher l'entree
-    ``running`` (SPEC-fc0c §2.2)."""
+    ``running`` (SPEC-74e9 §2.2)."""
     config = config or load_config()
     path = _queue_path(config)
     with _locked(path):
@@ -269,7 +269,7 @@ class Worker:
 
     def _recover_orphans(self) -> None:
         """Au demarrage, une entree ``running`` dont le pid est mort
-        (worker precedent tombe) repasse ``waiting`` en tete (SPEC-fc0c
+        (worker precedent tombe) repasse ``waiting`` en tete (SPEC-74e9
         §2.4). Une seule entree ``running`` possible a la fois."""
         with _locked(self._path):
             entries = _read_queue(self._path)
@@ -286,9 +286,9 @@ class Worker:
     def tick(self) -> None:
         """Une iteration : termine l'entree si l'enfant courant a fini,
         sinon lance la tete de file si aucun enfant ne vit, sinon reprend
-        les videos ``queued`` dont ``retry_at`` est passe (SPEC-fc0c
+        les videos ``queued`` dont ``retry_at`` est passe (SPEC-74e9
         §2.3-2.4). La surveillance des chaines echues passe d'abord, enfant
-        en cours ou non (SPEC-fc0c §5.1). Chaque itération bat d'abord (voyant
+        en cours ou non (SPEC-74e9 §5.1). Chaque itération bat d'abord (voyant
         de l'interface web)."""
         self._beat()
         self._watch_channels()
@@ -366,7 +366,7 @@ class Worker:
 
     def cancel(self, video_id: str) -> None:
         """Termine l'enfant en cours pour ``video_id`` et fait passer
-        ``pipeline.json`` en ``failed`` (SPEC-fc0c §2.3)."""
+        ``pipeline.json`` en ``failed`` (SPEC-74e9 §2.3)."""
         entries = _read_queue(self._path)
         entry = next((e for e in entries if e["video_id"] == video_id and e["status"] == "running"), None)
         if entry is None:
@@ -387,7 +387,7 @@ class Worker:
 
     def loop(self) -> None:
         """Boucle jusqu'a interruption, a l'intervalle ``poll_interval_s``
-        de CONFIG_DEFAULTS (SPEC-fc0c §2.3)."""
+        de CONFIG_DEFAULTS (SPEC-74e9 §2.3)."""
         interval = float(self.config.section("worker")["poll_interval_s"])
         while True:
             self.tick()

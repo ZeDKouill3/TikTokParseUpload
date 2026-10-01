@@ -1,4 +1,4 @@
-/* Surveillance des VOD (TASK-7508, SPEC-fc0c §5.3) : lignes « VOD à confirmer »
+/* Surveillance des VOD (TASK-7508, SPEC-74e9 §5.3) : lignes « VOD à confirmer »
    du tableau de bord, avec Confirmer (mise en file) et Ignorer. */
 
 function watchVodRow(vod) {

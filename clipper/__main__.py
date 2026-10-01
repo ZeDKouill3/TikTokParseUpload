@@ -16,7 +16,7 @@ from clipper.config import ConfigError, load_config
 _PROGRESS_POLL_SECONDS = 0.1
 _INIT_FILES = (("config.toml", "config.example.toml"), ("rubric.toml", "rubric.toml"))
 
-# Indirection pour injection dans les tests (ADR-4f6e §1 : 'serve' lance le
+# Indirection pour injection dans les tests (ADR-35b7 §1 : 'serve' lance le
 # worker en sous-processus).
 _popen = subprocess.Popen
 
@@ -272,7 +272,7 @@ def main(argv: list[str] | None = None) -> int:
             if host != "127.0.0.1" and not web_cfg["token"]:
                 raise ConfigError(
                     f"[web] token : un jeton est exige pour ecouter sur {host!r} (hors bouclage) ; "
-                    'ajoute token = "..." dans la table [web] de config.toml (ADR-4f6e §5)'
+                    'ajoute token = "..." dans la table [web] de config.toml (ADR-35b7 §5)'
                 )
             if host != web_cfg["host"] or int(port) != int(web_cfg["port"]):
                 # l'app voit l'hote et le port réellement écoutés (Réglages > Accès), pas ceux de config.toml

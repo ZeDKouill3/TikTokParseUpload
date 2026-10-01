@@ -1,4 +1,4 @@
-"""Interface web locale de clipper (TASK-634e, ADR-09ad ; v2, ADR-4f6e).
+"""Interface web locale de clipper (TASK-634e, ADR-09ad ; v2, ADR-35b7).
 
 Page HTML/CSS/JS statique (clipper/web/static/), servie par un serveur
 FastAPI local (voir ``python -m clipper serve``, clipper/__main__.py).
@@ -6,7 +6,7 @@ clipper.web n'appelle que clipper.pipeline, clipper.config, clipper.channel,
 clipper.worker, clipper.publish et clipper.watch, et lit workspace/, output/
 et state/ ; aucune logique de traitement video, audio ou LLM ici (ADR-09ad),
 et le traitement lui-meme tourne toujours dans le worker separe, jamais dans
-ce processus (ADR-4f6e §1).
+ce processus (ADR-35b7 §1).
 
 Routes (voir clipper/web/app.py pour le detail) :
 - GET    /                                    page statique
@@ -35,13 +35,13 @@ from __future__ import annotations
 from clipper.web.app import create_app
 
 CONFIG_DEFAULTS: dict[str, object] = {
-    # Hôte et port d'écoute de 'python -m clipper serve' (ADR-4f6e §5).
+    # Hôte et port d'écoute de 'python -m clipper serve' (ADR-35b7 §5).
     "host": "127.0.0.1",
     "port": 8000,
     # Jeton exige sur /api/* et /media/* des que l'hôte n'est pas le bouclage ;
     # vide et bouclage = pas d'authentification.
     "token": "",
-    # Intervalle (s) de scrutation des mtimes par /api/events (ADR-4f6e §4).
+    # Intervalle (s) de scrutation des mtimes par /api/events (ADR-35b7 §4).
     "sse_poll_interval_s": 1.0,
 }
 
