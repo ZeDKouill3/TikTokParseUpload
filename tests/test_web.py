@@ -204,6 +204,80 @@ def test_list_moments_merges_score_justification_and_preview(tmp_path, isolated_
     assert first["preview_url"] == f"/media/source/{VIDEO_ID}"
 
 
+JURY_VERDICT = {
+    "score": 71.0, "confidence": 60, "veto": None, "debated": True,
+    "trace": {"rounds": [
+        {"round": 1, "judges": {
+            "retention": {"scores": {"hook": 9}, "score": 90.0, "argument": "a", "confidence": 90},
+            "avocat": {"scores": {"hook": 5}, "score": 50.0, "argument": "b", "confidence": 30}}},
+        {"round": 2, "judges": {
+            "avocat": {"scores": {"hook": 6}, "score": 60.0, "argument": "c", "confidence": 55}}},
+    ], "revisions": [], "dissent": []},
+}
+
+
+def _with_jury_moments(tmp_path):
+    _write_moments_fixtures(tmp_path)
+    data = json.loads(json.dumps(MOMENTS_JSON))
+    data["moments"][0]["jury"] = JURY_VERDICT
+    (tmp_path / "workspace" / VIDEO_ID / "moments.json").write_text(json.dumps(data), encoding="utf-8")
+
+
+def test_list_moments_exposes_the_jury_confidence_aggregate_and_per_judge(tmp_path, isolated_cwd):
+    _with_jury_moments(tmp_path)
+
+    moments = client(tmp_path).get(f"/api/videos/{VIDEO_ID}/moments").json()
+
+    first, second = moments
+    assert first["confidence"] == 60
+    # derniere confiance de chaque juge : tour 2 si le juge a reevalue, sinon tour 1
+    assert first["judge_confidences"] == {"retention": 90, "avocat": 55}
+    assert second["confidence"] is None and second["judge_confidences"] is None
+
+
+def test_get_clips_exposes_the_jury_confidence_of_the_clips_moment(tmp_path, isolated_cwd):
+    video_dir = tmp_path / "workspace" / CLIPS_VIDEO
+    video_dir.mkdir(parents=True)
+    moments = {"video_id": CLIPS_VIDEO, "moments": [
+        {"id": 0, "final_score": 80.0, "jury": {**JURY_VERDICT, "confidence": 72}},
+        {"id": 1, "final_score": 70.0},
+    ]}
+    (video_dir / "moments.json").write_text(json.dumps(moments), encoding="utf-8")
+    _write_state(tmp_path, CLIPS_VIDEO, channel="ma_chaine")
+    _write_clip(tmp_path, CLIPS_VIDEO, _clip_sidecar("01", moment_id=0))
+    _write_clip(tmp_path, CLIPS_VIDEO, _clip_sidecar("02", moment_id=1))
+    _write_clip(tmp_path, CLIPS_VIDEO, _clip_sidecar("03"))
+
+    clips = {c["clip_id"]: c for c in client(tmp_path).get("/api/clips", params={"video_id": CLIPS_VIDEO}).json()}
+
+    assert clips["01"]["jury_confidence"] == 72
+    assert clips["01"]["jury_judge_confidences"] == {"retention": 90, "avocat": 55}
+    assert clips["02"]["jury_confidence"] is None  # moment sans jury : pas de valeur inventee
+    assert clips["03"]["jury_confidence"] is None  # sidecar sans moment_id
+
+
+def test_get_clips_without_moments_json_has_no_jury_confidence(tmp_path, isolated_cwd):
+    _clips_setup(tmp_path)
+
+    clips = client(tmp_path).get("/api/clips", params={"video_id": CLIPS_VIDEO}).json()
+
+    assert all(c["jury_confidence"] is None for c in clips)
+
+
+def test_review_screen_shows_the_jury_confidence():
+    js = _review_js()
+
+    assert "confidence" in js and "judge_confidences" in js
+    assert "Confiance" in js
+
+
+def test_clip_sheet_shows_the_jury_confidence():
+    js = (STATIC / "screens" / "clips.js").read_text(encoding="utf-8")
+
+    assert "jury_confidence" in js and "jury_judge_confidences" in js
+    assert "Confiance du jury" in js
+
+
 def test_list_moments_reports_existing_decisions(tmp_path, isolated_cwd):
     review = {"decisions": {"0": {"decision": "adjusted", "start": 4.0, "end": 26.0,
                                    "comment": "debut plus net", "at": "2026-01-01T00:00:00+00:00"}}}

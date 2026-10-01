@@ -31,32 +31,40 @@ Deroulement :
    "leader"), attendu jusqu'au bout, puis les autres juges de ce tour ;
    chaque vague en parallele.
 2. Desaccord : un candidat dont les scores par juge (0-100, grille ponderee)
-   s'ecartent de plus de ``threshold`` passe au debat.
+   s'ecartent de plus de ``threshold``, ou dont au moins un juge a une
+   confiance < ``debate_confidence_below`` (SPEC-73d0, R2), passe au debat.
+   Chaque juge donne, pour chaque candidat et a chaque tour, une confiance
+   entiere de 0 (au hasard) a 100 (certain), exigee par le schema (R1).
 3. Tour 2 (un seul) sur ces candidats : chaque juge relit ses notes et son
    argument, puis les arguments anonymes des autres, et peut reviser.
 4. Agregation : mediane par critere des notes finales de chaque juge, score
-   = moyenne ponderee des medianes x10. Quand le fichier de poids de
-   clipper.jury_calibration existe (``weights_path``, defaut
-   state/jury_weights.json), la mediane par critere est ponderee par le poids
-   de chaque juge (1 pour un juge absent du fichier) ; un juge a veto doit y
-   valoir 1, et un fichier illisible est une JuryError (ADR-1cf0, ADR-ad2e).
+   = moyenne ponderee des medianes x10. La mediane est ponderee par
+   (poids de calibration du juge, 1 s'il est absent du fichier de poids de
+   clipper.jury_calibration, ``weights_path``, defaut state/jury_weights.json)
+   x max(confiance/100, ``min_confidence_weight``) (SPEC-73d0, R3) : a
+   confiances egales, c'est la mediane d'avant. Un juge a veto doit valoir 1
+   dans le fichier de poids, et un fichier illisible est une JuryError
+   (ADR-1cf0, ADR-ad2e).
    Le veto motive d'un juge ``veto`` (tour final) rejette le candidat : c'est
    a l'etape d'en tirer la consequence (ici on ne supprime rien).
 
 Retour (serialisable en JSON, a ecrire dans le JSON de l'etape) :
 
     {"judges": [{"name", "usage", "model", "veto"}], "seed", "threshold",
+     "debate_confidence_below", "min_confidence_weight",
      "quorum", "weights": None | {nom: poids},
      "failed": [{"judge", "round", "error"}], "debated": [id],
-     "candidates": [{"id", "scores": {critere: mediane}, "score", "veto":
-                     None | {"judge", "reason"}, "debated",
+     "candidates": [{"id", "scores": {critere: mediane}, "score",
+                     "confidence", "veto": None | {"judge", "reason"}, "debated",
                      "trace": {"rounds": [{"round", "judges": {nom: {"scores",
-                               "score", "argument", ("veto", "veto_reason")}}}],
+                               "score", "argument", "confidence",
+                               ("veto", "veto_reason")}}}],
                                "revisions": [{"judge", "criterion", "from",
                                               "to", "argument"}],
                                "dissent": [{"judge", "score", "median"}]}}]}
 
-``candidates`` garde l'ordre d'entree. ``dissent`` : juges dont le score
+``candidates`` garde l'ordre d'entree. ``confidence`` d'un candidat : mediane
+des confiances finales des juges. ``dissent`` : juges dont le score
 final s'ecarte de la mediane des scores de plus de ``threshold``.
 
 Echecs (ADR-ad2e) : une reponse de juge invalide (JSON, schema, candidat
@@ -73,6 +81,8 @@ Configuration ([jury], fusionnee en profondeur avec CONFIG_DEFAULTS) :
 
     [jury]
     threshold = 20          # ecart de score (0-100) qui declenche le debat
+    debate_confidence_below = 40  # confiance (0-100) d'un juge qui declenche le debat
+    min_confidence_weight = 0.2   # plancher du poids de confiance (jamais zero)
     quorum = 4              # facultatif : juges valides minimum par tour
     seed = 0
 
@@ -169,6 +179,12 @@ CONFIG_DEFAULTS: dict[str, object] = {
     # Ecart (points sur 100) entre le score le plus haut et le plus bas des
     # juges au-dela duquel un candidat passe au debat.
     "threshold": 20,
+    # Un candidat passe aussi au debat si un juge a une confiance (0-100)
+    # strictement inferieure a ce seuil (SPEC-73d0, R2).
+    "debate_confidence_below": 40,
+    # Plancher du poids de confiance (confiance/100) dans la mediane ponderee
+    # (SPEC-73d0, R3) : aucun juge n'est jamais reduit a zero. ]0, 1].
+    "min_confidence_weight": 0.2,
     # Nombre minimal de juges valides par tour ; absent : tous obligatoires.
     "quorum": None,
     # Graine du melange des candidats (propre a chaque juge).
@@ -229,6 +245,17 @@ def _judges(settings: dict[str, Any]) -> list[dict[str, Any]]:
     return judges
 
 
+def _confidence_settings(settings: Mapping[str, Any]) -> tuple[float, float]:
+    """(debate_confidence_below, min_confidence_weight), valides (ADR-ad2e)."""
+    below = settings["debate_confidence_below"]
+    if isinstance(below, bool) or not isinstance(below, (int, float)) or not 0 <= below <= 100:
+        raise JuryError(f"[jury] debate_confidence_below invalide : {below!r} (nombre de 0 a 100)")
+    floor = settings["min_confidence_weight"]
+    if isinstance(floor, bool) or not isinstance(floor, (int, float)) or not 0 < floor <= 1:
+        raise JuryError(f"[jury] min_confidence_weight invalide : {floor!r} (nombre dans ]0, 1])")
+    return float(below), float(floor)
+
+
 class _JudgeConfig:
     """Vue de la config pour un juge : son ``model`` remplace celui de
     [llm.usages.<usage>], le reste est la config d'origine."""
@@ -272,6 +299,10 @@ def _schema(criteria: Mapping[str, Any], refs: list[str], veto: bool) -> dict[st
         "argument": {
             "type": "string", "minLength": 1, "maxLength": _ARGUMENT_CHARS,
             "description": "Une ou deux phrases concretes, qui citent le passage decisif.",
+        },
+        "confidence": {
+            "type": "integer", "minimum": 0, "maximum": 100,
+            "description": "Ta confiance dans ces notes : 0 = au hasard, 100 = certain.",
         },
         "scores": {
             "type": "object",
@@ -380,7 +411,9 @@ def _round1_prompt(
         "Note chaque candidat sur son seul texte, independamment des autres et de sa place dans la "
         "liste. Pour chacun : ref, puis argument (une ou deux phrases concretes qui citent entre "
         "guillemets le passage decisif et disent ce qui marche ou bloque de ton point de vue, sans "
-        "formule generique), puis les notes. Un element par candidat, sans en omettre.\n"
+        "formule generique), puis confidence (entier de 0 a 100 : 0 = tu notes au hasard, 100 = tu "
+        "es certain ; sois honnete, un candidat ambigu ou hors de ta competence merite une confiance "
+        "basse), puis les notes. Un element par candidat, sans en omettre.\n"
         + _schema_block(schema)
         + role
     )
@@ -403,7 +436,8 @@ def _round2_prompt(
         vetoed = f"Ton veto au tour 1 : {mine['veto_reason']}\n" if veto and mine["veto"] else ""
         blocks.append(
             _block(ref, c)
-            + f"\nTes notes au tour 1 : {notes}\nTon argument : {mine['argument']}\n"
+            + f"\nTes notes au tour 1 : {notes}\nTa confiance au tour 1 : confiance {mine['confidence']}/100\n"
+            f"Ton argument : {mine['argument']}\n"
             + vetoed
             + f"Autres avis :\n{heard}"
         )
@@ -416,7 +450,8 @@ def _round2_prompt(
         "texte ; ne t'aligne jamais pour faire consensus ni parce qu'un avis revient souvent.\n\n"
         + "\n\n".join(blocks)
         + "\n\n## Consignes\nPour chaque candidat : ref, puis argument (ce qui a change et pourquoi, "
-        "ou pourquoi tu maintiens, en une ou deux phrases), puis toutes tes notes, revisees ou non."
+        "ou pourquoi tu maintiens, en une ou deux phrases), puis ta confidence (0 a 100) apres "
+        "debat, puis toutes tes notes, revisees ou non."
         + (" Redonne aussi veto et veto_reason, maintenus ou leves." if veto else "")
         + "\n"
         + _schema_block(schema)
@@ -436,7 +471,7 @@ def _ask(
     schema: Mapping[str, Any],
     config: Any,
 ) -> dict[str, dict[str, Any]]:
-    """ref -> {"scores", "argument", ("veto", "veto_reason")} ; toute reponse
+    """ref -> {"scores", "argument", "confidence", ("veto", "veto_reason")} ; toute reponse
     incomplete ou incoherente est une llm.SchemaError. ``schema`` peut
     imposer veto/veto_reason meme a un juge sans veto (partage par son
     modele, TASK-b0fa) : seul ``judge["veto"]`` decide si on en tient
@@ -457,7 +492,12 @@ def _ask(
         ref = item["ref"]
         if ref in out:
             raise llm.SchemaError(f"juge {judge['name']} : {ref} note deux fois")
-        entry = {"scores": dict(item["scores"]), "argument": item["argument"]}
+        confidence = item.get("confidence")
+        if isinstance(confidence, bool) or not isinstance(confidence, int) or not 0 <= confidence <= 100:
+            raise llm.SchemaError(
+                f"juge {judge['name']} : confiance invalide sur {ref} : {confidence!r} (entier de 0 a 100)"
+            )
+        entry = {"scores": dict(item["scores"]), "argument": item["argument"], "confidence": confidence}
         if judge["veto"]:
             if item["veto"] and not item["veto_reason"].strip():
                 raise llm.SchemaError(f"juge {judge['name']} : veto sans raison sur {ref}")
@@ -597,7 +637,12 @@ def _spread(notes: Mapping[str, dict[str, Any]], criteria: Mapping[str, Any]) ->
 def _round_record(rnd: int, notes: Mapping[str, dict[str, Any]], criteria: Mapping[str, Any]) -> dict[str, Any]:
     judges = {}
     for name, n in notes.items():
-        entry = {"scores": n["scores"], "score": _score(n["scores"], criteria), "argument": n["argument"]}
+        entry = {
+            "scores": n["scores"],
+            "score": _score(n["scores"], criteria),
+            "argument": n["argument"],
+            "confidence": n["confidence"],
+        }
         if "veto" in n:
             entry["veto"] = n["veto"]
             entry["veto_reason"] = n["veto_reason"]
@@ -625,6 +670,7 @@ def deliberate(
     _check_candidates(candidates)
     criteria = rubric["criteria"]
     threshold = float(settings["threshold"])
+    conf_below, conf_floor = _confidence_settings(settings)
     quorum = settings["quorum"]
     seed = settings["seed"]
     parallel = int(settings["parallel"])
@@ -654,7 +700,11 @@ def deliberate(
 
     # roundN[id][juge] = {"scores", "argument", ("veto", "veto_reason")}
     round1 = {cid: {j["name"]: answers[j["name"]][_ref(views[j["name"]], cid)] for j in active} for cid in by_id}
-    debated = [cid for cid in by_id if _spread(round1[cid], criteria) > threshold]
+    debated = [
+        cid for cid in by_id
+        if _spread(round1[cid], criteria) > threshold
+        or any(n["confidence"] < conf_below for n in round1[cid].values())
+    ]
 
     # Tour 2 : debat sur les seuls desaccords.
     round2: dict[str, dict[str, dict[str, Any]]] = {cid: {} for cid in debated}
@@ -688,13 +738,15 @@ def deliberate(
     results = []
     for cid in by_id:
         final = {**round1[cid], **round2.get(cid, {})}
-        if weights is None:
-            scores = {name: statistics.median(n["scores"][name] for n in final.values()) for name in criteria}
-        else:
-            scores = {
-                name: _weighted_median([(n["scores"][name], weights[j]) for j, n in final.items()])
-                for name in criteria
-            }
+        # Poids = calibration (1 sans fichier) x confiance plancher (SPEC-73d0, R3).
+        pond = {
+            j: (1.0 if weights is None else weights[j]) * max(n["confidence"] / 100, conf_floor)
+            for j, n in final.items()
+        }
+        scores = {
+            name: _weighted_median([(n["scores"][name], pond[j]) for j, n in final.items()])
+            for name in criteria
+        }
         judge_scores = {name: _score(n["scores"], criteria) for name, n in final.items()}
         median = statistics.median(judge_scores.values())
         veto = next(
@@ -723,6 +775,7 @@ def deliberate(
                 "id": cid,
                 "scores": scores,
                 "score": _score(scores, criteria),
+                "confidence": statistics.median(n["confidence"] for n in final.values()),
                 "veto": veto,
                 "debated": cid in round2,
                 "trace": {"rounds": rounds, "revisions": revisions, "dissent": dissent},
@@ -733,6 +786,8 @@ def deliberate(
         "judges": [{k: j[k] for k in ("name", "usage", "model", "veto")} for j in judges],
         "seed": seed,
         "threshold": threshold,
+        "debate_confidence_below": conf_below,
+        "min_confidence_weight": conf_floor,
         "quorum": quorum,
         "weights": weights,
         "failed": failed,

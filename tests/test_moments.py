@@ -820,12 +820,13 @@ JUDGES = {"retention", "spectateur", "monteur", "avocat", "conformite"}
 _JURY_BLOCK = re.compile(r"### (C\d+)\n(?:Contexte : [^\n]*\n)?Texte : « mot(\d+)_0 ")
 
 
-def jury_notes(notes, vetoes=None, debate=None):
+def jury_notes(notes, vetoes=None, debate=None, confidence=None):
     """Reponse factice d'un juge. ``notes[k]`` : notes du candidat qui
     commence a la phrase k, soit une grille (tous les juges), soit
     {juge: grille} ; ``vetoes[k]`` : raison du veto de conformite ;
-    ``debate[k]`` : {juge: grille} renvoye au tour 2."""
-    vetoes, debate = vetoes or {}, debate or {}
+    ``debate[k]`` : {juge: grille} renvoye au tour 2 ; ``confidence`` :
+    {(k, juge, tour): confiance}, 80 par defaut."""
+    vetoes, debate, confidence = vetoes or {}, debate or {}, confidence or {}
 
     def answer(request):
         judge = request.usage.removeprefix("jury_")
@@ -838,7 +839,12 @@ def jury_notes(notes, vetoes=None, debate=None):
             grid = notes[k] if "hook" in notes[k] else notes[k][judge]
             if second_round and judge in debate.get(k, {}):
                 grid = debate[k][judge]
-            entry = {"ref": ref, "argument": f"{judge} sur {ref}", "scores": dict(grid)}
+            entry = {
+                "ref": ref,
+                "argument": f"{judge} sur {ref}",
+                "scores": dict(grid),
+                "confidence": confidence.get((k, judge, 2 if second_round else 1), 80),
+            }
             if "veto" in item:
                 entry["veto"] = k in vetoes
                 entry["veto_reason"] = vetoes.get(k, "")
@@ -971,6 +977,30 @@ def test_moments_json_holds_the_jury_trace_of_every_candidate(tmp_path, video_di
     [low] = [r for r in data["rejected"] if "min_score" in r["reason"]]
     assert low["jury"]["debated"] is False
     assert set(low["jury"]["trace"]["rounds"][0]["judges"]) == JUDGES
+
+
+def test_moments_json_keeps_each_judges_confidence_per_round_and_the_aggregate(tmp_path, video_dir, rubric_path):
+    # avocat peu sur au tour 1 (30 < 40) : debat ; tour 2 : confiances 60..100.
+    conf = {(2, "avocat", 1): 30}
+    conf.update({(2, j, 2): c for j, c in zip(["retention", "spectateur", "monteur", "avocat", "conformite"],
+                                              [60, 70, 80, 90, 100], strict=True)})
+    proposal = {"moments": [moment(10.25, 44.65), moment(100.25, 134.65)]}
+    notes = {2: GOOD, 20: GOOD}
+    run(
+        tmp_path, rubric_path, with_jury(proposal, jury_notes(notes, confidence=conf)),
+        config=auto_config(tmp_path, rubric_path),
+    )
+    data = read_moments(video_dir)
+    first, second = data["moments"][0], data["moments"][1]
+    assert data["jury"]["debate_confidence_below"] == 40
+    assert first["jury"]["debated"] is True
+    assert first["jury"]["confidence"] == 80
+    r1, r2 = first["jury"]["trace"]["rounds"]
+    assert r1["judges"]["avocat"]["confidence"] == 30
+    assert r1["judges"]["retention"]["confidence"] == 80
+    assert r2["judges"]["avocat"]["confidence"] == 90
+    assert second["jury"]["debated"] is False
+    assert second["jury"]["confidence"] == 80
 
 
 def test_review_mode_keeps_the_single_call_by_default(tmp_path, video_dir, rubric_path):

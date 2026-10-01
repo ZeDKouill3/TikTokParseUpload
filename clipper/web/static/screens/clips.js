@@ -158,6 +158,7 @@ function clipDrawerHtml(c) {
         ${lockHint}
         <div><button type="button" class="btn btn-xs" data-save-caption${locked ? " disabled" : ""}>${icon("check", "i-xs")}Enregistrer la description et les hashtags</button></div>
         <div class="field"><span class="field-label">Contrôle qualité</span>${clipQaBlock(c)}</div>
+        <div class="field"><span class="field-label">Confiance du jury</span><div data-jury-confidence>${juryConfidenceHtml(c.jury_confidence, c.jury_judge_confidences)}</div></div>
         <details><summary class="muted" style="cursor:pointer;font-size:13px">Sidecar JSON (SPEC-6a47)</summary><div class="code" style="margin-top:8px">${esc(sidecar)}</div></details>
       </div>
     </div>

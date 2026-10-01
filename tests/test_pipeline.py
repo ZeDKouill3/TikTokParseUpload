@@ -208,7 +208,7 @@ def answer(request):
         candidates = []
         for ref in item["ref"]["enum"]:
             entry = {"ref": ref, "argument": "« GTA six arrive vraiment. » : accroche nette.",
-                     "scores": {k: 9 for k in item["scores"]["required"]}}
+                     "scores": {k: 9 for k in item["scores"]["required"]}, "confidence": 80}
             if "veto" in item:
                 entry.update(veto=False, veto_reason="")
             candidates.append(entry)

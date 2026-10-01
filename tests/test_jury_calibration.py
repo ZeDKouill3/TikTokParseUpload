@@ -377,7 +377,7 @@ def fixed_jury(request):
     schema_item = request.schema["properties"]["candidates"]["items"]["properties"]
     answer = []
     for ref in refs:
-        item = {"ref": ref, "argument": "arg", "scores": {"hook": FIXED[judge]}}
+        item = {"ref": ref, "argument": "arg", "scores": {"hook": FIXED[judge]}, "confidence": 80}
         if "veto" in schema_item:
             item["veto"], item["veto_reason"] = False, ""
         answer.append(item)

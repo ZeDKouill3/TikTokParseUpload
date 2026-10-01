@@ -14,7 +14,8 @@ Sortie : workspace/<video_id>/moments.json
 
     {"video_id", "rubric": {"path", "weights", "min_score"}, "chunked",
      "selection": "single" | "jury",
-     "jury": {"judges", "seed", "threshold", "quorum", "failed", "debated"},  # jury
+     "jury": {"judges", "seed", "threshold", "debate_confidence_below",
+              "min_confidence_weight", "quorum", "failed", "debated"},      # jury
      "exploration": {"share", "seed", "target", "chosen"},   # jury, part > 0
      "moments": [{"id", "start", "end", "duration", "format", "parts",
                   "scores", "bonus", "final_score", "justification",
@@ -30,7 +31,9 @@ candidats ; clipper.jury les note ensuite sur la meme grille, et ses notes
 agregees (``scores``) remplacent celles du proposeur dans le score final
 (bonus, ``min_score`` et non-chevauchement inchanges). ``jury`` de chaque
 candidat garde les notes et la justification du proposeur, le score du jury,
-son veto et sa trace (tours, revisions, dissidences). Un veto rejette le
+sa confiance agregee (mediane des confiances finales des juges, SPEC-73d0),
+son veto et sa trace (tours avec la confiance de chaque juge, revisions,
+dissidences). Un veto rejette le
 candidat avec sa raison, sans score final. Juge invalide : l'erreur remonte,
 rien n'est ecrit (ADR-ad2e).
 
@@ -914,7 +917,7 @@ def _judge(
     for c, verdict in zip(candidates, result["candidates"], strict=True):
         c["jury"] = {
             "proposer": {"scores": c["scores"], "justification": c["justification"]},
-            **{k: verdict[k] for k in ("score", "veto", "debated", "trace")},
+            **{k: verdict[k] for k in ("score", "confidence", "veto", "debated", "trace")},
         }
         c["scores"] = verdict["scores"]
         if verdict["veto"] is None:

@@ -6,6 +6,14 @@ const $$ = (sel, root) => Array.from((root || document).querySelectorAll(sel));
 const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const fr = (n, d) => Number(n).toLocaleString("fr-FR", { minimumFractionDigits: d || 0, maximumFractionDigits: d || 0 });
 
+/* Confiance du jury (SPEC-73d0 R4) : agregat (mediane des confiances finales) puis
+   confiance finale de chaque juge. Sans jury : le dit, sans valeur inventee. */
+function juryConfidenceHtml(confidence, judges) {
+  if (confidence == null) return `<span class="muted">non évaluée (pas de jury pour ce moment)</span>`;
+  const per = Object.entries(judges || {}).map(([name, c]) => `<span class="tag">${esc(name)} ${fr(c)} %</span>`).join("");
+  return `<b class="num">${fr(confidence)} %</b>${per ? `<span class="row wrap" style="gap:6px;margin-top:6px">${per}</span>` : ""}`;
+}
+
 // Delai pendant lequel « Annuler » reste proposé dans un toast (SPEC-c100 T4).
 const UNDO_MS = 5000;
 
