@@ -12,6 +12,7 @@
 .acc-gen-body { padding: 16px 24px 24px; display: flex; flex-direction: column; gap: 16px; }
 .acc-gen-opts { display: flex; align-items: flex-end; gap: 16px; flex-wrap: wrap; }
 .acc-gen-length { width: 140px; }
+.acc-gen-length label { display: flex; flex-direction: column; gap: 6px; }
 .acc-gen-out { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
 .acc-gen-out .input { flex: 1 1 240px; min-width: 0; }
 .acc-gen-inline { display: flex; flex-direction: column; gap: 12px; padding: 12px; border: 1px solid var(--line); border-radius: var(--r-lg); }
