@@ -93,6 +93,8 @@ content_check_running = "div:has-text('Vérification en cours')"
 content_check_ok = "div:has-text('Aucun problème constaté')"
 # :has-text ignore la casse et cherche un fragment : « Aucun problème constaté » contient « problème constaté ».
 content_check_problem = "div:has-text('problème constaté'):not(:has-text('Aucun problème')), div:has-text('problème détecté'):not(:has-text('Aucun problème'))"
+# Interrupteur de la verification de contenu : le libelle exact, puis l'interrupteur du bloc le plus proche.
+content_check_switch = "text=\"Vérification de contenu simple\" >> xpath=ancestor::div[.//input[@role='switch']][1]//input[@role='switch']"
 # Bouton final UNIQUE : son texte est « Publier » (maintenant) ou « Programmer » ([labels]).
 post_button = "button[data-e2e='post_video_button']"
 # Abandon du brouillon (non utilise : un arret laisse la page telle quelle, avec sa capture).

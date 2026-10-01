@@ -77,6 +77,9 @@ class FakeKeyboard:
     def type(self, text, **kwargs):
         self.page.calls.append(("type", text))
 
+    def insert_text(self, text):
+        self.page.calls.append(("type", text))
+
 
 class FakeModal(FakeElement):
     """Une fenetre surgissante : un bouton par libelle ; le clic la ferme."""
@@ -325,7 +328,7 @@ class Env:
         self.mp4.parent.mkdir(parents=True, exist_ok=True)
         self.mp4.write_bytes(b"mp4")
         self.config = Config(mode="review", workspace_dir=tmp_path / "w", output_dir=tmp_path / "output",
-                             _sections={"tiktok": settings or {}})
+                             _sections={"tiktok": {"content_check": "wait", **(settings or {})}})
         self.clip = {"video_path": self.mp4, "caption": "Ma legende", "hashtags": ["#un", "#deux"]}
 
     @contextmanager
@@ -352,7 +355,7 @@ def test_tiktok_defaults_are_the_new_account_values_of_the_cadence_study():
     d = tiktok.CONFIG_DEFAULTS
     assert d["backend"] == "browser"
     assert (d["max_posts_per_day"], d["min_gap_minutes"]) == (1, 480)
-    assert (d["min_action_delay_s"], d["max_action_delay_s"]) == (3, 12)
+    assert (d["min_action_delay_s"], d["max_action_delay_s"]) == (1, 3)  # rapide (choix utilisateur)
     assert d["schedule_max_days"] == 10
 
 
@@ -399,13 +402,13 @@ def test_immediate_publish_uploads_mp4_with_caption_and_hashtags_and_returns_the
                       "publish_at": NOW.isoformat(), "note": None}
 
 
-def test_the_caption_is_cleared_then_typed_one_character_at_a_time_never_filled(env):
+def test_the_caption_is_cleared_then_inserted_at_once_never_filled(env):
     env.publish()
 
     keys = [c for c in env.page.calls if c[0] in ("press", "type")]
     text = "Ma legende #un #deux"
     assert keys[:2] == [("press", "Control+A"), ("press", "Backspace")]  # pre-rempli du nom du fichier : vide
-    assert keys[2:] == [("type", ch) for ch in text]
+    assert keys[2:] == [("type", text)]  # insert_text : instantane, un seul evenement
     assert env.page.fills() == []  # pas de fill sur l'editeur Draft.js
     first_click = env.page.calls.index(("click", _sel()["selectors"]["caption_editor"]))
     assert first_click < env.page.calls.index(("press", "Control+A"))
@@ -902,7 +905,7 @@ def test_a_missing_chrome_is_a_browser_error_not_a_stop(tmp_path, monkeypatch):
 def test_action_delays_are_random_bounded_and_beat_the_heartbeat(env):
     env.publish()
     assert len(env.sleeps) >= 4
-    assert all(3 <= s <= 12 for s in env.sleeps)  # bornes par defaut : compte neuf
+    assert all(1 <= s <= 3 for s in env.sleeps)  # bornes par defaut (rapides, choix utilisateur)
     assert len(set(env.sleeps)) > 1  # pas un intervalle mecanique
     assert env.ticks >= len(env.sleeps)
 
@@ -1451,3 +1454,28 @@ def test_a_missing_stats_selector_is_an_explicit_error(tmp_path):
     bad.write_text(text, encoding="utf-8")
     with pytest.raises(tiktok.TikTokError, match=r"\[stats\] row"):
         tiktok.load_selectors(bad)
+
+
+class FakeSwitch:
+    def __init__(self, checked):
+        self.checked, self.unchecks = checked, 0
+
+    def is_checked(self):
+        return self.checked
+
+    def uncheck(self, **kwargs):
+        self.unchecks += 1
+        self.checked = False
+
+
+def test_content_check_off_turns_the_switch_off_and_never_waits(tmp_path, monkeypatch):
+    env = Env(tmp_path, monkeypatch, settings={"content_check": "off"})
+    switch = FakeSwitch(True)
+    real = env.page.query_selector
+    env.page.query_selector = lambda css: switch if css == _sel()["selectors"]["content_check_switch"] else real(css)
+    env.publish()
+    assert switch.unchecks == 1 and switch.checked is False
+
+
+def test_content_check_defaults_to_off():
+    assert tiktok.CONFIG_DEFAULTS["content_check"] == "off"

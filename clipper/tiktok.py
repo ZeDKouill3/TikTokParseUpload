@@ -50,13 +50,15 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "visibility": "public",            # public | private (test reel : private)
     "max_posts_per_day": 1,
     "min_gap_minutes": 480,
-    "min_action_delay_s": 3,
-    "max_action_delay_s": 12,
+    "min_action_delay_s": 1,
+    "max_action_delay_s": 3,
     "schedule_max_days": 10,           # limite native de TikTok Studio
     "schedule_min_minutes": 15,        # avance minimale native de TikTok Studio
     "action_timeout_s": 30,            # attente d'un element de la page
     "upload_timeout_s": 300,           # attente de la fin de l'envoi du mp4
     "publish_confirm_timeout_s": 60,   # attente de la preuve de publication apres « Publier »
+    "content_check": "off",            # off : coupe la verification de contenu de TikTok avant de publier
+                                       # (rapide, comme a la main) ; wait : attend son resultat (~10 min)
     "content_check_timeout_s": 900,    # attente du resultat de la verification de contenu (~10 min)
     "poll_interval_s": 5,              # pas d'attente entre deux lectures de la verification
     "type_delay_ms": 50,               # delai entre deux touches de la legende
@@ -104,7 +106,8 @@ class TikTokStop(TikTokError):
 
 def get_settings(config: Config | None) -> dict[str, Any]:
     settings = dict(config.section("tiktok")) if config is not None else dict(CONFIG_DEFAULTS)
-    for key, allowed in (("backend", BACKENDS), ("publish_mode", MODES), ("visibility", VISIBILITIES)):
+    for key, allowed in (("backend", BACKENDS), ("publish_mode", MODES), ("visibility", VISIBILITIES),
+                         ("content_check", ("off", "wait"))):
         if settings[key] not in allowed:
             raise TikTokError(f"[tiktok] {key} invalide : {settings[key]!r} (attendu : {' | '.join(allowed)})")
     for key, minimum in (("max_posts_per_day", 1), ("min_gap_minutes", 0), ("min_action_delay_s", 0),
@@ -398,13 +401,13 @@ class _Flow:
 
     def type_caption(self, text: str) -> None:
         """L'editeur Draft.js est pre-rempli du nom du fichier : clic, tout selectionner, effacer, puis
-        une touche a la fois (``fill`` n'est pas pris en compte par l'editeur)."""
+        le texte d'un coup par insert_text (un seul evenement de saisie, instantane ; ``fill`` n'est pas
+        pris en compte par l'editeur)."""
         self.wait("caption_editor").click()
         keyboard = self.page.keyboard
         keyboard.press("Control+A")
         keyboard.press("Backspace")
-        for char in text:
-            keyboard.type(char, delay=int(self.settings["type_delay_ms"]))
+        keyboard.insert_text(text)
         self.pause()
 
     def expand_settings(self) -> None:
@@ -500,6 +503,19 @@ class _Flow:
         offered[minute].click()
         self.pause()
         return minute
+
+    def disable_content_check(self) -> None:
+        """Coupe l'interrupteur « Verification de contenu simple » s'il est actif (TikTok modere de toute
+        facon apres publication) : plus d'attente ni de fenetre « Continuer a publier ? »."""
+        switch = self.page.query_selector(self.sel["selectors"]["content_check_switch"])
+        if switch is None:
+            raise self.stop("element_missing", "interrupteur « Vérification de contenu simple » introuvable")
+        if switch.is_checked():
+            switch.uncheck(force=True)
+            self.pause()
+            if switch.is_checked():
+                raise self.stop("unexpected_page", "la vérification de contenu n'a pas pu être coupée")
+            logger.info("TikTok %s : vérification de contenu coupée avant publication", self.account)
 
     def await_content_check(self) -> None:
         """Avant le clic final : attend « Aucun probleme constate ». Probleme signale ou delai depasse :
@@ -614,7 +630,10 @@ class _Flow:
         else:
             self.schedule_now()
 
-        self.await_content_check()
+        if self.settings["content_check"] == "off":
+            self.disable_content_check()
+        else:
+            self.await_content_check()
         self.post(mode)
 
         self.await_published(mode)

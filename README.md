@@ -252,8 +252,8 @@ vues stables) :
 |---|---|---|
 | `max_posts_per_day` | 1 | 3 |
 | `min_gap_minutes` | 480 | 240 |
-| `min_action_delay_s` | 3 | 2 |
-| `max_action_delay_s` | 12 | 8 |
+| `min_action_delay_s` | 1 | 1 |
+| `max_action_delay_s` | 3 | 3 |
 
 ```toml
 [tiktok]
