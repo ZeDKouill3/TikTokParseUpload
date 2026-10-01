@@ -65,6 +65,79 @@ def _read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+# Statuts valides d'une video (contrat pipeline.json) : un filtre hors de cette
+# liste est une erreur, jamais une liste vide silencieuse (ADR-ad2e).
+_VIDEO_STATUSES = ("pending", "running", "awaiting_review", "queued", "done", "failed")
+
+
+def _parse_ts(video_id: str, step: str, key: str, value: str) -> datetime:
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"horodatage illisible ({key}) pour l'etape {step} de {video_id} : {value!r}",
+        ) from exc
+
+
+def _step_durations(state: dict[str, Any]) -> dict[str, float | None]:
+    """Duree (s) de chaque etape = finished_at - started_at ; None tant que
+    l'etape n'a pas fini (aucune duree inventee)."""
+    out: dict[str, float | None] = {}
+    for name, step in (state.get("steps") or {}).items():
+        started, finished = step.get("started_at"), step.get("finished_at")
+        if started and finished:
+            video_id = state.get("video_id", "?")
+            delta = _parse_ts(video_id, name, "finished_at", finished) - _parse_ts(video_id, name, "started_at", started)
+            out[name] = delta.total_seconds()
+        else:
+            out[name] = None
+    return out
+
+
+def _current_step(state: dict[str, Any]) -> str | None:
+    steps = state.get("steps") or {}
+    for name, step in steps.items():
+        if step.get("status") == "running":
+            return name
+    for name, step in steps.items():
+        if step.get("status") != "done":
+            return name
+    return None
+
+
+def _enrich(state: dict[str, Any], config: Config) -> dict[str, Any]:
+    """Etat pipeline.json + titre (meta.json de download, sinon l'identifiant
+    avec la raison), etape courante et duree par etape."""
+    video_id = state["video_id"]
+    out = dict(state)
+    meta_path = Path(config.workspace_dir) / video_id / "meta.json"
+    title = None
+    if meta_path.exists():
+        title = _read_json(meta_path).get("title")
+        reason = None if title else f"meta.json de {video_id} sans titre"
+    else:
+        reason = f"titre inconnu : meta.json absent pour {video_id} (telechargement pas encore fait)"
+    out["title"] = title or video_id
+    out["title_reason"] = reason
+    out["current_step"] = _current_step(state)
+    out["durations"] = _step_durations(state)
+    return out
+
+
+def _matches(video: dict[str, Any], channel: str | None, status: str | None, q: str | None) -> bool:
+    if channel is not None and video.get("channel") != channel:
+        return False
+    if status is not None and video.get("status") != status:
+        return False
+    if q:
+        needle = q.lower()
+        haystack = (video["video_id"], video["title"], video.get("source_url") or "")
+        if not any(needle in text.lower() for text in haystack):
+            return False
+    return True
+
+
 def _list_moments(config: Config, video_id: str) -> list[dict[str, Any]]:
     video_dir = Path(config.workspace_dir) / video_id
     parts_path = video_dir / "parts.json"
@@ -269,15 +342,29 @@ def create_app(config: Config | None = None) -> FastAPI:
         return _enqueue(body.url, None, "run", None, config)
 
     @app.get("/api/videos")
-    def list_videos() -> list[dict[str, Any]]:
-        return _list_states(config)
+    def list_videos(channel: str | None = None, status: str | None = None,
+                    q: str | None = None) -> list[dict[str, Any]]:
+        """Liste filtrable (chaine exacte, statut, texte sur video_id / titre /
+        source_url), chaque video enrichie de son titre, de son etape courante
+        et de la duree de chaque etape (SPEC-c100 E2)."""
+        if status is not None and status not in _VIDEO_STATUSES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"statut inconnu : {status!r} (attendu : {', '.join(_VIDEO_STATUSES)})",
+            )
+        videos = [_enrich(state, config) for state in _list_states(config)]
+        return [v for v in videos if _matches(v, channel, status, q)]
 
     @app.get("/api/videos/{video_id}")
     def get_video(video_id: str) -> dict[str, Any]:
         try:
-            return pipeline.load_state(video_id, config=config)
+            state = pipeline.load_state(video_id, config=config)
         except pipeline.PipelineError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        detail = _enrich(state, config)
+        detail["clips"] = state.get("clips") or []
+        detail["awaiting"] = state.get("awaiting") or []
+        return detail
 
     @app.get("/api/videos/{video_id}/moments")
     def list_moments(video_id: str) -> list[dict[str, Any]]:
