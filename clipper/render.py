@@ -113,7 +113,7 @@ from PIL import Image, ImageDraw, ImageFont
 from clipper.gpu import get_device
 
 CONFIG_DEFAULTS: dict[str, object] = {
-    # Cadence de sortie (SPEC-6127) : imposee, quelle que soit la cadence source.
+    # Cadence de sortie (SPEC-6127) : imposée, quelle que soit la cadence source.
     "max_fps": 30,
     "crf": 20,
     "x264_preset": "medium",
@@ -130,62 +130,62 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "part_font_color": "white",
     "part_margin": 40,
     # Miniature JPEG d'un clip rendu (galerie de l'interface web) : une seule
-    # image, largeur maximale en pixels, prise a thumbnail_seek secondes.
+    # image, largeur maximale en pixels, prise à thumbnail_seek secondes.
     "thumbnail_width": 360,
     "thumbnail_seek": 0.5,
     "blur_radius": 20,
     "blur_power": 2,
-    # Le fond flou (fallback_blur) est calcule sur une image reduite d'un
-    # facteur blur_downscale puis remis a la taille de dest : boxblur sur
-    # 1080x1920 en plein cadre est le cout dominant d'un rendu fallback_blur
-    # (constat essai reel 2026-09-25, ~1200s CPU pour 40s de clip).
+    # Le fond flou (fallback_blur) est calculé sur une image réduite d'un
+    # facteur blur_downscale puis remis à la taille de dest : boxblur sur
+    # 1080x1920 en plein cadre est le coût dominant d'un rendu fallback_blur
+    # (constat essai réel 2026-09-25, ~1200s CPU pour 40s de clip).
     "blur_downscale": 4,
-    # Ecart tolere (s) entre les bornes de captions.json et celles du plan
-    # reframe : au-dela, les entrees sont jugees incoherentes.
+    # Écart toléré (s) entre les bornes de captions.json et celles du plan
+    # reframe : au-delà, les entrées sont jugées incohérentes.
     "start_end_tolerance": 0.15,
-    # Format letterbox (SPEC-6127) : titre d'ecran sur encadre blanc. Tailles
-    # en pixels par em (meme unite pour Pillow et drawtext).
+    # Format letterbox (SPEC-6127) : titre d'écran sur encadré blanc. Tailles
+    # en pixels par em (même unité pour Pillow et drawtext).
     "title_font_size": 64,
     "title_font_size_min": 36,
     "title_font_size_step": 4,
     "title_line_height": 1.25,  # interligne, en em
     "title_emoji_scale": 0.9,  # hauteur de l'emoji, en em
-    # Espace ajoute entre un segment texte et un emoji qui se suivent, en em
-    # (compte dans la largeur mesuree de l'encadre).
+    # Espace ajouté entre un segment texte et un emoji qui se suivent, en em
+    # (compte dans la largeur mesurée de l'encadré).
     "title_emoji_gap": 0.25,
     "title_pad_x": 28,
     "title_pad_y": 16,
     "title_radius": 22,
-    # Ecart (px de sortie) entre le bas de l'encadre du titre et le bas de sa
-    # zone (TASK-ea6e : trop colle a la video sans lui).
+    # Écart (px de sortie) entre le bas de l'encadré du titre et le bas de sa
+    # zone (TASK-ea6e : trop collé à la vidéo sans lui).
     "title_lift": 40,
-    # Police emoji couleur : "" = resolue par plateforme (resolve_emoji_font).
+    # Police emoji couleur : "" = résolue par plateforme (resolve_emoji_font).
     "emoji_font": "",
-    # Taille de rasterisation des emojis, reduits ensuite : NotoColorEmoji
-    # (Linux) ne s'ouvre qu'a 109.
+    # Taille de rasterisation des emojis, réduits ensuite : NotoColorEmoji
+    # (Linux) ne s'ouvre qu'à 109.
     "emoji_raster_size": 109,
     # « Partie N » en letterbox (taille : part_font_size, couleur : part_font_color).
     "part_border": 4,
-    # Appel a l'abonnement (SPEC-6a47), desactive par defaut : sans
-    # configuration explicite, le rendu reste identique a SPEC-6127. Ne
+    # Appel à l'abonnement (SPEC-6a47), désactivé par défaut : sans
+    # configuration explicite, le rendu reste identique à SPEC-6127. Ne
     # s'applique qu'aux layouts letterbox/stream (_TEXT_LAYOUTS) ; le format
-    # crop reste fige (ADR-ad2e : jamais applique en silence hors de ces deux
-    # layouts, jamais non plus a moitie active sans cta_handle/cta_text).
+    # crop reste figé (ADR-ad2e : jamais appliqué en silence hors de ces deux
+    # layouts, jamais non plus à moitié active sans cta_handle/cta_text).
     "cta_enabled": False,
     "cta_handle": "",
     "cta_seconds": 2.0,
     "cta_text": "Abonne-toi !",
-    # Pseudo de chaine, sous le titre d'ecran, dans la meme bande floue du
-    # haut (texte discret, sans encadre) : tailles en pixels d'em.
+    # Pseudo de chaîne, sous le titre d'écran, dans la même bande floue du
+    # haut (texte discret, sans encadré) : tailles en pixels d'em.
     "cta_handle_font_size": 32,
     "cta_handle_font_size_min": 20,
     "cta_handle_font_size_step": 2,
     "cta_handle_font_color": "white",
     "cta_handle_outline": 3,
-    # Ecart (px) entre le bas de l'encadre du titre et le pseudo.
+    # Écart (px) entre le bas de l'encadré du titre et le pseudo.
     "cta_handle_gap": 8,
-    # Carte de fin (encadre blanc, texte noir, meme style que le titre mais
-    # centree dans sa zone) : tailles en pixels d'em.
+    # Carte de fin (encadré blanc, texte noir, même style que le titre mais
+    # centrée dans sa zone) : tailles en pixels d'em.
     "cta_card_font_size": 56,
     "cta_card_font_size_min": 32,
     "cta_card_font_size_step": 4,
@@ -193,11 +193,11 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "cta_card_pad_y": 16,
     "cta_card_radius": 22,
     "cta_card_line_height": 1.25,
-    # Titre d'ecran (SPEC-76dc, nouveau reglage : jusqu'ici toujours dessine).
-    # Defaut True = comportement inchange. False : aucun titre, sur aucun
+    # Titre d'écran (SPEC-76dc, nouveau réglage : jusqu'ici toujours dessiné).
+    # Défaut True = comportement inchangé. False : aucun titre, sur aucun
     # layout ; text_zones.title n'est alors plus requis.
     "title_enabled": True,
-    # Badge de chaine (SPEC-76dc, agencement stream split seulement : la
+    # Badge de chaîne (SPEC-76dc, agencement stream split seulement : la
     # zone badge n'existe que dans reframe/<clip_id>.json en stream_split,
     # erreur explicite sinon). Remplace le pseudo texte de l'appel a
     # l'abonnement (cta_handle) sur ce clip quand les deux sont actifs,
@@ -206,25 +206,25 @@ CONFIG_DEFAULTS: dict[str, object] = {
     # Chemin du logo (PNG), requis si badge_enabled ; fichier absent = erreur
     # explicite (ADR-ad2e).
     "badge_logo": "",
-    # Nom affiche a droite du logo, requis si badge_enabled.
+    # Nom affiché à droite du logo, requis si badge_enabled.
     "badge_name": "",
-    # Cote (px) du carre qui contient le logo.
+    # Côté (px) du carré qui contient le logo.
     "badge_logo_size": 100,
-    # Le glyphe du logo est reduit de ce facteur a l'interieur du carre
+    # Le glyphe du logo est réduit de ce facteur à l'intérieur du carré
     # (marge visuelle autour de lui).
     "badge_glyph_scale": 0.65,
     "badge_font_size": 40,
-    # Couleur de remplissage du carre du logo (jamais de noir par defaut) :
-    # vide ("") = echantillonnee automatiquement au coin (0, 0) de l'image
-    # du logo elle-meme (le fond du logo Twitch par ex. est deja viole dans
-    # le PNG). Toujours appliquee, quel que soit badge_background.
+    # Couleur de remplissage du carré du logo (jamais de noir par défaut) :
+    # vide ("") = échantillonnée automatiquement au coin (0, 0) de l'image
+    # du logo elle-meme (le fond du logo Twitch par ex. est déjà viole dans
+    # le PNG). Toujours appliquée, quel que soit badge_background.
     "badge_logo_fill": "",
     # Fond du bandeau badge (couleur PIL, ex. "black") ou "none" : dans ce
-    # cas aucun rectangle n'est dessine derriere le nom (le carre du logo
+    # cas aucun rectangle n'est dessiné derrière le nom (le carré du logo
     # garde toujours son propre remplissage, badge_logo_fill ci-dessus) ; le
     # nom reste lisible via badge_name_outline / badge_name_shadow_*
-    # ci-dessous. Defaut "black" = bandeau plein, comportement SPEC-76dc
-    # inchange.
+    # ci-dessous. Défaut "black" = bandeau plein, comportement SPEC-76dc
+    # inchangé.
     "badge_background": "black",
     "badge_name_outline_color": "black",
     "badge_name_outline": 3,

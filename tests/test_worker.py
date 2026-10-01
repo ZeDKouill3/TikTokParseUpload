@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 import os
 import sys
+from pathlib import Path
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -582,3 +584,84 @@ def test_tick_logs_a_broken_preset_instead_of_crashing(tmp_path, caplog):
         worker.Worker(config=config, spawner=FakeSpawner(), watch_lister=lister).tick()
 
     assert "cassee" in caplog.text
+
+
+# --------------------------------------------------------------------------
+# TASK-a40d : battement du worker (voyant « worker actif / arrêté » du tableau de bord)
+# --------------------------------------------------------------------------
+
+
+def _hb_config(tmp_path, **worker_overrides) -> Config:
+    return _config(tmp_path, **worker_overrides)
+
+
+def test_worker_defaults_declare_the_heartbeat_settings():
+    assert worker.CONFIG_DEFAULTS["heartbeat_interval_s"] > 0
+    assert worker.heartbeat_path(_config(Path("x"))) == Path("x") / "state" / "worker.json"
+
+
+def test_tick_writes_a_heartbeat_with_pid_and_timestamp(tmp_path):
+    config = _hb_config(tmp_path)
+
+    worker.Worker(config=config, spawner=FakeSpawner(FakeProcess())).tick()
+
+    beat = json.loads((tmp_path / "state" / "worker.json").read_text(encoding="utf-8"))
+    assert beat["pid"] == os.getpid()
+    assert datetime.fromisoformat(beat["at"]).tzinfo is not None
+
+
+def test_heartbeat_is_rewritten_only_once_the_interval_has_passed(tmp_path, monkeypatch):
+    config = _hb_config(tmp_path, heartbeat_interval_s=5)
+    path = tmp_path / "state" / "worker.json"
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(worker.time, "monotonic", lambda: clock["t"])
+    w = worker.Worker(config=config, spawner=FakeSpawner(FakeProcess()))
+
+    w.tick()
+    first = path.read_text(encoding="utf-8")
+    path.unlink()
+    clock["t"] += 2
+    w.tick()
+    assert not path.exists()
+    clock["t"] += 4
+    w.tick()
+    assert path.exists() and first
+
+
+def test_read_heartbeat_reports_active_stale_and_stopped(tmp_path):
+    config = _hb_config(tmp_path, heartbeat_interval_s=5)
+    now = datetime(2026, 10, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+    assert worker.read_heartbeat(config, now=now)["state"] == "stopped"
+
+    path = tmp_path / "state" / "worker.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"pid": os.getpid(), "at": (now - timedelta(seconds=4)).isoformat()}), encoding="utf-8")
+    active = worker.read_heartbeat(config, now=now)
+    assert active["state"] == "active" and active["pid"] == os.getpid() and active["age_s"] == 4
+
+    path.write_text(json.dumps({"pid": os.getpid(), "at": (now - timedelta(seconds=60)).isoformat()}), encoding="utf-8")
+    stale = worker.read_heartbeat(config, now=now)
+    assert stale["state"] == "stale" and "périmé" in stale["reason"]
+    assert stale["command"] == "python -m clipper worker"
+
+
+def test_read_heartbeat_refuses_an_unreadable_file_in_french(tmp_path):
+    config = _hb_config(tmp_path)
+    path = tmp_path / "state" / "worker.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{pas du json", encoding="utf-8")
+
+    with pytest.raises(worker.WorkerError, match="battement"):
+        worker.read_heartbeat(config)
+
+
+def test_heartbeat_with_a_dead_pid_is_stopped_even_if_recent(tmp_path, monkeypatch):
+    config = _hb_config(tmp_path)
+    now = datetime(2026, 10, 1, 12, 0, 0, tzinfo=timezone.utc)
+    path = tmp_path / "state" / "worker.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"pid": 99999, "at": now.isoformat()}), encoding="utf-8")
+    monkeypatch.setattr(worker, "_pid_alive", lambda pid: False)
+
+    assert worker.read_heartbeat(config, now=now)["state"] == "stopped"

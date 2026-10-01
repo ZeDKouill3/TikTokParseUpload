@@ -92,209 +92,209 @@ from clipper.gpu import Device, get_device
 log = logging.getLogger(__name__)
 
 CONFIG_DEFAULTS: dict[str, object] = {
-    # Mise en page : "letterbox" (zoom fixe, sans visage suivi, defaut) ou
-    # "crop" (suivi de visage, option figee, voir le reste de ce module).
+    # Mise en page : "letterbox" (zoom fixe, sans visage suivi, défaut) ou
+    # "crop" (suivi de visage, option figée, voir le reste de ce module).
     "format": "letterbox",
-    # Format letterbox seulement (SPEC-8257, succede a SPEC-3a88) :
-    # "letterbox" (defaut) ou "stream_auto" = clip en stream (facecam fixe
-    # agrandie en haut, jeu en bas) si la video a une facecam et que son
-    # rectangle y est present et vivant sur au moins facecam_clip_min_share
-    # des images cles du clip, sinon letterbox (raison journalisee). Voir
+    # Format letterbox seulement (SPEC-8257, succède à SPEC-3a88) :
+    # "letterbox" (défaut) ou "stream_auto" = clip en stream (facecam fixe
+    # agrandie en haut, jeu en bas) si la vidéo a une facecam et que son
+    # rectangle y est présent et vivant sur au moins facecam_clip_min_share
+    # des images clés du clip, sinon letterbox (raison journalisée). Voir
     # detect_facecam et _clip_facecam.
     "layout": "letterbox",
-    # Localisation de la facecam (une fois par video, SPEC-8257 regle 1) :
-    # visage a la meme position (centre a moins de facecam_tolerance px) sur
-    # au moins facecam_localize_min_share des images cles de scenes.json,
+    # Localisation de la facecam (une fois par vidéo, SPEC-8257 règle 1) :
+    # visage à la même position (centre à moins de facecam_tolerance px) sur
+    # au moins facecam_localize_min_share des images clés de scenes.json,
     # dans une zone de moins de facecam_max_area de l'image. Seuil distinct
-    # de, et par defaut bien plus bas que, celui exige par clip
-    # (facecam_clip_min_share ci-dessous) : une facecam est reperee des
-    # qu'un visage y apparait de temps en temps, meme rarement (jeu sombre,
+    # de, et par défaut bien plus bas que, celui exigé par clip
+    # (facecam_clip_min_share ci-dessous) : une facecam est repérée des
+    # qu'un visage y apparaît de temps en temps, même rarement (jeu sombre,
     # webcam petite, casque).
     "facecam_localize_min_share": 0.1,
     "facecam_tolerance": 40,
     "facecam_max_area": 0.25,
     # detect_facecam seulement (TASK-493f184c4ce1) : au plus ce nombre
-    # d'images cles examinees (image entiere + 4 coins agrandis), a
-    # intervalles reguliers sur toute la duree de la video (indices
-    # equirepartis, bornes comprises) quand scenes.json en fournit plus ;
-    # borne le nombre d'appels au detecteur sur une video a beaucoup
-    # d'images cles (248 s sur 2326 images cles avant ce reglage).
+    # d'images clés examinées (image entière + 4 coins agrandis), a
+    # intervalles réguliers sur toute la durée de la vidéo (indices
+    # équirépartis, bornes comprises) quand scenes.json en fournit plus ;
+    # borne le nombre d'appels au détecteur sur une vidéo à beaucoup
+    # d'images clés (248 s sur 2326 images clés avant ce réglage).
     "facecam_max_keyframes": 200,
-    # detect_facecam seulement : en plus de l'image entiere, chaque coin de
-    # l'image cle est recadre a facecam_corner_size de la largeur/hauteur puis
-    # agrandi facecam_corner_zoom fois avant detection (coordonnees ramenees
-    # a l'image source) : une petite facecam en coin (visage ~160 px sur
-    # 1920) y occupe une part bien plus grande que dans l'image entiere
-    # reduite par le detecteur.
+    # detect_facecam seulement : en plus de l'image entière, chaque coin de
+    # l'image clé est recadré à facecam_corner_size de la largeur/hauteur puis
+    # agrandi facecam_corner_zoom fois avant détection (coordonnées ramenées
+    # à l'image source) : une petite facecam en coin (visage ~160 px sur
+    # 1920) y occupe une part bien plus grande que dans l'image entière
+    # réduite par le détecteur.
     "facecam_corner_size": 0.3,
     "facecam_corner_zoom": 2.0,
-    # Rectangle source de la facecam : au format du panneau camera, centre
+    # Rectangle source de la facecam : au format du panneau caméra, centre
     # sur le visage, qui en occupe cette part de la hauteur. Repli quand les
-    # bords reels de l'incrustation ne sont pas trouves (voir plus bas).
+    # bords réels de l'incrustation ne sont pas trouvés (voir plus bas).
     "stream_face_height": 0.5,
-    # Bords reels de l'incrustation (TASK-6404), cherches de part et d'autre
-    # du visage stable plutot que devines depuis sa seule taille : premiere
-    # position, en s'eloignant du visage, ou le gradient moyen (colonne pour
-    # les bords gauche/droit, ligne pour haut/bas, sur l'etendue du visage)
-    # depasse facecam_edge_min_gradient sur au moins facecam_edge_min_share
-    # des images cles -- une discontinuite forte et constante. La recherche
-    # part du bord du visage elargi de facecam_edge_gap_ratio (fraction de sa
-    # largeur/hauteur, pour sauter son propre contour) et s'arrete a
+    # Bords réels de l'incrustation (TASK-6404), cherchés de part et d'autre
+    # du visage stable plutôt que devinés depuis sa seule taille : première
+    # position, en s'éloignant du visage, où le gradient moyen (colonne pour
+    # les bords gauche/droit, ligne pour haut/bas, sur l'étendue du visage)
+    # dépasse facecam_edge_min_gradient sur au moins facecam_edge_min_share
+    # des images clés -- une discontinuité forte et constante. La recherche
+    # part du bord du visage élargi de facecam_edge_gap_ratio (fraction de sa
+    # largeur/hauteur, pour sauter son propre contour) et s'arrête a
     # facecam_edge_search_ratio fois sa largeur/hauteur. Un ou deux bords non
-    # adjacents (un cote, ou un coin) introuvables alors que les autres sont
+    # adjacents (un côté, ou un coin) introuvables alors que les autres sont
     # nets sont pris pour des bords de l'image elle-meme (TASK-6519, cas
-    # courant : facecam collee a 1 ou 2 bords) ; au-dela (ou deux manquants
-    # sur le meme axe), repli sur le rectangle centre sur le visage
-    # (stream_face_height ci-dessus), raison journalisee (ADR-ad2e).
+    # courant : facecam collée à 1 ou 2 bords) ; au-delà (ou deux manquants
+    # sur le même axe), repli sur le rectangle centre sur le visage
+    # (stream_face_height ci-dessus), raison journalisée (ADR-ad2e).
     "facecam_edge_gap_ratio": 0.05,
     "facecam_edge_search_ratio": 3.0,
     "facecam_edge_min_gradient": 30.0,
     "facecam_edge_min_share": 0.8,
-    # Presence de la facecam par clip (SPEC-8257 regle 2) : un clip reste en
-    # stream si le rectangle de la facecam (deja localise) y est present et
-    # vivant sur au moins facecam_clip_min_share de ses images cles, SANS
-    # exiger qu'un visage y soit detecte (webcam petite, jeu sombre, casque,
-    # tete tournee : le visage n'est qu'un indice de localisation, pas une
-    # condition par clip). Un rectangle est present et vivant sur une image
-    # cle quand, a la fois :
-    # (a) son contenu n'est pas noir : luminosite moyenne au moins
-    #     facecam_black_min_mean, ou texture (ecart-type des niveaux de
+    # Présence de la facecam par clip (SPEC-8257 règle 2) : un clip reste en
+    # stream si le rectangle de la facecam (déjà localisé) y est présent et
+    # vivant sur au moins facecam_clip_min_share de ses images clés, SANS
+    # exiger qu'un visage y soit détecté (webcam petite, jeu sombre, casque,
+    # tête tournée : le visage n'est qu'un indice de localisation, pas une
+    # condition par clip). Un rectangle est présent et vivant sur une image
+    # clé quand, à la fois :
+    # (a) son contenu n'est pas noir : luminosité moyenne au moins
+    #     facecam_black_min_mean, ou texture (écart-type des niveaux de
     #     gris) au moins facecam_black_min_std ;
-    # (b) ses bords sont retrouves au meme endroit qu'a la localisation
-    #     (meme methode de gradient, facecam_edge_min_gradient) sur au moins
-    #     facecam_clip_edge_min_share d'une paire de cotes opposes
+    # (b) ses bords sont retrouvés au même endroit qu'à la localisation
+    #     (même méthode de gradient, facecam_edge_min_gradient) sur au moins
+    #     facecam_clip_edge_min_share d'une paire de côtés opposés
     #     (gauche/droit ou haut/bas) : le rectangle n'est agrandi que sur un
-    #     seul axe pour tenir le format du panneau camera, l'autre garde le
-    #     bord reel de l'incrustation ; ignoree quand la localisation
-    #     elle-meme n'a trouve aucun bord reel (repli sur le seul visage
+    #     seul axe pour tenir le format du panneau caméra, l'autre garde le
+    #     bord réel de l'incrustation ; ignorée quand la localisation
+    #     elle-meme n'a trouvé aucun bord réel (repli sur le seul visage
     #     stable, edge_reason non nul dans facecam.json : rien de comparable
-    #     a chercher par image cle) ;
-    # (c) il n'est pas fige : au moins facecam_frozen_min_pixel_share de ses
-    #     pixels different (niveaux de gris, ecart au moins
-    #     facecam_frozen_min_diff pour ecarter le bruit de capteur) de
-    #     l'image cle precedente du meme clip (un ecran de pause immobile ou
-    #     un BRB ne satisfont pas ce critere). Part de pixels plutot que
+    #     à chercher par image clé) ;
+    # (c) il n'est pas figé : au moins facecam_frozen_min_pixel_share de ses
+    #     pixels different (niveaux de gris, écart au moins
+    #     facecam_frozen_min_diff pour écarter le bruit de capteur) de
+    #     l'image clé précédente du même clip (un écran de pause immobile ou
+    #     un BRB ne satisfont pas ce critère). Part de pixels plutôt que
     #     moyenne globale : le rectangle est plus grand que la personne qui
     #     y bouge (marge de stream_face_height), une moyenne diluerait un
-    #     mouvement localise mais reel.
-    # Un clip qui ne l'est pas assez souvent reste entierement en letterbox,
-    # raison journalisee (ADR-ad2e : jamais un repli silencieux).
+    #     mouvement localise mais réel.
+    # Un clip qui ne l'est pas assez souvent reste entièrement en letterbox,
+    # raison journalisée (ADR-ad2e : jamais un repli silencieux).
     "facecam_clip_min_share": 0.8,
     "facecam_black_min_mean": 12.0,
     "facecam_black_min_std": 6.0,
     "facecam_clip_edge_min_share": 0.5,
     "facecam_frozen_min_diff": 8.0,
     "facecam_frozen_min_pixel_share": 0.001,
-    # Panneau camera : part de la hauteur de sortie, a partir de stream_top
-    # (titre d'ecran au-dessus) ; le jeu occupe tout le bas.
+    # Panneau caméra : part de la hauteur de sortie, à partir de stream_top
+    # (titre d'écran au-dessus) ; le jeu occupe tout le bas.
     "stream_camera_ratio": 0.4,
     "stream_top": 440,
-    # Agencement d'un clip deja en stream (SPEC-76dc) : n'intervient qu'apres
-    # les regles 1/2 ci-dessus (aucun effet sur le choix stream/letterbox
-    # lui-meme). "top" (defaut, comportement inchange) = SPEC-3a88 ci-dessus.
+    # Agencement d'un clip déjà en stream (SPEC-76dc) : n'intervient qu'après
+    # les règles 1/2 ci-dessus (aucun effet sur le choix stream/letterbox
+    # lui-meme). "top" (défaut, comportement inchangé) = SPEC-3a88 ci-dessus.
     # "split" = webcam en haut (~1/3 de la hauteur), jeu en bas pleine largeur,
-    # badge de chaine optionnel, sous-titres a deux couleurs (voir
+    # badge de chaîne optionnel, sous-titres à deux couleurs (voir
     # clipper.subtitles split_*).
     "stream_variant": "top",
     # Zones de sortie de l'agencement split (SPEC-76dc), en pixels du canevas
     # 1080x1920 : webcam agrandie en haut, jeu en bas pleine largeur. Chacune
-    # est recadree (jamais etiree) au ratio de son rectangle dest ; doivent
+    # est recadrée (jamais étirée) au ratio de son rectangle dest ; doivent
     # tenir dans le canevas et ne jamais se chevaucher (erreur explicite au
     # chargement sinon, ADR-ad2e).
     "split_webcam_dest": {"x": 20, "y": 0, "w": 1040, "h": 640},
     "split_gameplay_dest": {"x": 0, "y": 640, "w": 1080, "h": 1280},
-    # Bandeau de badge de chaine (logo + nom, [render] badge_*), a cheval par
-    # defaut sur la jonction webcam/jeu. Doit tenir dans la zone sure TikTok
+    # Bandeau de badge de chaîne (logo + nom, [render] badge_*), à cheval par
+    # défaut sur la jonction webcam/jeu. Doit tenir dans la zone sûre TikTok
     # (erreur explicite sinon).
     "badge_dest": {"x": 330, "y": 590, "w": 420, "h": 100},
     # Zone des sous-titres de l'agencement split (clipper.subtitles split_*),
-    # entierement dans la zone jeu, sans jamais recouvrir le badge. Doit
-    # tenir dans la zone sure TikTok (erreur explicite sinon).
+    # entièrement dans la zone jeu, sans jamais recouvrir le badge. Doit
+    # tenir dans la zone sûre TikTok (erreur explicite sinon).
     "split_subtitle_dest": {"x": 150, "y": 710, "w": 780, "h": 150},
-    # Le jeu est la plus grande fenetre, au format de son panneau, la plus
-    # centree possible, qui evite la facecam elargie de cette marge (px source :
-    # le cadre reel de la facecam deborde le rectangle centre sur le visage).
+    # Le jeu est la plus grande fenêtre, au format de son panneau, la plus
+    # centrée possible, qui évite la facecam élargie de cette marge (px source :
+    # le cadre réel de la facecam déborde le rectangle centre sur le visage).
     "stream_exclude_margin": 80,
-    # Zoom fixe du format letterbox : fenetre centrale de largeur
-    # source_w / letterbox_zoom, pleine hauteur. Pensees pour une source 16:9.
+    # Zoom fixe du format letterbox : fenêtre centrale de largeur
+    # source_w / letterbox_zoom, pleine hauteur. Pensées pour une source 16:9.
     "letterbox_zoom": 1.3,
-    # Ordonnee (sortie) ou commence le panneau video du format letterbox.
+    # Ordonnée (sortie) où commence le panneau vidéo du format letterbox.
     "letterbox_top": 440,
-    # Zone sure TikTok (sortie 1080x1920) : aucun texte hors de ces bornes.
+    # Zone sûre TikTok (sortie 1080x1920) : aucun texte hors de ces bornes.
     "safe_top": 160,
     "safe_bottom": 1520,
     "safe_left": 150,
     "safe_right": 930,
-    # Ecart minimal entre un bloc de texte et le panneau video.
+    # Écart minimal entre un bloc de texte et le panneau vidéo.
     "text_gap": 16,
-    # Hauteur de la bande "Partie N" en bas de la zone sure.
+    # Hauteur de la bande "Partie N" en bas de la zone sûre.
     "part_height": 56,
-    # Detecteur de visages local (seul "mediapipe" est fourni).
+    # Détecteur de visages local (seul "mediapipe" est fourni).
     "detector": "mediapipe",
-    # Modele .tflite de mediapipe ; "" = ~/.cache/clipper/blaze_face_short_range.tflite.
+    # Modèle .tflite de mediapipe ; "" = ~/.cache/clipper/blaze_face_short_range.tflite.
     "model_path": "",
-    # Telecharge une fois si model_path manque ; "" = jamais de telechargement.
+    # Télécharge une fois si model_path manque ; "" = jamais de téléchargement.
     "model_url": (
         "https://storage.googleapis.com/mediapipe-models/face_detector/"
         "blaze_face_short_range/float16/latest/blaze_face_short_range.tflite"
     ),
     "min_confidence": 0.5,
-    # Grilles de detection : 1 = image entiere, 2 = 2x2 tuiles qui se
+    # Grilles de détection : 1 = image entière, 2 = 2x2 tuiles qui se
     # chevauchent (visages petits, ex. facecam dans un coin).
     "tiles": [1, 2],
-    # Images analysees par seconde de plan.
+    # Images analysées par seconde de plan.
     "sample_fps": 5.0,
-    # Une piste plus courte est une fausse detection, ignoree.
+    # Une piste plus courte est une fausse détection, ignorée.
     "min_track_seconds": 0.5,
-    # Deux detections d'une meme image dont l'IoU atteint ce seuil sont un
-    # seul visage (ex. image entiere et tuile) : la plus sure est gardee. Le
-    # meme seuil recolle deux pistes qui se suivent dans le temps (voir
+    # Deux détections d'une même image dont l'IoU atteint ce seuil sont un
+    # seul visage (ex. image entière et tuile) : la plus sûre est gardée. Le
+    # même seuil recolle deux pistes qui se suivent dans le temps (voir
     # track_merge_seconds).
     "duplicate_iou": 0.3,
-    # Deux pistes dont la seconde commence au plus tant de secondes apres la
-    # fin de la premiere, a la meme place (IoU des boites de jonction >=
-    # duplicate_iou), sont un seul visage perdu un moment par le detecteur.
+    # Deux pistes dont la seconde commence au plus tant de secondes après la
+    # fin de la première, à la même place (IoU des boîtes de jonction >=
+    # duplicate_iou), sont un seul visage perdu un moment par le détecteur.
     "track_merge_seconds": 3.0,
-    # Visage retenu (jamais coupe par le cadre) : reellement detecte sur au
-    # moins cette part des images analysees de sa piste, de sa premiere a sa
-    # derniere detection (une fausse detection clignote, un vrai visage a
-    # l'image est vu presque partout, meme s'il entre a mi-plan)...
+    # Visage retenu (jamais coupé par le cadre) : réellement détecté sur au
+    # moins cette part des images analysées de sa piste, de sa première a sa
+    # dernière détection (une fausse détection clignote, un vrai visage a
+    # l'image est vu presque partout, même s'il entre à mi-plan)...
     "min_face_presence": 0.6,
-    # ... sur une piste d'au moins cette duree (une piste fantome de
+    # ... sur une piste d'au moins cette durée (une piste fantôme de
     # quelques images n'est pas un visage)...
     "min_face_seconds": 1.0,
     # ... et de hauteur moyenne au moins cette part de la hauteur source.
-    # Les autres pistes restent annotees pour le LLM, mais ne contraignent
+    # Les autres pistes restent annotées pour le LLM, mais ne contraignent
     # pas le cadre.
     "min_face_height": 0.05,
-    # Ecran partage : part de la hauteur d'un panneau occupee par son visage
+    # Écran partagé : part de la hauteur d'un panneau occupée par son visage
     # (le cadre est agrandi par paliers si l'autre visage retenu serait
-    # coupe, jusqu'au plus grand cadre possible).
+    # coupe, jusqu'àu plus grand cadre possible).
     "split_face_height": 0.35,
-    # Un ecran partage n'est jamais choisi pour un plan plus court : en
-    # dessous, repli fallback_blur (un split de 1 s clignote a l'ecran).
+    # Un écran partagé n'est jamais choisi pour un plan plus court : en
+    # dessous, repli fallback_blur (un split de 1 s clignote à l'écran).
     "split_min_seconds": 3.0,
-    # Plan plus court (coupe de scene parasite, bord du clip) : fusionne au
+    # Plan plus court (coupe de scène parasite, bord du clip) : fusionné au
     # plan voisin avant l'appel LLM.
     "min_plan_seconds": 0.5,
-    # Marge autour de chaque visage (fraction de sa taille, de chaque cote) :
-    # couvre le mouvement entre deux images analysees.
+    # Marge autour de chaque visage (fraction de sa taille, de chaque côté) :
+    # couvre le mouvement entre deux images analysées.
     "face_margin": 0.15,
-    # Paliers du cadrage single quand le visage suivi (gros plan, camera
-    # portee) ne tient pas dans le cadre, essayes dans l'ordre a chaque image
-    # analysee avant tout repli ; le visage suivi n'est jamais rogne et les
+    # Paliers du cadrage single quand le visage suivi (gros plan, caméra
+    # portée) ne tient pas dans le cadre, essayés dans l'ordre à chaque image
+    # analysée avant tout repli ; le visage suivi n'est jamais rogné et les
     # autres visages retenus gardent toujours face_margin et leur zone
-    # balayee (jamais coupes) :
-    # 1. marges reduites, dans l'ordre (celles < face_margin), sur la zone
-    #    balayee par le visage suivi ;
-    # 2. puis boite instantanee du visage suivi (marge 0) au lieu de sa zone
-    #    balayee.
+    # balayée (jamais coupes) :
+    # 1. marges réduites, dans l'ordre (celles < face_margin), sur la zone
+    #    balayée par le visage suivi ;
+    # 2. puis boîte instantanée du visage suivi (marge 0) au lieu de sa zone
+    #    balayée.
     "fit_margins": [0.1, 0.05, 0.0],
-    # Fenetre de la moyenne glissante du suivi.
+    # Fenêtre de la moyenne glissante du suivi.
     "smooth_seconds": 1.0,
     # Zone morte du suivi, fraction de la largeur du cadre.
     "deadzone": 0.1,
-    # Part de la hauteur de sortie donnee a la camera en facecam_gameplay.
+    # Part de la hauteur de sortie donnée à la caméra en facecam_gameplay.
     "facecam_height_ratio": 0.4,
     # Repli quand aucun cadre ne garde les visages entiers :
     # "auto" = split si au moins deux visages, sinon fallback_blur ;
@@ -302,7 +302,7 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "fallback": "auto",
     "output_width": 1080,
     "output_height": 1920,
-    # Largeur maximale de l'image annotee envoyee au LLM.
+    # Largeur maximale de l'image annotée envoyée au LLM.
     "annotated_max_width": 1280,
     "jpeg_quality": 90,
 }

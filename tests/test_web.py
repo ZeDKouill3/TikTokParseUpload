@@ -8,6 +8,10 @@ Aucun test n'utilise le reseau ni un vrai LLM.
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import subprocess
+from datetime import timezone
 from pathlib import Path
 
 import pytest
@@ -1723,7 +1727,7 @@ def test_get_clips_returns_sidecar_url_qa_and_publish_status(tmp_path, isolated_
     assert first["slot_at"] == "2026-10-02T18:00:00+00:00"
     assert clips["02"]["qa_status"] == "rejected"
     assert clips["02"]["issues"] == ["sous-titres hors zone"]
-    assert clips["02"]["publish_status"] == "à valider"
+    assert clips["02"]["publish_status"] == "rejected"               # refusé par la QA : jamais « à valider »
     assert clips["03"]["publish_status"] == "failed"
     assert clips["03"]["publish_error"] == "quota depasse"
 
@@ -1736,7 +1740,7 @@ def test_get_clips_filters_by_channel_video_and_status(tmp_path, isolated_cwd):
     assert [(x["video_id"], x["clip_id"]) for x in by_channel] == [("othervideo01", "01")]
     assert len(c.get("/api/clips").json()) == 4
     by_status = c.get("/api/clips", params={"status": "à valider"}).json()
-    assert {(x["video_id"], x["clip_id"]) for x in by_status} == {(CLIPS_VIDEO, "02"), ("othervideo01", "01")}
+    assert {(x["video_id"], x["clip_id"]) for x in by_status} == {("othervideo01", "01")}
     assert [x["clip_id"] for x in c.get("/api/clips", params={"status": "failed", "video_id": CLIPS_VIDEO}).json()] == ["03"]
 
 
@@ -2616,8 +2620,8 @@ def test_get_settings_returns_effective_values_and_documented_defaults_per_secti
         assert section in data["defaults"], section
     # même mécanisme que l'écran Chaînes : défaut + commentaire du source
     assert data["defaults"]["web"]["port"]["default"] == 8000
-    assert "Hote et port" in data["defaults"]["web"]["host"]["comment"]
-    assert "reponse refusee" in data["defaults"]["llm"]["repair_attempts"]["comment"]
+    assert "Hôte et port" in data["defaults"]["web"]["host"]["comment"]
+    assert "réponse refusée" in data["defaults"]["llm"]["repair_attempts"]["comment"]
     assert set(data["backends"]) == {"claude-cli", "claude-api", "ollama"}
     assert data["modes"] == ["review", "auto"]
     assert data["comments_lost"] is True                              # le fichier contient un commentaire
@@ -3532,3 +3536,277 @@ def test_new_channel_button_opens_a_defined_and_visible_modal_panel():
     # le panneau ne dépend pas du seul requestAnimationFrame (suspendu hors écran) pour devenir visible
     panel = ui[ui.index("function openPanel("):ui.index("document.addEventListener(\"keydown\"")]
     assert "setTimeout(reveal" in panel and "try { onOpen(el); }" in panel
+
+
+# --------------------------------------------------------------------------
+# TASK-a40d : corrections du deuxième tour de la console v2
+# --------------------------------------------------------------------------
+
+def _write_full_sidecar(tmp_path, video_id, clip_id, **fields):
+    """Sidecar tel que le rend le pipeline : il porte son video_id (SPEC-6a47)."""
+    sidecar = {"video_id": video_id, "clip_id": clip_id, "ready": True, "screen_title": f"Titre {clip_id}", **fields}
+    _write_json(tmp_path / "output" / video_id / f"{clip_id}.json", sidecar)
+
+
+_QA_ISSUE = {"type": "black_frames", "detail": "image noire de 2 s", "source": "local", "severity": "blocking"}
+
+
+def _round2_clips(tmp_path):
+    """3 clips d'une vidéo avec chaîne, dont 1 refusé par la QA : 2 à valider."""
+    _write_state(tmp_path, "aaaaaaaaaaa", channel="ma_chaine")
+    _write_full_sidecar(tmp_path, "aaaaaaaaaaa", "01", qa={"status": "passed", "issues": []})
+    _write_full_sidecar(tmp_path, "aaaaaaaaaaa", "02", qa={"status": "passed", "issues": []})
+    _write_full_sidecar(tmp_path, "aaaaaaaaaaa", "03", ready=False, qa={"status": "rejected", "issues": [_QA_ISSUE]})
+
+
+def test_stats_issue_text_extracts_the_message_of_a_qa_issue_never_object_object():
+    js = (STATIC / "screens" / "stats.js").read_text(encoding="utf-8")
+
+    assert "function statsIssueText" in js
+    assert "issue.detail" in js
+    assert 'c.issues.map(statsIssueText)' in js
+    assert 'c.issues.join(' not in js
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node absent du PATH")
+def test_stats_issue_text_renders_objects_and_strings_readably(tmp_path):
+    js = (STATIC / "screens" / "stats.js").read_text(encoding="utf-8")
+    start = js.index("function statsIssueText")
+    end = js.index("\n}\n", start) + 3
+    script = js[start:end] + f"\nconsole.log(JSON.stringify([statsIssueText({json.dumps(_QA_ISSUE)}), statsIssueText('hors cadre')]));"
+    out = subprocess.run(["node", "-e", script], capture_output=True, text=True, check=True).stdout
+    assert json.loads(out) == ["image noire de 2 s", "hors cadre"]
+
+
+def test_api_stats_passes_the_qa_issues_as_objects_the_screen_must_unwrap(tmp_path, isolated_cwd):
+    _round2_clips(tmp_path)
+
+    clips = {c["clip_id"]: c for c in _stats(tmp_path)["clips"]}
+
+    assert clips["03"]["issues"] == [_QA_ISSUE]
+
+
+def test_qa_rejected_clip_is_neither_counted_nor_listed_as_to_validate(tmp_path, isolated_cwd):
+    _round2_clips(tmp_path)
+    c = client(tmp_path)
+
+    to_validate = c.get("/api/clips", params={"status": "à valider"}).json()
+    rejected = c.get("/api/clips", params={"status": "rejected"}).json()
+
+    assert [x["clip_id"] for x in to_validate] == ["01", "02"]
+    assert [x["clip_id"] for x in rejected] == ["03"]
+    assert rejected[0]["qa_status"] == "rejected"
+    assert len(c.get("/api/clips").json()) == 3
+
+
+def test_dashboard_and_clips_page_count_the_same_clips_to_validate(tmp_path, isolated_cwd):
+    _round2_clips(tmp_path)
+    _write_state(tmp_path, "bbbbbbbbbbb", channel=None)
+    _write_full_sidecar(tmp_path, "bbbbbbbbbbb", "01")
+    c = client(tmp_path)
+
+    on_page = len(c.get("/api/clips", params={"status": "à valider"}).json())
+
+    assert _dashboard(tmp_path)["clips_to_review"] == on_page == 3
+
+
+def test_clip_not_ready_and_not_rejected_is_not_to_validate_either(tmp_path, isolated_cwd):
+    _write_state(tmp_path, "aaaaaaaaaaa", channel="ma_chaine")
+    _write_full_sidecar(tmp_path, "aaaaaaaaaaa", "01", ready=False)
+    c = client(tmp_path)
+
+    assert c.get("/api/clips", params={"status": "à valider"}).json() == []
+    assert _dashboard(tmp_path)["clips_to_review"] == 0
+    assert c.get("/api/clips").json()[0]["publish_status"] == "not_ready"
+
+
+def test_clips_screen_labels_every_server_status_including_not_ready():
+    js = (STATIC / "screens" / "clips.js").read_text(encoding="utf-8")
+
+    assert "not_ready" in js
+
+
+def _serve_like_config(tmp_path, port):
+    """Config lue dans config.toml puis surchargée comme le fait 'serve --port'."""
+    import dataclasses
+
+    from clipper.config import load_config
+
+    config = load_config(tmp_path / "config.toml")
+    sections = {**config._sections, "web": {**config._sections.get("web", {}), "port": port}}
+    return dataclasses.replace(config, _sections=sections)
+
+
+def test_settings_access_shows_the_real_port_and_flags_the_difference_with_config_toml(tmp_path, isolated_cwd):
+    _settings_setup(tmp_path, '[web]\nport = 8000\n')
+    app_client = TestClient(create_app(config=_serve_like_config(tmp_path, 8765)))
+
+    data = app_client.get("/api/settings").json()
+
+    access = data["access"]
+    assert access["port"] == 8765 and "--port 8765" in access["command"]
+    assert access["config_port"] == 8000 and access["config_host"] == "127.0.0.1"
+    assert access["differs_from_config"] is True
+    assert data["restart_required"] is True                          # config.toml dit 8000, l'écoute en cours 8765
+
+
+def test_settings_access_does_not_flag_anything_when_serve_matches_config_toml(tmp_path, isolated_cwd):
+    _settings_setup(tmp_path, '[web]\nport = 8000\n')
+
+    access = sclient(tmp_path).get("/api/settings").json()["access"]
+
+    assert access["port"] == 8000 and access["differs_from_config"] is False
+
+
+def test_cli_serve_hands_the_real_port_to_the_app(tmp_path, isolated_cwd, monkeypatch):
+    cli, runs, _ = _serve_setup(tmp_path, monkeypatch, '[web]\nport = 8000\n')
+
+    assert cli.main(["serve", "--port", "8765"]) == 0
+
+    app, kwargs = runs[0]
+    assert kwargs["port"] == 8765
+    access = TestClient(app).get("/api/settings").json()["access"]
+    assert access["port"] == 8765 and access["config_port"] == 8000 and access["differs_from_config"] is True
+
+
+def test_settings_screen_shows_the_real_access_and_the_difference():
+    js = (STATIC / "screens" / "settings.js").read_text(encoding="utf-8")
+
+    assert "differs_from_config" in js and "config_port" in js
+
+
+def _fresh_heartbeat(tmp_path, **fields):
+    beat = {"pid": os.getpid(), "at": datetime.now(timezone.utc).isoformat(), **fields}
+    _write_json(tmp_path / "state" / "worker.json", beat)
+    return beat
+
+
+def test_dashboard_exposes_a_worker_stopped_with_the_command_when_no_heartbeat(tmp_path, isolated_cwd):
+    worker = _dashboard(tmp_path)["worker"]
+
+    assert worker["state"] == "stopped"
+    assert worker["command"] == "python -m clipper worker"
+    assert worker["reason"]
+
+
+def test_dashboard_exposes_a_worker_active_with_pid_and_age(tmp_path, isolated_cwd):
+    beat = _fresh_heartbeat(tmp_path)
+
+    worker = _dashboard(tmp_path)["worker"]
+
+    assert worker["state"] == "active" and worker["pid"] == beat["pid"]
+    assert worker["age_s"] < 30
+
+
+def test_dashboard_worker_with_a_stale_heartbeat_is_not_active(tmp_path, isolated_cwd):
+    old = datetime.now(timezone.utc) - timedelta(hours=1)
+    _write_json(tmp_path / "state" / "worker.json", {"pid": os.getpid(), "at": old.isoformat()})
+
+    worker = _dashboard(tmp_path)["worker"]
+
+    assert worker["state"] == "stale"
+    assert worker["command"] == "python -m clipper worker"
+
+
+def test_dashboard_unreadable_heartbeat_is_null_with_a_french_error(tmp_path, isolated_cwd):
+    (tmp_path / "state").mkdir()
+    (tmp_path / "state" / "worker.json").write_text("{pas du json", encoding="utf-8")
+
+    data = _dashboard(tmp_path)
+
+    assert data["worker"] is None and "worker" in data["worker_error"]
+
+
+def test_dashboard_screen_shows_the_worker_light_and_the_command_when_not_active():
+    js = (STATIC / "screens" / "dashboard.js").read_text(encoding="utf-8")
+
+    assert "data.worker" in js and "worker_error" in js
+    assert "worker actif" in js and "worker arrêté" in js
+    assert "worker.command" in js and '"active"' in js
+
+
+def test_heartbeat_file_does_not_flood_the_event_stream(tmp_path, isolated_cwd):
+    from clipper.web.app import _scan_watched
+
+    _fresh_heartbeat(tmp_path)
+
+    kinds = {kind for _, kind, _ in _scan_watched(tmp_path / "workspace", tmp_path / "state")}
+
+    assert "worker" not in kinds
+
+
+_UNACCENTED = (
+    "reponse", "refusee", "hote", "ecoute", "defaut", "parametre", "frequence", "modele", "ecran", "meme",
+    "memes", "etape", "regle", "regles", "reglage", "reglages", "deja", "apres", "cle", "cles", "camera",
+    "video", "videos", "schema", "tete", "boite", "echec", "ecart", "resultat", "resultats", "selection",
+    "duree", "donnee", "donnees", "detecteur", "detection", "systeme", "memoire", "premiere", "derniere",
+    "entiere", "centree", "elargie", "reduite", "reduit", "reduits", "desactive", "desactivee", "generes",
+    "journalisee", "reel", "reelle", "reellement", "bornee", "scene", "scenes", "apparait", "recoit",
+    "telecharge", "telechargement", "appliquee", "precedent", "precedente", "presence", "pensees", "tolere",
+    "tolerance", "echantillonnee", "equirepartis", "etiree", "evite", "fenetre", "unite", "serie", "sure",
+    "cote", "cotes", "plutot", "ecartees", "elargi", "deborde", "defauts", "derriere",
+)
+
+
+def _exposed_comments(tmp_path) -> dict[str, str]:
+    c = sclient(tmp_path)
+    found = {}
+    for section, keys in c.get("/api/settings").json()["defaults"].items():
+        for key, doc in keys.items():
+            found[f"settings/{section}.{key}"] = doc["comment"]
+    return found
+
+
+def test_help_texts_exposed_by_the_api_are_accented_french(tmp_path, isolated_cwd):
+    import re
+
+    from clipper.web import app as web_app
+
+    comments = _exposed_comments(tmp_path)
+    for section in web_app._CHANNEL_FORM_SECTIONS:
+        for key, doc in web_app._defaults_documentation(section).items():
+            comments[f"channel/{section}.{key}"] = doc["comment"]
+    assert any(comments.values())
+    words = list(_UNACCENTED)
+    offenders = []
+    for where, comment in comments.items():
+        # hors identifiants : « scenes.json », « video_id », `nom_de_cle` ne sont pas du texte
+        prose = re.sub(r"[\w./-]*[_./][\w./-]*", " ", comment)
+        for word in words:
+            if re.search(rf"(?<![\w-]){word}(?![\w-])", prose, re.IGNORECASE):
+                offenders.append(f"{where} : « {word} »")
+    assert offenders == []
+
+
+def test_videos_are_listed_most_recently_added_first(tmp_path, isolated_cwd):
+    _write_state(tmp_path, "aaaaaaaaaaa", enqueued_at="2026-09-01T10:00:00+00:00")
+    _write_state(tmp_path, "ccccccccccc", enqueued_at="2026-09-03T10:00:00+00:00")
+    _write_state(tmp_path, "bbbbbbbbbbb", enqueued_at="2026-09-02T10:00:00+00:00")
+
+    ids = [v["video_id"] for v in client(tmp_path).get("/api/videos").json()]
+
+    assert ids == ["ccccccccccc", "bbbbbbbbbbb", "aaaaaaaaaaa"]
+
+
+def test_videos_screen_keeps_the_server_order(tmp_path):
+    js = (STATIC / "screens" / "videos.js").read_text(encoding="utf-8")
+
+    assert ".sort(" not in js
+
+
+def test_stats_clip_table_paginates_by_50_with_show_more():
+    js = (STATIC / "screens" / "stats.js").read_text(encoding="utf-8")
+
+    assert "STATS_CLIPS_PAGE_SIZE = 50" in js
+    assert "Afficher plus" in js and "data-stats-more" in js
+    assert "data.clips.slice(0, statsUi.shown)" in js
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node absent du PATH")
+def test_stats_clip_pagination_reveals_50_more_rows_per_click():
+    js = (STATIC / "screens" / "stats.js").read_text(encoding="utf-8")
+    start = js.index("function statsMoreCount")
+    end = js.index("\n}\n", start) + 3
+    script = "const STATS_CLIPS_PAGE_SIZE = 50;\n" + js[start:end] + "\nconsole.log(JSON.stringify([statsMoreCount(120, 50), statsMoreCount(120, 100), statsMoreCount(30, 50)]));"
+    out = subprocess.run(["node", "-e", script], capture_output=True, text=True, check=True).stdout
+    assert json.loads(out) == [50, 20, 0]

@@ -12,9 +12,10 @@ const STATS_STATUS_LABELS = {
   queued: "En file", done: "Terminées", failed: "En échec",
 };
 const STATS_DECISIONS = { approved: "Approuvé", accepted: "Accepté", adjusted: "Ajusté", rejected: "Refusé" };
+const STATS_CLIPS_PAGE_SIZE = 50; // « Résultats par clip » : 50 lignes à la fois, puis « Afficher plus »
 const STATS_QA = { passed: { label: "QA réussie", cls: "ok" }, rejected: { label: "QA refusée", cls: "bad" } };
 
-const statsUi = { data: null, error: null, loading: null, dirty: false, at: 0, preset: "30", since: "", until: "" };
+const statsUi = { data: null, error: null, loading: null, dirty: false, at: 0, preset: "30", since: "", until: "", shown: STATS_CLIPS_PAGE_SIZE };
 
 const statsMoney = (usd) => `${fr(usd, 2)} $`;
 const statsPct = (fraction) => `${fr(fraction * 100, 0)} %`;
@@ -86,9 +87,22 @@ function statsColumns(rows, emptyText) {
     <div class="stats-col" title="${esc(day)} : ${esc(statsMoney(value))}"><i style="height:${Math.max(3, Math.round((value / max) * 100))}%"></i><span>${esc(day.slice(5))}</span></div>`).join("")}</div>`;
 }
 
+/* Texte lisible d'un avertissement QA : le serveur renvoie des objets {type, detail, source, severity}
+   (clipper.qa), parfois des chaînes ; jamais « [object Object] ». */
+function statsIssueText(issue) {
+  if (typeof issue === "string") return issue;
+  if (issue && typeof issue === "object" && (issue.detail || issue.type)) return String(issue.detail || issue.type);
+  return JSON.stringify(issue);
+}
+
+/* Nombre de lignes que « Afficher plus » ajoute : une page, ou ce qui reste. */
+function statsMoreCount(total, shown) {
+  return Math.max(0, Math.min(STATS_CLIPS_PAGE_SIZE, total - shown));
+}
+
 function statsClipRow(c) {
   const qa = STATS_QA[c.qa_status] || { label: c.qa_status || "QA inconnue", cls: "pending" };
-  const issues = c.issues && c.issues.length ? `<div class="li-sub muted">${esc(c.issues.join(" · "))}</div>` : "";
+  const issues = c.issues && c.issues.length ? `<div class="li-sub muted">${esc(c.issues.map(statsIssueText).join(" · "))}</div>` : "";
   const decision = c.human_decision
     ? `${esc(STATS_DECISIONS[c.human_decision] || c.human_decision)}<div class="li-sub muted">${c.decision_source === "feedback" ? "revue des moments" : "journal des résultats"}</div>`
     : `<span class="muted">pas de décision</span>`;
@@ -102,14 +116,17 @@ function statsClipRow(c) {
 
 function statsClipsBlock(data) {
   const unmatched = data.stats_unmatched || [];
+  const next = statsMoreCount(data.clips.length, statsUi.shown);
+  const more = next
+    ? `<div class="panel-pad"><button type="button" class="btn btn-ghost" data-stats-more>Afficher plus (${next} sur ${data.clips.length - statsUi.shown} restants)</button></div>` : "";
   const table = data.clips.length
     ? `<div class="table-scroll"><table class="table"><thead><tr><th>Clip</th><th>Contrôle qualité</th><th>Décision</th><th class="r">Vues</th><th class="r">Rétention 3 s</th><th class="r">Vu en entier</th><th class="r">Partages</th></tr></thead>
-        <tbody>${data.clips.map(statsClipRow).join("")}</tbody></table></div>`
+        <tbody>${data.clips.slice(0, statsUi.shown).map(statsClipRow).join("")}</tbody></table></div>${more}`
     : `<p class="muted stats-empty">Aucun clip rendu sur cette période.</p>`;
   const orphans = unmatched.length
     ? `<div class="stats-unmatched"><b>Mesures non rattachées</b>${unmatched.map((u) => `<div class="li-sub">Clip ${esc(u.clip_id)} : ${esc(fr(u.stats.views))} vues le ${esc(u.stats.date)} — ${esc(u.reason)}</div>`).join("")}</div>`
     : "";
-  return `<section class="panel" data-block="clips"><div class="panel-head"><h2>Résultats par clip</h2><div class="right muted" style="font-size:12px">${data.clips.length} clip${data.clips.length > 1 ? "s" : ""}</div></div>
+  return `<section class="panel" data-block="clips"><div class="panel-head"><h2>Résultats par clip</h2><div class="right muted" style="font-size:12px">${Math.min(statsUi.shown, data.clips.length)} sur ${data.clips.length} clip${data.clips.length > 1 ? "s" : ""}</div></div>
     ${table}${orphans}
     <p class="muted stats-note">Les vues et la rétention n'existent que par le CSV importé tant que l'autopost n'est pas en place.</p></section>`;
 }
@@ -176,13 +193,17 @@ async function statsImport(file) {
 }
 
 function statsWire(body) {
+  const moreButton = $("[data-stats-more]", body);
+  if (moreButton) moreButton.onclick = () => { statsUi.shown += STATS_CLIPS_PAGE_SIZE; renderCurrent(); };
   $$("[data-stats-preset]", body).forEach((b) => (b.onclick = () => {
+    statsUi.shown = STATS_CLIPS_PAGE_SIZE;
     statsApplyPreset(b.dataset.statsPreset);
     renderCurrent();
     loadStats();
   }));
   const onDates = () => {
     statsUi.preset = "";
+    statsUi.shown = STATS_CLIPS_PAGE_SIZE;
     statsUi.since = $("[data-stats-since]", body).value;
     statsUi.until = $("[data-stats-until]", body).value;
     loadStats();

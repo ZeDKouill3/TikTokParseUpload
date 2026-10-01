@@ -21,7 +21,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from email.parser import BytesParser
 from email.policy import HTTP as _EMAIL_HTTP
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Iterator
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import FastAPI, HTTPException, Request
@@ -294,6 +294,8 @@ def _scan_watched(workspace_root: Path, state_root: Path) -> list[tuple[Path, st
     if state_root.is_dir():
         for p in state_root.rglob("*.json"):
             kind, id_ = _state_kind_and_id(p, state_root)
+            if (kind, id_) == ("worker", "worker"):  # battement du worker : réécrit en continu, lu par le polling du tableau de bord
+                continue
             found.append((p, kind, id_))
     return found
 
@@ -354,17 +356,13 @@ def _dashboard_watch(config: Config) -> dict[str, Any]:
 
 
 def _dashboard_clips_to_review(config: Config) -> dict[str, Any]:
-    states = _list_states(config)
-    publish_dir = Path(config.section("publish")["state_dir"])
-    count = 0
-    for channel in {s.get("channel") for s in states}:
-        if channel is None:  # sans chaine, aucun fichier de publication n'existe
-            for state in (s for s in states if s.get("channel") is None):
-                out_dir = Path(config.output_dir) / state["video_id"]
-                count += sum(1 for p in out_dir.glob("*.json") if _read_json(p).get("ready"))
-        else:
-            count += len(publish_mod.list_pending(
-                channel, workspace_dir=config.workspace_dir, output_dir=config.output_dir, state_dir=publish_dir))
+    """Même statut que l'écran Clips (``_clip_publish_status``) : un clip refusé
+    par la QA ou pas prêt n'est jamais « à valider »."""
+    try:
+        count = sum(1 for _v, _c, sidecar, entry in _iter_clips(config, None, None)
+                    if _clip_publish_status(sidecar, entry) == _TO_VALIDATE)
+    except HTTPException as exc:
+        raise ValueError(exc.detail) from exc
     return {"clips_to_review": count}
 
 
@@ -378,6 +376,13 @@ def _scheduled_entries(publish_dir: Path) -> list[dict[str, Any]]:
             if entry["status"] == "scheduled" and entry["slot_at"]:
                 entries.append({**entry, "channel": path.stem})
     return entries
+
+
+def _dashboard_worker(config: Config) -> dict[str, Any]:
+    try:
+        return {"worker": worker_mod.read_heartbeat(config)}
+    except worker_mod.WorkerError as exc:
+        raise ValueError(str(exc)) from exc
 
 
 def _dashboard_next_publications(config: Config) -> dict[str, Any]:
@@ -447,6 +452,7 @@ def _dashboard(config: Config) -> dict[str, Any]:
           lambda: {"queue": _read_json(queue_path) if queue_path.exists() else []})
     _fill(out, ("watch_pending",), "surveillance (state/watch)", lambda: _dashboard_watch(config))
     _fill(out, ("clips_to_review",), "clips a valider", lambda: _dashboard_clips_to_review(config))
+    _fill(out, ("worker",), "battement du worker (state/worker.json)", lambda: _dashboard_worker(config))
     _fill(out, ("next_publications",), "publications (state/publish)", lambda: _dashboard_next_publications(config))
     _fill(out, ("llm_cost",), "journal llm_usage.jsonl", lambda: _dashboard_llm_cost(config))
     out.update(_dashboard_hardware())
@@ -490,7 +496,8 @@ async def _event_stream(config: Config) -> AsyncIterator[str]:
 # --------------------------------------------------------------------------
 
 _TO_VALIDATE = "à valider"
-_CLIP_STATUSES = (_TO_VALIDATE, *publish_mod.VALID_STATUSES)
+_NOT_READY = "not_ready"
+_CLIP_STATUSES = (_TO_VALIDATE, _NOT_READY, *publish_mod.VALID_STATUSES)
 _RERENDER_STEPS = ["render", "qa"]
 
 
@@ -518,6 +525,18 @@ def _publish_entries(config: Config, channel: str | None) -> dict[tuple[str, str
         raise HTTPException(status_code=500, detail=f"fichier de publication illisible ({path.name}) : {exc}") from exc
 
 
+def _clip_publish_status(sidecar: dict[str, Any], entry: dict[str, Any] | None) -> str:
+    """Statut d'un clip, seule source de l'écran Clips et du tableau de bord.
+    Une entrée de publication dit son statut ; sinon un clip refusé par la QA
+    est « rejected » (Refusés), un clip pas encore prêt est « not_ready », et
+    seul un clip prêt et accepté par la QA est « à valider »."""
+    if entry:
+        return entry["status"]
+    if (sidecar.get("qa") or {}).get("status") == "rejected":
+        return "rejected"
+    return _TO_VALIDATE if sidecar.get("ready") is True else _NOT_READY
+
+
 def _clip_view(sidecar: dict[str, Any], channel: str | None, entry: dict[str, Any] | None) -> dict[str, Any]:
     qa = sidecar.get("qa") or {}
     video_id, clip_id = sidecar["video_id"], sidecar["clip_id"]
@@ -529,7 +548,7 @@ def _clip_view(sidecar: dict[str, Any], channel: str | None, entry: dict[str, An
         "thumbnail_url": f"/media/clip/{video_id}/{clip_id}/thumbnail",
         "qa_status": qa.get("status"),
         "issues": qa.get("issues"),
-        "publish_status": entry["status"] if entry else _TO_VALIDATE,
+        "publish_status": _clip_publish_status(sidecar, entry),
         "slot_at": entry.get("slot_at") if entry else None,
         "publish_error": entry.get("error") if entry else None,
     })
@@ -546,13 +565,13 @@ def _read_clip_sidecar(config: Config, video_id: str, clip_id: str) -> dict[str,
         raise HTTPException(status_code=500, detail=f"sidecar illisible ({path.name}) : {exc}") from exc
 
 
-def _list_clip_views(config: Config, channel: str | None, video_id: str | None,
-                     status: str | None) -> list[dict[str, Any]]:
+def _iter_clips(config: Config, channel: str | None, video_id: str | None
+                ) -> Iterator[tuple[str, str | None, dict[str, Any], dict[str, Any] | None]]:
+    """(video_id, chaîne, sidecar, entrée de publication) de chaque clip de output/."""
     root = Path(config.output_dir)
     if not root.is_dir():
-        return []
+        return
     entries_by_channel: dict[str | None, dict[tuple[str, str], dict[str, Any]]] = {}
-    clips = []
     for video_dir in sorted(p for p in root.iterdir() if p.is_dir()):
         if video_id is not None and video_dir.name != video_id:
             continue
@@ -564,9 +583,16 @@ def _list_clip_views(config: Config, channel: str | None, video_id: str | None,
         entries = entries_by_channel[video_channel]
         for path in sorted(video_dir.glob("*.json")):
             sidecar = _read_clip_sidecar(config, video_dir.name, path.stem)
-            clip = _clip_view(sidecar, video_channel, entries.get((video_dir.name, path.stem)))
-            if status is None or clip["publish_status"] == status:
-                clips.append(clip)
+            yield video_dir.name, video_channel, sidecar, entries.get((video_dir.name, path.stem))
+
+
+def _list_clip_views(config: Config, channel: str | None, video_id: str | None,
+                     status: str | None) -> list[dict[str, Any]]:
+    clips = []
+    for _video, video_channel, sidecar, entry in _iter_clips(config, channel, video_id):
+        clip = _clip_view(sidecar, video_channel, entry)
+        if status is None or clip["publish_status"] == status:
+            clips.append(clip)
     return clips
 
 
@@ -788,9 +814,11 @@ def _settings_without_token(web: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in web.items() if k != "token"}
 
 
-def _settings_access(web_cfg: dict[str, Any]) -> dict[str, Any]:
+def _settings_access(web_cfg: dict[str, Any], file_web: dict[str, Any]) -> dict[str, Any]:
     """Acces tel que le serveur en cours l'applique (lecture seule) : l'hote et
-    le port ne changent qu'au redemarrage, le jeton n'est jamais renvoye."""
+    le port ne changent qu'au redemarrage, le jeton n'est jamais renvoye.
+    ``config_host`` / ``config_port`` sont ceux de config.toml, signales quand
+    ils different de ceux du serveur (``serve --host/--port``)."""
     host, port, token = str(web_cfg["host"]), int(web_cfg["port"]), str(web_cfg["token"])
     command = f"python -m clipper serve --port {port}"
     if host != _LOOPBACK_HOST:
@@ -798,6 +826,8 @@ def _settings_access(web_cfg: dict[str, Any]) -> dict[str, Any]:
     return {
         "host": host, "port": port, "loopback": host == _LOOPBACK_HOST,
         "token_set": bool(token), "token": _SETTINGS_TOKEN_MASK if token else None, "command": command,
+        "config_host": str(file_web["host"]), "config_port": int(file_web["port"]),
+        "differs_from_config": (host, port) != (str(file_web["host"]), int(file_web["port"])),
     }
 
 
@@ -830,7 +860,7 @@ def _settings_detail(running_web: dict[str, Any]) -> dict[str, Any]:
         "path": _BASE_CONFIG, "exists": exists, "comments_lost": _settings_has_comments(text),
         "raw": raw, "effective": effective, "defaults": defaults,
         "modes": list(VALID_MODES), "backends": list(llm_mod._BACKENDS),
-        "access": _settings_access(running_web), "restart_required": restart,
+        "access": _settings_access(running_web, file_web), "restart_required": restart,
     }
 
 
@@ -1377,6 +1407,7 @@ def create_app(config: Config | None = None) -> FastAPI:
                 detail=f"statut inconnu : {status!r} (attendu : {', '.join(_VIDEO_STATUSES)})",
             )
         videos = [_enrich(state, config) for state in _list_states(config)]
+        videos.sort(key=lambda v: v.get("enqueued_at") or "", reverse=True)  # la plus récemment ajoutée en haut
         return [v for v in videos if _matches(v, channel, status, q)]
 
     @app.get("/api/videos/{video_id}")

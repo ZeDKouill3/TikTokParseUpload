@@ -13,6 +13,7 @@ const CLIP_STATUS = {
   "à valider": { label: "À valider", cls: "info" }, approved: { label: "Approuvé", cls: "ok" },
   scheduled: { label: "Planifié", cls: "info" }, published: { label: "Publié", cls: "ok" },
   failed: { label: "Échec", cls: "bad" }, rejected: { label: "Refusé", cls: "bad" },
+  not_ready: { label: "Pas prêt", cls: "pending" }, // rendu ou contrôle qualité pas terminé : ni à valider ni refusé
 };
 // SPEC-fc0c §4.5 : une entree scheduled/published n'est pas editable sans repasser approved.
 const CLIP_LOCKED = ["scheduled", "published"];
