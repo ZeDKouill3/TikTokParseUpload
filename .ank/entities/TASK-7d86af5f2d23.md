@@ -5,7 +5,7 @@ slug: web-cran-statistiques-r-sultats-par-clip-via-out
 title: "web : écran Statistiques (résultats par clip via outcomes, décisions et QA, coûts LLM par vidéo/usage/période, durée par étape, import CSV)"
 created: 2026-09-30T20:44:58Z
 author: w-plan-web
-status: open
+status: in_progress
 scope:
   - clipper/web/app.py
   - clipper/web/static/**
@@ -17,7 +17,7 @@ criteria_by: creator
 verify: [tests]
 method: tdd
 schema: 4
-version: 2
+version: 3
 ---
 
 SPEC-c100 E7. Les graphiques restent en SVG/canvas maison ou CSS (aucune bibliothèque externe, ADR-09ad sans build). Les vues/rétention n'existent que via le CSV importé (clipper.outcomes) tant que l'autopost n'existe pas.

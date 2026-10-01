@@ -5,7 +5,7 @@ slug: web-cran-r-glages-config-toml-en-formulaire-mode
 title: "web : écran Réglages (config.toml en formulaire : mode, dossiers, [llm] backend et modèles par usage, [web], [worker] ; écriture validée ; section Accès)"
 created: 2026-09-30T20:44:58Z
 author: w-plan-web
-status: open
+status: in_progress
 scope:
   - clipper/web/app.py
   - clipper/web/static/**
@@ -17,7 +17,7 @@ criteria_by: creator
 verify: [tests]
 method: tdd
 schema: 4
-version: 2
+version: 3
 ---
 
 SPEC-c100 E8, ADR-4f6e §2 et §5. Le jeton ne se modifie pas depuis l'interface (il faut le fichier et un redémarrage) : c'est ce que dit la section Accès.
