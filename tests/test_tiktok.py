@@ -177,11 +177,6 @@ def test_unknown_backend_is_refused(env):
         env.publish()
 
 
-def test_browser_fetch_stats_is_explicitly_not_implemented(env):
-    with pytest.raises(tiktok.TikTokError, match="statistiques"):
-        tiktok.fetch_stats("ma_chaine", config=env.config)
-
-
 # ---------------------------------------------------------------- (2) publication
 
 
@@ -470,3 +465,271 @@ def test_corrupt_events_file_is_an_explicit_error(tmp_path, monkeypatch):
     path.write_text("{pas du json", encoding="utf-8")
     with pytest.raises(tiktok.TikTokError, match="événements"):
         tiktok.read_events()
+
+
+# ---------------------------------------------------------------- statistiques (SPEC-9225 R7)
+
+
+class FakeCell:
+    def __init__(self, text=None, href=None):
+        self.text, self.href = text, href
+
+    def inner_text(self):
+        return self.text
+
+    def get_attribute(self, name):
+        return self.href if name == "href" else None
+
+
+class FakeRow:
+    def __init__(self, cells):
+        self.cells = cells  # selecteur -> FakeCell ; absent = non affiche
+
+    def query_selector(self, selector):
+        return self.cells.get(selector)
+
+
+class FakeStatsPage(FakePage):
+    def __init__(self, rows, **kwargs):
+        sel = _sel()["stats"]
+        super().__init__({sel["row"]} if rows else set(), **kwargs)
+        self.rows = rows
+
+    def query_selector_all(self, selector):
+        self.calls.append(("all", selector))
+        return list(self.rows) if selector == _sel()["stats"]["row"] else []
+
+
+def _row(post_id, *, views="1 200", likes="85", comments="7", shares="3", avg_watch="12,5 s", full="23,4 %",
+         account="ma_chaine"):
+    sel = _sel()["stats"]
+    cells = {sel["post_link"]: FakeCell(href=f"https://www.tiktok.com/@{account}/video/{post_id}")}
+    for key, value in (("views", views), ("likes", likes), ("comments", comments), ("shares", shares),
+                       ("avg_watch", avg_watch), ("watched_full", full)):
+        if value is not None:
+            cells[sel[key]] = FakeCell(value)
+    return FakeRow(cells)
+
+
+ID_A, ID_B, ID_C = "7300000000000000001", "7300000000000000002", "7300000000000000003"
+
+
+class StatsEnv:
+    """Un releve complet contre une fausse page ; sidecars de clips publies dans output/."""
+
+    def __init__(self, tmp_path, monkeypatch, rows, *, detect=None, redirect=None, settings=None):
+        monkeypatch.chdir(tmp_path)
+        self.page = FakeStatsPage(rows, redirect=redirect)
+        for kind in (detect or ()):
+            self.page.present.add(_sel()["detect"][kind][0])
+        self.sleeps: list[float] = []
+        self.config = Config(mode="review", workspace_dir=tmp_path / "w", output_dir=tmp_path / "output",
+                             _sections={"tiktok": settings or {}})
+        self.path = tmp_path / "state" / "stats" / "tiktok" / "ma_chaine.json"
+        self.tmp = tmp_path
+
+    def clip(self, video_id, clip_id, post_id=None, url=None, account="ma_chaine", state="published"):
+        out = self.tmp / "output" / video_id
+        out.mkdir(parents=True, exist_ok=True)
+        (out / f"{clip_id}.json").write_text(json.dumps({
+            "video_id": video_id, "clip_id": clip_id,
+            "tiktok_post": {"url": url, "id": post_id, "state": state, "account": account}}), encoding="utf-8")
+
+    @contextmanager
+    def opener(self, account, *, headless):
+        self.opened = (account, headless)
+        yield FakeContext(self.page)
+
+    def fetch(self, **kwargs):
+        return tiktok.fetch_stats("ma_chaine", config=self.config, now=NOW, opener=self.opener,
+                                  sleep=self.sleeps.append, rng=random.Random(1), **kwargs)
+
+
+def test_stats_interval_default_is_24_hours_and_invalid_values_are_refused(tmp_path, monkeypatch):
+    assert tiktok.CONFIG_DEFAULTS["stats_interval_h"] == 24
+    assert tiktok.CONFIG_DEFAULTS["stats_dir"] == "state/stats/tiktok"
+    for bad in (0, -1, "24", True):
+        config = Config(mode="review", workspace_dir=tmp_path, output_dir=tmp_path,
+                        _sections={"tiktok": {"stats_interval_h": bad}})
+        with pytest.raises(tiktok.TikTokError, match="stats_interval_h"):
+            tiktok.get_settings(config)
+
+
+def test_fetch_stats_reads_every_metric_per_published_post_on_a_visible_browser(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [_row(ID_A), _row(ID_B, views="3,4 K", full="5 %", avg_watch="1:05")])
+
+    result = env.fetch()
+
+    assert env.opened == ("ma_chaine", False)
+    assert env.page.calls[0] == ("goto", _sel()["urls"]["stats"])
+    a, b = result["posts"]
+    assert (a["post_id"], a["views"], a["likes"], a["comments"], a["shares"]) == (ID_A, 1200, 85, 7, 3)
+    assert a["avg_watch_s"] == 12.5 and a["watched_full"] == pytest.approx(0.234)
+    assert a["post_url"] == f"https://www.tiktok.com/@ma_chaine/video/{ID_A}"
+    assert (b["views"], b["avg_watch_s"], b["watched_full"]) == (3400, 65.0, pytest.approx(0.05))
+    assert result["fetched_at"] == NOW.isoformat() and result["account"] == "ma_chaine"
+
+
+def test_a_value_absent_from_the_page_is_an_explicit_null_never_an_invented_zero(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [_row(ID_A, avg_watch=None, full=None, shares="—"),
+                                           _row(ID_B, views="0", likes="0")])
+
+    first, second = env.fetch()["posts"]
+
+    assert first["avg_watch_s"] is None and first["watched_full"] is None and first["shares"] is None
+    assert first["views"] == 1200
+    assert second["views"] == 0 and second["likes"] == 0  # un zero affiche est un vrai zero
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("1 200", 1200), ("1\u202f200", 1200), ("1,2 K", 1200), ("1.5M", 1500000), ("2,5 Md", 2500000000), ("987", 987),
+])
+def test_counts_are_parsed_from_the_displayed_text(tmp_path, monkeypatch, text, expected):
+    env = StatsEnv(tmp_path, monkeypatch, [_row(ID_A, views=text)])
+    assert env.fetch()["posts"][0]["views"] == expected
+
+
+def test_an_unreadable_value_is_an_unexpected_page_stop_not_a_guess(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [_row(ID_A, views="beaucoup")])
+
+    with pytest.raises(tiktok.TikTokStop) as stop:
+        env.fetch()
+
+    assert stop.value.code == "unexpected_page" and "views" in stop.value.reason
+    assert stop.value.capture is not None and stop.value.capture.is_file()
+
+
+def test_the_report_is_written_atomically_and_linked_to_clips_by_post_id_and_url(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [_row(ID_A), _row(ID_B), _row(ID_C)])
+    env.clip("aaaaaaaaaaa", "01", post_id=ID_A)
+    env.clip("aaaaaaaaaaa", "02", url=f"https://www.tiktok.com/@ma_chaine/video/{ID_B}")
+    env.clip("bbbbbbbbbbb", "01", post_id=ID_C, account="autre")  # autre compte : jamais relie ici
+
+    env.fetch()
+
+    data = json.loads(env.path.read_text(encoding="utf-8"))
+    assert data["account"] == "ma_chaine" and data["fetched_at"] == NOW.isoformat() and data["error"] is None
+    linked = {(p["post_id"]): (p["video_id"], p["clip_id"]) for p in data["posts"]}
+    assert linked == {ID_A: ("aaaaaaaaaaa", "01"), ID_B: ("aaaaaaaaaaa", "02"), ID_C: (None, None)}
+    assert not [p for p in env.path.parent.iterdir() if p.suffix == ".tmp"]  # aucun .tmp laisse
+
+
+def test_a_second_fetch_replaces_the_report(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [_row(ID_A, views="10")])
+    env.fetch()
+    env.page.rows = [_row(ID_A, views="20")]
+    env.fetch()
+    assert json.loads(env.path.read_text(encoding="utf-8"))["posts"][0]["views"] == 20
+
+
+@pytest.mark.parametrize("kwargs,code", [
+    ({"detect": ["captcha"]}, "captcha"),
+    ({"detect": ["verification"]}, "verification"),
+    ({"detect": ["login"]}, "login"),
+    ({"redirect": "https://www.tiktok.com/login?redirect=studio"}, "login"),
+    ({"redirect": "https://www.tiktok.com/erreur"}, "unexpected_page"),
+])
+def test_r4_the_fetch_stops_safely_and_records_the_failure_keeping_the_last_report(tmp_path, monkeypatch, kwargs, code):
+    first = StatsEnv(tmp_path, monkeypatch, [_row(ID_A)])
+    first.fetch()
+    env = StatsEnv(tmp_path, monkeypatch, [_row(ID_A)], **kwargs)
+
+    with pytest.raises(tiktok.TikTokStop) as stop:
+        tiktok.fetch_stats("ma_chaine", config=env.config, now=NOW + timedelta(hours=1), opener=env.opener,
+                           sleep=env.sleeps.append, rng=random.Random(1))
+
+    assert stop.value.code == code
+    assert stop.value.capture is not None and stop.value.capture.is_file()
+    assert env.page.clicks() == [] and env.page.fills() == []  # aucun clic, aucune saisie
+    data = json.loads(env.path.read_text(encoding="utf-8"))
+    assert data["fetched_at"] == NOW.isoformat() and data["posts"][0]["views"] == 1200  # dernier releve intact
+    assert data["error"]["code"] == code and data["error"]["reason"] == stop.value.reason
+    assert data["error"]["at"] == (NOW + timedelta(hours=1)).isoformat()
+    event = tiktok.read_events(config=env.config)[-1]
+    assert event["level"] == "error" and event["account"] == "ma_chaine" and stop.value.reason in event["reason"]
+    assert event["capture"] == str(stop.value.capture)
+
+
+def test_r4_no_post_row_after_the_delay_is_an_element_missing_stop(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [])
+
+    with pytest.raises(tiktok.TikTokStop) as stop:
+        env.fetch()
+
+    assert stop.value.code == "element_missing" and "row" in stop.value.reason
+    assert json.loads(env.path.read_text(encoding="utf-8"))["error"]["code"] == "element_missing"
+
+
+def test_a_missing_chrome_during_the_fetch_is_recorded_and_raised(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [_row(ID_A)])
+
+    @contextmanager
+    def no_chrome(account, *, headless):
+        raise browser.BrowserError("Chrome introuvable")
+        yield
+
+    with pytest.raises(browser.BrowserError):
+        tiktok.fetch_stats("ma_chaine", config=env.config, now=NOW, opener=no_chrome)
+
+    assert "Chrome introuvable" in json.loads(env.path.read_text(encoding="utf-8"))["error"]["reason"]
+
+
+def test_fetch_stats_refuses_a_missing_account_and_the_api_backend(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [_row(ID_A)])
+    with pytest.raises(tiktok.TikTokError, match="compte"):
+        tiktok.fetch_stats("", config=env.config, opener=env.opener)
+    api = Config(mode="review", workspace_dir=tmp_path, output_dir=tmp_path, _sections={"tiktok": {"backend": "api"}})
+    with pytest.raises(tiktok.TikTokError, match="api"):
+        tiktok.fetch_stats("ma_chaine", config=api)
+
+
+def test_stats_due_follows_the_interval_since_the_last_attempt_success_or_failure(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [_row(ID_A)])
+    env.clip("aaaaaaaaaaa", "01", post_id=ID_A)
+    assert tiktok.stats_due("ma_chaine", config=env.config, now=NOW)  # jamais releve
+
+    env.fetch()
+    assert not tiktok.stats_due("ma_chaine", config=env.config, now=NOW + timedelta(hours=23))
+    assert tiktok.stats_due("ma_chaine", config=env.config, now=NOW + timedelta(hours=24))
+
+    env.page.present.add(_sel()["detect"]["captcha"][0])
+    with pytest.raises(tiktok.TikTokStop):
+        tiktok.fetch_stats("ma_chaine", config=env.config, now=NOW + timedelta(hours=24), opener=env.opener,
+                           sleep=env.sleeps.append)
+    # l'echec compte comme une tentative : pas de nouvelle ouverture du navigateur avant l'intervalle
+    assert not tiktok.stats_due("ma_chaine", config=env.config, now=NOW + timedelta(hours=30))
+    assert tiktok.stats_due("ma_chaine", config=env.config, now=NOW + timedelta(hours=49))
+
+
+def test_stats_accounts_lists_accounts_with_a_post_to_measure_only(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [])
+    env.clip("aaaaaaaaaaa", "01", post_id=ID_A)
+    env.clip("aaaaaaaaaaa", "02", post_id=None, url=None, state="scheduled_on_tiktok")  # pas d'adresse publique
+    env.clip("bbbbbbbbbbb", "01", post_id=ID_B, account="autre")
+    assert tiktok.stats_accounts(config=env.config) == ["autre", "ma_chaine"]
+
+
+def test_read_stats_returns_none_without_a_report_and_refuses_a_corrupt_one(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [])
+    assert tiktok.read_stats("ma_chaine", config=env.config) is None
+    env.path.parent.mkdir(parents=True)
+    env.path.write_text("{pas du json", encoding="utf-8")
+    with pytest.raises(tiktok.TikTokError, match="illisible"):
+        tiktok.read_stats("ma_chaine", config=env.config)
+
+
+def test_stats_selectors_live_in_the_selectors_file_marked_to_verify():
+    text = SELECTORS.read_text(encoding="utf-8")
+    data = tomllib.loads(text)
+    assert data["urls"]["stats"].startswith("https://") and data["expect"]["stats_url_prefix"].startswith("https://")
+    for key in tiktok.REQUIRED_STATS_SELECTORS:
+        assert data["stats"][key]
+    assert text.count("A VERIFIER SUR LA VRAIE PAGE") >= 2  # un second marquage pour les pages de statistiques
+
+
+def test_a_missing_stats_selector_is_an_explicit_error(tmp_path):
+    text = SELECTORS.read_text(encoding="utf-8").replace("[stats]", "[stats_absent]")
+    bad = tmp_path / "s.toml"
+    bad.write_text(text, encoding="utf-8")
+    with pytest.raises(tiktok.TikTokError, match=r"\[stats\] row"):
+        tiktok.load_selectors(bad)

@@ -1255,6 +1255,36 @@ def _stats_outcomes(config: Config) -> list[dict[str, Any]]:
         raise HTTPException(status_code=500, detail=f"{path.name} illisible : {exc}") from exc
 
 
+def _tiktok_reports(config: Config) -> list[dict[str, Any]]:
+    """Releves TikTok Studio (state/stats/tiktok/<compte>.json), un fichier illisible leve une 500."""
+    try:
+        return tiktok_mod.read_all_stats(config=config)
+    except tiktok_mod.TikTokError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+def _tiktok_measures(reports: list[dict[str, Any]]) -> dict[tuple[str, str], dict[str, Any]]:
+    """Mesure du releve la plus recente par clip relie (video_id, clip_id) ; ``retention_3s`` est
+    ``None`` : TikTok Studio donne la duree moyenne de visionnage, pas la retention a 3 s."""
+    measures: dict[tuple[str, str], dict[str, Any]] = {}
+    for report in reports:
+        if not report.get("fetched_at"):
+            continue
+        for post in report["posts"]:
+            if post.get("video_id") is None or post.get("clip_id") is None:
+                continue
+            key = (post["video_id"], post["clip_id"])
+            if key in measures and measures[key]["date"] > report["fetched_at"][:10]:
+                continue
+            measures[key] = {
+                "views": post.get("views"), "likes": post.get("likes"), "comments": post.get("comments"),
+                "shares": post.get("shares"), "avg_watch_s": post.get("avg_watch_s"),
+                "watched_full": post.get("watched_full"), "retention_3s": None,
+                "date": report["fetched_at"][:10],
+            }
+    return measures
+
+
 def _stats_clips(config: Config, lower: datetime | None, upper: datetime | None,
                  wanted: str | None = None) -> dict[str, Any]:
     """Un element par sidecar de output/ cree dans la periode, joint aux resultats
@@ -1275,6 +1305,7 @@ def _stats_clips(config: Config, lower: datetime | None, upper: datetime | None,
             raise HTTPException(status_code=500, detail=f"{feedback_path.name} : entree sans video_id/moment/decision ({exc})") from exc
     results: dict[tuple[Any, Any], Any] = {}
     measures: dict[str, list[tuple[str, int, dict[str, Any]]]] = {}
+    tiktok_measures = _tiktok_measures(_tiktok_reports(config))
     for index, entry in enumerate(journal):
         if entry.get("kind") == "result":
             if entry.get("human_decision") is not None:
@@ -1306,13 +1337,21 @@ def _stats_clips(config: Config, lower: datetime | None, upper: datetime | None,
         if decision is None:
             decision, source = decisions.get((video_id, moment_id)), "feedback"
         found = measures.get(clip_id) if holders[clip_id] == 1 else None
+        csv_stats = max(found)[2] if found else None
+        from_tiktok = tiktok_measures.get((video_id, clip_id))
+        # La mesure la plus recente gagne (egalite : le releve TikTok, qui porte le video_id) ;
+        # la source est dite a part pour que l'ecran l'affiche.
+        if from_tiktok is not None and (csv_stats is None or from_tiktok["date"] >= str(csv_stats.get("date"))):
+            stats, stats_source = from_tiktok, "tiktok"
+        else:
+            stats, stats_source = csv_stats, "csv" if csv_stats is not None else None
         clips.append({
             "video_id": video_id, "clip_id": clip_id, "moment_id": moment_id,
             "channel": channel, "screen_title": sidecar.get("screen_title"),
             "created_at": sidecar.get("created_at"),
             "qa_status": qa.get("status"), "issues": qa.get("issues"),
             "human_decision": decision, "decision_source": source if decision is not None else None,
-            "stats": max(found)[2] if found else None,
+            "stats": stats, "stats_source": stats_source,
         })
     unmatched = []
     for clip_id in sorted(measures) if wanted is None else []:
@@ -1322,6 +1361,18 @@ def _stats_clips(config: Config, lower: datetime | None, upper: datetime | None,
                   if holders.get(clip_id) else f"aucun clip {clip_id} dans {config.output_dir}")
         unmatched.append({"clip_id": clip_id, "reason": reason, "stats": max(measures[clip_id])[2]})
     return {"clips": clips, "stats_unmatched": unmatched}
+
+
+def _stats_tiktok(config: Config, wanted: str | None) -> dict[str, Any]:
+    """Etat des releves TikTok par compte (date, nombre de posts, dernier echec) et posts releves
+    qu'aucun clip n'explique (jamais attribues au hasard ; rendus sans filtre de chaine)."""
+    reports = _tiktok_reports(config)
+    accounts = [{"account": r["account"], "fetched_at": r.get("fetched_at"), "posts": len(r["posts"]),
+                 "error": r.get("error")} for r in reports]
+    unmatched = [{"account": r["account"], "post_id": p["post_id"], "post_url": p.get("post_url"),
+                  "views": p.get("views")}
+                 for r in reports for p in r["posts"] if p.get("video_id") is None] if wanted is None else []
+    return {"tiktok_stats": accounts, "tiktok_unmatched": unmatched}
 
 
 def _stats_llm_cost(config: Config, lower: datetime | None, upper: datetime | None,
@@ -1393,7 +1444,7 @@ def _stats(config: Config, since: str | None, until: str | None, channel: str | 
     lower, upper = _stats_period(since, until)
     wanted = channel or None
     return {"period": {"since": since or None, "until": until or None}, "channel": wanted,
-            **_stats_clips(config, lower, upper, wanted),
+            **_stats_clips(config, lower, upper, wanted), **_stats_tiktok(config, wanted),
             "llm_cost": _stats_llm_cost(config, lower, upper, wanted),
             **_stats_steps_and_counts(config, lower, upper, wanted)}
 
@@ -2079,6 +2130,36 @@ def create_app(config: Config | None = None) -> FastAPI:
     async def stats_import(request: Request) -> dict[str, Any]:
         data = _stats_csv_from_multipart(request.headers.get("content-type", ""), await request.body())
         return {"imported": _stats_import(config, data)}
+
+    @app.post("/api/stats/tiktok/refresh")
+    async def stats_tiktok_refresh(request: Request) -> dict[str, Any]:
+        """Releve a la demande des statistiques TikTok Studio (SPEC-9225 R7) : un compte
+        (``{"account": id}``) ou, sans corps, tous ceux qui ont un post publie. Ouvre le Chrome
+        visible du profil sur cette machine ; un arret sur (R4) est une 409 avec sa raison."""
+        raw = await request.body()
+        try:
+            body = json.loads(raw) if raw.strip() else {}
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="corps JSON invalide") from exc
+        if not isinstance(body, dict) or set(body) - {"account"}:
+            raise HTTPException(status_code=422, detail="corps invalide : {\"account\": id} ou aucun corps attendu")
+        try:
+            accounts = ([browser_mod.validate_account(body["account"])] if "account" in body
+                        else tiktok_mod.stats_accounts(config=config))
+        except (browser_mod.BrowserError, tiktok_mod.TikTokError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if not accounts:
+            raise HTTPException(status_code=409, detail="aucun compte n'a de post publié à mesurer : rien à relever")
+        done: dict[str, Any] = {}
+        for account in accounts:
+            try:
+                report = await run_in_threadpool(tiktok_mod.fetch_stats, account, config=config)
+            except (tiktok_mod.TikTokStop, browser_mod.BrowserError) as exc:
+                raise HTTPException(status_code=409, detail=f"relevé du compte {account} arrêté : {exc}") from exc
+            except tiktok_mod.TikTokError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            done[account] = {"fetched_at": report["fetched_at"], "posts": len(report["posts"])}
+        return {"accounts": done}
 
     # ----------------------------------------------------------------
     # Comptes (SPEC-6fa4)

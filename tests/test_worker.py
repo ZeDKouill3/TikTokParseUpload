@@ -1154,3 +1154,147 @@ def test_a_broken_publish_file_is_logged_once_and_does_not_kill_the_worker(tmp_p
         w.tick()
 
     assert caplog.text.count("publication TikTok impossible") == 1
+
+
+# --------------------------------------------------------------------------
+# Releve periodique des statistiques TikTok (SPEC-9225 R7)
+# --------------------------------------------------------------------------
+
+
+class FakeStatsFetcher:
+    """Remplace tiktok.fetch_stats : enregistre les appels, ecrit un releve ou leve ``error``."""
+
+    def __init__(self, tmp_path, error=None):
+        self.tmp, self.calls, self.error = tmp_path, [], error
+
+    def __call__(self, account, *, config=None, on_tick=None, **kwargs):
+        self.calls.append({"account": account, "on_tick": on_tick})
+        if self.error is not None:
+            raise self.error
+        path = self.tmp / "state" / "stats" / "tiktok" / f"{account}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"account": account, "fetched_at": datetime.now(timezone.utc).isoformat(),
+                                    "posts": [], "error": None}), encoding="utf-8")
+        return {"account": account}
+
+
+def _stats_worker(config, fetcher):
+    return worker.Worker(config=config, spawner=FakeSpawner(), publisher=FakePublisher(), stats_fetcher=fetcher)
+
+
+def _published_clip(tmp_path, clip_id, account=ACCOUNT, *, video_id="aaaaaaaaaaa", post_id="7300000000000000001"):
+    out = tmp_path / "output" / video_id
+    out.mkdir(parents=True, exist_ok=True)
+    (out / f"{clip_id}.json").write_text(json.dumps({
+        "video_id": video_id, "clip_id": clip_id,
+        "tiktok_post": {"url": LINK, "id": post_id, "state": "published", "account": account}}), encoding="utf-8")
+
+
+def test_tick_fetches_the_stats_of_an_account_with_a_published_post_then_waits_the_interval(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    _published_clip(tmp_path, "01")
+    fetcher = FakeStatsFetcher(tmp_path)
+    w = _stats_worker(config, fetcher)
+
+    w.tick()
+    w.tick()
+
+    assert [c["account"] for c in fetcher.calls] == [ACCOUNT]  # une fois : le releve est recent
+    assert callable(fetcher.calls[0]["on_tick"])  # le battement du worker continue pendant le releve
+
+
+def test_tick_refetches_once_the_configured_interval_has_passed(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch, tiktok_settings={"stats_interval_h": 2})
+    _published_clip(tmp_path, "01")
+    old = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
+    path = tmp_path / "state" / "stats" / "tiktok" / f"{ACCOUNT}.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"account": ACCOUNT, "fetched_at": old, "posts": [], "error": None}), encoding="utf-8")
+    fetcher = FakeStatsFetcher(tmp_path)
+
+    _stats_worker(config, fetcher).tick()
+
+    assert len(fetcher.calls) == 1
+
+
+def test_tick_does_not_open_a_browser_for_an_account_with_nothing_to_measure(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    fetcher = FakeStatsFetcher(tmp_path)
+
+    _stats_worker(config, fetcher).tick()
+
+    assert fetcher.calls == []
+
+
+def test_tick_skips_the_stats_of_an_account_halted_by_a_safe_stop(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch, tiktok_settings={"max_posts_per_day": 5, "min_gap_minutes": 0})
+    _published_clip(tmp_path, "00", video_id="bbbbbbbbbbb")
+    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1))
+    w = worker.Worker(config=config, spawner=FakeSpawner(),
+                      publisher=FakePublisher(error=tiktok.TikTokStop("captcha", "captcha détecté", None)),
+                      stats_fetcher=FakeStatsFetcher(tmp_path))
+
+    w.tick()  # la publication s'arrete sur captcha : compte arrete
+    w.tick()
+
+    assert w.stats_fetcher.calls == []
+
+
+def test_tick_does_not_fetch_stats_in_the_tick_that_drove_a_publication(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch, tiktok_settings={"max_posts_per_day": 5, "min_gap_minutes": 0})
+    _published_clip(tmp_path, "00", video_id="bbbbbbbbbbb")
+    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1))
+    fetcher = FakeStatsFetcher(tmp_path)
+    pub = FakePublisher()
+    w = worker.Worker(config=config, spawner=FakeSpawner(), publisher=pub, stats_fetcher=fetcher)
+
+    w.tick()
+    assert len(pub.calls) == 1 and fetcher.calls == []  # un seul pilotage du navigateur par iteration
+    w.tick()
+    assert len(fetcher.calls) == 1
+
+
+def test_tick_fetches_one_account_per_iteration(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch, channels=("ma_chaine", "autre"))
+    _published_clip(tmp_path, "01")
+    _published_clip(tmp_path, "02", account="ef34ab", video_id="bbbbbbbbbbb")
+    fetcher = FakeStatsFetcher(tmp_path)
+    w = _stats_worker(config, fetcher)
+
+    w.tick()
+    assert [c["account"] for c in fetcher.calls] == [ACCOUNT]
+    w.tick()
+    assert [c["account"] for c in fetcher.calls] == [ACCOUNT, "ef34ab"]
+
+
+@pytest.mark.parametrize("error", [
+    tiktok.TikTokStop("captcha", "captcha détecté : arrêt immédiat", None),
+    browser.BrowserError("Chrome introuvable"),
+    tiktok.TikTokError("réglage invalide"),
+])
+def test_a_failed_stats_fetch_is_logged_once_not_retried_every_tick_and_never_kills_the_worker(
+        tmp_path, monkeypatch, caplog, error):
+    config = _pub_env(tmp_path, monkeypatch)
+    _published_clip(tmp_path, "01")
+    fetcher = FakeStatsFetcher(tmp_path, error=error)
+    w = _stats_worker(config, fetcher)
+
+    with caplog.at_level(logging.ERROR):
+        w.tick()
+        w.tick()
+        w.tick()
+
+    assert len(fetcher.calls) == 1
+    assert caplog.text.count("relevé des statistiques TikTok impossible") == 1
+    assert str(error) in caplog.text
+
+
+def test_an_unexpected_error_in_the_stats_fetch_is_logged_not_fatal(tmp_path, monkeypatch, caplog):
+    config = _pub_env(tmp_path, monkeypatch)
+    _published_clip(tmp_path, "01")
+    w = _stats_worker(config, FakeStatsFetcher(tmp_path, error=RuntimeError("boom")))
+
+    with caplog.at_level(logging.ERROR):
+        w.tick()
+
+    assert "boom" in caplog.text
