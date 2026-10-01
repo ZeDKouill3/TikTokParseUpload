@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="fr" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Clipper · Console</title>
+<meta name="theme-color" content="#0f0f0d">
+<link rel="icon" type="image/svg+xml" href="img/logo.svg">
+<link rel="stylesheet" href="css/fonts.css">
+<link rel="stylesheet" href="css/style.css">
+<script>
+  // Theme avant le premier rendu : pas de flash clair -> sombre.
+  try {
+    var t = localStorage.getItem("clipper-maquette-theme");
+    if (t) document.documentElement.dataset.theme = t;
+  } catch (e) { /* stockage indisponible : sombre par defaut */ }
+  // Mode capture (?shot=1) : animations coupees pour les captures headless.
+  if (/[?&]shot=1/.test(location.hash)) document.documentElement.classList.add("shot");
+  var th = location.hash.match(/[?&]theme=(\w+)/);
+  if (th) document.documentElement.dataset.theme = th[1];
+</script>
+</head>
+<body>
+<div class="app" id="app">
+
+  <aside class="sidebar" aria-label="Navigation principale">
+    <a class="brand" href="#/tableau">
+      <img src="img/logo.svg" alt="" width="32" height="32">
+      <span class="brand-name">Clipper</span>
+      <span class="brand-env">local</span>
+    </a>
+    <nav class="nav" id="nav"></nav>
+    <div class="sidebar-foot">
+      <div class="machine" id="machine-mini"></div>
+    </div>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <button class="icon-btn only-mobile" id="btn-menu" aria-label="Menu"></button>
+      <div class="crumbs" id="crumbs"></div>
+      <button class="search" id="btn-search" type="button">
+        <span class="search-ico"></span>
+        <span class="search-label">Rechercher une vidéo, un clip, une chaîne…</span>
+        <kbd>Ctrl K</kbd>
+      </button>
+      <div class="top-actions">
+        <span class="live" id="live" title="Progression en temps réel (SSE)"><span class="live-dot"></span><span class="live-label">En direct</span></span>
+        <button class="icon-btn" id="btn-theme" aria-label="Changer de thème"></button>
+        <button class="icon-btn notif-btn" id="btn-notif" aria-label="Notifications"><span class="notif-count" id="notif-count">3</span></button>
+        <button class="btn btn-primary" id="btn-add" type="button"></button>
+      </div>
+    </header>
+
+    <main class="view" id="view" tabindex="-1"></main>
+  </div>
+
+  <nav class="tabbar" id="tabbar" aria-label="Navigation mobile"></nav>
+</div>
+
+<div class="toasts" id="toasts" aria-live="polite"></div>
+<div class="overlay" id="overlay" hidden></div>
+<div class="popover" id="notif-panel" hidden></div>
+
+<script src="js/icons.js"></script>
+<script src="js/data.js"></script>
+<script src="js/ui.js"></script>
+<script src="js/views.js"></script>
+<script src="js/editor.js"></script>
+<script src="js/review.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
