@@ -148,7 +148,7 @@ moitié activé.
   indisponible, quota, réseau) remet la vidéo en file d'attente au lieu
   d'abandonner ou de produire un résultat dégradé en silence.
 
-## Console de gestion web (v2)
+## Interface web (console de gestion v2)
 
 `python -m clipper serve` lance la console (`http://127.0.0.1:8000`) et le
 worker qui traite une file de vidéos, une à la fois. Huit écrans : Accueil,
@@ -161,7 +161,7 @@ sans étape de build) et ne fait aucun traitement vidéo, audio ou LLM.
 Pour l'ouvrir depuis un téléphone du réseau local :
 `python -m clipper serve --host 0.0.0.0`, ce qui exige `[web] token` dans
 `config.toml`. Pas de TLS : ne pas exposer le port sur Internet sans reverse
-proxy TLS. Détails dans [`docs/GUIDE.md`](docs/GUIDE.md#console-de-gestion).
+proxy TLS. Détails dans [`docs/GUIDE.md`](docs/GUIDE.md).
 
 ## Coûts et performances
 
