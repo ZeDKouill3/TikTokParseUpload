@@ -195,6 +195,7 @@ function chSectionHtml(spec, ed) {
     <summary><div><h3>${esc(spec.title)}</h3><span class="muted">${esc(spec.sub)}</span></div><span class="mono muted">[${esc(spec.section)}]</span>
       <span class="chip ${redefinedCount ? "info" : "pending"} plain" data-count>${redefinedCount ? `${redefinedCount} redéfini${redefinedCount > 1 ? "s" : ""}` : "hérité"}</span></summary>
     <p class="field-error chan-sec-error" data-sec-error role="alert"></p>
+    ${spec.section === "subtitles" ? chSubsPreviewHtml(ed) : ""}
     <div class="chan-fields">${main.map((k) => chField(spec.section, k, docs[k], ed)).join("")}</div>
     ${rest.length ? `<details class="chan-more" data-more="${esc(spec.section)}"><summary>Autres réglages de [${esc(spec.section)}] (${rest.length})</summary><div class="chan-fields">${rest.map((k) => chField(spec.section, k, docs[k], ed)).join("")}</div></details>` : ""}
   </details>`;
@@ -284,6 +285,7 @@ function chRepaintField(root, ed, section, key) {
   const chip = $("[data-count]", det);
   chip.textContent = n ? `${n} redéfini${n > 1 ? "s" : ""}` : "hérité";
   chip.className = `chip ${n ? "info" : "pending"} plain`;
+  if (section === "subtitles" || section === "reframe") chSubsPreview(root, ed);
 }
 
 async function chSave(root, ed) {
@@ -369,6 +371,7 @@ function chWireEdit(root, ed) {
       ed.draft[section][key] = chReadField(field);
       field.classList.remove("invalid");
       $(".field-error", field).textContent = "";
+      if (section === "subtitles" || section === "reframe") chSubsPreview(root, ed);
     } catch (err) {
       field.classList.add("invalid");
       $(".field-error", field).textContent = `[${section}] ${key} : JSON invalide (${err.message})`;
@@ -404,6 +407,7 @@ async function chOpenEdit(body, name) {
   if (chUi.edit !== edit || currentScreen !== "channels") return;
   body.innerHTML = chEditHtml(edit);
   chWireEdit(body, edit);
+  chSubsPreviewWire(body, edit);
 }
 
 Screens.channels = {

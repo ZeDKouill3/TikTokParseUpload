@@ -1148,3 +1148,46 @@ def test_subtitles_parallel_below_1_is_refused(tmp_path, parallel):
     with pytest.raises(PipelineError, match="parallel"):
         run_parallel_subtitles(tmp_path, parallel)
     assert not (d / "subtitles").exists()
+
+
+# --------------------------------------------------------------------------
+# Aperçu du style des sous-titres (TASK-dd3f) : seul point d'entrée du web
+# --------------------------------------------------------------------------
+
+
+def test_preview_subtitles_renders_through_the_subtitles_step(monkeypatch):
+    from clipper import pipeline
+
+    calls = []
+    monkeypatch.setattr(pipeline.subtitles, "render_preview",
+                        lambda section, text, **kw: calls.append((section, text, kw)) or b"PNG")
+    config = Config(mode="review", workspace_dir=Path("w"), output_dir=Path("o"),
+                    _sections={"subtitles": {"outline": 3}})
+
+    assert pipeline.preview_subtitles(config, "Salut") == b"PNG"
+    section, text, kw = calls[-1]
+    assert section["outline"] == 3 and text == "Salut" and kw["style"] == "letterbox"
+
+
+def test_preview_subtitles_uses_the_split_style_when_the_layout_is_split(monkeypatch):
+    from clipper import pipeline
+
+    calls = []
+    monkeypatch.setattr(pipeline.subtitles, "render_preview",
+                        lambda section, text, **kw: calls.append(kw) or b"PNG")
+    config = Config(mode="review", workspace_dir=Path("w"), output_dir=Path("o"),
+                    _sections={"reframe": {"stream_variant": "split"}})
+
+    pipeline.preview_subtitles(config, "Salut")
+    assert calls[-1]["style"] == "split"
+
+
+def test_preview_subtitles_turns_a_style_error_into_a_pipeline_error():
+    from clipper import pipeline
+
+    config = Config(mode="review", workspace_dir=Path("w"), output_dir=Path("o"),
+                    _sections={"subtitles": {"outline_color": "pas une couleur"}})
+    with pytest.raises(pipeline.PipelineError, match="couleur"):
+        pipeline.preview_subtitles(config, "Salut")
+    png = pipeline.preview_subtitles(Config(mode="review", workspace_dir=Path("w"), output_dir=Path("o")), "Salut")
+    assert png.startswith(b"\x89PNG")
