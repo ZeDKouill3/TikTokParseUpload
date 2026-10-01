@@ -34,6 +34,7 @@ from clipper import gpu as gpu_mod
 from clipper import outcomes as outcomes_mod
 from clipper import pipeline
 from clipper import publish as publish_mod
+from clipper import reframe as reframe_mod
 from clipper import watch as watch_mod
 from clipper import worker as worker_mod
 from clipper.config import Config, ConfigError, _section_defaults, load_config
@@ -732,6 +733,95 @@ def _save_channel_preset(name: str, preset: dict[str, Any]) -> None:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
+# --------------------------------------------------------------------------
+# Editeur d'agencement stream split (SPEC-c100 E5, SPEC-76dc) : memes cles et
+# memes validations que [reframe] (c'est reframe qui refuse, pas le JS).
+# L'image cle est un fichier deja produit par l'etape scenes.
+# --------------------------------------------------------------------------
+
+_LAYOUT_KEYS = ("split_webcam_dest", "split_gameplay_dest", "badge_dest", "split_subtitle_dest")
+_LAYOUT_KEYFRAME_DIRS = ("frames", "scenes")  # frames/ : sortie de clipper.scenes
+
+
+def _layout_keyframes(config: Config, video_id: str) -> list[Path]:
+    video_dir = Path(config.workspace_dir) / video_id
+    return sorted(p for d in _LAYOUT_KEYFRAME_DIRS for p in (video_dir / d).glob("*.jpg") if p.is_file())
+
+
+def _layout_keyframe_path(config: Config, name: str, video_id: str | None) -> Path:
+    """Image cle du milieu d'une video de la chaine (celle demandee, sinon la
+    premiere qui en a) : 404 en francais si aucune n'existe."""
+    if video_id is not None:
+        if not _SAFE_ID.fullmatch(video_id):
+            raise HTTPException(status_code=404, detail=f"identifiant invalide : {video_id!r}")
+        if _channel_of(video_id, config) != name:
+            raise HTTPException(status_code=404, detail=f"la vidéo {video_id!r} n'appartient pas à la chaîne {name!r}")
+        frames = _layout_keyframes(config, video_id)
+        if not frames:
+            raise HTTPException(status_code=404, detail=f"aucune image clé pour la vidéo {video_id!r} (étape scenes non faite)")
+        return frames[len(frames) // 2]
+    for state in sorted(_list_states(config), key=lambda s: s["video_id"]):
+        if state.get("channel") == name and _SAFE_ID.fullmatch(state["video_id"]):
+            frames = _layout_keyframes(config, state["video_id"])
+            if frames:
+                return frames[len(frames) // 2]
+    raise HTTPException(
+        status_code=404,
+        detail=f"aucune image clé : aucune vidéo de la chaîne {name!r} n'a passé l'étape scenes",
+    )
+
+
+def _layout_view(name: str) -> dict[str, Any]:
+    """Rectangles effectifs (preset > config.toml > defauts SPEC-76dc), defauts,
+    canevas et zone sure, tels que reframe les lit."""
+    config, _channel = _load_channel(name)
+    reframe = config.section("reframe")
+    defaults = _section_defaults("reframe")
+    return {
+        "name": name,
+        **{key: reframe[key] for key in _LAYOUT_KEYS},
+        "defaults": {key: defaults[key] for key in _LAYOUT_KEYS},
+        "canvas": {"w": reframe["output_width"], "h": reframe["output_height"]},
+        "safe": {"left": reframe["safe_left"], "top": reframe["safe_top"],
+                 "right": reframe["safe_right"], "bottom": reframe["safe_bottom"]},
+    }
+
+
+def _layout_check_geometry(name: str, preset: dict[str, Any]) -> None:
+    """Fait relire ``preset`` (stream_variant force a "split") par reframe :
+    load_config ne controle que les cles, c'est reframe._settings qui refuse un
+    rectangle hors canevas, chevauchant ou hors zone sure. Son message est
+    renvoye tel quel (ReframeError)."""
+    candidate = {**preset, "reframe": {**preset["reframe"], "stream_variant": "split"}}
+    _check_preset_types(candidate)
+    with tempfile.TemporaryDirectory() as tmp:
+        channel_mod.save_channel(name, candidate, presets_dir=tmp, base=_BASE_CONFIG)
+        config, _channel = channel_mod.load_channel(name, presets_dir=tmp, base=_BASE_CONFIG)
+    try:
+        reframe_mod._settings(config)
+    except reframe_mod.ReframeError as exc:
+        raise ConfigError(str(exc)) from exc
+
+
+def _layout_save(name: str, body: dict[str, Any]) -> None:
+    """Ecrit les rectangles dans [reframe] du preset par save_channel, apres
+    avoir verifie la geometrie comme reframe la verifiera au rendu : l'editeur
+    ne laisse jamais passer un agencement que reframe refuserait."""
+    given = {key: body[key] for key in _LAYOUT_KEYS if body.get(key) is not None}
+    if not given:
+        raise HTTPException(status_code=422, detail=f"aucun rectangle à enregistrer (attendu : {', '.join(_LAYOUT_KEYS)})")
+    path = _channel_preset_path(name)
+    try:
+        preset = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise HTTPException(status_code=422, detail=f"preset illisible ({path.name}) : {exc}") from exc
+    preset["reframe"] = {**preset.get("reframe", {}), **given}
+    try:
+        _layout_check_geometry(name, preset)
+    except ConfigError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    _save_channel_preset(name, preset)
+
 def _png_from_multipart(content_type: str, body: bytes) -> bytes:
     """Contenu du champ « file » d'un POST multipart (stdlib, sans dependance)."""
     if not content_type.lower().startswith("multipart/form-data"):
@@ -1014,6 +1104,13 @@ class DecideBody(BaseModel):
     start: float | None = None
     end: float | None = None
     comment: str | None = None
+
+
+class LayoutBody(BaseModel):
+    split_webcam_dest: dict[str, Any] | None = None
+    split_gameplay_dest: dict[str, Any] | None = None
+    badge_dest: dict[str, Any] | None = None
+    split_subtitle_dest: dict[str, Any] | None = None
 
 
 def create_app(config: Config | None = None) -> FastAPI:
@@ -1346,6 +1443,19 @@ def create_app(config: Config | None = None) -> FastAPI:
         os.replace(tmp, target)
         return {"name": name, "logo": f"{_PRESETS_DIR}/{name}.png"}
 
+    @app.get("/api/channels/{name}/keyframe")
+    def channel_keyframe(name: str, video_id: str | None = None) -> FileResponse:
+        _channel_preset_path(name)
+        return FileResponse(_layout_keyframe_path(config, name, video_id), media_type="image/jpeg")
+
+    @app.get("/api/channels/{name}/layout")
+    def get_channel_layout(name: str) -> dict[str, Any]:
+        return _layout_view(name)
+
+    @app.put("/api/channels/{name}/layout")
+    def put_channel_layout(name: str, body: LayoutBody) -> dict[str, Any]:
+        _layout_save(name, body.model_dump())
+        return _layout_view(name)
     # ----------------------------------------------------------------
     # Statistiques (SPEC-c100 E7)
     # ----------------------------------------------------------------
