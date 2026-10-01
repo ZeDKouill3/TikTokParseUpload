@@ -3652,7 +3652,7 @@ def test_stats_issue_text_renders_objects_and_strings_readably(tmp_path):
     start = js.index("function statsIssueText")
     end = js.index("\n}\n", start) + 3
     script = js[start:end] + f"\nconsole.log(JSON.stringify([statsIssueText({json.dumps(_QA_ISSUE)}), statsIssueText('hors cadre')]));"
-    out = subprocess.run(["node", "-e", script], capture_output=True, text=True, check=True).stdout
+    out = subprocess.run(["node", "-e", script], capture_output=True, text=True, encoding="utf-8", check=True).stdout
     assert json.loads(out) == ["image noire de 2 s", "hors cadre"]
 
 
@@ -3965,7 +3965,7 @@ def test_stats_clip_pagination_reveals_50_more_rows_per_click():
     start = js.index("function statsMoreCount")
     end = js.index("\n}\n", start) + 3
     script = "const STATS_CLIPS_PAGE_SIZE = 50;\n" + js[start:end] + "\nconsole.log(JSON.stringify([statsMoreCount(120, 50), statsMoreCount(120, 100), statsMoreCount(30, 50)]));"
-    out = subprocess.run(["node", "-e", script], capture_output=True, text=True, check=True).stdout
+    out = subprocess.run(["node", "-e", script], capture_output=True, text=True, encoding="utf-8", check=True).stdout
     assert json.loads(out) == [50, 20, 0]
 
 
@@ -4215,7 +4215,7 @@ def test_stats_clip_sort_orders_by_column_with_missing_values_last():
         + "\nstatsUi.sort = { key: 'views', dir: 'asc' }; statsSortInPlace(clips);"
         + "\nconsole.log(JSON.stringify([desc, clips.map(c => c.clip_id).join('')]));"
     )
-    out = subprocess.run(["node", "-e", script], capture_output=True, text=True, check=True).stdout
+    out = subprocess.run(["node", "-e", script], capture_output=True, text=True, encoding="utf-8", check=True).stdout
     assert json.loads(out) == ["cab", "acb"]
 
 
@@ -5123,7 +5123,7 @@ def test_every_static_javascript_file_parses():
     assert files
     bad = []
     for f in files:
-        run = subprocess.run(["node", "--check", str(f)], capture_output=True, text=True)
+        run = subprocess.run(["node", "--check", str(f)], capture_output=True, text=True, encoding="utf-8")
         if run.returncode != 0:
             bad.append(f"{f.name}: {run.stderr.strip().splitlines()[-1] if run.stderr.strip() else run.returncode}")
     assert not bad, bad
@@ -5396,5 +5396,301 @@ def test_the_form_lists_only_clips_to_validate_or_approved_newest_first():
         {"video_id": "v3", "clip_id": "01", "ready": False, "publish_status": "not_ready", "created_at": "2026-10-02T10:00:00"},
     ]
     script = start_key + fn + f"\nconsole.log(JSON.stringify(pubFormClips({json.dumps(clips)}).map(pubKey)));"
-    out = subprocess.run(["node", "-e", script], capture_output=True, text=True, check=True).stdout
+    out = subprocess.run(["node", "-e", script], capture_output=True, text=True, encoding="utf-8", check=True).stdout
     assert json.loads(out) == ["v2/01", "v1/01"]  # plus recents en haut ; ni refuses, ni publies, ni deja en file
+
+
+# --------------------------------------------------------------------------
+# Fiche vidéo : diagramme en étoile du jury par moment (TASK-3a08)
+# --------------------------------------------------------------------------
+
+JURY_VID = "jury1234567"
+_CRITERIA = {"hook": 3, "retention": 2, "clarte": 1, "meme": 0}
+
+
+def _jr_judge(scores, confidence, argument="ok", veto=None):
+    out = {"scores": scores, "score": round(sum(scores.values()) / len(scores) * 10, 1),
+           "argument": argument, "confidence": confidence}
+    if veto:
+        out.update({"veto": True, "veto_reason": veto})
+    return out
+
+
+def _jr_moment(**over):
+    base = {
+        "start": 10.0, "end": 40.0, "duration": 30.0, "format": "single", "parts": [],
+        "scores": {"hook": 8, "retention": 7, "clarte": 6, "meme": 5}, "bonus": {"total": 0.0},
+        "final_score": 71.0, "justification": "Bon moment", "hook_text": "Regarde ça",
+        "jury": {
+            "proposer": {"scores": {"hook": 9, "retention": 9, "clarte": 9, "meme": 9}, "justification": "p"},
+            "score": 71.0, "confidence": 62, "veto": None, "debated": True,
+            "trace": {"rounds": [
+                {"round": 1, "judges": {
+                    "retention": _jr_judge({"hook": 9, "retention": 8, "clarte": 6, "meme": 5}, 90),
+                    "avocat": _jr_judge({"hook": 5, "retention": 4, "clarte": 6, "meme": 5}, 30)}},
+                {"round": 2, "judges": {
+                    "avocat": _jr_judge({"hook": 7, "retention": 6, "clarte": 6, "meme": 5}, 55)}},
+            ], "revisions": [], "dissent": []},
+        },
+    }
+    base.update(over)
+    return base
+
+
+def _write_jury_moments(tmp_path, **over):
+    data = {
+        "video_id": JURY_VID, "rubric": {"path": "rubric.toml", "weights": _CRITERIA, "min_score": 60},
+        "chunked": False, "selection": "jury",
+        "jury": {"judges": [{"name": "retention", "veto": False}, {"name": "avocat", "veto": False}],
+                 "threshold": 20, "debated": ["m0"]},
+        "exploration": {"share": 0.1, "seed": 0, "target": 1, "chosen": 1},
+        "moments": [
+            {"id": 0, **_jr_moment()},
+            {"id": 1, **_jr_moment(start=100.0, end=130.0, final_score=55.0, exploration=True)},
+        ],
+        "rejected": [
+            {**_jr_moment(start=200.0, end=230.0, final_score=48.0),
+             "reason": "score 48.0 < min_score 60"},
+            {**_jr_moment(start=300.0, end=330.0, final_score=75.0),
+             "reason": "ecarte par le plafond de 1 moments par heure de video (max_moments_per_hour 1)"},
+            {**_jr_moment(start=400.0, end=430.0, final_score=None, jury={
+                **_jr_moment()["jury"], "veto": {"judge": "conformite", "reason": "propos haineux"}}),
+             "reason": "veto du juge conformite : propos haineux"},
+        ],
+        **over,
+    }
+    data["rejected"][2].pop("final_score")
+    _write_json(tmp_path / "workspace" / JURY_VID / "moments.json", data)
+
+
+def _jury(tmp_path, video_id=JURY_VID):
+    resp = client(tmp_path).get(f"/api/videos/{video_id}/jury")
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+def test_api_jury_lists_retained_moments_first_then_rejected_with_the_rubric(tmp_path, isolated_cwd):
+    _write_jury_moments(tmp_path)
+
+    body = _jury(tmp_path)
+
+    assert body["available"] is True and body["reason"] is None
+    assert body["criteria"] == [{"name": n, "weight": w} for n, w in _CRITERIA.items()]
+    assert body["threshold"] == 60
+    assert body["selection"] == "jury"
+    assert body["exploration"] == {"share": 0.1, "seed": 0, "target": 1, "chosen": 1}
+    assert [m["retained"] for m in body["moments"]] == [True, True, False, False, False]
+    assert [m["start"] for m in body["moments"]] == [10.0, 100.0, 200.0, 300.0, 400.0]
+    assert len({m["key"] for m in body["moments"]}) == 5
+
+
+def test_api_jury_moment_carries_scores_judges_rounds_and_confidence(tmp_path, isolated_cwd):
+    _write_jury_moments(tmp_path)
+
+    first = _jury(tmp_path)["moments"][0]
+
+    assert first["scores"] == {"hook": 8, "retention": 7, "clarte": 6, "meme": 5}  # note retenue (médiane pondérée)
+    assert first["final_score"] == 71.0 and first["jury_score"] == 71.0
+    assert first["confidence"] == 62
+    assert first["debated"] is True
+    assert first["veto"] is None
+    assert first["justification"] == "Bon moment" and first["hook_text"] == "Regarde ça"
+    assert first["proposer_scores"]["hook"] == 9
+    before, after = first["rounds"]
+    assert (before["round"], after["round"]) == (1, 2)
+    assert before["judges"]["avocat"]["scores"]["hook"] == 5 and before["judges"]["avocat"]["confidence"] == 30
+    # après débat : le juge qui a révisé change, l'autre garde ses notes du tour 1
+    assert after["judges"]["avocat"]["scores"]["hook"] == 7 and after["judges"]["avocat"]["confidence"] == 55
+    assert after["judges"]["avocat"]["revised"] is True
+    assert after["judges"]["retention"]["scores"]["hook"] == 9 and after["judges"]["retention"]["revised"] is False
+    assert before["judges"]["retention"]["revised"] is True
+
+
+def test_api_jury_reasons_for_retention_and_rejection(tmp_path, isolated_cwd):
+    _write_jury_moments(tmp_path)
+
+    moments = _jury(tmp_path)["moments"]
+
+    assert [m["reason_kind"] for m in moments] == ["retenu", "exploration", "score", "plafond", "veto"]
+    assert "71.0" in moments[0]["reason"] and "60" in moments[0]["reason"]
+    assert "exploration" in moments[1]["reason"]
+    assert moments[2]["reason"] == "score 48.0 < min_score 60"
+    assert "plafond" in moments[3]["reason"]
+    assert moments[4]["veto"] == {"judge": "conformite", "reason": "propos haineux"}
+    assert moments[4]["final_score"] is None
+
+
+def test_api_jury_single_round_moment_has_one_round_and_no_debate(tmp_path, isolated_cwd):
+    _write_jury_moments(tmp_path)
+    path = tmp_path / "workspace" / JURY_VID / "moments.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["moments"][0]["jury"]["trace"]["rounds"] = data["moments"][0]["jury"]["trace"]["rounds"][:1]
+    data["moments"][0]["jury"]["debated"] = False
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+    first = _jury(tmp_path)["moments"][0]
+
+    assert first["debated"] is False and len(first["rounds"]) == 1
+
+
+def test_api_jury_without_moments_json_is_an_explicit_unavailable_answer(tmp_path, isolated_cwd):
+    body = _jury(tmp_path)
+
+    assert body["available"] is False
+    assert "moments.json" in body["reason"]
+    assert body["moments"] == []
+
+
+def test_api_jury_without_jury_in_moments_json_is_explicit(tmp_path, isolated_cwd):
+    _write_json(tmp_path / "workspace" / JURY_VID / "moments.json", {
+        "video_id": JURY_VID, "rubric": {"path": "rubric.toml", "weights": _CRITERIA, "min_score": 60},
+        "selection": "single", "moments": [{"id": 0, "start": 1.0, "end": 9.0, "scores": {}, "final_score": 70.0}],
+        "rejected": []})
+
+    body = _jury(tmp_path)
+
+    assert body["available"] is False
+    assert "jury" in body["reason"] and "single" in body["reason"]
+    assert body["moments"] == []
+
+
+def test_api_jury_rejects_an_invalid_video_id(tmp_path, isolated_cwd):
+    resp = client(tmp_path).get("/api/videos/a%20b/jury")
+    assert resp.status_code in (400, 404)
+
+
+def test_api_jury_is_read_only(tmp_path, isolated_cwd):
+    _write_jury_moments(tmp_path)
+    path = tmp_path / "workspace" / JURY_VID / "moments.json"
+    before = path.read_bytes()
+
+    assert client(tmp_path).post(f"/api/videos/{JURY_VID}/jury").status_code == 405
+    _jury(tmp_path)
+
+    assert path.read_bytes() == before
+
+
+def test_api_jury_corrupted_moments_json_is_an_explicit_error(tmp_path, isolated_cwd):
+    (tmp_path / "workspace" / JURY_VID).mkdir(parents=True)
+    (tmp_path / "workspace" / JURY_VID / "moments.json").write_text("{pas du json", encoding="utf-8")
+
+    resp = client(tmp_path).get(f"/api/videos/{JURY_VID}/jury")
+
+    assert resp.status_code == 500 or resp.json().get("available") is False
+    assert "moments.json" in json.dumps(resp.json())
+
+
+# ---- statique : radar en SVG inline ----
+
+
+def _radar_js() -> str:
+    return (STATIC / "screens" / "jury-radar.js").read_text(encoding="utf-8")
+
+
+@pytest.fixture()
+def jury_payload(tmp_path, isolated_cwd):
+    _write_jury_moments(tmp_path)
+    return _jury(tmp_path)
+
+
+def _run_radar(payload, moment_index=0, round_index=None):
+    script = _radar_js() + (
+        "\nconst data = JSON.parse(process.argv[1]);"
+        f"\nprocess.stdout.write(juryRadarSvg(data, data.moments[{moment_index}], {json.dumps(round_index)}));"
+    )
+    return subprocess.run(["node", "-e", script, json.dumps(payload)], capture_output=True, text=True, encoding="utf-8", check=True).stdout
+
+
+def test_radar_js_is_wired_in_the_page_before_videos_and_has_no_external_library():
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    js = _radar_js()
+
+    assert html.index("jury-radar.js") < html.index("screens/videos.js")
+    assert "import " not in js and "require(" not in js and "http" not in js
+    videos = (STATIC / "screens" / "videos.js").read_text(encoding="utf-8")
+    assert "/jury`" in videos and "juryPanelHtml" in videos and "data-jr-round" in videos
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node absent du PATH")
+def test_node_check_of_every_static_script():
+    for js in sorted(STATIC.rglob("*.js")):
+        subprocess.run(["node", "--check", str(js)], capture_output=True, text=True, encoding="utf-8", check=True)
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node absent du PATH")
+def test_radar_svg_structure_for_a_two_round_moment(jury_payload):
+    import re
+    svg = _run_radar(jury_payload, 0)
+
+    assert svg.startswith("<svg") and svg.endswith("</svg>")
+    assert 'role="img"' in svg and "<title>" in svg
+    assert len(re.findall(r'class="jr-axis[ "]', svg)) == 4                 # une branche par critère
+    assert len(re.findall(r'class="jr-axis jr-zero"', svg)) == 1            # poids 0 grisé
+    assert len(re.findall(r'class="jr-judge ', svg)) == 2                   # un polygone fin par juge
+    assert len(re.findall(r'class="jr-retained"', svg)) == 1                # un polygone épais retenu
+    for label in ("hook", "retention", "clarte", "meme"):
+        assert re.search(rf'<text class="jr-label[^>]*>{label} ', svg)
+    assert "poids 3" in svg and "poids 0" in svg
+    # opacité du trait selon la confiance : après débat l'avocat est à 55, le juge retention à 90
+    opacities = {m[0]: float(m[1]) for m in re.findall(r'data-judge="([^"]+)"[^>]*stroke-opacity="([0-9.]+)"', svg)}
+    assert opacities["retention"] > opacities["avocat"]
+    assert 0 < opacities["avocat"] < 1
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node absent du PATH")
+def test_radar_before_and_after_debate_differ_for_the_revising_judge(jury_payload):
+    import re
+    before = _run_radar(jury_payload, 0, 0)
+    after = _run_radar(jury_payload, 0, 1)
+
+    def points(svg, judge):
+        return re.search(rf'data-judge="{judge}"[^>]*points="([^"]+)"', svg).group(1)
+
+    assert points(before, "avocat") != points(after, "avocat")
+    assert points(before, "retention") == points(after, "retention")
+    # une valeur de 10 sur l'axe haut touche le rayon, 0 reste au centre : coordonnées finies
+    assert "NaN" not in before + after and "undefined" not in before + after
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node absent du PATH")
+def test_radar_panel_shows_veto_threshold_reason_and_toggle(jury_payload):
+    script = _radar_js() + (
+        "\nconst data = JSON.parse(process.argv[1]);"
+        "\nconst ui = {key: null, round: null};"
+        "\nprocess.stdout.write(JSON.stringify([juryPanelHtml(data, ui), juryPanelHtml(data, {key: data.moments[4].key, round: null})]));"
+    )
+    out = subprocess.run(["node", "-e", script, json.dumps(jury_payload)], capture_output=True, text=True, encoding="utf-8", check=True).stdout
+    retained, vetoed = json.loads(out)
+
+    assert "data-jr-round" in retained                      # interrupteur avant / après débat (il y a eu débat)
+    assert "Avant débat" in retained and "Après débat" in retained
+    assert "seuil" in retained.lower() and "71" in retained and "60" in retained
+    assert "Bon moment" in retained and "Regarde ça" in retained   # justification + phrase d'accroche
+    assert "retention" in retained and "avocat" in retained       # légende des juges
+    assert "jr-veto" not in retained
+    assert "jr-veto" in vetoed and "propos haineux" in vetoed and "conformite" in vetoed
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node absent du PATH")
+def test_radar_panel_without_debate_has_no_toggle_and_unavailable_is_explicit(jury_payload):
+    jury_payload["moments"][0]["debated"] = False
+    jury_payload["moments"][0]["rounds"] = jury_payload["moments"][0]["rounds"][:1]
+    script = _radar_js() + (
+        "\nconst data = JSON.parse(process.argv[1]);"
+        "\nprocess.stdout.write(JSON.stringify([juryPanelHtml(data, {key: null, round: null}),"
+        " juryPanelHtml({available: false, reason: 'moments.json absent', moments: []}, {key: null, round: null})]));"
+    )
+    out = subprocess.run(["node", "-e", script, json.dumps(jury_payload)], capture_output=True, text=True, encoding="utf-8", check=True).stdout
+    plain, unavailable = json.loads(out)
+
+    assert "data-jr-round" not in plain
+    assert "moments.json absent" in unavailable and "<svg" not in unavailable
+
+
+def test_radar_css_is_themed_and_responsive():
+    css = (STATIC / "style.css").read_text(encoding="utf-8")
+
+    assert ".jr-retained" in css and ".jr-zero" in css
+    assert css.count("--jr-c0:") == 2                     # défini en sombre et en clair
+    assert css.index("--jr-c0:", css.index('[data-theme="light"]')) > 0
+    assert "@media (max-width: 900px)" in css[css.index(".vjury"):]  # mobile

@@ -19,6 +19,7 @@
     list: null, listAt: 0, listBusy: false, listAgain: false, listKey: null,
     detailId: null, detail: null, detailAt: 0, detailBusy: false, detailAgain: false,
     events: [], step: null,
+    jury: null, juryFor: null, juryUi: { key: null, round: null },
     channelsAsked: false, formChannels: null,
   };
 
@@ -238,6 +239,30 @@
       }).join("")}</div>`;
   }
 
+  /* Radar du jury (TASK-3a08) : GET /api/videos/{id}/jury, relu quand l'etape Moments se termine. */
+  function juryBody() {
+    if (state.jury === null) return `<div class="skeleton skeleton-card"></div>`;
+    if (state.jury.error) return `<div class="jr-empty"><b>Jury indisponible.</b> ${esc(state.jury.error)}</div>`;
+    return juryPanelHtml(state.jury, state.juryUi);
+  }
+
+  async function loadJury(video) {
+    const key = `${video.video_id}|${((video.steps || {}).moments || {}).finished_at || ""}`;
+    if (state.juryFor === key) return;
+    state.juryFor = key;
+    state.jury = null;
+    state.juryUi = { key: null, round: null };
+    try {
+      const data = await api(`/api/videos/${encodeURIComponent(video.video_id)}/jury`);
+      if (state.juryFor !== key) return;
+      state.jury = data;
+    } catch (err) {
+      if (state.juryFor !== key) return;
+      state.jury = { error: String(err.message || err) };
+    }
+    if (state.detailId === video.video_id && state.step === "moments") paintDetail();
+  }
+
   function stepPanelHtml(video) {
     const name = state.step;
     const step = (video.steps || {})[name] || {};
@@ -256,7 +281,8 @@
           ${step.reason ? `<dt>Raison</dt><dd class="vreason">${esc(step.reason)}</dd>` : ""}
         </dl>
         ${canRetry ? `<div class="row wrap" style="margin-top:20px"><button type="button" class="btn btn-sm" data-retry="${name}">${icon("rotate-ccw")}Relancer depuis cette étape</button></div>` : ""}
-      </div>`;
+      </div>
+      ${name === "moments" && st === "done" ? `<div class="vjury"><h3>Jury par moment</h3>${juryBody()}</div>` : ""}`;
   }
 
   function levelClass(level) {
@@ -304,6 +330,7 @@
         </section>
       </div>`;
 
+    if (state.step === "moments" && stepStatusOf(video, "moments") === "done") loadJury(video);
     const done = STEP_ORDER.filter((n) => stepStatusOf(video, n) === "done").length;
     const total = STEP_ORDER.reduce((t, n) => t + ((video.durations || {})[n] || 0), 0);
     $(".vsum", view).textContent = `${done} / ${STEP_ORDER.length} étapes · ${fmtDur(total) || "0 s"} de calcul`;
@@ -315,6 +342,8 @@
   function wireDetail(view, video) {
     wireActions(view); // Relancer / Retirer / Rétablir : mêmes gestionnaires que le tableau de bord
     $$("[data-step]", view).forEach((b) => (b.onclick = () => { state.step = b.dataset.step; paintDetail(); }));
+    $$("[data-jr-pick]", view).forEach((b) => (b.onclick = () => { state.juryUi = { key: b.dataset.jrPick, round: null }; paintDetail(); }));
+    $$("[data-jr-round]", view).forEach((b) => (b.onclick = () => { state.juryUi = { ...state.juryUi, round: Number(b.dataset.jrRound) }; paintDetail(); }));
     const retry = $("[data-retry]", view);
     if (retry) retry.onclick = () => retryFrom(video, retry.dataset.retry);
     const cancel = $("[data-cancel-video]", view);
