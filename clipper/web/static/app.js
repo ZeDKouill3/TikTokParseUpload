@@ -1,46 +1,65 @@
+/* Coquille de la console : routeur par hash (8 ecrans), client d'API avec
+   jeton, temps reel SSE avec repli sur polling, theme, notifications, ajout
+   de video. Les ecrans eux-memes vivent dans screens.js. */
 "use strict";
 
-const STEP_LABELS = {
-  download: "Telechargement", transcribe: "Transcription", scenes: "Plans",
-  audio: "Audio", moments: "Moments", vision: "Images", parts: "Decoupage",
-  captions: "Legendes", reframe: "Recadrage", subtitles: "Sous-titres",
-  render: "Rendu", qa: "Controle qualite",
+const SCREEN_IDS = ["dashboard", "videos", "review", "clips", "channels", "publish", "stats", "settings"];
+const POLL_MS = 5000;
+const THEME_KEY = "clipper-theme";
+const NOTIF_KEY = "clipper-notifications";
+const TOKEN_COOKIE = "clipper_token";
+// Statuts de video qui declenchent un toast (SPEC-c100 T5).
+const NOTIFY_STATUS = {
+  done: { kind: "ok", title: "Vidéo terminée" },
+  failed: { kind: "bad", title: "Échec du traitement" },
+  awaiting_review: { kind: "warn", title: "Moments à valider" },
+  queued: { kind: "info", title: "Vidéo remise en file" },
 };
-const STATUS_LABELS = {
-  pending: "en attente", running: "en cours", done: "termine",
-  awaiting_review: "en attente de revue", queued: "en file d'attente",
-  failed: "echec",
-};
-const POLL_MS = 2000;
 
-const videosList = document.getElementById("videos-list");
-const submitForm = document.getElementById("submit-form");
-const submitUrl = document.getElementById("submit-url");
-const submitMessage = document.getElementById("submit-message");
-const detailSection = document.getElementById("detail-section");
-const detailStatus = document.getElementById("detail-status");
-const detailSteps = document.getElementById("detail-steps");
-const momentsBlock = document.getElementById("moments-block");
-const momentsList = document.getElementById("moments-list");
-const renderButton = document.getElementById("render-button");
-const renderMessage = document.getElementById("render-message");
-const clipsBlock = document.getElementById("clips-block");
-const clipsList = document.getElementById("clips-list");
-const videoItemTemplate = document.getElementById("video-item-template");
-const momentItemTemplate = document.getElementById("moment-item-template");
-const clipItemTemplate = document.getElementById("clip-item-template");
-
-let selectedVideoId = null;
+const store = { videos: null, queue: null, channels: null };
+let currentScreen = null;
+let source = null;
 let pollHandle = null;
 
-function showMessage(el, text, isError) {
-  el.textContent = text;
-  el.hidden = false;
-  el.classList.toggle("error", Boolean(isError));
+/* ---------- Jeton d'acces (SPEC-c100 T7) ---------- */
+let tokenPrompt = null;
+
+function readCookie(name) {
+  const hit = document.cookie.split("; ").find((c) => c.startsWith(name + "="));
+  return hit ? decodeURIComponent(hit.slice(name.length + 1)) : "";
 }
 
-async function api(path, options) {
-  const resp = await fetch(path, options);
+/* Affiche la page de saisie du jeton ; la promesse se resout une fois le
+   cookie pose. Un seul affichage meme si plusieurs requetes recoivent 401. */
+function askToken(rejected) {
+  if (tokenPrompt) return tokenPrompt;
+  tokenPrompt = new Promise((resolve) => {
+    const view = $("#token-view");
+    const input = $("#token-input");
+    $("#token-error").textContent = rejected ? "Jeton refusé : vérifie-le et réessaie." : "";
+    view.hidden = false;
+    input.value = "";
+    setTimeout(() => input.focus(), 30);
+    $("#token-form").onsubmit = (e) => {
+      e.preventDefault();
+      document.cookie = `${TOKEN_COOKIE}=${encodeURIComponent(input.value.trim())}; path=/; SameSite=Strict`;
+      view.hidden = true;
+      tokenPrompt = null;
+      resolve();
+    };
+  });
+  return tokenPrompt;
+}
+
+/* ---------- Client d'API ---------- */
+async function api(path, options, replayed) {
+  const resp = await fetch(path, Object.assign({ credentials: "same-origin" }, options));
+  if (resp.status === 401) {
+    // Jeton manquant ou refuse : on le demande, puis on rejoue la requete.
+    await askToken(replayed || Boolean(readCookie(TOKEN_COOKIE)));
+    connectEvents();
+    return api(path, options, true);
+  }
   if (!resp.ok) {
     let detail = resp.statusText;
     try {
@@ -48,181 +67,283 @@ async function api(path, options) {
     } catch (err) {
       // reponse sans corps JSON : on garde le statusText.
     }
-    throw new Error(detail);
+    throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
   }
   if (resp.status === 204) return null;
   return resp.json();
 }
 
-function renderVideosList(videos) {
-  videosList.innerHTML = "";
-  for (const video of videos) {
-    const node = videoItemTemplate.content.cloneNode(true);
-    const link = node.querySelector(".video-link");
-    link.textContent = `${video.video_id} - ${video.source_url}`;
-    link.addEventListener("click", () => selectVideo(video.video_id));
-    node.querySelector(".video-status").textContent = STATUS_LABELS[video.status] || video.status;
-    videosList.appendChild(node);
+const jsonBody = (method, payload) => ({ method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+
+/* ---------- Donnees ---------- */
+async function loadVideos() { store.videos = await api("/api/videos"); }
+async function loadQueue() { store.queue = await api("/api/queue"); }
+async function loadChannels() { store.channels = await api("/api/channels"); }
+
+function notifyChange(previous, video) {
+  if (!previous || previous.status === video.status || !NOTIFY_STATUS[video.status]) return;
+  const n = NOTIFY_STATUS[video.status];
+  toast({ kind: n.kind, title: n.title, body: video.reason ? `${video.video_id} : ${video.reason}` : video.video_id,
+    action: { label: "Voir", run: () => { location.hash = "#/videos"; } } });
+  if (notificationsOn() && typeof Notification !== "undefined" && Notification.permission === "granted") {
+    new Notification(n.title, { body: video.video_id });
   }
 }
 
-async function refreshVideosList() {
-  const videos = await api("/api/videos");
-  renderVideosList(videos);
-  return videos;
-}
-
-function renderSteps(state) {
-  detailStatus.textContent = `Statut : ${STATUS_LABELS[state.status] || state.status}`
-    + (state.reason ? ` (${state.reason})` : "");
-  detailSteps.innerHTML = "";
-  for (const [name, step] of Object.entries(state.steps || {})) {
-    const li = document.createElement("li");
-    li.textContent = `${STEP_LABELS[name] || name} : ${STATUS_LABELS[step.status] || step.status}`
-      + (step.reason ? ` (${step.reason})` : "");
-    li.className = `step step-${step.status}`;
-    detailSteps.appendChild(li);
-  }
-}
-
-function formatSeconds(value) {
-  const m = Math.floor(value / 60);
-  const s = (value % 60).toFixed(1);
-  return `${m}:${s.padStart(4, "0")}`;
-}
-
-function attachPreview(video, start, end) {
-  video.addEventListener("loadedmetadata", () => {
-    video.currentTime = start;
-  });
-  video.addEventListener("timeupdate", () => {
-    if (video.currentTime >= end) video.pause();
-  });
-  video.addEventListener("play", () => {
-    if (video.currentTime < start || video.currentTime >= end) video.currentTime = start;
-  });
-}
-
-async function decide(videoId, momentId, decision, extra) {
-  renderMessage.hidden = true;
+/* Recharge uniquement la video visee par l'evenement. */
+async function reloadVideo(id) {
+  let video = null;
   try {
-    await api(`/api/videos/${videoId}/moments/${momentId}/decide`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ decision, ...extra }),
-    });
-    await refreshMoments(videoId);
+    video = await api(`/api/videos/${encodeURIComponent(id)}`);
   } catch (err) {
-    showMessage(renderMessage, `Decision refusee : ${err.message}`, true);
+    // video disparue (workspace nettoye) : on la retire de la liste.
   }
+  const list = store.videos || [];
+  const index = list.findIndex((v) => v.video_id === id);
+  if (video) {
+    notifyChange(index >= 0 ? list[index] : null, video);
+    if (index >= 0) list[index] = video; else list.push(video);
+  } else if (index >= 0) {
+    list.splice(index, 1);
+  }
+  store.videos = list;
 }
 
-function renderMoments(videoId, moments) {
-  momentsList.innerHTML = "";
-  for (const moment of moments) {
-    const node = momentItemTemplate.content.cloneNode(true);
-    const video = node.querySelector("video");
-    video.src = moment.preview_url;
-    attachPreview(video, moment.start, moment.end);
-
-    node.querySelector(".moment-hook").textContent = moment.hook_text || "";
-    node.querySelector(".score-value").textContent = moment.score != null ? moment.score : "?";
-    node.querySelector(".moment-justification").textContent = moment.justification || "";
-
-    const decisionEl = node.querySelector(".moment-decision");
-    decisionEl.textContent = moment.decision
-      ? `Decision : ${moment.decision.decision} (${formatSeconds(moment.decision.start)} - ${formatSeconds(moment.decision.end)})`
-      : `Debut ${formatSeconds(moment.start)}, fin ${formatSeconds(moment.end)} : aucune decision`;
-
-    node.querySelector(".decide-accept").addEventListener("click", () => decide(videoId, moment.id, "accepted"));
-    node.querySelector(".decide-reject").addEventListener("click", () => decide(videoId, moment.id, "rejected"));
-
-    const startInput = node.querySelector(".adjust-start");
-    const endInput = node.querySelector(".adjust-end");
-    startInput.value = moment.start;
-    endInput.value = moment.end;
-    node.querySelector(".decide-adjust").addEventListener("click", () => decide(videoId, moment.id, "adjusted", {
-      start: parseFloat(startInput.value), end: parseFloat(endInput.value),
-    }));
-
-    momentsList.appendChild(node);
-  }
-}
-
-async function refreshMoments(videoId) {
+/* Evenement SSE {kind, id, at} : recharge l'objet concerne, pas la page. */
+async function onServerEvent(event) {
   try {
-    const moments = await api(`/api/videos/${videoId}/moments`);
-    momentsBlock.hidden = false;
-    renderMoments(videoId, moments);
+    if (event.kind === "video") await reloadVideo(event.id);
+    else if (event.kind === "queue") await loadQueue();
+    // publish / watch / worker : les ecrans concernes ecoutent cet evenement.
+    document.dispatchEvent(new CustomEvent("clipper:event", { detail: event }));
   } catch (err) {
-    momentsBlock.hidden = true;
+    toastError("Actualisation impossible", err);
+  }
+  renderCurrent();
+  updateCounts();
+}
+
+/* ---------- Temps reel : SSE, repli sur polling (T3) ---------- */
+function setLive(ok) {
+  $("#conn-banner").hidden = ok;
+  $("#live").classList.toggle("off", !ok);
+  $("#live-label").textContent = ok ? "En direct" : "Hors ligne";
+}
+
+async function pollOnce() {
+  try {
+    await Promise.all([loadVideos(), loadQueue()]);
+    renderCurrent();
+    updateCounts();
+  } catch (err) {
+    // le bandeau « connexion perdue » est deja affiche ; on retentera dans 5 s.
   }
 }
 
-function renderClips(clips) {
-  clipsList.innerHTML = "";
-  for (const clip of clips) {
-    const node = clipItemTemplate.content.cloneNode(true);
-    node.querySelector("video").src = clip.video_url;
-    node.querySelector(".clip-title").textContent = clip.title;
-    node.querySelector(".clip-caption").textContent = clip.caption;
-    node.querySelector(".clip-hashtags").textContent = (clip.hashtags || []).join(" ");
-    node.querySelector(".clip-qa").textContent = `Controle qualite : ${clip.qa.status}`;
-    clipsList.appendChild(node);
-  }
+function startPolling() {
+  if (pollHandle) return;
+  pollHandle = setInterval(pollOnce, POLL_MS);
 }
 
-async function refreshClips(videoId) {
-  const clips = await api(`/api/videos/${videoId}/clips`);
-  clipsBlock.hidden = clips.length === 0;
-  renderClips(clips);
-}
-
-async function refreshDetail(videoId) {
-  const state = await api(`/api/videos/${videoId}`);
-  renderSteps(state);
-  await refreshMoments(videoId);
-  await refreshClips(videoId);
-}
-
-function selectVideo(videoId) {
-  selectedVideoId = videoId;
-  detailSection.hidden = false;
+function stopPolling() {
   if (pollHandle) clearInterval(pollHandle);
-  refreshDetail(videoId).catch((err) => showMessage(detailStatus, err.message, true));
-  pollHandle = setInterval(() => {
-    refreshDetail(videoId).catch(() => {});
-  }, POLL_MS);
+  pollHandle = null;
 }
 
-renderButton.addEventListener("click", async () => {
-  if (!selectedVideoId) return;
-  try {
-    await api(`/api/videos/${selectedVideoId}/render`, { method: "POST" });
-    showMessage(renderMessage, "Rendu lance.", false);
-  } catch (err) {
-    showMessage(renderMessage, `Impossible de lancer le rendu : ${err.message}`, true);
-  }
-});
+function connectEvents() {
+  if (typeof EventSource === "undefined") { setLive(false); startPolling(); return; }
+  if (source) source.close();
+  source = new EventSource("/api/events");
+  source.onopen = () => {
+    setLive(true);
+    stopPolling();
+    pollOnce(); // rattrape ce qui a change pendant la coupure
+  };
+  source.onmessage = (msg) => {
+    let event;
+    try { event = JSON.parse(msg.data); } catch (err) { return; }
+    onServerEvent(event);
+  };
+  source.onerror = () => {
+    // Flux ferme : bandeau + polling toutes les 5 s ; EventSource retente seul.
+    setLive(false);
+    startPolling();
+  };
+}
 
-submitForm.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  submitMessage.hidden = true;
-  try {
-    await api("/api/videos", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url: submitUrl.value }),
+/* ---------- Routeur par hash ---------- */
+function route() {
+  const id = (location.hash.replace(/^#\/?/, "").split(/[/?]/)[0]) || "dashboard";
+  const screen = SCREEN_IDS.includes(id) ? id : "dashboard";
+  currentScreen = screen;
+  $$("#view > .screen").forEach((s) => { s.hidden = s.id !== `screen-${screen}`; });
+  $$("[data-screen]").forEach((a) => {
+    const on = a.dataset.screen === screen;
+    a.classList.toggle("active", on);
+    if (on) a.setAttribute("aria-current", "page"); else a.removeAttribute("aria-current");
+  });
+  const section = $(`#screen-${screen}`);
+  $("#crumb-title").textContent = section.dataset.title;
+  document.title = `${section.dataset.title} · Clipper`;
+  window.scrollTo(0, 0);
+  $(".sidebar").classList.remove("open");
+  renderCurrent();
+}
+
+function renderCurrent() {
+  if (!currentScreen) return;
+  const body = $(`#screen-${currentScreen} [data-body]`);
+  // Tant que les premieres donnees ne sont pas la : le squelette reste affiche.
+  if (store.videos === null && (currentScreen === "dashboard" || currentScreen === "videos")) return;
+  Screens[currentScreen].render(body, store);
+  $$("[data-add]", body).forEach((b) => (b.onclick = () => openAddVideo()));
+  wireActions(body);
+}
+
+function updateCounts() {
+  const videos = store.videos || [];
+  const set = (id, n) => $$(`[data-count-for="${id}"]`).forEach((el) => { el.textContent = n; el.hidden = !n; });
+  set("videos", videos.filter((v) => v.status === "running").length);
+  set("review", videos.filter((v) => v.status === "awaiting_review").length);
+}
+
+/* ---------- Actions de la file et des videos (T4 : confirmation) ---------- */
+function wireActions(root) {
+  $$("[data-front]", root).forEach((b) => (b.onclick = async () => {
+    try {
+      await api(`/api/queue/${encodeURIComponent(b.dataset.front)}/front`, { method: "POST" });
+      await loadQueue();
+      renderCurrent();
+    } catch (err) { toastError("Impossible de passer la vidéo en tête", err); }
+  }));
+  $$("[data-remove]", root).forEach((b) => (b.onclick = async () => {
+    const id = b.dataset.remove;
+    if (!(await confirmDialog({ title: "Retirer de la file ?", body: `${id} ne sera plus traitée.`, confirmLabel: "Retirer" }))) return;
+    try {
+      await api(`/api/queue/${encodeURIComponent(id)}`, { method: "DELETE" });
+      await loadQueue();
+      renderCurrent();
+      toast({ kind: "ok", title: "Retirée de la file", body: id });
+    } catch (err) { toastError("Impossible de retirer la vidéo", err); }
+  }));
+  $$("[data-cancel]", root).forEach((b) => (b.onclick = async () => {
+    const id = b.dataset.cancel;
+    if (!(await confirmDialog({ title: "Annuler le traitement ?", body: `Le traitement de ${id} sera arrêté.`, confirmLabel: "Annuler le traitement" }))) return;
+    try {
+      await api(`/api/videos/${encodeURIComponent(id)}/cancel`, { method: "POST" });
+      await reloadVideo(id);
+      renderCurrent();
+    } catch (err) { toastError("Impossible d'annuler le traitement", err); }
+  }));
+}
+
+/* ---------- Ajout de video ---------- */
+async function openAddVideo() {
+  try { if (store.channels === null) await loadChannels(); } catch (err) { toastError("Chaînes indisponibles", err); }
+  const channels = store.channels || [];
+  openPanel("modal", `
+    <div class="modal-head"><h2>Ajouter une vidéo</h2><p class="muted" style="margin-top:4px">YouTube ou VOD Twitch. Elle passe en file avec le preset de sa chaîne.</p></div>
+    <form id="add-form"><div class="modal-body">
+      <div class="field"><label for="add-url">Adresse (URL)</label><input class="input" id="add-url" name="url" type="url" required placeholder="https://…" autocomplete="off"></div>
+      <div class="field"><label for="add-channel">Chaîne</label>
+        <select class="input" id="add-channel" name="channel"><option value="">Sans chaîne (config.toml)</option>${channels.map((c) => `<option value="${esc(c)}">${esc(c)}</option>`).join("")}</select>
+        ${channels.length ? "" : `<span class="hint">Aucune chaîne : crée-en une dans l'écran Chaînes.</span>`}</div>
+    </div>
+    <div class="modal-foot"><button type="button" class="btn btn-ghost" data-dismiss>Annuler</button><button type="submit" class="btn btn-primary">Mettre en file</button></div></form>`,
+  (el) => {
+    setTimeout(() => $("#add-url", el).focus(), 60);
+    $("#add-form", el).onsubmit = async (e) => {
+      e.preventDefault();
+      const url = $("#add-url", el).value.trim();
+      const channel = $("#add-channel", el).value || null;
+      closeLayer();
+      try {
+        const entry = await api("/api/queue", jsonBody("POST", { url, channel, action: "run" }));
+        toast({ kind: "ok", title: "Vidéo mise en file", body: entry.video_id });
+        await Promise.all([loadVideos(), loadQueue()]);
+        renderCurrent();
+        updateCounts();
+      } catch (err) { toastError("Ajout impossible", err); }
+    };
+  });
+}
+
+/* ---------- Theme (sombre / clair) ---------- */
+function applyTheme(theme) {
+  document.documentElement.dataset.theme = theme;
+  $("#btn-theme").innerHTML = icon(theme === "light" ? "moon" : "sun");
+  $('meta[name="theme-color"]').content = theme === "light" ? "#f4f2ec" : "#0e0e0c";
+}
+
+function toggleTheme() {
+  const next = document.documentElement.dataset.theme === "light" ? "dark" : "light";
+  try { localStorage.setItem(THEME_KEY, next); } catch (e) { /* stockage indisponible : choix non memorise */ }
+  applyTheme(next);
+}
+
+function followSystemTheme() {
+  if (!window.matchMedia) return;
+  matchMedia("(prefers-color-scheme: light)").addEventListener("change", (e) => {
+    let saved = null;
+    try { saved = localStorage.getItem(THEME_KEY); } catch (err) { /* ignore */ }
+    if (!saved) applyTheme(e.matches ? "light" : "dark"); // sans choix memorise, on suit le systeme
+  });
+}
+
+/* ---------- Notifications du navigateur (reglage local) ---------- */
+function notificationsOn() {
+  try { return localStorage.getItem(NOTIF_KEY) === "on"; } catch (e) { return false; }
+}
+
+function paintNotifButton() {
+  const on = notificationsOn() && typeof Notification !== "undefined" && Notification.permission === "granted";
+  $("#btn-notif").classList.toggle("on", on);
+  $("#btn-notif").setAttribute("aria-pressed", String(on));
+}
+
+async function toggleNotifications() {
+  if (typeof Notification === "undefined") {
+    toast({ kind: "warn", title: "Notifications indisponibles", body: "Ce navigateur ne gère pas les notifications." });
+    return;
+  }
+  const turnOn = !notificationsOn();
+  if (turnOn && Notification.permission !== "granted") {
+    const answer = await Notification.requestPermission();
+    if (answer !== "granted") {
+      toast({ kind: "warn", title: "Notifications refusées", body: "Autorise-les dans les réglages du navigateur pour les recevoir." });
+      return;
+    }
+  }
+  try { localStorage.setItem(NOTIF_KEY, turnOn ? "on" : "off"); } catch (e) { /* stockage indisponible */ }
+  paintNotifButton();
+  toast({ kind: "info", title: turnOn ? "Notifications activées" : "Notifications désactivées", ms: 2600 });
+}
+
+/* ---------- Demarrage ---------- */
+(function boot() {
+  hydrateIcons(document);
+  applyTheme(document.documentElement.dataset.theme === "light" ? "light" : "dark");
+  followSystemTheme();
+  paintNotifButton();
+
+  $("#btn-theme").onclick = toggleTheme;
+  $("#btn-notif").onclick = toggleNotifications;
+  $("#btn-add").onclick = () => openAddVideo();
+  $("#btn-menu").onclick = () => {
+    const sb = $(".sidebar");
+    sb.classList.add("open");
+    showOverlay(() => sb.classList.remove("open"));
+  };
+  $$("#nav a").forEach((a) => a.addEventListener("click", () => { if (closeCurrent) closeLayer(); }));
+
+  window.addEventListener("hashchange", route);
+  route();
+  connectEvents();
+  Promise.all([loadVideos(), loadQueue(), loadChannels()])
+    .then(() => { renderCurrent(); updateCounts(); })
+    .catch((err) => {
+      toastError("Chargement impossible", err);
+      const body = $(`#screen-${currentScreen} [data-body]`);
+      if (body) body.innerHTML = emptyState("circle-alert", "Chargement impossible", String(err.message || err));
     });
-    showMessage(submitMessage, "Traitement lance.", false);
-    submitUrl.value = "";
-    await refreshVideosList();
-  } catch (err) {
-    showMessage(submitMessage, `Echec de la soumission : ${err.message}`, true);
-  }
-});
-
-refreshVideosList().catch((err) => showMessage(submitMessage, err.message, true));
-setInterval(() => {
-  refreshVideosList().catch(() => {});
-}, POLL_MS);
+})();
