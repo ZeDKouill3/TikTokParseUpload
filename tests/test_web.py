@@ -2328,6 +2328,83 @@ def test_dashboard_vod_section_is_wired_to_confirm_and_ignore():
 
 
 # --------------------------------------------------------------------------
+# Aperçu du style des sous-titres (TASK-dd3f, SPEC-c100 E5)
+# --------------------------------------------------------------------------
+
+
+def test_subtitles_preview_returns_a_png_rendered_by_the_pipeline(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import pipeline
+
+    _channels_setup(tmp_path)
+    seen = []
+    monkeypatch.setattr(pipeline, "preview_subtitles",
+                        lambda config, text: seen.append((config.section("subtitles"), text)) or b"\x89PNG\r\n\x1a\nxx")
+
+    resp = client(tmp_path).get(f"/api/channels/{CH}/subtitles-preview", params={"text": "Salut à tous"})
+
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "image/png"
+    assert resp.content.startswith(b"\x89PNG")
+    assert seen and seen[0][1] == "Salut à tous"
+
+
+def test_subtitles_preview_renders_a_real_png_with_the_preset_style(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path, preset=_CH_PRESET + '\n[subtitles]\nletterbox_font_size = 50\n')
+    resp = client(tmp_path).get(f"/api/channels/{CH}/subtitles-preview", params={"text": "Salut"})
+    assert resp.status_code == 200 and resp.content.startswith(b"\x89PNG")
+
+
+def test_subtitles_preview_with_an_unsaved_draft_uses_the_draft_style(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import pipeline
+
+    _channels_setup(tmp_path)
+    seen = []
+    monkeypatch.setattr(pipeline, "preview_subtitles",
+                        lambda config, text: seen.append((config.section("subtitles"), config.section("reframe"))) or b"\x89PNG\r\n\x1a\n")
+    draft = json.dumps({"subtitles": {"letterbox_outline": 11}, "reframe": {"stream_variant": "split"}})
+
+    resp = client(tmp_path).get(f"/api/channels/{CH}/subtitles-preview", params={"text": "Salut", "draft": draft})
+
+    assert resp.status_code == 200
+    assert seen[0][0]["letterbox_outline"] == 11 and seen[0][1]["stream_variant"] == "split"
+    # le preset enregistré n'a pas bougé
+    assert "letterbox_outline" not in (tmp_path / "presets" / f"{CH}.toml").read_text(encoding="utf-8")
+
+
+def test_subtitles_preview_invalid_style_is_422_with_detail(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path, preset=_CH_PRESET + '\n[subtitles]\nsplit_text_color = "caca"\n')
+    c = client(tmp_path)
+    # le style effectif est celui du format split : la couleur invalide est rendue
+    draft = json.dumps({"reframe": {"stream_variant": "split"}, "subtitles": {"split_text_color": "caca"}})
+    resp = c.get(f"/api/channels/{CH}/subtitles-preview", params={"text": "Salut", "draft": draft})
+    assert resp.status_code == 422
+    assert "couleur" in resp.json()["detail"]
+
+
+def test_subtitles_preview_unknown_channel_404_and_bad_draft_422(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path)
+    c = client(tmp_path)
+    assert c.get("/api/channels/inconnue/subtitles-preview", params={"text": "x"}).status_code == 404
+    bad = c.get(f"/api/channels/{CH}/subtitles-preview", params={"text": "x", "draft": "{pas du json"})
+    assert bad.status_code == 422 and "draft" in bad.json()["detail"]
+    empty = c.get(f"/api/channels/{CH}/subtitles-preview", params={"text": "  "})
+    assert empty.status_code == 422 and "texte" in empty.json()["detail"]
+
+
+def test_channels_screen_previews_subtitles_style_with_a_300ms_debounce():
+    js = (STATIC / "screens" / "channels.js").read_text(encoding="utf-8")
+    css = (STATIC / "style.css").read_text(encoding="utf-8")
+    shot = (STATIC / "screens" / "chan-subtitles-preview.js")
+    page = (STATIC / "index.html").read_text(encoding="utf-8")
+    prev = shot.read_text(encoding="utf-8")
+
+    assert "/static/screens/chan-subtitles-preview.js" in page
+    assert page.index("/static/screens/channels.js") < page.index("/static/screens/chan-subtitles-preview.js")
+    assert "/subtitles-preview" in prev and "PREVIEW_DELAY_MS = 300" in prev
+    assert "setTimeout" in prev and "clearTimeout" in prev
+    assert "draft: JSON.stringify" in prev   # brouillon non enregistré envoyé tel quel
+    assert ".chan-preview" in css
+    assert "chSubsPreview" in js          # point d'accroche dans l'écran chaînes
 # TASK-7d86 : ecran Statistiques (GET /api/stats, POST /api/stats/import)
 # --------------------------------------------------------------------------
 

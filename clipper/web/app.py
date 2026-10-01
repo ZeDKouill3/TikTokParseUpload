@@ -25,7 +25,7 @@ from typing import Any, AsyncIterator
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -689,6 +689,39 @@ def _channel_detail(name: str) -> dict[str, Any]:
     return {"name": name, "raw": raw, "effective": effective, "defaults": defaults}
 
 
+def _subspreview_config(name: str, draft: str | None) -> Config:
+    """Config effective de la chaine pour l'apercu des sous-titres. Avec
+    ``draft`` (JSON ``{"subtitles": {...}, "reframe": {...}}`` : les tables du
+    formulaire pas encore enregistrees), le preset est recompose avec ces
+    tables puis relu par save_channel/load_channel dans un dossier temporaire
+    (heritage compris, comme a l'enregistrement) ; le fichier reel n'est
+    jamais touche."""
+    config, _channel = _load_channel(name)
+    if not draft:
+        return config
+    try:
+        tables = json.loads(draft)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=422, detail=f"draft : JSON invalide ({exc})") from exc
+    if not isinstance(tables, dict) or any(not isinstance(v, dict) for v in tables.values()):
+        raise HTTPException(status_code=422, detail="draft : attendu un objet {section: {cle: valeur}}")
+    if set(tables) - {"subtitles", "reframe"}:
+        raise HTTPException(status_code=422, detail="draft : seules les sections subtitles et reframe sont admises")
+    preset = tomllib.loads(_channel_preset_path(name).read_text(encoding="utf-8"))
+    for section, table in tables.items():
+        if table:
+            preset[section] = table
+        else:
+            preset.pop(section, None)
+    try:
+        _check_preset_types(preset)
+        with tempfile.TemporaryDirectory() as tmp:
+            channel_mod.save_channel(name, preset, presets_dir=tmp, base=_BASE_CONFIG)
+            return channel_mod.load_channel(name, presets_dir=tmp, base=_BASE_CONFIG)[0]
+    except ConfigError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
 def _save_channel_preset(name: str, preset: dict[str, Any]) -> None:
     if "channel" not in preset:
         preset = {**preset, "channel": {}}  # sans [channel], le preset ne serait plus une chaine
@@ -1291,6 +1324,15 @@ def create_app(config: Config | None = None) -> FastAPI:
             "name": name, "timezone": channel["timezone"], "slots": [s.isoformat() for s in slots],
             "reason": None if channel["slots"] else "aucun créneau défini dans [channel].slots",
         }
+
+    @app.get("/api/channels/{name}/subtitles-preview")
+    def channel_subtitles_preview(name: str, text: str = "", draft: str | None = None) -> Response:
+        config = _subspreview_config(name, draft)
+        try:
+            png = pipeline.preview_subtitles(config, text)
+        except pipeline.PipelineError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return Response(png, media_type="image/png", headers={"Cache-Control": "no-store"})
 
     @app.post("/api/channels/{name}/logo")
     async def upload_channel_logo(name: str, request: Request) -> dict[str, Any]:

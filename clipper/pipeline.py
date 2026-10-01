@@ -502,6 +502,21 @@ class _Run:
         qa.run(self.video_id, self.ws, self.out, config=self.config, force=self._forced("qa"), **self.opts("qa"))
 
 
+def preview_subtitles(config: Config, text: str) -> bytes:
+    """PNG de ``text`` dans le style de sous-titres effectif de ``config``
+    (TASK-dd3f, SPEC-c100 E5) : seul point d'entree de clipper.web (ADR-b16b).
+    Le style est celui qu'un clip de cette config recevrait en agencement
+    stream (split si [reframe] stream_variant = "split", sinon letterbox)."""
+    variant = {**reframe.CONFIG_DEFAULTS, **config.section("reframe")}["stream_variant"]
+    try:
+        return subtitles.render_preview(
+            {**subtitles.CONFIG_DEFAULTS, **config.section("subtitles")}, text,
+            style="split" if variant == "split" else "letterbox",
+        )
+    except subtitles.SubtitlesError as exc:
+        raise PipelineError(f"apercu des sous-titres impossible : {exc}") from exc
+
+
 def subtitles_zone(plan: dict[str, Any], clip_id: str) -> dict[str, Any]:
     """Zone des sous-titres d'un plan de recadrage letterbox (SPEC-6127) ou
     stream (SPEC-3a88) :
