@@ -24,9 +24,13 @@ Sortie : workspace/<video_id>/captions.json
 ``<moment_id>-p<part>`` (multipart), ex. ``03-p2`` (SPEC-6127).
 
 Pour chaque clip, l'IA recoit le texte prononce dans la partie, l'accroche
-et la justification du moment, et rend titre, legende, hashtags (chacun
-commencant par #, sans doublon), texte d'accroche (8 mots au plus, valeur
-par defaut) et titre d'ecran ``screen_title`` (SPEC-6a86 : 6 mots au plus,
+et la justification du moment, et rend titre, legende (``caption``, ton
+sobre, aucun mot d'emphase clickbait, aucun emoji sauf ``[captions]
+caption_allow_emoji`` explicite qui en autorise au plus deux, jamais
+obligatoires, TASK-a844), hashtags (chacun commencant par #, sans doublon),
+texte d'accroche (``hook_text``, memes regles de sobriete que caption,
+8 mots au plus, valeur par defaut) et titre d'ecran ``screen_title``
+(SPEC-6a86 : 6 mots au plus,
 valeur par defaut, ton sobre sans mot d'emphase clickbait, aucun emoji sauf
 ``[captions] screen_title_allow_emoji`` explicite, qui autorise au plus un
 emoji simple sans le rendre obligatoire) dans la
@@ -95,6 +99,11 @@ CONFIG_DEFAULTS: dict[str, object] = {
         "pur", "total", "explose", "choc", "incroyable", "fou", "dingue",
         "glaçant", "assourdissant", "dévoilé",
     ],
+    # TASK-a844 : meme sobriete que screen_title pour caption et hook_text.
+    # Sans configuration explicite, le moindre emoji est refuse. Activer
+    # l'option autorise jusqu'a _CAPTION_ALLOWED_EMOJI_MAX emojis simples,
+    # sans jamais les rendre obligatoires.
+    "caption_allow_emoji": False,
     # Nombre de moments traites en parallele (leurs parties restant
     # sequentielles entre elles) ; 1 = sequentiel, comme avant.
     "parallel": 4,
@@ -108,6 +117,10 @@ CONFIG_DEFAULTS: dict[str, object] = {
 
 _EDGE = 0.1
 _EPS = 1e-6
+
+# TASK-a844 : nombre d'emojis simples au plus dans caption/hook_text quand
+# [captions] caption_allow_emoji est actif.
+_CAPTION_ALLOWED_EMOJI_MAX = 2
 
 # --------------------------------------------------------------------------
 # screen_title : un seul emoji Extended_Pictographic (SPEC-6127).
@@ -181,10 +194,19 @@ def response_schema(
     pour les parties d'un moment multipart apres la premiere : le titre
     d'ecran n'est alors plus redemande (recopie de la partie 1).
     ``include_title`` suit la meme regle pour le titre de publication."""
+    caption_allow_emoji = bool(settings["caption_allow_emoji"])
+    caption_emoji_desc = (
+        f"au plus {_CAPTION_ALLOWED_EMOJI_MAX} emojis simples, jamais obligatoires"
+        if caption_allow_emoji
+        else "AUCUN emoji"
+    )
     properties: dict[str, Any] = {
         "caption": {
             "type": "string", "minLength": 1, "maxLength": int(settings["caption_max_chars"]),
-            "description": "Legende publiee sous le clip, dans la langue de la video.",
+            "description": (
+                "Legende publiee sous le clip, dans la langue de la video ; ton sobre, "
+                f"aucun mot d'emphase clickbait ; {caption_emoji_desc}."
+            ),
         },
         "hashtags": {
             "type": "array",
@@ -200,7 +222,8 @@ def response_schema(
             "type": "string", "minLength": 1, "maxLength": 80,
             "description": (
                 f"Texte d'accroche affiche a l'ecran les 2 premieres secondes, "
-                f"{settings['hook_words_max']} mots au plus."
+                f"{settings['hook_words_max']} mots au plus ; ton sobre, aucun mot d'emphase "
+                f"clickbait ; {caption_emoji_desc}."
             ),
         },
     }
@@ -256,17 +279,26 @@ def _prompt(
             "parties precedentes.\n"
         )
 
+    caption_allow_emoji = bool(settings["caption_allow_emoji"])
+    caption_emoji_rule = (
+        f"au plus {_CAPTION_ALLOWED_EMOJI_MAX} emojis simples, jamais obligatoires"
+        if caption_allow_emoji
+        else "aucun emoji"
+    )
     rules = [f"Reponds entierement dans la langue de la video ({language or 'celle de la transcription'})."]
     if title is None:
         rules.append("title : court, accrocheur, sans hashtag ni exces d'emoji.")
-    rules.append("caption : la legende publiee sous le clip, qui donne envie de regarder en entier.")
+    rules.append(
+        "caption : la legende publiee sous le clip, qui donne envie de regarder en entier ; ton sobre, "
+        f"aucun mot d'emphase clickbait ; {caption_emoji_rule}."
+    )
     rules.append(
         "hashtags : chacun commence par #, jamais deux fois le meme, pertinents pour ce clip precis "
         f"(pas de generique inutile), {int(settings['hashtags_max'])} au plus."
     )
     rules.append(
         f"hook_text : le texte affiche a l'ecran des le debut, {int(settings['hook_words_max'])} mots "
-        "au plus, qui arrete le scroll."
+        f"au plus, qui arrete le scroll ; ton sobre, aucun mot d'emphase clickbait ; {caption_emoji_rule}."
     )
     if screen_title is None:
         allow_emoji = bool(settings["screen_title_allow_emoji"])
@@ -402,6 +434,51 @@ def _validate_screen_title_emoji(screen_title: str, allow_emoji: bool) -> None:
         )
 
 
+def _validate_sober_text_emoji(text: str, field_name: str, allow_emoji: bool) -> None:
+    """TASK-a844 : meme detecteur d'emoji que screen_title (Extended_Pictographic,
+    VS16, modificateur de teint, sequence ZWJ, drapeau regional), applique a
+    caption/hook_text. Sans option (``allow_emoji`` faux), le moindre emoji
+    est refuse. Si autorise, au plus ``_CAPTION_ALLOWED_EMOJI_MAX`` emoji(s)
+    simples, jamais obligatoires ; sequence ZWJ et drapeau toujours refuses."""
+    codepoints = [ord(c) for c in text]
+    n = len(codepoints)
+    emoji_count = 0
+    i = 0
+    while i < n:
+        cp = codepoints[i]
+        if cp in _REGIONAL_INDICATORS and i + 1 < n and codepoints[i + 1] in _REGIONAL_INDICATORS:
+            if not allow_emoji:
+                raise llm.SchemaError(
+                    f"aucun emoji autorise par defaut dans {field_name} (TASK-a844, "
+                    f"[captions] caption_allow_emoji) : {text!r}"
+                )
+            raise llm.SchemaError(f"emoji de type drapeau refuse dans {field_name} : {text!r}")
+        if _is_pictographic(cp):
+            if not allow_emoji:
+                raise llm.SchemaError(
+                    f"aucun emoji autorise par defaut dans {field_name} (TASK-a844, "
+                    f"[captions] caption_allow_emoji) : {text!r}"
+                )
+            j = i + 1
+            if j < n and codepoints[j] == ord(_VS16):
+                j += 1
+            if j < n and codepoints[j] in _SKIN_TONE_MODIFIERS:
+                j += 1
+            if j < n and codepoints[j] == ord(_ZWJ):
+                raise llm.SchemaError(
+                    f"emoji compose (sequence ZWJ) refuse dans {field_name} : {text!r}"
+                )
+            emoji_count += 1
+            i = j
+            continue
+        i += 1
+    if emoji_count > _CAPTION_ALLOWED_EMOJI_MAX:
+        raise llm.SchemaError(
+            f"{field_name} doit contenir au plus {_CAPTION_ALLOWED_EMOJI_MAX} emoji(s), "
+            f"{emoji_count} trouve(s) : {text!r}"
+        )
+
+
 _WORD_RE = re.compile(r"[^\W\d_]+", re.UNICODE)
 
 
@@ -439,6 +516,7 @@ def _check_answer(
     screen_title_words_max: int,
     screen_title_forbidden_words: list[str],
     screen_title_allow_emoji: bool,
+    caption_allow_emoji: bool,
     *,
     require_screen_title: bool = True,
 ):
@@ -450,6 +528,8 @@ def _check_answer(
     def check(answer: dict[str, Any]) -> None:
         _validate_hashtags(answer["hashtags"])
         _validate_hook_text(answer["hook_text"], hook_words_max)
+        _validate_sober_text_emoji(answer["caption"], "caption", caption_allow_emoji)
+        _validate_sober_text_emoji(answer["hook_text"], "hook_text", caption_allow_emoji)
         if require_screen_title:
             _validate_screen_title(
                 answer["screen_title"], screen_title_words_max,
@@ -550,6 +630,7 @@ def _process_moment(
         check = _check_answer(
             hook_words_max, screen_title_words_max,
             list(settings["screen_title_forbidden_words"]), bool(settings["screen_title_allow_emoji"]),
+            bool(settings["caption_allow_emoji"]),
             require_screen_title=request_screen_title,
         )
         text = _part_text(transcript, part["start"], part["end"])

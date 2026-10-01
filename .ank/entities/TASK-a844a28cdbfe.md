@@ -5,7 +5,7 @@ slug: captions-l-gende-tiktok-sobre-sans-emoji-ni-supe
 title: "captions : légende TikTok sobre (sans emoji ni superlatif clickbait par défaut), comme le titre d'écran"
 created: 2026-10-01T07:54:41Z
 author: nicoc@zedk_ordi
-status: in_progress
+status: done
 scope:
   - clipper/captions.py
   - tests/test_captions.py
@@ -15,8 +15,15 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/27b4249944be@e7f701b
+    tree: scope/7fef27a620cb
+    criteria: c4753c0a744d
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 2
+version: 3
 ---
 
 La légende TikTok (caption) reste kitsch : emojis, « rage totale », superlatifs. Le titre d'écran est déjà sobre (screen_title_allow_emoji, SPEC-6a86 proposée). Appliquer la même sobriété à caption et hook_text, réglable dans CONFIG_DEFAULTS de captions, sans toucher aux hashtags ni à cta_line/cta_hashtags.
