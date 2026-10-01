@@ -2103,7 +2103,7 @@ def test_get_channel_comments_come_from_source_without_importing_values(tmp_path
 
     comments = web_app._defaults_documentation("moments")
     assert "Grille de notation" in comments["rubric_path"]["comment"]
-    assert "jamais de repli" in comments["rubric_path"]["comment"]    # bloc de commentaires entier
+    assert "jamais de repli" in comments["rubric_path"]["details"]    # reste du bloc de commentaires, replié
     assert comments["rubric_path"]["default"] == "rubric.toml"
 
 
@@ -4471,3 +4471,210 @@ def test_channel_form_picks_the_linked_tiktok_account_from_the_accounts():
     assert '"tiktok_account"' in js and "/api/accounts" in js
     assert "Compte TikTok" in js
     assert "Aucun compte" in js  # option vide = aucun compte relie
+# TASK-4bfc : console v2, cinquième tour
+# --------------------------------------------------------------------------
+
+
+
+def test_render_current_leaves_the_dom_alone_when_the_html_is_unchanged():
+    js = _static("app.js")
+    start = js.index("function renderCurrent()")
+    block = js[start:js.index("\n}\n", start)]
+
+    assert "guardBodyHtml(body)" in block                        # le HTML calculé est comparé au précédent
+    guard = js[js.index("function guardBodyHtml"):]
+    guard = guard[:guard.index("\n}\n")]
+    assert "innerHTML" in guard and "===" in guard and "return;" in guard   # identique : le DOM n'est pas touché
+
+
+def test_worker_event_only_refreshes_the_worker_light():
+    js = _static("app.js")
+    start = js.index("async function onServerEvent")
+    block = js[start:js.index("\n}\n", start)]
+
+    assert 'event.kind === "worker"' in block
+    branch = block[block.index('event.kind === "worker"'):]
+    branch = branch[:branch.index("return;") + len("return;")]
+    assert "clipper:worker" in branch                            # événement dédié, pas « clipper:event »
+    assert "renderCurrent" not in branch and "updateCounts" not in branch
+    dash = _static("screens", "dashboard.js")
+    assert 'addEventListener("clipper:worker"' in dash
+    assert "/api/dashboard/worker" in dash
+    assert 'data-section="worker"' in dash                       # seule la section du worker est mise à jour
+
+
+def test_dashboard_worker_route_returns_only_the_worker_heartbeat(tmp_path, isolated_cwd):
+    resp = client(tmp_path).get("/api/dashboard/worker")
+
+    assert resp.status_code == 200
+    assert set(resp.json()) <= {"worker", "worker_error"}
+    assert "worker" in resp.json()
+
+
+def test_every_thumbnail_reserves_its_size_so_loading_never_shifts_the_layout():
+    import re
+
+    for name in ("screens.js", "screens/clips.js", "screens/publish.js"):
+        js = _static(*name.split("/"))
+        thumbs = [m for m in re.findall(r"<img [^>]*thumbnail[^>]*>", js)]
+        assert thumbs, name
+        for tag in thumbs:
+            assert "width=" in tag and "height=" in tag, f"{name} : {tag}"
+    css = _static("style.css")
+    for selector in (".job-thumb", ".mini-clip", ".clip-poster"):
+        rule = re.search(rf"^{re.escape(selector)} \{{[^}}]*\}}|^{re.escape(selector)} \{{\n[^}}]*\}}", css, re.MULTILINE)
+        assert rule and "aspect-ratio" in rule.group(0), selector
+
+
+def test_new_channel_form_offers_the_standard_and_stream_gaming_models():
+    js = _static("screens", "channels.js")
+
+    assert "Standard" in js and "Stream gaming" in js
+    assert 'name="model"' in js
+    start = js.index("const CHAN_MODELS")
+    models = js[start:js.index("];", start)]
+    for needle in ('"builtin:gaming"', '"stream_auto"', '"split"', "rubric_path", "stream_variant", "layout"):
+        assert needle in models, needle
+    assert "CHAN_MODELS" in js[js.index("function chOpenNew"):]    # le modèle choisi part dans le preset
+
+
+def test_post_channel_with_the_stream_gaming_model_writes_rubric_and_stream_layout(tmp_path, isolated_cwd):
+    preset = {
+        "channel": {},
+        "moments": {"rubric_path": "builtin:gaming"},
+        "reframe": {"layout": "stream_auto", "stream_variant": "split"},
+    }
+
+    _channels_setup(tmp_path)
+    resp = client(tmp_path).post("/api/channels", json={"name": "stream", "preset": preset})
+
+    assert resp.status_code == 201, resp.text
+    saved = (tmp_path / "presets" / "stream.toml").read_text(encoding="utf-8")
+    assert 'rubric_path = "builtin:gaming"' in saved
+    assert 'layout = "stream_auto"' in saved and 'stream_variant = "split"' in saved
+    effective = resp.json()["effective"]
+    assert effective["moments"]["rubric_path"] == "builtin:gaming"
+    assert effective["reframe"]["layout"] == "stream_auto"
+
+
+def test_post_channel_with_the_standard_model_writes_nothing_more(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path)
+    resp = client(tmp_path).post("/api/channels", json={"name": "standard", "preset": {"channel": {}}})
+
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["raw"] == {"channel": {}}
+
+
+def test_channel_form_shows_the_rubric_at_the_top_of_the_channel_section():
+    js = _static("screens", "channels.js")
+    start = js.index("function chSectionHtml")
+    block = js[start:js.index("\n}\n", start)]
+
+    assert 'spec.section === "channel"' in block
+    assert 'chField("moments", "rubric_path"' in block
+    assert block.index('chField("moments", "rubric_path"') < block.index("main.map")   # avant les autres champs
+    # un seul contrôle de grille : la section repliée ne la répète pas
+    assert 'k !== "rubric_path"' in block or "rubric_path" in block[block.index("const main"):block.index("const rest")]
+
+
+def _rubric_asset(name: str) -> bytes:
+    from importlib import resources
+
+    return resources.files("clipper").joinpath("assets", name).read_bytes()
+
+
+def test_channel_rubric_label_for_a_file_identical_to_the_standard_grid(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path, preset=_CH_PRESET + '\n[moments]\nrubric_path = "ma_grille.toml"\n')
+    (tmp_path / "ma_grille.toml").write_bytes(_rubric_asset("rubric.toml").replace(b"\n", b"\r\n"))
+
+    rubric = client(tmp_path).get(f"/api/channels/{CH}").json()["rubric"]
+
+    assert rubric["label"] == "Standard (ma_grille.toml)"
+    assert rubric["kind"] == "standard"
+
+
+def test_channel_rubric_label_for_a_file_identical_to_the_gaming_grid(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path, preset=_CH_PRESET + '\n[moments]\nrubric_path = "ma_grille.toml"\n')
+    (tmp_path / "ma_grille.toml").write_bytes(_rubric_asset("rubric-gaming.toml"))
+
+    rubric = client(tmp_path).get(f"/api/channels/{CH}").json()["rubric"]
+
+    assert rubric["label"] == "Gaming (ma_grille.toml)"
+    assert rubric["kind"] == "gaming"
+
+
+def test_channel_rubric_label_default_value_and_builtin_values(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path)
+    (tmp_path / "rubric.toml").write_bytes(_rubric_asset("rubric.toml"))
+    c = client(tmp_path)
+
+    assert c.get(f"/api/channels/{CH}").json()["rubric"]["label"] == "Standard (rubric.toml)"
+    assert c.get("/api/rubric-label", params={"path": "builtin"}).json()["label"] == "Standard (builtin)"
+    assert c.get("/api/rubric-label", params={"path": "builtin:gaming"}).json()["label"] == "Gaming (builtin:gaming)"
+
+
+def test_channel_rubric_label_stays_custom_for_a_different_or_missing_file(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path)
+    (tmp_path / "autre.toml").write_text("# ma grille à moi\n", encoding="utf-8")
+    c = client(tmp_path)
+
+    different = c.get("/api/rubric-label", params={"path": "autre.toml"}).json()
+    missing = c.get("/api/rubric-label", params={"path": "absente.toml"}).json()
+    unknown = c.get("/api/rubric-label", params={"path": "builtin:inconnue"}).json()
+
+    assert different == {"value": "autre.toml", "kind": "custom", "label": "Fichier personnalisé (autre.toml)"}
+    assert missing["kind"] == "custom" and "introuvable" in missing["label"]
+    assert unknown["kind"] == "invalid" and "builtin:inconnue" in unknown["label"]
+
+
+def test_channels_screen_labels_the_rubric_from_the_server():
+    js = _static("screens", "channels.js")
+
+    assert "/api/rubric-label" in js
+    assert "detail.rubric" in js or "ed.detail.rubric" in js
+
+
+_TECH_REF = None
+
+
+def _all_help(tmp_path) -> dict[str, dict]:
+    from clipper.web import app as web_app
+
+    docs = {}
+    for section in web_app._CHANNEL_FORM_SECTIONS:
+        for key, doc in web_app._defaults_documentation(section).items():
+            docs[f"channel/{section}.{key}"] = doc
+    c = sclient(tmp_path)
+    for section, keys in c.get("/api/settings").json()["defaults"].items():
+        for key, doc in keys.items():
+            docs[f"settings/{section}.{key}"] = doc
+    for key, doc in c.get(f"/api/channels/{CH}").json()["defaults"]["moments"].items() if False else []:
+        docs[key] = doc
+    return docs
+
+
+def test_help_main_text_is_a_simple_sentence_without_technical_references(tmp_path, isolated_cwd):
+    import re
+
+    docs = _all_help(tmp_path)
+    assert any(d["comment"] for d in docs.values())
+    offenders = []
+    for where, doc in docs.items():
+        text = doc["comment"]
+        if re.search(r"SPEC-|ADR-|TASK-|\b[a-z][a-z0-9]*_[a-z0-9_]+\(", text):
+            offenders.append(f"{where} : {text}")
+        if text and text.count(". ") + text.count(" ? ") > 0 and len(re.split(r"(?<=[.!?])\s+(?=[A-ZÀ-Ý«\"])", text)) > 1:
+            offenders.append(f"{where} : plusieurs phrases dans le texte principal : {text}")
+    assert offenders == []
+
+
+def test_help_details_keep_the_rest_of_the_comment_for_a_folded_block(tmp_path, isolated_cwd):
+    docs = _all_help(tmp_path)
+
+    assert all("details" in d for d in docs.values())
+    assert any(d["details"] for d in docs.values())
+    rubric = docs["channel/moments.rubric_path"]
+    assert "builtin:gaming" in rubric["comment"]           # l'aide simple dit déjà quoi saisir
+    assert rubric["comment"].count(".") <= 2
+    js = _static("screens", "channels.js") + _static("screens", "settings.js")
+    assert js.count("<details class=\"chan-help\"") + js.count("<details class=\"set-help\"") >= 2

@@ -113,6 +113,7 @@ from PIL import Image, ImageDraw, ImageFont
 from clipper.gpu import get_device
 
 CONFIG_DEFAULTS: dict[str, object] = {
+    # Cadence de sortie maximale du clip, en images par seconde.
     # Cadence de sortie (SPEC-6127) : imposée, quelle que soit la cadence source.
     "max_fps": 30,
     "crf": 20,
@@ -146,6 +147,7 @@ CONFIG_DEFAULTS: dict[str, object] = {
     # Écart toléré (s) entre les bornes de captions.json et celles du plan
     # reframe : au-delà, les entrées sont jugées incohérentes.
     "start_end_tolerance": 0.15,
+    # Taille de police du titre d'écran en format letterbox.
     # Format letterbox (SPEC-6127) : titre d'écran sur encadré blanc. Tailles
     # en pixels par em (même unité pour Pillow et drawtext).
     "title_font_size": 64,
@@ -159,6 +161,7 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "title_pad_x": 28,
     "title_pad_y": 16,
     "title_radius": 22,
+    # Écart, en pixels, entre le titre d'écran et la vidéo.
     # Écart (px de sortie) entre le bas de l'encadré du titre et le bas de sa
     # zone (TASK-ea6e : trop collé à la vidéo sans lui).
     "title_lift": 40,
@@ -169,6 +172,7 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "emoji_raster_size": 109,
     # « Partie N » en letterbox (taille : part_font_size, couleur : part_font_color).
     "part_border": 4,
+    # Active l'appel à l'abonnement (pseudo de chaîne et carte de fin) ; désactivé par défaut.
     # Appel à l'abonnement (SPEC-6a47), désactivé par défaut : sans
     # configuration explicite, le rendu reste identique à SPEC-6127. Ne
     # s'applique qu'aux layouts letterbox/stream (_TEXT_LAYOUTS) ; le format
@@ -196,16 +200,19 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "cta_card_pad_y": 16,
     "cta_card_radius": 22,
     "cta_card_line_height": 1.25,
+    # Affiche un titre d'écran sur le clip.
     # Titre d'écran (SPEC-76dc, nouveau réglage : jusqu'ici toujours dessiné).
     # Défaut True = comportement inchangé. False : aucun titre, sur aucun
     # layout ; text_zones.title n'est alors plus requis.
     "title_enabled": True,
+    # Affiche le badge de chaîne (logo et nom) entre la webcam et le jeu ; agencement stream split seulement.
     # Badge de chaîne (SPEC-76dc, agencement stream split seulement : la
     # zone badge n'existe que dans reframe/<clip_id>.json en stream_split,
     # erreur explicite sinon). Remplace le pseudo texte de l'appel a
     # l'abonnement (cta_handle) sur ce clip quand les deux sont actifs,
     # sans affecter la carte de fin.
     "badge_enabled": False,
+    # Chemin du logo (PNG) du badge de chaîne.
     # Chemin du logo (PNG), requis si badge_enabled ; fichier absent = erreur
     # explicite (ADR-ad2e).
     "badge_logo": "",

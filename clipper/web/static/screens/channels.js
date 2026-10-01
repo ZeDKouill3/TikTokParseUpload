@@ -22,6 +22,13 @@ const CHAN_MODES = [["review", "review (tu valides les moments)"], ["auto", "aut
 // Toute autre valeur est un chemin de fichier (« Fichier personnalisé »).
 const CHAN_RUBRICS = [["builtin", "Standard"], ["builtin:gaming", "Gaming"]];
 const CHAN_RUBRIC_CUSTOM = "custom";
+// Modèles proposés à la création d'une chaîne. « Standard » n'écrit rien de plus que [channel] ;
+// « Stream gaming » écrit la grille gaming et l'agencement stream (webcam en haut, jeu en bas).
+const CHAN_MODELS = [
+  { id: "standard", label: "Standard", help: "Réglages par défaut de config.toml.", preset: {} },
+  { id: "stream", label: "Stream gaming", help: "Grille de notation gaming et agencement stream (webcam en haut, jeu en bas).",
+    preset: { moments: { rubric_path: "builtin:gaming" }, reframe: { layout: "stream_auto", stream_variant: "split" } } },
+];
 const CHAN_STALE_MS = 4000;
 const CHAN_SLOTS_SHOWN = 3;
 
@@ -118,6 +125,9 @@ function chOpenNew() {
     <form id="chan-new-form"><div class="modal-body">
       <div class="field"><label for="chan-new-name">Nom</label><input class="input mono" id="chan-new-name" name="name" required maxlength="40" placeholder="ma_chaine" autocomplete="off"><span class="field-error" id="chan-new-error" role="alert"></span></div>
       <div class="field"><label for="chan-new-url">Adresse de la chaîne (YouTube ou Twitch, facultatif)</label><input class="input" id="chan-new-url" name="source_url" type="url" placeholder="https://…" autocomplete="off"></div>
+      <fieldset class="field chan-models"><legend>Modèle</legend>
+        ${CHAN_MODELS.map((m, i) => `<label class="chan-model"><input type="radio" name="model" value="${m.id}"${i === 0 ? " checked" : ""}><span><b>${esc(m.label)}</b><span class="hint">${esc(m.help)}</span></span></label>`).join("")}
+      </fieldset>
     </div>
     <div class="modal-foot"><button type="button" class="btn btn-ghost" data-dismiss>Annuler</button><button type="submit" class="btn btn-primary">Créer la chaîne</button></div></form>`,
   (el) => {
@@ -126,8 +136,10 @@ function chOpenNew() {
       e.preventDefault();
       const name = $("#chan-new-name", el).value.trim();
       const url = $("#chan-new-url", el).value.trim();
+      const model = CHAN_MODELS.find((m) => m.id === $('input[name="model"]:checked', el).value);
+      const preset = { channel: url ? { source_url: url } : {}, ...JSON.parse(JSON.stringify(model.preset)) };
       try {
-        await api("/api/channels", jsonBody("POST", { name, preset: { channel: url ? { source_url: url } : {} } }));
+        await api("/api/channels", jsonBody("POST", { name, preset }));
       } catch (err) {
         $("#chan-new-error", el).textContent = err.message;
         return;
@@ -163,20 +175,47 @@ function chSlotsEditor(value, dis) {
     <button type="button" class="btn btn-xs" data-slot-add${dis}>${icon("plus", "i-xs")}Ajouter un créneau</button></div>`;
 }
 
-/* Libellé de la grille en vigueur pour une valeur de rubric_path. */
+/* Libellé provisoire de la grille pour une valeur de rubric_path ; le serveur (/api/rubric-label)
+   donne le vrai : un fichier au contenu identique à la grille standard ou gaming n'est pas « personnalisé ». */
 function chRubricLabel(value) {
   const known = CHAN_RUBRICS.find(([k]) => k === value);
   return known ? `${known[1]} (${value})` : `Fichier personnalisé (${value})`;
 }
 
-function chRubricEditor(id, value, dis) {
+let chRubricTimer = null;
+/* Relit le libellé auprès du serveur et le pose sur le champ si la valeur n'a pas changé entre-temps. */
+function chRubricRefresh(field, value) {
+  clearTimeout(chRubricTimer);
+  chRubricTimer = setTimeout(async () => {
+    try {
+      const info = await api(`/api/rubric-label?path=${encodeURIComponent(value)}`);
+      const now = $("[data-rubric-now]", field);
+      if (!now || !field.isConnected || (chRubricValue(field) !== value)) return;
+      now.textContent = `Grille en vigueur : ${info.label}`;
+      const custom = $(`[data-rubric-select] option[value="${CHAN_RUBRIC_CUSTOM}"]`, field);
+      if (custom) custom.textContent = info.kind === "standard" || info.kind === "gaming" ? info.label : "Fichier personnalisé";
+    } catch (err) {
+      const now = $("[data-rubric-now]", field);
+      if (now) now.textContent = `Grille en vigueur : ${chRubricLabel(value)} (libellé indisponible : ${err.message})`;
+    }
+  }, 250);
+}
+
+function chRubricValue(field) {
+  const choice = $("[data-rubric-select]", field).value;
+  return choice === CHAN_RUBRIC_CUSTOM ? $("[data-rubric-path]", field).value.trim() : choice;
+}
+
+function chRubricEditor(id, value, dis, info) {
   const known = CHAN_RUBRICS.some(([k]) => k === value);
-  const options = [...CHAN_RUBRICS, [CHAN_RUBRIC_CUSTOM, "Fichier personnalisé"]]
+  const shown = info && info.value === value ? info : null;
+  const customLabel = shown && (shown.kind === "standard" || shown.kind === "gaming") ? shown.label : "Fichier personnalisé";
+  const options = [...CHAN_RUBRICS, [CHAN_RUBRIC_CUSTOM, customLabel]]
     .map(([k, l]) => `<option value="${k}"${(known ? k === value : k === CHAN_RUBRIC_CUSTOM) ? " selected" : ""}>${esc(l)}</option>`).join("");
   return `<div class="chan-rubric">
     <select class="input" id="${id}" data-rubric-select aria-label="Grille de notation"${dis}>${options}</select>
     <input class="input mono" type="text" data-rubric-path aria-label="Chemin du fichier de grille" placeholder="ma_grille.toml" value="${known ? "" : esc(value)}" autocomplete="off"${known ? " hidden" : ""}${dis}>
-    <span class="hint" data-rubric-now>Grille en vigueur : ${esc(chRubricLabel(value))}</span></div>`;
+    <span class="hint" data-rubric-now>Grille en vigueur : ${esc(shown ? shown.label : chRubricLabel(value))}</span></div>`;
 }
 
 function chAccountEditor(id, value, dis) {
@@ -198,6 +237,11 @@ function chControl(id, kind, value, locked) {
     case "slots": return chSlotsEditor(value, dis);
     case "rubric": return chRubricEditor(id, value, dis);
     case "account": return chAccountEditor(id, value, dis);
+function chControl(id, kind, value, locked, rubric) {
+  const dis = locked ? " disabled" : "";
+  switch (kind) {
+    case "slots": return chSlotsEditor(value, dis);
+    case "rubric": return chRubricEditor(id, value, dis, rubric);
     case "mode": return `<select class="input" id="${id}"${dis}>${CHAN_MODES.map(([k, l]) => `<option value="${k}"${k === value ? " selected" : ""}>${esc(l)}</option>`).join("")}</select>`;
     case "bool": return `<label class="switch"><input type="checkbox" id="${id}"${value ? " checked" : ""}${dis}><span></span></label>`;
     case "number": return `<input class="input mono" id="${id}" type="number" step="any" value="${esc(value)}"${dis}>`;
@@ -219,16 +263,17 @@ function chField(section, key, info, ed) {
   const logo = section === "channel" && key === "logo"
     ? `<div class="chan-logo"><input type="file" accept="image/png" data-logo-file aria-label="Fichier PNG du logo"><button type="button" class="btn btn-xs" data-logo-send>${icon("upload", "i-xs")}Envoyer le logo</button></div>` : "";
   return `<div class="field chan-field ${redefined ? "redefined" : "inherited"}" data-section="${esc(section)}" data-key="${esc(key)}" data-kind="${kind}">
-    <div class="chan-head"><label for="${id}" class="mono">${esc(key)}</label><span class="grow"></span>${state}</div>
-    ${chControl(id, kind, value, !redefined)}${logo}
-    ${info.comment ? `<span class="hint">${esc(info.comment)}</span>` : ""}
+    <div class="chan-head"><label for="${id}"${kind === "rubric" ? "" : ` class="mono"`}>${esc(kind === "rubric" ? "Grille de notation" : key)}</label><span class="grow"></span>${state}</div>
+    ${chControl(id, kind, value, !redefined, ed.detail.rubric)}${logo}
+    ${info.comment ? `<span class="hint">${esc(info.comment)}</span>` : ""}${info.details ? `<details class="chan-help"><summary>détails</summary><p class="hint">${esc(info.details)}</p></details>` : ""}
     <span class="field-error" role="alert"></span></div>`;
 }
 
 function chSectionHtml(spec, ed) {
   const docs = ed.detail.defaults[spec.section];
   const keys = Object.keys(docs);
-  const main = spec.only ? keys.filter((k) => spec.only.test(k)) : keys;
+  // La grille de notation est tout en haut de la section Chaîne : pas répétée dans « moments ».
+  const main = (spec.only ? keys.filter((k) => spec.only.test(k)) : keys).filter((k) => k !== "rubric_path");
   const rest = spec.only ? keys.filter((k) => !spec.only.test(k)) : [];
   const redefinedCount = Object.keys(ed.draft[spec.section] || {}).length;
   const open = spec.open || ed.open.has(spec.section) ? " open" : "";
@@ -237,7 +282,7 @@ function chSectionHtml(spec, ed) {
       <span class="chip ${redefinedCount ? "info" : "pending"} plain" data-count>${redefinedCount ? `${redefinedCount} redéfini${redefinedCount > 1 ? "s" : ""}` : "hérité"}</span></summary>
     <p class="field-error chan-sec-error" data-sec-error role="alert"></p>
     ${spec.section === "subtitles" ? chSubsPreviewHtml(ed) : ""}
-    <div class="chan-fields">${main.map((k) => chField(spec.section, k, docs[k], ed)).join("")}</div>
+    <div class="chan-fields">${spec.section === "channel" ? chField("moments", "rubric_path", ed.detail.defaults.moments.rubric_path, ed) : ""}${main.map((k) => chField(spec.section, k, docs[k], ed)).join("")}</div>
     ${rest.length ? `<details class="chan-more" data-more="${esc(spec.section)}"><summary>Autres réglages de [${esc(spec.section)}] (${rest.length})</summary><div class="chan-fields">${rest.map((k) => chField(spec.section, k, docs[k], ed)).join("")}</div></details>` : ""}
   </details>`;
 }
@@ -423,7 +468,10 @@ function chWireEdit(root, ed) {
       ed.draft[section][key] = chReadField(field);
       field.classList.remove("invalid");
       $(".field-error", field).textContent = "";
-      if (field.dataset.kind === "rubric") $("[data-rubric-now]", field).textContent = `Grille en vigueur : ${chRubricLabel(ed.draft[section][key])}`;
+      if (field.dataset.kind === "rubric") {
+        $("[data-rubric-now]", field).textContent = `Grille en vigueur : ${chRubricLabel(ed.draft[section][key])}`;
+        chRubricRefresh(field, ed.draft[section][key]);
+      }
       if (section === "subtitles" || section === "reframe") chSubsPreview(root, ed);
     } catch (err) {
       field.classList.add("invalid");

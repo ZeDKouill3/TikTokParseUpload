@@ -32,6 +32,19 @@ document.addEventListener("clipper:event", () => {
   if (currentScreen === "dashboard") loadDashboard();
 });
 
+/* Battement du worker : seul le voyant est relu et remplace, le reste de l'ecran n'est pas touche. */
+document.addEventListener("clipper:worker", async () => {
+  if (currentScreen !== "dashboard" || !store.dashboard) return;
+  try {
+    const part = await api("/api/dashboard/worker");
+    Object.assign(store.dashboard, part);
+    const panel = $('[data-section="worker"] .panel', $("#screen-dashboard"));
+    if (panel) panel.innerHTML = dashWorkerContent(store.dashboard);
+  } catch (err) {
+    // voyant inchange : la prochaine mise a jour complete (ou le prochain battement) le corrigera.
+  }
+});
+
 const dashDate = (iso) => {
   const d = new Date(iso);
   return Number.isNaN(d.getTime()) ? String(iso) : d.toLocaleString("fr-FR", { weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });

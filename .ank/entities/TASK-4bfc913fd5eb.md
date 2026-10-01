@@ -5,7 +5,7 @@ slug: console-v2-cinqui-me-tour-saccades-au-rafra-chis
 title: "console v2 : cinquième tour (saccades au rafraîchissement, modèle de chaîne et grille visible, libellé de grille, aides lisibles)"
 created: 2026-10-01T14:10:01Z
 author: nicoc@zedk_ordi
-status: in_progress
+status: done
 scope:
   - clipper/web/app.py
   - clipper/web/static/**
@@ -17,8 +17,15 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/4d01c3883033@fe48681
+    tree: scope/41d07ef8c0bf
+    criteria: 64343e7deeb4
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 2
+version: 3
 ---
 
 Séance d'utilisation réelle 2026-10-01 (cinquième tour). Voir les points du critère.

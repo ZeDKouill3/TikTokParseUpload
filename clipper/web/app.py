@@ -37,6 +37,7 @@ from clipper import accounts as accounts_mod
 from clipper import browser as browser_mod
 from clipper import channel as channel_mod
 from clipper import gpu as gpu_mod
+from clipper import moments as moments_mod
 from clipper import outcomes as outcomes_mod
 from clipper import pipeline
 from clipper import publish as publish_mod
@@ -710,10 +711,22 @@ def _comment_above(lines: list[str], lineno: int) -> str:
     return " ".join(part for part in block if part)
 
 
+_SENTENCE_END = re.compile(r"(?<=[.!?])\s+(?=[A-ZÀ-Ý«\"])")
+
+
+def _split_help(comment: str) -> tuple[str, str]:
+    """Aide d'un reglage : (premiere phrase, reste). La premiere phrase est le
+    texte simple affiche a l'utilisateur ; le reste (references techniques,
+    cas particuliers) est replie dans un « details » cote interface."""
+    parts = _SENTENCE_END.split(comment.strip(), maxsplit=1)
+    return parts[0], parts[1] if len(parts) > 1 else ""
+
+
 def _defaults_documentation(section: str) -> dict[str, dict[str, Any]]:
     """CONFIG_DEFAULTS de clipper.<section> : pour chaque cle, son defaut et le
     commentaire place au-dessus dans le source (inspect.getsource + ast : le
-    source n'est lu que pour ses commentaires, jamais evalue)."""
+    source n'est lu que pour ses commentaires, jamais evalue). ``comment`` est
+    la premiere phrase (aide simple), ``details`` le reste du commentaire."""
     defaults = _section_defaults(section)
     module = importlib.import_module(f"clipper.{section}")
     lines = inspect.getsource(module).splitlines()
@@ -726,7 +739,11 @@ def _defaults_documentation(section: str) -> dict[str, dict[str, Any]]:
             for key in node.value.keys:
                 if isinstance(key, ast.Constant) and isinstance(key.value, str):
                     comments[key.value] = _comment_above(lines, key.lineno)
-    return {key: {"default": value, "comment": comments.get(key, "")} for key, value in defaults.items()}
+    docs: dict[str, dict[str, Any]] = {}
+    for key, value in defaults.items():
+        simple, details = _split_help(comments.get(key, ""))
+        docs[key] = {"default": value, "comment": simple, "details": details}
+    return docs
 
 
 def _check_preset_types(preset: dict[str, Any]) -> None:
@@ -806,7 +823,34 @@ def _channel_detail(name: str) -> dict[str, Any]:
         defaults = {s: _defaults_documentation(s) for s in _CHANNEL_FORM_SECTIONS}
     except (OSError, tomllib.TOMLDecodeError, ConfigError) as exc:
         raise HTTPException(status_code=422, detail=f"preset illisible ({path.name}) : {exc}") from exc
-    return {"name": name, "raw": raw, "effective": effective, "defaults": defaults}
+    return {"name": name, "raw": raw, "effective": effective, "defaults": defaults,
+            "rubric": _rubric_info(effective["moments"]["rubric_path"])}
+
+
+def _rubric_info(value: str) -> dict[str, str]:
+    """Libelle de la grille designee par une valeur de [moments] rubric_path :
+    « Standard (<valeur>) » ou « Gaming (<valeur>) » pour une grille embarquee
+    ou un fichier dont le contenu est identique a celle-ci, sinon « Fichier
+    personnalise (<valeur>) » (kind « custom ») ; une valeur « builtin:... »
+    inconnue est « invalid », jamais ramenee a la grille standard (ADR-ad2e)."""
+    try:
+        path = moments_mod.resolve_rubric_path(value)
+    except moments_mod.MomentsError as exc:
+        return {"value": value, "kind": "invalid", "label": str(exc)}
+    if value in moments_mod._BUILTIN_RUBRICS:
+        kind = "gaming" if value == "builtin:gaming" else "standard"
+    else:
+        try:
+            content = path.read_bytes().replace(b"\r\n", b"\n")
+        except OSError:
+            return {"value": value, "kind": "custom", "label": f"Fichier personnalisé ({value}) : fichier introuvable"}
+        kind = next(
+            (name for name, builtin in (("standard", "builtin"), ("gaming", "builtin:gaming"))
+             if moments_mod.resolve_rubric_path(builtin).read_bytes().replace(b"\r\n", b"\n") == content),
+            "custom",
+        )
+    names = {"standard": "Standard", "gaming": "Gaming", "custom": "Fichier personnalisé"}
+    return {"value": value, "kind": kind, "label": f"{names[kind]} ({value})"}
 
 
 def _subspreview_config(name: str, draft: str | None) -> Config:
@@ -910,7 +954,7 @@ def _settings_detail(running_web: dict[str, Any]) -> dict[str, Any]:
         effective: dict[str, Any] = {"mode": config.mode, "workspace_dir": str(config.workspace_dir),
                                      "output_dir": str(config.output_dir)}
         defaults: dict[str, Any] = {
-            "general": {k: {"default": v, "comment": ""} for k, v in _CONFIG_FLAT_DEFAULTS.items()},
+            "general": {k: {"default": v, "comment": "", "details": ""} for k, v in _CONFIG_FLAT_DEFAULTS.items()},
         }
         from clipper import llm as llm_mod
 
@@ -1559,6 +1603,12 @@ def create_app(config: Config | None = None) -> FastAPI:
     def dashboard() -> dict[str, Any]:
         return _dashboard(config)
 
+    @app.get("/api/dashboard/worker")
+    def dashboard_worker() -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        _fill(out, ("worker",), "battement du worker (state/worker.json)", lambda: _dashboard_worker(config))
+        return out
+
     # ----------------------------------------------------------------
     # File de traitement (SPEC-74e9 §2)
     # ----------------------------------------------------------------
@@ -1866,6 +1916,10 @@ def create_app(config: Config | None = None) -> FastAPI:
         Path(_PRESETS_DIR).mkdir(parents=True, exist_ok=True)
         _save_channel_preset(body.name, body.preset or {"channel": {}})
         return _channel_detail(body.name)
+
+    @app.get("/api/rubric-label")
+    def rubric_label(path: str) -> dict[str, str]:
+        return _rubric_info(path)
 
     @app.get("/api/channels/{name}")
     def get_channel(name: str) -> dict[str, Any]:
