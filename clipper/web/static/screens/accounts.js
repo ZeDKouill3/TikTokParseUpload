@@ -99,7 +99,7 @@ async function accGenerate(root) {
 
 function accGenControls(state) {
   return `<div class="acc-gen-opts">
-    <div class="field acc-gen-length"><label>Longueur<input class="input" data-gen-length type="number" min="12" max="64" step="1" placeholder="défaut" value="${esc(state.length)}"></label></div>
+    <div class="field acc-gen-length"><label>Longueur<input class="input" data-gen-length type="number" min="12" max="64" step="1" placeholder="20" value="${esc(state.length)}"></label></div>
     <label class="acc-check"><input type="checkbox" data-gen-symbols${state.symbols ? " checked" : ""}> Symboles</label>
     <label class="acc-check"><input type="checkbox" data-gen-ambiguous${state.ambiguous ? " checked" : ""}> Sans caractères ambigus</label>
   </div>`;
