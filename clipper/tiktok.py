@@ -447,6 +447,7 @@ class _Flow:
         keyboard.press("Control+A")
         keyboard.press("Backspace")
         keyboard.insert_text(text)
+        keyboard.press("Escape")  # ferme la liste de suggestions de hashtags qui recouvre le formulaire
         self.pause()
 
     def expand_settings(self) -> None:
@@ -467,7 +468,9 @@ class _Flow:
             wanted = bool(self.settings[key])
             if bool(box.is_checked()) == wanted:
                 continue
-            (box.check if wanted else box.uncheck)(force=True)
+            # Case dessinee en CSS par-dessus un input invisible : Playwright refuse check() ; un clic
+            # JavaScript sur l'input declenche le meme changement que le clic de l'utilisateur.
+            box.evaluate("el => el.click()")
             self.pause()
             if bool(box.is_checked()) != wanted:
                 raise self.stop("unexpected_page", f"la case « {label} » n'a pas pu être réglée")

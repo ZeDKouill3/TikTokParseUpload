@@ -332,6 +332,13 @@ class FakeToggle(FakeElement):
         self.page.options[self.name] = True
         self.page.toggles.append((self.name, True))
 
+    def evaluate(self, script):
+        # clic JavaScript sur l'input (case dessinee en CSS) : bascule l'etat comme un clic utilisateur
+        assert "click()" in script
+        wanted = not self.page.options[self.name]
+        self.page.options[self.name] = wanted
+        self.page.toggles.append((self.name, wanted))
+
     def uncheck(self, **kwargs):
         self.page.options[self.name] = False
         self.page.toggles.append((self.name, False))
@@ -435,7 +442,7 @@ def test_the_caption_is_cleared_then_inserted_at_once_never_filled(env):
     keys = [c for c in env.page.calls if c[0] in ("press", "type")]
     text = "Ma legende #un #deux"
     assert keys[:2] == [("press", "Control+A"), ("press", "Backspace")]  # pre-rempli du nom du fichier : vide
-    assert keys[2:] == [("type", text)]  # insert_text : instantane, un seul evenement
+    assert keys[2:] == [("type", text), ("press", "Escape")]  # insert_text instantane, puis Echap ferme les suggestions de hashtags
     assert env.page.fills() == []  # pas de fill sur l'editeur Draft.js
     first_click = env.page.calls.index(("click", _sel()["selectors"]["caption_editor"]))
     assert first_click < env.page.calls.index(("press", "Control+A"))
