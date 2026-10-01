@@ -405,7 +405,7 @@ def test_media_clip_rejects_path_traversal(tmp_path, isolated_cwd):
 
 _ALLOWED_CLIPPER_IMPORTS = {
     "clipper", "clipper.pipeline", "clipper.config", "clipper.web", "clipper.web.app",
-    "clipper.channel", "clipper.worker", "clipper.publish", "clipper.watch",
+    "clipper.channel", "clipper.worker", "clipper.publish", "clipper.watch", "clipper.gpu",
 }
 
 
@@ -1060,3 +1060,278 @@ def test_static_assets_are_served(tmp_path, isolated_cwd):
     for name in ("app.js", "ui.js", "icons.js", "screens.js", "style.css", "fonts.css", "logo.svg"):
         assert client(tmp_path).get(f"/static/{name}").status_code == 200, name
     assert not (STATIC / "data.js").exists()
+
+
+# --------------------------------------------------------------------------
+# E1 : GET /api/dashboard (TASK-aad3, SPEC-c100 E1, T2, T8)
+# --------------------------------------------------------------------------
+
+import sys  # noqa: E402
+import types  # noqa: E402
+from datetime import datetime, timedelta  # noqa: E402
+
+STATIC = Path(__file__).resolve().parent.parent / "clipper" / "web" / "static"
+
+
+def _dashboard(tmp_path) -> dict:
+    resp = client(tmp_path).get("/api/dashboard")
+    assert resp.status_code == 200
+    return resp.json()
+
+
+def _write_json(path: Path, data) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
+def _write_sidecar(tmp_path, video_id, clip_id, **fields):
+    sidecar = {"clip_id": clip_id, "ready": True, "screen_title": f"Titre {clip_id}"}
+    sidecar.update(fields)
+    _write_json(tmp_path / "output" / video_id / f"{clip_id}.json", sidecar)
+
+
+def _publish_entry(video_id, clip_id, status, slot_at):
+    return {"video_id": video_id, "clip_id": clip_id, "series_id": None, "part": None, "status": status,
+            "slot_at": slot_at, "decided_at": "2026-01-01T00:00:00+00:00", "published_at": None, "error": None}
+
+
+def _usage_line(usage, cost, when, **extra):
+    return {"recorded_at": when.isoformat(), "usage": usage, "model": "m", "input_tokens": 10,
+            "output_tokens": 5, "cache_read_tokens": 0, "cost_usd": cost, "duration_s": 1.0, **extra}
+
+
+def _write_usage(tmp_path, video_id, lines):
+    path = tmp_path / "workspace" / video_id / "llm_usage.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8")
+
+
+def test_dashboard_empty_workspace_has_explicit_empty_sections(tmp_path, isolated_cwd):
+    data = _dashboard(tmp_path)
+
+    assert data["running"] == [] and data["queue"] == [] and data["failed"] == [] and data["queued"] == []
+    assert data["watch_pending"] == []
+    assert data["clips_to_review"] == 0
+    assert data["next_publications"] == []
+    assert data["llm_cost"]["today"] == 0 and data["llm_cost"]["week"] == 0 and data["llm_cost"]["by_usage"] == {}
+    assert not [k for k in data if k.endswith("_error")]
+
+
+def test_dashboard_running_videos_expose_current_step_and_progress(tmp_path, isolated_cwd):
+    progress = {"fraction": 0.4, "eta_s": 90.0, "message": "segment 3/8"}
+    state = _write_state(tmp_path, "aaaaaaaaaaa", status="running", channel="ma_chaine")
+    state["steps"]["download"]["status"] = "done"
+    state["steps"]["transcribe"].update(status="running", progress=progress)
+    _write_json(tmp_path / "workspace" / "aaaaaaaaaaa" / "pipeline.json", state)
+    _write_state(tmp_path, "bbbbbbbbbbb", status="done")
+
+    running = _dashboard(tmp_path)["running"]
+
+    assert [v["video_id"] for v in running] == ["aaaaaaaaaaa"]
+    assert running[0]["step"] == "transcribe"
+    assert running[0]["progress"] == progress
+    assert running[0]["channel"] == "ma_chaine"
+
+
+def test_dashboard_queue_lists_queue_json_entries(tmp_path, isolated_cwd):
+    entries = [{"id": "e1", "video_id": VIDEO_ID, "url": URL, "channel": None, "action": "run",
+                "force_steps": [], "enqueued_at": "2026-01-01T00:00:00+00:00", "status": "waiting", "pid": None}]
+    _write_json(tmp_path / "state" / "queue.json", entries)
+
+    assert _dashboard(tmp_path)["queue"] == entries
+
+
+def test_dashboard_failed_and_queued_carry_reason_and_retry_at(tmp_path, isolated_cwd):
+    _write_state(tmp_path, "aaaaaaaaaaa", status="failed", reason="ffmpeg a echoue", retry_at=None)
+    _write_state(tmp_path, "bbbbbbbbbbb", status="queued", reason="quota LLM atteint",
+                 retry_at="2026-01-02T08:00:00+00:00")
+    _write_state(tmp_path, "ccccccccccc", status="done")
+
+    data = _dashboard(tmp_path)
+
+    assert [(v["video_id"], v["reason"], v["retry_at"]) for v in data["failed"]] == [
+        ("aaaaaaaaaaa", "ffmpeg a echoue", None)]
+    assert [(v["video_id"], v["reason"], v["retry_at"]) for v in data["queued"]] == [
+        ("bbbbbbbbbbb", "quota LLM atteint", "2026-01-02T08:00:00+00:00")]
+
+
+def test_dashboard_watch_pending_gathers_vods_to_confirm(tmp_path, isolated_cwd):
+    vod = {"video_id": "ddddddddddd", "url": "https://example.test/v/1", "title": "Direct du soir",
+           "duration_s": 7200, "published_at": "2026-01-01T20:00:00+00:00", "found_at": "2026-01-02T01:00:00+00:00"}
+    _write_json(tmp_path / "state" / "watch" / "ma_chaine.json",
+                {"checked_at": "2026-01-02T01:00:00+00:00", "seen": [], "pending": [vod], "last_error": None})
+    _write_json(tmp_path / "state" / "watch" / "autre.json",
+                {"checked_at": "2026-01-02T01:00:00+00:00", "seen": [], "pending": [], "last_error": None})
+
+    pending = _dashboard(tmp_path)["watch_pending"]
+
+    assert pending == [{**vod, "channel": "ma_chaine"}]
+
+
+def test_dashboard_unreadable_watch_file_is_null_with_a_french_error(tmp_path, isolated_cwd):
+    (tmp_path / "state" / "watch").mkdir(parents=True)
+    (tmp_path / "state" / "watch" / "ma_chaine.json").write_text("{pas du json", encoding="utf-8")
+
+    data = _dashboard(tmp_path)
+
+    assert data["watch_pending"] is None
+    assert "ma_chaine.json" in data["watch_pending_error"]
+
+
+def test_dashboard_counts_ready_clips_absent_from_publish_state(tmp_path, isolated_cwd):
+    _write_state(tmp_path, "aaaaaaaaaaa", channel="ma_chaine")
+    _write_state(tmp_path, "bbbbbbbbbbb", channel=None)
+    _write_sidecar(tmp_path, "aaaaaaaaaaa", "01")
+    _write_sidecar(tmp_path, "aaaaaaaaaaa", "02")
+    _write_sidecar(tmp_path, "aaaaaaaaaaa", "03", ready=False)
+    _write_sidecar(tmp_path, "bbbbbbbbbbb", "01")
+    _write_json(tmp_path / "state" / "publish" / "ma_chaine.json",
+                [_publish_entry("aaaaaaaaaaa", "01", "approved", None)])
+
+    assert _dashboard(tmp_path)["clips_to_review"] == 2  # aaaa/02 et bbbb/01
+
+
+def test_dashboard_invalid_publish_entry_is_null_with_a_french_error(tmp_path, isolated_cwd):
+    _write_state(tmp_path, "aaaaaaaaaaa", channel="ma_chaine")
+    _write_sidecar(tmp_path, "aaaaaaaaaaa", "01")
+    _write_json(tmp_path / "state" / "publish" / "ma_chaine.json", [{"video_id": "aaaaaaaaaaa"}])
+
+    data = _dashboard(tmp_path)
+
+    assert data["clips_to_review"] is None
+    assert data["clips_to_review_error"]
+    assert data["next_publications"] is None
+    assert data["next_publications_error"]
+
+
+def test_dashboard_next_publications_are_the_five_earliest_scheduled_across_channels(tmp_path, isolated_cwd):
+    base = datetime(2030, 1, 1, 12, 0)
+    for i in range(4):
+        _write_sidecar(tmp_path, "aaaaaaaaaaa", f"{i:02d}")
+    entries_a = [_publish_entry("aaaaaaaaaaa", f"{i:02d}", "scheduled", (base + timedelta(days=2 * i)).isoformat())
+                 for i in range(4)]
+    entries_a.append(_publish_entry("aaaaaaaaaaa", "99", "approved", None))
+    entries_a.append(_publish_entry("aaaaaaaaaaa", "98", "published", base.isoformat()))
+    entries_b = [_publish_entry("bbbbbbbbbbb", f"{i:02d}", "scheduled", (base + timedelta(days=2 * i + 1)).isoformat())
+                 for i in range(4)]
+    _write_json(tmp_path / "state" / "publish" / "ma_chaine.json", entries_a)
+    _write_json(tmp_path / "state" / "publish" / "autre.json", entries_b)
+
+    nxt = _dashboard(tmp_path)["next_publications"]
+
+    assert len(nxt) == 5
+    assert [e["slot_at"] for e in nxt] == [(base + timedelta(days=d)).isoformat() for d in range(5)]
+    assert [e["channel"] for e in nxt] == ["ma_chaine", "autre", "ma_chaine", "autre", "ma_chaine"]
+    assert nxt[0]["screen_title"] == "Titre 00"
+    assert all(e["status"] == "scheduled" for e in nxt)
+
+
+def test_dashboard_llm_cost_sums_usage_journals_by_window_and_usage(tmp_path, isolated_cwd):
+    now = datetime.now().astimezone()
+    _write_usage(tmp_path, "aaaaaaaaaaa", [
+        _usage_line("moments", 0.25, now),
+        _usage_line("vision", 0.10, now),
+        _usage_line("moments", 0.50, now - timedelta(days=3)),
+        _usage_line("moments", 9.00, now - timedelta(days=30)),  # hors fenetre
+    ])
+    _write_usage(tmp_path, "bbbbbbbbbbb", [_usage_line("moments", 0.15, now)])
+
+    cost = _dashboard(tmp_path)["llm_cost"]
+
+    assert cost["today"] == pytest.approx(0.50)
+    assert cost["week"] == pytest.approx(1.00)
+    assert cost["by_usage"] == {"moments": pytest.approx(0.90), "vision": pytest.approx(0.10)}
+
+
+def test_dashboard_llm_cost_window_uses_the_local_timezone(tmp_path, isolated_cwd):
+    local_midnight = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+    _write_usage(tmp_path, "aaaaaaaaaaa", [
+        _usage_line("moments", 1.0, local_midnight + timedelta(seconds=1)),
+        _usage_line("moments", 2.0, local_midnight - timedelta(seconds=1)),  # veille locale
+    ])
+
+    cost = _dashboard(tmp_path)["llm_cost"]
+
+    assert cost["today"] == pytest.approx(1.0)
+    assert cost["week"] == pytest.approx(3.0)
+
+
+def test_dashboard_llm_cost_reports_calls_with_unknown_cost(tmp_path, isolated_cwd):
+    now = datetime.now().astimezone()
+    _write_usage(tmp_path, "aaaaaaaaaaa", [_usage_line("moments", None, now), _usage_line("moments", 0.2, now)])
+
+    cost = _dashboard(tmp_path)["llm_cost"]
+
+    assert cost["today"] == pytest.approx(0.2)
+    assert cost["unreported_calls"] == 1
+
+
+def test_dashboard_unreadable_usage_journal_is_null_with_a_french_error(tmp_path, isolated_cwd):
+    path = tmp_path / "workspace" / "aaaaaaaaaaa" / "llm_usage.jsonl"
+    path.parent.mkdir(parents=True)
+    path.write_text("pas du json\n", encoding="utf-8")
+
+    data = _dashboard(tmp_path)
+
+    assert data["llm_cost"] is None
+    assert "llm_usage.jsonl" in data["llm_cost_error"]
+
+
+def test_dashboard_hardware_is_cpu_without_vram_or_error(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import gpu
+
+    monkeypatch.setattr(gpu, "get_device", lambda: gpu.Device(type="cpu", compute_type="int8"))
+
+    data = _dashboard(tmp_path)
+
+    assert data["hardware"] == {"device": "cpu", "vram_used_mb": None}
+    assert "hardware_error" not in data
+
+
+def _fake_torch(monkeypatch, *, available=True, free=3 * 1024**3, total=8 * 1024**3):
+    torch = types.ModuleType("torch")
+    torch.cuda = types.SimpleNamespace(is_available=lambda: available, mem_get_info=lambda: (free, total))
+    monkeypatch.setitem(sys.modules, "torch", torch)
+
+
+def test_dashboard_hardware_reads_vram_used_on_cuda(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import gpu
+
+    monkeypatch.setattr(gpu, "get_device", lambda: gpu.Device(type="cuda", compute_type="float16"))
+    _fake_torch(monkeypatch)
+
+    assert _dashboard(tmp_path)["hardware"] == {"device": "cuda", "vram_used_mb": 5 * 1024}
+
+
+def test_dashboard_hardware_vram_unknown_is_null_with_a_french_error(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import gpu
+
+    monkeypatch.setattr(gpu, "get_device", lambda: gpu.Device(type="cuda", compute_type="float16"))
+    monkeypatch.setitem(sys.modules, "torch", None)  # import torch -> ImportError
+
+    hw = _dashboard(tmp_path)["hardware"]
+
+    assert hw["device"] == "cuda"
+    assert hw["vram_used_mb"] is None
+    assert "torch" in hw["vram_used_mb_error"]
+
+
+def test_dashboard_screen_is_wired_with_every_section_and_empty_state():
+    page = (STATIC / "index.html").read_text(encoding="utf-8")
+    js = (STATIC / "screens" / "dashboard.js").read_text(encoding="utf-8")
+
+    assert "/static/screens/dashboard.js" in page
+    assert page.index("/static/screens.js") < page.index("/static/screens/dashboard.js")
+    # une section par bloc de donnees (data-section=<cle>), chacune avec un etat vide explicite
+    assert 'data-section="${key}"' in js
+    for section in ("running", "queue", "failed", "queued", "watch_pending", "clips_to_review",
+                    "next_publications", "llm_cost", "hardware"):
+        assert f'dashSection("{section}"' in js, section
+    for empty in ("Aucune vidéo en cours", "La file est vide", "Aucun échec", "Aucune vidéo en attente de reprise",
+                  "Aucune VOD à confirmer", "Aucun clip à valider", "Aucune publication programmée",
+                  "Aucun appel au modèle", "CPU"):
+        assert empty in js, empty
+    # mise a jour sur evenement SSE, donnees lues sur /api/dashboard, erreurs affichees
+    assert "/api/dashboard" in js
+    assert "clipper:event" in js
+    assert "_error" in js

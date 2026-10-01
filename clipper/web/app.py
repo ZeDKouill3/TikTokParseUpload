@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator
 
@@ -20,7 +20,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from clipper import channel as channel_mod
+from clipper import gpu as gpu_mod
 from clipper import pipeline
+from clipper import publish as publish_mod
 from clipper import worker as worker_mod
 from clipper.config import Config, load_config
 
@@ -148,6 +150,181 @@ def _scan_watched(workspace_root: Path, state_root: Path) -> list[tuple[Path, st
     return found
 
 
+# --------------------------------------------------------------------------
+# Tableau de bord (SPEC-c100 E1, T2, T8) : lecture de fichiers seulement.
+# Une donnee introuvable est null avec une cle <champ>_error en francais,
+# jamais un 0 ou une liste vide muets (ADR-ad2e).
+# --------------------------------------------------------------------------
+
+_WATCH_DIR = Path("state") / "watch"
+_NEXT_PUBLICATIONS = 5
+_COST_WEEK_DAYS = 7
+_MIB = 1024 * 1024
+
+
+def _fill(out: dict[str, Any], fields: tuple[str, ...], label: str, build) -> None:
+    """Renseigne ``fields`` avec ``build()`` (un dict champ -> valeur) ; si la
+    lecture echoue, chaque champ vaut null et ``<champ>_error`` dit pourquoi."""
+    try:
+        out.update(build())
+    except (OSError, ValueError, KeyError, TypeError, publish_mod.PublishError) as exc:
+        for name in fields:
+            out[name] = None
+            out[f"{name}_error"] = f"{label} illisible : {exc}"
+
+
+def _current_step(state: dict[str, Any]) -> str | None:
+    steps = state.get("steps", {})
+    for name, step in steps.items():
+        if step.get("status") == "running":
+            return name
+    for name, step in steps.items():
+        if step.get("status") != "done":
+            return name
+    return None
+
+
+def _dashboard_videos(config: Config) -> dict[str, Any]:
+    states = _list_states(config)
+    running = []
+    for state in states:
+        if state.get("status") != "running":
+            continue
+        step = _current_step(state)
+        running.append({
+            "video_id": state["video_id"], "channel": state.get("channel"), "source_url": state.get("source_url"),
+            "step": step, "progress": state["steps"][step].get("progress") if step else None,
+        })
+
+    def problem(status: str) -> list[dict[str, Any]]:
+        return [
+            {"video_id": s["video_id"], "channel": s.get("channel"), "step": _current_step(s),
+             "reason": s.get("reason"), "retry_at": s.get("retry_at")}
+            for s in states if s.get("status") == status
+        ]
+
+    return {"running": running, "failed": problem("failed"), "queued": problem("queued")}
+
+
+def _dashboard_watch() -> dict[str, Any]:
+    pending: list[dict[str, Any]] = []
+    for path in sorted(_WATCH_DIR.glob("*.json")) if _WATCH_DIR.is_dir() else []:
+        try:
+            pending.extend({**vod, "channel": path.stem} for vod in _read_json(path)["pending"])
+        except (ValueError, KeyError, TypeError) as exc:
+            raise ValueError(f"{path.name} : {exc}") from exc
+    return {"watch_pending": pending}
+
+
+def _dashboard_clips_to_review(config: Config) -> dict[str, Any]:
+    states = _list_states(config)
+    publish_dir = Path(config.section("publish")["state_dir"])
+    count = 0
+    for channel in {s.get("channel") for s in states}:
+        if channel is None:  # sans chaine, aucun fichier de publication n'existe
+            for state in (s for s in states if s.get("channel") is None):
+                out_dir = Path(config.output_dir) / state["video_id"]
+                count += sum(1 for p in out_dir.glob("*.json") if _read_json(p).get("ready"))
+        else:
+            count += len(publish_mod.list_pending(
+                channel, workspace_dir=config.workspace_dir, output_dir=config.output_dir, state_dir=publish_dir))
+    return {"clips_to_review": count}
+
+
+def _scheduled_entries(publish_dir: Path) -> list[dict[str, Any]]:
+    entries = []
+    for path in sorted(publish_dir.glob("*.json")) if publish_dir.is_dir() else []:
+        for entry in _read_json(path):
+            for field_name in ("video_id", "clip_id", "status", "slot_at"):
+                if field_name not in entry:
+                    raise ValueError(f"{path.name} : champ {field_name!r} absent d'une entree")
+            if entry["status"] == "scheduled" and entry["slot_at"]:
+                entries.append({**entry, "channel": path.stem})
+    return entries
+
+
+def _dashboard_next_publications(config: Config) -> dict[str, Any]:
+    entries = _scheduled_entries(Path(config.section("publish")["state_dir"]))
+    entries.sort(key=lambda e: datetime.fromisoformat(e["slot_at"]).astimezone(timezone.utc))
+    entries = entries[:_NEXT_PUBLICATIONS]
+    for entry in entries:
+        sidecar = Path(config.output_dir) / entry["video_id"] / f"{entry['clip_id']}.json"
+        entry["screen_title"] = _read_json(sidecar).get("screen_title") if sidecar.is_file() else None
+    return {"next_publications": entries}
+
+
+def _dashboard_llm_cost(config: Config) -> dict[str, Any]:
+    """Somme de workspace/*/llm_usage.jsonl : ``today`` = jour calendaire local,
+    ``week`` = les 7 derniers jours locaux (aujourd'hui compris), ``by_usage`` =
+    cout de la semaine par usage ; les appels sans cout rapporte sont comptes
+    a part (``unreported_calls``), jamais pour 0."""
+    now = datetime.now().astimezone()
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    week_start = today_start - timedelta(days=_COST_WEEK_DAYS - 1)
+    cost: dict[str, Any] = {"today": 0.0, "week": 0.0, "by_usage": {}, "unreported_calls": 0}
+    root = Path(config.workspace_dir)
+    for path in sorted(root.glob("*/llm_usage.jsonl")) if root.is_dir() else []:
+        for number, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+            if not raw.strip():
+                continue
+            try:
+                entry = json.loads(raw)
+                # clipper.llm date chaque appel de "timestamp" ; "recorded_at" est la forme du contrat
+                recorded = datetime.fromisoformat(entry.get("recorded_at") or entry["timestamp"]).astimezone()
+                usage = entry["usage"]
+            except (ValueError, KeyError, TypeError) as exc:
+                raise ValueError(f"{path.parent.name}/{path.name} ligne {number} : {exc}") from exc
+            if recorded < week_start or recorded > now:
+                continue
+            amount = entry.get("cost_usd")
+            if amount is None:
+                cost["unreported_calls"] += 1
+                continue
+            cost["week"] += amount
+            cost["by_usage"][usage] = cost["by_usage"].get(usage, 0.0) + amount
+            if recorded >= today_start:
+                cost["today"] += amount
+    return {"llm_cost": cost}
+
+
+def _vram_used_mb() -> int:
+    import torch  # lourd et optionnel : charge seulement si le device est CUDA
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("torch.cuda n'est pas disponible")
+    free, total = torch.cuda.mem_get_info()
+    return (total - free) // _MIB
+
+
+def _dashboard_hardware() -> dict[str, Any]:
+    try:
+        device = gpu_mod.get_device().type
+    except Exception as exc:  # get_device ne leve pas en pratique ; jamais de device invente
+        return {"hardware": None, "hardware_error": f"device illisible : {exc}"}
+    hardware: dict[str, Any] = {"device": device, "vram_used_mb": None}
+    if device != "cpu":
+        try:
+            hardware["vram_used_mb"] = _vram_used_mb()
+        except Exception as exc:  # torch absent (ImportError), CUDA indisponible...
+            hardware["vram_used_mb_error"] = f"VRAM utilisée illisible (torch) : {exc}"
+    return {"hardware": hardware}
+
+
+def _dashboard(config: Config) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    _fill(out, ("running", "failed", "queued"), "etat des videos (workspace/*/pipeline.json)",
+          lambda: _dashboard_videos(config))
+    queue_path = _queue_path(config)
+    _fill(out, ("queue",), f"file d'attente ({queue_path.name})",
+          lambda: {"queue": _read_json(queue_path) if queue_path.exists() else []})
+    _fill(out, ("watch_pending",), "surveillance (state/watch)", _dashboard_watch)
+    _fill(out, ("clips_to_review",), "clips a valider", lambda: _dashboard_clips_to_review(config))
+    _fill(out, ("next_publications",), "publications (state/publish)", lambda: _dashboard_next_publications(config))
+    _fill(out, ("llm_cost",), "journal llm_usage.jsonl", lambda: _dashboard_llm_cost(config))
+    out.update(_dashboard_hardware())
+    return out
+
+
 async def _event_stream(config: Config) -> AsyncIterator[str]:
     """Scrute workspace/*/pipeline.json et state/**/*.json par mtime,
     sans broker (ADR-4f6e §4) ; un evenement {kind, id, at} par changement,
@@ -225,6 +402,10 @@ def create_app(config: Config | None = None) -> FastAPI:
     @app.get("/")
     def index() -> FileResponse:
         return FileResponse(STATIC_DIR / "index.html")
+
+    @app.get("/api/dashboard")
+    def dashboard() -> dict[str, Any]:
+        return _dashboard(config)
 
     # ----------------------------------------------------------------
     # File de traitement (SPEC-fc0c §2)
