@@ -47,7 +47,10 @@ logger = logging.getLogger(__name__)
 CONFIG_DEFAULTS: dict[str, object] = {
     "backend": "browser",              # browser | api (pas encore disponible)
     "publish_mode": "immediate",       # immediate | scheduled (programme cote TikTok)
-    "visibility": "public",            # public | private (test reel : private)
+    "visibility": "public",            # public | friends | private (test reel : private)
+    "allow_comments": True,            # case « Commentaire » (etat par defaut de TikTok : cochee)
+    "allow_reuse": True,               # case « Reutilisation du contenu » (duo, collage ; cochee par defaut)
+    "ai_generated": False,             # interrupteur « Contenu genere par IA » (coupe par defaut)
     "max_posts_per_day": 1,
     "min_gap_minutes": 480,
     "min_action_delay_s": 0.3,
@@ -68,13 +71,15 @@ CONFIG_DEFAULTS: dict[str, object] = {
 }
 
 MODES = ("immediate", "scheduled")
-VISIBILITIES = ("public", "private")
+VISIBILITIES = ("public", "friends", "private")
+POST_OPTIONS = ("visibility", "allow_comments", "allow_reuse", "ai_generated", "content_check")
 BACKENDS = ("browser", "api")
 MAX_EVENTS = 50
 SELECTORS_PATH = Path(__file__).parent / "assets" / "tiktok_selectors.toml"
 REQUIRED_SELECTORS = (
     "file_input", "upload_done", "caption_editor", "advanced_settings", "visibility_dropdown",
-    "visibility_public", "visibility_private", "schedule_now", "schedule_later", "schedule_inputs",
+    "visibility_public", "visibility_private", "visibility_friends", "comment_switch", "reuse_switch",
+    "ai_switch", "schedule_now", "schedule_later", "schedule_inputs",
     "calendar_month_title", "calendar_year_title", "calendar_arrow", "calendar_day", "timepicker_hour",
     "timepicker_minute", "schedule_picker_close", "content_check_running", "content_check_ok",
     "content_check_problem", "post_button", "discard_button", "published_marker",
@@ -121,6 +126,9 @@ def get_settings(config: Config | None) -> dict[str, Any]:
     hours = settings["stats_interval_h"]
     if isinstance(hours, bool) or not isinstance(hours, (int, float)) or hours <= 0:
         raise TikTokError(f"[tiktok] stats_interval_h invalide : {hours!r} (un nombre d'heures > 0 est attendu)")
+    for key in ("allow_comments", "allow_reuse", "ai_generated"):
+        if not isinstance(settings[key], bool):
+            raise TikTokError(f"[tiktok] {key} invalide : {settings[key]!r} (true ou false attendu)")
     if not isinstance(settings["stats_dir"], str) or not settings["stats_dir"]:
         raise TikTokError(f"[tiktok] stats_dir invalide : {settings['stats_dir']!r} (un chemin est attendu)")
     if settings["min_action_delay_s"] > settings["max_action_delay_s"]:
@@ -129,6 +137,24 @@ def get_settings(config: Config | None) -> dict[str, Any]:
             f"({settings['max_action_delay_s']})"
         )
     return settings
+
+
+def post_settings(settings: dict[str, Any], options: dict[str, Any] | None) -> dict[str, Any]:
+    """Reglages d'un post (SPEC-1ed3 R2) : ceux de [tiktok] surchargés par ``options`` (visibilite, commentaires,
+    reutilisation, contenu IA, verification de contenu). Une option inconnue ou invalide est une erreur explicite."""
+    merged = dict(settings)
+    for key, value in (options or {}).items():
+        if key not in POST_OPTIONS:
+            raise TikTokError(f"réglage de publication inconnu : {key!r} (attendu : {' | '.join(POST_OPTIONS)})")
+        if key in ("allow_comments", "allow_reuse", "ai_generated"):
+            if not isinstance(value, bool):
+                raise TikTokError(f"réglage de publication {key} invalide : {value!r} (true ou false attendu)")
+        else:
+            allowed = VISIBILITIES if key == "visibility" else ("off", "wait")
+            if value not in allowed:
+                raise TikTokError(f"réglage de publication {key} invalide : {value!r} (attendu : {' | '.join(allowed)})")
+        merged[key] = value
+    return merged
 
 
 def load_selectors(path: str | Path | None = None) -> dict[str, Any]:
@@ -209,6 +235,19 @@ def check_limits(times: list[datetime], target: datetime, settings: dict[str, An
         if abs(t - target) < gap:
             return (f"écart minimal de {settings['min_gap_minutes']} minutes non respecté avec la "
                     f"publication du {t.astimezone(tz).strftime('%Y-%m-%d %H:%M')}")
+    return None
+
+
+def next_allowed(times: list[datetime], after: datetime, settings: dict[str, Any], tz: tzinfo) -> datetime | None:
+    """Premiere heure ``>= after`` qui respecte les plafonds du compte (``check_limits``), ou None si aucune
+    n'existe dans les 60 jours : ``after`` lui-meme, la fin de chaque ecart minimal et chaque minuit local."""
+    candidates = {after}
+    candidates.update(t + timedelta(minutes=float(settings["min_gap_minutes"])) for t in times)
+    midnight = datetime.combine(after.astimezone(tz).date(), datetime.min.time(), tzinfo=tz)
+    candidates.update((midnight + timedelta(days=d)).astimezone(timezone.utc) for d in range(1, 61))
+    for candidate in sorted(c for c in candidates if c >= after):
+        if check_limits(times, candidate, settings, tz) is None:
+            return candidate
     return None
 
 
@@ -415,6 +454,24 @@ class _Flow:
         dropdown = self.page.query_selector(self.sel["selectors"]["visibility_dropdown"])
         if dropdown is None or not dropdown.is_visible():
             self.click("advanced_settings")
+
+    def apply_options(self) -> None:
+        """Commentaires, reutilisation, contenu genere par IA (SPEC-1ed3 R2) : chaque case est lue, et cliquee
+        seulement si elle n'est pas deja dans l'etat voulu. Bloc absent = arret R4, jamais un clic de repli."""
+        for key, name, label in (("allow_comments", "comment_switch", "commentaires"),
+                                 ("allow_reuse", "reuse_switch", "réutilisation du contenu"),
+                                 ("ai_generated", "ai_switch", "contenu généré par IA")):
+            box = self.page.query_selector(self.sel["selectors"][name])
+            if box is None:
+                raise self.stop("element_missing", f"case « {label} » introuvable (réglage de publication {key})")
+            wanted = bool(self.settings[key])
+            if bool(box.is_checked()) == wanted:
+                continue
+            (box.check if wanted else box.uncheck)(force=True)
+            self.pause()
+            if bool(box.is_checked()) != wanted:
+                raise self.stop("unexpected_page", f"la case « {label} » n'a pas pu être réglée")
+            logger.info("TikTok %s : %s réglé à %s", self.account, label, "oui" if wanted else "non")
 
     def schedule_now(self) -> None:
         # Video privee : TikTok grise « Maintenant » et « Programmer », « Maintenant » deja coche.
@@ -626,6 +683,7 @@ class _Flow:
         if current != wanted:  # deja la bonne visibilite (« Tout le monde » par defaut) : aucun clic
             self.click("visibility_dropdown")
             self.click("visibility_" + str(self.settings["visibility"]))
+        self.apply_options()
 
         effective, note = schedule_at, None
         if mode == "scheduled":
@@ -799,13 +857,14 @@ def publish(
     clip: dict[str, Any], account: str, *, mode: str | None = None, schedule_at: datetime | None = None,
     config: Config | None = None, now: datetime | None = None, selectors: dict[str, Any] | None = None,
     opener: Opener | None = None, sleep: Callable[[float], None] = time.sleep, rng: Any = None,
-    on_tick: Callable[[], None] | None = None,
+    on_tick: Callable[[], None] | None = None, options: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Publie ``clip`` ({video_path, caption, hashtags}) sur le compte, ``mode`` ``immediate``
+    """Publie ``clip`` ({video_path, caption, hashtags}) sur le compte, avec les reglages ``options`` de ce post
+    (visibilite, commentaires, reutilisation, contenu IA, verification de contenu ; sinon ceux de [tiktok]), ``mode`` ``immediate``
     ou ``scheduled`` (date ``schedule_at``, programmation cote TikTok). Rend
     ``{post_url, post_id, state, publish_at, note}`` ; leve ``TikTokError`` (reglage, date,
     clip), ``TikTokStop`` (R4) ou ``BrowserError`` (Chrome/Playwright absent)."""
-    settings = get_settings(config)
+    settings = post_settings(get_settings(config), options)
     backend = _BACKENDS[settings["backend"]]()
     mode = mode if mode is not None else str(settings["publish_mode"])
     if not account:

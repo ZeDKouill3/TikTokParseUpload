@@ -69,6 +69,14 @@ advanced_settings = "[data-e2e='advanced_settings_container']"
 visibility_dropdown = "[data-e2e='video_visibility_container'] button[role='combobox']"
 visibility_public = "div[role='option'].Select__item[id$='option-\"0\"'], div[role='option']:has-text('Tout le monde')"
 visibility_private = "div[role='option'].Select__item[id$='option-\"1\"'], div[role='option']:has-text('Toi uniquement')"
+visibility_friends = "div[role='option'].Select__item[id$='option-\"2\"'], div[role='option']:has-text('Ami(e)s')"
+# Reglages par post (SPEC-1ed3 R2), releves en reel le 2026-10-01 (FR) : ces blocs n'apparaissent qu'apres
+# « Afficher plus ». « Autoriser les utilisateurs a » : deux cases input.Checkbox__input (« Commentaire »,
+# « Reutilisation du contenu ») ; « Contenu genere par IA » : un interrupteur input[role='switch'].
+# Chaque case est visee par le libelle le plus proche (comme content_check_switch), jamais par position.
+comment_switch = "[data-e2e='user_perm_container'] >> text=\"Commentaire\" >> xpath=ancestor::div[.//input[contains(@class,'Checkbox__input')]][1]//input[contains(@class,'Checkbox__input')]"
+reuse_switch = "[data-e2e='user_perm_container'] >> text=\"Réutilisation du contenu\" >> xpath=ancestor::div[.//input[contains(@class,'Checkbox__input')]][1]//input[contains(@class,'Checkbox__input')]"
+ai_switch = "[data-e2e='aigc_container'] >> text=\"Contenu généré par IA\" >> xpath=ancestor::div[.//input[@role='switch']][1]//input[@role='switch']"
 # Quand publier : deux radios aux ids aleatoires, vises par libelle.
 schedule_now = "[data-e2e='schedule_container'] label:has-text('Maintenant'), [data-e2e='schedule_container'] [role='radio']:has-text('Maintenant')"
 # Bouton radio dans un libelle (Maintenant / Programmer) : coche ou grise (video privee).
@@ -109,6 +117,7 @@ post_scheduled = "Programmer"
 # Texte affiche par le menu de visibilite pour chaque choix : deja affiche = aucun clic.
 visibility_public = "Tout le monde"
 visibility_private = "Toi uniquement"
+visibility_friends = "Ami(e)s"
 
 [continue_publish]
 # Fenetre « Continuer a publier ? » (verification de contenu encore en cours) : fragment de son texte

@@ -5127,3 +5127,274 @@ def test_every_static_javascript_file_parses():
         if run.returncode != 0:
             bad.append(f"{f.name}: {run.stderr.strip().splitlines()[-1] if run.stderr.strip() else run.returncode}")
     assert not bad, bad
+
+
+# --------------------------------------------------------------------------
+# SPEC-1ed3 : publication pilotee depuis l'ecran Publication (API + ecran)
+# --------------------------------------------------------------------------
+
+from datetime import datetime as _dt, timedelta as _td, timezone as _tz  # noqa: E402
+
+
+def _pub_client(tmp_path, **tiktok_settings) -> TestClient:
+    config = Config(mode="review", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output",
+                    _sections={"tiktok": {"max_posts_per_day": 5, "min_gap_minutes": 0, **tiktok_settings}})
+    return TestClient(create_app(config=config))
+
+
+def _publications_setup(tmp_path, *, ready=(READY, SPARE), slots=False):
+    _publish_setup(tmp_path, slots=slots)
+    _accounts_state(tmp_path, ready=ready)
+
+
+def _soon(**kw) -> str:
+    return (_dt.now(_tz.utc) + _td(**kw)).replace(microsecond=0).isoformat()
+
+
+def _publications(tmp_path, c=None):
+    return (c or _pub_client(tmp_path)).get("/api/publications").json()["publications"]
+
+
+def test_creating_a_post_now_approves_implicitly_and_records_account_mode_and_settings(tmp_path, isolated_cwd):
+    _publications_setup(tmp_path)
+    options = {"visibility": "friends", "allow_comments": False, "allow_reuse": True, "ai_generated": True,
+               "content_check": "wait"}
+
+    resp = _pub_client(tmp_path).post("/api/publications", json={
+        "video_id": CLIPS_VIDEO, "clip_id": "01", "account": SPARE, "mode": "immediate", "options": options})
+
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["publish_status"] == "scheduled" and body["account"] == SPARE and body["publish_mode"] == "immediate"
+    entry = json.loads((tmp_path / "state" / "publish" / "ma_chaine.json").read_text(encoding="utf-8"))[0]
+    assert entry["post_options"] == options and entry["slot_at"] is not None  # due tout de suite, sans creneau de chaine
+    clips = {c["clip_id"]: c for c in client(tmp_path).get("/api/clips", params={"video_id": CLIPS_VIDEO}).json()}
+    assert clips["01"]["publish_status"] == "scheduled"  # plus « a valider » : approuve par le formulaire
+
+
+def test_creating_a_scheduled_post_keeps_the_date(tmp_path, isolated_cwd):
+    _publications_setup(tmp_path)
+    when = _soon(days=3)
+
+    resp = _pub_client(tmp_path).post("/api/publications", json={
+        "video_id": CLIPS_VIDEO, "clip_id": "01", "account": READY, "mode": "scheduled", "publish_at": when})
+
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["slot_at"] == when and resp.json()["publish_mode"] == "scheduled"
+
+
+def test_a_video_without_channel_is_publishable_through_the_form(tmp_path, isolated_cwd):
+    _publications_setup(tmp_path)
+    _write_state(tmp_path, "nochannel001")
+    _write_clip(tmp_path, "nochannel001", {**_clip_sidecar("01"), "video_id": "nochannel001"})
+
+    resp = _pub_client(tmp_path).post("/api/publications", json={
+        "video_id": "nochannel001", "clip_id": "01", "account": READY, "mode": "immediate"})
+
+    assert resp.status_code == 201, resp.text
+    assert (tmp_path / "state" / "publish" / "_sans_chaine.json").is_file()
+    clips = {c["video_id"]: c for c in client(tmp_path).get("/api/clips", params={"video_id": "nochannel001"}).json()}
+    assert clips["nochannel001"]["publish_status"] == "scheduled" and clips["nochannel001"]["account"] == READY
+
+
+def test_private_and_scheduled_is_refused_in_french(tmp_path, isolated_cwd):
+    _publications_setup(tmp_path)
+
+    resp = _pub_client(tmp_path).post("/api/publications", json={
+        "video_id": CLIPS_VIDEO, "clip_id": "01", "account": READY, "mode": "scheduled", "publish_at": _soon(days=3),
+        "options": {"visibility": "private"}})
+
+    assert resp.status_code == 409 and "privée" in resp.json()["detail"]
+    assert _publications(tmp_path) == []
+
+
+def test_a_daily_cap_overrun_is_refused_with_the_reason_and_the_next_possible_time(tmp_path, isolated_cwd):
+    _publications_setup(tmp_path)
+    c = _pub_client(tmp_path, max_posts_per_day=1, min_gap_minutes=0)
+    assert c.post("/api/publications", json={
+        "video_id": CLIPS_VIDEO, "clip_id": "01", "account": READY, "mode": "immediate"}).status_code == 201
+
+    resp = c.post("/api/publications", json={
+        "video_id": CLIPS_VIDEO, "clip_id": "03", "account": READY, "mode": "immediate"})
+
+    assert resp.status_code == 409
+    assert "plafond de 1 publication" in resp.json()["detail"] and "prochaine heure possible" in resp.json()["detail"]
+    next_at = _dt.fromisoformat(resp.json()["next_at"])
+    assert next_at > _dt.now(_tz.utc)
+    assert [p["clip_id"] for p in _publications(tmp_path, c)] == ["01"]  # rien n'est ecrit
+    ok = c.post("/api/publications", json={
+        "video_id": CLIPS_VIDEO, "clip_id": "03", "account": READY, "mode": "scheduled",
+        "publish_at": next_at.isoformat()})
+    assert ok.status_code == 201, ok.text
+
+
+def test_an_account_not_ready_or_unknown_is_refused(tmp_path, isolated_cwd):
+    _publications_setup(tmp_path, ready=(READY,))
+    c = _pub_client(tmp_path)
+
+    for account in (SPARE, "zzzzzz"):
+        resp = c.post("/api/publications", json={
+            "video_id": CLIPS_VIDEO, "clip_id": "01", "account": account, "mode": "immediate"})
+        assert resp.status_code == 409
+    assert _publications(tmp_path) == []
+
+
+@pytest.mark.parametrize("body, status", [
+    ({"clip_id": "01", "account": READY, "mode": "immediate"}, 422),
+    ({"video_id": CLIPS_VIDEO, "clip_id": "../x", "account": READY, "mode": "immediate"}, 400),
+    ({"video_id": CLIPS_VIDEO, "clip_id": "01", "account": READY, "mode": "demain"}, 409),
+    ({"video_id": CLIPS_VIDEO, "clip_id": "01", "account": READY, "mode": "scheduled"}, 409),
+    ({"video_id": CLIPS_VIDEO, "clip_id": "01", "account": READY, "mode": "scheduled", "publish_at": "demain"}, 422),
+    ({"video_id": CLIPS_VIDEO, "clip_id": "01", "account": READY, "mode": "scheduled", "publish_at": "2030-01-01T10:00:00"}, 422),
+    ({"video_id": CLIPS_VIDEO, "clip_id": "99", "account": READY, "mode": "immediate"}, 409),
+    ({"video_id": CLIPS_VIDEO, "clip_id": "01", "account": READY, "mode": "immediate", "options": {"visibility": "x"}}, 409),
+])
+def test_invalid_publication_requests_are_refused(tmp_path, isolated_cwd, body, status):
+    _publications_setup(tmp_path)
+
+    resp = _pub_client(tmp_path).post("/api/publications", json=body)
+
+    assert resp.status_code == status, resp.text
+    assert _publications(tmp_path) == []
+
+
+def test_a_publication_can_be_edited_until_it_is_in_progress_or_published(tmp_path, isolated_cwd):
+    _publications_setup(tmp_path)
+    c = _pub_client(tmp_path)
+    c.post("/api/publications", json={"video_id": CLIPS_VIDEO, "clip_id": "01", "account": READY, "mode": "immediate"})
+    when = _soon(days=4)
+
+    resp = c.patch(f"/api/publications/{CLIPS_VIDEO}/01", json={
+        "account": SPARE, "mode": "scheduled", "publish_at": when, "options": {"ai_generated": True},
+        "description": "Nouvelle description", "hashtags": ["#a"]})
+
+    assert resp.status_code == 200, resp.text
+    row = _publications(tmp_path, c)[0]
+    assert (row["account"], row["publish_mode"], row["slot_at"]) == (SPARE, "scheduled", when)
+    assert row["post_options"] == {"ai_generated": True} and row["description"] == "Nouvelle description"
+    assert row["editable"] is True
+
+    path = tmp_path / "state" / "publish" / "ma_chaine.json"
+    entries = json.loads(path.read_text(encoding="utf-8"))
+    entries[0]["in_progress_since"] = _soon()
+    path.write_text(json.dumps(entries), encoding="utf-8")
+    assert c.patch(f"/api/publications/{CLIPS_VIDEO}/01", json={"account": READY}).status_code == 409
+    assert c.delete(f"/api/publications/{CLIPS_VIDEO}/01").status_code == 409
+    assert _publications(tmp_path, c)[0]["tiktok_status"] == "in_progress" and _publications(tmp_path, c)[0]["editable"] is False
+
+
+def test_a_publication_can_be_cancelled_and_the_clip_is_to_validate_again(tmp_path, isolated_cwd):
+    _publications_setup(tmp_path)
+    c = _pub_client(tmp_path)
+    c.post("/api/publications", json={"video_id": CLIPS_VIDEO, "clip_id": "01", "account": READY, "mode": "immediate"})
+
+    resp = c.delete(f"/api/publications/{CLIPS_VIDEO}/01")
+
+    assert resp.status_code == 204
+    assert _publications(tmp_path, c) == []
+    clips = {x["clip_id"]: x for x in client(tmp_path).get("/api/clips", params={"video_id": CLIPS_VIDEO}).json()}
+    assert clips["01"]["publish_status"] == "à valider"
+    assert c.delete(f"/api/publications/{CLIPS_VIDEO}/01").status_code == 409
+
+
+def test_a_published_publication_cannot_be_edited_or_cancelled(tmp_path, isolated_cwd):
+    _publications_setup(tmp_path)
+    _write_publish(tmp_path, "ma_chaine", [_entry("01", "published", published_at="2026-10-01T10:00:00+00:00",
+                                                  account=READY, post_url="https://exemple.invalid/video/1")])
+    c = _pub_client(tmp_path)
+
+    assert c.patch(f"/api/publications/{CLIPS_VIDEO}/01", json={"account": SPARE}).status_code == 409
+    assert c.delete(f"/api/publications/{CLIPS_VIDEO}/01").status_code == 409
+    assert _publications(tmp_path, c)[0]["editable"] is False
+
+
+def test_the_list_shows_the_status_of_each_entry(tmp_path, isolated_cwd):
+    _publications_setup(tmp_path)
+    _write_publish(tmp_path, "ma_chaine", [
+        _entry("01", "scheduled", slot_at=_soon(hours=1), account=READY, publish_mode="immediate"),
+        _entry("03", "scheduled", slot_at=_soon(hours=2), account=READY, in_progress_since=_soon()),
+        _entry("04", "published", account=READY, tiktok_state="scheduled_on_tiktok",
+               tiktok_publish_at=_soon(days=2)),
+        _entry("05", "published", account=READY, post_url="https://exemple.invalid/video/1"),
+        _entry("06", "failed", account=READY, error="captcha détecté", capture=str(tmp_path / "x.png")),
+        _entry("02", "rejected"),
+    ])
+
+    rows = {p["clip_id"]: p for p in _publications(tmp_path)}
+
+    assert {k: v["tiktok_status"] for k, v in rows.items()} == {
+        "01": "pending", "03": "in_progress", "04": "scheduled_on_tiktok", "05": "published", "06": "failed"}
+    assert rows["05"]["post_url"] == "https://exemple.invalid/video/1"
+    assert rows["06"]["publish_error"] == "captcha détecté" and rows["06"]["capture_url"]
+    assert rows["01"]["thumbnail_url"] and rows["01"]["screen_title"] == "Titre 01" and rows["01"]["score"] == 80.0
+
+
+def test_the_list_carries_the_defaults_of_the_form_and_the_ready_accounts(tmp_path, isolated_cwd):
+    _publications_setup(tmp_path, ready=(READY,))
+
+    data = _pub_client(tmp_path, visibility="friends", allow_comments=False).get("/api/publications").json()
+
+    assert data["defaults"]["options"] == {"visibility": "friends", "allow_comments": False, "allow_reuse": True,
+                                           "ai_generated": False, "content_check": "off"}
+    assert data["defaults"]["schedule_max_days"] == 10 and data["defaults"]["schedule_min_minutes"] == 15
+    assert [a["id"] for a in data["accounts"] if a["ready_to_publish"]] == [READY]
+
+
+def test_a_failed_entry_of_a_video_without_channel_can_be_retried_and_shows_its_capture(tmp_path, isolated_cwd):
+    _publications_setup(tmp_path)
+    _write_state(tmp_path, "nochannel001")
+    _write_clip(tmp_path, "nochannel001", {**_clip_sidecar("01"), "video_id": "nochannel001"})
+    capture = tmp_path / "state" / "browser" / READY / "captures" / "x-captcha.png"
+    capture.parent.mkdir(parents=True)
+    capture.write_bytes(b"\x89PNG")
+    _write_publish(tmp_path, "_sans_chaine", [
+        _entry("01", "failed", video_id="nochannel001", account=READY, slot_at=_soon(), error="captcha détecté",
+               capture=str(capture))])
+    c = _pub_client(tmp_path)
+
+    assert c.get("/api/publish/nochannel001/01/capture").status_code in (200, 404)  # route atteinte sans 409 « chaine »
+    resp = c.post("/api/publish/nochannel001/01/retry")
+
+    assert resp.status_code == 200 and resp.json()["status"] == "scheduled"
+
+
+def test_publication_form_markup_and_wiring_are_in_the_publish_screen():
+    js = (STATIC / "screens" / "publish.js").read_text(encoding="utf-8")
+
+    assert "Nouvelle publication" in js and "data-pub-new" in js and "pubOpenForm" in js
+    assert "/api/publications" in js and '"POST"' in js and "next_at" in js
+    for marker in ("pub-form-search", "pub-form-video", "pub-form-channel", "pub-form-account", "pub-form-when",
+                   "pub-form-at", "pub-form-caption", "pub-form-tags", "pub-form-visibility", "pub-form-comments",
+                   "pub-form-reuse", "pub-form-ai", "pub-form-check"):
+        assert marker in js, marker
+    assert "Maintenant" in js and "Programmer" in js and "score" in js and "thumbnail_url" in js
+    assert "Contenu généré par IA" in js and "Vérification de contenu" in js and "Toi uniquement" in js
+    # le statut de chaque entree, modifiable / annulable
+    for label in ("En attente", "En cours", "Programmée sur TikTok", "Publiée", "Échec"):
+        assert label in js, label
+    assert "in_progress" in js and "capture_url" in js and "post_url" in js and '"DELETE"' in js and '"PATCH"' in js
+
+
+def test_clips_screen_publish_now_opens_the_prefilled_form():
+    js = (STATIC / "screens" / "clips.js").read_text(encoding="utf-8")
+
+    assert "Publier maintenant" in js and "data-publish-now" in js and "pubOpenForm" in js
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node absent du PATH")
+def test_the_form_lists_only_clips_to_validate_or_approved_newest_first():
+    js = (STATIC / "screens" / "publish.js").read_text(encoding="utf-8")
+    start = js.index("const pubKey")
+    start_key = js[start:js.index("\n", start) + 1]
+    fn = js[js.index("function pubFormClips"):js.index("\n}\n", js.index("function pubFormClips")) + 3]
+    clips = [
+        {"video_id": "v1", "clip_id": "01", "ready": True, "publish_status": "à valider", "created_at": "2026-09-30T10:00:00"},
+        {"video_id": "v1", "clip_id": "02", "ready": True, "publish_status": "rejected", "created_at": "2026-10-01T10:00:00"},
+        {"video_id": "v2", "clip_id": "01", "ready": True, "publish_status": "approved", "created_at": "2026-10-01T09:00:00"},
+        {"video_id": "v2", "clip_id": "02", "ready": True, "publish_status": "published", "created_at": "2026-10-01T12:00:00"},
+        {"video_id": "v2", "clip_id": "03", "ready": True, "publish_status": "scheduled", "created_at": "2026-10-01T13:00:00"},
+        {"video_id": "v3", "clip_id": "01", "ready": False, "publish_status": "not_ready", "created_at": "2026-10-02T10:00:00"},
+    ]
+    script = start_key + fn + f"\nconsole.log(JSON.stringify(pubFormClips({json.dumps(clips)}).map(pubKey)));"
+    out = subprocess.run(["node", "-e", script], capture_output=True, text=True, check=True).stdout
+    assert json.loads(out) == ["v2/01", "v1/01"]  # plus recents en haut ; ni refuses, ni publies, ni deja en file

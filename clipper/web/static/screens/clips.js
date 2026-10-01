@@ -166,6 +166,7 @@ function clipDrawerHtml(c) {
       </div>
     </div>
     <div class="drawer-foot">
+      ${c.publish_status === "à valider" || c.publish_status === "approved" ? `<button type="button" class="btn btn-primary" data-publish-now>${icon("send")}Publier maintenant</button>` : ""}
       <button type="button" class="btn btn-ok" data-approve>${icon("check")}Approuver</button>
       <button type="button" class="btn btn-bad" data-reject>${icon("x")}Refuser</button>
       <button type="button" class="btn" data-rerender>${icon("refresh-cw")}Re-rendre</button>
@@ -240,6 +241,9 @@ async function openClipDrawer(key) {
       } catch (err) { toastError("Impossible de relancer le rendu", err); }
     };
     clipFillAccounts(c, d);
+    const now = $("[data-publish-now]", d);
+    // « Publier maintenant » ouvre le formulaire de l'ecran Publication, prerempli avec ce clip (SPEC-1ed3 R5)
+    if (now) now.onclick = () => { closeLayer(); setTimeout(() => pubOpenForm({ video_id: c.video_id, clip_id: c.clip_id }), 340); };
     $("[data-approve]", d).onclick = async () => {
       const chosen = $("#clip-account", d).value; // vide : le compte de la chaîne (peut ne pas être prêt : le clip attend)
       try {

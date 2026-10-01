@@ -14,7 +14,7 @@ const PUB_STATUS = {
 };
 // Statut TikTok d'une publication (SPEC-9225 R3, R4), calcule par l'API : prime sur le statut de la file.
 const PUB_TIKTOK = {
-  pending: { label: "En attente", cls: "pending" }, scheduled_on_tiktok: { label: "Programmée sur TikTok", cls: "info" },
+  pending: { label: "En attente", cls: "pending" }, in_progress: { label: "En cours", cls: "info" }, scheduled_on_tiktok: { label: "Programmée sur TikTok", cls: "info" },
   published: { label: "Publiée", cls: "ok" }, failed: { label: "Échec", cls: "bad" },
 };
 const PUB_STALE_MS = 4000;
@@ -24,8 +24,12 @@ const pubEnc = encodeURIComponent;
 
 const pubUi = { channel: "", week: "", key: "", data: null, error: null, loading: null, dirty: false, at: 0, html: "", dragKey: null, touching: false, landed: null };
 
+// Publications pilotees (SPEC-1ed3) : GET /api/publications, independantes de la chaine choisie.
+const pubPosts = { data: null, error: null, loading: null, dirty: false, at: 0 };
+
 const pubAccountLabel = (id) => {
-  const found = pubUi.data && (pubUi.data.accounts || []).find((a) => a.id === id);
+  const accounts = [...((pubUi.data && pubUi.data.accounts) || []), ...((pubPosts.data && pubPosts.data.accounts) || [])];
+  const found = accounts.find((a) => a.id === id);
   return found ? (found.label || id) : id;
 };
 const pubKey = (c) => `${c.video_id}/${c.clip_id}`;
@@ -76,10 +80,32 @@ function pubLoad() {
   return pubUi.loading;
 }
 
-// Un evenement publish / video / queue rend la semaine obsolete (le serveur reste la source).
+function pubPostsLoad() {
+  if (pubPosts.loading) { pubPosts.dirty = true; return pubPosts.loading; }
+  pubPosts.loading = (async () => {
+    try {
+      pubPosts.data = await api("/api/publications");
+      pubPosts.error = null;
+    } catch (err) {
+      pubPosts.error = err;
+    } finally {
+      pubPosts.loading = null;
+      pubPosts.at = Date.now();
+    }
+    if (currentScreen === "publish") renderCurrent();
+    if (pubPosts.dirty) { pubPosts.dirty = false; pubPostsLoad(); }
+  })();
+  return pubPosts.loading;
+}
+
+// Un evenement publish / video / queue rend la semaine et la liste obsoletes (le serveur reste la source).
 document.addEventListener("clipper:event", () => {
   pubUi.at = 0;
-  if (currentScreen === "publish" && pubUi.channel && !pubUi.dragKey) pubLoad();
+  pubPosts.at = 0;
+  if (currentScreen === "publish" && !pubUi.dragKey) {
+    if (pubUi.channel) pubLoad();
+    pubPostsLoad();
+  }
 });
 
 /* ---------- Rendu ---------- */
@@ -163,11 +189,221 @@ function pubView(body, channels) {
       <div class="grid g-side pub-grid" style="align-items:start"><div class="stack">${pubQueue(d)}</div>
       <div class="stack"><section>${d.slots.length ? pubCalendar(d) : `<p class="reason">${esc(d.reason || "Aucun créneau cette semaine.")}</p>`}</section>${pubDone(d)}</div></div>`;
   }
-  const html = `<div class="pub-pad">${pubToolbar(channels, d)}${content}</div>`;
+  const html = `<div class="pub-pad">${pubPostsSection()}${pubToolbar(channels, d)}${content}</div>`;
   if (pubUi.html === html && body.childElementCount) return false; // rien de change : on garde les vignettes et le survol
   pubUi.html = html;
   body.innerHTML = html;
   return true;
+}
+
+
+/* ---------- Publications pilotees : liste, statuts, modifier / annuler (SPEC-1ed3 R5) ---------- */
+
+const pubWhen = (iso) => new Date(iso).toLocaleString("fr-FR", { weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+const pubPostChip = (p) => {
+  const s = p.waiting_reason ? { label: "En attente du compte", cls: "warn" } : (PUB_TIKTOK[p.tiktok_status] || { label: p.publish_status, cls: "pending" });
+  return `<span class="chip ${s.cls}">${esc(s.label)}</span>`;
+};
+
+function pubPostRow(p) {
+  const mode = p.publish_mode === "scheduled" ? "programmée" : "maintenant";
+  const when = p.tiktok_publish_at ? `en ligne le ${pubWhen(p.tiktok_publish_at)}` : (p.slot_at ? `${mode} · ${pubWhen(p.slot_at)}` : "");
+  const detail = [when, p.account ? pubAccountLabel(p.account) : "", p.channel || "sans chaîne"].filter(Boolean).join(" · ");
+  return `<div class="list-item pub-post-row" data-pub-row="${esc(pubKey(p))}">
+    <div class="mini-clip">${p.thumbnail_url ? `<img loading="lazy" decoding="async" width="36" height="64" src="${esc(p.thumbnail_url)}" alt="">` : ""}</div>
+    <div class="li-main grow"><div class="li-title">${esc(pubTitle(p))}</div>
+      <div class="li-sub muted">${esc(detail)}</div>
+      ${p.waiting_reason ? `<div class="li-sub warn" data-waiting-reason>${esc(p.waiting_reason)}</div>` : ""}
+      ${p.publish_error ? `<div class="li-sub bad">Échec : ${esc(p.publish_error)}</div>` : ""}
+      ${p.postponed_reason ? `<div class="li-sub muted">${esc(p.postponed_reason)}</div>` : ""}
+      ${p.capture_url ? `<a href="${esc(p.capture_url)}" target="_blank" rel="noopener">voir la capture d'écran</a>` : ""}
+      ${p.post_url ? `<a href="${esc(p.post_url)}" target="_blank" rel="noopener">voir sur TikTok</a>` : ""}
+      ${p.tiktok_status === "scheduled_on_tiktok" && !p.post_url ? `<span class="muted">programmée sur TikTok${p.post_note ? ` : ${esc(p.post_note)}` : ""}</span>` : ""}</div>
+    ${pubPostChip(p)}
+    <div class="row" style="gap:6px">
+      ${p.publish_status === "failed" ? `<button type="button" class="btn btn-xs btn-primary" data-pub-retry>Réessayer</button>` : ""}
+      ${p.editable ? `<button type="button" class="btn btn-xs" data-pub-edit>Modifier</button><button type="button" class="btn btn-xs btn-ghost" data-pub-cancel>Annuler</button>` : ""}
+    </div></div>`;
+}
+
+function pubPostsSection() {
+  const head = `<div class="section-title">${icon("send")}Publications <span class="more">${pubPosts.data ? pubPosts.data.publications.length || "" : ""}</span>
+    <span class="grow"></span><button type="button" class="btn btn-primary btn-xs" data-pub-new>${icon("plus", "i-xs")}Nouvelle publication</button></div>`;
+  if (pubPosts.error) return `<section>${head}<p class="reason bad">Chargement impossible : ${esc(pubPosts.error.message || pubPosts.error)}</p></section>`;
+  if (!pubPosts.data) return `<section>${head}<div class="skeleton skeleton-line"></div></section>`;
+  const rows = pubPosts.data.publications;
+  return `<section>${head}${rows.length ? `<div class="panel" id="pub-posts">${rows.map(pubPostRow).join("")}</div>`
+    : `<p class="muted" style="font-size:13px">Aucune publication : « Nouvelle publication » choisit un clip, le compte, maintenant ou à une date.</p>`}</section>`;
+}
+
+async function pubPostCancel(p) {
+  const ok = await confirmDialog({ title: "Annuler cette publication ?", body: `« ${pubTitle(p)} » ne sera pas publié ; le clip redevient « à valider ».`, confirmLabel: "Annuler la publication" });
+  if (!ok) return;
+  try {
+    await api(`/api/publications/${pubEnc(p.video_id)}/${pubEnc(p.clip_id)}`, { method: "DELETE" });
+    toast({ kind: "warn", title: "Publication annulée", body: pubTitle(p), ms: 2600 });
+  } catch (err) { toastError("Impossible d'annuler la publication", err); }
+  pubPosts.at = 0;
+  pubPostsLoad();
+}
+
+/* ---------- Formulaire « Nouvelle publication » (SPEC-1ed3 R1, R2) ---------- */
+
+const PUB_VISIBILITIES = [["public", "Tout le monde"], ["friends", "Ami(e)s"], ["private", "Toi uniquement"]];
+const PUB_CHECKS = [["off", "Désactivée (rapide)"], ["wait", "Attendre le résultat (~10 min)"]];
+const pubLocalInput = (iso) => { const d = new Date(iso); const p = (n) => String(n).padStart(2, "0"); return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`; };
+
+function pubFormClips(clips) {
+  return clips.filter((c) => c.ready && (c.publish_status === "à valider" || c.publish_status === "approved"))
+    .sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")) || pubKey(b).localeCompare(pubKey(a)));
+}
+
+function pubFormHtml(f) {
+  const videos = Array.from(new Set(f.clips.map((c) => c.video_id)));
+  const channels = Array.from(new Set(f.clips.map((c) => c.channel || ""))).sort();
+  const ready = f.accounts.filter((a) => a.ready_to_publish);
+  const o = f.options;
+  const editing = Boolean(f.edit);
+  return `
+    <div class="modal-head"><h2>${editing ? "Modifier la publication" : "Nouvelle publication"}</h2>
+      <p class="muted" style="margin-top:4px">Valider approuve le clip et le met en file : aucun créneau de chaîne n'est nécessaire.</p></div>
+    <div class="modal-body stack" style="gap:16px">
+      ${editing ? "" : `<div class="field"><span class="field-label">Clip</span>
+        <div class="row wrap" style="gap:8px">
+          <input class="input" id="pub-form-search" type="search" placeholder="Rechercher (titre, description, identifiant)" aria-label="Rechercher un clip" style="flex:1 1 220px">
+          <select class="input" id="pub-form-video" aria-label="Filtrer par vidéo"><option value="">Toutes les vidéos</option>${videos.map((v) => `<option value="${esc(v)}">${esc(v)}</option>`).join("")}</select>
+          <select class="input" id="pub-form-channel" aria-label="Filtrer par chaîne"><option value="">Toutes les chaînes</option>${channels.map((ch) => `<option value="${esc(ch)}">${esc(ch || "sans chaîne")}</option>`).join("")}</select></div>
+        <div class="pubf-clips" id="pub-form-clips" role="listbox" aria-label="Clips à publier"></div></div>`}
+      <div class="field"><label for="pub-form-account">Compte</label>
+        <select class="input" id="pub-form-account">${ready.length ? ready.map((a) => `<option value="${esc(a.id)}">${esc(a.label || a.id)}</option>`).join("") : `<option value="">Aucun compte prêt à publier</option>`}</select>
+        <span class="hint">Seuls les comptes « prêts à publier » (écran Comptes) sont proposés ; prérempli avec le compte de la chaîne.</span></div>
+      <div class="field"><span class="field-label">Quand</span>
+        <div class="row wrap" style="gap:16px">
+          <label class="row" style="gap:6px"><input type="radio" name="pub-form-when" value="immediate" id="pub-form-now"${f.mode === "immediate" ? " checked" : ""}> Maintenant</label>
+          <label class="row" style="gap:6px"><input type="radio" name="pub-form-when" value="scheduled" id="pub-form-later"${f.mode === "scheduled" ? " checked" : ""}> Programmer</label>
+          <input class="input" id="pub-form-at" type="datetime-local" aria-label="Date et heure"${f.mode === "scheduled" ? "" : " hidden"} value="${esc(f.at || "")}"></div>
+        <span class="hint">Programmer : TikTok programme la vidéo si la date est entre ${esc(f.minMinutes)} min et ${esc(f.maxDays)} jours ; au-delà, Clipper la garde et la programme le moment venu.</span></div>
+      <div class="field"><label for="pub-form-caption">Légende</label><textarea class="input" id="pub-form-caption" rows="3">${esc(f.caption)}</textarea></div>
+      <div class="field"><label for="pub-form-tags">Hashtags</label><input class="input" id="pub-form-tags" value="${esc(f.tags)}"><span class="hint">Séparés par des espaces.</span></div>
+      <div class="field"><label for="pub-form-visibility">Visibilité</label>
+        <select class="input" id="pub-form-visibility">${PUB_VISIBILITIES.map(([k, l]) => `<option value="${k}"${o.visibility === k ? " selected" : ""}>${esc(l)}</option>`).join("")}</select>
+        <span class="hint">Une vidéo « Toi uniquement » ne peut pas être programmée (règle de TikTok).</span></div>
+      <div class="field"><span class="field-label">Autoriser</span>
+        <label class="row" style="gap:6px"><input type="checkbox" id="pub-form-comments"${o.allow_comments ? " checked" : ""}> Les commentaires</label>
+        <label class="row" style="gap:6px"><input type="checkbox" id="pub-form-reuse"${o.allow_reuse ? " checked" : ""}> La réutilisation du contenu (duo, collage)</label>
+        <label class="row" style="gap:6px"><input type="checkbox" id="pub-form-ai"${o.ai_generated ? " checked" : ""}> Contenu généré par IA (étiquette)</label></div>
+      <div class="field"><label for="pub-form-check">Vérification de contenu</label>
+        <select class="input" id="pub-form-check">${PUB_CHECKS.map(([k, l]) => `<option value="${k}"${o.content_check === k ? " selected" : ""}>${esc(l)}</option>`).join("")}</select></div>
+      <p class="reason bad" id="pub-form-error" hidden role="alert"></p>
+    </div>
+    <div class="modal-foot"><button type="button" class="btn btn-ghost" data-dismiss>Fermer</button><span class="grow"></span>
+      <button type="button" class="btn btn-primary" id="pub-form-submit">${editing ? "Enregistrer" : "Valider et publier"}</button></div>`;
+}
+
+function pubFormClipCards(f, d) {
+  const q = ($("#pub-form-search", d).value || "").trim().toLowerCase();
+  const video = $("#pub-form-video", d).value, channel = $("#pub-form-channel", d).value;
+  const list = f.clips.filter((c) => (!video || c.video_id === video) && (channel === "" ? true : (c.channel || "") === channel)
+    && (!q || [c.screen_title, c.description, c.clip_id, c.video_id].some((t) => String(t || "").toLowerCase().includes(q))));
+  const box = $("#pub-form-clips", d);
+  box.innerHTML = list.length ? list.map((c) => `<button type="button" class="pubf-clip${pubKey(c) === f.selected ? " on" : ""}" role="option" aria-selected="${pubKey(c) === f.selected}" data-pubf-clip="${esc(pubKey(c))}">
+      <span class="mini-clip">${c.thumbnail_url ? `<img loading="lazy" decoding="async" width="36" height="64" src="${esc(c.thumbnail_url)}" alt="">` : ""}</span>
+      <span class="pubf-clip-main"><b>${esc(pubTitle(c))}</b><span class="muted">${esc(c.video_id)} · ${c.channel ? esc(c.channel) : "sans chaîne"}</span></span>
+      <span class="num" title="Score">${c.score != null ? esc(fr(c.score)) : ""}</span></button>`).join("")
+    : `<p class="muted" style="padding:8px">Aucun clip à valider ou approuvé ne correspond.</p>`;
+  $$("[data-pubf-clip]", box).forEach((b) => (b.onclick = () => pubFormSelect(f, d, b.dataset.pubfClip)));
+}
+
+async function pubFormSelect(f, d, key) {
+  f.selected = key;
+  const c = f.clips.find((x) => pubKey(x) === key);
+  if (!c) return;
+  $("#pub-form-caption", d).value = c.description || "";
+  $("#pub-form-tags", d).value = (c.hashtags || []).join(" ");
+  pubFormClipCards(f, d);
+  try {
+    const out = await api(`/api/publish/accounts?channel=${pubEnc(c.channel || "")}`);
+    const pick = $("#pub-form-account", d);
+    const known = f.accounts.find((a) => a.id === out.default && a.ready_to_publish);
+    if (known) pick.value = known.id;
+  } catch (err) { /* pas de compte par defaut : le choix reste a l'utilisateur */ }
+}
+
+function pubFormBody(f, d) {
+  const now = $("#pub-form-now", d).checked;
+  const body = {
+    account: $("#pub-form-account", d).value, mode: now ? "immediate" : "scheduled",
+    description: $("#pub-form-caption", d).value, hashtags: parseHashtags($("#pub-form-tags", d).value),
+    options: {
+      visibility: $("#pub-form-visibility", d).value, allow_comments: $("#pub-form-comments", d).checked,
+      allow_reuse: $("#pub-form-reuse", d).checked, ai_generated: $("#pub-form-ai", d).checked,
+      content_check: $("#pub-form-check", d).value,
+    },
+  };
+  if (!now) {
+    const at = $("#pub-form-at", d).value;
+    body.publish_at = at ? new Date(at).toISOString() : null;
+  }
+  return body;
+}
+
+async function pubFormSubmit(f, d) {
+  const err = $("#pub-form-error", d);
+  err.hidden = true;
+  const body = pubFormBody(f, d);
+  if (!body.account) { err.textContent = "Choisis un compte prêt à publier (écran Comptes)."; err.hidden = false; return; }
+  if (!f.edit && !f.selected) { err.textContent = "Choisis un clip."; err.hidden = false; return; }
+  const [video_id, clip_id] = f.edit ? [f.edit.video_id, f.edit.clip_id] : f.selected.split("/");
+  try {
+    if (f.edit) await api(`/api/publications/${pubEnc(video_id)}/${pubEnc(clip_id)}`, jsonBody("PATCH", body));
+    else await api("/api/publications", jsonBody("POST", Object.assign({ video_id, clip_id }, body)));
+  } catch (e) {
+    err.textContent = e.message || String(e);
+    if (e.body && e.body.next_at) { // plafond depasse : la raison est dite, la prochaine heure possible se prend en un clic
+      const next = e.body.next_at;
+      err.innerHTML = `${esc(e.message)} <button type="button" class="btn btn-xs" id="pub-form-use-next">Programmer à ${esc(pubWhen(next))}</button>`;
+      $("#pub-form-use-next", err).onclick = () => { $("#pub-form-later", d).checked = true; $("#pub-form-at", d).hidden = false; $("#pub-form-at", d).value = pubLocalInput(next); err.hidden = true; };
+    }
+    err.hidden = false;
+    return;
+  }
+  closeLayer();
+  toast({ kind: "ok", title: f.edit ? "Publication modifiée" : (body.mode === "immediate" ? "Publication en file : le worker la publie dès qu'il est libre" : "Publication programmée"), body: f.edit ? pubTitle(f.edit) : "", ms: 3200 });
+  pubPosts.at = 0;
+  pubPostsLoad();
+  if (typeof loadClips === "function") loadClips();
+}
+
+/* ouvre le formulaire ; `preset` { video_id, clip_id } prerempli depuis l'ecran Clips ; `edit` : une publication a modifier */
+async function pubOpenForm(preset, edit) {
+  let clips, data;
+  try {
+    [clips, data] = await Promise.all([api("/api/clips"), api("/api/publications")]);
+  } catch (err) { toastError("Impossible d'ouvrir le formulaire", err); return null; }
+  const base = edit || (preset && clips.find((c) => c.video_id === preset.video_id && c.clip_id === preset.clip_id)) || null;
+  const f = {
+    clips: pubFormClips(clips), accounts: data.accounts, edit: edit || null, selected: base && !edit ? pubKey(base) : "",
+    options: Object.assign({}, data.defaults.options, edit ? edit.post_options : {}),
+    mode: edit && edit.publish_mode === "scheduled" ? "scheduled" : "immediate",
+    at: edit && edit.publish_mode === "scheduled" && edit.slot_at ? pubLocalInput(edit.slot_at) : "",
+    caption: base ? (base.description || "") : "", tags: base ? (base.hashtags || []).join(" ") : "",
+    minMinutes: data.defaults.schedule_min_minutes, maxDays: data.defaults.schedule_max_days,
+  };
+  if (preset && !edit && base && !f.clips.some((c) => pubKey(c) === pubKey(base))) {
+    toastError("Ce clip ne peut pas être publié", new Error("Il n'est ni à valider ni approuvé (refusé, déjà publié ou déjà en file)."));
+    return null;
+  }
+  return openPanel("modal pub-modal pub-form", pubFormHtml(f), (d) => {
+    if (!edit) {
+      ["#pub-form-search"].forEach((s) => ($(s, d).oninput = () => pubFormClipCards(f, d)));
+      ["#pub-form-video", "#pub-form-channel"].forEach((s) => ($(s, d).onchange = () => pubFormClipCards(f, d)));
+      pubFormClipCards(f, d);
+      if (f.selected) pubFormSelect(f, d, f.selected);
+    }
+    if (edit && edit.account) $("#pub-form-account", d).value = edit.account;
+    $$("input[name='pub-form-when']", d).forEach((r) => (r.onchange = () => { $("#pub-form-at", d).hidden = !$("#pub-form-later", d).checked; }));
+    $("#pub-form-submit", d).onclick = () => pubFormSubmit(f, d);
+  });
 }
 
 /* ---------- Actions ---------- */
@@ -229,7 +465,7 @@ async function pubMarkPublished(c) {
 async function pubRetry(c) {
   try {
     await api(`/api/publish/${pubEnc(c.video_id)}/${pubEnc(c.clip_id)}/retry`, { method: "POST" });
-    await pubLoad();
+    if (pubUi.channel) await pubLoad();
     toast({ kind: "info", title: "Publication relancée", body: pubTitle(c), ms: 2600 });
     return true;
   } catch (err) {
@@ -427,6 +663,16 @@ function pubWireTouch(body) {
 }
 
 function pubWire(body) {
+  const fresh = $("[data-pub-new]", body);
+  if (fresh) fresh.onclick = () => pubOpenForm(null);
+  $$("[data-pub-row]", body).forEach((row) => {
+    const p = pubPosts.data.publications.find((x) => pubKey(x) === row.dataset.pubRow);
+    if (!p) return;
+    const edit = $("[data-pub-edit]", row), cancel = $("[data-pub-cancel]", row), retry = $("[data-pub-retry]", row);
+    if (edit) edit.onclick = () => pubOpenForm(null, p);
+    if (cancel) cancel.onclick = () => pubPostCancel(p);
+    if (retry) retry.onclick = async () => { await pubRetry(p); pubPosts.at = 0; pubPostsLoad(); };
+  });
   const sel = $("#pub-channel", body);
   if (sel) sel.onchange = () => { pubUi.channel = sel.value; pubUi.week = ""; pubUi.data = null; pubUi.error = null; pubUi.html = ""; renderCurrent(); };
   $$("[data-week]", body).forEach((b) => (b.onclick = () => {
@@ -456,9 +702,14 @@ Screens.publish = {
       body.innerHTML = `<div class="skeleton skeleton-line"></div><div class="skeleton skeleton-card"></div>`;
       return;
     }
+    if (!pubPosts.data && !pubPosts.loading) pubPostsLoad();
+    else if (Date.now() - pubPosts.at > PUB_STALE_MS) pubPostsLoad();
     if (!channels.length) {
-      pubUi.html = "";
-      body.innerHTML = emptyState("send", "Rien à publier", "Crée une chaîne, par exemple « ma_chaine » : ses clips approuvés apparaîtront ici avec leurs créneaux.");
+      const html = `<div class="pub-pad">${pubPostsSection()}${emptyState("send", "Aucun créneau de chaîne", "Les créneaux de chaîne sont facultatifs (mode auto) : « Nouvelle publication » publie sans chaîne, avec un compte.")}</div>`;
+      if (pubUi.html === html && body.childElementCount) return;
+      pubUi.html = html;
+      body.innerHTML = html;
+      pubWire(body, channels);
       return;
     }
     if (pubUi.dragKey) return; // pas de rendu pendant un glisser-deposer

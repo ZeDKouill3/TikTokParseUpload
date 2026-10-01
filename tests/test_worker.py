@@ -882,11 +882,14 @@ class FakeLogin:
 class FakePublisher:
     """Remplace tiktok.publish : enregistre les appels, rend un resultat ou leve ``error``."""
 
-    def __init__(self, error=None, state="published"):
-        self.calls, self.error, self.state = [], error, state
+    def __init__(self, error=None, state="published", during=None):
+        self.calls, self.error, self.state, self.during = [], error, state, during
 
     def __call__(self, clip, account, *, mode, schedule_at=None, config=None, on_tick=None, **kwargs):
-        self.calls.append({"clip": clip, "account": account, "mode": mode, "schedule_at": schedule_at, "on_tick": on_tick})
+        self.calls.append({"clip": clip, "account": account, "mode": mode, "schedule_at": schedule_at, "on_tick": on_tick,
+                           **kwargs})
+        if self.during is not None:
+            self.during()
         if self.error is not None:
             raise self.error
         scheduled = mode == "scheduled"
@@ -1552,3 +1555,137 @@ def test_a_halt_on_the_chosen_account_does_not_block_the_channel_account(tmp_pat
 
     assert [c["account"] for c in pub.calls] == [OTHER, ACCOUNT]
     assert _entries(tmp_path)[1]["status"] == "published"
+
+
+# --------------------------------------------------------------------------
+# SPEC-1ed3 R4 : publications pilotees depuis l'ecran Publication (entrees manuelles)
+# --------------------------------------------------------------------------
+
+NO_CHANNEL = "_sans_chaine"
+_OPTIONS = {"visibility": "friends", "allow_comments": False, "allow_reuse": True, "ai_generated": True,
+            "content_check": "wait"}
+
+
+def _manual(tmp_path, clip_id, slot_at, *, channel=NO_CHANNEL, mode="immediate", account="ef34ab", options=None,
+            **extra):
+    _seed(tmp_path, channel, clip_id, slot_at, publish_mode=mode, account=account, manual=True,
+          post_options=_OPTIONS if options is None else options, **extra)
+
+
+def test_now_is_due_right_away_for_a_video_without_channel_and_transmits_the_post_options(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    _manual(tmp_path, "01", datetime.now(timezone.utc))
+    pub = FakePublisher()
+
+    _pub_worker(config, pub).tick()
+
+    assert len(pub.calls) == 1
+    call = pub.calls[0]
+    assert (call["account"], call["mode"], call["schedule_at"]) == ("ef34ab", "immediate", None)
+    assert call["options"] == _OPTIONS  # reglages par post transmis a clipper.tiktok
+    entry = _entries(tmp_path, NO_CHANNEL)[0]
+    assert entry["status"] == "published" and entry["post_url"] == LINK and entry["in_progress_since"] is None
+
+
+def test_an_entry_without_post_options_does_not_pass_options(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1))
+    pub = FakePublisher()
+
+    _pub_worker(config, pub).tick()
+
+    assert "options" not in pub.calls[0]
+
+
+def test_the_entry_is_in_progress_while_the_browser_is_driven(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    _manual(tmp_path, "01", datetime.now(timezone.utc))
+    seen = []
+    pub = FakePublisher(during=lambda: seen.append(_entries(tmp_path, NO_CHANNEL)[0].get("in_progress_since")))
+
+    _pub_worker(config, pub).tick()
+
+    assert seen and seen[0]  # « en cours » : ni modifiable ni annulable pendant le pilotage
+
+
+def test_a_failed_publication_clears_in_progress_and_keeps_the_reason(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    _manual(tmp_path, "01", datetime.now(timezone.utc))
+    pub = FakePublisher(error=tiktok.TikTokStop("captcha", "captcha détecté", None))
+
+    _pub_worker(config, pub).tick()
+
+    entry = _entries(tmp_path, NO_CHANNEL)[0]
+    assert entry["status"] == "failed" and entry["error"] == "captcha détecté" and entry["in_progress_since"] is None
+
+
+def test_scheduled_inside_the_tiktok_window_is_scheduled_on_tiktok(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    when = datetime.now(timezone.utc) + timedelta(days=3)
+    _manual(tmp_path, "01", when, mode="scheduled")
+    pub = FakePublisher()
+
+    _pub_worker(config, pub).tick()
+
+    assert [(c["mode"], c["schedule_at"]) for c in pub.calls] == [("scheduled", when)]
+    entry = _entries(tmp_path, NO_CHANNEL)[0]
+    assert entry["status"] == "published" and entry["tiktok_state"] == "scheduled_on_tiktok"
+
+
+def test_scheduled_beyond_the_window_is_kept_then_scheduled_once_the_date_enters_the_window(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch, tiktok_settings={"schedule_max_days": 1})
+    far = datetime.now(timezone.utc) + timedelta(hours=30)
+    _manual(tmp_path, "01", far, mode="scheduled")
+    pub = FakePublisher()
+    w = _pub_worker(config, pub)
+
+    w.tick()
+    assert pub.calls == [] and _entries(tmp_path, NO_CHANNEL)[0]["status"] == "scheduled"  # gardee par Clipper
+
+    # le temps passe : la date entre dans la fenetre de TikTok (24 h)
+    path = tmp_path / "state" / "publish" / f"{NO_CHANNEL}.json"
+    entries = json.loads(path.read_text(encoding="utf-8"))
+    near = datetime.now(timezone.utc) + timedelta(hours=20)
+    entries[0]["slot_at"] = near.isoformat()
+    path.write_text(json.dumps(entries), encoding="utf-8")
+    w.tick()
+
+    assert [(c["mode"], c["schedule_at"]) for c in pub.calls] == [("scheduled", near)]
+    assert _entries(tmp_path, NO_CHANNEL)[0]["tiktok_state"] == "scheduled_on_tiktok"
+
+
+def test_a_manual_entry_over_the_account_cap_waits_with_the_reason_and_is_never_moved(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch, tiktok_settings={"max_posts_per_day": 1, "min_gap_minutes": 0})
+    _seed(tmp_path, "ma_chaine", "00", _ago(seconds=5), status="published", published_at=_ago(seconds=5).isoformat(),
+          account="ef34ab")
+    slot = datetime.now(timezone.utc)
+    _manual(tmp_path, "01", slot)
+    pub = FakePublisher()
+
+    _pub_worker(config, pub).tick()
+
+    assert pub.calls == []
+    entry = _entries(tmp_path, NO_CHANNEL)[0]
+    assert entry["status"] == "scheduled" and entry["slot_at"] == slot.isoformat()  # aucun report silencieux
+    assert "plafond" in entry["waiting_reason"]
+
+
+def test_a_manual_entry_of_an_account_not_ready_is_not_attempted(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    _manual(tmp_path, "01", datetime.now(timezone.utc), account="inconnu")
+    pub = FakePublisher()
+
+    _pub_worker(config, pub).tick()
+
+    assert pub.calls == []
+    assert "inconnu" in _entries(tmp_path, NO_CHANNEL)[0]["waiting_reason"]
+
+
+def test_starting_the_worker_fails_an_entry_left_in_progress(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    _manual(tmp_path, "01", datetime.now(timezone.utc), in_progress_since="2026-10-01T10:00:00+00:00")
+
+    _pub_worker(config, FakePublisher())
+
+    entry = _entries(tmp_path, NO_CHANNEL)[0]
+    assert entry["status"] == "failed" and "interrompue" in entry["error"] and entry["in_progress_since"] is None
