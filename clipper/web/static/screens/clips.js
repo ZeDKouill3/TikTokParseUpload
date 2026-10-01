@@ -1,4 +1,4 @@
-/* Ecran « Clips » (SPEC-c100 E4, SPEC-fc0c §4.5). Lit GET /api/clips ; la galerie
+/* Ecran « Clips » (SPEC-c100 E4, SPEC-74e9 §4.5). Lit GET /api/clips ; la galerie
    9:16 ouvre une fiche (lecteur, sidecar, QA, edition en place). Aucune logique
    video ici : le texte passe par PATCH /api/clips/.../ (publish.edit_caption), le
    titre d'ecran et « Re-rendre » par la file de traitement. Charge apres
@@ -15,7 +15,7 @@ const CLIP_STATUS = {
   failed: { label: "Échec", cls: "bad" }, rejected: { label: "Refusé", cls: "bad" },
   not_ready: { label: "Pas prêt", cls: "pending" }, // rendu ou contrôle qualité pas terminé : ni à valider ni refusé
 };
-// SPEC-fc0c §4.5 : une entree scheduled/published n'est pas editable sans repasser approved.
+// SPEC-74e9 §4.5 : une entree scheduled/published n'est pas editable sans repasser approved.
 const CLIP_LOCKED = ["scheduled", "published"];
 const CLIPS_STALE_MS = 4000;
 const CLIPS_PAGE_SIZE = 24; // la galerie n'affiche que 24 clips a la fois (« Afficher plus »)

@@ -1,4 +1,4 @@
-"""Surveillance des VOD d'une chaine (SPEC-fc0c §5, ADR-4f6e §1 et §3).
+"""Surveillance des VOD d'une chaine (SPEC-74e9 §5, ADR-35b7 §1 et §3).
 
 Bibliotheque, pas une etape (ADR-b16b) : elle liste les VOD de
 ``[channel].source_url`` par yt-dlp en extraction plate (aucun
@@ -152,7 +152,7 @@ def _mark_seen(state: dict[str, Any], video_id: str) -> None:
 
 
 def _queue_vod(url: str, channel: str, config: Config) -> None:
-    """Met la VOD en file ; une VOD deja ``waiting`` (SPEC-fc0c §2.2) est deja
+    """Met la VOD en file ; une VOD deja ``waiting`` (SPEC-74e9 §2.2) est deja
     prise en compte, pas une erreur."""
     try:
         worker.enqueue(url, channel, "run", config=config)
@@ -179,7 +179,7 @@ def check(
     lister: Lister | None = None,
     config: Config | None = None,
 ) -> None:
-    """Un passage de surveillance pour ``channel`` (SPEC-fc0c §5.1-5.4) : liste
+    """Un passage de surveillance pour ``channel`` (SPEC-74e9 §5.1-5.4) : liste
     les VOD de sa ``source_url``, ignore celles plus courtes que
     ``watch_min_duration_s`` et celles deja vues ou en attente, puis met les
     nouvelles en file (mode ``auto``) ou en ``pending`` (mode ``review``).
@@ -270,7 +270,7 @@ def ignore(channel: str, video_id: str, *, config: Config | None = None) -> None
 
 def is_due(channel: str, interval_s: float, now: datetime, *, config: Config | None = None) -> bool:
     """Vrai si la chaine n'a jamais ete verifiee ou si ``checked_at +
-    interval_s`` est passe (SPEC-fc0c §5.1)."""
+    interval_s`` est passe (SPEC-74e9 §5.1)."""
     config = config or load_config()
     checked_at = _read_state(_state_path(channel, config))["checked_at"]
     if checked_at is None:

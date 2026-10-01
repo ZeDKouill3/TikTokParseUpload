@@ -38,7 +38,7 @@ class ChannelError(Exception):
 
 
 # Verrou de fichier inter-processus (stdlib seulement) : le worker et l'API
-# web sont deux processus (ADR-4f6e) qui reecrivent les memes fichiers
+# web sont deux processus (ADR-35b7) qui reecrivent les memes fichiers
 # state/. Un cycle lecture-modification-ecriture se fait sous
 # ``file_lock(path)``, l'ecriture elle-meme par ``atomic_write_json``.
 _REPLACE_ATTEMPTS = 5
@@ -112,7 +112,7 @@ def _validate_name(name: str) -> None:
 def list_channels(presets_dir: str | Path) -> list[str]:
     """Preset names under presets_dir that declare a [channel] table,
     sorted by name. A preset without [channel] stays a valid CLI preset and
-    is skipped, its name never checked (SPEC-fc0c 1.4)."""
+    is skipped, its name never checked (SPEC-74e9 1.4)."""
     names = []
     for path in Path(presets_dir).glob("*.toml"):
         try:
@@ -143,7 +143,7 @@ def load_channel(
 ) -> tuple[Config, dict[str, object]]:
     """The merged Config (preset over base) and the validated [channel]
     dict: display_name defaults to the channel name, mode defaults to the
-    global config mode (SPEC-fc0c 1.3)."""
+    global config mode (SPEC-74e9 1.3)."""
     _validate_name(name)
     path = _preset_path(presets_dir, name)
     if not path.exists():
@@ -177,7 +177,7 @@ def save_channel(
 ) -> None:
     """Serialize data (the full preset, e.g. {"channel": {...}}) and replace
     the preset file, via config.write_config: reread and validated against
-    base first, an invalid file is left intact (SPEC-fc0c 1.5)."""
+    base first, an invalid file is left intact (SPEC-74e9 1.5)."""
     _validate_name(name)
     write_config(_preset_path(presets_dir, name), data, base=base)
 

@@ -316,7 +316,7 @@
     $("[data-log-copy]", view).onclick = () => copyText(state.events.map((e) => `${e.at} ${e.level} ${e.step || ""} ${e.message}`).join("\n"), "Journal");
   }
 
-  /* Relancer : remet cette etape et les suivantes a zero (SPEC-fc0c 3.3). */
+  /* Relancer : remet cette etape et les suivantes a zero (SPEC-74e9 3.3). */
   async function retryFrom(video, step) {
     const after = STEP_ORDER.slice(STEP_ORDER.indexOf(step) + 1).map((n) => STEP_LABELS[n]);
     const ok = await confirmDialog({
