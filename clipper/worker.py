@@ -43,6 +43,24 @@ HEARTBEAT_FILE = "worker.json"
 _STALE_AFTER_BEATS = 3
 
 _CANCEL_REASON = "annulée par l'utilisateur"
+LOG_FILE = "worker.log"
+_LOG_TAIL_LINES = 20
+_LOG_TAIL_CHARS = 2000
+
+
+def log_path(video_id: str, config: Config) -> Path:
+    """Journal de la sortie (stdout + stderr) du processus enfant d'une vidéo :
+    ``workspace/<video_id>/worker.log``, réécrit à chaque lancement."""
+    return Path(config.workspace_dir) / video_id / LOG_FILE
+
+
+def _log_tail(path: Path) -> str:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return f"(journal illisible : {exc})"
+    tail = "\n".join(text.strip().splitlines()[-_LOG_TAIL_LINES:])[-_LOG_TAIL_CHARS:]
+    return tail or "(aucune sortie)"
 
 
 def heartbeat_path(config: Config) -> Path:
@@ -220,9 +238,11 @@ def _pid_alive(pid: int | None) -> bool:
 
 
 def _build_command(entry: dict[str, Any]) -> list[str]:
-    cmd = [sys.executable, "-m", "clipper", entry["action"], entry["url"] if entry["action"] == "run" else entry["video_id"]]
+    # --config est une option globale du parseur : avant la sous-commande.
+    cmd = [sys.executable, "-m", "clipper"]
     if entry.get("channel"):
         cmd += ["--config", f"presets/{entry['channel']}.toml"]
+    cmd += [entry["action"], entry["url"] if entry["action"] == "run" else entry["video_id"]]
     for step in entry.get("force_steps") or []:
         cmd += ["--force-step", step]
     return cmd
@@ -239,12 +259,15 @@ class Worker:
         spawner: Callable[[list[str]], Any] | None = None,
         watch_lister: Callable[[str], list[dict[str, Any]]] | None = None,
     ) -> None:
+        self._popen = None
         if spawner is None:
             import subprocess
 
-            spawner = subprocess.Popen
+            self._popen = subprocess.Popen
         self.config = config or load_config()
         self.spawner = spawner
+        self._log_handle: Any | None = None
+        self._launched_at: datetime | None = None
         self.watch_lister = watch_lister
         self._logged_watch_errors: set[str] = set()
         self._path = _queue_path(self.config)
@@ -338,7 +361,8 @@ class Worker:
             entry = next((e for e in entries if e["status"] == "waiting"), None)
             if entry is None:
                 return False
-            process = self.spawner(_build_command(entry))
+            self._launched_at = datetime.now(timezone.utc)
+            process = self._spawn(entry, _build_command(entry))
             entry["status"] = "running"
             entry["pid"] = process.pid
             _write_queue(self._path, entries)
@@ -346,14 +370,71 @@ class Worker:
         self._entry = entry
         return True
 
+    def _spawn(self, entry: dict[str, Any], cmd: list[str]) -> Any:
+        if self.spawner is not None:
+            return self.spawner(cmd)
+        return self._popen_logged(entry, cmd)
+
+    def _popen_logged(self, entry: dict[str, Any], cmd: list[str]) -> Any:
+        """Lance l'enfant avec stdout et stderr dans son journal (jamais perdus)."""
+        import subprocess
+
+        path = log_path(entry["video_id"], self.config)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(path, "wb")
+        try:
+            process = self._popen(cmd, stdout=handle, stderr=subprocess.STDOUT)
+        except BaseException:
+            handle.close()
+            raise
+        self._log_handle = handle
+        return process
+
+    def _close_log(self) -> None:
+        if self._log_handle is not None:
+            self._log_handle.close()
+            self._log_handle = None
+
+    def _record_child_failure(self, entry: dict[str, Any], code: int) -> None:
+        """L'enfant a quitté avec un code non nul : la vidéo passe ``failed`` dans
+        ``pipeline.json`` (créé au besoin) avec le code et la fin du journal, sauf
+        si l'enfant a lui-même écrit son échec (failed/queued) depuis son lancement
+        (ADR-ad2e : jamais une disparition silencieuse)."""
+        from clipper import pipeline
+
+        video_id = entry["video_id"]
+        try:
+            state = pipeline.load_state(video_id, config=self.config)
+        except pipeline.PipelineError:
+            state = pipeline.new_state(video_id, entry["url"], self.config.mode, channel=entry.get("channel"))
+        else:
+            written = state.get("updated_at")
+            if (state.get("status") in ("failed", "queued") and written
+                    and datetime.fromisoformat(written) >= self._launched_at):
+                log.error("%s : processus enfant terminé avec le code %s (état écrit par l'enfant conservé)", video_id, code)
+                return
+        path = log_path(video_id, self.config)
+        reason = f"le processus enfant s'est terminé avec le code {code} (journal : {path}) : {_log_tail(path)}"
+        state.pop("dismissed_at", None)
+        state.update(status="failed", reason=reason, retry_at=None)
+        pipeline.save_state(state, config=self.config)
+        log.error("%s : %s", video_id, reason)
+
     def _finish_current(self) -> None:
-        video_id = self._entry["video_id"]
-        with _locked(self._path):
-            entries = _read_queue(self._path)
-            entries = [e for e in entries if not (e["video_id"] == video_id and e["status"] == "running")]
-            _write_queue(self._path, entries)
-        self._process = None
-        self._entry = None
+        entry = self._entry
+        video_id = entry["video_id"]
+        self._close_log()
+        code = self._process.poll()
+        try:
+            if code:
+                self._record_child_failure(entry, code)
+        finally:
+            with _locked(self._path):
+                entries = _read_queue(self._path)
+                entries = [e for e in entries if not (e["video_id"] == video_id and e["status"] == "running")]
+                _write_queue(self._path, entries)
+            self._process = None
+            self._entry = None
 
     def _terminate_process(self) -> None:
         self._process.terminate()

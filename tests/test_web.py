@@ -4281,3 +4281,44 @@ def test_video_sheet_shows_the_rubric_used():
     js = (STATIC / "screens" / "videos.js").read_text(encoding="utf-8")
 
     assert "video.rubric" in js and "Grille" in js
+
+
+# --------------------------------------------------------------------------
+# TASK-6a1b : un enfant du worker qui meurt apparait dans Echecs
+# --------------------------------------------------------------------------
+
+
+def test_dashboard_lists_a_video_whose_worker_child_died(tmp_path, isolated_cwd):
+    from clipper import worker
+
+    class _Proc:
+        pid = 4242
+        returncode = None
+
+        def poll(self):
+            return self.returncode
+
+    proc = _Proc()
+    config = make_config(tmp_path)
+
+    def spawner(cmd):
+        log = worker.log_path(VIDEO_ID, config)
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text("clipper: error: unrecognized arguments: --config presets/ma_chaine.toml\n", encoding="utf-8")
+        return proc
+
+    c = client(tmp_path)
+    resp = c.post("/api/queue", json={"url": f"https://youtu.be/{VIDEO_ID}", "channel": None, "action": "run"})
+    assert resp.status_code == 202
+    w = worker.Worker(config=config, spawner=spawner)
+    w.tick()
+    proc.returncode = 2
+    w.tick()
+
+    assert c.get("/api/queue").json() == []
+    failed = c.get("/api/dashboard").json()["failed"]
+    assert [f["video_id"] for f in failed] == [VIDEO_ID]
+    assert "2" in failed[0]["reason"]
+    assert "unrecognized arguments" in failed[0]["reason"]
+    video = c.get(f"/api/videos/{VIDEO_ID}").json()
+    assert video["status"] == "failed"

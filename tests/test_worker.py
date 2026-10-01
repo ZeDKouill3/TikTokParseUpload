@@ -214,8 +214,9 @@ def test_tick_launches_head_entry_with_exact_command_line_run_action(tmp_path):
     w.tick()
 
     assert spawner.calls == [[
-        sys.executable, "-m", "clipper", "run", URL_A,
+        sys.executable, "-m", "clipper",
         "--config", "presets/ma_chaine.toml",
+        "run", URL_A,
         "--force-step", "parts", "--force-step", "render",
     ]]
 
@@ -274,6 +275,186 @@ def test_tick_removes_entry_and_starts_next_once_child_finishes(tmp_path):
     entries = _queue(config)
     assert [e["video_id"] for e in entries] == [VIDEO_B]
     assert len(spawner.calls) == 2
+
+
+# --------------------------------------------------------------------------
+# TASK-6a1b : --config avant la sous-commande ; un enfant en echec reste visible
+# --------------------------------------------------------------------------
+
+
+def _parse_built(entry: dict):
+    from clipper.__main__ import build_parser
+
+    cmd = worker._build_command(entry)
+    assert cmd[:3] == [sys.executable, "-m", "clipper"]
+    return build_parser().parse_args(cmd[3:])
+
+
+def _cmd_entry(action: str = "run", channel: str | None = "ma_chaine", force_steps=None) -> dict:
+    return {
+        "video_id": VIDEO_A, "url": URL_A if action == "run" else VIDEO_A, "channel": channel,
+        "action": action, "force_steps": force_steps or [],
+    }
+
+
+def test_build_command_is_accepted_by_the_real_parser_with_channel(tmp_path):
+    args = _parse_built(_cmd_entry("run", "ma_chaine"))
+    assert (args.config, args.command, args.url) == ("presets/ma_chaine.toml", "run", URL_A)
+
+
+def test_build_command_is_accepted_by_the_real_parser_without_channel(tmp_path):
+    args = _parse_built(_cmd_entry("run", None))
+    assert (args.config, args.command, args.url) == (None, "run", URL_A)
+
+
+def test_build_command_render_with_channel_and_force_step_is_accepted(tmp_path):
+    args = _parse_built(_cmd_entry("render", "ma_chaine", ["parts", "render"]))
+    assert (args.config, args.command, args.video_id) == ("presets/ma_chaine.toml", "render", VIDEO_A)
+    assert args.force_step == ["parts", "render"]
+
+
+def test_build_command_run_without_channel_with_force_step_is_accepted(tmp_path):
+    args = _parse_built(_cmd_entry("run", None, ["parts"]))
+    assert (args.config, args.command, args.url, args.force_step) == (None, "run", URL_A, ["parts"])
+
+
+class _LoggingSpawner(FakeSpawner):
+    """Simule un enfant qui ecrit sa sortie d'erreur dans le journal du worker."""
+
+    def __init__(self, config: Config, output: str):
+        super().__init__()
+        self._config, self._output = config, output
+
+    def __call__(self, cmd):
+        log_path = worker.log_path(VIDEO_A, self._config)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(self._output, encoding="utf-8")
+        return super().__call__(cmd)
+
+
+def _fail_child(config: Config, output: str, code: int = 2, *, queue_second: bool = False):
+    worker.enqueue(URL_A, "ma_chaine", "run", config=config)
+    if queue_second:
+        worker.enqueue(URL_B, None, "run", config=config)
+    spawner = _LoggingSpawner(config, output)
+    w = worker.Worker(config=config, spawner=spawner)
+    w.tick()
+    spawner.process.finish(code)
+    w.tick()
+    return w, spawner
+
+
+def test_failed_child_without_pipeline_state_creates_a_failed_state_with_code_and_stderr_tail(tmp_path):
+    config = _config(tmp_path)
+    output = "ligne 1\n" + "clipper: error: unrecognized arguments: --config presets/ma_chaine.toml\n"
+
+    _fail_child(config, output, code=2)
+
+    state = pipeline.load_state(VIDEO_A, config=config)
+    assert state["status"] == "failed"
+    assert "2" in state["reason"]
+    assert "unrecognized arguments: --config presets/ma_chaine.toml" in state["reason"]
+    assert state["source_url"] == URL_A
+    assert state["channel"] == "ma_chaine"
+    assert _queue(config) == []
+
+
+def test_failed_child_reason_keeps_only_the_end_of_a_long_output(tmp_path):
+    config = _config(tmp_path)
+    output = "".join(f"ligne {i}\n" for i in range(500))
+
+    _fail_child(config, output, code=1)
+
+    reason = pipeline.load_state(VIDEO_A, config=config)["reason"]
+    assert "ligne 499" in reason
+    assert "ligne 0\n" not in reason
+    assert len(reason) < 4000
+
+
+def test_failed_child_output_is_kept_in_the_log_file(tmp_path):
+    config = _config(tmp_path)
+
+    _fail_child(config, "boum\n", code=3)
+
+    log_file = worker.log_path(VIDEO_A, config)
+    assert log_file == config.workspace_dir / VIDEO_A / "worker.log"
+    assert log_file.read_text(encoding="utf-8") == "boum\n"
+    assert str(log_file) in pipeline.load_state(VIDEO_A, config=config)["reason"]
+
+
+def test_failed_child_overrides_a_stale_state_left_running(tmp_path):
+    config = _config(tmp_path)
+    _pipeline_state(VIDEO_A, config, status="running")
+
+    _fail_child(config, "kaboom\n", code=1)
+
+    state = pipeline.load_state(VIDEO_A, config=config)
+    assert state["status"] == "failed"
+    assert "kaboom" in state["reason"]
+
+
+def test_failed_child_clears_dismissed_at_so_the_failure_shows(tmp_path):
+    config = _config(tmp_path)
+    state = pipeline.new_state(VIDEO_A, URL_A, "auto")
+    state["dismissed_at"] = "2026-01-01T00:00:00+00:00"
+    pipeline.save_state(state, config=config)
+
+    _fail_child(config, "oups\n", code=1)
+
+    assert "dismissed_at" not in pipeline.load_state(VIDEO_A, config=config)
+
+
+def test_failed_child_keeps_the_reason_the_pipeline_wrote_itself(tmp_path):
+    config = _config(tmp_path)
+    worker.enqueue(URL_A, None, "run", config=config)
+    spawner = FakeSpawner()
+    w = worker.Worker(config=config, spawner=spawner)
+    w.tick()
+    state = pipeline.new_state(VIDEO_A, URL_A, "auto")
+    state.update(status="failed", reason="download : video privee")
+    pipeline.save_state(state, config=config)  # l'enfant a ecrit son propre echec
+    spawner.process.finish(1)
+    w.tick()
+
+    assert pipeline.load_state(VIDEO_A, config=config)["reason"] == "download : video privee"
+    assert _queue(config) == []
+
+
+def test_failed_child_does_not_block_the_next_cmd_entry(tmp_path):
+    config = _config(tmp_path)
+
+    _, spawner = _fail_child(config, "x\n", code=1, queue_second=True)
+
+    assert len(spawner.calls) == 2
+    assert [e["video_id"] for e in _queue(config)] == [VIDEO_B]
+
+
+def test_child_exiting_zero_writes_no_failure(tmp_path):
+    config = _config(tmp_path)
+    worker.enqueue(URL_A, None, "run", config=config)
+    spawner = FakeSpawner()
+    w = worker.Worker(config=config, spawner=spawner)
+    w.tick()
+    spawner.process.finish(0)
+    w.tick()
+
+    assert _queue(config) == []
+    assert not (config.workspace_dir / VIDEO_A / "pipeline.json").exists()
+
+
+def test_default_spawner_writes_child_output_to_the_log_file(tmp_path):
+    config = _config(tmp_path)
+    worker.enqueue(URL_A, None, "run", config=config)
+    w = worker.Worker(config=config)  # vrai subprocess.Popen
+    w._spawn = lambda entry, cmd: w._popen_logged(entry, [sys.executable, "-c", "import sys; sys.stderr.write('fin triste'); sys.exit(7)"])
+    w.tick()
+    w._process.wait(timeout=30)
+    w.tick()
+
+    state = pipeline.load_state(VIDEO_A, config=config)
+    assert state["status"] == "failed"
+    assert "7" in state["reason"] and "fin triste" in state["reason"]
+    assert "fin triste" in worker.log_path(VIDEO_A, config).read_text(encoding="utf-8")
 
 
 # --------------------------------------------------------------------------
