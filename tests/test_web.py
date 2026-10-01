@@ -123,7 +123,9 @@ def test_get_video_detail_uses_pipeline_load_state(tmp_path, isolated_cwd, monke
     resp = client(tmp_path).get(f"/api/videos/{VIDEO_ID}")
 
     assert resp.status_code == 200
-    assert resp.json() == state
+    body = resp.json()
+    assert {k: body[k] for k in state} == state
+    assert body["clips"] == [] and body["awaiting"] == [] and body["durations"] == {}
 
 
 def test_get_video_detail_unknown_video_is_404(tmp_path, isolated_cwd, monkeypatch):
@@ -938,7 +940,7 @@ def _api_calls(js: str) -> list[tuple[str, str]]:
 
 def test_every_route_called_by_app_js_exists_in_the_app(tmp_path, isolated_cwd):
     app = create_app(config=make_config(tmp_path))
-    js = "".join(p.read_text(encoding="utf-8") for p in sorted(STATIC.glob("*.js")))
+    js = "".join(p.read_text(encoding="utf-8") for p in sorted(STATIC.rglob("*.js")))
     calls = _api_calls(js)
     assert len(calls) >= 6, calls
     missing = []
@@ -1063,6 +1065,159 @@ def test_static_assets_are_served(tmp_path, isolated_cwd):
 
 
 # --------------------------------------------------------------------------
+# TASK-157b : ecran Videos (liste filtrable, fiche, durees, journal)
+# --------------------------------------------------------------------------
+
+
+def _step(started, finished, status="done", **extra):
+    return {"status": status, "reason": None, "started_at": started, "finished_at": finished, **extra}
+
+
+def _write_meta(tmp_path, video_id, title):
+    meta = tmp_path / "workspace" / video_id / "meta.json"
+    meta.write_text(json.dumps({"video_id": video_id, "title": title}), encoding="utf-8")
+
+
+def _seed_videos(tmp_path):
+    steps_a = {
+        "download": _step("2026-09-30T10:00:00+00:00", "2026-09-30T10:00:42+00:00"),
+        "transcribe": _step("2026-09-30T10:00:42+00:00", None, status="running",
+                            progress={"fraction": 0.4, "eta_s": 90.0, "message": "segment 4/10"}),
+    }
+    _write_state(tmp_path, "aaaaaaaaaaa", status="running", channel="ma_chaine", steps=steps_a)
+    _write_meta(tmp_path, "aaaaaaaaaaa", "Grosse partie du soir")
+    _write_state(tmp_path, "bbbbbbbbbbb", status="failed", channel=None, reason="Erreur: reseau coupe")
+    _write_state(tmp_path, "ccccccccccc", status="done", channel="autre_chaine",
+                 source_url="https://example.org/video/XYZ")
+
+
+def test_list_videos_enriches_each_video_with_title_duration_and_current_step(tmp_path, isolated_cwd):
+    _seed_videos(tmp_path)
+
+    by_id = {v["video_id"]: v for v in client(tmp_path).get("/api/videos").json()}
+
+    a = by_id["aaaaaaaaaaa"]
+    assert a["channel"] == "ma_chaine" and a["status"] == "running" and a["reason"] is None
+    assert a["title"] == "Grosse partie du soir"
+    assert a["current_step"] == "transcribe"
+    assert a["durations"]["download"] == 42.0
+    assert a["durations"]["transcribe"] is None  # pas finie : pas de duree inventee
+    b = by_id["bbbbbbbbbbb"]
+    assert b["channel"] is None and b["reason"] == "Erreur: reseau coupe"
+    assert b["current_step"] == "download"  # premiere etape non terminee
+    # sans meta.json : l'identifiant sert de titre, et la raison est dite
+    assert b["title"] == "bbbbbbbbbbb"
+    assert "meta.json" in b["title_reason"]
+    assert "title_reason" not in a or a["title_reason"] is None
+
+
+def test_list_videos_filters_by_channel(tmp_path, isolated_cwd):
+    _seed_videos(tmp_path)
+    resp = client(tmp_path).get("/api/videos", params={"channel": "ma_chaine"})
+    assert [v["video_id"] for v in resp.json()] == ["aaaaaaaaaaa"]
+
+
+def test_list_videos_filters_by_status(tmp_path, isolated_cwd):
+    _seed_videos(tmp_path)
+    resp = client(tmp_path).get("/api/videos", params={"status": "failed"})
+    assert [v["video_id"] for v in resp.json()] == ["bbbbbbbbbbb"]
+
+
+def test_list_videos_unknown_status_is_400_in_french(tmp_path, isolated_cwd):
+    _seed_videos(tmp_path)
+    resp = client(tmp_path).get("/api/videos", params={"status": "bizarre"})
+    assert resp.status_code == 400
+    assert "statut" in resp.json()["detail"]
+
+
+@pytest.mark.parametrize("q, expected", [
+    ("AAAAAA", ["aaaaaaaaaaa"]),              # video_id, insensible a la casse
+    ("grosse partie", ["aaaaaaaaaaa"]),       # titre de meta.json
+    ("example.org/video", ["ccccccccccc"]),   # source_url
+    ("introuvable", []),
+])
+def test_list_videos_text_filter_matches_id_title_and_source_url(tmp_path, isolated_cwd, q, expected):
+    _seed_videos(tmp_path)
+    resp = client(tmp_path).get("/api/videos", params={"q": q})
+    assert sorted(v["video_id"] for v in resp.json()) == expected
+
+
+def test_list_videos_filters_combine(tmp_path, isolated_cwd):
+    _seed_videos(tmp_path)
+    resp = client(tmp_path).get("/api/videos", params={"channel": "ma_chaine", "status": "done"})
+    assert resp.json() == []
+
+
+def test_get_video_detail_includes_clips_awaiting_title_and_durations(tmp_path, isolated_cwd):
+    clips = [{"clip_id": "03-p2", "ready": True, "qa_status": "passed", "issues": [],
+              "mp4": "output/x/03-p2.mp4", "json": "output/x/03-p2.json"}]
+    steps = {"download": _step("2026-09-30T10:00:00+00:00", "2026-09-30T10:01:30+00:00")}
+    _write_state(tmp_path, VIDEO_ID, status="awaiting_review", awaiting=[0, 3], clips=clips, steps=steps)
+    _write_meta(tmp_path, VIDEO_ID, "Titre de la source")
+
+    body = client(tmp_path).get(f"/api/videos/{VIDEO_ID}").json()
+
+    assert body["clips"] == clips
+    assert body["awaiting"] == [0, 3]
+    assert body["durations"]["download"] == 90.0
+    assert body["title"] == "Titre de la source"
+    assert body["video_id"] == VIDEO_ID and body["steps"]["download"]["status"] == "done"
+
+
+# --- ecran videos de la page -------------------------------------------------
+
+VIDEOS_JS = STATIC / "screens" / "videos.js"
+
+
+def _videos_js(tmp_path) -> str:
+    return served(tmp_path, "/static/screens/videos.js")
+
+
+def test_index_loads_the_videos_screen_script_after_the_shell_screens(tmp_path, isolated_cwd):
+    html = served(tmp_path, "/")
+    assert html.index("/static/screens.js") < html.index("/static/screens/videos.js") < html.index("/static/app.js")
+
+
+def test_videos_screen_has_add_form_with_channel_selector_and_action(tmp_path, isolated_cwd):
+    js = _videos_js(tmp_path)
+    for needle in ('name="url"', 'name="channel"', 'name="action"', "Sans chaîne", 'api("/api/channels"',
+                   'value="run"', 'value="render"', '"/api/queue"', 'method: "POST"'):
+        assert needle in js, needle
+
+
+def test_videos_screen_lists_with_server_side_filters(tmp_path, isolated_cwd):
+    js = _videos_js(tmp_path)
+    assert "/api/videos?" in js
+    for needle in ("channel", "status", "q"):
+        assert f'.set("{needle}"' in js or f"{needle}:" in js or f'"{needle}"' in js, needle
+    assert 'name="q"' in js and 'name="filter-channel"' in js and 'name="filter-status"' in js
+
+
+def test_videos_screen_detail_has_12_step_frise_log_and_actions(tmp_path, isolated_cwd):
+    js = _videos_js(tmp_path)
+    for needle in ("class=\"frise\"", "fstep", "/api/videos/${", "/events", "clipper:event",
+                   "/retry", "/cancel", "from_step", "confirmDialog(",
+                   "Relancer depuis cette étape", "Annuler le traitement", "#/review/", "#/clips/",
+                   'class="log"', "STEP_LABELS"):
+        assert needle in js, needle
+    # la frise est faite des 12 etapes du pipeline, dans l'ordre
+    from clipper import pipeline
+    app_text = "".join(p.read_text(encoding="utf-8") for p in STATIC.glob("*.js"))
+    for step in pipeline.STEPS:
+        assert f"{step}:" in app_text, step
+
+
+def test_videos_screen_confirms_before_retry_and_cancel(tmp_path, isolated_cwd):
+    js = _videos_js(tmp_path)
+    for route in ("/retry", "/cancel"):
+        idx = js.index(route)
+        before = js[max(0, idx - 600):idx]
+        assert "confirmDialog(" in before, route
+
+
+def test_videos_screen_has_its_own_css_section(tmp_path, isolated_cwd):
+    css = served(tmp_path, "/static/style.css")
+    assert "/* ---------- Ecran Videos (TASK-157b) ---------- */" in css
 # E1 : GET /api/dashboard (TASK-aad3, SPEC-c100 E1, T2, T8)
 # --------------------------------------------------------------------------
 
