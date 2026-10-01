@@ -355,7 +355,7 @@ def test_tiktok_defaults_are_the_new_account_values_of_the_cadence_study():
     d = tiktok.CONFIG_DEFAULTS
     assert d["backend"] == "browser"
     assert (d["max_posts_per_day"], d["min_gap_minutes"]) == (1, 480)
-    assert (d["min_action_delay_s"], d["max_action_delay_s"]) == (1, 3)  # rapide (choix utilisateur)
+    assert (d["min_action_delay_s"], d["max_action_delay_s"]) == (0.3, 1)  # rapide (choix utilisateur)
     assert d["schedule_max_days"] == 10
 
 
@@ -905,7 +905,7 @@ def test_a_missing_chrome_is_a_browser_error_not_a_stop(tmp_path, monkeypatch):
 def test_action_delays_are_random_bounded_and_beat_the_heartbeat(env):
     env.publish()
     assert len(env.sleeps) >= 4
-    assert all(1 <= s <= 3 for s in env.sleeps)  # bornes par defaut (rapides, choix utilisateur)
+    assert all(0.3 <= s <= 1 for s in env.sleeps)  # bornes par defaut (rapides, choix utilisateur)
     assert len(set(env.sleeps)) > 1  # pas un intervalle mecanique
     assert env.ticks >= len(env.sleeps)
 
@@ -971,7 +971,8 @@ def test_selectors_file_carries_the_real_markers_of_tiktok_studio():
     assert sel["discard_button"] == "button[data-e2e='discard_post_button']"
     assert "upload_status_success" not in str(_sel()) and "schedule_video_button" not in str(_sel())
     assert "privacy_container" not in str(_sel()) and "schedule_radio" not in str(_sel())
-    assert _sel()["labels"] == {"post_now": "Publier", "post_scheduled": "Programmer"}
+    assert _sel()["labels"] == {"post_now": "Publier", "post_scheduled": "Programmer",
+                                "visibility_public": "Tout le monde", "visibility_private": "Toi uniquement"}
     assert _sel()["popups"] == {
         "Activer les vérifications automatiques du contenu": "Annuler",
         "Nouvelles fonctionnalités d'édition ajoutées": "J'ai compris",

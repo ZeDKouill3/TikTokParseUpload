@@ -106,6 +106,9 @@ published_marker = "div:has-text('Vidéo publiée')"
 # Texte du bouton final selon le mode ; un autre texte = page inattendue, arret.
 post_now = "Publier"
 post_scheduled = "Programmer"
+# Texte affiche par le menu de visibilite pour chaque choix : deja affiche = aucun clic.
+visibility_public = "Tout le monde"
+visibility_private = "Toi uniquement"
 
 [continue_publish]
 # Fenetre « Continuer a publier ? » (verification de contenu encore en cours) : fragment de son texte

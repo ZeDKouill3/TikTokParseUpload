@@ -50,8 +50,8 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "visibility": "public",            # public | private (test reel : private)
     "max_posts_per_day": 1,
     "min_gap_minutes": 480,
-    "min_action_delay_s": 1,
-    "max_action_delay_s": 3,
+    "min_action_delay_s": 0.3,
+    "max_action_delay_s": 1,
     "schedule_max_days": 10,           # limite native de TikTok Studio
     "schedule_min_minutes": 15,        # avance minimale native de TikTok Studio
     "action_timeout_s": 30,            # attente d'un element de la page
@@ -621,8 +621,11 @@ class _Flow:
 
         self.type_caption(" ".join([clip["caption"], *clip["hashtags"]]))
         self.expand_settings()
-        self.click("visibility_dropdown")
-        self.click("visibility_" + str(self.settings["visibility"]))
+        wanted = self.sel["labels"]["visibility_" + str(self.settings["visibility"])]
+        current = " ".join(str(self.wait("visibility_dropdown").inner_text()).split())
+        if current != wanted:  # deja la bonne visibilite (« Tout le monde » par defaut) : aucun clic
+            self.click("visibility_dropdown")
+            self.click("visibility_" + str(self.settings["visibility"]))
 
         effective, note = schedule_at, None
         if mode == "scheduled":
