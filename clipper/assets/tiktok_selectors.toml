@@ -17,11 +17,15 @@ version = 1
 [urls]
 # Page d'envoi d'une video.
 upload = "https://www.tiktok.com/tiktokstudio/upload?from=webapp"
+# Liste des contenus publies avec leurs chiffres (releve des statistiques, R7).
+stats = "https://www.tiktok.com/tiktokstudio/content"
 
 [expect]
 # Apres l'ouverture de la page d'envoi, l'adresse courante doit commencer par ceci ;
 # sinon la page est inattendue (redirection, erreur) : arret, jamais un clic au hasard.
 upload_url_prefix = "https://www.tiktok.com/tiktokstudio/upload"
+# Idem pour la page des statistiques : une autre adresse = page inattendue, arret.
+stats_url_prefix = "https://www.tiktok.com/tiktokstudio/content"
 # Fragments d'adresse qui disent « connexion expiree » (redirection vers la connexion).
 login_url_markers = ["/login"]
 
@@ -48,6 +52,25 @@ success_marker = "[data-e2e='post_success_modal'], div:has-text('Video envoyee')
 # Lien vers la video publiee, dans la confirmation (attribut href) ; absent pour un
 # post programme (pas encore d'adresse publique).
 post_link = "[data-e2e='post_success_modal'] a[href*='/video/']"
+
+# A VERIFIER SUR LA VRAIE PAGE (pages de statistiques, SPEC-9225 R7) : comme ci-dessus,
+# ces selecteurs sont plausibles mais n'ont PAS ete valides sur la vraie page TikTok
+# Studio. Une ligne = un post publie ; les autres selecteurs sont cherches DANS la ligne.
+# Une valeur que la page n'affiche pas (selecteur sans resultat) est relevee « null » ;
+# une valeur affichee mais illisible arrete le releve (page inattendue).
+[stats]
+# Une ligne de la liste des contenus (un post publie).
+row = "div[data-e2e='content_item'], tr[data-e2e='content_row']"
+# Lien du post dans la ligne (href contenant /video/<id>).
+post_link = "a[href*='/video/']"
+# Compteurs de la ligne.
+views = "[data-e2e='content_views']"
+likes = "[data-e2e='content_likes']"
+comments = "[data-e2e='content_comments']"
+shares = "[data-e2e='content_shares']"
+# Si TikTok Studio les affiche : duree moyenne de visionnage, part vue en entier.
+avg_watch = "[data-e2e='content_avg_watch_time']"
+watched_full = "[data-e2e='content_full_watch_rate']"
 
 [detect]
 # Signes de captcha (iframe/conteneur de verification).

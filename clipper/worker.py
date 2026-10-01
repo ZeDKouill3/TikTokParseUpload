@@ -265,6 +265,7 @@ class Worker:
         spawner: Callable[[list[str]], Any] | None = None,
         watch_lister: Callable[[str], list[dict[str, Any]]] | None = None,
         publisher: Callable[..., dict[str, Any]] | None = None,
+        stats_fetcher: Callable[..., dict[str, Any]] | None = None,
     ) -> None:
         self._popen = None
         if spawner is None:
@@ -279,6 +280,9 @@ class Worker:
         self._logged_watch_errors: set[str] = set()
         self.publisher = publisher or tiktok.publish
         self._logged_publish_errors: set[str] = set()
+        self.stats_fetcher = stats_fetcher or tiktok.fetch_stats
+        self._stats_attempts: dict[str, datetime] = {}
+        self._logged_stats_errors: set[str] = set()
         self._path = _queue_path(self.config)
         self._process: Any | None = None
         self._entry: dict[str, Any] | None = None
@@ -324,7 +328,8 @@ class Worker:
         de l'interface web)."""
         self._beat()
         self._watch_channels()
-        self._publish_due()
+        if not self._publish_due():
+            self._stats_due()
 
         if self._process is not None:
             if self._process.poll() is None:
@@ -364,18 +369,52 @@ class Worker:
 
     # ------------------------------------------------------------ publication TikTok
 
-    def _publish_due(self) -> None:
-        """Une publication TikTok due par iteration (SPEC-9225 R3). Une file, un preset ou un
-        reglage illisible est journalise une fois (ADR-ad2e) et ne tue pas le worker."""
+    def _publish_due(self) -> bool:
+        """Une publication TikTok due par iteration (SPEC-9225 R3) ; vrai si une tentative a eu lieu.
+        Une file, un preset ou un reglage illisible est journalise une fois (ADR-ad2e) et ne tue
+        pas le worker."""
         try:
-            self._publish_next()
+            return self._publish_next()
         except (publish_mod.PublishError, channel_mod.ChannelError, ConfigError, tiktok.TikTokError) as exc:
             message = str(exc)
             if message not in self._logged_publish_errors:
                 self._logged_publish_errors.add(message)
                 log.error("publication TikTok impossible : %s", message)
+        return False
 
-    def _publish_next(self) -> None:
+    def _stats_due(self) -> None:
+        """Releve periodique des statistiques (SPEC-9225 R7) : un compte par iteration, jamais dans
+        l'iteration qui a pilote une publication (un seul pilotage du navigateur a la fois), jamais
+        pour un compte arrete (R4) ni sans post publie a mesurer. Un echec est journalise une fois et
+        n'est pas retente avant ``stats_interval_h`` (ADR-ad2e : jamais silencieux, jamais en boucle)."""
+        now = datetime.now(timezone.utc)
+        try:
+            settings = tiktok.get_settings(self.config)
+            watch = self.config.section("watch")
+            scope = {"state_dir": self.config.section("publish")["state_dir"],
+                     "presets_dir": watch["presets_dir"], "base": watch["base_config"]}
+            wait = timedelta(hours=float(settings["stats_interval_h"]))
+            for account in tiktok.stats_accounts(config=self.config):
+                tried = self._stats_attempts.get(account)
+                if tried is not None and now - tried < wait:
+                    continue
+                if publish_mod.halted_account(account, **scope) is not None:
+                    continue
+                if not tiktok.stats_due(account, config=self.config, now=now):
+                    continue
+                self._stats_attempts[account] = now
+                self.stats_fetcher(account, config=self.config, on_tick=self._beat)
+                log.info("%s : statistiques TikTok relevées", account)
+                return
+        except Exception as exc:  # noqa: BLE001 - jamais un worker mort : l'echec est journalise une fois
+            message = f"{type(exc).__name__} : {exc}" if not isinstance(
+                exc, (tiktok.TikTokError, browser.BrowserError, publish_mod.PublishError, channel_mod.ChannelError,
+                      ConfigError)) else str(exc)
+            if message not in self._logged_stats_errors:
+                self._logged_stats_errors.add(message)
+                log.error("relevé des statistiques TikTok impossible : %s", message)
+
+    def _publish_next(self) -> bool:
         now = datetime.now(timezone.utc)
         settings = tiktok.get_settings(self.config)
         watch = self.config.section("watch")
@@ -395,7 +434,8 @@ class Worker:
         due.sort(key=lambda d: (d[0], d[1], d[3]["clip_id"]))
         for slot, name, channel, entry, mode in due:
             if self._publish_one(slot, name, channel, entry, mode, settings, paths, now):
-                return
+                return True
+        return False
 
     def _publish_one(self, slot: datetime, name: str, channel: dict[str, Any], entry: dict[str, Any], mode: str,
                      settings: dict[str, Any], paths: dict[str, Any], now: datetime) -> bool:

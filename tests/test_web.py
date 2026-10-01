@@ -4790,3 +4790,182 @@ def test_console_shows_tiktok_status_retry_button_and_notifications():
     for label in ("En attente", "Programmée sur TikTok", "Publiée", "Échec", "Réessayer", "/retry", "capture_url", "post_url"):
         assert label in publish_js
     assert "/api/tiktok/events" in app_js and 'event.kind === "tiktok"' in app_js
+
+
+# --------------------------------------------------------------------------
+# Statistiques TikTok relevees automatiquement (SPEC-9225 R7)
+# --------------------------------------------------------------------------
+
+from clipper import browser as browser_mod  # noqa: E402
+from clipper import tiktok as tiktok_mod  # noqa: E402
+
+TT_ACCOUNT = "ab12cd"
+
+
+def _tt_post(post_id, video_id, clip_id, **fields):
+    return {"post_id": post_id, "post_url": f"https://example.invalid/@ma_chaine/video/{post_id}",
+            "video_id": video_id, "clip_id": clip_id, "views": 4200, "likes": 310, "comments": 12, "shares": 40,
+            "avg_watch_s": 11.5, "watched_full": 0.31, **fields}
+
+
+def _tt_report(tmp_path, posts, *, fetched_at="2026-09-26T08:00:00+00:00", error=None, account=TT_ACCOUNT):
+    _write_json(tmp_path / "state" / "stats" / "tiktok" / f"{account}.json",
+                {"account": account, "fetched_at": fetched_at, "source": "tiktok_studio", "posts": posts, "error": error})
+
+
+def test_stats_clips_take_views_retention_full_and_shares_from_the_tiktok_report(tmp_path, isolated_cwd):
+    _stats_seed(tmp_path)
+    _tt_report(tmp_path, [_tt_post("7300000000000000001", STATS_A, "01")])
+
+    data = _stats(tmp_path)
+    one = next(c for c in data["clips"] if (c["video_id"], c["clip_id"]) == (STATS_A, "01"))
+
+    assert one["stats"]["views"] == 4200 and one["stats"]["shares"] == 40
+    assert one["stats"]["watched_full"] == 0.31 and one["stats"]["avg_watch_s"] == 11.5
+    assert one["stats"]["likes"] == 310 and one["stats"]["comments"] == 12
+    assert one["stats"]["retention_3s"] is None            # TikTok Studio ne donne pas la retention a 3 s
+    assert one["stats_source"] == "tiktok" and one["stats"]["date"] == "2026-09-26"
+    assert data["tiktok_stats"] == [{"account": TT_ACCOUNT, "fetched_at": "2026-09-26T08:00:00+00:00",
+                                     "posts": 1, "error": None}]
+
+
+def test_stats_a_null_in_the_report_stays_null_in_the_clip_stats(tmp_path, isolated_cwd):
+    _stats_seed(tmp_path)
+    _tt_report(tmp_path, [_tt_post("1", STATS_A, "01", avg_watch_s=None, watched_full=None, shares=None)])
+
+    one = next(c for c in _stats(tmp_path)["clips"] if (c["video_id"], c["clip_id"]) == (STATS_A, "01"))
+
+    assert one["stats"]["avg_watch_s"] is None and one["stats"]["watched_full"] is None
+    assert one["stats"]["shares"] is None and one["stats"]["views"] == 4200
+
+
+def test_stats_the_csv_stays_possible_and_the_source_is_shown(tmp_path, isolated_cwd):
+    _stats_seed(tmp_path)
+
+    two = next(c for c in _stats(tmp_path)["clips"] if (c["video_id"], c["clip_id"]) == (STATS_A, "02"))
+
+    assert two["stats_source"] == "csv" and two["stats"]["views"] == 1200
+
+
+def test_stats_the_most_recent_measure_wins_between_csv_and_tiktok_and_a_tie_goes_to_tiktok(tmp_path, isolated_cwd):
+    _stats_seed(tmp_path)  # CSV du clip 02 : 2026-09-25
+    _tt_report(tmp_path, [_tt_post("2", STATS_A, "02", views=5)], fetched_at="2026-09-24T08:00:00+00:00")
+    assert next(c for c in _stats(tmp_path)["clips"] if c["clip_id"] == "02")["stats_source"] == "csv"
+
+    _tt_report(tmp_path, [_tt_post("2", STATS_A, "02", views=5)], fetched_at="2026-09-25T23:00:00+00:00")
+    two = next(c for c in _stats(tmp_path)["clips"] if c["clip_id"] == "02")
+    assert two["stats_source"] == "tiktok" and two["stats"]["views"] == 5
+
+
+def test_stats_a_tiktok_post_not_linked_to_a_clip_is_reported_apart_never_attributed(tmp_path, isolated_cwd):
+    _stats_seed(tmp_path)
+    _tt_report(tmp_path, [_tt_post("9", None, None, views=77)])
+
+    data = _stats(tmp_path)
+
+    assert all(c["stats_source"] in (None, "csv") for c in data["clips"])
+    assert data["tiktok_unmatched"] == [{"account": TT_ACCOUNT, "post_id": "9",
+                                         "post_url": "https://example.invalid/@ma_chaine/video/9", "views": 77}]
+
+
+def test_stats_a_failed_tiktok_fetch_is_shown_with_its_reason_and_keeps_the_last_report(tmp_path, isolated_cwd):
+    _stats_seed(tmp_path)
+    error = {"at": "2026-09-27T08:00:00+00:00", "code": "captcha", "reason": "captcha détecté", "capture": None}
+    _tt_report(tmp_path, [_tt_post("1", STATS_A, "01")], error=error)
+
+    data = _stats(tmp_path)
+
+    assert data["tiktok_stats"][0]["error"] == error and data["tiktok_stats"][0]["posts"] == 1
+    assert next(c for c in data["clips"] if c["clip_id"] == "01" and c["video_id"] == STATS_A)["stats"]["views"] == 4200
+
+
+def test_stats_a_corrupt_tiktok_report_is_an_explicit_500_not_an_empty_screen(tmp_path, isolated_cwd):
+    path = tmp_path / "state" / "stats" / "tiktok" / f"{TT_ACCOUNT}.json"
+    path.parent.mkdir(parents=True)
+    path.write_text("{pas du json", encoding="utf-8")
+
+    resp = client(tmp_path).get("/api/stats")
+
+    assert resp.status_code == 500 and "illisible" in resp.json()["detail"]
+
+
+class FakeFetch:
+    def __init__(self, error=None):
+        self.calls, self.error = [], error
+
+    def __call__(self, account, *, config=None, **kwargs):
+        self.calls.append(account)
+        if self.error is not None:
+            raise self.error
+        return {"account": account, "fetched_at": "2026-09-27T08:00:00+00:00", "posts": [{}, {}], "error": None}
+
+
+def _tt_clip(tmp_path, video_id, clip_id, account=TT_ACCOUNT):
+    _write_sidecar(tmp_path, video_id, clip_id, tiktok_post={"url": "https://example.invalid/video/1", "id": "1",
+                                                           "state": "published", "account": account})
+
+
+def test_refresh_route_fetches_the_given_account_in_the_background_thread_pool(tmp_path, isolated_cwd, monkeypatch):
+    fetch = FakeFetch()
+    monkeypatch.setattr(tiktok_mod, "fetch_stats", fetch)
+
+    resp = client(tmp_path).post("/api/stats/tiktok/refresh", json={"account": TT_ACCOUNT})
+
+    assert resp.status_code == 200, resp.text
+    assert fetch.calls == [TT_ACCOUNT]
+    assert resp.json() == {"accounts": {TT_ACCOUNT: {"fetched_at": "2026-09-27T08:00:00+00:00", "posts": 2}}}
+
+
+def test_refresh_route_without_body_fetches_every_account_with_a_published_post(tmp_path, isolated_cwd, monkeypatch):
+    _tt_clip(tmp_path, STATS_A, "01")
+    _tt_clip(tmp_path, STATS_B, "01", account="ef34ab")
+    _write_sidecar(tmp_path, STATS_C, "01")  # jamais publie : ne compte pas
+    fetch = FakeFetch()
+    monkeypatch.setattr(tiktok_mod, "fetch_stats", fetch)
+
+    resp = client(tmp_path).post("/api/stats/tiktok/refresh")
+
+    assert resp.status_code == 200 and fetch.calls == [TT_ACCOUNT, "ef34ab"]
+    assert sorted(resp.json()["accounts"]) == [TT_ACCOUNT, "ef34ab"]
+
+
+def test_refresh_route_with_nothing_to_measure_says_so(tmp_path, isolated_cwd, monkeypatch):
+    fetch = FakeFetch()
+    monkeypatch.setattr(tiktok_mod, "fetch_stats", fetch)
+
+    resp = client(tmp_path).post("/api/stats/tiktok/refresh")
+
+    assert resp.status_code == 409 and "publié" in resp.json()["detail"] and fetch.calls == []
+
+
+@pytest.mark.parametrize("error,status,words", [
+    (tiktok_mod.TikTokStop("captcha", "captcha détecté : arrêt immédiat", None), 409, "captcha"),
+    (browser_mod.BrowserError("Chrome introuvable"), 409, "Chrome"),
+    (tiktok_mod.TikTokError("réglage invalide"), 422, "réglage"),
+])
+def test_refresh_route_reports_a_safe_stop_or_error_in_french(tmp_path, isolated_cwd, monkeypatch, error, status, words):
+    monkeypatch.setattr(tiktok_mod, "fetch_stats", FakeFetch(error=error))
+
+    resp = client(tmp_path).post("/api/stats/tiktok/refresh", json={"account": TT_ACCOUNT})
+
+    assert resp.status_code == status and words in resp.json()["detail"]
+
+
+def test_refresh_route_refuses_an_invalid_body_or_account(tmp_path, isolated_cwd, monkeypatch):
+    fetch = FakeFetch()
+    monkeypatch.setattr(tiktok_mod, "fetch_stats", fetch)
+
+    assert client(tmp_path).post("/api/stats/tiktok/refresh", json={"account": "../x"}).status_code == 422
+    assert client(tmp_path).post("/api/stats/tiktok/refresh", json={"autre": 1}).status_code == 422
+    assert fetch.calls == []
+
+
+def test_stats_screen_has_a_tiktok_refresh_button_and_shows_the_source_of_each_figure():
+    js = (STATIC / "screens" / "stats.js").read_text(encoding="utf-8")
+
+    assert "/api/stats/tiktok/refresh" in js and "data-stats-tiktok" in js
+    assert "Relever les statistiques TikTok" in js
+    assert "tiktok_stats" in js and "tiktok_unmatched" in js
+    assert "avg_watch_s" in js and "stats_source" in js
+    assert "aucune mesure" in js and "Rétention" in js
+    assert "toastError" in js

@@ -1,7 +1,8 @@
 /* Ecran « Statistiques » (SPEC-c100 E7, TASK-7d86). Lit GET /api/stats?since=&until= :
    resultats par clip (outcomes + sidecar + decision humaine), couts du modele de
    langage, duree par etape, videos par statut ; l'import CSV des stats de plateforme
-   passe par POST /api/stats/import. Graphiques en CSS, sans bibliotheque (ADR-09ad).
+   passe par POST /api/stats/import ; le releve automatique de TikTok Studio (SPEC-9225 R7)
+   par POST /api/stats/tiktok/refresh (la source de chaque chiffre est affichee). Graphiques en CSS, sans bibliotheque (ADR-09ad).
    Charge apres screens.js dont il remplace l'entree Screens.stats. */
 "use strict";
 
@@ -23,16 +24,30 @@ const STATS_SORTS = {
   qa: (c) => c.qa_status || null,
   decision: (c) => c.human_decision || null,
   views: (c) => (c.stats ? c.stats.views : null),
-  retention: (c) => (c.stats ? c.stats.retention_3s : null),
+  retention: (c) => (c.stats ? (c.stats.retention_3s ?? c.stats.avg_watch_s ?? null) : null),
   full: (c) => (c.stats ? c.stats.watched_full : null),
   shares: (c) => (c.stats ? c.stats.shares : null),
 };
 
-const statsUi = { data: null, error: null, loading: null, dirty: false, at: 0, preset: "30", since: "", until: "", shown: STATS_CLIPS_PAGE_SIZE, channel: "", sort: { key: null, dir: "asc" } };
+const statsUi = { data: null, error: null, loading: null, dirty: false, at: 0, preset: "30", since: "", until: "", shown: STATS_CLIPS_PAGE_SIZE, channel: "", sort: { key: null, dir: "asc" }, refreshing: false };
 
 const statsMoney = (usd) => `${fr(usd, 2)} $`;
+const STATS_SOURCES = { tiktok: "relevé TikTok", csv: "CSV importé" };
 const statsPct = (fraction) => `${fr(fraction * 100, 0)} %`;
 const statsSeconds = (s) => (s >= 90 ? `${fr(s / 60, 1)} min` : `${fr(s, 1)} s`);
+
+/* Une valeur absente du releve est « null » : tiret, jamais un 0 invente. */
+function statsCell(value, format) {
+  return value === null || value === undefined
+    ? `<td class="r muted" title="non affichée par la source">—</td>`
+    : `<td class="r num">${esc(format(value))}</td>`;
+}
+
+/* Retention : part gardee a 3 s (CSV) ou, a defaut, duree moyenne de visionnage (releve TikTok). */
+function statsRetention(s) {
+  if (s.retention_3s !== null && s.retention_3s !== undefined) return statsCell(s.retention_3s, statsPct);
+  return statsCell(s.avg_watch_s, (v) => `${statsSeconds(v)} en moyenne`);
+}
 
 function statsIso(date) {
   const p = (n) => String(n).padStart(2, "0");
@@ -143,11 +158,12 @@ function statsClipRow(c) {
     : `<span class="muted">pas de décision</span>`;
   const s = c.stats;
   const cells = s
-    ? `<td class="r num">${esc(fr(s.views))}</td><td class="r num">${esc(statsPct(s.retention_3s))}</td><td class="r num">${esc(statsPct(s.watched_full))}</td><td class="r num">${esc(fr(s.shares))}</td>`
-    : `<td class="r muted" colspan="4">aucune mesure importée</td>`;
+    ? `${statsCell(s.views, fr)}${statsRetention(s)}${statsCell(s.watched_full, statsPct)}${statsCell(s.shares, fr)}`
+    : `<td class="r muted" colspan="4">aucune mesure (ni relevé TikTok ni CSV)</td>`;
+  const source = s && c.stats_source ? `<div class="li-sub muted">${esc(STATS_SOURCES[c.stats_source] || c.stats_source)}${s.date ? ` · ${esc(s.date)}` : ""}</div>` : "";
   return `<tr><td><div class="stats-clip-title">${esc(c.screen_title || c.clip_id)}</div><div class="li-sub muted mono">${esc(c.video_id)}/${esc(c.clip_id)}</div></td>
     <td>${c.channel ? esc(c.channel) : `<span class="muted">sans chaîne</span>`}</td>
-    <td><span class="chip ${qa.cls}">${esc(qa.label)}</span>${issues}</td><td>${decision}</td>${cells}</tr>`;
+    <td><span class="chip ${qa.cls}">${esc(qa.label)}</span>${issues}</td><td>${decision}</td>${cells.replace("</td>", `${source}</td>`)}</tr>`;
 }
 
 function statsClipsBlock(data) {
@@ -156,15 +172,30 @@ function statsClipsBlock(data) {
   const more = next
     ? `<div class="panel-pad"><button type="button" class="btn btn-ghost" data-stats-more>Afficher plus (${next} sur ${data.clips.length - statsUi.shown} restants)</button></div>` : "";
   const table = data.clips.length
-    ? `<div class="table-scroll"><table class="table"><thead><tr>${statsHead("clip", "Clip")}${statsHead("channel", "Chaîne")}${statsHead("qa", "Contrôle qualité")}${statsHead("decision", "Décision")}${statsHead("views", "Vues", true)}${statsHead("retention", "Rétention 3 s", true)}${statsHead("full", "Vu en entier", true)}${statsHead("shares", "Partages", true)}</tr></thead>
+    ? `<div class="table-scroll"><table class="table"><thead><tr>${statsHead("clip", "Clip")}${statsHead("channel", "Chaîne")}${statsHead("qa", "Contrôle qualité")}${statsHead("decision", "Décision")}${statsHead("views", "Vues", true)}${statsHead("retention", "Rétention", true)}${statsHead("full", "Vu en entier", true)}${statsHead("shares", "Partages", true)}</tr></thead>
         <tbody>${data.clips.slice(0, statsUi.shown).map(statsClipRow).join("")}</tbody></table></div>${more}`
     : `<p class="muted stats-empty">Aucun clip rendu sur cette période.</p>`;
   const orphans = unmatched.length
     ? `<div class="stats-unmatched"><b>Mesures non rattachées</b>${unmatched.map((u) => `<div class="li-sub">Clip ${esc(u.clip_id)} : ${esc(fr(u.stats.views))} vues le ${esc(u.stats.date)} — ${esc(u.reason)}</div>`).join("")}</div>`
     : "";
+  const tiktok = statsTiktokBlock(data);
   return `<section class="panel" data-block="clips"><div class="panel-head"><h2>Résultats par clip</h2><div class="right muted" style="font-size:12px">${Math.min(statsUi.shown, data.clips.length)} sur ${data.clips.length} clip${data.clips.length > 1 ? "s" : ""}</div></div>
-    ${table}${orphans}
-    <p class="muted stats-note">Les vues et la rétention n'existent que par le CSV importé tant que l'autopost n'est pas en place.</p></section>`;
+    ${tiktok}${table}${orphans}
+    <p class="muted stats-note">Les vues, la rétention, la part vue en entier et les partages viennent du relevé TikTok Studio (bouton ci-dessus, et automatique par le worker) ou du CSV importé ; la mesure la plus récente est affichée, avec sa source.</p></section>`;
+}
+
+/* Etat des releves TikTok : date, nombre de posts, dernier arret sur (R4) ; posts non rattaches a un clip. */
+function statsTiktokBlock(data) {
+  const reports = data.tiktok_stats || [];
+  const lines = reports.map((r) => {
+    const when = r.fetched_at ? `relevé le ${esc(r.fetched_at.slice(0, 16).replace("T", " "))} · ${esc(fr(r.posts))} post${r.posts > 1 ? "s" : ""}` : "jamais relevé";
+    const err = r.error ? ` <span class="chip bad">arrêt : ${esc(r.error.reason)}</span>` : "";
+    return `<div class="li-sub">Compte ${esc(r.account)} : ${when}${err}</div>`;
+  });
+  const orphans = (data.tiktok_unmatched || []).map((u) =>
+    `<div class="li-sub">Post ${esc(u.post_id)} (compte ${esc(u.account)}) : ${esc(u.views === null || u.views === undefined ? "—" : fr(u.views))} vues — aucun clip ne correspond</div>`);
+  return lines.length || orphans.length
+    ? `<div class="stats-unmatched" data-block="tiktok-reports"><b>Relevés TikTok</b>${lines.join("")}${orphans.join("")}</div>` : "";
 }
 
 function statsCostBlock(data) {
@@ -220,7 +251,27 @@ function statsToolbar() {
       <label>au <input class="input" type="date" data-stats-until value="${esc(statsUi.until)}"></label></div>
     <div class="stats-import"><input type="file" accept=".csv,text/csv" data-stats-file hidden aria-label="Fichier CSV des statistiques de plateforme">
       <button type="button" class="btn btn-primary" data-stats-import>${icon("upload")}Importer un CSV</button></div>
+    <div class="stats-import"><button type="button" class="btn btn-primary" data-stats-tiktok${statsUi.refreshing ? " disabled" : ""}>${icon("refresh-cw")}${statsUi.refreshing ? "Relevé en cours…" : "Relever les statistiques TikTok"}</button></div>
   </div>`;
+}
+
+/* Releve a la demande : ouvre le Chrome du profil sur ce PC (visible) ; un arret sur (captcha, connexion
+   expiree...) revient en 409 avec sa raison, affichee telle quelle. */
+async function statsTiktokRefresh() {
+  statsUi.refreshing = true;
+  renderCurrent();
+  try {
+    const sent = await api("/api/stats/tiktok/refresh", { method: "POST" });
+    const posts = Object.values(sent.accounts).reduce((t, a) => t + a.posts, 0);
+    toast({ kind: "ok", title: "Statistiques TikTok relevées", body: `${posts} post${posts > 1 ? "s" : ""} relevé${posts > 1 ? "s" : ""}.` });
+  } catch (err) {
+    toastError("Relevé TikTok impossible", err);
+  } finally {
+    statsUi.refreshing = false;
+    statsUi.at = 0;
+    await loadStats();
+    if (currentScreen === "stats") renderCurrent();
+  }
 }
 
 async function statsImport(file) {
@@ -265,6 +316,7 @@ function statsWire(body) {
   };
   $("[data-stats-since]", body).onchange = onDates;
   $("[data-stats-until]", body).onchange = onDates;
+  $("[data-stats-tiktok]", body).onclick = () => statsTiktokRefresh();
   const fileInput = $("[data-stats-file]", body);
   $("[data-stats-import]", body).onclick = () => fileInput.click();
   fileInput.onchange = async () => {
