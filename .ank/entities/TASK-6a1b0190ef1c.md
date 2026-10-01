@@ -5,7 +5,7 @@ slug: worker-config-plac-avant-la-sous-commande-et-un
 title: "worker : --config placé avant la sous-commande, et un enfant qui meurt n'efface plus la vidéo en silence"
 created: 2026-10-01T13:51:05Z
 author: nicoc@zedk_ordi
-status: open
+status: in_progress
 scope:
   - clipper/worker.py
   - tests/test_worker.py
@@ -18,7 +18,7 @@ criteria_by: creator
 verify: [tests]
 method: diagnose
 schema: 4
-version: 1
+version: 2
 ---
 
 Séance réelle 2026-10-01 : une vidéo mise en file avec une chaîne (POST /api/queue 202) disparaît : la file se vide, aucun dossier workspace, aucun échec visible. Cause 1 : _build_command (worker.py:223) produit « python -m clipper run <url> --config presets/<chaine>.toml » ; --config est une option globale du parseur, l'enfant meurt sur « clipper: error: unrecognized arguments: --config presets/salur.toml ». Cause 2 : _finish_current ignore le code de retour de l'enfant et retire l'entrée de la file ; un enfant mort avant d'écrire pipeline.json ne laisse aucune trace (contraire à ADR-ad2e).
