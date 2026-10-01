@@ -344,7 +344,7 @@ def _jury_answer(request):
     item = request.schema["properties"]["candidates"]["items"]["properties"]
     candidates = []
     for ref in item["ref"]["enum"]:
-        entry = {"ref": ref, "argument": "accroche nette", "scores": {"hook": 10}}
+        entry = {"ref": ref, "argument": "accroche nette", "scores": {"hook": 10}, "confidence": 80}
         if "veto" in item:
             entry.update(veto=False, veto_reason="")
         candidates.append(entry)
