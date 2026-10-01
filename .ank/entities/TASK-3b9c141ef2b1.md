@@ -5,7 +5,7 @@ slug: web-cran-clips-galerie-9-16-sidecar-qa-dition-de
 title: "web : écran Clips (galerie 9:16, sidecar, QA, édition description/hashtags, titre d'écran avec re-rendu, approuver/refuser, télécharger, copier)"
 created: 2026-09-30T20:44:55Z
 author: w-plan-web
-status: open
+status: in_progress
 scope:
   - clipper/web/app.py
   - clipper/web/static/**
@@ -17,7 +17,7 @@ criteria_by: creator
 verify: [tests]
 method: tdd
 schema: 4
-version: 2
+version: 3
 ---
 
 SPEC-c100 E4, T4 ; SPEC-fc0c §4.5. Les champs du sidecar sont ceux de SPEC-6a47 (screen_title, description, hashtags, series/part, qa). L'API ne touche jamais un mp4 ni le sidecar elle-même : publish.edit_caption pour le texte, la file pour le rendu.
