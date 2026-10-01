@@ -25,6 +25,20 @@ VIDEO_ID = "abcdefghijk"
 URL = f"https://www.youtube.com/watch?v={VIDEO_ID}"
 
 
+
+def _node_run(script: str, *args: str) -> str:
+    """Execute un script node depuis un fichier temporaire : ``node -e <script>`` depasse la longueur
+    maximale d'une ligne de commande sous Windows (WinError 206) quand le script embarque un ecran entier.
+    ``process.argv[1]`` designe le premier argument, comme avec ``-e``."""
+    import tempfile
+    with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, encoding="utf-8") as handle:
+        handle.write("process.argv.splice(1, 1);" + chr(10) + script)
+        path = handle.name
+    try:
+        return subprocess.run(["node", path, *args], capture_output=True, text=True, encoding="utf-8", check=True).stdout
+    finally:
+        Path(path).unlink(missing_ok=True)
+
 def make_config(tmp_path) -> Config:
     return Config(mode="review", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output")
 
@@ -3654,7 +3668,7 @@ def test_stats_issue_text_renders_objects_and_strings_readably(tmp_path):
     start = js.index("function statsIssueText")
     end = js.index("\n}\n", start) + 3
     script = js[start:end] + f"\nconsole.log(JSON.stringify([statsIssueText({json.dumps(_QA_ISSUE)}), statsIssueText('hors cadre')]));"
-    out = subprocess.run(["node", "-e", script], capture_output=True, text=True, encoding="utf-8", check=True).stdout
+    out = _node_run(script)
     assert json.loads(out) == ["image noire de 2 s", "hors cadre"]
 
 
@@ -3967,7 +3981,7 @@ def test_stats_clip_pagination_reveals_50_more_rows_per_click():
     start = js.index("function statsMoreCount")
     end = js.index("\n}\n", start) + 3
     script = "const STATS_CLIPS_PAGE_SIZE = 50;\n" + js[start:end] + "\nconsole.log(JSON.stringify([statsMoreCount(120, 50), statsMoreCount(120, 100), statsMoreCount(30, 50)]));"
-    out = subprocess.run(["node", "-e", script], capture_output=True, text=True, encoding="utf-8", check=True).stdout
+    out = _node_run(script)
     assert json.loads(out) == [50, 20, 0]
 
 
@@ -4217,7 +4231,7 @@ def test_stats_clip_sort_orders_by_column_with_missing_values_last():
         + "\nstatsUi.sort = { key: 'views', dir: 'asc' }; statsSortInPlace(clips);"
         + "\nconsole.log(JSON.stringify([desc, clips.map(c => c.clip_id).join('')]));"
     )
-    out = subprocess.run(["node", "-e", script], capture_output=True, text=True, encoding="utf-8", check=True).stdout
+    out = _node_run(script)
     assert json.loads(out) == ["cab", "acb"]
 
 
@@ -5398,7 +5412,7 @@ def test_the_form_lists_only_clips_to_validate_or_approved_newest_first():
         {"video_id": "v3", "clip_id": "01", "ready": False, "publish_status": "not_ready", "created_at": "2026-10-02T10:00:00"},
     ]
     script = start_key + fn + f"\nconsole.log(JSON.stringify(pubFormClips({json.dumps(clips)}).map(pubKey)));"
-    out = subprocess.run(["node", "-e", script], capture_output=True, text=True, encoding="utf-8", check=True).stdout
+    out = _node_run(script)
     assert json.loads(out) == ["v2/01", "v1/01"]  # plus recents en haut ; ni refuses, ni publies, ni deja en file
 
 
@@ -5600,7 +5614,7 @@ def _run_radar(payload, moment_index=0, round_index=None):
         "\nconst data = JSON.parse(process.argv[1]);"
         f"\nprocess.stdout.write(juryRadarSvg(data, data.moments[{moment_index}], {json.dumps(round_index)}));"
     )
-    return subprocess.run(["node", "-e", script, json.dumps(payload)], capture_output=True, text=True, encoding="utf-8", check=True).stdout
+    return _node_run(script, json.dumps(payload))
 
 
 def test_radar_js_is_wired_in_the_page_before_videos_and_has_no_external_library():
@@ -5661,7 +5675,7 @@ def test_radar_panel_shows_veto_threshold_reason_and_toggle(jury_payload):
         "\nconst ui = {key: null, round: null};"
         "\nprocess.stdout.write(JSON.stringify([juryPanelHtml(data, ui), juryPanelHtml(data, {key: data.moments[4].key, round: null})]));"
     )
-    out = subprocess.run(["node", "-e", script, json.dumps(jury_payload)], capture_output=True, text=True, encoding="utf-8", check=True).stdout
+    out = _node_run(script, json.dumps(jury_payload))
     retained, vetoed = json.loads(out)
 
     assert "data-jr-round" in retained                      # interrupteur avant / après débat (il y a eu débat)
@@ -5682,7 +5696,7 @@ def test_radar_panel_without_debate_has_no_toggle_and_unavailable_is_explicit(ju
         "\nprocess.stdout.write(JSON.stringify([juryPanelHtml(data, {key: null, round: null}),"
         " juryPanelHtml({available: false, reason: 'moments.json absent', moments: []}, {key: null, round: null})]));"
     )
-    out = subprocess.run(["node", "-e", script, json.dumps(jury_payload)], capture_output=True, text=True, encoding="utf-8", check=True).stdout
+    out = _node_run(script, json.dumps(jury_payload))
     plain, unavailable = json.loads(out)
 
     assert "data-jr-round" not in plain
@@ -5908,7 +5922,7 @@ def _run_js(files_and_names, expr, preamble=""):
         source = (STATIC / relative).read_text(encoding="utf-8")
         parts += [_js_def(source, n) for n in names]
     script = "\n".join(parts) + f"\nconsole.log(JSON.stringify({expr}));"
-    out = subprocess.run(["node", "-e", script], capture_output=True, text=True, encoding="utf-8", check=True).stdout
+    out = _node_run(script)
     return json.loads(out)
 
 
@@ -6074,7 +6088,7 @@ const renderCurrent = () => {}; const api = async () => ({}); const toast = () =
 def _run_publish(expr):
     source = (STATIC / "screens" / "publish.js").read_text(encoding="utf-8")
     script = _JS_PRELUDE + _PUB_STUBS + source + f"\nconsole.log(JSON.stringify({expr}));"
-    out = subprocess.run(["node", "-e", script], capture_output=True, text=True, encoding="utf-8", check=True).stdout
+    out = _node_run(script)
     return json.loads(out)
 
 
