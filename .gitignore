@@ -12,3 +12,6 @@ __pycache__/
 research/
 # Worktrees des workers (un par tache)
 .worktrees/
+
+# Presets de chaîne de l'utilisateur (local, comme config.toml)
+presets/
