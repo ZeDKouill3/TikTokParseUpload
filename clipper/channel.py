@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Iterator
 from zoneinfo import ZoneInfo
 
+from clipper import accounts
 from clipper.config import Config, ConfigError, VALID_MODES, load_config, write_config
 
 NAME_RE = re.compile(r"^[a-z0-9_-]{1,40}$")
@@ -135,6 +136,25 @@ def _validate_slots(slots: list[object]) -> None:
             raise ConfigError(f"creneau invalide dans [channel].slots : {slot!r}")
 
 
+def _validate_tiktok_account(channel: dict[str, object], config: Config) -> None:
+    """[channel] tiktok_account : vide (aucun compte relie) ou l'id d'un compte du
+    carnet clipper.accounts ; un id inconnu est une erreur, jamais ignore (SPEC-9225 R2)."""
+    account = channel["tiktok_account"]
+    if not isinstance(account, str):
+        raise ConfigError(f"[channel] tiktok_account : une chaine est attendue, recu {account!r}")
+    if not account:
+        return
+    try:
+        known = {a["id"] for a in accounts.list_accounts(config)}
+    except accounts.AccountsError as exc:
+        raise ConfigError(f"[channel] tiktok_account {account!r} : carnet des comptes illisible ({exc})") from exc
+    if account not in known:
+        raise ConfigError(
+            f"[channel] tiktok_account {account!r} : compte inconnu "
+            "(cree-le dans l'ecran Comptes, puis choisis-le dans la chaine)"
+        )
+
+
 def load_channel(
     name: str,
     *,
@@ -156,6 +176,7 @@ def load_channel(
         channel["display_name"] = name
 
     _validate_slots(channel["slots"])
+    _validate_tiktok_account(channel, config)
 
     if not channel["mode"]:
         channel["mode"] = config.mode

@@ -132,6 +132,29 @@ function accWireGenPanel(body) {
   $("[data-gen-copy]", root).onclick = (e) => accCopy(accUi.gen.value, e.currentTarget);
 }
 
+/* ---------- Profil du navigateur (SPEC-9225 R1) ---------- */
+
+function accBrowserState(a) {
+  const b = a.browser;
+  if (!b) return "";
+  if (b.error) return `<div class="li-sub bad">Profil du navigateur illisible : ${esc(b.error)}</div>`;
+  const when = b.modified_at ? ` · ${esc(new Date(b.modified_at).toLocaleString("fr-FR", { dateStyle: "medium", timeStyle: "short" }))}` : "";
+  return `<div class="li-sub muted" data-acc-browser-state>Profil du navigateur : ${b.present ? `<b>présent</b>${when}` : "<b>absent</b> (jamais connecté)"}</div>`;
+}
+
+async function accBrowserLogin(account, button) {
+  button.disabled = true;
+  try {
+    await api(`/api/accounts/${encodeURIComponent(account.id)}/browser/login`, jsonBody("POST", {}));
+    toast({ kind: "ok", title: "Navigateur ouvert", body: `Connecte-toi à la main dans la fenêtre Chrome, puis ferme-la (${account.label}).` });
+    await accLoad();
+  } catch (err) {
+    toastError("Ouverture du navigateur impossible", err);
+  } finally {
+    button.disabled = false;
+  }
+}
+
 /* ---------- Liste ---------- */
 
 function accRow(a) {
@@ -148,11 +171,13 @@ function accRow(a) {
       <div class="li-title">${a.platform ? `<span class="tag">${esc(a.platform)}</span> ` : ""}${esc(a.label)}</div>
       <div class="li-sub muted mono">${a.username ? esc(a.username) : "—"}</div>
       ${a.notes ? `<div class="li-sub faint">${esc(a.notes)}</div>` : ""}
+      ${accBrowserState(a)}
     </div>
     <div class="acc-pass-cell">${pass}</div>
     <div class="acc-actions">
       ${a.username ? `<button type="button" class="btn btn-xs" data-acc-copy-user="${esc(a.id)}">${icon("copy", "i-xs")}Copier l'identifiant</button>` : ""}
       ${copyPass}
+      <button type="button" class="btn btn-xs" data-acc-browser-login="${esc(a.id)}">${icon("external-link", "i-xs")}Se connecter dans le navigateur</button>
       <button type="button" class="btn btn-xs" data-acc-edit="${esc(a.id)}">${icon("pencil", "i-xs")}Modifier</button>
       <button type="button" class="btn btn-xs btn-bad" data-acc-delete="${esc(a.id)}">${icon("trash-2", "i-xs")}Supprimer</button>
     </div>
@@ -176,6 +201,7 @@ function accWireList(body) {
       renderCurrent();
     } catch (err) { toastError("Mot de passe indisponible", err); }
   }));
+  $$("[data-acc-browser-login]", body).forEach((b) => (b.onclick = () => accBrowserLogin(find(b.dataset.accBrowserLogin), b)));
   $$("[data-acc-edit]", body).forEach((b) => (b.onclick = () => accOpenForm(find(b.dataset.accEdit))));
   $$("[data-acc-delete]", body).forEach((b) => (b.onclick = async () => {
     const account = find(b.dataset.accDelete);

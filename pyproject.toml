@@ -25,6 +25,8 @@ dependencies = [
     # render : titre d'ecran letterbox rasterise (Pillow) et couverture des polices (fonttools).
     "pillow",
     "fonttools",
+    # browser : profils persistants par compte, vrai Chrome visible (connexion manuelle, cookies).
+    "playwright",
 ]
 
 [project.optional-dependencies]

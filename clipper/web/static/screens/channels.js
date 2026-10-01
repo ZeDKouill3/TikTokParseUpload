@@ -25,6 +25,10 @@ const CHAN_RUBRIC_CUSTOM = "custom";
 const CHAN_STALE_MS = 4000;
 const CHAN_SLOTS_SHOWN = 3;
 
+// Comptes du carnet (écran Comptes) proposés pour relier un compte TikTok à la chaîne ;
+// list = null quand GET /api/accounts est refusé (console ouverte à distance) : le message
+// d'erreur est alors affiché, jamais un champ libre de repli.
+const chAccounts = { list: null, error: "" };
 const chUi = { names: null, details: {}, slots: {}, errors: {}, at: 0, loading: null, edit: null, html: "" };
 
 const chHash = () => decodeURIComponent((location.hash.replace(/^#\/?/, "").split("/")[1] || "").split("?")[0]);
@@ -142,6 +146,7 @@ function chOpenNew() {
 function chKind(key, section, def) {
   if (section === "channel" && key === "slots") return "slots";
   if (section === "channel" && key === "mode") return "mode";
+  if (section === "channel" && key === "tiktok_account") return "account";
   if (section === "moments" && key === "rubric_path") return "rubric";
   if (typeof def === "boolean") return "bool";
   if (typeof def === "number") return "number";
@@ -174,11 +179,25 @@ function chRubricEditor(id, value, dis) {
     <span class="hint" data-rubric-now>Grille en vigueur : ${esc(chRubricLabel(value))}</span></div>`;
 }
 
+function chAccountEditor(id, value, dis) {
+  if (chAccounts.list === null) {
+    return `<select class="input" id="${id}" aria-label="Compte TikTok relié" disabled><option value="${esc(value)}" selected>${esc(value || "Aucun compte")}</option></select>
+      <span class="hint">Comptes indisponibles : ${esc(chAccounts.error || "chargement impossible")}</span>`;
+  }
+  const known = chAccounts.list.some((a) => a.id === value);
+  const options = [`<option value=""${value ? "" : " selected"}>Aucun compte</option>`]
+    .concat(chAccounts.list.map((a) => `<option value="${esc(a.id)}"${a.id === value ? " selected" : ""}>${esc(a.label)}${a.platform ? ` (${esc(a.platform)})` : ""}</option>`))
+    .concat(value && !known ? [`<option value="${esc(value)}" selected>${esc(value)} (compte inconnu)</option>`] : []);
+  return `<select class="input" id="${id}" aria-label="Compte TikTok relié"${dis}>${options.join("")}</select>
+    <span class="hint">Compte TikTok relié à la chaîne, créé dans l'écran Comptes ; « Se connecter dans le navigateur » s'y trouve aussi.</span>`;
+}
+
 function chControl(id, kind, value, locked) {
   const dis = locked ? " disabled" : "";
   switch (kind) {
     case "slots": return chSlotsEditor(value, dis);
     case "rubric": return chRubricEditor(id, value, dis);
+    case "account": return chAccountEditor(id, value, dis);
     case "mode": return `<select class="input" id="${id}"${dis}>${CHAN_MODES.map(([k, l]) => `<option value="${k}"${k === value ? " selected" : ""}>${esc(l)}</option>`).join("")}</select>`;
     case "bool": return `<label class="switch"><input type="checkbox" id="${id}"${value ? " checked" : ""}${dis}><span></span></label>`;
     case "number": return `<input class="input mono" id="${id}" type="number" step="any" value="${esc(value)}"${dis}>`;
@@ -435,6 +454,13 @@ async function chOpenEdit(body, name) {
     if (chUi.edit === edit) body.innerHTML = emptyState("circle-alert", "Chaîne illisible", err.message);
     edit.failed = true;
     return;
+  }
+  try {
+    chAccounts.list = await api("/api/accounts");
+    chAccounts.error = "";
+  } catch (err) {
+    chAccounts.list = null;
+    chAccounts.error = String(err.message || err);
   }
   edit.pending = false;
   edit.draft = chDraft(edit.detail.raw);

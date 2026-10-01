@@ -10,11 +10,16 @@ from urllib.parse import parse_qs, urlparse
 
 import yt_dlp
 
+from clipper import browser
+
 log = logging.getLogger(__name__)
 
 CONFIG_DEFAULTS: dict[str, object] = {
     "cookies_file": None,
     "cookies_from_browser": None,
+    # Compte (state/browser/<compte>/) dont les cookies YouTube sont exportes vers un
+    # cookies.txt pour yt-dlp ; reglé, il remplace cookies_from_browser (SPEC-9225 R8).
+    "cookies_profile": "",
     "js_runtimes": "node",
 }
 
@@ -160,6 +165,7 @@ def download(
     *,
     cookies_file: str | Path | None = None,
     cookies_from_browser: str | None = None,
+    cookies_profile: str | None = "",
     js_runtimes: str | None = "node",
     ydl_factory: Callable[[dict[str, Any]], Any] = yt_dlp.YoutubeDL,
 ) -> dict[str, Any]:
@@ -176,6 +182,18 @@ def download(
 
     if meta_file.exists() and video_file.exists():
         return json.loads(meta_file.read_text(encoding="utf-8"))
+
+    if cookies_profile:
+        if cookies_file:
+            raise DownloadError(
+                "[download] cookies_profile et cookies_file sont tous deux regles : "
+                "yt-dlp ne lit qu'un fichier de cookies, retire l'un des deux"
+            )
+        try:
+            cookies_file = browser.export_cookies(cookies_profile)
+        except browser.BrowserError as exc:
+            raise DownloadError(f"cookies du profil {cookies_profile!r} : {exc}") from exc
+        cookies_from_browser = None  # le profil prime sur la lecture des cookies d'un navigateur
 
     video_dir.mkdir(parents=True, exist_ok=True)
     opts = _ydl_opts(video_dir, cookies_file, cookies_from_browser, js_runtimes, video_id)

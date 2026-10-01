@@ -76,7 +76,8 @@ OpenCV installé (`opencv-contrib-python`) — `mediapipe` et `scenedetect` en
 réclament chacun un différent, et `pip` seul ignore ce réglage.
 
 Ou lance `tools/setup.ps1`, qui fait tout ça et vérifie les prérequis (uv,
-Python 3.11, ffmpeg, `claude`, `ank`, GPU optionnel).
+Python 3.11, ffmpeg, `claude`, `ank`, GPU optionnel, Google Chrome pour
+[publier sur TikTok](#publier-sur-tiktok)).
 
 Depuis la release (sans cloner le dépôt) : télécharge le `.whl` de la
 [dernière release](docs/releases/v0.1.0.md), `uv pip install
@@ -162,6 +163,53 @@ Pour l'ouvrir depuis un téléphone du réseau local :
 `python -m clipper serve --host 0.0.0.0`, ce qui exige `[web] token` dans
 `config.toml`. Pas de TLS : ne pas exposer le port sur Internet sans reverse
 proxy TLS. Détails dans [`docs/GUIDE.md`](docs/GUIDE.md).
+
+## Publier sur TikTok
+
+La publication passe par un **vrai Chrome visible** piloté par Playwright, avec
+un profil par compte rangé dans `state/browser/<compte>/` (ignoré par git,
+jamais copié hors de `state/`). Le programme ne saisit **jamais** ton
+identifiant ni ton mot de passe : tu te connectes à la main, une fois.
+
+1. **Relier un compte** — dans la console, écran **Comptes**, ajoute le compte
+   TikTok (libellé, plateforme) ; dans l'écran **Chaînes**, ouvre la chaîne et
+   choisis ce compte dans `tiktok_account` (ou écris `tiktok_account = "<id>"`
+   dans la table `[channel]` du preset). Un identifiant inconnu est refusé.
+2. **Se connecter une fois** — bouton **Se connecter dans le navigateur** du
+   compte (console ouverte sur `127.0.0.1`/`localhost` seulement), ou
+   `python -m clipper browser login <compte>` (`--url` pour une autre page,
+   TikTok par défaut). Chrome s'ouvre sur la page de connexion : connecte-toi,
+   puis ferme la fenêtre. L'écran Comptes affiche l'état du profil (absent ou
+   présent, avec la date).
+3. **Prérequis** — Google Chrome installé et la dépendance `playwright`
+   (installée par `tools/setup.ps1` ou `uv pip install -e ".[test]"`). Sans
+   Chrome ou sans Playwright, la commande échoue avec un message qui donne la
+   commande à lancer (`playwright install chrome`) : aucun navigateur de
+   remplacement n'est utilisé.
+
+**Risques assumés** : piloter TikTok par un navigateur n'est pas prévu par ses
+conditions d'utilisation ; le compte peut subir un captcha, une vérification
+ou une restriction. **Captcha, vérification ou page inattendue = arrêt
+immédiat** : le programme ne résout ni ne contourne jamais un captcha, il
+laisse la main à l'utilisateur et remonte l'échec.
+
+## Cookies YouTube
+
+Pour télécharger une vidéo qui exige d'être connecté (âge, abonnés...), yt-dlp
+lit les cookies d'un profil du navigateur de clipper plutôt que ceux de
+Firefox :
+
+1. connecte le profil à YouTube : `python -m clipper browser login <compte>
+   --url https://www.youtube.com` (connexion à la main, puis fermeture de la
+   fenêtre) ;
+2. dans `config.toml`, règle `[download] cookies_profile = "<compte>"`.
+
+Au téléchargement, les cookies YouTube/Google du profil sont exportés vers
+`state/browser/<compte>/cookies.txt` (format Netscape, lisible par toi seul ;
+les cookies TikTok n'en sortent pas) et passés à yt-dlp. `cookies_profile`
+prime sur `cookies_from_browser` ; le combiner avec `cookies_file` est une
+erreur. Profil absent ou sans cookie YouTube : le téléchargement s'arrête avec
+un message, sans repli.
 
 ## Coûts et performances
 
