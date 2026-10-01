@@ -18,6 +18,8 @@ dependencies = [
     "fastapi",
     "uvicorn",
     "tomli-w",
+    # accounts : coffre de l'OS (Gestionnaire d'identification Windows) pour les mots de passe.
+    "keyring",
     # zoneinfo (clipper.channel) n'embarque pas la base IANA sur Windows.
     "tzdata; sys_platform == 'win32'",
     # render : titre d'ecran letterbox rasterise (Pillow) et couverture des polices (fonttools).
