@@ -1678,17 +1678,19 @@ def _accounts_overview(config: Config) -> list[dict[str, Any]]:
     return [_account_overview(config, a) for a in _accounts_call(accounts_mod.list_accounts, config)]
 
 
-def _account_ready(config: Config, account_id: str, ready: Any) -> dict[str, Any]:
-    """Coche ou decoche « pret a publier » : la connexion est verifiee a l'instant (R2), cocher sans connexion
-    verifiee est refuse avec la raison (R3)."""
+def _account_resolve(config: Config, account_id: str) -> dict[str, Any]:
+    """« J'ai regle le probleme » (SPEC-e500 R3) : revérifie la connexion (R2), puis efface l'arret R4 en
+    attente ; la case suit la connexion revérifiee. Cookies illisibles : 409, l'arret reste en attente."""
     account = next((a for a in _accounts_call(accounts_mod.list_accounts, config) if a["id"] == account_id), None)
     if account is None:
         raise HTTPException(status_code=404, detail=f"compte introuvable : {account_id!r}")
-    if ready is True:
-        verified = _verify_login(config, account)
-        if verified.get("login_error") is not None:
-            raise HTTPException(status_code=409, detail=f"« prêt à publier » refusé : connexion non vérifiable : {verified['login_error']}")
-    return _accounts_call(accounts_mod.set_ready, config, account_id, ready)
+    verified = _verify_login(config, account)
+    if verified.get("login_error") is not None:
+        raise HTTPException(status_code=409, detail=f"connexion non vérifiable : {verified['login_error']} "
+                            "(l'arrêt reste en attente)")
+    out = _accounts_call(accounts_mod.clear_halt, config, account_id)
+    out.pop("auto_checked", None), out.pop("auto_unchecked", None)
+    return out
 
 
 def _publish_accounts(config: Config) -> list[dict[str, Any]]:
@@ -1704,7 +1706,7 @@ def _require_ready_account(config: Config, account_id: Any) -> str:
         raise HTTPException(status_code=409, detail=f"compte inconnu : {account_id!r} (écran Comptes)")
     if not found["ready_to_publish"]:
         raise HTTPException(status_code=409, detail=f"compte {found['label'] or account_id} non prêt à publier : "
-                            "coche « prêt à publier » dans l'écran Comptes (connexion TikTok vérifiée)")
+                            "« prêt à publier » est automatique : connecte-le (Se connecter) ou règle l'arrêt en attente dans l'écran Comptes")
     return found["id"]
 
 
@@ -2275,11 +2277,16 @@ def create_app(config: Config | None = None) -> FastAPI:
         return [{**a, "browser": _browser_state(a["id"])} for a in listed]
 
     @app.put("/api/accounts/{account_id}/ready")
-    async def accounts_ready(account_id: str, request: Request) -> dict[str, Any]:
-        body = await _accounts_json(request)
-        if not isinstance(body, dict) or set(body) != {"ready"}:
-            raise HTTPException(status_code=422, detail="corps invalide : {\"ready\": true|false} attendu")
-        return await run_in_threadpool(_account_ready, config, account_id, body["ready"])
+    async def accounts_ready(account_id: str) -> dict[str, Any]:
+        raise HTTPException(
+            status_code=405, headers={"Allow": "GET"},
+            detail="« prêt à publier » est automatique (connexion TikTok vérifiée, aucun arrêt en attente) : "
+                   "il ne se coche ni ne se décoche à la main ; clique sur « Se connecter » ou « J'ai réglé le problème »",
+        )
+
+    @app.post("/api/accounts/{account_id}/resolve")
+    async def accounts_resolve(account_id: str) -> dict[str, Any]:
+        return await run_in_threadpool(_account_resolve, config, account_id)
 
     @app.post("/api/accounts", status_code=201)
     async def accounts_add(request: Request) -> dict[str, Any]:
