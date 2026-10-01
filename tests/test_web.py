@@ -3652,7 +3652,7 @@ def test_stats_issue_text_renders_objects_and_strings_readably(tmp_path):
     start = js.index("function statsIssueText")
     end = js.index("\n}\n", start) + 3
     script = js[start:end] + f"\nconsole.log(JSON.stringify([statsIssueText({json.dumps(_QA_ISSUE)}), statsIssueText('hors cadre')]));"
-    out = subprocess.run(["node", "-e", script], capture_output=True, text=True, check=True).stdout
+    out = subprocess.run(["node", "-e", script], capture_output=True, text=True, encoding="utf-8", check=True).stdout
     assert json.loads(out) == ["image noire de 2 s", "hors cadre"]
 
 
@@ -3965,7 +3965,7 @@ def test_stats_clip_pagination_reveals_50_more_rows_per_click():
     start = js.index("function statsMoreCount")
     end = js.index("\n}\n", start) + 3
     script = "const STATS_CLIPS_PAGE_SIZE = 50;\n" + js[start:end] + "\nconsole.log(JSON.stringify([statsMoreCount(120, 50), statsMoreCount(120, 100), statsMoreCount(30, 50)]));"
-    out = subprocess.run(["node", "-e", script], capture_output=True, text=True, check=True).stdout
+    out = subprocess.run(["node", "-e", script], capture_output=True, text=True, encoding="utf-8", check=True).stdout
     assert json.loads(out) == [50, 20, 0]
 
 
@@ -4215,7 +4215,7 @@ def test_stats_clip_sort_orders_by_column_with_missing_values_last():
         + "\nstatsUi.sort = { key: 'views', dir: 'asc' }; statsSortInPlace(clips);"
         + "\nconsole.log(JSON.stringify([desc, clips.map(c => c.clip_id).join('')]));"
     )
-    out = subprocess.run(["node", "-e", script], capture_output=True, text=True, check=True).stdout
+    out = subprocess.run(["node", "-e", script], capture_output=True, text=True, encoding="utf-8", check=True).stdout
     assert json.loads(out) == ["cab", "acb"]
 
 
@@ -5123,7 +5123,7 @@ def test_every_static_javascript_file_parses():
     assert files
     bad = []
     for f in files:
-        run = subprocess.run(["node", "--check", str(f)], capture_output=True, text=True)
+        run = subprocess.run(["node", "--check", str(f)], capture_output=True, text=True, encoding="utf-8")
         if run.returncode != 0:
             bad.append(f"{f.name}: {run.stderr.strip().splitlines()[-1] if run.stderr.strip() else run.returncode}")
     assert not bad, bad
@@ -5396,7 +5396,7 @@ def test_the_form_lists_only_clips_to_validate_or_approved_newest_first():
         {"video_id": "v3", "clip_id": "01", "ready": False, "publish_status": "not_ready", "created_at": "2026-10-02T10:00:00"},
     ]
     script = start_key + fn + f"\nconsole.log(JSON.stringify(pubFormClips({json.dumps(clips)}).map(pubKey)));"
-    out = subprocess.run(["node", "-e", script], capture_output=True, text=True, check=True).stdout
+    out = subprocess.run(["node", "-e", script], capture_output=True, text=True, encoding="utf-8", check=True).stdout
     assert json.loads(out) == ["v2/01", "v1/01"]  # plus recents en haut ; ni refuses, ni publies, ni deja en file
 
 
@@ -5598,7 +5598,7 @@ def _run_radar(payload, moment_index=0, round_index=None):
         "\nconst data = JSON.parse(process.argv[1]);"
         f"\nprocess.stdout.write(juryRadarSvg(data, data.moments[{moment_index}], {json.dumps(round_index)}));"
     )
-    return subprocess.run(["node", "-e", script, json.dumps(payload)], capture_output=True, text=True, check=True).stdout
+    return subprocess.run(["node", "-e", script, json.dumps(payload)], capture_output=True, text=True, encoding="utf-8", check=True).stdout
 
 
 def test_radar_js_is_wired_in_the_page_before_videos_and_has_no_external_library():
@@ -5614,7 +5614,7 @@ def test_radar_js_is_wired_in_the_page_before_videos_and_has_no_external_library
 @pytest.mark.skipif(shutil.which("node") is None, reason="node absent du PATH")
 def test_node_check_of_every_static_script():
     for js in sorted(STATIC.rglob("*.js")):
-        subprocess.run(["node", "--check", str(js)], capture_output=True, text=True, check=True)
+        subprocess.run(["node", "--check", str(js)], capture_output=True, text=True, encoding="utf-8", check=True)
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node absent du PATH")
@@ -5659,7 +5659,7 @@ def test_radar_panel_shows_veto_threshold_reason_and_toggle(jury_payload):
         "\nconst ui = {key: null, round: null};"
         "\nprocess.stdout.write(JSON.stringify([juryPanelHtml(data, ui), juryPanelHtml(data, {key: data.moments[4].key, round: null})]));"
     )
-    out = subprocess.run(["node", "-e", script, json.dumps(jury_payload)], capture_output=True, text=True, check=True).stdout
+    out = subprocess.run(["node", "-e", script, json.dumps(jury_payload)], capture_output=True, text=True, encoding="utf-8", check=True).stdout
     retained, vetoed = json.loads(out)
 
     assert "data-jr-round" in retained                      # interrupteur avant / après débat (il y a eu débat)
@@ -5680,7 +5680,7 @@ def test_radar_panel_without_debate_has_no_toggle_and_unavailable_is_explicit(ju
         "\nprocess.stdout.write(JSON.stringify([juryPanelHtml(data, {key: null, round: null}),"
         " juryPanelHtml({available: false, reason: 'moments.json absent', moments: []}, {key: null, round: null})]));"
     )
-    out = subprocess.run(["node", "-e", script, json.dumps(jury_payload)], capture_output=True, text=True, check=True).stdout
+    out = subprocess.run(["node", "-e", script, json.dumps(jury_payload)], capture_output=True, text=True, encoding="utf-8", check=True).stdout
     plain, unavailable = json.loads(out)
 
     assert "data-jr-round" not in plain
