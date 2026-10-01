@@ -5,7 +5,7 @@ slug: console-v2-corrections-du-quatri-me-tour-ancres
 title: "console v2 : corrections du quatrième tour (ancres de Réglages, échecs actionnables, vignettes des vidéos, statistiques par chaîne)"
 created: 2026-10-01T12:17:59Z
 author: nicoc@zedk_ordi
-status: in_progress
+status: done
 scope:
   - clipper/web/app.py
   - clipper/web/static/**
@@ -20,8 +20,15 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/879da5df9cca@507c962
+    tree: scope/30086fc13462
+    criteria: 39b4c447bb6c
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 2
+version: 3
 ---
 
 Quatrième tour de la console v2, utilisation réelle par l'utilisateur (2026-10-01). Voir les 4 points du critère.
