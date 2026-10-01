@@ -1170,3 +1170,14 @@ input[type="color"] { width: 36px; height: 36px; padding: 2px; border-radius: va
 .dash .panel > .list-item.dash-problem .chip { margin-top: 2px; }
 .dash .dash-problem .reason { margin-top: 8px; }
 .dash .job { grid-template-columns: minmax(0, 1fr) auto; }
+
+/* ---------- Ecran Clips (TASK-3b9c) ---------- */
+.clip-poster video, .phone video { width: 100%; height: 100%; object-fit: cover; display: block; background: #000; }
+.parts button.part { background: none; color: inherit; font: inherit; font-size: 12px; cursor: pointer; }
+.drawer .field .btn { align-self: flex-start; }
+.drawer .input:disabled { opacity: 0.6; cursor: not-allowed; }
+.drawer-foot a.btn { text-decoration: none; }
+@media (max-width: 900px) {
+  .drawer-body { grid-template-columns: minmax(0, 1fr); }
+  .drawer-foot .btn { min-height: 44px; }
+}
