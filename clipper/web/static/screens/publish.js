@@ -1,11 +1,12 @@
-/* Ecran « Publication » (SPEC-c100 E6, SPEC-74e9 §4). Lit GET /api/publish?channel=&week= :
-   les creneaux de la semaine (avec le clip planifie ou libres), la file des clips
-   approuves sans creneau et les publies / en echec de la semaine. Un clip se glisse
-   (souris ou appui long au toucher) vers un creneau libre : POST .../move. En attendant
-   l'API TikTok, publier = telecharger + copier + « Marquer publie » a la main ; la
-   colonne statut et le compte cible gardent la place de l'autopost. Aucune logique
-   serveur ici : tout passe par l'API. Charge apres screens.js dont il remplace
-   l'entree Screens.publish. */
+/* Ecran « Publication » (SPEC-c100 E6, SPEC-74e9 §4, SPEC-1ed3), agencement de la maquette
+   docs/maquette-web-v2 : le CALENDRIER de la semaine est la vue principale (colonne de droite) ;
+   a gauche, « Nouvelle publication », la liste des publications en cours et les clips approuves
+   a publier. Lit GET /api/publish?channel=&week= (creneaux de la semaine, publications entre les
+   creneaux, publies / echecs) et GET /api/publications. Publier = « Nouvelle publication » (clip,
+   compte, Maintenant ou une date) ; les creneaux de chaine sont facultatifs : un clip approuve se
+   glisse (souris ou appui long au toucher) vers un creneau libre : POST .../move. Toutes les
+   heures affichees sont celles de Paris (Europe/Paris). Aucune logique serveur ici : tout passe
+   par l'API. Charge apres screens.js dont il remplace l'entree Screens.publish. */
 "use strict";
 
 const PUB_STATUS = {
@@ -35,9 +36,19 @@ const pubAccountLabel = (id) => {
 const pubKey = (c) => `${c.video_id}/${c.clip_id}`;
 const pubStatus = (c) => PUB_STATUS[c.publish_status] || { label: c.publish_status, cls: "pending" };
 const pubTitle = (c) => c.screen_title || c.title || c.clip_id;
-const pubChip = (c) => { const s = c.waiting_reason ? { label: "En attente du compte", cls: "warn" } : (PUB_TIKTOK[c.tiktok_status] || pubStatus(c)); return `<span class="chip ${s.cls}">${esc(s.label)}</span>`; };
+/* Libelle et classe du statut d'une publication. Programmee sur TikTok = pas encore en ligne : « Publiée » seulement
+   une fois l'heure passee (`tiktok_live`, calcule par le serveur). */
+function pubStatusOf(c) {
+  if (c.waiting_reason) return { label: "En attente du compte", cls: "warn" };
+  if (c.tiktok_status === "scheduled_on_tiktok" && c.tiktok_live) return PUB_TIKTOK.published;
+  return PUB_TIKTOK[c.tiktok_status] || pubStatus(c);
+}
+const pubChip = (c) => { const s = pubStatusOf(c); return `<span class="chip ${s.cls}">${esc(s.label)}</span>`; };
 const pubCaptionText = (c) => [c.description || "", (c.hashtags || []).join(" ")].filter(Boolean).join("\n\n");
-// Les dates de l'API sont deja dans le fuseau de la chaine : on les lit telles quelles.
+// Toutes les heures affichees sont celles de Paris (Europe/Paris, ete +02:00 / hiver +01:00), jamais un
+// decalage fixe : le serveur donne les champs *_paris (zoneinfo) que l'on lit tels quels, et tout autre
+// instant passe par Intl avec le fuseau Europe/Paris.
+const PUB_TZ = "Europe/Paris";
 const pubDate = (iso) => iso.slice(0, 10);
 const pubTime = (iso) => iso.slice(11, 16);
 const pubUtc = (ymd) => { const [y, m, d] = ymd.split("-").map(Number); return new Date(Date.UTC(y, m - 1, d)); };
@@ -45,11 +56,31 @@ const pubFmt = (ymd, opts) => pubUtc(ymd).toLocaleDateString("fr-FR", Object.ass
 const pubShift = (ymd, days) => { const d = pubUtc(ymd); d.setUTCDate(d.getUTCDate() + days); return d.toISOString().slice(0, 10); };
 const pubDayIndex = (ymd, start) => Math.round((pubUtc(ymd) - pubUtc(start)) / 86400000);
 const pubSlotLabel = (iso) => `${pubFmt(pubDate(iso), { weekday: "long", day: "numeric", month: "long" })} à ${pubTime(iso)}`;
+const pubWhen = (iso) => new Date(iso).toLocaleString("fr-FR", { weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit", timeZone: PUB_TZ });
+
+/* Heure murale de Paris d'un instant, au format du champ datetime-local (AAAA-MM-JJTHH:MM). */
+const pubLocalInput = (iso) => new Date(iso).toLocaleString("sv-SE", { timeZone: PUB_TZ, hour12: false, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" }).replace(" ", "T");
+
+/* Instant (Date) d'une heure murale de Paris saisie dans un champ datetime-local : le decalage d'ete ou d'hiver
+   est celui de Paris a cette date, pas celui du navigateur. */
+function pubParisInstant(local) {
+  const [ymd, hm] = local.split("T");
+  const [y, m, d] = ymd.split("-").map(Number);
+  const [h, mi] = hm.split(":").map(Number);
+  const wanted = Date.UTC(y, m - 1, d, h, mi);
+  let guess = wanted;
+  for (let i = 0; i < 2; i++) {
+    const [gy, gm, gd] = pubLocalInput(new Date(guess).toISOString()).split("T")[0].split("-").map(Number);
+    const [gh, gmi] = pubLocalInput(new Date(guess).toISOString()).split("T")[1].split(":").map(Number);
+    guess += wanted - Date.UTC(gy, gm - 1, gd, gh, gmi);
+  }
+  return new Date(guess);
+}
 
 function pubClips() {
   const d = pubUi.data;
   if (!d) return [];
-  return [...d.unscheduled, ...d.slots.map((s) => s.clip).filter(Boolean), ...d.done];
+  return [...d.unscheduled, ...d.slots.map((s) => s.clip).filter(Boolean), ...(d.off_slot || []), ...d.done];
 }
 const pubFind = (key) => pubClips().find((c) => pubKey(c) === key) || null;
 
@@ -121,33 +152,48 @@ function pubPost(c, extra) {
 }
 
 function pubCalendar(d) {
-  const times = Array.from(new Set(d.slots.map((s) => pubTime(s.slot_at)))).sort();
+  const off = d.off_slot || [];
+  const times = Array.from(new Set([...d.slots.map((s) => pubTime(s.slot_at_paris)), ...off.map((c) => pubTime(c.slot_at_paris))])).sort();
   const bySlot = {};
-  d.slots.forEach((s) => { bySlot[`${pubDayIndex(pubDate(s.slot_at), d.week_start)}|${pubTime(s.slot_at)}`] = s; });
-  const today = new Date().toLocaleDateString("sv-SE", { timeZone: d.timezone });
+  d.slots.forEach((s) => { bySlot[`${pubDayIndex(pubDate(s.slot_at_paris), d.week_start)}|${pubTime(s.slot_at_paris)}`] = s; });
+  const byOff = {};
+  off.forEach((c) => { byOff[`${pubDayIndex(pubDate(c.slot_at_paris), d.week_start)}|${pubTime(c.slot_at_paris)}`] = c; });
+  const today = new Date().toLocaleDateString("sv-SE", { timeZone: PUB_TZ });
   const days = Array.from({ length: 7 }, (_, i) => pubShift(d.week_start, i));
   let h = `<div class="cal-h"></div>${days.map((ymd) => `<div class="cal-h${ymd === today ? " today" : ""}"><div class="d">${esc(pubFmt(ymd, { weekday: "short" }))}</div><div class="n">${esc(pubFmt(ymd, { day: "numeric" }))}</div></div>`).join("")}`;
   times.forEach((time) => {
     h += `<div class="cal-t">${esc(time)}</div>`;
     days.forEach((ymd, i) => {
-      const s = bySlot[`${i}|${time}`];
-      if (!s) { h += `<div class="cal-c off"></div>`; return; }
-      const past = Date.parse(s.slot_at) < Date.now();
-      h += `<div class="cal-c slot${past ? " past" : ""}${s.free ? " free" : ""}" data-slot-at="${esc(s.slot_at)}" data-slot="${esc(time)}" aria-label="Créneau ${esc(pubSlotLabel(s.slot_at))}${s.free ? ", libre" : ""}">${s.clip ? pubPost(s.clip) : ""}</div>`;
+      const s = bySlot[`${i}|${time}`], manual = byOff[`${i}|${time}`];
+      if (s) {
+        const past = Date.parse(s.slot_at) < Date.now();
+        h += `<div class="cal-c slot${past ? " past" : ""}${s.free ? " free" : ""}" data-slot-at="${esc(s.slot_at)}" data-slot="${esc(time)}" aria-label="Créneau ${esc(pubSlotLabel(s.slot_at_paris))}${s.free ? ", libre" : ""}">${s.clip ? pubPost(s.clip) : ""}</div>`;
+      } else if (manual) {
+        h += `<div class="cal-c manual" aria-label="Publication programmée ${esc(pubSlotLabel(manual.slot_at_paris))}">${pubPost(manual)}</div>`;
+      } else h += `<div class="cal-c off"></div>`;
     });
   });
   return `<div class="cal-wrap"><div class="cal" id="pub-cal">${h}</div></div>`;
 }
 
+/* Clips approuves sans moment : « Publier maintenant » ouvre le formulaire, ou glisse-les sur un creneau libre. */
 function pubQueue(d) {
   const items = d.unscheduled;
   return `<section>
     <div class="section-title">${icon("inbox")}À publier <span class="more">${items.length ? `${items.length} clip${items.length > 1 ? "s" : ""}` : ""}</span></div>
-    <div class="queue" id="pub-queue">${items.length ? items.map((c) => pubPost(c, `<span class="grow"></span><span class="muted">${icon("grip-vertical", "i-xs")}</span>`)).join("")
-      : `<div class="panel empty" style="padding:24px"><div class="empty-art">${icon("circle-check")}</div><p>Tout est planifié.</p></div>`}</div>
-    ${items.length && d.slots.length ? `<p class="hint muted" style="font-size:12px;margin-top:8px">Glisse un clip sur un créneau libre du calendrier (appui long sur mobile).</p>` : ""}
-    ${items.length && !d.slots.length ? `<p class="hint muted" style="font-size:12px;margin-top:8px">${esc(d.reason || "Aucun créneau cette semaine.")}</p>` : ""}
+    <div class="queue" id="pub-queue">${items.length ? items.map((c) => pubPost(c, `<button type="button" class="btn btn-xs btn-primary" data-publish-now="${esc(pubKey(c))}">Publier maintenant</button>`)).join("")
+      : `<div class="panel empty" style="padding:24px"><div class="empty-art">${icon("circle-check")}</div><p>Rien à publier en attente.</p></div>`}</div>
+    ${items.length && d.slots.length ? `<p class="hint muted" style="font-size:12px;margin-top:8px">Ou glisse un clip sur un créneau libre du calendrier (appui long sur mobile).</p>` : ""}
   </section>`;
+}
+
+/* Ligne de detail d'une publication terminee : « programmee » tant que l'heure n'est pas passee, « publie » ensuite. */
+function pubDoneLine(c) {
+  const live = c.publish_status !== "published" || c.tiktok_status !== "scheduled_on_tiktok" || c.tiktok_live;
+  const state = c.publish_status === "failed" ? "échec"
+    : live ? "publié" : `programmée sur TikTok${c.tiktok_publish_at ? `, en ligne le ${pubWhen(c.tiktok_publish_at)}` : ""}`;
+  const at = c.publish_status === "published" && !live ? "" : (c.publish_status === "published" ? (c.published_at_paris || c.slot_at_paris) : c.slot_at_paris);
+  return `${state}${at ? ` · ${pubSlotLabel(at)}` : ""}`;
 }
 
 function pubDone(d) {
@@ -155,14 +201,15 @@ function pubDone(d) {
   return `<section>
     <div class="section-title">${icon("circle-check")}Publiés et échecs de la semaine <span class="more">${d.done.length}</span></div>
     <div class="panel">${d.done.map((c) => `<div class="list-item pub-done" data-post="${esc(pubKey(c))}" tabindex="0" role="button">
-      <div class="mini-clip">${c.video_url ? `<img loading="lazy" decoding="async" width="36" height="64" src="${esc(c.thumbnail_url)}" alt="" tabindex="-1">` : ""}</div>
+      <div class="mini-clip">${c.video_url ? `<img loading="lazy" decoding="async" width="36" height="64" src="${esc(c.thumbnail_url)}" alt="">` : ""}</div>
       <div class="li-main grow"><div class="li-title">${esc(pubTitle(c))}</div>
-        <div class="li-sub muted">${c.publish_status === "published" ? "publié" : "échec"}${c.slot_at ? ` · ${esc(pubSlotLabel(c.slot_at))}` : ""}${c.account ? ` · ${esc(pubAccountLabel(c.account))}` : ""}${c.publish_error ? ` · ${esc(c.publish_error)}` : ""}${c.post_url ? ` · <a href="${esc(c.post_url)}" target="_blank" rel="noopener">voir sur TikTok</a>` : ""}</div></div>
+        <div class="li-sub muted">${esc(pubDoneLine(c))}${c.account ? ` · ${esc(pubAccountLabel(c.account))}` : ""}${c.publish_error ? ` · ${esc(c.publish_error)}` : ""}${c.post_url ? ` · <a href="${esc(c.post_url)}" target="_blank" rel="noopener">voir sur TikTok</a>` : ""}</div></div>
       ${pubChip(c)}</div>`).join("")}</div>
   </section>`;
 }
 
 function pubToolbar(channels, d) {
+  if (!channels.length) return "";
   const weekLabel = d ? `${pubFmt(d.week_start, { day: "numeric", month: "short" })} au ${pubFmt(d.week_end, { day: "numeric", month: "short", year: "numeric" })}` : "";
   const account = d ? (d.tiktok_account ? `Compte cible : <b>${esc(d.tiktok_account)}</b>` : `<span class="muted">Aucun compte TikTok renseigné (<span class="mono">tiktok_account</span>)</span>`) : "";
   return `<div class="toolbar pub-toolbar">
@@ -177,19 +224,27 @@ function pubToolbar(channels, d) {
   </div>`;
 }
 
+const PUB_HELP = `<div class="banner">${icon("info", "i-lg")}<p><b>Publier :</b> « Nouvelle publication » choisit un clip, un compte, puis Maintenant ou une date ; le worker publie sur TikTok (Chrome visible). Un arrêt (captcha, connexion expirée...) met la publication en échec avec une capture : « Réessayer » la relance. Les créneaux de chaîne sont facultatifs : ils servent à planifier un clip approuvé en le glissant sur le calendrier.</p></div>`;
+
+/* Zone principale : le calendrier de la semaine. Le message « aucun creneau » n'y apparait qu'une fois. */
+function pubCalendarZone(channels, d) {
+  if (!channels.length) return `<p class="reason" data-no-slot>Aucune chaîne : crée-en une (écran Chaînes) pour voir le calendrier de ses créneaux. « Nouvelle publication » publie sans chaîne, avec un compte.</p>`;
+  if (pubUi.error) return `<p class="reason bad">Chargement impossible : ${esc(pubUi.error.message || pubUi.error)}</p>`;
+  if (!d) return `<div class="skeleton skeleton-line"></div><div class="skeleton skeleton-card"></div>`;
+  if (d.slots.length || (d.off_slot || []).length) return `<section>${pubCalendar(d)}</section>`;
+  return `<p class="reason" data-no-slot>${esc(d.reason || "Aucun créneau cette semaine.")} (facultatif : « Nouvelle publication » publie sans créneau.)</p>`;
+}
+
+/* Agencement de la maquette : a gauche Nouvelle publication, les publications en cours et les clips a publier ;
+   a droite le calendrier de la semaine, puis les publies et echecs de la semaine. */
+function pubLayoutHtml(channels, d, postsHtml) {
+  const side = `${postsHtml}${d ? pubQueue(d) : ""}`;
+  const main = `${pubToolbar(channels, d)}${pubCalendarZone(channels, d)}${d ? pubDone(d) : ""}`;
+  return `<div class="pub-pad">${PUB_HELP}<div class="grid g-side pub-grid" style="align-items:start"><div class="stack pub-side">${side}</div><div class="stack pub-main">${main}</div></div></div>`;
+}
+
 function pubView(body, channels) {
-  const d = pubUi.data;
-  let content;
-  if (pubUi.error) content = `<p class="reason bad">Chargement impossible : ${esc(pubUi.error.message || pubUi.error)}</p>`;
-  else if (!d) content = `<div class="skeleton skeleton-line"></div><div class="skeleton skeleton-card"></div>`;
-  else if (!d.slots.length && !d.unscheduled.length && !d.done.length) {
-    content = emptyState("send", "Rien à publier", "Approuve des clips : ils apparaîtront ici avec leurs créneaux." + (d.reason ? ` Cette chaîne n'a pas de créneau : ${d.reason}.` : ""));
-  } else {
-    content = `<div class="banner">${icon("info", "i-lg")}<p><b>Le worker publie sur TikTok au créneau</b> (compte cible ci-dessus, Chrome visible). Un arrêt (captcha, connexion expirée...) met le clip en échec avec une capture : « Réessayer » le relance. Tu peux aussi publier à la main : télécharge, copie la description, puis « Marquer publié ».</p></div>
-      <div class="grid g-side pub-grid" style="align-items:start"><div class="stack">${pubQueue(d)}</div>
-      <div class="stack"><section>${d.slots.length ? pubCalendar(d) : `<p class="reason">${esc(d.reason || "Aucun créneau cette semaine.")}</p>`}</section>${pubDone(d)}</div></div>`;
-  }
-  const html = `<div class="pub-pad">${pubPostsSection()}${pubToolbar(channels, d)}${content}</div>`;
+  const html = pubLayoutHtml(channels, pubUi.data, pubPostsSection());
   if (pubUi.html === html && body.childElementCount) return false; // rien de change : on garde les vignettes et le survol
   pubUi.html = html;
   body.innerHTML = html;
@@ -199,11 +254,10 @@ function pubView(body, channels) {
 
 /* ---------- Publications pilotees : liste, statuts, modifier / annuler (SPEC-1ed3 R5) ---------- */
 
-const pubWhen = (iso) => new Date(iso).toLocaleString("fr-FR", { weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
-const pubPostChip = (p) => {
-  const s = p.waiting_reason ? { label: "En attente du compte", cls: "warn" } : (PUB_TIKTOK[p.tiktok_status] || { label: p.publish_status, cls: "pending" });
-  return `<span class="chip ${s.cls}">${esc(s.label)}</span>`;
-};
+/* Une publication « terminee » (publiee, ou programmee sur TikTok) quitte la liste en cours : elle reste au calendrier. */
+const pubIsOngoing = (p) => p.publish_status !== "published";
+/* Entree approuvee a l'ancienne, sans creneau ni Maintenant/Programmer : elle attend sans le dire. */
+const pubNeedsMoment = (p) => p.publish_status === "approved" && !p.publish_mode && !p.slot_at;
 
 function pubPostRow(p) {
   const mode = p.publish_mode === "scheduled" ? "programmée" : "maintenant";
@@ -213,27 +267,26 @@ function pubPostRow(p) {
     <div class="mini-clip">${p.thumbnail_url ? `<img loading="lazy" decoding="async" width="36" height="64" src="${esc(p.thumbnail_url)}" alt="">` : ""}</div>
     <div class="li-main grow"><div class="li-title">${esc(pubTitle(p))}</div>
       <div class="li-sub muted">${esc(detail)}</div>
+      ${pubNeedsMoment(p) ? `<div class="li-sub warn" data-needs-moment>choisis Maintenant ou une date (Modifier)</div>` : ""}
       ${p.waiting_reason ? `<div class="li-sub warn" data-waiting-reason>${esc(p.waiting_reason)}</div>` : ""}
       ${p.publish_error ? `<div class="li-sub bad">Échec : ${esc(p.publish_error)}</div>` : ""}
       ${p.postponed_reason ? `<div class="li-sub muted">${esc(p.postponed_reason)}</div>` : ""}
-      ${p.capture_url ? `<a href="${esc(p.capture_url)}" target="_blank" rel="noopener">voir la capture d'écran</a>` : ""}
-      ${p.post_url ? `<a href="${esc(p.post_url)}" target="_blank" rel="noopener">voir sur TikTok</a>` : ""}
-      ${p.tiktok_status === "scheduled_on_tiktok" && !p.post_url ? `<span class="muted">programmée sur TikTok${p.post_note ? ` : ${esc(p.post_note)}` : ""}</span>` : ""}</div>
-    ${pubPostChip(p)}
-    <div class="row" style="gap:6px">
+      ${p.capture_url ? `<a href="${esc(p.capture_url)}" target="_blank" rel="noopener">voir la capture d'écran</a>` : ""}</div>
+    ${pubChip(p)}
+    <div class="row wrap" style="gap:6px">
       ${p.publish_status === "failed" ? `<button type="button" class="btn btn-xs btn-primary" data-pub-retry>Réessayer</button>` : ""}
       ${p.editable ? `<button type="button" class="btn btn-xs" data-pub-edit>Modifier</button><button type="button" class="btn btn-xs btn-ghost" data-pub-cancel>Annuler</button>` : ""}
     </div></div>`;
 }
 
 function pubPostsSection() {
-  const head = `<div class="section-title">${icon("send")}Publications <span class="more">${pubPosts.data ? pubPosts.data.publications.length || "" : ""}</span>
+  const rows = pubPosts.data ? pubPosts.data.publications.filter(pubIsOngoing) : [];
+  const head = `<div class="section-title">${icon("send")}Publications <span class="more">${rows.length || ""}</span>
     <span class="grow"></span><button type="button" class="btn btn-primary btn-xs" data-pub-new>${icon("plus", "i-xs")}Nouvelle publication</button></div>`;
   if (pubPosts.error) return `<section>${head}<p class="reason bad">Chargement impossible : ${esc(pubPosts.error.message || pubPosts.error)}</p></section>`;
   if (!pubPosts.data) return `<section>${head}<div class="skeleton skeleton-line"></div></section>`;
-  const rows = pubPosts.data.publications;
   return `<section>${head}${rows.length ? `<div class="panel" id="pub-posts">${rows.map(pubPostRow).join("")}</div>`
-    : `<p class="muted" style="font-size:13px">Aucune publication : « Nouvelle publication » choisit un clip, le compte, maintenant ou à une date.</p>`}</section>`;
+    : `<p class="muted" style="font-size:13px">Aucune publication en cours : « Nouvelle publication » choisit un clip, le compte, maintenant ou à une date. Les publications terminées sont dans le calendrier.</p>`}</section>`;
 }
 
 async function pubPostCancel(p) {
@@ -251,7 +304,6 @@ async function pubPostCancel(p) {
 
 const PUB_VISIBILITIES = [["public", "Tout le monde"], ["friends", "Ami(e)s"], ["private", "Toi uniquement"]];
 const PUB_CHECKS = [["off", "Désactivée (rapide)"], ["wait", "Attendre le résultat (~10 min)"]];
-const pubLocalInput = (iso) => { const d = new Date(iso); const p = (n) => String(n).padStart(2, "0"); return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`; };
 
 function pubFormClips(clips) {
   return clips.filter((c) => c.ready && (c.publish_status === "à valider" || c.publish_status === "approved"))
@@ -342,7 +394,7 @@ function pubFormBody(f, d) {
   };
   if (!now) {
     const at = $("#pub-form-at", d).value;
-    body.publish_at = at ? new Date(at).toISOString() : null;
+    body.publish_at = at ? pubParisInstant(at).toISOString() : null; // l'heure saisie est celle de Paris
   }
   return body;
 }
@@ -442,9 +494,9 @@ async function pubRestore(c, slotAt, viaUnschedule) {
 async function pubMarkPublished(c) {
   const account = pubUi.data && pubUi.data.tiktok_account;
   const ok = await confirmDialog({
-    title: "Marquer comme publié ?",
-    body: `Confirme que « ${pubTitle(c)} » est bien en ligne${account ? ` sur ${account}` : ""}. L'autopost n'est pas branché : ce statut se pose à la main.`,
-    confirmLabel: "Marquer publié", danger: false,
+    title: "Déclarer ce clip comme publié ?",
+    body: `À utiliser seulement si « ${pubTitle(c)} » a déjà été publié hors de Clipper${account ? ` (sur ${account})` : ""}, par exemple depuis TikTok Studio ou l'appli : Clipper ne le publiera pas et le marque publié. Pour publier depuis Clipper, utilise « Nouvelle publication ».`,
+    confirmLabel: "Déclarer publié", danger: false,
   });
   if (!ok) return false;
   const slotAt = c.slot_at;
@@ -452,12 +504,12 @@ async function pubMarkPublished(c) {
     await api(`/api/publish/${pubEnc(c.video_id)}/${pubEnc(c.clip_id)}/published`, { method: "POST" });
     await pubLoad();
     toast({
-      kind: "ok", title: "Clip marqué publié", body: pubTitle(c),
+      kind: "ok", title: "Clip déclaré publié (hors Clipper)", body: pubTitle(c),
       undo: () => pubRestore(c, slotAt, true),
     });
     return true;
   } catch (err) {
-    toastError("Impossible de marquer le clip publié", err);
+    toastError("Impossible de déclarer le clip publié", err);
     return false;
   }
 }
@@ -518,7 +570,7 @@ async function pubSetAccount(c, account) {
 function pubDetailHtml(c) {
   const account = c.account || (pubUi.data && pubUi.data.tiktok_account);
   const status = c.publish_status;
-  const hint = status === "approved" ? "Glisse ce clip sur un créneau libre du calendrier pour le planifier."
+  const hint = status === "approved" ? "Clique « Publier maintenant » (formulaire Nouvelle publication), ou glisse ce clip sur un créneau libre du calendrier pour le planifier."
     : status === "failed" ? "La publication s'est arrêtée : regarde la capture, règle le problème dans le navigateur du compte, puis « Réessayer » (ou repasse le clip en attente pour le replanifier)." : "";
   return `
     <div class="modal-head"><div class="row wrap" style="gap:8px">${pubChip(c)}<h2>${esc(pubTitle(c))}</h2></div>
@@ -532,6 +584,7 @@ function pubDetailHtml(c) {
       ${c.post_note ? `<p class="muted">${esc(c.post_note)}</p>` : ""}
       ${c.postponed_reason ? `<p class="muted">Reportée : ${esc(c.postponed_reason)}</p>` : ""}
       ${hint ? `<p class="muted">${esc(hint)}</p>` : ""}
+      ${status === "scheduled" ? `<p class="muted">« Déclarer publié » sert à un clip que tu as déjà publié toi-même, hors de Clipper : il ne sera pas publié par le worker.</p>` : ""}
       <div class="field"><span class="field-label">Description</span><div class="pub-caption">${esc(c.description || "")}</div></div>
       <div class="hashtags">${(c.hashtags || []).map((t) => `<span class="tag">${esc(t)}</span>`).join("")}</div>
     </div>
@@ -541,7 +594,8 @@ function pubDetailHtml(c) {
       <span class="grow"></span>
       ${status === "failed" ? `<button type="button" class="btn btn-primary" data-retry>${icon("rotate-ccw")}Réessayer</button>` : ""}
       ${status === "scheduled" || status === "failed" ? `<button type="button" class="btn" data-unschedule>${icon("undo-2")}Repasser en attente</button>` : ""}
-      ${status === "scheduled" ? `<button type="button" class="btn btn-primary" data-published>${icon("check")}Marquer publié</button>` : ""}
+      ${status === "approved" ? `<button type="button" class="btn btn-primary" data-publish-now>${icon("send")}Publier maintenant</button>` : ""}
+      ${status === "scheduled" ? `<button type="button" class="btn" data-published title="Pour un clip déjà publié hors de Clipper">${icon("check")}Déclarer publié (hors Clipper)</button>` : ""}
     </div>`;
 }
 
@@ -559,6 +613,8 @@ function pubOpenDetail(key) {
     if (un) un.onclick = async () => { closeLayer(); await pubUnschedule(c); };
     const pub = $("[data-published]", d);
     if (pub) pub.onclick = async () => { closeLayer(); await pubMarkPublished(c); };
+    const now = $("[data-publish-now]", d);
+    if (now) now.onclick = () => { closeLayer(); setTimeout(() => pubOpenForm({ video_id: c.video_id, clip_id: c.clip_id }), 340); };
   });
 }
 
@@ -673,6 +729,11 @@ function pubWire(body) {
     if (cancel) cancel.onclick = () => pubPostCancel(p);
     if (retry) retry.onclick = async () => { await pubRetry(p); pubPosts.at = 0; pubPostsLoad(); };
   });
+  $$("[data-publish-now]", body).forEach((b) => (b.onclick = (e) => {
+    e.stopPropagation();
+    const [video_id, clip_id] = b.dataset.publishNow.split("/");
+    pubOpenForm({ video_id, clip_id });
+  }));
   const sel = $("#pub-channel", body);
   if (sel) sel.onchange = () => { pubUi.channel = sel.value; pubUi.week = ""; pubUi.data = null; pubUi.error = null; pubUi.html = ""; renderCurrent(); };
   $$("[data-week]", body).forEach((b) => (b.onclick = () => {
@@ -704,15 +765,15 @@ Screens.publish = {
     }
     if (!pubPosts.data && !pubPosts.loading) pubPostsLoad();
     else if (Date.now() - pubPosts.at > PUB_STALE_MS) pubPostsLoad();
+    if (pubUi.dragKey) return; // pas de rendu pendant un glisser-deposer
     if (!channels.length) {
-      const html = `<div class="pub-pad">${pubPostsSection()}${emptyState("send", "Aucun créneau de chaîne", "Les créneaux de chaîne sont facultatifs (mode auto) : « Nouvelle publication » publie sans chaîne, avec un compte.")}</div>`;
+      const html = pubLayoutHtml(channels, null, pubPostsSection());
       if (pubUi.html === html && body.childElementCount) return;
       pubUi.html = html;
       body.innerHTML = html;
       pubWire(body, channels);
       return;
     }
-    if (pubUi.dragKey) return; // pas de rendu pendant un glisser-deposer
     if (!channels.includes(pubUi.channel)) { pubUi.channel = channels[0]; pubUi.week = ""; pubUi.data = null; pubUi.html = ""; }
     if (pubUi.key !== pubWantedKey() || Date.now() - pubUi.at > PUB_STALE_MS) pubLoad();
     if (pubView(body, channels)) pubWire(body, channels);

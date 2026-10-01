@@ -46,7 +46,7 @@ function videoRow(video) {
   const reason = video.reason ? `<div class="job-meta"><span>${esc(video.reason)}</span></div>` : "";
   const stepLine = video.status === "running" && cur
     ? `<div class="job-prog"><div class="job-step"><b>${esc(STEP_LABELS[cur.name] || cur.name)}</b>${pct != null ? `<span>${pct} %${eta}</span>` : ""}</div>
-         <div class="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct == null ? 0 : pct}"><i style="width:${pct == null ? 8 : pct}%"></i></div></div>`
+         ${progressBar(pct)}</div>`
     : `<div class="job-meta"><span>${stepsDone(video)} / 12 étapes</span></div>`;
   return `<div class="job" data-video="${esc(video.video_id)}">
     <div class="job-main" style="min-width:0">
@@ -60,22 +60,40 @@ function videoRow(video) {
   </div>`;
 }
 
-/* Vignette d'une video source (GET /media/source/<id>/thumbnail, extraite par le pipeline) :
-   image paresseuse ; si la source manque (404) ou l'extraction echoue, l'image est remplacee
-   par une vignette neutre « pas d'image » (ecouteur d'erreur ci-dessous). */
-function videoThumb(videoId) {
-  return `<span class="job-thumb"><img loading="lazy" decoding="async" alt="" width="96" height="54" src="/media/source/${encodeURIComponent(videoId)}/thumbnail"><span class="job-thumb-none">pas d'image</span></span>`;
+/* Vignette d'une video source. Priorite : image extraite du mp4 local (GET /media/source/<id>/thumbnail,
+   extraite par le pipeline) > miniature de la plateforme (`platformUrl`, chargee par le navigateur :
+   YouTube deduite de l'id, sinon l'URL donnee par yt-dlp) > vignette neutre « pas d'image ». */
+function videoThumb(videoId, platformUrl) {
+  const platform = platformUrl ? ` data-platform="${esc(platformUrl)}"` : "";
+  return `<span class="job-thumb"><img loading="lazy" decoding="async" alt="" width="96" height="54" src="/media/source/${encodeURIComponent(videoId)}/thumbnail"${platform}><span class="job-thumb-none">pas d'image</span></span>`;
+}
+
+/* Image locale en erreur : on passe a la miniature de la plateforme (une seule fois), puis a la vignette neutre. */
+function thumbFallback(img) {
+  if (img.dataset.platform) {
+    img.src = img.dataset.platform;
+    delete img.dataset.platform;
+    return "platform";
+  }
+  return "none";
 }
 
 // Les erreurs de chargement ne remontent pas : on les ecoute en phase de capture.
 document.addEventListener("error", (e) => {
-  const box = e.target instanceof HTMLImageElement ? e.target.closest(".job-thumb") : null;
-  if (box) box.classList.add("empty");
+  const img = e.target instanceof HTMLImageElement ? e.target : null;
+  const box = img ? img.closest(".job-thumb") : null;
+  if (box && thumbFallback(img) === "none") box.classList.add("no-img");
 }, true);
+
+/* Barre de progression : remplie a `pct` %, sinon indeterminee (animee, visible) quand l'etape ne publie pas de fraction. */
+function progressBar(pct) {
+  if (pct == null) return `<div class="bar indeterminate" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-busy="true" aria-label="Progression inconnue"><i></i></div>`;
+  return `<div class="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}"><i style="width:${pct}%"></i></div>`;
+}
 
 function queueRow(entry, index) {
   return `<div class="list-item" data-queue="${esc(entry.video_id)}">
-    <span class="when num">${index + 1}</span>${videoThumb(entry.video_id)}
+    <span class="when num">${index + 1}</span>${videoThumb(entry.video_id, entry.platform_thumbnail)}
     <div class="li-main grow"><div class="li-title">${esc(entry.video_id)}</div>
       <div class="li-sub muted">${esc(entry.action === "render" ? "rendu" : "traitement complet")}${entry.channel ? ` · ${esc(entry.channel)}` : ""}</div></div>
     ${index > 0 ? `<button type="button" class="btn btn-xs" data-front="${esc(entry.video_id)}">Passer en tête</button>` : ""}

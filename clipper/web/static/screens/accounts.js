@@ -142,7 +142,7 @@ function accBrowserState(a) {
   const b = a.browser;
   if (!b) return "";
   if (b.error) return `<div class="li-sub bad">Profil du navigateur illisible : ${esc(b.error)}</div>`;
-  const when = b.modified_at ? ` · ${esc(new Date(b.modified_at).toLocaleString("fr-FR", { dateStyle: "medium", timeStyle: "short" }))}` : "";
+  const when = b.modified_at ? ` · ${esc(fmtParis(b.modified_at, { dateStyle: "medium", timeStyle: "short" }))}` : "";
   return `<div class="li-sub muted" data-acc-browser-state>Profil du navigateur : ${b.present ? `<b>présent</b>${when}` : "<b>absent</b> (jamais connecté)"}</div>`;
 }
 
@@ -180,7 +180,7 @@ const ACC_LOGIN = {
   connected: { label: "connecté", cls: "ok" },
   expired: { label: "session expirée", cls: "bad" },
 };
-const accFmtDate = (iso) => (iso ? new Date(iso).toLocaleString("fr-FR", { dateStyle: "medium", timeStyle: "short" }) : "");
+const accFmtDate = (iso) => (iso ? fmtParis(iso, { dateStyle: "medium", timeStyle: "short" }) : "");
 
 function accLoginState(a) {
   const l = a.login || { state: "never" };

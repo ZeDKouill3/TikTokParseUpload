@@ -1101,6 +1101,27 @@ def restore_video(video_id: str, *, config: Config | None = None) -> dict[str, A
     return state
 
 
+def set_channel(
+    video_id: str, channel: str, *, config: Config | None = None, presets_dir: str | Path = "presets",
+) -> dict[str, Any]:
+    """Attribue ``channel`` a une video qui n'en a pas (console, fiche video) : ecrit ``channel`` dans son
+    pipeline.json et le journalise. Refuse une chaine sans preset, une video en cours de traitement (le worker
+    reecrit son etat) et une video qui a deja une chaine (ses publications sont rangees par chaine)."""
+    config = config or load_config()
+    state = load_state(video_id, config=config)
+    if channel not in channel_mod.list_channels(presets_dir):
+        raise PipelineError(f"chaîne inconnue : {channel!r} (aucun preset presets/{channel}.toml avec une table [channel])")
+    if state.get("status") == "running":
+        raise PipelineError(f"{video_id} est en cours de traitement : attends la fin avant de lui attribuer une chaîne")
+    current = state.get("channel")
+    if current is not None:
+        raise PipelineError(f"{video_id} a déjà la chaîne « {current} » : elle ne se change pas ici")
+    state["channel"] = channel
+    save_state(state, config=config)
+    log.info("%s : chaîne « %s » attribuée depuis la console", video_id, channel)
+    return state
+
+
 def queued(*, config: Config | None = None) -> list[dict[str, Any]]:
     """Etats des videos en file d'attente, par retry_at croissant."""
     config = config or load_config()

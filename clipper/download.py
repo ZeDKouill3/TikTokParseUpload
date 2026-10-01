@@ -98,6 +98,9 @@ def _build_meta(info: dict[str, Any], url: str) -> dict[str, Any]:
         "chapters": info.get("chapters") or [],
         "heatmap": info.get("heatmap") or [],
         "sponsorblock_segments": info.get("sponsorblock_chapters") or [],
+        # URL de la miniature donnee par yt-dlp : la console l'affiche tant qu'aucune image n'est
+        # extraite du mp4 local (None quand l'extracteur n'en fournit pas).
+        "thumbnail": info.get("thumbnail"),
     }
 
 
@@ -107,15 +110,32 @@ def _format_speed(bytes_per_second: float | None) -> str:
     return f"{bytes_per_second / 1_000_000:.1f} Mo/s"
 
 
-def _progress_hook(video_id: str) -> Callable[[dict[str, Any]], None]:
+THUMBNAIL_FILE = "thumbnail.json"
+
+
+def _save_thumbnail(video_dir: Path, url: str) -> None:
+    """Garde l'URL de miniature des le debut du telechargement : si celui-ci echoue, meta.json n'existe pas
+    mais la console a de quoi afficher une image (SPEC console, point 1 de TASK-c32b)."""
+    path = video_dir / THUMBNAIL_FILE
+    video_dir.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"url": url}), encoding="utf-8")
+
+
+def _progress_hook(video_id: str, video_dir: Path | None = None) -> Callable[[dict[str, Any]], None]:
     """Journalise la progression du telechargement (pourcentage, debit) :
     DEBUG a chaque evenement yt-dlp, INFO au plus toutes les 30 s ou tous les
-    10 % (done_criteria de TASK-8abc)."""
+    10 % (done_criteria de TASK-8abc). Enregistre aussi, une fois, l'URL de
+    miniature de la video quand yt-dlp la donne."""
     last: dict[str, float] = {"pct": 0.0, "t": time.monotonic()}
+    saved = {"thumbnail": False}
 
     def hook(d: dict[str, Any]) -> None:
         if d.get("status") != "downloading":
             return
+        thumbnail = (d.get("info_dict") or {}).get("thumbnail")
+        if video_dir is not None and thumbnail and not saved["thumbnail"]:
+            saved["thumbnail"] = True
+            _save_thumbnail(video_dir, thumbnail)
         total = d.get("total_bytes") or d.get("total_bytes_estimate")
         downloaded = d.get("downloaded_bytes")
         speed = _format_speed(d.get("speed"))
@@ -146,7 +166,7 @@ def _ydl_opts(
         "postprocessors": [{"key": "SponsorBlock", "categories": ["all"]}],
         "quiet": True,
         "noprogress": True,
-        "progress_hooks": [_progress_hook(video_id)],
+        "progress_hooks": [_progress_hook(video_id, video_dir)],
     }
     if cookies_file:
         opts["cookiefile"] = str(cookies_file)

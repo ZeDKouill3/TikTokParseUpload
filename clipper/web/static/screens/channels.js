@@ -70,8 +70,8 @@ function chLoadList() {
   return chUi.loading;
 }
 
-function chSlotLabel(iso, tz) {
-  return new Date(iso).toLocaleString("fr-FR", { weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit", timeZone: tz });
+function chSlotLabel(iso) {
+  return fmtParis(iso, { weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
 }
 
 function chCard(name) {
@@ -91,8 +91,8 @@ function chCard(name) {
   const c = detail.effective.channel;
   const info = chUi.slots[name];
   const slots = info ? info.slots : [];
-  const shown = slots.slice(0, CHAN_SLOTS_SHOWN).map((s) => `<span class="mono">${esc(chSlotLabel(s, info.timezone))}</span>`).join(" ");
-  const more = slots.length > CHAN_SLOTS_SHOWN ? `<span class="faint" title="${esc(slots.map((s) => chSlotLabel(s, info.timezone)).join(" · "))}">+${slots.length - CHAN_SLOTS_SHOWN}</span>` : "";
+  const shown = slots.slice(0, CHAN_SLOTS_SHOWN).map((s) => `<span class="mono">${esc(chSlotLabel(s))}</span>`).join(" ");
+  const more = slots.length > CHAN_SLOTS_SHOWN ? `<span class="faint" title="${esc(slots.map((s) => chSlotLabel(s)).join(" · "))}">+${slots.length - CHAN_SLOTS_SHOWN}</span>` : "";
   const watch = c.watch
     ? `<span class="chip running plain">surveillée</span><span class="muted">toutes les ${esc(fr(Math.round(c.watch_interval_s / 60)))} min · VOD ≥ ${esc(fr(Math.round(c.watch_min_duration_s / 60)))} min</span>`
     : `<span class="chip pending plain">coupée</span>`;
@@ -105,8 +105,80 @@ function chCard(name) {
         <dt>Mode</dt><dd><span class="chip ${c.mode === "auto" ? "running" : "info"} plain">${esc(c.mode)}</span></dd>
         <dt>Prochains créneaux</dt><dd>${slots.length ? shown + more : `<span class="faint">${esc(info && info.reason ? info.reason : "créneaux indisponibles")}</span>`}</dd>
       </dl>
+      <div class="ch-actions">
+        <button type="button" class="btn btn-sm" data-chan-add-slot="${esc(name)}">${icon("calendar-days", "i-xs")}Ajouter un créneau</button>
+        <button type="button" class="btn btn-sm" data-chan-account="${esc(name)}">${icon("user", "i-xs")}Compte TikTok${c.tiktok_account ? ` : ${esc(c.tiktok_account)}` : ""}</button>
+        <button type="button" class="btn btn-sm" data-chan-queue="${esc(name)}">${icon("plus", "i-xs")}Mettre une vidéo en file pour cette chaîne</button>
+      </div>
       <div class="ch-foot"><a class="btn btn-sm grow" href="#/channels/${encodeURIComponent(name)}">${icon("sliders-horizontal")}Éditer le preset</a></div>
     </div></article>`;
+}
+
+/* ---------- Actions directes sur la carte (sans ouvrir le formulaire du preset) ---------- */
+
+/* Preset du serveur avec une seule clé de [channel] changée ; le reste du preset est renvoyé tel quel. */
+function chPresetWithChannel(detail, key, value) {
+  const preset = JSON.parse(JSON.stringify(detail.raw));
+  preset.channel = Object.assign({}, preset.channel, { [key]: value });
+  return preset;
+}
+
+/* Créneaux de la chaîne (ceux du preset, sinon les effectifs) plus le nouveau. */
+function chSlotsWith(detail, day, time) {
+  const current = (detail.raw.channel && detail.raw.channel.slots) || detail.effective.channel.slots || [];
+  return [...current, { day, time }];
+}
+
+async function chSaveChannelKey(name, key, value, doneTitle) {
+  try {
+    await api(`/api/channels/${encodeURIComponent(name)}`, jsonBody("PUT", { preset: chPresetWithChannel(chUi.details[name], key, value) }));
+  } catch (err) {
+    toastError("Enregistrement refusé", err);
+    return false;
+  }
+  toast({ kind: "ok", title: doneTitle, body: name });
+  chUi.at = 0;
+  chLoadList();
+  return true;
+}
+
+function chOpenAddSlot(name) {
+  openPanel("modal", `
+    <div class="modal-head"><h2>Ajouter un créneau</h2><p class="muted" style="margin-top:4px">Créneau hebdomadaire de ${esc(name)} (heure de Paris). Les créneaux sont facultatifs : « Nouvelle publication » publie sans.</p></div>
+    <form id="chan-slot-form"><div class="modal-body">
+      <div class="field"><label for="chan-slot-day">Jour</label><select class="input" id="chan-slot-day">${CHAN_DAYS.map(([k, l]) => `<option value="${k}">${l}</option>`).join("")}</select></div>
+      <div class="field"><label for="chan-slot-time">Heure</label><input class="input mono" id="chan-slot-time" type="time" required value="18:00"></div>
+    </div>
+    <div class="modal-foot"><button type="button" class="btn btn-ghost" data-dismiss>Annuler</button><button type="submit" class="btn btn-primary">Ajouter</button></div></form>`,
+  (el) => {
+    $("#chan-slot-form", el).onsubmit = async (e) => {
+      e.preventDefault();
+      const slots = chSlotsWith(chUi.details[name], $("#chan-slot-day", el).value, $("#chan-slot-time", el).value);
+      closeLayer();
+      await chSaveChannelKey(name, "slots", slots, "Créneau ajouté");
+    };
+  });
+}
+
+async function chOpenAccount(name) {
+  let accounts;
+  try { accounts = await api("/api/accounts"); } catch (err) { toastError("Comptes indisponibles", err); return; }
+  const current = chUi.details[name].effective.channel.tiktok_account || "";
+  openPanel("modal", `
+    <div class="modal-head"><h2>Compte TikTok</h2><p class="muted" style="margin-top:4px">Compte relié à ${esc(name)} : celui de ses publications par défaut. Les comptes se créent dans l'écran Comptes.</p></div>
+    <form id="chan-account-form"><div class="modal-body">
+      <div class="field"><label for="chan-account-pick">Compte</label><select class="input" id="chan-account-pick">
+        <option value=""${current ? "" : " selected"}>Aucun compte</option>${accounts.map((a) => `<option value="${esc(a.id)}"${a.id === current ? " selected" : ""}>${esc(a.label)}${a.platform ? ` (${esc(a.platform)})` : ""}</option>`).join("")}</select></div>
+    </div>
+    <div class="modal-foot"><button type="button" class="btn btn-ghost" data-dismiss>Annuler</button><button type="submit" class="btn btn-primary">Enregistrer</button></div></form>`,
+  (el) => {
+    $("#chan-account-form", el).onsubmit = async (e) => {
+      e.preventDefault();
+      const account = $("#chan-account-pick", el).value;
+      closeLayer();
+      await chSaveChannelKey(name, "tiktok_account", account, "Compte TikTok enregistré");
+    };
+  });
 }
 
 function chListHtml() {
@@ -245,19 +317,24 @@ function chControl(id, kind, value, locked, rubric) {
   }
 }
 
+/* Les champs de [channel] (créneaux, compte TikTok, source, mode...) n'ont de sens que pour la chaîne : ils se modifient
+   directement, sans « redéfinir » (rien à hériter de config.toml). Le brouillon ne les reçoit qu'à la première modification. */
+const chIsDirect = (section) => section === "channel";
+
 function chField(section, key, info, ed) {
   const raw = ed.draft[section] || {};
-  const redefined = key in raw;
+  const direct = chIsDirect(section);
+  const redefined = direct || key in raw;
   const kind = chKind(key, section, info.default);
-  const value = redefined ? raw[key] : ed.detail.effective[section][key];
+  const value = key in raw ? raw[key] : ed.detail.effective[section][key];
   const id = `chan-${section}-${key}`;
   const origin = chSame(ed.detail.effective[section][key], info.default) ? "valeur par défaut" : (section === "channel" ? "valeur déduite" : "hérité de config.toml");
-  const state = redefined
+  const state = direct ? "" : redefined
     ? `<button type="button" class="btn btn-xs btn-ghost" data-reset>Rétablir l'héritage</button>`
     : `<span class="chan-origin">${esc(origin)}</span><button type="button" class="btn btn-xs" data-redefine>redéfinir</button>`;
   const logo = section === "channel" && key === "logo"
     ? `<div class="chan-logo"><input type="file" accept="image/png" data-logo-file aria-label="Fichier PNG du logo"><button type="button" class="btn btn-xs" data-logo-send>${icon("upload", "i-xs")}Envoyer le logo</button></div>` : "";
-  return `<div class="field chan-field ${redefined ? "redefined" : "inherited"}" data-section="${esc(section)}" data-key="${esc(key)}" data-kind="${kind}">
+  return `<div class="field chan-field ${direct ? "direct" : redefined ? "redefined" : "inherited"}" data-section="${esc(section)}" data-key="${esc(key)}" data-kind="${kind}">
     <div class="chan-head"><label for="${id}"${kind === "rubric" ? "" : ` class="mono"`}>${esc(kind === "rubric" ? "Grille de notation" : key)}</label><span class="grow"></span>${state}</div>
     ${chControl(id, kind, value, !redefined, ed.detail.rubric)}${logo}
     ${info.comment ? `<span class="hint">${esc(info.comment)}</span>` : ""}${info.details ? `<details class="chan-help"><summary>détails</summary><p class="hint">${esc(info.details)}</p></details>` : ""}
@@ -274,7 +351,7 @@ function chSectionHtml(spec, ed) {
   const open = spec.open || ed.open.has(spec.section) ? " open" : "";
   return `<details class="panel chan-sec" data-sec="${esc(spec.section)}"${open}>
     <summary><div><h3>${esc(spec.title)}</h3><span class="muted">${esc(spec.sub)}</span></div><span class="mono muted">[${esc(spec.section)}]</span>
-      <span class="chip ${redefinedCount ? "info" : "pending"} plain" data-count>${redefinedCount ? `${redefinedCount} redéfini${redefinedCount > 1 ? "s" : ""}` : "hérité"}</span></summary>
+      <span class="chip ${chIsDirect(spec.section) ? "info" : redefinedCount ? "info" : "pending"} plain" data-count>${chIsDirect(spec.section) ? "propre à la chaîne" : redefinedCount ? `${redefinedCount} redéfini${redefinedCount > 1 ? "s" : ""}` : "hérité"}</span></summary>
     <p class="field-error chan-sec-error" data-sec-error role="alert"></p>
     ${spec.section === "subtitles" ? chSubsPreviewHtml(ed) : ""}
     <div class="chan-fields">${spec.section === "channel" ? chField("moments", "rubric_path", ed.detail.defaults.moments.rubric_path, ed) : ""}${main.map((k) => chField(spec.section, k, docs[k], ed)).join("")}</div>
@@ -291,7 +368,7 @@ function chEditHtml(ed) {
       <button type="button" class="btn btn-sm btn-bad" data-chan-delete>${icon("trash-2", "i-xs")}Supprimer</button>
       <button type="button" class="btn btn-primary" data-chan-save>Enregistrer</button></div>
     <p class="reason bad" data-form-error role="alert" hidden></p>
-    <p class="muted chan-intro">Un champ grisé n'est pas redéfini : il prend la valeur de config.toml (ou le défaut du module). « redéfinir » le copie dans ce preset pour le modifier.</p>
+    <p class="muted chan-intro">Les champs de « Chaîne » (source, mode, créneaux, compte TikTok) se modifient directement. Dans les autres sections, un champ grisé n'est pas redéfini : il prend la valeur de config.toml (ou le défaut du module) ; « redéfinir » le copie dans ce preset pour le modifier.</p>
     <div class="chan-sections">${CHAN_SECTIONS.map((s) => chSectionHtml(s, ed)).join("")}</div></div>`;
 }
 
@@ -375,8 +452,10 @@ function chRepaintField(root, ed, section, key) {
   const det = $(`details.chan-sec[data-sec="${section}"]`, root);
   const n = Object.keys(ed.draft[section] || {}).length;
   const chip = $("[data-count]", det);
-  chip.textContent = n ? `${n} redéfini${n > 1 ? "s" : ""}` : "hérité";
-  chip.className = `chip ${n ? "info" : "pending"} plain`;
+  if (!chIsDirect(section)) {
+    chip.textContent = n ? `${n} redéfini${n > 1 ? "s" : ""}` : "hérité";
+    chip.className = `chip ${n ? "info" : "pending"} plain`;
+  }
   if (section === "subtitles" || section === "reframe") chSubsPreview(root, ed);
 }
 
@@ -430,6 +509,12 @@ async function chSendLogo(root, ed, field) {
   }
 }
 
+/* Un champ direct absent du brouillon y entre avec sa valeur effective (avant d'être modifié). */
+function chEnsureDraft(ed, section, key) {
+  const table = (ed.draft[section] = ed.draft[section] || {});
+  if (!(key in table)) table[key] = JSON.parse(JSON.stringify(ed.detail.effective[section][key]));
+}
+
 function chWireEdit(root, ed) {
   root.onclick = (e) => {
     const t = e.target.closest("button");
@@ -447,10 +532,12 @@ function chWireEdit(root, ed) {
       chRepaintField(root, ed, section, key);
     } else if (field && t.hasAttribute("data-slot-add")) {
       const { section, key } = field.dataset;
+      chEnsureDraft(ed, section, key);
       ed.draft[section][key] = [...ed.draft[section][key], { day: "mon", time: "18:00" }];
       chRepaintField(root, ed, section, key);
     } else if (field && t.hasAttribute("data-slot-del")) {
       const { section, key } = field.dataset;
+      chEnsureDraft(ed, section, key);
       ed.draft[section][key] = ed.draft[section][key].filter((_, i) => i !== Number(t.dataset.slotDel));
       chRepaintField(root, ed, section, key);
     } else if (field && t.hasAttribute("data-logo-send")) chSendLogo(root, ed, field);
@@ -530,5 +617,8 @@ Screens.channels = {
     const html = chListHtml();
     if (chUi.html !== html || !body.childElementCount) { chUi.html = html; body.innerHTML = html; }
     $$("[data-chan-new]", body).forEach((b) => (b.onclick = chOpenNew));
+    $$("[data-chan-add-slot]", body).forEach((b) => (b.onclick = () => chOpenAddSlot(b.dataset.chanAddSlot)));
+    $$("[data-chan-account]", body).forEach((b) => (b.onclick = () => chOpenAccount(b.dataset.chanAccount)));
+    $$("[data-chan-queue]", body).forEach((b) => (b.onclick = () => openAddVideo(b.dataset.chanQueue)));
   },
 };

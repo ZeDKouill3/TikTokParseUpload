@@ -1362,6 +1362,8 @@ def test_an_entry_whose_account_is_not_ready_is_not_attempted_and_waits_with_the
     entry = _entries(tmp_path)[0]
     assert entry["status"] == "scheduled" and entry["error"] is None  # en attente, pas en échec
     assert "non prêt à publier" in entry["waiting_reason"] and "A" in entry["waiting_reason"]
+    assert "Comptes > A > J'ai réglé le problème" in entry["waiting_reason"]  # plus de « coche prêt à publier » périmé
+    assert "coche" not in entry["waiting_reason"]
     assert "non prêt à publier" in caplog.text
     event = tiktok.read_events(config=config)[-1]
     assert event["level"] == "warn" and event["account"] == ACCOUNT and event["clip_id"] == "01"

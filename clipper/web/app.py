@@ -26,6 +26,7 @@ from pathlib import Path
 from email.parser import BytesParser
 from email.policy import HTTP as _EMAIL_HTTP
 from typing import Any, AsyncIterator, Iterator
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import FastAPI, HTTPException, Request
@@ -120,6 +121,49 @@ def _list_states(config: Config) -> list[dict[str, Any]]:
 
 def _read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+_PARIS = ZoneInfo("Europe/Paris")
+_YOUTUBE_HOSTS = ("youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be")
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _paris(value: Any) -> str | None:
+    """Une date ISO avec fuseau, ramenee en heure de Paris (zoneinfo : +02:00 l'ete, +01:00 l'hiver) ; None si
+    absente. Toute heure affichee par la console est celle de Paris, jamais un decalage fixe."""
+    if not value:
+        return None
+    try:
+        when = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    if when.tzinfo is None:
+        return None
+    return when.astimezone(_PARIS).isoformat()
+
+
+def _platform_thumbnail(config: Config, video_id: str, source_url: str | None) -> str | None:
+    """Miniature de la plateforme d'une video (chargee par le navigateur, aucun traitement serveur) : YouTube se
+    deduit de l'identifiant ; sinon l'URL donnee par yt-dlp, enregistree dans meta.json (telechargement
+    termine) ou thumbnail.json (debut du telechargement). None si rien n'est connu."""
+    host = urlparse(source_url or "").netloc.lower().removeprefix("www.")
+    if host in _YOUTUBE_HOSTS and _SAFE_ID.fullmatch(video_id):
+        return f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+    video_dir = Path(config.workspace_dir) / video_id
+    for name, key in (("meta.json", "thumbnail"), ("thumbnail.json", "url")):
+        path = video_dir / name
+        if not path.is_file():
+            continue
+        try:
+            url = _read_json(path).get(key)
+        except (OSError, ValueError, AttributeError):
+            continue
+        if isinstance(url, str) and url:
+            return url
+    return None
 
 
 def _source_duration(video_dir: Path) -> tuple[float | None, str | None]:
@@ -220,6 +264,7 @@ def _enrich(state: dict[str, Any], config: Config) -> dict[str, Any]:
     out["title_reason"] = reason
     out["current_step"] = _current_step(state)
     out["durations"] = _step_durations(state)
+    out["platform_thumbnail"] = _platform_thumbnail(config, video_id, state.get("source_url"))
     return out
 
 
@@ -468,8 +513,10 @@ def _dashboard_videos(config: Config) -> dict[str, Any]:
         if state.get("status") != "running":
             continue
         step = _current_step(state)
+        enriched = _enrich(state, config)
         running.append({
-            "video_id": state["video_id"], "channel": state.get("channel"), "source_url": state.get("source_url"),
+            "video_id": state["video_id"], "title": enriched["title"], "channel": state.get("channel"),
+            "source_url": state.get("source_url"), "platform_thumbnail": enriched["platform_thumbnail"],
             "step": step, "progress": state["steps"][step].get("progress") if step else None,
         })
 
@@ -477,6 +524,7 @@ def _dashboard_videos(config: Config) -> dict[str, Any]:
         # Une video « retiree » (dismissed_at) sort des echecs et des compteurs.
         return [
             {"video_id": s["video_id"], "title": _enrich(s, config)["title"], "channel": s.get("channel"),
+             "platform_thumbnail": _platform_thumbnail(config, s["video_id"], s.get("source_url")),
              "step": _current_step(s), "reason": s.get("reason"), "retry_at": s.get("retry_at")}
             for s in states if s.get("status") == status and not s.get("dismissed_at")
         ]
@@ -532,6 +580,7 @@ def _dashboard_next_publications(config: Config) -> dict[str, Any]:
     for entry in entries:
         sidecar = Path(config.output_dir) / entry["video_id"] / f"{entry['clip_id']}.json"
         entry["screen_title"] = _read_json(sidecar).get("screen_title") if sidecar.is_file() else None
+        entry["slot_at_paris"] = _paris(entry["slot_at"])
     return {"next_publications": entries}
 
 
@@ -583,13 +632,18 @@ def _dashboard_hardware() -> dict[str, Any]:
     return {"hardware": hardware}
 
 
+def _with_thumbnails(config: Config, entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Entrees de la file avec la miniature de plateforme de leur video (None si inconnue)."""
+    return [{**e, "platform_thumbnail": _platform_thumbnail(config, e["video_id"], e.get("url"))} for e in entries]
+
+
 def _dashboard(config: Config) -> dict[str, Any]:
     out: dict[str, Any] = {}
     _fill(out, ("running", "failed", "queued"), "etat des videos (workspace/*/pipeline.json)",
           lambda: _dashboard_videos(config))
     queue_path = _queue_path(config)
     _fill(out, ("queue",), f"file d'attente ({queue_path.name})",
-          lambda: {"queue": _read_json(queue_path) if queue_path.exists() else []})
+          lambda: {"queue": _with_thumbnails(config, _read_json(queue_path) if queue_path.exists() else [])})
     _fill(out, ("watch_pending",), "surveillance (state/watch)", lambda: _dashboard_watch(config))
     _fill(out, ("clips_to_review",), "clips a valider", lambda: _dashboard_clips_to_review(config))
     _fill(out, ("worker",), "battement du worker (state/worker.json)", lambda: _dashboard_worker(config))
@@ -691,8 +745,14 @@ def _tiktok_fields(entry: dict[str, Any] | None, video_id: str, clip_id: str) ->
         tiktok_status = "failed"
     else:
         tiktok_status = None
+    scheduled_at = _publish_entry_instant(entry, "tiktok_publish_at") if status == "published" else None
+    # « en ligne » : publie pour de bon, ou programme sur TikTok dont l'heure est passee (une programmee future n'est pas publiee)
+    live = status == "published" and not (tiktok_status == "scheduled_on_tiktok" and scheduled_at is not None
+                                          and scheduled_at > _now_utc())
     return {
-        "tiktok_status": tiktok_status,
+        "tiktok_status": tiktok_status, "tiktok_live": live,
+        "slot_at_paris": _paris(entry.get("slot_at")), "published_at_paris": _paris(entry.get("published_at")),
+        "tiktok_publish_at_paris": _paris(entry.get("tiktok_publish_at")),
         "post_url": entry.get("post_url"), "post_id": entry.get("post_id"), "post_note": entry.get("post_note"),
         "tiktok_publish_at": entry.get("tiktok_publish_at"), "postponed_reason": entry.get("postponed_reason"),
         "account": entry.get("account"), "waiting_reason": entry.get("waiting_reason"),
@@ -767,7 +827,21 @@ def _list_clip_views(config: Config, channel: str | None, video_id: str | None,
         clip = _clip_view(sidecar, video_channel, entry, jury_by_video[video])
         if status is None or clip["publish_status"] == status:
             clips.append(clip)
+    clips.sort(key=lambda c: str(c.get("created_at") or ""), reverse=True)  # plus récents en haut (tri stable)
     return clips
+
+
+def _channel_names() -> list[str]:
+    return channel_mod.list_channels(_PRESETS_DIR)
+
+
+class _NoChannel(HTTPException):
+    """409 « la vidéo n'a pas de chaîne » : la réponse dit aussi quelles chaînes existent, pour que la console
+    propose d'en attribuer une sur place (POST /api/videos/<id>/channel)."""
+
+    def __init__(self, detail: str, video_id: str, channels: list[str]) -> None:
+        super().__init__(status_code=409, detail=detail)
+        self.video_id, self.channels = video_id, channels
 
 
 def _require_channel(video_id: str, clip_id: str, config: Config, *, or_no_channel: bool = False) -> str:
@@ -777,10 +851,9 @@ def _require_channel(video_id: str, clip_id: str, config: Config, *, or_no_chann
     if channel is None:
         if or_no_channel:
             return publish_mod.NO_CHANNEL
-        raise HTTPException(
-            status_code=409,
-            detail=f"la vidéo {video_id} n'a pas de chaîne : publier {clip_id} demande une chaîne (presets/<chaîne>.toml)",
-        )
+        raise _NoChannel(
+            f"la vidéo {video_id} n'a pas de chaîne : publier {clip_id} demande une chaîne (presets/<chaîne>.toml)",
+            video_id, _channel_names())
     return channel
 
 
@@ -1436,6 +1509,7 @@ def _stats_clips(config: Config, lower: datetime | None, upper: datetime | None,
             "human_decision": decision, "decision_source": source if decision is not None else None,
             "stats": stats, "stats_source": stats_source,
         })
+    clips.sort(key=lambda c: str(c.get("created_at") or ""), reverse=True)  # plus récents en haut (tri stable)
     unmatched = []
     for clip_id in sorted(measures) if wanted is None else []:
         if holders.get(clip_id, 0) == 1:
@@ -1592,6 +1666,10 @@ class QueueBody(BaseModel):
     channel: str | None = None
     action: str
     force_steps: list[str] = []
+
+
+class AssignChannelBody(BaseModel):
+    channel: str
 
 
 class RetryBody(BaseModel):
@@ -1821,7 +1899,10 @@ def create_app(config: Config | None = None) -> FastAPI:
 
     @app.exception_handler(HTTPException)
     async def _http_error(_request: Request, exc: HTTPException) -> JSONResponse:
-        return JSONResponse({"detail": exc.detail}, status_code=exc.status_code, headers=exc.headers)
+        body: dict[str, Any] = {"detail": exc.detail}
+        if isinstance(exc, _NoChannel):
+            body.update(needs_channel=True, video_id=exc.video_id, channels=exc.channels)
+        return JSONResponse(body, status_code=exc.status_code, headers=exc.headers)
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
     @app.middleware("http")
@@ -1882,7 +1963,7 @@ def create_app(config: Config | None = None) -> FastAPI:
         path = _queue_path(config)
         if not path.exists():
             return []
-        return json.loads(path.read_text(encoding="utf-8"))
+        return _with_thumbnails(config, json.loads(path.read_text(encoding="utf-8")))
 
     @app.post("/api/queue/{video_id}/front")
     def queue_front(video_id: str) -> dict[str, Any]:
@@ -1985,6 +2066,17 @@ def create_app(config: Config | None = None) -> FastAPI:
             pipeline.restore_video(video_id, config=config)  # relancer = ne plus etre « retiree »
         force_steps = list(pipeline.STEPS[pipeline.STEPS.index(body.from_step):])
         return _enqueue(video_id, _channel_of(video_id, config), "render", force_steps, config)
+
+    @app.post("/api/videos/{video_id}/channel")
+    def assign_channel(video_id: str, body: AssignChannelBody) -> dict[str, Any]:
+        """Attribue une chaîne à une vidéo qui n'en a pas (fiche vidéo, erreur d'approbation) : pipeline.set_channel
+        écrit pipeline.json et journalise."""
+        _validate_video_id(video_id)
+        _validate_channel_name(body.channel)
+        try:
+            return _enrich(pipeline.set_channel(video_id, body.channel, config=config, presets_dir=_PRESETS_DIR), config)
+        except pipeline.PipelineError as exc:
+            raise HTTPException(status_code=404 if "aucun etat" in str(exc) else 409, detail=str(exc)) from exc
 
     @app.post("/api/videos/{video_id}/dismiss")
     def dismiss_video(video_id: str) -> dict[str, Any]:
@@ -2688,12 +2780,16 @@ def _publish_week_view(config: Config, channel_name: str, week: str | None) -> d
     entries = _publish_entries(config, channel_name)
     clips = {(c["video_id"], c["clip_id"]): c for c in _list_clip_views(config, channel_name, None, None)}
     by_slot: dict[datetime, dict[str, Any]] = {}
-    unscheduled, done = [], []
+    unscheduled, done, off_slot = [], [], []
+    slot_instants = {s for s in channel_mod.next_slots(channel, start - timedelta(microseconds=1), len(channel["slots"]) + 1)
+                     if s < end} if channel["slots"] else set()
     for entry in entries.values():
         slot = _publish_entry_instant(entry, "slot_at")
         published = _publish_entry_instant(entry, "published_at")
         if slot is not None and entry["status"] in ("scheduled", "published", "failed"):
             by_slot[slot] = entry
+        if entry["status"] == "scheduled" and slot is not None and start <= slot < end and slot not in slot_instants:
+            off_slot.append(_publish_clip_view(clips, channel_name, entry))  # publication manuelle entre les créneaux
         if entry["status"] == "approved" and slot is None:
             unscheduled.append(_publish_clip_view(clips, channel_name, entry))
         elif entry["status"] in ("published", "failed"):
@@ -2710,14 +2806,14 @@ def _publish_week_view(config: Config, channel_name: str, week: str | None) -> d
             seen.add(slot)
             entry = by_slot.get(slot)
             slots.append({
-                "slot_at": slot.isoformat(),
+                "slot_at": slot.isoformat(), "slot_at_paris": _paris(slot.isoformat()),
                 "clip": _publish_clip_view(clips, channel_name, entry) if entry is not None else None,
                 "free": entry is None,
             })
     return {
         "channel": channel_name, "timezone": str(channel["timezone"]), "tiktok_account": channel["tiktok_account"],
         "week_start": monday.isoformat(), "week_end": (monday + timedelta(days=6)).isoformat(),
-        "slots": slots, "unscheduled": unscheduled, "done": done,
+        "slots": slots, "unscheduled": unscheduled, "done": done, "off_slot": sorted(off_slot, key=lambda c: datetime.fromisoformat(c["slot_at"])),
         "accounts": _publish_accounts(config),
         "reason": None if channel["slots"] else "aucun créneau défini dans [channel].slots",
     }
