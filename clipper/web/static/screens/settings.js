@@ -121,8 +121,15 @@ function setField(path, label, hint, kind) {
   return `<div class="field set-field" data-fpath="${esc(path.join("."))}">
     <label for="${id}" class="mono">${esc(label || path[path.length - 1])}</label>
     ${setInput(id, path, k, setEffective(path))}
-    ${hint ? `<span class="hint">${esc(hint)}</span>` : ""}
+    ${hint ? `<span class="hint">${esc(hint)}</span>` : ""}${setHelpDetails(path, hint)}
     <span class="field-error" role="alert"></span></div>`;
+}
+
+/* Reste du commentaire du reglage (references techniques, cas particuliers) : replie. */
+function setHelpDetails(path, hint) {
+  const doc = ((setUi.data.defaults || {})[path[0]] || {})[path[path.length - 1]];
+  return doc && doc.details && hint === doc.comment
+    ? `<details class="set-help"><summary>détails</summary><p class="hint">${esc(doc.details)}</p></details>` : "";
 }
 
 function setSectionFields(section, skip) {
@@ -400,6 +407,7 @@ Screens.settings = {
     // Un tableau modifié à moitié n'est jamais écrasé par un rechargement périodique.
     if (setUi.dirty && body.querySelector("#set-savebar") && !setUi.forceRender) return;
     setUi.forceRender = false;
+    if (body.resetHtmlGuard) body.resetHtmlGuard();   // formulaire : toujours reconstruit, saisies jetees
     body.innerHTML = setHtml();
     setWire(body);
   },

@@ -109,8 +109,14 @@ async function reloadVideo(id) {
   store.videos = list;
 }
 
-/* Evenement SSE {kind, id, at} : recharge l'objet concerne, pas la page. */
+/* Evenement SSE {kind, id, at} : recharge l'objet concerne, pas la page. Le
+   battement du worker (toutes les quelques secondes) ne met a jour que son
+   voyant : il ne declenche ni rechargement de donnees ni nouveau rendu. */
 async function onServerEvent(event) {
+  if (event.kind === "worker") {
+    document.dispatchEvent(new CustomEvent("clipper:worker", { detail: event }));
+    return;
+  }
   try {
     if (event.kind === "video") await reloadVideo(event.id);
     else if (event.kind === "queue") await loadQueue();
@@ -203,9 +209,31 @@ function route() {
   }
 }
 
+/* Ecrit body.innerHTML seulement si le HTML calcule differe du precedent :
+   un rendu identique (evenement SSE sans changement, polling) ne touche pas
+   au DOM, donc ni clignotement, ni image rechargee, ni defilement perdu. */
+function guardBodyHtml(body) {
+  if (body.dataset.guarded) return;
+  body.dataset.guarded = "1";
+  const native = Object.getOwnPropertyDescriptor(Element.prototype, "innerHTML");
+  let last = null;
+  // Un ecran dont le DOM porte des saisies a jeter (reglages) force le prochain rendu.
+  body.resetHtmlGuard = () => { last = null; };
+  Object.defineProperty(body, "innerHTML", {
+    configurable: true,
+    get() { return native.get.call(this); },
+    set(html) {
+      if (html === last && this.childNodes.length) return;
+      last = html;
+      native.set.call(this, html);
+    },
+  });
+}
+
 function renderCurrent() {
   if (!currentScreen) return;
   const body = $(`#screen-${currentScreen} [data-body]`);
+  guardBodyHtml(body);
   // Tant que les premieres donnees ne sont pas la : le squelette reste affiche.
   if (store.videos === null && (currentScreen === "dashboard" || currentScreen === "videos")) return;
   Screens[currentScreen].render(body, store);

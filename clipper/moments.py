@@ -108,9 +108,11 @@ from clipper import jury, llm
 log = logging.getLogger(__name__)
 
 CONFIG_DEFAULTS: dict[str, object] = {
+    # Qui note les moments : "single" (le proposeur seul) ou "jury".
     # Qui note les candidats du proposeur : "single" (le proposeur seul) ou
     # "jury" (clipper.jury, ADR-ff87). En mode auto, le jury note toujours.
     "selection": "single",
+    # Grille de notation des moments : "builtin" (standard), "builtin:gaming" (gaming) ou un chemin de fichier.
     # Grille de notation (SPEC-0eec), relative au dossier courant. "builtin"
     # : grille standard embarquée dans le paquet (clipper/assets/rubric.toml),
     # "builtin:gaming" : grille gaming embarquée (rubric-gaming.toml, SPEC-9216 ;
@@ -129,6 +131,7 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "chunk_overlap_seconds": 300,
     # Pics audio envoyés au LLM (les plus forts).
     "max_audio_peaks": 200,
+    # Part des clips retenus choisie en exploration parmi les moments où le jury hésite ; 0 = aucune.
     # Sélection par jury : part des clips retenus ajoutée en exploration,
     # prise parmi les candidats où le jury hésite (ADR-1cf0). 0 : aucune.
     "exploration_share": 0.1,

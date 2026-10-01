@@ -79,7 +79,7 @@ function pubPost(c, extra) {
   const draggable = (c.publish_status === "approved" || c.publish_status === "scheduled" || c.publish_status === "failed") && !c.missing;
   const icoName = c.publish_status === "published" ? "circle-check" : c.publish_status === "failed" ? "circle-alert" : "";
   return `<div class="post ${esc(c.publish_status)}${c.missing ? " missing" : ""}" data-post="${esc(pubKey(c))}" draggable="${draggable}" tabindex="0" role="button" aria-label="Ouvrir le clip ${esc(pubTitle(c))}" title="${esc(pubTitle(c))}">
-    <div class="mini-clip">${c.video_url ? `<img loading="lazy" decoding="async" src="${esc(c.thumbnail_url)}" alt="" tabindex="-1">` : ""}</div>
+    <div class="mini-clip">${c.video_url ? `<img loading="lazy" decoding="async" width="36" height="64" src="${esc(c.thumbnail_url)}" alt="" tabindex="-1">` : ""}</div>
     <span class="pt">${esc(c.missing ? `Clip introuvable (${c.clip_id})` : pubTitle(c))}</span>
     ${extra || ""}${icoName ? icon(icoName, "i-xs") : ""}</div>`;
 }
@@ -119,7 +119,7 @@ function pubDone(d) {
   return `<section>
     <div class="section-title">${icon("circle-check")}Publiés et échecs de la semaine <span class="more">${d.done.length}</span></div>
     <div class="panel">${d.done.map((c) => `<div class="list-item pub-done" data-post="${esc(pubKey(c))}" tabindex="0" role="button">
-      <div class="mini-clip">${c.video_url ? `<img loading="lazy" decoding="async" src="${esc(c.thumbnail_url)}" alt="" tabindex="-1">` : ""}</div>
+      <div class="mini-clip">${c.video_url ? `<img loading="lazy" decoding="async" width="36" height="64" src="${esc(c.thumbnail_url)}" alt="" tabindex="-1">` : ""}</div>
       <div class="li-main grow"><div class="li-title">${esc(pubTitle(c))}</div>
         <div class="li-sub muted">${c.publish_status === "published" ? "publié" : "échec"}${c.slot_at ? ` · ${esc(pubSlotLabel(c.slot_at))}` : ""}${c.publish_error ? ` · ${esc(c.publish_error)}` : ""}</div></div>
       ${pubChip(c)}</div>`).join("")}</div>
