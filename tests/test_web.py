@@ -3114,14 +3114,10 @@ def test_channels_screen_previews_subtitles_style_with_a_300ms_debounce():
     assert "draft: JSON.stringify" in prev   # brouillon non enregistré envoyé tel quel
     assert ".chan-preview" in css
     assert "chSubsPreview" in js          # point d'accroche dans l'écran chaînes
-# TASK-7d86 : ecran Statistiques (GET /api/stats, POST /api/stats/import)
+# TASK-7d86 puis SPEC-86fe : mesures internes de Clipper (GET /api/measures), affichees par le Tableau de bord
 # --------------------------------------------------------------------------
 
 STATS_A, STATS_B, STATS_C, STATS_D = "aaaaaaaaaaa", "bbbbbbbbbbb", "ccccccccccc", "ddddddddddd"
-STATS_CSV = (
-    "clip_id,views,retention_3s,watched_full,shares,date\n"
-    "02,1200,0.61,0.22,14,2026-09-25\n"
-)
 
 
 def _stats_jsonl(path: Path, lines) -> None:
@@ -3179,7 +3175,7 @@ def _stats_seed(tmp_path) -> None:
 
 
 def _stats(tmp_path, query=""):
-    resp = client(tmp_path).get(f"/api/stats{query}")
+    resp = client(tmp_path).get(f"/api/measures{query}")
     assert resp.status_code == 200, resp.text
     return resp.json()
 
@@ -3187,30 +3183,12 @@ def _stats(tmp_path, query=""):
 def test_stats_empty_state_has_explicit_empty_blocks(tmp_path, isolated_cwd):
     data = _stats(tmp_path)
 
-    assert data["clips"] == [] and data["stats_unmatched"] == []
+    assert "clips" not in data and "stats_unmatched" not in data and "tiktok_stats" not in data  # plus rien de TikTok ni des clips ici
     assert data["llm_cost"] == {"total": 0.0, "unreported_calls": 0, "by_video": {}, "by_usage": {}, "by_day": {}}
     assert data["steps"] == {}
     assert data["counts"] == {s: 0 for s in ("pending", "running", "awaiting_review", "queued", "done", "failed")}
 
 
-def test_stats_clips_join_sidecar_outcomes_and_human_decision(tmp_path, isolated_cwd):
-    _stats_seed(tmp_path)
-
-    data = _stats(tmp_path, "?since=2026-09-01&until=2026-09-30")
-    clips = {(c["video_id"], c["clip_id"]): c for c in data["clips"]}
-
-    assert sorted(clips) == [(STATS_A, "01"), (STATS_A, "02")]      # le clip d'août est hors période
-    one, two = clips[(STATS_A, "01")], clips[(STATS_A, "02")]
-    assert one["screen_title"] == "Titre 01" and one["moment_id"] == 1
-    assert one["qa_status"] == "passed" and one["issues"] == []
-    assert one["human_decision"] == "approved" and one["decision_source"] == "outcomes"
-    assert one["stats"] is None                                       # clip_id « 01 » existe dans 2 vidéos
-    assert two["qa_status"] == "rejected" and two["issues"] == ["sous-titres hors cadre"]
-    assert two["human_decision"] == "adjusted" and two["decision_source"] == "feedback"
-    assert two["stats"] == {"views": 1200, "retention_3s": 0.61, "watched_full": 0.22, "shares": 14,
-                            "date": "2026-09-25"}                    # la mesure la plus récente
-    assert [u["clip_id"] for u in data["stats_unmatched"]] == ["01"]
-    assert "plusieurs vidéos" in data["stats_unmatched"][0]["reason"]
 
 
 def test_stats_without_period_covers_everything(tmp_path, isolated_cwd):
@@ -3218,7 +3196,6 @@ def test_stats_without_period_covers_everything(tmp_path, isolated_cwd):
 
     data = _stats(tmp_path)
 
-    assert len(data["clips"]) == 3
     assert data["llm_cost"]["total"] == pytest.approx(3.75)
 
 
@@ -3257,88 +3234,23 @@ def test_stats_counts_videos_by_status(tmp_path, isolated_cwd):
 
 @pytest.mark.parametrize("query", ["?since=hier", "?until=2026-13-45", "?since=2026-09-30&until=2026-09-01"])
 def test_stats_invalid_period_is_a_422_with_detail(tmp_path, isolated_cwd, query):
-    resp = client(tmp_path).get(f"/api/stats{query}")
+    resp = client(tmp_path).get(f"/api/measures{query}")
     assert resp.status_code == 422
     assert resp.json()["detail"]
 
 
-def test_stats_unreadable_journal_is_a_500_naming_the_file(tmp_path, isolated_cwd):
-    (tmp_path / "state").mkdir()
-    (tmp_path / "state" / "outcomes.jsonl").write_text("{pas du json\n", encoding="utf-8")
-
-    resp = client(tmp_path).get("/api/stats")
-
-    assert resp.status_code == 500
-    assert "outcomes.jsonl" in resp.json()["detail"]
 
 
-def _stats_post(tmp_path, content, name="stats.csv", field="file"):
-    return client(tmp_path).post("/api/stats/import", files={field: (name, content, "text/csv")})
 
 
-def test_stats_import_calls_outcomes_import_stats_and_returns_the_row_count(tmp_path, isolated_cwd, monkeypatch):
-    from clipper import outcomes
-
-    seen = {}
-    real = outcomes.import_stats
-
-    def spy(csv_path, *, path=None):
-        seen["text"] = Path(csv_path).read_text(encoding="utf-8")
-        seen["path"] = path
-        return real(csv_path, path=path)
-
-    monkeypatch.setattr(outcomes, "import_stats", spy)
-
-    resp = _stats_post(tmp_path, STATS_CSV.encode("utf-8"))
-
-    assert resp.status_code == 200
-    assert resp.json() == {"imported": 1}
-    assert seen["text"] == STATS_CSV
-    assert Path(seen["path"]) == Path("state/outcomes.jsonl")
-    journal = [json.loads(line) for line in (tmp_path / "state" / "outcomes.jsonl").read_text(encoding="utf-8").splitlines()]
-    assert journal[0]["kind"] == "stats" and journal[0]["stats"]["views"] == 1200
 
 
-def test_stats_import_missing_column_is_a_422_with_detail_and_writes_nothing(tmp_path, isolated_cwd):
-    resp = _stats_post(tmp_path, b"clip_id,views\n01,10\n")
-
-    assert resp.status_code == 422
-    assert "colonne" in resp.json()["detail"] and "shares" in resp.json()["detail"]
-    assert not (tmp_path / "state" / "outcomes.jsonl").exists()
 
 
-def test_stats_import_bad_row_leaves_the_journal_untouched(tmp_path, isolated_cwd):
-    _stats_jsonl(tmp_path / "state" / "outcomes.jsonl", [{"kind": "result", "recorded_at": "2026-09-01T00:00:00+00:00"}])
-    before = (tmp_path / "state" / "outcomes.jsonl").read_bytes()
-    bad = STATS_CSV + "03,beaucoup,0.5,0.2,1,2026-09-26\n"
-
-    resp = _stats_post(tmp_path, bad.encode("utf-8"))
-
-    assert resp.status_code == 422 and resp.json()["detail"]
-    assert (tmp_path / "state" / "outcomes.jsonl").read_bytes() == before
 
 
-def test_stats_import_requires_a_multipart_file_field(tmp_path, isolated_cwd):
-    assert client(tmp_path).post("/api/stats/import", json={"x": 1}).status_code == 422
-    assert _stats_post(tmp_path, STATS_CSV.encode("utf-8"), field="autre").status_code == 422
-    assert _stats_post(tmp_path, b"\xff\xfe\x00").status_code == 422
 
 
-def test_stats_screen_shows_four_blocks_period_and_import():
-    page = (STATIC / "index.html").read_text(encoding="utf-8")
-    js = (STATIC / "screens" / "stats.js").read_text(encoding="utf-8")
-    css = (STATIC / "style.css").read_text(encoding="utf-8")
-
-    assert "/static/screens/stats.js" in page
-    assert page.index("/static/screens.js") < page.index("/static/screens/stats.js") < page.index("/static/app.js")
-    assert "Screens.stats" in js and "/api/stats" in js and "/api/stats/import" in js
-    assert "since" in js and "until" in js and 'type="file"' in js and "FormData" in js
-    for block in ("Résultats par clip", "Coûts du modèle", "Durée par étape", "Vidéos par statut"):
-        assert block in js
-    for field in ("llm_cost", "by_video", "by_usage", "by_day", "steps", "counts", "stats_unmatched"):
-        assert field in js
-    assert "toastError" in js                              # erreur d'API affichée, jamais avalée
-    assert "TASK-7d86" in css
 
 
 def test_style_css_braces_are_balanced():
@@ -3653,31 +3565,10 @@ def _round2_clips(tmp_path):
     _write_full_sidecar(tmp_path, "aaaaaaaaaaa", "03", ready=False, qa={"status": "rejected", "issues": [_QA_ISSUE]})
 
 
-def test_stats_issue_text_extracts_the_message_of_a_qa_issue_never_object_object():
-    js = (STATIC / "screens" / "stats.js").read_text(encoding="utf-8")
-
-    assert "function statsIssueText" in js
-    assert "issue.detail" in js
-    assert 'c.issues.map(statsIssueText)' in js
-    assert 'c.issues.join(' not in js
 
 
-@pytest.mark.skipif(shutil.which("node") is None, reason="node absent du PATH")
-def test_stats_issue_text_renders_objects_and_strings_readably(tmp_path):
-    js = (STATIC / "screens" / "stats.js").read_text(encoding="utf-8")
-    start = js.index("function statsIssueText")
-    end = js.index("\n}\n", start) + 3
-    script = js[start:end] + f"\nconsole.log(JSON.stringify([statsIssueText({json.dumps(_QA_ISSUE)}), statsIssueText('hors cadre')]));"
-    out = _node_run(script)
-    assert json.loads(out) == ["image noire de 2 s", "hors cadre"]
 
 
-def test_api_stats_passes_the_qa_issues_as_objects_the_screen_must_unwrap(tmp_path, isolated_cwd):
-    _round2_clips(tmp_path)
-
-    clips = {c["clip_id"]: c for c in _stats(tmp_path)["clips"]}
-
-    assert clips["03"]["issues"] == [_QA_ISSUE]
 
 
 def test_qa_rejected_clip_is_neither_counted_nor_listed_as_to_validate(tmp_path, isolated_cwd):
@@ -3967,22 +3858,8 @@ def test_videos_screen_keeps_the_server_order(tmp_path):
     assert ".sort(" not in js
 
 
-def test_stats_clip_table_paginates_by_50_with_show_more():
-    js = (STATIC / "screens" / "stats.js").read_text(encoding="utf-8")
-
-    assert "STATS_CLIPS_PAGE_SIZE = 50" in js
-    assert "Afficher plus" in js and "data-stats-more" in js
-    assert "data.clips.slice(0, statsUi.shown)" in js
 
 
-@pytest.mark.skipif(shutil.which("node") is None, reason="node absent du PATH")
-def test_stats_clip_pagination_reveals_50_more_rows_per_click():
-    js = (STATIC / "screens" / "stats.js").read_text(encoding="utf-8")
-    start = js.index("function statsMoreCount")
-    end = js.index("\n}\n", start) + 3
-    script = "const STATS_CLIPS_PAGE_SIZE = 50;\n" + js[start:end] + "\nconsole.log(JSON.stringify([statsMoreCount(120, 50), statsMoreCount(120, 100), statsMoreCount(30, 50)]));"
-    out = _node_run(script)
-    assert json.loads(out) == [50, 20, 0]
 
 
 # --------------------------------------------------------------------------
@@ -4176,23 +4053,20 @@ def test_stats_channel_filter_applies_to_every_block(tmp_path, isolated_cwd):
     data = _stats(tmp_path, "?channel=ma_chaine")
 
     assert data["channel"] == "ma_chaine"
-    assert sorted((c["video_id"], c["clip_id"]) for c in data["clips"]) == [(STATS_A, "01"), (STATS_A, "02")]
     assert set(data["llm_cost"]["by_video"]) == {STATS_A}
     assert data["llm_cost"]["total"] == pytest.approx(1.75)
     assert data["counts"] == {"pending": 0, "running": 0, "awaiting_review": 0, "queued": 0, "done": 1, "failed": 0}
     assert data["steps"]["download"]["mean_s"] == pytest.approx(40)
-    assert data["stats_unmatched"] == []
 
 
 def test_stats_channel_filter_other_channel_and_no_channel(tmp_path, isolated_cwd):
     _stats_channels(tmp_path)
 
     other = _stats(tmp_path, "?channel=autre")
-    assert [(c["video_id"], c["clip_id"]) for c in other["clips"]] == [(STATS_B, "01")]
     assert other["llm_cost"]["total"] == pytest.approx(2.0) and other["counts"]["done"] == 1
 
     none = _stats(tmp_path, "?channel=__none__")
-    assert none["clips"] == [] and none["llm_cost"]["by_video"] == {}
+    assert none["llm_cost"]["by_video"] == {}
     assert none["counts"]["failed"] == 1 and none["counts"]["running"] == 1 and none["counts"]["done"] == 0
 
 
@@ -4202,37 +4076,11 @@ def test_stats_without_channel_parameter_still_covers_everything(tmp_path, isola
     data = _stats(tmp_path)
 
     assert data["channel"] is None
-    assert len(data["clips"]) == 3 and data["counts"]["done"] == 2
+    assert data["counts"]["done"] == 2
 
 
-def test_stats_screen_filters_by_channel_and_sorts_the_clip_table_on_header_click():
-    stats = _static("screens", "stats.js")
-
-    assert "data-stats-channel" in stats and "Toutes les chaînes" in stats and "Sans chaîne" in stats
-    assert 'params.set("channel"' in stats and "__none__" in stats
-    table = stats[stats.index("function statsClipsBlock"):stats.index("function statsCostBlock")]
-    assert "statsHead(" in table and '"Chaîne"' in table
-    assert "data-stats-sort" in stats and "aria-sort" in stats
-    assert "statsSortInPlace(" in stats and "statsUi.sort" in stats
-    assert "[data-stats-sort]" in stats[stats.index("function statsWire"):]
 
 
-@pytest.mark.skipif(shutil.which("node") is None, reason="node absent du PATH")
-def test_stats_clip_sort_orders_by_column_with_missing_values_last():
-    js = _static("screens", "stats.js")
-    start = js.index("const STATS_SORTS")
-    end = js.index("};\n", start) + 3
-    fn_start = js.index("function statsSortInPlace")
-    fn_end = js.index("\n}\n", fn_start) + 3
-    script = (
-        js[start:end] + "const statsUi = { sort: { key: 'views', dir: 'desc' } };\n" + js[fn_start:fn_end]
-        + "\nconst clips = [{clip_id:'a', stats:{views:5}}, {clip_id:'b', stats:null}, {clip_id:'c', stats:{views:50}}];"
-        + "\nstatsSortInPlace(clips); const desc = clips.map(c => c.clip_id).join('');"
-        + "\nstatsUi.sort = { key: 'views', dir: 'asc' }; statsSortInPlace(clips);"
-        + "\nconsole.log(JSON.stringify([desc, clips.map(c => c.clip_id).join('')]));"
-    )
-    out = _node_run(script)
-    assert json.loads(out) == ["cab", "acb"]
 
 
 # --------------------------------------------------------------------------
@@ -4809,100 +4657,200 @@ def test_console_shows_tiktok_status_retry_button_and_notifications():
 
 
 # --------------------------------------------------------------------------
-# Statistiques TikTok relevees automatiquement (SPEC-9225 R7)
+# Statistiques TikTok par compte, a partir du releve de TikTok Studio (SPEC-86fe)
 # --------------------------------------------------------------------------
 
 from clipper import browser as browser_mod  # noqa: E402
 from clipper import tiktok as tiktok_mod  # noqa: E402
 
-TT_ACCOUNT = "ab12cd"
+TT_ACCOUNT, TT_OTHER = "ab12cd", "ef34ab"
+TT_ID_A, TT_ID_B, TT_ID_C = "7300000000000000001", "7300000000000000002", "7300000000000000003"
+_TT_TILES = ("views", "profile_views", "likes", "comments", "shares")
 
 
-def _tt_post(post_id, video_id, clip_id, **fields):
-    return {"post_id": post_id, "post_url": f"https://example.invalid/@ma_chaine/video/{post_id}",
-            "video_id": video_id, "clip_id": clip_id, "views": 4200, "likes": 310, "comments": 12, "shares": 40,
-            "avg_watch_s": 11.5, "watched_full": 0.31, **fields}
+def _tt_accounts(tmp_path, *, ready=(TT_ACCOUNT,), channel=True):
+    """Deux comptes TikTok (ecran Comptes), ``ready`` ceux « prets a publier » ; le premier est lie a la chaine ma_chaine."""
+    rows = [{"id": TT_ACCOUNT, "label": "Compte exemple", "platform": "TikTok"},
+            {"id": TT_OTHER, "label": "Autre compte", "platform": "TikTok"}]
+    for row in rows:
+        row["ready_to_publish"] = row["id"] in ready
+        row["login"] = {"state": "connected" if row["id"] in ready else "expired",
+                        "checked_at": "2026-10-01T10:00:00+00:00", "expires_at": None}
+    (tmp_path / "state").mkdir(exist_ok=True)
+    (tmp_path / "state" / "accounts.json").write_text(json.dumps({"accounts": rows}), encoding="utf-8")
+    if channel:
+        _channels_setup(tmp_path, f'[channel]\ndisplay_name = "Ma chaîne"\ntiktok_account = "{TT_ACCOUNT}"\n')
 
 
-def _tt_report(tmp_path, posts, *, fetched_at="2026-09-26T08:00:00+00:00", error=None, account=TT_ACCOUNT):
-    _write_json(tmp_path / "state" / "stats" / "tiktok" / f"{account}.json",
-                {"account": account, "fetched_at": fetched_at, "source": "tiktok_studio", "posts": posts, "error": error})
+def _tt_snapshot(tmp_path, day, *, account=TT_ACCOUNT, views=100, posts=(), origin="full", hour=12):
+    """Un releve de l'historique (state/stats/tiktok/<compte>/) du ``day`` octobre 2026 ; ``views`` : tuile « vues » 7 jours."""
+    stamp = f"2026-10-{day:02d}T{hour:02d}:00:00+00:00"
+    overview = None if origin != "full" else {
+        str(n): {key: {"value": views * (n // 7) + i, "change_pct": 4.5 if key == "views" else None}
+                 for i, key in enumerate(_TT_TILES)} for n in (7, 28, 60)}
+    _write_json(tmp_path / "state" / "stats" / "tiktok" / account / f"202610{day:02d}T{hour:02d}0000000000Z.json",
+                {"account": account, "fetched_at": stamp, "source": "tiktok_studio", "origin": origin,
+                 "overview": overview, "posts": list(posts)})
 
 
-def test_stats_clips_take_views_retention_full_and_shares_from_the_tiktok_report(tmp_path, isolated_cwd):
-    _stats_seed(tmp_path)
-    _tt_report(tmp_path, [_tt_post("7300000000000000001", STATS_A, "01")])
-
-    data = _stats(tmp_path)
-    one = next(c for c in data["clips"] if (c["video_id"], c["clip_id"]) == (STATS_A, "01"))
-
-    assert one["stats"]["views"] == 4200 and one["stats"]["shares"] == 40
-    assert one["stats"]["watched_full"] == 0.31 and one["stats"]["avg_watch_s"] == 11.5
-    assert one["stats"]["likes"] == 310 and one["stats"]["comments"] == 12
-    assert one["stats"]["retention_3s"] is None            # TikTok Studio ne donne pas la retention a 3 s
-    assert one["stats_source"] == "tiktok" and one["stats"]["date"] == "2026-09-26"
-    assert data["tiktok_stats"] == [{"account": TT_ACCOUNT, "fetched_at": "2026-09-26T08:00:00+00:00",
-                                     "posts": 1, "error": None}]
+def _tt_post(post_id, caption, **fields):
+    return {"post_id": post_id, "post_url": f"https://example.invalid/@ma_chaine/video/{post_id}", "caption": caption,
+            "posted_at": "2026-09-30T14:05:00", "posted_at_text": "2026-09-30 14:05", "visibility": "public",
+            "views": 1200, "likes": 85, "comments": 7, "shares": 12, "avg_watch_s": 12.0, "watched_full": 0.23,
+            "retention_curve": [{"t_s": 0.0, "share": 1.0}, {"t_s": 5.0, "share": 0.5}],
+            "viewers": {"total": 1200, "types": [{"label": "Nouveaux", "value": 0.6}], "age": None, "gender": None,
+                        "locations": None},
+            "engagement": {"shares": 12, "likes_over_time": None, "comment_words": [{"label": "génial", "value": 5}]},
+            **fields}
 
 
-def test_stats_a_null_in_the_report_stays_null_in_the_clip_stats(tmp_path, isolated_cwd):
-    _stats_seed(tmp_path)
-    _tt_report(tmp_path, [_tt_post("1", STATS_A, "01", avg_watch_s=None, watched_full=None, shares=None)])
-
-    one = next(c for c in _stats(tmp_path)["clips"] if (c["video_id"], c["clip_id"]) == (STATS_A, "01"))
-
-    assert one["stats"]["avg_watch_s"] is None and one["stats"]["watched_full"] is None
-    assert one["stats"]["shares"] is None and one["stats"]["views"] == 4200
+def _tt_get(tmp_path, path, **params):
+    return client(tmp_path).get(f"/api/stats/tiktok{path}", params=params)
 
 
-def test_stats_the_csv_stays_possible_and_the_source_is_shown(tmp_path, isolated_cwd):
-    _stats_seed(tmp_path)
+def test_the_stats_accounts_list_says_which_account_is_ready_and_what_the_last_fetch_was(tmp_path, isolated_cwd):
+    _tt_accounts(tmp_path, ready=(TT_ACCOUNT,))
+    _tt_snapshot(tmp_path, 1, posts=[_tt_post(TT_ID_A, "Un")])
+    _tt_snapshot(tmp_path, 2, posts=[_tt_post(TT_ID_A, "Un")], origin="opportunistic", hour=9)
 
-    two = next(c for c in _stats(tmp_path)["clips"] if (c["video_id"], c["clip_id"]) == (STATS_A, "02"))
+    resp = _tt_get(tmp_path, "")
 
-    assert two["stats_source"] == "csv" and two["stats"]["views"] == 1200
-
-
-def test_stats_the_most_recent_measure_wins_between_csv_and_tiktok_and_a_tie_goes_to_tiktok(tmp_path, isolated_cwd):
-    _stats_seed(tmp_path)  # CSV du clip 02 : 2026-09-25
-    _tt_report(tmp_path, [_tt_post("2", STATS_A, "02", views=5)], fetched_at="2026-09-24T08:00:00+00:00")
-    assert next(c for c in _stats(tmp_path)["clips"] if c["clip_id"] == "02")["stats_source"] == "csv"
-
-    _tt_report(tmp_path, [_tt_post("2", STATS_A, "02", views=5)], fetched_at="2026-09-25T23:00:00+00:00")
-    two = next(c for c in _stats(tmp_path)["clips"] if c["clip_id"] == "02")
-    assert two["stats_source"] == "tiktok" and two["stats"]["views"] == 5
-
-
-def test_stats_a_tiktok_post_not_linked_to_a_clip_is_reported_apart_never_attributed(tmp_path, isolated_cwd):
-    _stats_seed(tmp_path)
-    _tt_report(tmp_path, [_tt_post("9", None, None, views=77)])
-
-    data = _stats(tmp_path)
-
-    assert all(c["stats_source"] in (None, "csv") for c in data["clips"])
-    assert data["tiktok_unmatched"] == [{"account": TT_ACCOUNT, "post_id": "9",
-                                         "post_url": "https://example.invalid/@ma_chaine/video/9", "views": 77}]
+    assert resp.status_code == 200, resp.text
+    accounts = {a["account"]: a for a in resp.json()["accounts"]}
+    ready, other = accounts[TT_ACCOUNT], accounts[TT_OTHER]
+    assert ready["ready"] is True and ready["not_ready_reason"] is None and ready["label"] == "Compte exemple"
+    assert ready["channel"] == "ma_chaine"  # rappel de la chaine liee
+    assert ready["snapshots"] == 2 and ready["fetched_at"] == "2026-10-02T09:00:00+00:00"
+    assert ready["last_full_at"] == "2026-10-01T12:00:00+00:00" and ready["error"] is None
+    assert other["ready"] is False and "expirée" in other["not_ready_reason"]  # le compte non pret dit pourquoi
+    assert other["channel"] is None and other["snapshots"] == 0 and other["fetched_at"] is None
 
 
-def test_stats_a_failed_tiktok_fetch_is_shown_with_its_reason_and_keeps_the_last_report(tmp_path, isolated_cwd):
-    _stats_seed(tmp_path)
-    error = {"at": "2026-09-27T08:00:00+00:00", "code": "captcha", "reason": "captcha détecté", "capture": None}
-    _tt_report(tmp_path, [_tt_post("1", STATS_A, "01")], error=error)
+def test_the_stats_accounts_list_carries_the_last_safe_stop(tmp_path, isolated_cwd):
+    _tt_accounts(tmp_path)
+    _tt_snapshot(tmp_path, 1)
+    error = {"at": "2026-10-02T08:00:00+00:00", "code": "captcha", "reason": "captcha détecté", "capture": None}
+    _write_json(tmp_path / "state" / "stats" / "tiktok" / TT_ACCOUNT / "20261002T080000000000Z.error.json", error)
 
-    data = _stats(tmp_path)
+    account = next(a for a in _tt_get(tmp_path, "").json()["accounts"] if a["account"] == TT_ACCOUNT)
 
-    assert data["tiktok_stats"][0]["error"] == error and data["tiktok_stats"][0]["posts"] == 1
-    assert next(c for c in data["clips"] if c["clip_id"] == "01" and c["video_id"] == STATS_A)["stats"]["views"] == 4200
+    assert account["error"] == error and account["last_full_at"] == "2026-10-01T12:00:00+00:00"
 
 
-def test_stats_a_corrupt_tiktok_report_is_an_explicit_500_not_an_empty_screen(tmp_path, isolated_cwd):
-    path = tmp_path / "state" / "stats" / "tiktok" / f"{TT_ACCOUNT}.json"
+def test_the_overview_gives_five_tiles_with_evolution_and_the_daily_curves(tmp_path, isolated_cwd):
+    _tt_accounts(tmp_path)
+    _tt_snapshot(tmp_path, 1, views=100)
+    _tt_snapshot(tmp_path, 8, views=130)
+
+    data = _tt_get(tmp_path, f"/{TT_ACCOUNT}", period=7).json()
+
+    assert data["account"] == TT_ACCOUNT and data["channel"] == "ma_chaine" and data["ready"] is True
+    assert data["period"] == 7 and data["last_full_at"] == "2026-10-08T12:00:00+00:00"
+    assert list(data["tiles"]) == list(_TT_TILES)
+    assert data["tiles"]["views"] == {"value": 130, "change_pct": 4.5, "history_change_pct": 30.0}
+    series = data["series"]["views"]
+    assert series["labels"][0] == "2026-10-02" and series["labels"][-1] == "2026-10-08"
+    assert series["values"][-1] == 130 and series["values"].count(None) == 6
+    assert series["previous"] == [None] * 6 + [100]  # le 8/10 se compare au releve du 1/10 : la periode d'avant, decalee de 7 jours
+
+
+def test_the_overview_defaults_to_28_days_and_refuses_another_period(tmp_path, isolated_cwd):
+    _tt_accounts(tmp_path)
+    _tt_snapshot(tmp_path, 1)
+
+    assert _tt_get(tmp_path, f"/{TT_ACCOUNT}").json()["period"] == 28
+    bad = _tt_get(tmp_path, f"/{TT_ACCOUNT}", period=14)
+    assert bad.status_code == 422 and "période" in bad.json()["detail"]
+    assert _tt_get(tmp_path, f"/{TT_ACCOUNT}", period="x").status_code == 422
+
+
+def test_the_overview_of_an_account_never_fetched_is_an_explicit_empty_state(tmp_path, isolated_cwd):
+    _tt_accounts(tmp_path)
+
+    data = _tt_get(tmp_path, f"/{TT_OTHER}").json()
+
+    assert data["tiles"] is None and data["series"] is None and data["snapshots"] == 0 and data["fetched_at"] is None
+    assert data["ready"] is False and data["not_ready_reason"]
+
+
+def test_an_unknown_account_is_a_404_on_every_stats_route(tmp_path, isolated_cwd):
+    _tt_accounts(tmp_path)
+    for path in ("/inconnu", "/inconnu/videos", f"/inconnu/videos/{TT_ID_A}"):
+        assert _tt_get(tmp_path, path).status_code == 404
+
+
+def test_the_video_list_comes_from_the_report_sorted_searched_and_linked_to_clips(tmp_path, isolated_cwd):
+    _tt_accounts(tmp_path)
+    _tt_snapshot(tmp_path, 1, posts=[
+        _tt_post(TT_ID_A, "Clip Clipper", views=500, posted_at="2026-09-29T10:00:00"),
+        _tt_post(TT_ID_B, "Publié à la main", views=900, posted_at="2026-09-30T10:00:00"),
+        _tt_post(TT_ID_C, "Encore en traitement", views=None, posted_at="2026-10-01T10:00:00")])
+    _write_sidecar(tmp_path, "aaaaaaaaaaa", "01", tiktok_post={"url": None, "id": TT_ID_A, "state": "published",
+                                                                "account": TT_ACCOUNT})
+
+    data = _tt_get(tmp_path, f"/{TT_ACCOUNT}/videos").json()
+
+    assert [v["post_id"] for v in data["videos"]] == [TT_ID_C, TT_ID_B, TT_ID_A]  # date, la plus recente en premier
+    by_id = {v["post_id"]: v for v in data["videos"]}
+    assert by_id[TT_ID_A]["clip"] == {"video_id": "aaaaaaaaaaa", "clip_id": "01"} and by_id[TT_ID_A]["outside_clipper"] is False
+    assert by_id[TT_ID_B]["clip"] is None and by_id[TT_ID_B]["outside_clipper"] is True  # « publié hors Clipper »
+    assert by_id[TT_ID_C]["views"] is None and by_id[TT_ID_C]["processing"] is True
+    assert data["account"] == TT_ACCOUNT and data["channel"] == "ma_chaine"
+    ids = lambda **params: [v["post_id"] for v in _tt_get(tmp_path, f"/{TT_ACCOUNT}/videos", **params).json()["videos"]]
+    assert ids(sort="views", dir="desc") == [TT_ID_B, TT_ID_A, TT_ID_C]  # sans valeur : en dernier
+    assert ids(sort="views", dir="asc") == [TT_ID_A, TT_ID_B, TT_ID_C]
+    assert ids(q="main") == [TT_ID_B] and ids(q="TRAITEMENT") == [TT_ID_C] and ids(q="zzz") == []
+
+
+def test_the_video_list_refuses_an_unknown_sort_or_direction(tmp_path, isolated_cwd):
+    _tt_accounts(tmp_path)
+    assert _tt_get(tmp_path, f"/{TT_ACCOUNT}/videos", sort="couleur").status_code == 422
+    assert _tt_get(tmp_path, f"/{TT_ACCOUNT}/videos", dir="haut").status_code == 422
+
+
+def test_the_video_sheet_gives_figures_tabs_data_links_and_history(tmp_path, isolated_cwd):
+    _tt_accounts(tmp_path)
+    _tt_snapshot(tmp_path, 1, posts=[_tt_post(TT_ID_A, "Clip Clipper", views=10)])
+    _tt_snapshot(tmp_path, 2, posts=[_tt_post(TT_ID_A, "Clip Clipper", views=25)])
+    _write_sidecar(tmp_path, "aaaaaaaaaaa", "01", tiktok_post={"url": None, "id": TT_ID_A, "state": "published",
+                                                                "account": TT_ACCOUNT})
+
+    resp = _tt_get(tmp_path, f"/{TT_ACCOUNT}/videos/{TT_ID_A}")
+
+    assert resp.status_code == 200, resp.text
+    video = resp.json()["video"]
+    assert video["post_id"] == TT_ID_A and video["views"] == 25 and video["post_url"].endswith(TT_ID_A)
+    assert video["clip"] == {"video_id": "aaaaaaaaaaa", "clip_id": "01"} and video["outside_clipper"] is False
+    assert video["viewers"]["types"] == [{"label": "Nouveaux", "value": 0.6}] and video["viewers"]["age"] is None
+    assert video["engagement"]["comment_words"] == [{"label": "génial", "value": 5}]
+    assert video["retention_curve"][1] == {"t_s": 5.0, "share": 0.5}
+    assert [h["views"] for h in video["history"]] == [10, 25]
+    assert _tt_get(tmp_path, f"/{TT_ACCOUNT}/videos/999").status_code == 404
+
+
+def test_a_post_published_outside_clipper_has_a_sheet_marked_as_such(tmp_path, isolated_cwd):
+    _tt_accounts(tmp_path)
+    _tt_snapshot(tmp_path, 1, posts=[_tt_post(TT_ID_B, "À la main")])
+
+    video = _tt_get(tmp_path, f"/{TT_ACCOUNT}/videos/{TT_ID_B}").json()["video"]
+
+    assert video["clip"] is None and video["outside_clipper"] is True
+
+
+def test_a_corrupt_history_file_is_an_explicit_500_not_an_empty_screen(tmp_path, isolated_cwd):
+    _tt_accounts(tmp_path)
+    path = tmp_path / "state" / "stats" / "tiktok" / TT_ACCOUNT / "20261001T120000000000Z.json"
     path.parent.mkdir(parents=True)
     path.write_text("{pas du json", encoding="utf-8")
 
-    resp = client(tmp_path).get("/api/stats")
+    for route in ("", f"/{TT_ACCOUNT}", f"/{TT_ACCOUNT}/videos"):
+        resp = _tt_get(tmp_path, route)
+        assert resp.status_code == 500 and "illisible" in resp.json()["detail"]
 
-    assert resp.status_code == 500 and "illisible" in resp.json()["detail"]
+
+def test_the_csv_import_is_gone(tmp_path, isolated_cwd):
+    resp = client(tmp_path).post("/api/stats/import", files={"file": ("stats.csv", b"clip_id,views\n01,10\n", "text/csv")})
+    assert resp.status_code in (404, 405)
 
 
 class FakeFetch:
@@ -4913,15 +4861,11 @@ class FakeFetch:
         self.calls.append(account)
         if self.error is not None:
             raise self.error
-        return {"account": account, "fetched_at": "2026-09-27T08:00:00+00:00", "posts": [{}, {}], "error": None}
+        return {"account": account, "fetched_at": "2026-09-27T08:00:00+00:00", "posts": [{}, {}], "overview": {}}
 
 
-def _tt_clip(tmp_path, video_id, clip_id, account=TT_ACCOUNT):
-    _write_sidecar(tmp_path, video_id, clip_id, tiktok_post={"url": "https://example.invalid/video/1", "id": "1",
-                                                           "state": "published", "account": account})
-
-
-def test_refresh_route_fetches_the_given_account_in_the_background_thread_pool(tmp_path, isolated_cwd, monkeypatch):
+def test_refresh_route_fetches_the_given_ready_account(tmp_path, isolated_cwd, monkeypatch):
+    _tt_accounts(tmp_path)
     fetch = FakeFetch()
     monkeypatch.setattr(tiktok_mod, "fetch_stats", fetch)
 
@@ -4932,26 +4876,39 @@ def test_refresh_route_fetches_the_given_account_in_the_background_thread_pool(t
     assert resp.json() == {"accounts": {TT_ACCOUNT: {"fetched_at": "2026-09-27T08:00:00+00:00", "posts": 2}}}
 
 
-def test_refresh_route_without_body_fetches_every_account_with_a_published_post(tmp_path, isolated_cwd, monkeypatch):
-    _tt_clip(tmp_path, STATS_A, "01")
-    _tt_clip(tmp_path, STATS_B, "01", account="ef34ab")
-    _write_sidecar(tmp_path, STATS_C, "01")  # jamais publie : ne compte pas
+def test_refresh_route_does_not_fetch_an_account_that_is_not_ready_and_says_why(tmp_path, isolated_cwd, monkeypatch):
+    _tt_accounts(tmp_path, ready=(TT_ACCOUNT,))
+    fetch = FakeFetch()
+    monkeypatch.setattr(tiktok_mod, "fetch_stats", fetch)
+
+    resp = client(tmp_path).post("/api/stats/tiktok/refresh", json={"account": TT_OTHER})
+
+    assert resp.status_code == 409 and fetch.calls == []
+    assert "non prêt" in resp.json()["detail"] and "expirée" in resp.json()["detail"]
+    assert client(tmp_path).post("/api/stats/tiktok/refresh", json={"account": "inconnu"}).status_code == 404
+
+
+def test_refresh_route_without_body_fetches_every_ready_account_only(tmp_path, isolated_cwd, monkeypatch):
+    _tt_accounts(tmp_path, ready=(TT_ACCOUNT, TT_OTHER))
+    fetch = FakeFetch()
+    monkeypatch.setattr(tiktok_mod, "fetch_stats", fetch)
+    assert client(tmp_path).post("/api/stats/tiktok/refresh").status_code == 200
+    assert fetch.calls == [TT_ACCOUNT, TT_OTHER]
+
+    _tt_accounts(tmp_path, ready=(TT_OTHER,))
+    fetch.calls.clear()
+    client(tmp_path).post("/api/stats/tiktok/refresh")
+    assert fetch.calls == [TT_OTHER]
+
+
+def test_refresh_route_with_no_ready_account_says_so(tmp_path, isolated_cwd, monkeypatch):
+    _tt_accounts(tmp_path, ready=())
     fetch = FakeFetch()
     monkeypatch.setattr(tiktok_mod, "fetch_stats", fetch)
 
     resp = client(tmp_path).post("/api/stats/tiktok/refresh")
 
-    assert resp.status_code == 200 and fetch.calls == [TT_ACCOUNT, "ef34ab"]
-    assert sorted(resp.json()["accounts"]) == [TT_ACCOUNT, "ef34ab"]
-
-
-def test_refresh_route_with_nothing_to_measure_says_so(tmp_path, isolated_cwd, monkeypatch):
-    fetch = FakeFetch()
-    monkeypatch.setattr(tiktok_mod, "fetch_stats", fetch)
-
-    resp = client(tmp_path).post("/api/stats/tiktok/refresh")
-
-    assert resp.status_code == 409 and "publié" in resp.json()["detail"] and fetch.calls == []
+    assert resp.status_code == 409 and "prêt" in resp.json()["detail"] and fetch.calls == []
 
 
 @pytest.mark.parametrize("error,status,words", [
@@ -4960,6 +4917,7 @@ def test_refresh_route_with_nothing_to_measure_says_so(tmp_path, isolated_cwd, m
     (tiktok_mod.TikTokError("réglage invalide"), 422, "réglage"),
 ])
 def test_refresh_route_reports_a_safe_stop_or_error_in_french(tmp_path, isolated_cwd, monkeypatch, error, status, words):
+    _tt_accounts(tmp_path)
     monkeypatch.setattr(tiktok_mod, "fetch_stats", FakeFetch(error=error))
 
     resp = client(tmp_path).post("/api/stats/tiktok/refresh", json={"account": TT_ACCOUNT})
@@ -4968,23 +4926,13 @@ def test_refresh_route_reports_a_safe_stop_or_error_in_french(tmp_path, isolated
 
 
 def test_refresh_route_refuses_an_invalid_body_or_account(tmp_path, isolated_cwd, monkeypatch):
+    _tt_accounts(tmp_path)
     fetch = FakeFetch()
     monkeypatch.setattr(tiktok_mod, "fetch_stats", fetch)
 
     assert client(tmp_path).post("/api/stats/tiktok/refresh", json={"account": "../x"}).status_code == 422
     assert client(tmp_path).post("/api/stats/tiktok/refresh", json={"autre": 1}).status_code == 422
     assert fetch.calls == []
-
-
-def test_stats_screen_has_a_tiktok_refresh_button_and_shows_the_source_of_each_figure():
-    js = (STATIC / "screens" / "stats.js").read_text(encoding="utf-8")
-
-    assert "/api/stats/tiktok/refresh" in js and "data-stats-tiktok" in js
-    assert "Relever les statistiques TikTok" in js
-    assert "tiktok_stats" in js and "tiktok_unmatched" in js
-    assert "avg_watch_s" in js and "stats_source" in js
-    assert "aucune mesure" in js and "Rétention" in js
-    assert "toastError" in js
 
 
 # --------------------------------------------------------------------------
@@ -6211,11 +6159,139 @@ def test_every_panel_screen_keeps_its_content_off_the_edges():
         assert any("padding" in r or "background: none" in r for r in rules), f"screen-{name} : contenu collé aux bords"
 
 
-def test_stats_lists_the_clips_newest_first(tmp_path, isolated_cwd):
-    _write_state(tmp_path, "aaaaaaaaaaa", channel="ma_chaine")
-    for clip_id, created in (("01", "2026-09-30T10:00:00+00:00"), ("02", "2026-10-01T10:00:00+00:00"), ("03", "2026-09-29T10:00:00+00:00")):
-        _write_full_sidecar(tmp_path, "aaaaaaaaaaa", clip_id, qa={"status": "passed", "issues": []}, created_at=created)
 
-    clips = _stats(tmp_path, "?since=2026-09-01&until=2026-10-31")["clips"]
 
-    assert [c["clip_id"] for c in clips] == ["02", "01", "03"]
+# --------------------------------------------------------------------------
+# Ecran Statistiques TikTok (SPEC-86fe R3, R1) : interface
+# --------------------------------------------------------------------------
+
+
+def _js_function(source: str, name: str) -> str:
+    """Le texte d'une fonction ou constante fleche de premier niveau (accolades equilibrees)."""
+    start = source.index(f"function {name}(")
+    depth, i = 0, source.index("{", start)
+    while True:
+        depth += {"{": 1, "}": -1}.get(source[i], 0)
+        i += 1
+        if depth == 0:
+            return source[start:i]
+
+
+def _stats_js_run(functions: list[str], expression: str) -> object:
+    stats = _static("screens", "stats.js")
+    script = (
+        'const fr = (n, d) => Number(n).toLocaleString("fr-FR", { minimumFractionDigits: d || 0, maximumFractionDigits: d || 0 });\n'
+        'const esc = (s) => String(s == null ? "" : s);\n'
+        'const location = { hash: process.argv[1] };\n'
+        + "\n".join(_js_function(stats, name) for name in functions)
+        + f"\nprocess.stdout.write(JSON.stringify({expression}));"
+    )
+    return json.loads(_node_run(script, "#/stats"))
+
+
+def test_the_stats_screen_follows_the_mockup_account_period_scan_tabs_and_video_sheet():
+    js, page = _static("screens", "stats.js"), _static("index.html")
+
+    assert "/static/screens/stats.js" in page
+    assert page.index("/static/screens.js") < page.index("/static/screens/stats.js") < page.index("/static/app.js")
+    assert "Screens.stats" in js
+    for route in ("/api/stats/tiktok", "/videos", "/api/stats/tiktok/refresh", "?period="):
+        assert route in js
+    for text in ("Compte TikTok", "Chaîne Clipper liée", "Période", "Dernier relevé", "Relever maintenant",
+                 "Vue d'ensemble", "Vidéos", "Spectateurs", "Engagement", "Ouvrir sur TikTok", "Voir le clip dans Clipper",
+                 "Vidéo source", "publié hors Clipper", "Publié hors Clipper", "Compte non prêt à publier",
+                 "Filtrer par légende", "Taux de rétention", "dès 100 vues", "Mots les plus utilisés dans les commentaires",
+                 "J'aime dans le temps", "Jour sans relevé"):
+        assert text in js, text
+    for key in ("data-stats-account", "data-stats-period", "data-stats-metric", "data-stats-scan", "data-stats-sort",
+                "data-stats-q", "data-stats-open", "data-stats-vtab", "data-stats-tiles", "data-stats-notready"):
+        assert key in js, key
+    assert "toastError" in js and "target=\"_blank\" rel=\"noopener noreferrer\"" in js
+    for period in ("7", "28", "60"):
+        assert period in js[js.index("STATS_PERIODS"):js.index("STATS_PERIODS") + 40]
+    for label in ("Vues de vidéo", "Vues du profil", "J'aime", "Commentaires", "Partages"):
+        assert f'"{label}"' in js
+
+
+def test_the_stats_screen_no_longer_has_the_csv_import_nor_the_internal_measures():
+    js, page, css = _static("screens", "stats.js"), _static("index.html"), _static("style.css")
+    everything = "".join(p.read_text(encoding="utf-8") for p in sorted(STATIC.rglob("*.js"))) + page
+
+    assert "/api/stats/import" not in everything and "data-stats-import" not in everything
+    assert "Importer un CSV" not in everything and "data-stats-file" not in everything
+    for internal in ("llm_cost", "by_usage", "by_video", "by_day", ".steps", ".counts", "/api/measures", "Coûts du modèle de langage",
+                     "Durée par étape", "Vidéos par statut"):
+        assert internal not in js, internal
+    assert "Résultats par clip" not in js and "stats_unmatched" not in js
+    assert ".stats-import" not in css
+
+
+def test_the_dashboard_now_carries_the_internal_measures():
+    js = _static("screens", "dashboard.js")
+
+    assert "/api/measures" in js and "dashMeasuresSection()" in js and "wireMeasures(body)" in js
+    for block in ("Coûts du modèle de langage", "Durée par étape", "Vidéos par statut", "data-block=\"llm\"",
+                  "data-block=\"steps\"", "data-block=\"counts\"", "Mesures internes"):
+        assert block in js, block
+    for field in ("llm_cost", "by_video", "by_usage", "by_day", "steps", "counts"):
+        assert field in js
+    assert "data-measures-channel" in js and "data-measures-preset" in js and "Toutes les chaînes" in js
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node absent du PATH")
+def test_stats_evolutions_are_signed_percentages_and_null_is_a_dash():
+    out = _stats_js_run(["statsDelta"], "[statsDelta(12.5), statsDelta(-3), statsDelta(0), statsDelta(null)]")
+
+    assert out[0] == {"cls": "up", "text": "▲ +12,5 %"}
+    assert out[1] == {"cls": "down", "text": "▼ -3,0 %"}
+    assert out[2] == {"cls": "flat", "text": "■ 0,0 %"}
+    assert out[3] == {"cls": "flat", "text": "—"}
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node absent du PATH")
+def test_stats_durations_dates_and_missing_values_are_never_a_zero():
+    out = _stats_js_run(["statsDuration", "statsPostedAt"], (
+        '[statsDuration(65), statsDuration(0), statsDuration(null), statsPostedAt("2026-09-30T14:05:00", "x"), '
+        'statsPostedAt("2026-09-30T00:00:00", null), statsPostedAt(null, "hier"), statsPostedAt(null, null)]'))
+
+    assert out == ["1:05", "0:00", "—", "30/09 · 14:05", "30/09 · 00:00", "hier", "—"]
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node absent du PATH")
+def test_stats_curve_breaks_the_line_on_a_day_without_a_relevé_never_inventing_a_value():
+    out = _stats_js_run(["statsLinePaths", "statsNiceMax"], (
+        "[statsLinePaths([1, 2, null, 4], (i) => i * 10, (v) => 100 - v),"
+        " statsLinePaths([null, null], (i) => i, (v) => v), statsLinePaths([5], (i) => 0, (v) => v),"
+        " statsNiceMax(0), statsNiceMax(1180), statsNiceMax(7)]"))
+
+    assert out[0] == "M0.0 99.0L10.0 98.0M30.0 96.0"  # le jour sans valeur coupe la ligne en deux segments
+    assert out[1] == "" and out[2] == "M0.0 5.0"
+    assert out[3] == 1 and out[4] >= 1180 and out[5] >= 7  # jamais un maximum nul : l'axe reste lisible
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node absent du PATH")
+def test_stats_addresses_carry_account_tab_and_video():
+    script = (
+        'const location = { hash: process.argv[1] };\n'
+        + "\n".join(_js_function(_static("screens", "stats.js"), n) for n in ("statsRoute", "statsHref"))
+        + '\nconst r = (h) => { location.hash = h; return statsRoute(); };'
+        + '\nprocess.stdout.write(JSON.stringify([r("#/stats"), r("#/stats/ab12cd"), r("#/stats/ab12cd/videos"),'
+        + ' r("#/stats/ab12cd/videos/730?x=1"), statsHref("ab12cd", "overview"), statsHref("ab12cd", "videos"),'
+        + ' statsHref("ab12cd", "videos", "730")]));'
+    )
+    out = json.loads(_node_run(script, "#/stats"))
+
+    assert out[0] == {"account": "", "tab": "overview", "post": ""}
+    assert out[1] == {"account": "ab12cd", "tab": "overview", "post": ""}
+    assert out[2] == {"account": "ab12cd", "tab": "videos", "post": ""}
+    assert out[3] == {"account": "ab12cd", "tab": "videos", "post": "730"}
+    assert out[4:] == ["#/stats/ab12cd", "#/stats/ab12cd/videos", "#/stats/ab12cd/videos/730"]
+
+
+def test_stats_css_carries_the_mockup_layout():
+    css = _static("style.css")
+
+    for selector in (".ctl", ".linked", ".scan", ".kpi-btn", ".delta", ".chart .ln", ".chart .ln.prev", ".gapband",
+                     ".ptable", ".thumb-p", ".figs", ".src-row", ".poster-big", ".video-sheet", ".dlinks", ".sort-m"):
+        assert selector in css, selector
+    assert "@media (max-width: 720px)" in css and ".ptable thead { display: none; }" in css  # liste en cartes sur mobile
