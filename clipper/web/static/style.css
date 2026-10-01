@@ -1176,7 +1176,8 @@ input[type="color"] { width: 36px; height: 36px; padding: 2px; border-radius: va
 .dash .panel > .list-item.dash-problem { align-items: flex-start; padding-top: 16px; padding-bottom: 16px; }
 .dash .panel > .list-item.dash-problem .chip { margin-top: 2px; }
 .dash .dash-problem .reason { margin-top: 8px; }
-.dash .job { grid-template-columns: minmax(0, 1fr) auto; }
+.dash .job { grid-template-columns: 96px minmax(0, 1fr) auto; }  /* vignette | texte | actions */
+@media (max-width: 900px) { .dash .job { grid-template-columns: 72px minmax(0, 1fr); } }
 
 /* ---------- Revue des moments v2 (TASK-6e75) ---------- */
 .screen[id="screen-review"] [data-body] { background: none; border: 0; box-shadow: none; }
