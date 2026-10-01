@@ -1195,6 +1195,39 @@ input[type="color"] { width: 36px; height: 36px; padding: 2px; border-radius: va
   .drawer-foot .btn { min-height: 44px; }
 }
 
+/* ---------- Ecran Chaînes v2 (TASK-ed15) ---------- */
+.screen[id="screen-channels"] [data-body] { background: none; border: 0; box-shadow: none; }
+.chan-card .ch-avatar { margin: 24px 0 0 24px; background: var(--accent); color: #111; }
+.chan-card .ch-body { padding-top: 16px; }
+.chan-url { overflow-wrap: anywhere; }
+.chan-title { font-size: 20px; display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+.chan-intro { margin: 0 0 16px; font-size: 13px; }
+.chan-sections { display: flex; flex-direction: column; gap: 16px; }
+.chan-sec { padding: 0; overflow: hidden; }
+.chan-sec > summary { display: flex; align-items: center; gap: 16px; padding: 16px 24px; cursor: pointer; list-style: none; }
+.chan-sec > summary::-webkit-details-marker { display: none; }
+.chan-sec > summary > div { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.chan-sec > summary h3 { font-size: 16px; }
+.chan-sec[open] > summary { border-bottom: 1px solid var(--line); }
+.chan-fields { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 20px 24px; padding: 20px 24px; }
+.chan-more > summary { padding: 12px 24px; cursor: pointer; font-size: 13px; color: var(--muted); border-top: 1px solid var(--line); }
+.chan-head { display: flex; align-items: center; gap: 8px; min-height: 28px; }
+.chan-origin { font-size: 12px; color: var(--faint); }
+.chan-field.inherited .input, .chan-field.inherited .switch { opacity: 0.55; }
+.chan-field.inherited .input { color: var(--muted); background: var(--surface-2, var(--surface)); }
+.chan-field.invalid .input { border-color: var(--bad); }
+.chan-field .input:disabled { cursor: not-allowed; }
+.field-error { font-size: 12px; color: var(--bad); }
+.field-error:empty { display: none; }
+.chan-sec-error { padding: 12px 24px 0; }
+.chan-json { height: auto; min-height: 44px; padding: 8px 12px; resize: vertical; }
+.chan-slots { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
+.chan-slot { display: flex; gap: 8px; align-items: center; }
+.chan-logo { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; font-size: 12px; }
+@media (max-width: 900px) {
+  .chan-fields { grid-template-columns: minmax(0, 1fr); padding: 16px; }
+  .chan-sec > summary { padding: 12px 16px; }
+  .chan-field .btn, .chan-slot .input, .chan-slot .icon-btn { min-height: 44px; }
 /* ---------- Surveillance : VOD à confirmer (TASK-7508) ---------- */
 .watch-vod .watch-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
 .watch-vod .btn:disabled { opacity: 0.45; cursor: not-allowed; }

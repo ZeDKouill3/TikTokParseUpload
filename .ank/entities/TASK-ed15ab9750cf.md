@@ -5,7 +5,7 @@ slug: web-cran-cha-nes-liste-cr-ation-dition-d-un-pres
 title: "web : écran Chaînes (liste, création/édition d'un preset par formulaire avec valeurs héritées, validation au champ, suppression)"
 created: 2026-09-30T20:44:56Z
 author: w-plan-web
-status: in_progress
+status: done
 scope:
   - clipper/web/app.py
   - clipper/web/static/**
@@ -16,8 +16,15 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/2f4e2be401ab@6477563
+    tree: scope/7ad26e9ad211
+    criteria: 487afe953a76
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 3
+version: 4
 ---
 
 SPEC-c100 E5 (hors éditeur visuel et aperçu, tâches séparées), SPEC-fc0c §1. Les commentaires des CONFIG_DEFAULTS servent d'aide contextuelle : extraits par inspect.getsource du module, jamais évalués. Le logo de la chaîne ([channel] logo, PNG) s'envoie par POST multipart vers presets/<name>.png.
