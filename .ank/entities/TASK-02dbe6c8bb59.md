@@ -5,7 +5,7 @@ slug: jury-confiance-par-juge-et-par-moment-d-bat-sur
 title: "Jury : confiance par juge et par moment, débat sur confiance basse, médiane pondérée (SPEC-73d0)"
 created: 2026-10-01T13:23:00Z
 author: nicoc@zedk_ordi
-status: open
+status: in_progress
 scope:
   - clipper/jury.py
   - clipper/moments.py
@@ -21,7 +21,7 @@ criteria_by: creator
 verify: [tests]
 method: tdd
 schema: 4
-version: 1
+version: 2
 ---
 
 Implémente SPEC-73d05edb4a74 (ratifiée 2026-10-01).
