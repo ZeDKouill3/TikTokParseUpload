@@ -4140,3 +4140,70 @@ def test_stats_clip_sort_orders_by_column_with_missing_values_last():
     )
     out = subprocess.run(["node", "-e", script], capture_output=True, text=True, check=True).stdout
     assert json.loads(out) == ["cab", "acb"]
+
+
+# --------------------------------------------------------------------------
+# Grille de notation par chaîne (SPEC-9216 R4)
+# --------------------------------------------------------------------------
+
+
+def test_put_channel_writes_the_builtin_gaming_rubric_in_the_preset(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path)
+
+    resp = client(tmp_path).put(f"/api/channels/{CH}", json={"preset": {
+        "channel": {"display_name": "Ma chaîne"}, "moments": {"rubric_path": "builtin:gaming"},
+    }})
+
+    assert resp.status_code == 200, resp.text
+    saved = (tmp_path / "presets" / f"{CH}.toml").read_text(encoding="utf-8")
+    assert 'rubric_path = "builtin:gaming"' in saved
+    body = client(tmp_path).get(f"/api/channels/{CH}").json()
+    assert body["raw"]["moments"] == {"rubric_path": "builtin:gaming"}
+    assert body["effective"]["moments"]["rubric_path"] == "builtin:gaming"   # grille en vigueur
+
+
+def test_get_channel_effective_rubric_is_inherited_without_a_preset_value(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path)
+
+    body = client(tmp_path).get(f"/api/channels/{CH}").json()
+
+    assert "moments" not in body["raw"]
+    assert body["effective"]["moments"]["rubric_path"] == "rubric.toml"      # défaut du module
+    assert body["defaults"]["moments"]["rubric_path"]["default"] == "rubric.toml"
+    assert "builtin:gaming" in body["defaults"]["moments"]["rubric_path"]["comment"]
+
+
+def test_get_video_detail_reports_the_rubric_used_by_moments_json(tmp_path, isolated_cwd):
+    _write_state(tmp_path, VIDEO_ID, status="done", steps={})
+    _write_json(tmp_path / "workspace" / VIDEO_ID / "moments.json", {
+        "video_id": VIDEO_ID, "moments": [],
+        "rubric": {"path": "/x/clipper/assets/rubric-gaming.toml", "weights": {"emotion": 4}, "min_score": 45},
+    })
+
+    body = client(tmp_path).get(f"/api/videos/{VIDEO_ID}").json()
+
+    assert body["rubric"] == "/x/clipper/assets/rubric-gaming.toml"
+
+
+def test_get_video_detail_without_moments_json_has_no_rubric(tmp_path, isolated_cwd):
+    _write_state(tmp_path, VIDEO_ID, status="running", steps={})
+
+    assert client(tmp_path).get(f"/api/videos/{VIDEO_ID}").json()["rubric"] is None
+
+
+def test_channels_form_offers_the_rubric_choice_standard_gaming_or_custom_file():
+    js = (STATIC / "screens" / "channels.js").read_text(encoding="utf-8")
+
+    assert "Grille de notation" in js
+    for label in ("Standard", "Gaming", "Fichier personnalisé"):
+        assert label in js, label
+    for value in ("builtin", "builtin:gaming", "rubric_path"):
+        assert f'"{value}"' in js, value
+    assert "Grille en vigueur" in js                       # la grille effective est affichée
+    assert 'kind === "rubric"' in js or '"rubric"' in js   # contrôle dédié, pas un champ texte brut
+
+
+def test_video_sheet_shows_the_rubric_used():
+    js = (STATIC / "screens" / "videos.js").read_text(encoding="utf-8")
+
+    assert "video.rubric" in js and "Grille" in js

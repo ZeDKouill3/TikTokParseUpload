@@ -18,6 +18,10 @@ const CHAN_SECTIONS = [
 ];
 const CHAN_DAYS = [["mon", "Lundi"], ["tue", "Mardi"], ["wed", "Mercredi"], ["thu", "Jeudi"], ["fri", "Vendredi"], ["sat", "Samedi"], ["sun", "Dimanche"]];
 const CHAN_MODES = [["review", "review (tu valides les moments)"], ["auto", "auto (le jury décide)"]];
+// Grilles de notation embarquées (SPEC-9216 R4) : valeur de [moments] rubric_path -> libellé.
+// Toute autre valeur est un chemin de fichier (« Fichier personnalisé »).
+const CHAN_RUBRICS = [["builtin", "Standard"], ["builtin:gaming", "Gaming"]];
+const CHAN_RUBRIC_CUSTOM = "custom";
 const CHAN_STALE_MS = 4000;
 const CHAN_SLOTS_SHOWN = 3;
 
@@ -138,6 +142,7 @@ function chOpenNew() {
 function chKind(key, section, def) {
   if (section === "channel" && key === "slots") return "slots";
   if (section === "channel" && key === "mode") return "mode";
+  if (section === "moments" && key === "rubric_path") return "rubric";
   if (typeof def === "boolean") return "bool";
   if (typeof def === "number") return "number";
   if (typeof def === "string") return "text";
@@ -153,10 +158,27 @@ function chSlotsEditor(value, dis) {
     <button type="button" class="btn btn-xs" data-slot-add${dis}>${icon("plus", "i-xs")}Ajouter un créneau</button></div>`;
 }
 
+/* Libellé de la grille en vigueur pour une valeur de rubric_path. */
+function chRubricLabel(value) {
+  const known = CHAN_RUBRICS.find(([k]) => k === value);
+  return known ? `${known[1]} (${value})` : `Fichier personnalisé (${value})`;
+}
+
+function chRubricEditor(id, value, dis) {
+  const known = CHAN_RUBRICS.some(([k]) => k === value);
+  const options = [...CHAN_RUBRICS, [CHAN_RUBRIC_CUSTOM, "Fichier personnalisé"]]
+    .map(([k, l]) => `<option value="${k}"${(known ? k === value : k === CHAN_RUBRIC_CUSTOM) ? " selected" : ""}>${esc(l)}</option>`).join("");
+  return `<div class="chan-rubric">
+    <select class="input" id="${id}" data-rubric-select aria-label="Grille de notation"${dis}>${options}</select>
+    <input class="input mono" type="text" data-rubric-path aria-label="Chemin du fichier de grille" placeholder="ma_grille.toml" value="${known ? "" : esc(value)}" autocomplete="off"${known ? " hidden" : ""}${dis}>
+    <span class="hint" data-rubric-now>Grille en vigueur : ${esc(chRubricLabel(value))}</span></div>`;
+}
+
 function chControl(id, kind, value, locked) {
   const dis = locked ? " disabled" : "";
   switch (kind) {
     case "slots": return chSlotsEditor(value, dis);
+    case "rubric": return chRubricEditor(id, value, dis);
     case "mode": return `<select class="input" id="${id}"${dis}>${CHAN_MODES.map(([k, l]) => `<option value="${k}"${k === value ? " selected" : ""}>${esc(l)}</option>`).join("")}</select>`;
     case "bool": return `<label class="switch"><input type="checkbox" id="${id}"${value ? " checked" : ""}${dis}><span></span></label>`;
     case "number": return `<input class="input mono" id="${id}" type="number" step="any" value="${esc(value)}"${dis}>`;
@@ -229,13 +251,24 @@ function chReadField(field) {
   if (kind === "slots") {
     return $$(".chan-slot", field).map((row) => ({ day: $("[data-slot-day]", row).value, time: $("[data-slot-time]", row).value }));
   }
+  if (kind === "rubric") {
+    const choice = $("[data-rubric-select]", field).value;
+    const pathEl = $("[data-rubric-path]", field);
+    pathEl.hidden = choice !== CHAN_RUBRIC_CUSTOM;
+    if (choice !== CHAN_RUBRIC_CUSTOM) return choice;
+    const path = pathEl.value.trim();
+    if (!path) throw new Error("indique le chemin du fichier de grille");
+    return path;
+  }
   const el = $("input, select, textarea", field);
   if (kind === "bool") return el.checked;
   if (kind === "number") {
     const text = el.value.trim();
     return text !== "" && Number.isFinite(Number(text)) ? Number(text) : text;
   }
-  if (kind === "json") return JSON.parse(el.value);
+  if (kind === "json") {
+    try { return JSON.parse(el.value); } catch (err) { throw new Error(`JSON invalide (${err.message})`); }
+  }
   return el.value;
 }
 
@@ -371,10 +404,11 @@ function chWireEdit(root, ed) {
       ed.draft[section][key] = chReadField(field);
       field.classList.remove("invalid");
       $(".field-error", field).textContent = "";
+      if (field.dataset.kind === "rubric") $("[data-rubric-now]", field).textContent = `Grille en vigueur : ${chRubricLabel(ed.draft[section][key])}`;
       if (section === "subtitles" || section === "reframe") chSubsPreview(root, ed);
     } catch (err) {
       field.classList.add("invalid");
-      $(".field-error", field).textContent = `[${section}] ${key} : JSON invalide (${err.message})`;
+      $(".field-error", field).textContent = `[${section}] ${key} : ${err.message}`;
     }
   };
   root.oninput = changed;
