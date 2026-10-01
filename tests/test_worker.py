@@ -855,11 +855,28 @@ def test_heartbeat_with_a_dead_pid_is_stopped_even_if_recent(tmp_path, monkeypat
 
 import logging  # noqa: E402
 
-from clipper import browser, publish, tiktok  # noqa: E402
+from clipper import accounts as accounts_mod, browser, publish, tiktok  # noqa: E402
 
 ACCOUNT = "ab12cd"
 LINK = "https://example.invalid/@ma_chaine/video/7300000000000000001"
 _WEEK = "".join(f'[[channel.slots]]\nday = "{d}"\ntime = "09:00"\n' for d in ("mon", "tue", "wed", "thu", "fri", "sat", "sun"))
+
+
+_CONNECTED = {"state": "connected", "checked_at": "2026-10-01T10:00:00+00:00", "expires_at": None}
+
+
+class FakeLogin:
+    """Remplace browser.login_state : connexion simulee par compte (defaut : connecte), jamais de cookie lu."""
+
+    def __init__(self, **states):
+        self.states, self.calls = states, []
+
+    def __call__(self, account, *, config=None, now=None):
+        self.calls.append(account)
+        state = self.states.get(account, "connected")
+        if isinstance(state, Exception):
+            raise state
+        return {"state": state, "checked_at": "2026-10-01T10:00:00+00:00", "expires_at": None}
 
 
 class FakePublisher:
@@ -883,7 +900,9 @@ def _pub_env(tmp_path, monkeypatch, *, tiktok_settings=None, account=ACCOUNT, ch
     (tmp_path / "config.toml").write_text('mode = "review"\n', encoding="utf-8")
     (tmp_path / "state").mkdir(exist_ok=True)
     (tmp_path / "state" / "accounts.json").write_text(
-        json.dumps({"accounts": [{"id": ACCOUNT, "label": "A"}, {"id": "ef34ab", "label": "B"}]}), encoding="utf-8")
+        json.dumps({"accounts": [{"id": ACCOUNT, "label": "A", "ready_to_publish": True, "login": _CONNECTED},
+                                 {"id": "ef34ab", "label": "B", "ready_to_publish": True, "login": _CONNECTED}]}),
+        encoding="utf-8")
     presets = tmp_path / "presets"
     presets.mkdir(exist_ok=True)
     for i, name in enumerate(channels):
@@ -919,8 +938,13 @@ def _entries(tmp_path, channel="ma_chaine"):
     return json.loads((tmp_path / "state" / "publish" / f"{channel}.json").read_text(encoding="utf-8"))
 
 
-def _pub_worker(config, publisher):
-    return worker.Worker(config=config, spawner=FakeSpawner(), publisher=publisher)
+def _pub_worker(config, publisher, login=None):
+    return worker.Worker(config=config, spawner=FakeSpawner(), publisher=publisher, login_checker=login or FakeLogin())
+
+
+def _recheck(account=ACCOUNT):
+    """L'utilisateur recoche « pret a publier » (decoche apres un arret R4, SPEC-00d1 R3)."""
+    accounts_mod.set_ready(Config(mode="review", workspace_dir=Path("workspace"), output_dir=Path("output")), account, True)
 
 
 def _ago(**kw):
@@ -1060,6 +1084,7 @@ def test_r4_a_stop_fails_the_entry_with_reason_and_capture_halts_the_account_and
     assert len(pub.calls) == 1
 
     publish.retry("aaaaaaaaaaa", "01", "ma_chaine")  # bouton Reessayer
+    _recheck()  # l'arret a decoche la case : elle se recoche a la main
     w.tick()
     assert len(pub.calls) == 2 and _entries(tmp_path)[0]["status"] == "published"
 
@@ -1073,6 +1098,7 @@ def test_a_browser_error_fails_and_halts_a_tiktok_error_only_fails_the_entry(tmp
     assert entry["status"] == "failed" and "Chrome est introuvable" in entry["error"] and entry["halted"] is True
 
     publish.retry("aaaaaaaaaaa", "01", "ma_chaine")
+    _recheck()
     w.publisher = FakePublisher(error=tiktok.TikTokError("programmation refusée : trop loin"))
     w.tick()
     entry = _entries(tmp_path)[0]
@@ -1179,7 +1205,8 @@ class FakeStatsFetcher:
 
 
 def _stats_worker(config, fetcher):
-    return worker.Worker(config=config, spawner=FakeSpawner(), publisher=FakePublisher(), stats_fetcher=fetcher)
+    return worker.Worker(config=config, spawner=FakeSpawner(), publisher=FakePublisher(), stats_fetcher=fetcher,
+                         login_checker=FakeLogin())
 
 
 def _published_clip(tmp_path, clip_id, account=ACCOUNT, *, video_id="aaaaaaaaaaa", post_id="7300000000000000001"):
@@ -1232,7 +1259,7 @@ def test_tick_skips_the_stats_of_an_account_halted_by_a_safe_stop(tmp_path, monk
     _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1))
     w = worker.Worker(config=config, spawner=FakeSpawner(),
                       publisher=FakePublisher(error=tiktok.TikTokStop("captcha", "captcha détecté", None)),
-                      stats_fetcher=FakeStatsFetcher(tmp_path))
+                      stats_fetcher=FakeStatsFetcher(tmp_path), login_checker=FakeLogin())
 
     w.tick()  # la publication s'arrete sur captcha : compte arrete
     w.tick()
@@ -1246,7 +1273,7 @@ def test_tick_does_not_fetch_stats_in_the_tick_that_drove_a_publication(tmp_path
     _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1))
     fetcher = FakeStatsFetcher(tmp_path)
     pub = FakePublisher()
-    w = worker.Worker(config=config, spawner=FakeSpawner(), publisher=pub, stats_fetcher=fetcher)
+    w = worker.Worker(config=config, spawner=FakeSpawner(), publisher=pub, stats_fetcher=fetcher, login_checker=FakeLogin())
 
     w.tick()
     assert len(pub.calls) == 1 and fetcher.calls == []  # un seul pilotage du navigateur par iteration
@@ -1298,3 +1325,230 @@ def test_an_unexpected_error_in_the_stats_fetch_is_logged_not_fatal(tmp_path, mo
         w.tick()
 
     assert "boom" in caplog.text
+
+
+# --------------------------------------------------------------------------
+# SPEC-00d1 R2-R4, R6 : comptes prets, connexion verifiee, compte choisi par publication
+# --------------------------------------------------------------------------
+
+OTHER = "ef34ab"
+
+
+def _set_account_state(tmp_path, account, **fields):
+    path = tmp_path / "state" / "accounts.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    next(a for a in data["accounts"] if a["id"] == account).update(fields)
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
+def _account_state(tmp_path, account):
+    data = json.loads((tmp_path / "state" / "accounts.json").read_text(encoding="utf-8"))
+    return next(a for a in data["accounts"] if a["id"] == account)
+
+
+def test_an_entry_whose_account_is_not_ready_is_not_attempted_and_waits_with_the_reason(tmp_path, monkeypatch, caplog):
+    config = _pub_env(tmp_path, monkeypatch)
+    _set_account_state(tmp_path, ACCOUNT, ready_to_publish=False)
+    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1))
+    pub, login = FakePublisher(), FakeLogin()
+
+    with caplog.at_level(logging.WARNING):
+        _pub_worker(config, pub, login).tick()
+
+    assert pub.calls == [] and login.calls == []  # ni publication, ni lecture de cookies pour un compte non prêt
+    entry = _entries(tmp_path)[0]
+    assert entry["status"] == "scheduled" and entry["error"] is None  # en attente, pas en échec
+    assert "non prêt à publier" in entry["waiting_reason"] and "A" in entry["waiting_reason"]
+    assert "non prêt à publier" in caplog.text
+    event = tiktok.read_events(config=config)[-1]
+    assert event["level"] == "warn" and event["account"] == ACCOUNT and event["clip_id"] == "01"
+
+
+def test_a_not_ready_account_never_falls_back_to_another_account(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)  # le compte de la chaine (ab12cd) est prêt, l'autre non
+    _set_account_state(tmp_path, OTHER, ready_to_publish=False)
+    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1), account=OTHER)
+    pub = FakePublisher()
+
+    _pub_worker(config, pub).tick()
+
+    assert pub.calls == []  # ni l'autre compte, ni celui de la chaine
+    assert "non prêt à publier" in _entries(tmp_path)[0]["waiting_reason"]
+
+
+def test_the_account_chosen_for_the_publication_is_the_one_the_worker_uses(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1), account=OTHER)  # la chaine pointe ab12cd
+    pub, login = FakePublisher(), FakeLogin()
+
+    _pub_worker(config, pub, login).tick()
+
+    assert [c["account"] for c in pub.calls] == [OTHER]
+    assert login.calls == [OTHER]  # c'est la connexion de CE compte qui est verifiee
+    entry = _entries(tmp_path)[0]
+    assert entry["status"] == "published" and entry["waiting_reason"] is None
+    sidecar = json.loads((tmp_path / "output" / "aaaaaaaaaaa" / "01.json").read_text(encoding="utf-8"))
+    assert sidecar["tiktok_post"]["account"] == OTHER
+
+
+def test_an_entry_without_account_field_keeps_using_the_channel_account(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1))  # file d'avant R4 : aucun champ account
+    pub = FakePublisher()
+
+    _pub_worker(config, pub).tick()
+
+    assert [c["account"] for c in pub.calls] == [ACCOUNT]
+
+
+def test_an_entry_with_an_unknown_account_waits_with_the_reason(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1), account="supprime")
+    pub = FakePublisher()
+
+    _pub_worker(config, pub).tick()
+
+    assert pub.calls == []
+    assert "introuvable" in _entries(tmp_path)[0]["waiting_reason"]
+
+
+def test_a_waiting_entry_does_not_block_the_next_due_entry_of_a_ready_account(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch, tiktok_settings={"max_posts_per_day": 5, "min_gap_minutes": 0})
+    _set_account_state(tmp_path, OTHER, ready_to_publish=False)
+    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=3), account=OTHER)
+    _seed(tmp_path, "ma_chaine", "02", _ago(minutes=2))
+    pub = FakePublisher()
+
+    _pub_worker(config, pub).tick()
+
+    assert [c["clip"]["caption"] for c in pub.calls] == ["legende 02"]
+    first, second = _entries(tmp_path)
+    assert first["status"] == "scheduled" and first["waiting_reason"] and second["status"] == "published"
+
+
+def test_the_entry_is_attempted_again_once_the_account_is_ready_and_the_reason_is_cleared(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    _set_account_state(tmp_path, ACCOUNT, ready_to_publish=False)
+    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1))
+    pub = FakePublisher()
+    w = _pub_worker(config, pub)
+    w.tick()
+    assert pub.calls == [] and _entries(tmp_path)[0]["waiting_reason"]
+
+    _recheck()
+    w.tick()
+
+    assert len(pub.calls) == 1 and _entries(tmp_path)[0]["status"] == "published"
+    assert _entries(tmp_path)[0]["waiting_reason"] is None
+
+
+def test_the_reason_is_logged_and_notified_once_not_at_every_tick(tmp_path, monkeypatch, caplog):
+    config = _pub_env(tmp_path, monkeypatch)
+    _set_account_state(tmp_path, ACCOUNT, ready_to_publish=False)
+    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1))
+    w = _pub_worker(config, FakePublisher())
+
+    with caplog.at_level(logging.WARNING):
+        w.tick()
+        w.tick()
+        w.tick()
+
+    assert caplog.text.count("publication en attente") == 1
+    assert len(tiktok.read_events(config=config)) == 1
+
+
+def test_the_connection_is_verified_before_each_publication(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch, tiktok_settings={"max_posts_per_day": 5, "min_gap_minutes": 0})
+    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=2))
+    _seed(tmp_path, "ma_chaine", "02", _ago(minutes=1))
+    login = FakeLogin()
+    w = _pub_worker(config, FakePublisher(), login)
+
+    w.tick()
+    w.tick()
+
+    assert login.calls == [ACCOUNT, ACCOUNT]
+
+
+def test_an_expired_session_before_publishing_unticks_ready_and_the_entry_waits(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1))
+    pub = FakePublisher()
+
+    _pub_worker(config, pub, FakeLogin(**{ACCOUNT: "expired"})).tick()
+
+    assert pub.calls == []
+    entry = _entries(tmp_path)[0]
+    assert entry["status"] == "scheduled" and "session TikTok expirée" in entry["waiting_reason"]
+    assert "décoché" in entry["waiting_reason"]
+    stored = _account_state(tmp_path, ACCOUNT)
+    assert stored["ready_to_publish"] is False and "décoché automatiquement" in stored["ready_note"]
+    assert stored["login"]["state"] == "expired"
+
+
+def test_a_never_connected_profile_before_publishing_waits_without_publishing(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1))
+    pub = FakePublisher()
+
+    _pub_worker(config, pub, FakeLogin(**{ACCOUNT: "never"})).tick()
+
+    assert pub.calls == [] and "non connecté à TikTok" in _entries(tmp_path)[0]["waiting_reason"]
+
+
+def test_a_connection_that_cannot_be_verified_waits_with_the_error_and_nothing_is_published(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1))
+    pub = FakePublisher()
+    login = FakeLogin(**{ACCOUNT: browser.BrowserError("cookies du profil illisibles : ferme la fenêtre Chrome")})
+
+    _pub_worker(config, pub, login).tick()
+
+    assert pub.calls == []
+    entry = _entries(tmp_path)[0]
+    assert entry["status"] == "scheduled" and "non vérifiable" in entry["waiting_reason"]
+    assert "ferme la fenêtre Chrome" in entry["waiting_reason"]
+    assert _account_state(tmp_path, ACCOUNT)["ready_to_publish"] is True  # pas de verification : pas de decochage
+
+
+@pytest.mark.parametrize("error", [
+    tiktok.TikTokStop("captcha", "captcha détecté", None),
+    browser.BrowserError("Chrome est introuvable"),
+    RuntimeError("boum"),
+])
+def test_an_r4_stop_unticks_ready_until_the_user_ticks_it_again(tmp_path, monkeypatch, caplog, error):
+    config = _pub_env(tmp_path, monkeypatch)
+    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1))
+
+    with caplog.at_level(logging.WARNING):
+        _pub_worker(config, FakePublisher(error=error)).tick()
+
+    stored = _account_state(tmp_path, ACCOUNT)
+    assert stored["ready_to_publish"] is False and "arrêt de publication" in stored["ready_note"]
+    assert "prêt à publier" in caplog.text and "décoché" in caplog.text
+    assert _account_state(tmp_path, OTHER)["ready_to_publish"] is True  # les autres comptes ne bougent pas
+
+
+def test_an_error_that_does_not_halt_the_account_keeps_ready_ticked(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1))
+
+    _pub_worker(config, FakePublisher(error=tiktok.TikTokError("programmation refusée"))).tick()
+
+    assert _account_state(tmp_path, ACCOUNT)["ready_to_publish"] is True
+    assert _entries(tmp_path)[0]["failed_at"]  # l'echec est date
+
+
+def test_a_halt_on_the_chosen_account_does_not_block_the_channel_account(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch, tiktok_settings={"max_posts_per_day": 5, "min_gap_minutes": 0})
+    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=2), account=OTHER)
+    _seed(tmp_path, "ma_chaine", "02", _ago(minutes=1))
+    pub = FakePublisher(error=tiktok.TikTokStop("captcha", "captcha détecté", None))
+    w = _pub_worker(config, pub)
+
+    w.tick()  # l'entree 01 (compte OTHER) s'arrete
+    pub.error = None
+    w.tick()
+
+    assert [c["account"] for c in pub.calls] == [OTHER, ACCOUNT]
+    assert _entries(tmp_path)[1]["status"] == "published"

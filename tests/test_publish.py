@@ -730,3 +730,104 @@ def test_set_mode_overrides_the_publish_mode_of_one_entry(isolated_cwd):
     assert publish.set_mode("vid1", "01", "ma_chaine", None)["publish_mode"] is None
     with pytest.raises(publish.PublishError, match="mode"):
         publish.set_mode("vid1", "01", "ma_chaine", "demain")
+
+
+# --------------------------------------------------------------------------
+# SPEC-00d1 R4 : compte choisi par publication
+# --------------------------------------------------------------------------
+
+_OTHER = "ef34ab"
+
+
+def test_approve_prefills_the_account_with_the_channel_account(isolated_cwd):
+    publish = _tiktok_env(isolated_cwd, ("01",))
+
+    assert publish.list_entries("ma_chaine")[0]["account"] == _ACCOUNT
+
+
+def test_approve_can_pick_another_account_and_a_channel_without_account_leaves_it_empty(isolated_cwd):
+    _write_config(isolated_cwd)
+    _write_preset(isolated_cwd, "ma_chaine", _SLOT_PRESET)  # aucun tiktok_account
+    from clipper import publish
+
+    _write_sidecar(isolated_cwd, "vid1", "01")
+    _write_sidecar(isolated_cwd, "vid1", "02")
+    publish.approve("vid1", "01", "ma_chaine", now=_MON)
+    publish.approve("vid1", "02", "ma_chaine", now=_MON, account=_OTHER)
+
+    first, second = publish.list_entries("ma_chaine")
+    assert first["account"] is None and second["account"] == _OTHER
+
+
+def test_set_account_changes_the_account_of_an_entry_until_it_is_published(isolated_cwd):
+    publish = _tiktok_env(isolated_cwd, ("01", "02"))
+
+    entry = publish.set_account("vid1", "01", "ma_chaine", _OTHER)
+    assert entry["account"] == _OTHER and publish.list_entries("ma_chaine")[0]["account"] == _OTHER
+    assert publish.list_entries("ma_chaine")[1]["account"] == _ACCOUNT  # les autres entrees ne bougent pas
+
+    publish.mark_published("vid1", "02", "ma_chaine", now=_MON)
+    with pytest.raises(publish.PublishError, match="changement de compte refusé"):
+        publish.set_account("vid1", "02", "ma_chaine", _OTHER)
+    with pytest.raises(publish.PublishError, match="absent de la file"):
+        publish.set_account("vid1", "99", "ma_chaine", _OTHER)
+    with pytest.raises(publish.PublishError, match="compte de publication manquant"):
+        publish.set_account("vid1", "01", "ma_chaine", "")
+
+
+def test_entry_account_never_falls_back_to_another_account(isolated_cwd):
+    from clipper import publish
+
+    assert publish.entry_account({"account": _OTHER}, _ACCOUNT) == _OTHER
+    assert publish.entry_account({"account": None}, _ACCOUNT) is None      # aucun compte choisi : pas le defaut
+    assert publish.entry_account({}, _ACCOUNT) == _ACCOUNT                  # file d'avant R4 : compte de la chaine
+    assert publish.entry_account({}, "") is None
+
+
+def test_the_posts_and_halt_of_an_account_follow_the_entry_account_across_channels(isolated_cwd):
+    publish = _tiktok_env(isolated_cwd, ("01", "02"))
+    _write_preset(isolated_cwd, "autre", _TWO_SLOTS.replace(_ACCOUNT, _OTHER))
+    (isolated_cwd / "state" / "accounts.json").write_text(json.dumps({"accounts": [
+        {"id": _ACCOUNT, "label": "A"}, {"id": _OTHER, "label": "B"}]}), encoding="utf-8")
+    publish.set_account("vid1", "01", "ma_chaine", _OTHER)  # le clip de ma_chaine part sur l'autre compte
+    at = datetime(2026, 9, 28, 9, 0, tzinfo=timezone.utc)
+    publish.mark_published("vid1", "01", "ma_chaine", now=at, tiktok_state="published", post_id="1",
+                           publish_at=at.isoformat(), account=_OTHER)
+    publish.mark_failed("vid1", "02", "ma_chaine", "captcha", halted=True)
+
+    assert publish.account_publish_times(_OTHER) == [at]
+    assert publish.account_publish_times(_ACCOUNT) == []
+    assert publish.halted_account(_OTHER) is None
+    assert publish.halted_account(_ACCOUNT)["clip_id"] == "02"
+
+
+def test_mark_failed_records_when_and_last_failure_is_the_most_recent_of_the_account(isolated_cwd):
+    publish = _tiktok_env(isolated_cwd, ("01", "02"))
+    early = datetime(2026, 9, 28, 9, 0, tzinfo=timezone.utc)
+
+    first = publish.mark_failed("vid1", "01", "ma_chaine", "premier", now=early)
+    publish.mark_failed("vid1", "02", "ma_chaine", "second", now=early.replace(hour=11), capture="c.png")
+
+    assert first["failed_at"] == early.isoformat()
+    last = publish.last_failure(_ACCOUNT)
+    assert (last["clip_id"], last["error"], last["channel"], last["capture"]) == ("02", "second", "ma_chaine", "c.png")
+    assert publish.last_failure(_OTHER) is None
+
+
+def test_waiting_reason_is_set_once_and_cleared_by_publishing_failing_or_changing_account(isolated_cwd):
+    publish = _tiktok_env(isolated_cwd, ("01", "02", "03"))
+
+    assert publish.set_waiting_reason("vid1", "01", "ma_chaine", "compte non prêt") is True
+    assert publish.set_waiting_reason("vid1", "01", "ma_chaine", "compte non prêt") is False  # inchange
+    assert publish.list_entries("ma_chaine")[0]["waiting_reason"] == "compte non prêt"
+    publish.set_account("vid1", "01", "ma_chaine", _OTHER)
+    assert publish.list_entries("ma_chaine")[0]["waiting_reason"] is None
+
+    publish.set_waiting_reason("vid1", "02", "ma_chaine", "raison")
+    publish.mark_failed("vid1", "02", "ma_chaine", "echec")
+    assert publish.list_entries("ma_chaine")[1]["waiting_reason"] is None
+    publish.set_waiting_reason("vid1", "03", "ma_chaine", "raison")
+    publish.mark_published("vid1", "03", "ma_chaine", now=_MON)
+    assert publish.list_entries("ma_chaine")[2]["waiting_reason"] is None
+    with pytest.raises(publish.PublishError, match="absent de la file"):
+        publish.set_waiting_reason("vid1", "99", "ma_chaine", "x")

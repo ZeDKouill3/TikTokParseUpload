@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
+from clipper import accounts as accounts_mod
 from clipper import browser
 from clipper import channel as channel_mod
 from clipper import publish as publish_mod
@@ -266,6 +267,7 @@ class Worker:
         watch_lister: Callable[[str], list[dict[str, Any]]] | None = None,
         publisher: Callable[..., dict[str, Any]] | None = None,
         stats_fetcher: Callable[..., dict[str, Any]] | None = None,
+        login_checker: Callable[..., dict[str, Any]] | None = None,
     ) -> None:
         self._popen = None
         if spawner is None:
@@ -281,6 +283,7 @@ class Worker:
         self.publisher = publisher or tiktok.publish
         self._logged_publish_errors: set[str] = set()
         self.stats_fetcher = stats_fetcher or tiktok.fetch_stats
+        self.login_checker = login_checker or browser.login_state  # connexion verifiee avant chaque publication
         self._stats_attempts: dict[str, datetime] = {}
         self._logged_stats_errors: set[str] = set()
         self._path = _queue_path(self.config)
@@ -441,11 +444,13 @@ class Worker:
                      settings: dict[str, Any], paths: dict[str, Any], now: datetime) -> bool:
         """Vrai si la tentative de publication a eu lieu (reussie ou en echec) : fin de l'iteration."""
         video_id, clip_id = entry["video_id"], entry["clip_id"]
-        account = channel["tiktok_account"]
+        account = publish_mod.entry_account(entry, channel["tiktok_account"])  # jamais un autre compte en repli
         where = {"channel": name, "video_id": video_id, "clip_id": clip_id}
         if not account:
             self._fail(entry, name, f"chaîne {name} sans compte TikTok relié : renseigne [channel] tiktok_account "
                        "dans son preset", halted=False, account=None, state_dir=paths["state_dir"])
+            return False
+        if not self._account_ready(entry, name, account, paths["state_dir"]):
             return False
         scope = {"state_dir": paths["state_dir"], "presets_dir": paths["presets_dir"], "base": paths["base"]}
         if publish_mod.halted_account(account, **scope) is not None:
@@ -463,6 +468,10 @@ class Worker:
                                "capture": None}, config=self.config)
             return False
 
+        if not self._connected(entry, name, account, paths["state_dir"]):
+            return False
+        if entry.get("waiting_reason"):
+            publish_mod.set_waiting_reason(video_id, clip_id, name, None, state_dir=paths["state_dir"])
         try:
             clip = tiktok.clip_payload(publish_mod.read_sidecar(self.config.output_dir, video_id, clip_id),
                                        self.config.output_dir)
@@ -491,12 +500,58 @@ class Worker:
                               config=self.config)
         return True
 
+    def _wait(self, entry: dict[str, Any], channel: str, account: str, reason: str, state_dir: str | Path) -> None:
+        """Entree non tentee (SPEC-00d1 R4) : elle reste ``scheduled`` avec la raison visible ; journal et
+        evenement console une seule fois par raison."""
+        if publish_mod.set_waiting_reason(entry["video_id"], entry["clip_id"], channel, reason, state_dir=state_dir):
+            log.warning("%s/%s : publication en attente : %s", entry["video_id"], entry["clip_id"], reason)
+            tiktok.emit_event({"level": "warn", "account": account, "channel": channel, "video_id": entry["video_id"],
+                               "clip_id": entry["clip_id"], "reason": reason, "capture": None}, config=self.config)
+
+    def _account_ready(self, entry: dict[str, Any], channel: str, account: str, state_dir: str | Path) -> bool:
+        """Le compte de l'entree est-il « pret a publier » (R3, R4) ? Sinon l'entree n'est pas tentee."""
+        known = {a["id"]: a for a in accounts_mod.list_accounts(self.config)}
+        found = known.get(account)
+        if found is None:
+            reason = f"compte {account} introuvable dans l'écran Comptes : choisis un autre compte pour cette publication"
+        elif not found["ready_to_publish"]:
+            why = f" ({found['ready_note']})" if found.get("ready_note") else ""
+            reason = (f"compte {found['label'] or account} non prêt à publier{why} : coche « prêt à publier » "
+                      "dans l'écran Comptes, ou choisis un autre compte")
+        else:
+            return True
+        self._wait(entry, channel, account, reason, state_dir)
+        return False
+
+    def _connected(self, entry: dict[str, Any], channel: str, account: str, state_dir: str | Path) -> bool:
+        """Connexion TikTok du profil verifiee avant chaque publication (R2) ; une session expiree decoche
+        « pret a publier » (R3) et l'entree reste en attente avec la raison."""
+        try:
+            observed = self.login_checker(account, config=self.config)
+            result = accounts_mod.record_login(self.config, account, observed)
+        except (browser.BrowserError, accounts_mod.AccountsError) as exc:
+            self._wait(entry, channel, account, f"connexion du compte {account} non vérifiable : {exc}", state_dir)
+            return False
+        if result["login"]["state"] == "connected":
+            return True
+        reason = f"compte {account} non connecté à TikTok : {accounts_mod.ready_blocked_reason(result)}"
+        if result["auto_unchecked"]:
+            reason += " (« prêt à publier » décoché)"
+        self._wait(entry, channel, account, reason, state_dir)
+        return False
+
     def _fail(self, entry: dict[str, Any], channel: str, reason: str, *, halted: bool, account: str | None,
               state_dir: str | Path, capture: Path | None = None) -> None:
-        """Entree ``failed`` (reessayable), journal et evenement console (SPEC-9225 R4)."""
+        """Entree ``failed`` (reessayable), journal et evenement console (SPEC-9225 R4). Un arret R4 decoche
+        aussi « pret a publier » du compte, jusqu'a ce que l'utilisateur le recoche (SPEC-00d1 R3)."""
         video_id, clip_id = entry["video_id"], entry["clip_id"]
         log.error("%s/%s : publication TikTok en échec : %s", video_id, clip_id, reason)
         publish_mod.mark_failed(video_id, clip_id, channel, reason, capture=capture, halted=halted, state_dir=state_dir)
+        if halted and account:
+            try:
+                accounts_mod.uncheck_ready(self.config, account, f"arrêt de publication : {reason}")
+            except accounts_mod.AccountsError as exc:
+                log.error("compte %s : « prêt à publier » non décoché : %s", account, exc)
         tiktok.emit_event({"level": "error", "account": account, "channel": channel, "video_id": video_id,
                            "clip_id": clip_id, "reason": reason, "capture": str(capture) if capture else None},
                           config=self.config)

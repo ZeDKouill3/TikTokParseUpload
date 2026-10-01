@@ -49,7 +49,11 @@ function accHideAll() {
 
 window.addEventListener("hashchange", () => {
   if (!/^#\/?accounts/.test(location.hash)) accHideAll(); // plus aucun secret en mémoire hors de l'écran
+  else accLoad(); // la connexion TikTok de chaque compte est vérifiée à l'ouverture de l'écran (SPEC-00d1 R2)
 });
+
+// La fenêtre de connexion fermée, on revient sur la console : l'état est relu (le serveur le revérifie).
+window.addEventListener("focus", () => { if (currentScreen === "accounts" && !accIsRemote()) accLoad(); });
 
 /* ---------- Presse-papiers ---------- */
 
@@ -155,6 +159,68 @@ async function accBrowserLogin(account, button) {
   }
 }
 
+/* ---------- Compte de publication (SPEC-00d1) ---------- */
+
+const ACC_LOGIN = {
+  never: { label: "jamais connecté", cls: "pending" },
+  connected: { label: "connecté", cls: "ok" },
+  expired: { label: "session expirée", cls: "bad" },
+};
+const accFmtDate = (iso) => (iso ? new Date(iso).toLocaleString("fr-FR", { dateStyle: "medium", timeStyle: "short" }) : "");
+
+function accLoginState(a) {
+  const l = a.login || { state: "never" };
+  const s = ACC_LOGIN[l.state] || ACC_LOGIN.never;
+  const when = l.state === "connected" && l.checked_at ? ` · vérifié le ${esc(accFmtDate(l.checked_at))}` : "";
+  const err = a.login_error ? `<div class="li-sub bad">Connexion non vérifiable : ${esc(a.login_error)}</div>` : "";
+  return `<div class="li-sub" data-acc-login><span class="chip ${s.cls}">TikTok : ${esc(s.label)}</span><span class="muted">${when}</span></div>${err}`;
+}
+
+function accReadyBox(a) {
+  const blocked = !a.ready_to_publish && a.ready_blocked_reason;
+  return `<div class="li-sub acc-ready" data-acc-ready-cell>
+    <label class="acc-check"><input type="checkbox" data-acc-ready="${esc(a.id)}"${a.ready_to_publish ? " checked" : ""}${blocked ? " disabled" : ""}> Prêt à publier</label>
+    ${blocked ? `<span class="muted" data-acc-ready-reason>${esc(a.ready_blocked_reason)}</span>` : ""}
+    ${a.ready_note ? `<span class="bad" data-acc-ready-note>${esc(a.ready_note)}</span>` : ""}</div>`;
+}
+
+function accPosts(a) {
+  if (a.publish_error) return `<div class="li-sub bad">Publications illisibles : ${esc(a.publish_error)}</div>`;
+  const today = a.posts_today === null || a.posts_today === undefined ? "—" : fr(a.posts_today);
+  const cap = a.max_posts_per_day === null || a.max_posts_per_day === undefined ? "—" : fr(a.max_posts_per_day);
+  return `<div class="li-sub muted" data-acc-posts>Posts du jour : <b>${today} / ${cap}</b></div>`;
+}
+
+function accLastFailure(a) {
+  const f = a.last_failure;
+  if (!f) return "";
+  const capture = f.capture_url ? ` · <a href="${esc(f.capture_url)}" target="_blank" rel="noopener" data-acc-capture>voir la capture</a>` : "";
+  return `<div class="li-sub bad" data-acc-failure>Dernier échec (${esc(f.channel)}, ${esc(f.clip_id)}) : ${esc(f.reason || "raison inconnue")}${capture}</div>`;
+}
+
+async function accSetReady(box) {
+  box.disabled = true;
+  try {
+    await api(`/api/accounts/${encodeURIComponent(box.dataset.accReady)}/ready`, jsonBody("PUT", { ready: box.checked }));
+  } catch (err) {
+    toastError("Case « prêt à publier » refusée", err);
+  }
+  await accLoad();
+}
+
+async function accRefreshStats(account, button) {
+  button.disabled = true;
+  try {
+    const out = await api("/api/stats/tiktok/refresh", jsonBody("POST", { account: account.id }));
+    const done = out.accounts[account.id];
+    toast({ kind: "ok", title: "Statistiques relevées", body: `${account.label} : ${done ? done.posts : 0} post(s)` });
+  } catch (err) {
+    toastError("Relevé des statistiques impossible", err);
+  } finally {
+    button.disabled = false;
+  }
+}
+
 /* ---------- Liste ---------- */
 
 function accRow(a) {
@@ -172,12 +238,17 @@ function accRow(a) {
       <div class="li-sub muted mono">${a.username ? esc(a.username) : "—"}</div>
       ${a.notes ? `<div class="li-sub faint">${esc(a.notes)}</div>` : ""}
       ${accBrowserState(a)}
+      ${accLoginState(a)}
+      ${accReadyBox(a)}
+      ${accPosts(a)}
+      ${accLastFailure(a)}
     </div>
     <div class="acc-pass-cell">${pass}</div>
     <div class="acc-actions">
       ${a.username ? `<button type="button" class="btn btn-xs" data-acc-copy-user="${esc(a.id)}">${icon("copy", "i-xs")}Copier l'identifiant</button>` : ""}
       ${copyPass}
-      <button type="button" class="btn btn-xs" data-acc-browser-login="${esc(a.id)}">${icon("external-link", "i-xs")}Se connecter dans le navigateur</button>
+      <button type="button" class="btn btn-xs" data-acc-browser-login="${esc(a.id)}" title="Se connecter dans le navigateur (Chrome normal, à la main)">${icon("external-link", "i-xs")}Se connecter</button>
+      <button type="button" class="btn btn-xs" data-acc-stats="${esc(a.id)}">${icon("refresh-cw", "i-xs")}Relever les stats</button>
       <button type="button" class="btn btn-xs" data-acc-edit="${esc(a.id)}">${icon("pencil", "i-xs")}Modifier</button>
       <button type="button" class="btn btn-xs btn-bad" data-acc-delete="${esc(a.id)}">${icon("trash-2", "i-xs")}Supprimer</button>
     </div>
@@ -202,6 +273,8 @@ function accWireList(body) {
     } catch (err) { toastError("Mot de passe indisponible", err); }
   }));
   $$("[data-acc-browser-login]", body).forEach((b) => (b.onclick = () => accBrowserLogin(find(b.dataset.accBrowserLogin), b)));
+  $$("[data-acc-stats]", body).forEach((b) => (b.onclick = () => accRefreshStats(find(b.dataset.accStats), b)));
+  $$("[data-acc-ready]", body).forEach((b) => (b.onchange = () => accSetReady(b)));
   $$("[data-acc-edit]", body).forEach((b) => (b.onclick = () => accOpenForm(find(b.dataset.accEdit))));
   $$("[data-acc-delete]", body).forEach((b) => (b.onclick = async () => {
     const account = find(b.dataset.accDelete);

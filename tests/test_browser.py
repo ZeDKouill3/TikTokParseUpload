@@ -493,3 +493,183 @@ def test_browser_section_resolves_through_clipper_config(tmp_path):
 
     assert section["login_url"] == "https://exemple.invalid/login"
     assert section["cookie_domains"] == ["youtube.com", "google.com"]
+
+
+# ------------------------------------------------------------------ connexion TikTok verifiee (SPEC-00d1 R2, R6)
+
+import sqlite3  # noqa: E402
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+NOW = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
+
+
+@pytest.fixture
+def no_navigation(monkeypatch):
+    """Lire la connexion ne lance ni Playwright ni Chrome : l'un ou l'autre ferait echouer le test."""
+    def boom(*a, **k):
+        raise AssertionError("navigateur lance pour lire la connexion")
+
+    browser.use_playwright(boom)
+    monkeypatch.setattr(browser, "_popen", boom)
+    yield
+    browser.use_cookie_reader(None)
+
+
+def _profile(cwd, account="ab12cd"):
+    directory = cwd / "state" / "browser" / account
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "Local State").write_text("{}", encoding="utf-8")
+    return directory
+
+
+def _cookie(name="sessionid", domain=".tiktok.com", expires=None):
+    return {"name": name, "domain": domain, "expires": expires if expires is not None else (NOW + timedelta(days=30)).timestamp()}
+
+
+def test_login_state_is_connected_with_the_expiry_date_when_a_live_session_cookie_exists(cwd, no_navigation):
+    _profile(cwd)
+    browser.use_cookie_reader(lambda account: [_cookie(expires=(NOW + timedelta(days=30)).timestamp())])
+
+    state = browser.login_state("ab12cd", now=NOW)
+
+    assert state == {"state": "connected", "checked_at": NOW.isoformat(timespec="seconds"),
+                     "expires_at": (NOW + timedelta(days=30)).isoformat(timespec="seconds")}
+
+
+def test_login_state_a_browser_session_cookie_without_expiry_is_connected(cwd, no_navigation):
+    _profile(cwd)
+    browser.use_cookie_reader(lambda account: [_cookie(expires=-1)])
+
+    state = browser.login_state("ab12cd", now=NOW)
+
+    assert state["state"] == "connected" and state["expires_at"] is None
+
+
+def test_login_state_is_never_without_profile_and_does_not_even_read_cookies(cwd, no_navigation):
+    browser.use_cookie_reader(lambda account: pytest.fail("cookies lus sans profil"))
+
+    assert browser.login_state("ab12cd", now=NOW)["state"] == "never"
+
+
+def test_login_state_is_never_when_the_profile_has_no_tiktok_session_cookie(cwd, no_navigation):
+    _profile(cwd)
+    browser.use_cookie_reader(lambda account: [
+        _cookie(domain=".youtube.com"), _cookie(name="ttwid"), _cookie(domain="evil-tiktok.com.example")])
+
+    assert browser.login_state("ab12cd", now=NOW)["state"] == "never"
+
+
+def test_login_state_is_expired_when_every_session_cookie_is_past(cwd, no_navigation):
+    _profile(cwd)
+    browser.use_cookie_reader(lambda account: [
+        _cookie(expires=(NOW - timedelta(days=1)).timestamp()), _cookie("sessionid_ss", expires=(NOW - timedelta(hours=1)).timestamp())])
+
+    state = browser.login_state("ab12cd", now=NOW)
+
+    assert state["state"] == "expired" and state["expires_at"] is None
+
+
+def test_login_state_one_live_cookie_is_enough(cwd, no_navigation):
+    _profile(cwd)
+    browser.use_cookie_reader(lambda account: [
+        _cookie(expires=(NOW - timedelta(days=1)).timestamp()), _cookie("sessionid_ss")])
+
+    assert browser.login_state("ab12cd", now=NOW)["state"] == "connected"
+
+
+def test_login_state_rejects_an_unsafe_account_id(cwd, no_navigation):
+    with pytest.raises(browser.BrowserError, match="identifiant de compte invalide"):
+        browser.login_state("../x")
+
+
+def test_login_state_cookie_names_and_domains_are_settings(cwd, no_navigation):
+    _profile(cwd)
+    browser.use_cookie_reader(lambda account: [_cookie("autre", ".exemple.invalid")])
+    config = Config(mode="review", workspace_dir=cwd / "w", output_dir=cwd / "o",
+                    _sections={"browser": {"login_domains": ["exemple.invalid"], "login_cookies": ["autre"]}})
+
+    assert browser.login_state("ab12cd", config=config, now=NOW)["state"] == "connected"
+    assert browser.CONFIG_DEFAULTS["login_domains"] == ["tiktok.com"]
+    assert "sessionid" in browser.CONFIG_DEFAULTS["login_cookies"]
+
+
+def _chrome_cookie_db(path: Path, rows):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(path)
+    db.execute("CREATE TABLE cookies (host_key TEXT, name TEXT, value TEXT, encrypted_value BLOB, "
+               "expires_utc INTEGER, is_persistent INTEGER)")
+    db.executemany("INSERT INTO cookies VALUES (?, ?, '', x'00', ?, ?)", rows)
+    db.commit()
+    db.close()
+
+
+def _chrome_micros(moment):
+    return int((moment.timestamp() + 11_644_473_600) * 1_000_000)
+
+
+def test_the_default_reader_reads_the_chrome_cookie_database_without_values(cwd, no_navigation):
+    directory = _profile(cwd)
+    _chrome_cookie_db(directory / "Default" / "Network" / "Cookies", [
+        (".tiktok.com", "sessionid", _chrome_micros(NOW + timedelta(days=10)), 1),
+        (".tiktok.com", "ttwid", 0, 0),
+        (".youtube.com", "SID", _chrome_micros(NOW + timedelta(days=10)), 1)])
+
+    state = browser.login_state("ab12cd", now=NOW)
+    cookies = browser._read_profile_cookies("ab12cd")
+
+    assert state == {"state": "connected", "checked_at": NOW.isoformat(timespec="seconds"),
+                     "expires_at": (NOW + timedelta(days=10)).isoformat(timespec="seconds")}
+    assert all(set(c) == {"domain", "name", "expires"} for c in cookies)  # jamais une valeur
+    assert next(c for c in cookies if c["name"] == "ttwid")["expires"] == -1
+
+
+def test_the_default_reader_sees_an_expired_session_in_the_database(cwd, no_navigation):
+    directory = _profile(cwd)
+    _chrome_cookie_db(directory / "Default" / "Cookies", [
+        (".tiktok.com", "sessionid", _chrome_micros(NOW - timedelta(days=2)), 1)])
+
+    assert browser.login_state("ab12cd", now=NOW)["state"] == "expired"
+
+
+def test_the_default_reader_without_a_cookie_file_means_never_connected(cwd, no_navigation):
+    _profile(cwd)
+
+    assert browser.login_state("ab12cd", now=NOW)["state"] == "never"
+
+
+def test_a_locked_cookie_database_is_an_explicit_error_not_a_guess(cwd, no_navigation, monkeypatch):
+    directory = _profile(cwd)
+    _chrome_cookie_db(directory / "Default" / "Network" / "Cookies", [])
+
+    def locked(src, dst):
+        raise PermissionError("verrouillé")
+
+    monkeypatch.setattr(browser.shutil, "copyfile", locked)
+    with pytest.raises(browser.BrowserError, match="ferme la fenêtre Chrome"):
+        browser.login_state("ab12cd", now=NOW)
+
+
+def test_a_corrupt_cookie_database_is_an_explicit_error(cwd, no_navigation):
+    directory = _profile(cwd)
+    bad = directory / "Default" / "Network" / "Cookies"
+    bad.parent.mkdir(parents=True)
+    bad.write_bytes(b"pas une base sqlite" * 50)
+
+    with pytest.raises(browser.BrowserError, match="illisible"):
+        browser.login_state("ab12cd", now=NOW)
+
+
+def test_start_login_calls_on_close_once_the_chrome_window_is_closed(cwd, monkeypatch):
+    release = threading.Event()
+    _launches, config, _proc = fake_chrome(monkeypatch, cwd, FakeProc(release))
+    closed = threading.Event()
+    seen = []
+
+    def on_close():
+        seen.append("ab12cd" in browser._active)  # le profil est deja libere
+        closed.set()
+
+    browser.start_login("ab12cd", config=config, on_close=on_close)
+    assert not closed.is_set()  # la fenetre est encore ouverte
+    release.set()
+    assert closed.wait(5) and seen == [False]

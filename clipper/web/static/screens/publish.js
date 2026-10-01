@@ -24,10 +24,14 @@ const pubEnc = encodeURIComponent;
 
 const pubUi = { channel: "", week: "", key: "", data: null, error: null, loading: null, dirty: false, at: 0, html: "", dragKey: null, touching: false, landed: null };
 
+const pubAccountLabel = (id) => {
+  const found = pubUi.data && (pubUi.data.accounts || []).find((a) => a.id === id);
+  return found ? (found.label || id) : id;
+};
 const pubKey = (c) => `${c.video_id}/${c.clip_id}`;
 const pubStatus = (c) => PUB_STATUS[c.publish_status] || { label: c.publish_status, cls: "pending" };
 const pubTitle = (c) => c.screen_title || c.title || c.clip_id;
-const pubChip = (c) => { const s = PUB_TIKTOK[c.tiktok_status] || pubStatus(c); return `<span class="chip ${s.cls}">${esc(s.label)}</span>`; };
+const pubChip = (c) => { const s = c.waiting_reason ? { label: "En attente du compte", cls: "warn" } : (PUB_TIKTOK[c.tiktok_status] || pubStatus(c)); return `<span class="chip ${s.cls}">${esc(s.label)}</span>`; };
 const pubCaptionText = (c) => [c.description || "", (c.hashtags || []).join(" ")].filter(Boolean).join("\n\n");
 // Les dates de l'API sont deja dans le fuseau de la chaine : on les lit telles quelles.
 const pubDate = (iso) => iso.slice(0, 10);
@@ -86,6 +90,7 @@ function pubPost(c, extra) {
   return `<div class="post ${esc(c.publish_status)}${c.missing ? " missing" : ""}" data-post="${esc(pubKey(c))}" draggable="${draggable}" tabindex="0" role="button" aria-label="Ouvrir le clip ${esc(pubTitle(c))}" title="${esc(pubTitle(c))}">
     <div class="mini-clip">${c.video_url ? `<img loading="lazy" decoding="async" width="36" height="64" src="${esc(c.thumbnail_url)}" alt="" tabindex="-1">` : ""}</div>
     <span class="pt">${esc(c.missing ? `Clip introuvable (${c.clip_id})` : pubTitle(c))}</span>
+    ${c.account ? `<span class="pub-acct${c.waiting_reason ? " waiting" : ""}" data-post-account title="${esc(c.waiting_reason || `Compte : ${pubAccountLabel(c.account)}`)}">${esc(pubAccountLabel(c.account))}</span>` : ""}
     ${extra || ""}${icoName ? icon(icoName, "i-xs") : ""}</div>`;
 }
 
@@ -126,7 +131,7 @@ function pubDone(d) {
     <div class="panel">${d.done.map((c) => `<div class="list-item pub-done" data-post="${esc(pubKey(c))}" tabindex="0" role="button">
       <div class="mini-clip">${c.video_url ? `<img loading="lazy" decoding="async" width="36" height="64" src="${esc(c.thumbnail_url)}" alt="" tabindex="-1">` : ""}</div>
       <div class="li-main grow"><div class="li-title">${esc(pubTitle(c))}</div>
-        <div class="li-sub muted">${c.publish_status === "published" ? "publié" : "échec"}${c.slot_at ? ` · ${esc(pubSlotLabel(c.slot_at))}` : ""}${c.publish_error ? ` · ${esc(c.publish_error)}` : ""}${c.post_url ? ` · <a href="${esc(c.post_url)}" target="_blank" rel="noopener">voir sur TikTok</a>` : ""}</div></div>
+        <div class="li-sub muted">${c.publish_status === "published" ? "publié" : "échec"}${c.slot_at ? ` · ${esc(pubSlotLabel(c.slot_at))}` : ""}${c.account ? ` · ${esc(pubAccountLabel(c.account))}` : ""}${c.publish_error ? ` · ${esc(c.publish_error)}` : ""}${c.post_url ? ` · <a href="${esc(c.post_url)}" target="_blank" rel="noopener">voir sur TikTok</a>` : ""}</div></div>
       ${pubChip(c)}</div>`).join("")}</div>
   </section>`;
 }
@@ -251,16 +256,41 @@ async function pubUnschedule(c) {
 
 /* ---------- Fiche d'un clip ---------- */
 
+function pubAccountField(c) {
+  const accounts = (pubUi.data && pubUi.data.accounts) || [];
+  const locked = c.publish_status === "published" || c.missing;
+  const options = accounts.filter((a) => a.ready_to_publish || a.id === c.account)
+    .map((a) => `<option value="${esc(a.id)}"${a.id === c.account ? " selected" : ""}${a.ready_to_publish ? "" : " disabled"}>${esc(a.label || a.id)}${a.ready_to_publish ? "" : " (non prêt à publier)"}</option>`);
+  if (!c.account) options.unshift(`<option value="" selected>Aucun compte</option>`);
+  return `<div class="field"><label for="pub-account">Compte de publication</label>
+    <select class="input" id="pub-account" data-pub-account${locked ? " disabled" : ""}>${options.join("")}</select>
+    <span class="hint">Seuls les comptes « prêts à publier » (écran Comptes) peuvent être choisis.</span></div>`;
+}
+
+async function pubSetAccount(c, account) {
+  try {
+    await api(`/api/publish/${pubEnc(c.video_id)}/${pubEnc(c.clip_id)}/account`, jsonBody("POST", { account }));
+    await pubLoad();
+    toast({ kind: "ok", title: "Compte de publication changé", body: `${pubTitle(c)} : ${pubAccountLabel(account)}`, ms: 2600 });
+  } catch (err) {
+    toastError("Impossible de changer le compte", err);
+    pubUi.at = 0;
+    pubLoad();
+  }
+}
+
 function pubDetailHtml(c) {
-  const account = pubUi.data && pubUi.data.tiktok_account;
+  const account = c.account || (pubUi.data && pubUi.data.tiktok_account);
   const status = c.publish_status;
   const hint = status === "approved" ? "Glisse ce clip sur un créneau libre du calendrier pour le planifier."
     : status === "failed" ? "La publication s'est arrêtée : regarde la capture, règle le problème dans le navigateur du compte, puis « Réessayer » (ou repasse le clip en attente pour le replanifier)." : "";
   return `
     <div class="modal-head"><div class="row wrap" style="gap:8px">${pubChip(c)}<h2>${esc(pubTitle(c))}</h2></div>
-      <p class="muted" style="margin-top:4px">${c.slot_at ? esc(pubSlotLabel(c.slot_at)) : "Sans créneau"}${account ? ` · ${esc(account)}` : ""}</p></div>
+      <p class="muted" style="margin-top:4px">${c.slot_at ? esc(pubSlotLabel(c.slot_at)) : "Sans créneau"}${account ? ` · ${esc(pubAccountLabel(account))}` : ""}</p></div>
     <div class="modal-body stack" style="gap:16px">
       ${c.publish_error ? `<p class="reason bad">Publication en échec : ${esc(c.publish_error)}</p>` : ""}
+      ${c.waiting_reason ? `<p class="reason warn" data-waiting-reason>En attente, non tentée : ${esc(c.waiting_reason)}</p>` : ""}
+      ${pubAccountField(c)}
       ${c.capture_url ? `<a href="${esc(c.capture_url)}" target="_blank" rel="noopener" title="Capture d'écran de l'arrêt"><img class="pub-capture" loading="lazy" src="${esc(c.capture_url)}" alt="Capture d'écran de l'arrêt" style="max-width:100%;border-radius:8px"></a>` : ""}
       ${c.post_url ? `<p>Publiée : <a href="${esc(c.post_url)}" target="_blank" rel="noopener">${esc(c.post_url)}</a></p>` : ""}
       ${c.post_note ? `<p class="muted">${esc(c.post_note)}</p>` : ""}
@@ -285,6 +315,8 @@ function pubOpenDetail(key) {
   if (c.missing) { toastError("Clip introuvable", new Error(`Le sidecar de ${c.video_id}/${c.clip_id} n'existe plus dans output/.`)); return; }
   openPanel("modal pub-modal", pubDetailHtml(c), (d) => {
     $("[data-copy]", d).onclick = () => copyText(pubCaptionText(c), "Description et hashtags");
+    const acc = $("[data-pub-account]", d);
+    if (acc) acc.onchange = async () => { if (acc.value && acc.value !== c.account) { closeLayer(); await pubSetAccount(c, acc.value); } };
     const retry = $("[data-retry]", d);
     if (retry) retry.onclick = async () => { closeLayer(); await pubRetry(c); };
     const un = $("[data-unschedule]", d);

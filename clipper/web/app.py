@@ -15,6 +15,7 @@ import importlib
 import inspect
 import ipaddress
 import json
+import logging
 import os
 import re
 import sys
@@ -62,6 +63,8 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 _SAFE_ID = re.compile(r"^[A-Za-z0-9_-]+$")
 
 _LOOPBACK_HOST = "127.0.0.1"
+logger = logging.getLogger(__name__)
+
 _PRESETS_DIR = "presets"
 _PROTECTED_PREFIXES = ("/api", "/media")
 _TOKEN_HEADER = "x-clipper-token"
@@ -619,6 +622,7 @@ def _tiktok_fields(entry: dict[str, Any] | None, video_id: str, clip_id: str) ->
         "tiktok_status": tiktok_status,
         "post_url": entry.get("post_url"), "post_id": entry.get("post_id"), "post_note": entry.get("post_note"),
         "tiktok_publish_at": entry.get("tiktok_publish_at"), "postponed_reason": entry.get("postponed_reason"),
+        "account": entry.get("account"), "waiting_reason": entry.get("waiting_reason"),
         "capture_url": f"/api/publish/{video_id}/{clip_id}/capture" if entry.get("capture") else None,
     }
 
@@ -1615,9 +1619,93 @@ def _require_account(config: Config, account_id: str) -> None:
 
 def _browser_login(config: Config, account_id: str, url: str | None) -> None:
     try:
-        browser_mod.start_login(account_id, url, config=config)
+        browser_mod.start_login(account_id, url, config=config, on_close=lambda: _verify_login(
+            config, {"id": account_id}))
     except browser_mod.BrowserError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from None
+
+
+def _verify_login(config: Config, account: dict[str, Any]) -> dict[str, Any]:
+    """Connexion TikTok d'un compte, lue dans les cookies de son profil sans naviguer (SPEC-00d1 R2) et
+    enregistree ; une session expiree decoche « pret a publier » (R3) et le signale a la console.
+    Une lecture impossible (profil verrouille...) garde l'etat connu et le dit dans ``login_error``."""
+    try:
+        observed = browser_mod.login_state(account["id"], config=config)
+        result = accounts_mod.record_login(config, account["id"], observed)
+    except browser_mod.BrowserError as exc:
+        return {**account, "login_error": str(exc)}
+    if result.pop("auto_unchecked"):
+        try:
+            tiktok_mod.emit_event({"level": "warn", "account": account["id"], "channel": None, "video_id": None,
+                                   "clip_id": None, "reason": result["ready_note"], "capture": None}, config=config)
+        except tiktok_mod.TikTokError as exc:
+            logger.error("evenement « prêt à publier décoché » non écrit : %s", exc)
+    return result
+
+
+def _account_overview(config: Config, account: dict[str, Any]) -> dict[str, Any]:
+    """Un compte pour l'ecran Comptes (SPEC-00d1 R5) : connexion verifiee, case « pret a publier » avec la raison
+    qui la grise, posts du jour / plafond, dernier echec de publication (avec capture)."""
+    out = _verify_login(config, account)
+    out["ready_blocked_reason"] = accounts_mod.ready_blocked_reason(out) if out.get("login_error") is None else \
+        f"connexion non vérifiable : {out['login_error']}"
+    scope = {"state_dir": _publish_dir(config), "presets_dir": _PRESETS_DIR, "base": _BASE_CONFIG}
+    out.update(posts_today=None, max_posts_per_day=None, last_failure=None, publish_error=None)
+    try:
+        out["max_posts_per_day"] = tiktok_mod.get_settings(config)["max_posts_per_day"]
+        tz = ZoneInfo("UTC")
+        for name in channel_mod.list_channels(_PRESETS_DIR):
+            _config, settings = channel_mod.load_channel(name, presets_dir=_PRESETS_DIR, base=_BASE_CONFIG)
+            if settings["tiktok_account"] == out["id"]:
+                tz = ZoneInfo(str(settings["timezone"]))
+                break
+        today = datetime.now(tz).date()
+        out["posts_today"] = sum(1 for t in publish_mod.account_publish_times(out["id"], **scope)
+                                 if t.astimezone(tz).date() == today)
+        failure = publish_mod.last_failure(out["id"], **scope)
+        if failure is not None:
+            out["last_failure"] = {
+                "channel": failure["channel"], "video_id": failure["video_id"], "clip_id": failure["clip_id"],
+                "reason": failure.get("error"), "failed_at": failure.get("failed_at"),
+                "capture_url": f"/api/publish/{failure['video_id']}/{failure['clip_id']}/capture" if failure.get("capture") else None,
+            }
+    except (publish_mod.PublishError, channel_mod.ChannelError, ConfigError, tiktok_mod.TikTokError) as exc:
+        out["publish_error"] = str(exc)
+    return out
+
+
+def _accounts_overview(config: Config) -> list[dict[str, Any]]:
+    return [_account_overview(config, a) for a in _accounts_call(accounts_mod.list_accounts, config)]
+
+
+def _account_ready(config: Config, account_id: str, ready: Any) -> dict[str, Any]:
+    """Coche ou decoche « pret a publier » : la connexion est verifiee a l'instant (R2), cocher sans connexion
+    verifiee est refuse avec la raison (R3)."""
+    account = next((a for a in _accounts_call(accounts_mod.list_accounts, config) if a["id"] == account_id), None)
+    if account is None:
+        raise HTTPException(status_code=404, detail=f"compte introuvable : {account_id!r}")
+    if ready is True:
+        verified = _verify_login(config, account)
+        if verified.get("login_error") is not None:
+            raise HTTPException(status_code=409, detail=f"« prêt à publier » refusé : connexion non vérifiable : {verified['login_error']}")
+    return _accounts_call(accounts_mod.set_ready, config, account_id, ready)
+
+
+def _publish_accounts(config: Config) -> list[dict[str, Any]]:
+    """Comptes proposes a la publication : id, libelle, pret ou non (aucun secret, lisible hors du PC)."""
+    return [{"id": a["id"], "label": a["label"], "ready_to_publish": a["ready_to_publish"]}
+            for a in _accounts_call(accounts_mod.list_accounts, config)]
+
+
+def _require_ready_account(config: Config, account_id: Any) -> str:
+    """Compte choisi pour une publication (SPEC-00d1 R4) : un compte pret a publier, sinon 409 explicite."""
+    found = next((a for a in _publish_accounts(config) if a["id"] == account_id), None)
+    if found is None:
+        raise HTTPException(status_code=409, detail=f"compte inconnu : {account_id!r} (écran Comptes)")
+    if not found["ready_to_publish"]:
+        raise HTTPException(status_code=409, detail=f"compte {found['label'] or account_id} non prêt à publier : "
+                            "coche « prêt à publier » dans l'écran Comptes (connexion TikTok vérifiée)")
+    return found["id"]
 
 
 def create_app(config: Config | None = None) -> FastAPI:
@@ -1858,11 +1946,11 @@ def create_app(config: Config | None = None) -> FastAPI:
             )
         return _list_clip_views(config, channel or None, video_id, status)
 
-    def _decide(video_id: str, clip_id: str, action: str) -> dict[str, Any]:
+    def _decide(video_id: str, clip_id: str, action: str, **extra: Any) -> dict[str, Any]:
         _validate_video_id(video_id)
         _validate_clip_id(clip_id)
         channel = _require_channel(video_id, clip_id, config)
-        kwargs: dict[str, Any] = {"output_dir": Path(config.output_dir), "state_dir": _publish_dir(config)}
+        kwargs: dict[str, Any] = {"output_dir": Path(config.output_dir), "state_dir": _publish_dir(config), **extra}
         if action == "approve":
             kwargs["presets_dir"] = _PRESETS_DIR
         try:
@@ -1871,7 +1959,11 @@ def create_app(config: Config | None = None) -> FastAPI:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post("/api/clips/{video_id}/{clip_id}/approve")
-    def approve_clip(video_id: str, clip_id: str) -> dict[str, Any]:
+    def approve_clip(video_id: str, clip_id: str, body: AccountBody | None = None) -> dict[str, Any]:
+        """Valide le clip ; ``{"account": id}`` choisit le compte de publication parmi les comptes prets
+        (SPEC-00d1 R4), sinon c'est celui de la chaine."""
+        if body is not None and body.account is not None:
+            return _decide(video_id, clip_id, "approve", account=_require_ready_account(config, body.account))
         return _decide(video_id, clip_id, "approve")
 
     @app.post("/api/clips/{video_id}/{clip_id}/reject")
@@ -1954,6 +2046,18 @@ def create_app(config: Config | None = None) -> FastAPI:
     @app.post("/api/publish/{video_id}/{clip_id}/retry")
     def publish_retry(video_id: str, clip_id: str) -> dict[str, Any]:
         return _publish_action(video_id, clip_id, "retry")
+
+    @app.get("/api/publish/accounts")
+    def publish_accounts(channel: str | None = None) -> dict[str, Any]:
+        """Comptes proposes a la validation et a la programmation (SPEC-00d1 R4) : tous, avec leur case « pret a
+        publier », et le compte par defaut de la chaine ([channel] tiktok_account) pour le preremplissage."""
+        default = _load_channel(channel)[1]["tiktok_account"] or None if channel else None
+        return {"accounts": _publish_accounts(config), "default": default}
+
+    @app.post("/api/publish/{video_id}/{clip_id}/account")
+    def publish_account(video_id: str, clip_id: str, body: AccountBody) -> dict[str, Any]:
+        """Compte de publication d'une entree, parmi les comptes prets (SPEC-00d1 R4)."""
+        return _publish_action(video_id, clip_id, "set_account", _require_ready_account(config, body.account))
 
     @app.post("/api/publish/{video_id}/{clip_id}/mode")
     def publish_mode(video_id: str, clip_id: str, body: PublishModeBody) -> dict[str, Any]:
@@ -2167,8 +2271,15 @@ def create_app(config: Config | None = None) -> FastAPI:
 
     @app.get("/api/accounts")
     async def accounts_list() -> list[dict[str, Any]]:
-        listed = await run_in_threadpool(_accounts_call, accounts_mod.list_accounts, config)
+        listed = await run_in_threadpool(_accounts_overview, config)  # connexion verifiee a l'ouverture (R2)
         return [{**a, "browser": _browser_state(a["id"])} for a in listed]
+
+    @app.put("/api/accounts/{account_id}/ready")
+    async def accounts_ready(account_id: str, request: Request) -> dict[str, Any]:
+        body = await _accounts_json(request)
+        if not isinstance(body, dict) or set(body) != {"ready"}:
+            raise HTTPException(status_code=422, detail="corps invalide : {\"ready\": true|false} attendu")
+        return await run_in_threadpool(_account_ready, config, account_id, body["ready"])
 
     @app.post("/api/accounts", status_code=201)
     async def accounts_add(request: Request) -> dict[str, Any]:
@@ -2282,6 +2393,10 @@ class PublishMoveBody(BaseModel):
     slot_at: str
 
 
+class AccountBody(BaseModel):
+    account: str | None = None
+
+
 class PublishModeBody(BaseModel):
     mode: str | None = None
 
@@ -2372,5 +2487,6 @@ def _publish_week_view(config: Config, channel_name: str, week: str | None) -> d
         "channel": channel_name, "timezone": str(channel["timezone"]), "tiktok_account": channel["tiktok_account"],
         "week_start": monday.isoformat(), "week_end": (monday + timedelta(days=6)).isoformat(),
         "slots": slots, "unscheduled": unscheduled, "done": done,
+        "accounts": _publish_accounts(config),
         "reason": None if channel["slots"] else "aucun créneau défini dans [channel].slots",
     }
