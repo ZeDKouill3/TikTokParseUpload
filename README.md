@@ -193,6 +193,51 @@ ou une restriction. **Captcha, vérification ou page inattendue = arrêt
 immédiat** : le programme ne résout ni ne contourne jamais un captcha, il
 laisse la main à l'utilisateur et remonte l'échec.
 
+### Publication automatique (worker)
+
+Le worker (`python -m clipper worker`, lancé par `serve`) publie, une à la
+fois et un compte à la fois, les clips **dus** de `state/publish/<chaîne>.json`
+(statut `scheduled`) avec le mp4, la légende et les hashtags du sidecar. Deux
+modes, réglés par `[tiktok] publish_mode` (ou par clip) :
+
+- `immediate` (défaut) : publié quand le créneau est atteint (le PC doit être
+  allumé) ;
+- `scheduled` : programmé côté TikTok à la date du créneau, dès qu'elle est à
+  moins de `schedule_max_days` jours (10 : la limite de TikTok Studio) ; au-delà
+  ou à moins de `schedule_min_minutes` du créneau, la programmation est refusée
+  explicitement.
+
+Le succès enregistre l'URL ou l'id du post dans l'entrée et le sidecar. **Tout
+arrêt** (captcha, vérification, connexion expirée, élément absent, page
+inattendue) met le clip en `failed` avec la raison et une capture d'écran sous
+`state/browser/<compte>/captures/`, arrête les publications de ce compte et
+notifie la console : bouton **Réessayer** dans l'écran Publication. Les
+sélecteurs de la page TikTok Studio vivent dans
+`clipper/assets/tiktok_selectors.toml` (valeurs **à vérifier sur la vraie
+page**, avec `CLIPPER_TIKTOK_REAL=1 pytest tests/integration/test_tiktok_real.py`,
+qui publie en privé sur un compte de test).
+
+Rythme (`[tiktok]`, étude `docs/tiktok-cadence.md` §3.1) : délais aléatoires
+entre actions, plafond de posts par jour et écart minimal par compte ; un
+dépassement reporte le clip au prochain créneau libre, journalisé. Les défauts
+sont ceux d'un **compte neuf** ; pour un **compte établi** (après 14 jours,
+vues stables) :
+
+| Réglage | Compte neuf (défaut) | Compte établi |
+|---|---|---|
+| `max_posts_per_day` | 1 | 3 |
+| `min_gap_minutes` | 480 | 240 |
+| `min_action_delay_s` | 3 | 2 |
+| `max_action_delay_s` | 12 | 8 |
+
+```toml
+[tiktok]
+max_posts_per_day = 3
+min_gap_minutes = 240
+min_action_delay_s = 2
+max_action_delay_s = 8
+```
+
 ## Cookies YouTube
 
 Pour télécharger une vidéo qui exige d'être connecté (âge, abonnés...), yt-dlp

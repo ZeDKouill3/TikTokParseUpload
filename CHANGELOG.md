@@ -8,6 +8,9 @@ version 0.1.0 est une pré-version, avant tout tag ou publication.
 
 ### Ajouté
 
+- Publication TikTok par le worker (`clipper/tiktok.py`, SPEC-9225 R3-R6) : mode
+  immédiat ou programmé côté TikTok, arrêt sûr avec capture et bouton Réessayer,
+  plafonds par compte, sélecteurs dans `clipper/assets/tiktok_selectors.toml`.
 - Console de gestion web v2 (`python -m clipper serve`, `clipper/web/`) :
   huit écrans (Accueil, Vidéos, Revue, Clips, Chaînes, Publication,
   Statistiques, Réglages), temps réel par SSE avec repli sur polling,

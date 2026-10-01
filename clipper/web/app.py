@@ -42,6 +42,7 @@ from clipper import outcomes as outcomes_mod
 from clipper import pipeline
 from clipper import publish as publish_mod
 from clipper import reframe as reframe_mod
+from clipper import tiktok as tiktok_mod
 from clipper import watch as watch_mod
 from clipper import worker as worker_mod
 from clipper.config import (
@@ -600,6 +601,28 @@ def _clip_publish_status(sidecar: dict[str, Any], entry: dict[str, Any] | None) 
     return _TO_VALIDATE if sidecar.get("ready") is True else _NOT_READY
 
 
+def _tiktok_fields(entry: dict[str, Any] | None, video_id: str, clip_id: str) -> dict[str, Any]:
+    """Statut TikTok d'une publication (SPEC-9225 R3, R4) : ``pending`` (en attente),
+    ``scheduled_on_tiktok`` (programmee cote TikTok), ``published`` (avec lien si connu),
+    ``failed`` (avec capture et raison) ; None sans entree ou refusee."""
+    entry = entry or {}
+    status = entry.get("status")
+    if status in ("approved", "scheduled"):
+        tiktok_status = "pending"
+    elif status == "published":
+        tiktok_status = "scheduled_on_tiktok" if entry.get("tiktok_state") == "scheduled_on_tiktok" else "published"
+    elif status == "failed":
+        tiktok_status = "failed"
+    else:
+        tiktok_status = None
+    return {
+        "tiktok_status": tiktok_status,
+        "post_url": entry.get("post_url"), "post_id": entry.get("post_id"), "post_note": entry.get("post_note"),
+        "tiktok_publish_at": entry.get("tiktok_publish_at"), "postponed_reason": entry.get("postponed_reason"),
+        "capture_url": f"/api/publish/{video_id}/{clip_id}/capture" if entry.get("capture") else None,
+    }
+
+
 def _clip_view(sidecar: dict[str, Any], channel: str | None, entry: dict[str, Any] | None,
                jury: dict[Any, tuple[Any, Any]] | None = None) -> dict[str, Any]:
     """``jury`` : moment_id -> confiance du jury (voir _moments_jury_confidences)."""
@@ -619,6 +642,7 @@ def _clip_view(sidecar: dict[str, Any], channel: str | None, entry: dict[str, An
         "jury_judge_confidences": jury_judges,
         "slot_at": entry.get("slot_at") if entry else None,
         "publish_error": entry.get("error") if entry else None,
+        **_tiktok_fields(entry, video_id, clip_id),
     })
     return clip
 
@@ -1876,6 +1900,39 @@ def create_app(config: Config | None = None) -> FastAPI:
     def publish_unschedule(video_id: str, clip_id: str) -> dict[str, Any]:
         return _publish_action(video_id, clip_id, "unschedule")
 
+    @app.post("/api/publish/{video_id}/{clip_id}/retry")
+    def publish_retry(video_id: str, clip_id: str) -> dict[str, Any]:
+        return _publish_action(video_id, clip_id, "retry")
+
+    @app.post("/api/publish/{video_id}/{clip_id}/mode")
+    def publish_mode(video_id: str, clip_id: str, body: PublishModeBody) -> dict[str, Any]:
+        return _publish_action(video_id, clip_id, "set_mode", body.mode)
+
+    @app.get("/api/publish/{video_id}/{clip_id}/capture")
+    def publish_capture(video_id: str, clip_id: str) -> FileResponse:
+        """Capture d'ecran d'un arret sur (SPEC-9225 R4) : seulement un .png sous
+        state/browser/<compte>/captures/, jamais un chemin lu ailleurs."""
+        _validate_video_id(video_id)
+        _validate_clip_id(clip_id)
+        channel = _require_channel(video_id, clip_id, config)
+        entry = _publish_entries(config, channel).get((video_id, clip_id))
+        captured = entry.get("capture") if entry else None
+        if not captured:
+            raise HTTPException(status_code=404, detail=f"aucune capture pour {video_id}/{clip_id}")
+        path = Path(captured).resolve()
+        root = browser_mod.STATE_DIR.resolve()
+        if path.suffix != ".png" or not path.is_file() or root not in path.parents or path.parent.name != "captures":
+            raise HTTPException(status_code=404, detail=f"capture introuvable : {captured}")
+        return FileResponse(path, media_type="image/png")
+
+    @app.get("/api/tiktok/events")
+    def tiktok_events(since: str | None = None) -> list[dict[str, Any]]:
+        """Notifications de publication (arrets sur, reports, succes) ecrites par le worker."""
+        try:
+            return tiktok_mod.read_events(since, config=config)
+        except tiktok_mod.TikTokError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
     # ----------------------------------------------------------------
     # Surveillance : VOD a confirmer (SPEC-74e9 §5.3)
     # ----------------------------------------------------------------
@@ -2144,6 +2201,10 @@ class PublishMoveBody(BaseModel):
     slot_at: str
 
 
+class PublishModeBody(BaseModel):
+    mode: str | None = None
+
+
 def _publish_parse_slot(value: str) -> datetime:
     try:
         slot = datetime.fromisoformat(value)
@@ -2186,6 +2247,7 @@ def _publish_clip_view(clips: dict[tuple[str, str], dict[str, Any]], channel: st
         "video_id": entry["video_id"], "clip_id": entry["clip_id"], "channel": channel, "missing": True,
         "publish_status": entry["status"], "slot_at": entry.get("slot_at"), "publish_error": entry.get("error"),
         "screen_title": None, "description": None, "hashtags": [], "video_url": None, "thumbnail_url": None,
+        **_tiktok_fields(entry, entry["video_id"], entry["clip_id"]),
     }
 
 

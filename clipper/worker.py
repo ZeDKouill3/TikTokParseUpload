@@ -2,7 +2,9 @@
 ``state/queue.json`` (SPEC-74e9 §2) et lance chaque video dans un processus
 enfant ``python -m clipper <action> <url|id>``, un seul a la fois
 (ADR-fb9b). N'importe que clipper.pipeline, clipper.channel et
-clipper.config : jamais clipper.web, jamais une etape (ADR-b16b).
+clipper.config : jamais clipper.web, jamais une etape (ADR-b16b). Il pousse aussi
+les publications dues de state/publish/<chaine>.json vers TikTok, une a la fois
+(SPEC-9225 R3), par clipper.tiktok (ADR-1a58) : seul module qui parle a TikTok.
 
 Entree de file (SPEC-74e9 §2.1) : {id, video_id, url, channel | null,
 action ("run" | "render"), force_steps, enqueued_at, status ("waiting" |
@@ -18,11 +20,15 @@ import os
 import sys
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
+from zoneinfo import ZoneInfo
 
+from clipper import browser
 from clipper import channel as channel_mod
+from clipper import publish as publish_mod
+from clipper import tiktok
 from clipper.config import Config, ConfigError, load_config
 
 log = logging.getLogger(__name__)
@@ -258,6 +264,7 @@ class Worker:
         config: Config | None = None,
         spawner: Callable[[list[str]], Any] | None = None,
         watch_lister: Callable[[str], list[dict[str, Any]]] | None = None,
+        publisher: Callable[..., dict[str, Any]] | None = None,
     ) -> None:
         self._popen = None
         if spawner is None:
@@ -270,6 +277,8 @@ class Worker:
         self._launched_at: datetime | None = None
         self.watch_lister = watch_lister
         self._logged_watch_errors: set[str] = set()
+        self.publisher = publisher or tiktok.publish
+        self._logged_publish_errors: set[str] = set()
         self._path = _queue_path(self.config)
         self._process: Any | None = None
         self._entry: dict[str, Any] | None = None
@@ -315,6 +324,7 @@ class Worker:
         de l'interface web)."""
         self._beat()
         self._watch_channels()
+        self._publish_due()
 
         if self._process is not None:
             if self._process.poll() is None:
@@ -351,6 +361,105 @@ class Worker:
             if message not in self._logged_watch_errors:
                 self._logged_watch_errors.add(message)
                 log.error("surveillance des chaines impossible : %s", message)
+
+    # ------------------------------------------------------------ publication TikTok
+
+    def _publish_due(self) -> None:
+        """Une publication TikTok due par iteration (SPEC-9225 R3). Une file, un preset ou un
+        reglage illisible est journalise une fois (ADR-ad2e) et ne tue pas le worker."""
+        try:
+            self._publish_next()
+        except (publish_mod.PublishError, channel_mod.ChannelError, ConfigError, tiktok.TikTokError) as exc:
+            message = str(exc)
+            if message not in self._logged_publish_errors:
+                self._logged_publish_errors.add(message)
+                log.error("publication TikTok impossible : %s", message)
+
+    def _publish_next(self) -> None:
+        now = datetime.now(timezone.utc)
+        settings = tiktok.get_settings(self.config)
+        watch = self.config.section("watch")
+        paths = {"state_dir": self.config.section("publish")["state_dir"],
+                 "presets_dir": watch["presets_dir"], "base": watch["base_config"]}
+        due = []
+        for name in channel_mod.list_channels(paths["presets_dir"]):
+            _config, channel = channel_mod.load_channel(name, presets_dir=paths["presets_dir"], base=paths["base"])
+            for entry in publish_mod.list_entries(name, state_dir=paths["state_dir"]):
+                if entry["status"] != "scheduled" or not entry["slot_at"]:
+                    continue
+                slot = datetime.fromisoformat(entry["slot_at"])
+                mode = entry.get("publish_mode") or str(settings["publish_mode"])
+                window = timedelta(days=float(settings["schedule_max_days"])) if mode == "scheduled" else timedelta(0)
+                if slot - window <= now:  # immediat : creneau atteint ; programme : date dans la fenetre TikTok
+                    due.append((slot, name, channel, entry, mode))
+        due.sort(key=lambda d: (d[0], d[1], d[3]["clip_id"]))
+        for slot, name, channel, entry, mode in due:
+            if self._publish_one(slot, name, channel, entry, mode, settings, paths, now):
+                return
+
+    def _publish_one(self, slot: datetime, name: str, channel: dict[str, Any], entry: dict[str, Any], mode: str,
+                     settings: dict[str, Any], paths: dict[str, Any], now: datetime) -> bool:
+        """Vrai si la tentative de publication a eu lieu (reussie ou en echec) : fin de l'iteration."""
+        video_id, clip_id = entry["video_id"], entry["clip_id"]
+        account = channel["tiktok_account"]
+        where = {"channel": name, "video_id": video_id, "clip_id": clip_id}
+        if not account:
+            self._fail(entry, name, f"chaîne {name} sans compte TikTok relié : renseigne [channel] tiktok_account "
+                       "dans son preset", halted=False, account=None, state_dir=paths["state_dir"])
+            return False
+        scope = {"state_dir": paths["state_dir"], "presets_dir": paths["presets_dir"], "base": paths["base"]}
+        if publish_mod.halted_account(account, **scope) is not None:
+            return False  # arret sur en cours (R4) : rien ne part avant « Reessayer »
+
+        times = publish_mod.account_publish_times(account, **scope)
+        tz = ZoneInfo(str(channel["timezone"]))
+        blocked = tiktok.check_limits(times, slot if mode == "scheduled" else now, settings, tz)
+        if blocked is not None:
+            moved = publish_mod.postpone(
+                video_id, clip_id, name, blocked, now=now,
+                allowed=lambda candidate: tiktok.check_limits(times, candidate, settings, tz), **scope)
+            log.warning("%s/%s : %s", video_id, clip_id, moved["postponed_reason"])
+            tiktok.emit_event({"level": "warn", "account": account, **where, "reason": moved["postponed_reason"],
+                               "capture": None}, config=self.config)
+            return False
+
+        try:
+            clip = tiktok.clip_payload(publish_mod.read_sidecar(self.config.output_dir, video_id, clip_id),
+                                       self.config.output_dir)
+            result = self.publisher(clip, account, mode=mode, schedule_at=slot if mode == "scheduled" else None,
+                                    config=self.config, on_tick=self._beat)
+        except tiktok.TikTokStop as stop:
+            self._fail(entry, name, stop.reason, halted=True, account=account, capture=stop.capture,
+                       state_dir=paths["state_dir"])
+        except browser.BrowserError as exc:
+            self._fail(entry, name, str(exc), halted=True, account=account, state_dir=paths["state_dir"])
+        except (tiktok.TikTokError, publish_mod.PublishError) as exc:
+            self._fail(entry, name, str(exc), halted=False, account=account, state_dir=paths["state_dir"])
+        except Exception as exc:  # noqa: BLE001 - jamais un worker mort : l'entree echoue, avec la raison
+            log.exception("%s/%s : erreur inattendue pendant la publication", video_id, clip_id)
+            self._fail(entry, name, f"erreur inattendue : {type(exc).__name__} : {exc}", halted=True,
+                       account=account, state_dir=paths["state_dir"])
+        else:
+            publish_mod.mark_published(
+                video_id, clip_id, name, state_dir=paths["state_dir"], output_dir=self.config.output_dir,
+                tiktok_state=result["state"], post_url=result["post_url"], post_id=result["post_id"],
+                publish_at=result["publish_at"], post_note=result["note"], account=account)
+            label = "programmée sur TikTok" if result["state"] == "scheduled_on_tiktok" else "publiée"
+            log.info("%s/%s : %s (%s)", video_id, clip_id, label, result["post_url"] or result["note"])
+            tiktok.emit_event({"level": "info", "account": account, **where,
+                               "reason": f"{label} : {result['post_url'] or result['note']}", "capture": None},
+                              config=self.config)
+        return True
+
+    def _fail(self, entry: dict[str, Any], channel: str, reason: str, *, halted: bool, account: str | None,
+              state_dir: str | Path, capture: Path | None = None) -> None:
+        """Entree ``failed`` (reessayable), journal et evenement console (SPEC-9225 R4)."""
+        video_id, clip_id = entry["video_id"], entry["clip_id"]
+        log.error("%s/%s : publication TikTok en échec : %s", video_id, clip_id, reason)
+        publish_mod.mark_failed(video_id, clip_id, channel, reason, capture=capture, halted=halted, state_dir=state_dir)
+        tiktok.emit_event({"level": "error", "account": account, "channel": channel, "video_id": video_id,
+                           "clip_id": clip_id, "reason": reason, "capture": str(capture) if capture else None},
+                          config=self.config)
 
     def _launch_head(self) -> bool:
         """Lance la tete de file ``waiting`` ; le cycle relecture-lancement-

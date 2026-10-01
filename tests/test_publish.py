@@ -573,3 +573,132 @@ def test_sibling_clip_ids_raises_publish_error_on_corrupt_json(isolated_cwd):
 
     with pytest.raises(publish.PublishError, match="03-p2.json"):
         publish._sibling_clip_ids(isolated_cwd / "output", "vid1", "vid1:03", exclude="03-p1")
+
+
+# --------------------------------------------------------------------------
+# TASK-0b78 : etat de publication TikTok (SPEC-9225 R3, R4, R6)
+# --------------------------------------------------------------------------
+
+_ACCOUNT = "ab12cd"
+_TWO_SLOTS = (
+    f'[channel]\ntimezone = "UTC"\ntiktok_account = "{_ACCOUNT}"\n'
+    '[[channel.slots]]\nday = "mon"\ntime = "09:00"\n[[channel.slots]]\nday = "mon"\ntime = "18:00"\n'
+)
+_MON = datetime(2026, 9, 28, 6, 0, tzinfo=timezone.utc)
+
+
+def _tiktok_env(cwd, clips=("01", "02", "03"), preset=_TWO_SLOTS):
+    _write_config(cwd)
+    (cwd / "state").mkdir(exist_ok=True)
+    (cwd / "state" / "accounts.json").write_text(
+        json.dumps({"accounts": [{"id": _ACCOUNT, "label": "Compte"}]}), encoding="utf-8")
+    _write_preset(cwd, "ma_chaine", preset)
+    from clipper import publish
+
+    for clip in clips:
+        _write_sidecar(cwd, "vid1", clip)
+        publish.approve("vid1", clip, "ma_chaine", now=_MON)
+    return publish
+
+
+def test_mark_published_with_a_tiktok_post_records_it_in_the_entry_and_the_sidecar(isolated_cwd):
+    publish = _tiktok_env(isolated_cwd, ("01",))
+    at = datetime(2026, 9, 28, 9, 0, tzinfo=timezone.utc)
+
+    entry = publish.mark_published(
+        "vid1", "01", "ma_chaine", now=at, post_url="https://example.invalid/@ma_chaine/video/42", post_id="42",
+        tiktok_state="published", publish_at=at.isoformat(), account=_ACCOUNT)
+
+    assert entry["status"] == "published"
+    assert (entry["post_url"], entry["post_id"], entry["tiktok_state"]) == ("https://example.invalid/@ma_chaine/video/42", "42", "published")
+    assert entry["tiktok_publish_at"] == at.isoformat()
+    assert _read_state(isolated_cwd, "ma_chaine")[0]["post_id"] == "42"
+    sidecar = _read_sidecar(isolated_cwd, "vid1", "01")
+    assert sidecar["tiktok_post"] == {
+        "url": "https://example.invalid/@ma_chaine/video/42", "id": "42", "state": "published",
+        "publish_at": at.isoformat(), "account": _ACCOUNT, "note": None}
+
+
+def test_mark_failed_records_reason_capture_and_halt_then_retry_puts_it_back(isolated_cwd):
+    publish = _tiktok_env(isolated_cwd, ("01",))
+
+    entry = publish.mark_failed("vid1", "01", "ma_chaine", "captcha détecté",
+                                capture="state/browser/ab12cd/captures/x.png", halted=True)
+
+    assert entry["status"] == "failed"
+    assert entry["error"] == "captcha détecté"
+    assert entry["capture"] == "state/browser/ab12cd/captures/x.png"
+    assert publish.halted_account(_ACCOUNT)["error"] == "captcha détecté"
+
+    retried = publish.retry("vid1", "01", "ma_chaine")
+
+    assert retried["status"] == "scheduled"
+    assert retried["slot_at"] == entry["slot_at"]
+    assert retried["error"] is None and retried["capture"] is None and not retried["halted"]
+    assert publish.halted_account(_ACCOUNT) is None
+
+
+def test_retry_refuses_an_entry_that_did_not_fail(isolated_cwd):
+    publish = _tiktok_env(isolated_cwd, ("01",))
+    with pytest.raises(publish.PublishError, match="failed"):
+        publish.retry("vid1", "01", "ma_chaine")
+    with pytest.raises(publish.PublishError, match="absent"):
+        publish.retry("vid1", "99", "ma_chaine")
+
+
+def test_mark_failed_refuses_a_published_or_unknown_entry(isolated_cwd):
+    publish = _tiktok_env(isolated_cwd, ("01",))
+    publish.mark_published("vid1", "01", "ma_chaine")
+    with pytest.raises(publish.PublishError, match="published"):
+        publish.mark_failed("vid1", "01", "ma_chaine", "x")
+    with pytest.raises(publish.PublishError, match="absent"):
+        publish.mark_failed("vid1", "99", "ma_chaine", "x")
+
+
+def test_account_publish_times_lists_the_posts_of_every_channel_of_the_account(isolated_cwd):
+    publish = _tiktok_env(isolated_cwd, ("01", "02"))
+    at = datetime(2026, 9, 28, 9, 0, tzinfo=timezone.utc)
+    publish.mark_published("vid1", "01", "ma_chaine", now=at, tiktok_state="published", publish_at=at.isoformat(), account=_ACCOUNT)
+    later = datetime(2026, 10, 5, 9, 0, tzinfo=timezone.utc)
+    publish.mark_published("vid1", "02", "ma_chaine", now=at, tiktok_state="scheduled_on_tiktok", publish_at=later.isoformat())
+    _write_preset(isolated_cwd, "autre", f'[channel]\ntiktok_account = "{_ACCOUNT}"\n')
+    _write_preset(isolated_cwd, "sans_compte", "[channel]\n")
+
+    assert publish.account_publish_times(_ACCOUNT) == [at, later]
+    assert publish.account_publish_times("zz99") == []
+
+
+def test_manually_published_entries_count_by_their_published_at(isolated_cwd):
+    publish = _tiktok_env(isolated_cwd, ("01",))
+    publish.mark_published("vid1", "01", "ma_chaine", now=_MON)
+    assert publish.account_publish_times(_ACCOUNT) == [_MON]
+
+
+def test_postpone_moves_to_the_next_free_allowed_slot_and_records_why(isolated_cwd):
+    publish = _tiktok_env(isolated_cwd, ("01", "02"))  # 01 : lun 09:00, 02 : lun 18:00
+    first = publish.list_entries("ma_chaine")[0]
+    blocked_until = datetime(2026, 10, 5, 8, 0, tzinfo=timezone.utc)
+
+    entry = publish.postpone(
+        "vid1", "01", "ma_chaine", "plafond atteint",
+        allowed=lambda slot: "trop tot" if slot < blocked_until else None, now=_MON)
+
+    assert first["slot_at"] == "2026-09-28T09:00:00+00:00"
+    assert entry["slot_at"] == "2026-10-05T09:00:00+00:00"  # le 18:00 du 28 est pris par 02 ; le 05 09:00 est libre
+    assert entry["status"] == "scheduled"
+    assert "plafond atteint" in entry["postponed_reason"] and "2026-10-05" in entry["postponed_reason"]
+    assert _read_state(isolated_cwd, "ma_chaine")[0]["slot_at"] == entry["slot_at"]
+
+
+def test_postpone_without_any_allowed_slot_is_an_explicit_error(isolated_cwd):
+    publish = _tiktok_env(isolated_cwd, ("01",))
+    with pytest.raises(publish.PublishError, match="créneau"):
+        publish.postpone("vid1", "01", "ma_chaine", "plafond", allowed=lambda slot: "jamais", now=_MON)
+
+
+def test_set_mode_overrides_the_publish_mode_of_one_entry(isolated_cwd):
+    publish = _tiktok_env(isolated_cwd, ("01",))
+    assert publish.set_mode("vid1", "01", "ma_chaine", "scheduled")["publish_mode"] == "scheduled"
+    assert publish.set_mode("vid1", "01", "ma_chaine", None)["publish_mode"] is None
+    with pytest.raises(publish.PublishError, match="mode"):
+        publish.set_mode("vid1", "01", "ma_chaine", "demain")
