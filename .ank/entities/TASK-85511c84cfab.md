@@ -5,7 +5,7 @@ slug: maquette-cliquable-du-tableau-de-bord-statistiqu
 title: Maquette cliquable du tableau de bord Statistiques TikTok (avant spec)
 created: 2026-10-01T21:59:18Z
 author: nicoc@zedk_ordi
-status: open
+status: in_progress
 scope:
   - docs/maquette-stats/**
 blocked_by: []
@@ -14,7 +14,7 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 schema: 4
-version: 1
+version: 2
 ---
 
 L'utilisateur veut un écran Statistiques façon TikTok Studio, basé UNIQUEMENT sur le relevé des pages TikTok Studio (aucun import CSV, aucune mesure interne). Maquette à valider avant la spec.
