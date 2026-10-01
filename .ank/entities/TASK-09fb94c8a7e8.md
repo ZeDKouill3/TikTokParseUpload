@@ -5,7 +5,7 @@ slug: web-api-v2-file-de-traitement-journal-relance-an
 title: "web API v2 : file de traitement, journal, relance, annulation, chaînes, flux SSE /api/events, jeton d'accès"
 created: 2026-09-30T20:43:35Z
 author: w-plan-web
-status: open
+status: done
 scope:
   - clipper/web/app.py
   - clipper/web/__init__.py
@@ -16,8 +16,15 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/ec392f390178@5db05b2
+    tree: scope/f48bd5c98e6c
+    criteria: 1ea5ab4d3ea1
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 2
+version: 4
 ---
 
 ADR-4f6e §1, §4, §5 ; SPEC-c100 T1, T3, T7 ; SPEC-fc0c §2, §3.2. POST /api/videos (v1) reste et devient un alias de POST /api/queue sans chaîne. clipper/web/__init__.py déclare CONFIG_DEFAULTS pour [web] : host (défaut 127.0.0.1), port (8000), token ("") ; `serve --host/--port` les surchargent.

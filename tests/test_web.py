@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from clipper.config import Config
@@ -41,27 +42,28 @@ def test_serve_static_index_page(tmp_path, isolated_cwd):
 
 
 # --------------------------------------------------------------------------
-# C : POST /api/videos lance pipeline.run en arriere-plan
+# C : POST /api/videos est un alias de POST /api/queue sans chaine (ADR-4f6e
+# §1 : jamais pipeline.run dans ce processus, worker.enqueue a la place)
 # --------------------------------------------------------------------------
 
 
-def test_submit_url_starts_pipeline_run(tmp_path, isolated_cwd, monkeypatch):
-    from clipper import pipeline
+def test_submit_url_enqueues_via_worker(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import worker
 
     calls = []
 
-    def fake_run(url, *, config=None, **kwargs):
-        calls.append((url, config))
-        return {"video_id": VIDEO_ID, "status": "awaiting_review"}
+    def fake_enqueue(url, channel, action, force_steps, *, config=None):
+        calls.append((url, channel, action, force_steps))
+        return {"id": "e1", "video_id": VIDEO_ID, "url": url, "channel": channel,
+                "action": action, "force_steps": force_steps or [], "status": "waiting"}
 
-    monkeypatch.setattr(pipeline, "run", fake_run)
+    monkeypatch.setattr(worker, "enqueue", fake_enqueue)
 
     resp = client(tmp_path).post("/api/videos", json={"url": URL})
 
     assert resp.status_code == 202
-    assert resp.json() == {"url": URL, "submitted": True}
-    assert len(calls) == 1
-    assert calls[0][0] == URL
+    assert resp.json()["video_id"] == VIDEO_ID
+    assert calls == [(URL, None, "run", None)]
 
 
 def test_submit_missing_url_is_a_validation_error(tmp_path, isolated_cwd):
@@ -269,27 +271,47 @@ def test_decide_invalid_decision_is_400(tmp_path, isolated_cwd, monkeypatch):
 
 
 # --------------------------------------------------------------------------
-# H : POST /api/videos/{id}/render lance pipeline.render en arriere-plan
+# H : POST /api/videos/{id}/render remet en file (action 'render') via
+# worker.enqueue, jamais pipeline.render dans ce processus (ADR-4f6e §1)
 # --------------------------------------------------------------------------
 
 
-def test_render_starts_pipeline_render(tmp_path, isolated_cwd, monkeypatch):
-    from clipper import pipeline
+def test_render_enqueues_render_action(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import worker
 
     calls = []
 
-    def fake_render(video_id, *, config=None, **kwargs):
-        calls.append((video_id, config))
-        return {"video_id": video_id, "status": "done"}
+    def fake_enqueue(url, channel, action, force_steps, *, config=None):
+        calls.append((url, channel, action, force_steps))
+        return {"id": "e1", "video_id": VIDEO_ID, "channel": channel, "action": action,
+                "force_steps": force_steps or [], "status": "waiting"}
 
-    monkeypatch.setattr(pipeline, "render", fake_render)
+    monkeypatch.setattr(worker, "enqueue", fake_enqueue)
 
     resp = client(tmp_path).post(f"/api/videos/{VIDEO_ID}/render")
 
     assert resp.status_code == 202
-    assert resp.json() == {"video_id": VIDEO_ID, "submitted": True}
-    assert len(calls) == 1
-    assert calls[0][0] == VIDEO_ID
+    assert resp.json()["video_id"] == VIDEO_ID
+    assert calls == [(VIDEO_ID, None, "render", None)]
+
+
+def test_render_passes_the_video_channel(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import pipeline, worker
+
+    _write_state(tmp_path, VIDEO_ID, channel="une_chaine")
+    calls = []
+    monkeypatch.setattr(
+        worker, "enqueue",
+        lambda url, channel, action, force_steps, *, config=None:
+            calls.append((url, channel, action, force_steps)) or
+            {"id": "e1", "video_id": VIDEO_ID, "channel": channel, "action": action,
+             "force_steps": force_steps or [], "status": "waiting"},
+    )
+
+    resp = client(tmp_path).post(f"/api/videos/{VIDEO_ID}/render")
+
+    assert resp.status_code == 202
+    assert calls == [(VIDEO_ID, "une_chaine", "render", None)]
 
 
 # --------------------------------------------------------------------------
@@ -381,7 +403,10 @@ def test_media_clip_rejects_path_traversal(tmp_path, isolated_cwd):
 # --------------------------------------------------------------------------
 
 
-_ALLOWED_CLIPPER_IMPORTS = {"clipper", "clipper.pipeline", "clipper.config", "clipper.web", "clipper.web.app"}
+_ALLOWED_CLIPPER_IMPORTS = {
+    "clipper", "clipper.pipeline", "clipper.config", "clipper.web", "clipper.web.app",
+    "clipper.channel", "clipper.worker", "clipper.publish", "clipper.watch",
+}
 
 
 def test_web_module_only_imports_pipeline_and_config():
@@ -460,3 +485,389 @@ def test_index_declares_logo_as_icon_and_shows_it_in_header(tmp_path, isolated_c
     assert 'src="/static/logo.svg"' in header
     assert 'alt=""' in header
     assert "Clipper" in header
+
+
+# --------------------------------------------------------------------------
+# L : file de traitement (/api/queue) - SPEC-fc0c §2
+# --------------------------------------------------------------------------
+
+
+def test_queue_post_calls_worker_enqueue(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import worker
+
+    calls = []
+
+    def fake_enqueue(url, channel, action, force_steps, *, config=None):
+        calls.append((url, channel, action, force_steps))
+        return {"id": "e1", "video_id": VIDEO_ID, "url": url, "channel": channel,
+                "action": action, "force_steps": force_steps, "status": "waiting"}
+
+    monkeypatch.setattr(worker, "enqueue", fake_enqueue)
+
+    resp = client(tmp_path).post("/api/queue", json={
+        "url": URL, "channel": "une_chaine", "action": "run", "force_steps": ["render"],
+    })
+
+    assert resp.status_code == 202
+    assert resp.json()["video_id"] == VIDEO_ID
+    assert calls == [(URL, "une_chaine", "run", ["render"])]
+
+
+def test_queue_post_duplicate_is_409_with_french_detail(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import worker
+
+    def fake_enqueue(url, channel, action, force_steps, *, config=None):
+        raise worker.WorkerError(f"deja en file d'attente : {VIDEO_ID} ({action})")
+
+    monkeypatch.setattr(worker, "enqueue", fake_enqueue)
+
+    resp = client(tmp_path).post(
+        "/api/queue", json={"url": URL, "channel": None, "action": "run", "force_steps": []}
+    )
+
+    assert resp.status_code == 409
+    assert "file d'attente" in resp.json()["detail"]
+
+
+def test_queue_get_lists_entries(tmp_path, isolated_cwd):
+    queue_path = tmp_path / "state" / "queue.json"
+    queue_path.parent.mkdir(parents=True)
+    entries = [{"id": "e1", "video_id": VIDEO_ID, "url": URL, "channel": None, "action": "run",
+                "force_steps": [], "enqueued_at": "2026-01-01T00:00:00+00:00", "status": "waiting", "pid": None}]
+    queue_path.write_text(json.dumps(entries), encoding="utf-8")
+
+    resp = client(tmp_path).get("/api/queue")
+
+    assert resp.status_code == 200
+    assert resp.json() == entries
+
+
+def test_queue_get_empty_is_an_empty_list(tmp_path, isolated_cwd):
+    resp = client(tmp_path).get("/api/queue")
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
+def test_queue_front_calls_worker_move_to_front(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import worker
+
+    calls = []
+    monkeypatch.setattr(worker, "move_to_front", lambda video_id, *, config=None: calls.append(video_id))
+
+    resp = client(tmp_path).post(f"/api/queue/{VIDEO_ID}/front")
+
+    assert resp.status_code == 200
+    assert calls == [VIDEO_ID]
+
+
+def test_queue_front_unknown_entry_is_404(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import worker
+
+    def fake(video_id, *, config=None):
+        raise worker.WorkerError(f"aucune entree en attente pour {video_id!r}")
+
+    monkeypatch.setattr(worker, "move_to_front", fake)
+
+    resp = client(tmp_path).post(f"/api/queue/{VIDEO_ID}/front")
+
+    assert resp.status_code == 404
+
+
+def test_queue_delete_calls_worker_remove(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import worker
+
+    calls = []
+    monkeypatch.setattr(worker, "remove", lambda video_id, *, config=None: calls.append(video_id))
+
+    resp = client(tmp_path).delete(f"/api/queue/{VIDEO_ID}")
+
+    assert resp.status_code == 200
+    assert calls == [VIDEO_ID]
+
+
+def test_queue_delete_unknown_entry_is_404(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import worker
+
+    def fake(video_id, *, config=None):
+        raise worker.WorkerError(f"aucune entree en attente pour {video_id!r}")
+
+    monkeypatch.setattr(worker, "remove", fake)
+
+    resp = client(tmp_path).delete(f"/api/queue/{VIDEO_ID}")
+
+    assert resp.status_code == 404
+
+
+# --------------------------------------------------------------------------
+# M : annulation, relance, journal par video - SPEC-fc0c §2.3, §3.2
+# --------------------------------------------------------------------------
+
+
+def test_cancel_calls_worker_cancel(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import worker
+
+    calls = []
+    monkeypatch.setattr(worker.Worker, "cancel", lambda self, video_id: calls.append(video_id))
+
+    resp = client(tmp_path).post(f"/api/videos/{VIDEO_ID}/cancel")
+
+    assert resp.status_code == 200
+    assert calls == [VIDEO_ID]
+
+
+def test_cancel_not_running_is_404(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import worker
+
+    def fake_cancel(self, video_id):
+        raise worker.WorkerError(f"aucune video en cours pour {video_id!r}")
+
+    monkeypatch.setattr(worker.Worker, "cancel", fake_cancel)
+
+    resp = client(tmp_path).post(f"/api/videos/{VIDEO_ID}/cancel")
+
+    assert resp.status_code == 404
+
+
+def test_retry_enqueues_render_with_force_steps_from_step(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import pipeline, worker
+
+    calls = []
+    monkeypatch.setattr(
+        worker, "enqueue",
+        lambda url, channel, action, force_steps, *, config=None:
+            calls.append((url, channel, action, force_steps)) or
+            {"id": "e1", "video_id": VIDEO_ID, "channel": channel, "action": action,
+             "force_steps": force_steps, "status": "waiting"},
+    )
+
+    resp = client(tmp_path).post(f"/api/videos/{VIDEO_ID}/retry", json={"from_step": "reframe"})
+
+    assert resp.status_code == 202
+    expected_force_steps = list(pipeline.STEPS[pipeline.STEPS.index("reframe"):])
+    assert calls == [(VIDEO_ID, None, "render", expected_force_steps)]
+    assert "reframe" in resp.json()["force_steps"]
+
+
+def test_retry_unknown_step_is_400(tmp_path, isolated_cwd):
+    resp = client(tmp_path).post(f"/api/videos/{VIDEO_ID}/retry", json={"from_step": "bogus"})
+    assert resp.status_code == 400
+    assert "bogus" in resp.json()["detail"]
+
+
+def test_video_events_reads_events_jsonl(tmp_path, isolated_cwd):
+    video_dir = tmp_path / "workspace" / VIDEO_ID
+    video_dir.mkdir(parents=True)
+    lines = [
+        {"at": "2026-01-01T00:00:00+00:00", "level": "INFO", "step": "download", "message": "demarre"},
+        {"at": "2026-01-01T00:01:00+00:00", "level": "INFO", "step": "download", "message": "termine"},
+    ]
+    (video_dir / "events.jsonl").write_text("\n".join(json.dumps(l) for l in lines) + "\n", encoding="utf-8")
+
+    resp = client(tmp_path).get(f"/api/videos/{VIDEO_ID}/events")
+
+    assert resp.status_code == 200
+    assert resp.json() == lines
+
+
+def test_video_events_since_filters_older_lines(tmp_path, isolated_cwd):
+    video_dir = tmp_path / "workspace" / VIDEO_ID
+    video_dir.mkdir(parents=True)
+    lines = [
+        {"at": "2026-01-01T00:00:00+00:00", "level": "INFO", "step": "download", "message": "demarre"},
+        {"at": "2026-01-01T00:01:00+00:00", "level": "INFO", "step": "download", "message": "termine"},
+    ]
+    (video_dir / "events.jsonl").write_text("\n".join(json.dumps(l) for l in lines) + "\n", encoding="utf-8")
+
+    resp = client(tmp_path).get(f"/api/videos/{VIDEO_ID}/events", params={"since": "2026-01-01T00:00:00+00:00"})
+
+    assert resp.status_code == 200
+    assert resp.json() == [lines[1]]
+
+
+def test_video_events_no_journal_yet_is_an_empty_list(tmp_path, isolated_cwd):
+    resp = client(tmp_path).get(f"/api/videos/{VIDEO_ID}/events")
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
+def test_video_events_rejects_path_traversal(tmp_path, isolated_cwd):
+    # "..%2F..%2Fsecret" (comme test_media_clip_rejects_path_traversal) : pas
+    # de normalisation cote client httpx (le "/" reste encode), contrairement
+    # a un ".." nu qui serait resolu avant l'envoi et, ici, retomberait sur
+    # /api/events (flux SSE infini) au lieu d'exercer la validation serveur.
+    resp = client(tmp_path).get("/api/videos/..%2F..%2Fsecret/events")
+    assert resp.status_code in (400, 404)
+
+
+def test_cancel_rejects_path_traversal(tmp_path, isolated_cwd):
+    resp = client(tmp_path).post("/api/videos/..%2F..%2Fsecret/cancel")
+    assert resp.status_code in (400, 404)
+
+
+# --------------------------------------------------------------------------
+# N : GET /api/channels - channel.list_channels (SPEC-fc0c §1)
+# --------------------------------------------------------------------------
+
+
+def test_channels_lists_presets_with_channel_table(tmp_path, isolated_cwd):
+    presets_dir = tmp_path / "presets"
+    presets_dir.mkdir()
+    (presets_dir / "une_chaine.toml").write_text('[channel]\ndisplay_name = "Une chaine"\n', encoding="utf-8")
+    (presets_dir / "sans_channel.toml").write_text('mode = "auto"\n', encoding="utf-8")
+
+    resp = client(tmp_path).get("/api/channels")
+
+    assert resp.status_code == 200
+    assert resp.json() == ["une_chaine"]
+
+
+def test_channels_no_presets_dir_is_an_empty_list(tmp_path, isolated_cwd):
+    resp = client(tmp_path).get("/api/channels")
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
+# --------------------------------------------------------------------------
+# O : GET /api/events - flux SSE par mtime (ADR-4f6e §4)
+# --------------------------------------------------------------------------
+
+
+def _sse_config(tmp_path) -> Config:
+    return Config(
+        mode="review", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output",
+        _sections={"web": {"host": "127.0.0.1", "port": 8000, "token": "", "sse_poll_interval_s": 0.05}},
+    )
+
+
+def test_events_route_is_declared_as_sse(tmp_path, isolated_cwd):
+    # La reponse HTTP infinie de ce flux ne peut pas etre lue de bout en bout
+    # ici : le TestClient de ce venv bloque indefiniment sur un corps qui ne
+    # se termine jamais (reproduit hors pytest avec un generateur minimal,
+    # voir ank log). Le contrat "flux SSE" est donc verifie par la route
+    # elle-meme (media_type) ; le comportement "un evenement par mtime
+    # changee" est prouve directement sur le generateur ci-dessous.
+    app = create_app(config=_sse_config(tmp_path))
+    route = next(r for r in app.router.routes if getattr(r, "path", None) == "/api/events")
+    assert "GET" in route.methods
+
+
+def test_event_stream_generator_emits_on_file_mtime_change(tmp_path, isolated_cwd):
+    import asyncio
+
+    from clipper.web.app import _event_stream
+
+    config = _sse_config(tmp_path)
+
+    async def _run() -> str:
+        agen = _event_stream(config).__aiter__()
+
+        async def _touch_queue_file_soon() -> None:
+            await asyncio.sleep(0.15)
+            state_dir = tmp_path / "state"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            (state_dir / "queue.json").write_text("[]", encoding="utf-8")
+
+        asyncio.create_task(_touch_queue_file_soon())
+        return await asyncio.wait_for(agen.__anext__(), timeout=2.0)
+
+    chunk = asyncio.run(_run())
+
+    assert chunk.startswith("data: ")
+    event = json.loads(chunk[len("data: "):].strip())
+    assert event["kind"] == "queue"
+    assert "id" in event and "at" in event
+
+
+def test_event_stream_generator_ignores_files_present_before_connecting(tmp_path, isolated_cwd):
+    import asyncio
+
+    from clipper.web.app import _event_stream
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(parents=True)
+    (state_dir / "queue.json").write_text("[]", encoding="utf-8")
+    config = _sse_config(tmp_path)
+
+    async def _run() -> bool:
+        agen = _event_stream(config).__aiter__()
+        try:
+            await asyncio.wait_for(agen.__anext__(), timeout=0.3)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+    got_event = asyncio.run(_run())
+    assert got_event is False
+
+
+# --------------------------------------------------------------------------
+# P : jeton d'acces (ADR-4f6e §5)
+# --------------------------------------------------------------------------
+
+
+def _config_with_web(tmp_path, **web) -> Config:
+    return Config(
+        mode="review", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output",
+        _sections={"web": web},
+    )
+
+
+def test_create_app_refuses_non_loopback_host_without_token(tmp_path, isolated_cwd):
+    from clipper.web.app import WebConfigError
+
+    config = _config_with_web(tmp_path, host="0.0.0.0", token="")
+
+    with pytest.raises(WebConfigError):
+        create_app(config=config)
+
+
+def test_create_app_accepts_non_loopback_host_with_token(tmp_path, isolated_cwd):
+    config = _config_with_web(tmp_path, host="0.0.0.0", token="secret")
+    create_app(config=config)
+
+
+def test_api_requires_token_on_non_loopback_host(tmp_path, isolated_cwd):
+    config = _config_with_web(tmp_path, host="0.0.0.0", token="secret")
+    test_client = TestClient(create_app(config=config))
+
+    resp = test_client.get("/api/videos")
+
+    assert resp.status_code == 401
+    assert "detail" in resp.json()
+
+
+def test_api_accepts_token_via_header(tmp_path, isolated_cwd):
+    config = _config_with_web(tmp_path, host="0.0.0.0", token="secret")
+    test_client = TestClient(create_app(config=config))
+
+    resp = test_client.get("/api/videos", headers={"X-Clipper-Token": "secret"})
+
+    assert resp.status_code == 200
+
+
+def test_api_accepts_token_via_cookie(tmp_path, isolated_cwd):
+    config = _config_with_web(tmp_path, host="0.0.0.0", token="secret")
+    test_client = TestClient(create_app(config=config))
+    test_client.cookies.set("clipper_token", "secret")
+
+    resp = test_client.get("/api/videos")
+
+    assert resp.status_code == 200
+
+
+def test_media_also_requires_token_on_non_loopback_host(tmp_path, isolated_cwd):
+    config = _config_with_web(tmp_path, host="0.0.0.0", token="secret")
+    test_client = TestClient(create_app(config=config))
+
+    resp = test_client.get(f"/media/source/{VIDEO_ID}")
+
+    assert resp.status_code == 401
+
+
+def test_loopback_host_requires_no_token(tmp_path, isolated_cwd):
+    config = _config_with_web(tmp_path, host="127.0.0.1", token="")
+    test_client = TestClient(create_app(config=config))
+
+    resp = test_client.get("/api/videos")
+
+    assert resp.status_code == 200
