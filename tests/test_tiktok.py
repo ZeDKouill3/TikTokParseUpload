@@ -194,7 +194,7 @@ class StudioPage(FakePage):
         self.posted: list[str] = []
         self.arrows: list[str] = []
         self.present |= {sel[k] for k in ("file_input", "upload_done", "caption_editor", "advanced_settings",
-                                          "visibility_public", "visibility_private", "schedule_now",
+                                          "visibility_public", "visibility_private", "visibility_friends", "schedule_now",
                                           "schedule_later", "post_button", "discard_button", "schedule_picker_close")}
         if folded:
             self.present.add(sel["advanced_settings"])
@@ -202,6 +202,11 @@ class StudioPage(FakePage):
         else:
             self.present.add(sel["visibility_dropdown"])
         self.set_check(check)
+        # Reglages par post (apres « Afficher plus ») : etat initial de TikTok (commentaires et reutilisation
+        # cochees, contenu IA coupe) ; ``toggles`` garde chaque changement d'etat, jamais un clic « de position ».
+        self.options = {"comment_switch": True, "reuse_switch": True, "ai_switch": False}
+        self.toggles: list[tuple[str, bool]] = []
+        self.present |= {sel[k] for k in self.options}
         # Programmer / Maintenant : le texte du bouton final suit
         self.on_click = {sel["schedule_later"]: self.choose_scheduled, sel["schedule_now"]: self.choose_now}
         self.texts[sel["post_button"]] = _sel()["labels"]["post_now"]
@@ -230,6 +235,9 @@ class StudioPage(FakePage):
             return FakeElement(self, selector, text=lambda: str(self.cal[0]))
         if selector == sel["schedule_picker_close"]:
             return FakeElement(self, selector, on_click=self.close_pickers)
+        for name in self.options:
+            if selector == sel[name]:
+                return FakeToggle(self, selector, name)
         element = super().make(selector)
         element.on_click = self.on_click.get(selector)
         return element
@@ -308,6 +316,25 @@ class StudioPage(FakePage):
     def pick_time(self, hour=None, minute=None):
         h, m = self.time_value.split(":")
         self.time_value = f"{hour if hour is not None else int(h):02d}:{minute if minute is not None else int(m):02d}"
+
+
+class FakeToggle(FakeElement):
+    """Une case ou un interrupteur du bloc des reglages : ``check`` / ``uncheck`` changent l'etat de la page."""
+
+    def __init__(self, page, selector, name):
+        super().__init__(page, selector)
+        self.name = name
+
+    def is_checked(self):
+        return self.page.options[self.name]
+
+    def check(self, **kwargs):
+        self.page.options[self.name] = True
+        self.page.toggles.append((self.name, True))
+
+    def uncheck(self, **kwargs):
+        self.page.options[self.name] = False
+        self.page.toggles.append((self.name, False))
 
 
 class Env:
@@ -972,7 +999,8 @@ def test_selectors_file_carries_the_real_markers_of_tiktok_studio():
     assert "upload_status_success" not in str(_sel()) and "schedule_video_button" not in str(_sel())
     assert "privacy_container" not in str(_sel()) and "schedule_radio" not in str(_sel())
     assert _sel()["labels"] == {"post_now": "Publier", "post_scheduled": "Programmer",
-                                "visibility_public": "Tout le monde", "visibility_private": "Toi uniquement"}
+                                "visibility_public": "Tout le monde", "visibility_private": "Toi uniquement",
+                                "visibility_friends": "Ami(e)s"}
     assert _sel()["popups"] == {
         "Activer les vérifications automatiques du contenu": "Annuler",
         "Nouvelles fonctionnalités d'édition ajoutées": "J'ai compris",
@@ -1480,3 +1508,126 @@ def test_content_check_off_turns_the_switch_off_and_never_waits(tmp_path, monkey
 
 def test_content_check_defaults_to_off():
     assert tiktok.CONFIG_DEFAULTS["content_check"] == "off"
+
+
+# ---------------------------------------------------------------- reglages par post (SPEC-1ed3 R2)
+
+
+def test_post_options_drive_visibility_comments_reuse_and_ai_label_without_clicking_what_is_already_set(env):
+    # etat initial de TikTok : tout le monde, commentaires et reutilisation cochees, contenu IA coupe
+    env.publish(options={"allow_comments": True, "allow_reuse": True, "ai_generated": False})
+    assert env.page.toggles == []  # deja dans l'etat voulu : aucun clic
+
+
+def test_post_options_toggle_only_the_boxes_that_differ(env):
+    env.publish(options={"allow_comments": False, "allow_reuse": True, "ai_generated": True})
+    assert env.page.toggles == [("comment_switch", False), ("ai_switch", True)]
+    assert env.page.options == {"comment_switch": False, "reuse_switch": True, "ai_switch": True}
+
+
+def test_post_options_reuse_off(env):
+    env.publish(options={"allow_reuse": False})
+    assert env.page.toggles == [("reuse_switch", False)]
+
+
+def test_settings_blocks_are_opened_with_show_more_before_the_options_are_read(tmp_path, monkeypatch):
+    sel = _sel()["selectors"]
+    folded = Env(tmp_path, monkeypatch, page_kwargs={"folded": True})
+    folded.publish(options={"ai_generated": True})
+    assert sel["advanced_settings"] in folded.page.clicks()
+    assert folded.page.toggles == [("ai_switch", True)]
+
+
+def test_friends_visibility_selects_the_friends_option(env):
+    env.publish(options={"visibility": "friends"})
+    sel = _sel()["selectors"]
+    assert env.page.clicks() == [sel["caption_editor"], sel["visibility_dropdown"], sel["visibility_friends"],
+                                 sel["schedule_now"], sel["post_button"]]
+
+
+def test_post_options_default_to_the_tiktok_section(tmp_path, monkeypatch):
+    env = Env(tmp_path, monkeypatch, settings={"allow_comments": False, "ai_generated": True})
+    env.publish()
+    assert env.page.toggles == [("comment_switch", False), ("ai_switch", True)]  # reglage [tiktok], sans options
+
+
+def test_post_options_override_the_tiktok_section(tmp_path, monkeypatch):
+    env = Env(tmp_path, monkeypatch, settings={"allow_comments": False})
+    env.publish(options={"allow_comments": True})
+    assert env.page.toggles == []
+
+
+def test_post_options_content_check_wait_overrides_off(tmp_path, monkeypatch):
+    env = Env(tmp_path, monkeypatch, settings={"content_check": "off"})
+    switch = FakeSwitch(True)
+    real = env.page.query_selector
+    env.page.query_selector = lambda css: switch if css == _sel()["selectors"]["content_check_switch"] else real(css)
+    env.publish(options={"content_check": "wait"})
+    assert switch.unchecks == 0  # « wait » : on attend le resultat, on ne coupe pas l'interrupteur
+
+
+def test_private_post_option_with_schedule_is_refused_before_any_browser_is_opened(env):
+    when = NOW + timedelta(days=2)
+    with pytest.raises(tiktok.TikTokError, match="privée"):
+        env.publish("scheduled", when, options={"visibility": "private"})
+    assert env.opened == []
+
+
+@pytest.mark.parametrize("options, message", [
+    ({"visibility": "secret"}, "visibility"),
+    ({"allow_comments": "oui"}, "allow_comments"),
+    ({"ai_generated": 1}, "ai_generated"),
+    ({"content_check": "never"}, "content_check"),
+    ({"inconnu": True}, "inconnu"),
+])
+def test_invalid_post_options_are_an_explicit_error(env, options, message):
+    with pytest.raises(tiktok.TikTokError, match=message):
+        env.publish(options=options)
+    assert env.opened == []
+
+
+def test_a_missing_option_block_is_an_r4_stop_with_a_capture_never_a_blind_click(tmp_path, monkeypatch):
+    env = Env(tmp_path, monkeypatch)
+    env.page.present.discard(_sel()["selectors"]["ai_switch"])
+    with pytest.raises(tiktok.TikTokStop) as stop:
+        env.publish(options={"ai_generated": True})
+    assert stop.value.code == "element_missing" and "contenu généré par IA" in stop.value.reason
+    assert env.page.posted == []
+
+
+def test_option_selectors_target_the_nearest_label_never_a_position():
+    sel = _sel()["selectors"]
+    assert "user_perm_container" in sel["comment_switch"] and 'text="Commentaire"' in sel["comment_switch"]
+    assert "user_perm_container" in sel["reuse_switch"] and 'text="Réutilisation du contenu"' in sel["reuse_switch"]
+    assert "aigc_container" in sel["ai_switch"] and "Contenu généré par IA" in sel["ai_switch"]
+    assert "role='switch'" in sel["ai_switch"]
+    for key in ("comment_switch", "reuse_switch", "ai_switch"):
+        assert "ancestor::div" in sel[key] and "nth" not in sel[key]
+    assert "option-\"2\"" in sel["visibility_friends"] and "Ami(e)s" in sel["visibility_friends"]
+    assert _sel()["labels"]["visibility_friends"] == "Ami(e)s"
+
+
+def test_new_option_selectors_are_required_in_the_selectors_file():
+    for key in ("comment_switch", "reuse_switch", "ai_switch", "visibility_friends"):
+        assert key in tiktok.REQUIRED_SELECTORS
+
+
+def test_tiktok_option_defaults_match_the_tiktok_page_defaults():
+    d = tiktok.CONFIG_DEFAULTS
+    assert (d["allow_comments"], d["allow_reuse"], d["ai_generated"]) == (True, True, False)
+
+
+# ---------------------------------------------------------------- prochaine heure possible (SPEC-1ed3 R4)
+
+
+def test_next_allowed_returns_the_first_time_that_respects_the_caps():
+    from zoneinfo import ZoneInfo
+
+    tz = ZoneInfo("UTC")
+    settings = {**tiktok.CONFIG_DEFAULTS, "max_posts_per_day": 2, "min_gap_minutes": 120}
+    times = [NOW.replace(hour=8), NOW.replace(hour=10)]  # deux posts : plafond du jour atteint
+    assert tiktok.next_allowed(times, NOW, settings, tz) == datetime(2026, 10, 2, 0, 0, tzinfo=timezone.utc)
+    # un seul post : le prochain creneau est la fin de l'ecart minimal
+    assert tiktok.next_allowed([NOW.replace(hour=11)], NOW, settings, tz) == NOW.replace(hour=13)
+    # aucun obstacle : l'heure demandee elle-meme
+    assert tiktok.next_allowed([], NOW, settings, tz) == NOW
