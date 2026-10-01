@@ -5114,3 +5114,16 @@ def test_publish_screen_shows_and_changes_the_account_of_each_post():
     assert "/account" in js and "data-pub-account" in js and "Compte de publication" in js
     assert "waiting_reason" in js and "En attente" in js                  # raison visible quand l'entrée n'est pas tentée
     assert "ready_to_publish" in js                                       # seuls les comptes prêts sont choisissables
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node absent du PATH")
+def test_every_static_javascript_file_parses():
+    # Une fusion automatique a déjà laissé un JS tronqué (écran Chaînes vide) sans qu'aucun test ne le voie.
+    files = sorted(STATIC.rglob("*.js"))
+    assert files
+    bad = []
+    for f in files:
+        run = subprocess.run(["node", "--check", str(f)], capture_output=True, text=True)
+        if run.returncode != 0:
+            bad.append(f"{f.name}: {run.stderr.strip().splitlines()[-1] if run.stderr.strip() else run.returncode}")
+    assert not bad, bad

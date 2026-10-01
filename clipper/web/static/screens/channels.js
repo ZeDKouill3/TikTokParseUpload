@@ -231,17 +231,12 @@ function chAccountEditor(id, value, dis) {
     <span class="hint">Compte TikTok relié à la chaîne, créé dans l'écran Comptes ; « Se connecter dans le navigateur » s'y trouve aussi.</span>`;
 }
 
-function chControl(id, kind, value, locked) {
-  const dis = locked ? " disabled" : "";
-  switch (kind) {
-    case "slots": return chSlotsEditor(value, dis);
-    case "rubric": return chRubricEditor(id, value, dis);
-    case "account": return chAccountEditor(id, value, dis);
 function chControl(id, kind, value, locked, rubric) {
   const dis = locked ? " disabled" : "";
   switch (kind) {
     case "slots": return chSlotsEditor(value, dis);
     case "rubric": return chRubricEditor(id, value, dis, rubric);
+    case "account": return chAccountEditor(id, value, dis);
     case "mode": return `<select class="input" id="${id}"${dis}>${CHAN_MODES.map(([k, l]) => `<option value="${k}"${k === value ? " selected" : ""}>${esc(l)}</option>`).join("")}</select>`;
     case "bool": return `<label class="switch"><input type="checkbox" id="${id}"${value ? " checked" : ""}${dis}><span></span></label>`;
     case "number": return `<input class="input mono" id="${id}" type="number" step="any" value="${esc(value)}"${dis}>`;
