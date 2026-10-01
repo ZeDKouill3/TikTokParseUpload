@@ -5,7 +5,7 @@ slug: tiktok-preuve-de-publication-lien-du-post-priv-n
 title: "TikTok : preuve de publication, lien du post, privé non programmable, statistiques lues sur les vraies pages"
 created: 2026-10-01T16:06:39Z
 author: nicoc@zedk_ordi
-status: in_progress
+status: done
 scope:
   - clipper/assets/tiktok_selectors.toml
   - clipper/tiktok.py
@@ -18,8 +18,15 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: diagnose
+proof:
+  - type: test
+    ref: local/306456d65596@d21a008
+    tree: scope/e1a560d30821
+    criteria: 433529f0faf4
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 2
+version: 3
 ---
 
 Relevé réel 2026-10-01 (post privé de test publié par l'utilisateur, FR).
