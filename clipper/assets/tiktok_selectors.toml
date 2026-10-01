@@ -10,12 +10,19 @@
 # Maintenant / Programmer (radios, vises par libelle), champs heure et date, calendrier,
 # selecteur d'heure, bouton final unique post_video_button (« Publier » ou « Programmer »),
 # bouton d'abandon, et les deux fenetres surgissantes vues au premier envoi.
+# VERIFIE EN REEL (meme jour, post prive de test, TASK-e4bf) : la confirmation apres publication
+# (message « Video publiee » puis adresse /tiktokstudio/content), la fenetre « Continuer a publier ? »
+# (boutons « Annuler » / « Publier maintenant »), le lien du post sur la page Publications
+# (a[href*='/video/'], texte = legende), l'adresse directe d'analyse d'un post et ses cartes de
+# metriques (data-tt VideoOverviewPage_VideoMetricsCard_FlexItem, texte « libelle | valeur »).
 #
-# A VERIFIER SUR LA VRAIE PAGE (jamais vu en reel) : la confirmation apres publication
-# (success_marker, post_link), la fenetre / bulle generique (modal.container), le texte du
-# bloc « Verification de contenu simple » quand il signale un probleme (content_check_problem),
-# le clic hors du champ qui ferme les selecteurs (schedule_picker_close), et toute la page des
-# statistiques ([stats], SPEC-9225 R7). Le test reel (CLIPPER_TIKTOK_REAL=1, tests/integration/
+# A VERIFIER SUR LA VRAIE PAGE (jamais vu en reel) : la confirmation d'un post PROGRAMME (seule
+# la navigation vers /tiktokstudio/content est attendue), la fenetre / bulle generique
+# (modal.container), le texte du bloc « Verification de contenu simple » quand il signale un
+# probleme (content_check_problem), le clic hors du champ qui ferme les selecteurs
+# (schedule_picker_close), les cellules J'aime / Commentaires de la ligne de la page Publications
+# ([stats] likes, comments : colonnes du tableau, pas de data-tt releve) et le bloc des sources de
+# trafic ([stats] traffic_sources). Le test reel (CLIPPER_TIKTOK_REAL=1, tests/integration/
 # test_tiktok_real.py) sert a les confirmer.
 #
 # Un selecteur est une chaine CSS/Playwright. Une liste (captcha, verification,
@@ -26,8 +33,10 @@ version = 1
 [urls]
 # Page d'envoi d'une video.
 upload = "https://www.tiktok.com/tiktokstudio/upload?from=webapp"
-# Liste des contenus publies avec leurs chiffres (releve des statistiques, R7).
+# Liste des contenus publies (page Publications : lien du post, J'aime, Commentaires).
 stats = "https://www.tiktok.com/tiktokstudio/content"
+# Analyse d'un post, adresse directe ({post_id} = fin de l'adresse du post) : vues, temps de lecture...
+analytics = "https://www.tiktok.com/tiktokstudio/analytics/{post_id}?qa_enter_from=analytics"
 
 [expect]
 # Apres l'ouverture de la page d'envoi, l'adresse courante doit commencer par ceci ;
@@ -35,6 +44,10 @@ stats = "https://www.tiktok.com/tiktokstudio/content"
 upload_url_prefix = "https://www.tiktok.com/tiktokstudio/upload"
 # Idem pour la page des statistiques : une autre adresse = page inattendue, arret.
 stats_url_prefix = "https://www.tiktok.com/tiktokstudio/content"
+# Preuve principale d'une publication : apres « Publier », l'adresse passe sur la page Publications.
+published_url_prefix = "https://www.tiktok.com/tiktokstudio/content"
+# Page d'analyse d'un post : une autre adresse = page inattendue, arret.
+analytics_url_prefix = "https://www.tiktok.com/tiktokstudio/analytics/"
 # Fragments d'adresse qui disent « connexion expiree » (redirection vers la connexion).
 login_url_markers = ["/login"]
 
@@ -81,16 +94,19 @@ content_check_problem = "div:has-text('Problème constaté'), div:has-text('prob
 post_button = "button[data-e2e='post_video_button']"
 # Abandon du brouillon (non utilise : un arret laisse la page telle quelle, avec sa capture).
 discard_button = "button[data-e2e='discard_post_button']"
-# Confirmation apres publication (boite « Video envoyee » / « Programmee ») : JAMAIS VUE EN REEL.
-success_marker = "[data-e2e='post_success_modal'], div:has-text('Vidéo envoyée')"
-# Lien vers la video publiee, dans la confirmation (attribut href) ; absent pour un
-# post programme (pas encore d'adresse publique). JAMAIS VU EN REEL.
-post_link = "[data-e2e='post_success_modal'] a[href*='/video/']"
+# Preuve de secours d'une publication : le message « Video publiee » (la preuve principale est la navigation).
+published_marker = "div:has-text('Vidéo publiée')"
 
 [labels]
 # Texte du bouton final selon le mode ; un autre texte = page inattendue, arret.
 post_now = "Publier"
 post_scheduled = "Programmer"
+
+[continue_publish]
+# Fenetre « Continuer a publier ? » (verification de contenu encore en cours) : fragment de son texte
+# et bouton a cliquer (jamais « Publier maintenant »).
+dialog = "Continuer à publier"
+cancel = "Annuler"
 
 [calendar]
 # Noms des mois affiches par le calendrier (langue de TikTok Studio : francais), janvier a decembre.
@@ -108,24 +124,32 @@ button = "button:has-text(\"{label}\"), [role='button']:has-text(\"{label}\")"
 "Activer les vérifications automatiques du contenu" = "Annuler"
 "Nouvelles fonctionnalités d'édition ajoutées" = "J'ai compris"
 
-# A VERIFIER SUR LA VRAIE PAGE (pages de statistiques, SPEC-9225 R7) : comme ci-dessus,
-# ces selecteurs sont plausibles mais n'ont PAS ete valides sur la vraie page TikTok
-# Studio. Une ligne = un post publie ; les autres selecteurs sont cherches DANS la ligne.
-# Une valeur que la page n'affiche pas (selecteur sans resultat) est relevee « null » ;
-# une valeur affichee mais illisible arrete le releve (page inattendue).
+# Page Publications (SPEC-9225 R7) : une ligne = un post ; likes et commentaires sont lus dans la
+# ligne du post (celle qui contient son lien). Une valeur que la page n'affiche pas (selecteur sans
+# resultat) est relevee « null » ; une valeur affichee mais illisible arrete le releve (page inattendue).
 [stats]
-# Une ligne de la liste des contenus (un post publie).
-row = "div[data-e2e='content_item'], tr[data-e2e='content_row']"
-# Lien du post dans la ligne (href contenant /video/<id>).
+# Une ligne du tableau « Contenu | Politique de confidentialite | Vues | J'aime | Commentaires | Actions ».
+row = "tr:has(a[href*='/video/'])"
+# Lien du post (/@<compte>/video/<id>, texte = legende) : sert a la ligne et a la recherche du lien apres publication.
 post_link = "a[href*='/video/']"
-# Compteurs de la ligne.
-views = "[data-e2e='content_views']"
-likes = "[data-e2e='content_likes']"
-comments = "[data-e2e='content_comments']"
-shares = "[data-e2e='content_shares']"
-# Si TikTok Studio les affiche : duree moyenne de visionnage, part vue en entier.
-avg_watch = "[data-e2e='content_avg_watch_time']"
-watched_full = "[data-e2e='content_full_watch_rate']"
+# Cellules de la ligne (colonnes 4 et 5 du tableau). A VERIFIER SUR LA VRAIE PAGE.
+likes = "td:nth-child(4)"
+comments = "td:nth-child(5)"
+# Page d'analyse d'un post : une carte par metrique, texte « libelle | valeur ».
+metric_card = "[data-tt='VideoOverviewPage_VideoMetricsCard_FlexItem']"
+# Bloc des sources de trafic (visibles a partir de 100 vues). A VERIFIER SUR LA VRAIE PAGE.
+traffic_sources = "[data-tt='VideoOverviewPage_TrafficSourceCard_FlexRow']"
+# Valeur affichee tant que TikTok n'a pas fini de calculer (retention, sources) : relevee « null ».
+processing = "en cours de traitement"
+
+# Libelle de chaque metrique de l'analyse d'un post (langue de TikTok Studio : francais).
+[metrics]
+views = "Vues de vidéo"
+watch_total = "Temps de lecture total"
+watch_avg = "Temps de visionnage moyen"
+watched_full = "A regardé toute la vidéo"
+new_followers = "Nouveaux followers"
+retention = "Taux de rétention"
 
 [detect]
 # Signes de captcha (iframe/conteneur de verification).

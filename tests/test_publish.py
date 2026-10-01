@@ -619,6 +619,34 @@ def test_mark_published_with_a_tiktok_post_records_it_in_the_entry_and_the_sidec
         "publish_at": at.isoformat(), "account": _ACCOUNT, "note": None}
 
 
+def test_mark_published_records_the_full_url_and_the_id_taken_from_the_end_of_the_link(isolated_cwd):
+    from clipper import tiktok
+
+    publish = _tiktok_env(isolated_cwd, ("01",))
+    url = "https://www.tiktok.com/@ma_chaine/video/7300000000000000042"
+    post_id = tiktok._POST_ID_END.search(url).group(1)
+
+    entry = publish.mark_published("vid1", "01", "ma_chaine", post_url=url, post_id=post_id,
+                                   tiktok_state="published", publish_at="2026-10-01T12:00:00+00:00", account=_ACCOUNT)
+
+    assert (entry["post_url"], entry["post_id"]) == (url, "7300000000000000042")
+    sidecar = _read_sidecar(isolated_cwd, "vid1", "01")
+    assert (sidecar["tiktok_post"]["url"], sidecar["tiktok_post"]["id"]) == (url, "7300000000000000042")
+
+
+def test_mark_published_with_a_missing_post_link_keeps_the_note_and_invents_no_id(isolated_cwd):
+    publish = _tiktok_env(isolated_cwd, ("01",))
+    note = "publication réussie mais lien du post introuvable sur la page Publications (aucun lien) : à vérifier à la main"
+
+    entry = publish.mark_published("vid1", "01", "ma_chaine", post_url=None, post_id=None, tiktok_state="published",
+                                   publish_at="2026-10-01T12:00:00+00:00", post_note=note, account=_ACCOUNT)
+
+    assert entry["status"] == "published"  # la publication a reussi
+    assert entry["post_url"] is None and entry["post_id"] is None and entry["post_note"] == note
+    tiktok_post = _read_sidecar(isolated_cwd, "vid1", "01")["tiktok_post"]
+    assert tiktok_post["url"] is None and tiktok_post["id"] is None and tiktok_post["note"] == note
+
+
 def test_mark_failed_records_reason_capture_and_halt_then_retry_puts_it_back(isolated_cwd):
     publish = _tiktok_env(isolated_cwd, ("01",))
 

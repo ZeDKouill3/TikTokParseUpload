@@ -34,6 +34,7 @@ from contextlib import AbstractContextManager
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urljoin
 
 from clipper import browser
 from clipper import channel as channel_mod
@@ -55,6 +56,7 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "schedule_min_minutes": 15,        # avance minimale native de TikTok Studio
     "action_timeout_s": 30,            # attente d'un element de la page
     "upload_timeout_s": 300,           # attente de la fin de l'envoi du mp4
+    "publish_confirm_timeout_s": 60,   # attente de la preuve de publication apres « Publier »
     "content_check_timeout_s": 900,    # attente du resultat de la verification de contenu (~10 min)
     "poll_interval_s": 5,              # pas d'attente entre deux lectures de la verification
     "type_delay_ms": 50,               # delai entre deux touches de la legende
@@ -73,14 +75,15 @@ REQUIRED_SELECTORS = (
     "visibility_public", "visibility_private", "schedule_now", "schedule_later", "schedule_inputs",
     "calendar_month_title", "calendar_year_title", "calendar_arrow", "calendar_day", "timepicker_hour",
     "timepicker_minute", "schedule_picker_close", "content_check_running", "content_check_ok",
-    "content_check_problem", "post_button", "discard_button", "success_marker", "post_link",
+    "content_check_problem", "post_button", "discard_button", "published_marker",
 )
 MAX_POPUP_ROUNDS = 5   # fenetres successives fermees par un meme controle avant d'abandonner
 MAX_MONTH_STEPS = 24   # fleches du calendrier cliquees au plus avant d'abandonner
-REQUIRED_STATS_SELECTORS = ("row", "post_link", "views", "likes", "comments", "shares", "avg_watch", "watched_full")
+REQUIRED_STATS_SELECTORS = ("row", "post_link", "likes", "comments", "metric_card", "traffic_sources", "processing")
+METRICS = ("views", "watch_total", "watch_avg", "watched_full", "new_followers", "retention")
 _DETECT_KINDS = ("captcha", "verification", "login")
-_COUNTS = ("views", "likes", "comments", "shares")
 _POST_ID = re.compile(r"/video/(\d+)")
+_POST_ID_END = re.compile(r"/video/(\d+)/?(?:[?#].*)?$")
 
 
 class TikTokError(Exception):
@@ -89,7 +92,7 @@ class TikTokError(Exception):
 
 class TikTokStop(TikTokError):
     """Arret sur de la page (SPEC-9225 R4). ``code`` : captcha | verification | login |
-    element_missing | unexpected_page ; ``capture`` : la capture d'ecran, ou None."""
+    element_missing | unexpected_page | content_check | publish_unconfirmed ; ``capture`` : la capture d'ecran, ou None."""
 
     def __init__(self, code: str, reason: str, capture: Path | None = None) -> None:
         super().__init__(reason)
@@ -106,7 +109,8 @@ def get_settings(config: Config | None) -> dict[str, Any]:
             raise TikTokError(f"[tiktok] {key} invalide : {settings[key]!r} (attendu : {' | '.join(allowed)})")
     for key, minimum in (("max_posts_per_day", 1), ("min_gap_minutes", 0), ("min_action_delay_s", 0),
                          ("max_action_delay_s", 0), ("schedule_max_days", 1), ("schedule_min_minutes", 0),
-                         ("action_timeout_s", 1), ("upload_timeout_s", 1), ("content_check_timeout_s", 1),
+                         ("action_timeout_s", 1), ("upload_timeout_s", 1), ("publish_confirm_timeout_s", 1),
+                         ("content_check_timeout_s", 1),
                          ("poll_interval_s", 1), ("type_delay_ms", 0)):
         value = settings[key]
         if isinstance(value, bool) or not isinstance(value, (int, float)) or value < minimum:
@@ -151,6 +155,9 @@ def load_selectors(path: str | Path | None = None) -> dict[str, Any]:
         need("detect", key, list)
     need("labels", "post_now", str)
     need("labels", "post_scheduled", str)
+    need("continue_publish", "dialog", str)
+    need("continue_publish", "cancel", str)
+    need("expect", "published_url_prefix", str)
     need("modal", "container", str)
     need("modal", "button", str)
     months = data.get("calendar", {}).get("months")
@@ -162,9 +169,13 @@ def load_selectors(path: str | Path | None = None) -> dict[str, Any]:
         raise TikTokError(f"fichier de sélecteurs TikTok ({target.name}) : [popups] manquant ou invalide "
                           f"(texte de la fenêtre -> libellé du bouton, sans guillemet double)")
     need("urls", "stats", str)
+    need("urls", "analytics", str)
     need("expect", "stats_url_prefix", str)
+    need("expect", "analytics_url_prefix", str)
     for key in REQUIRED_STATS_SELECTORS:
         need("stats", key, str)
+    for key in METRICS:
+        need("metrics", key, str)
     return data
 
 
@@ -232,13 +243,17 @@ def read_events(since: str | None = None, *, config: Config | None = None) -> li
 
 # ---------------------------------------------------------------- lecture des chiffres affiches
 
-_STAT_FIELDS = {"avg_watch": "avg_watch_s"}
 _ABSENT = frozenset({"", "-", "--", "–", "—", "N/A", "n/a"})
 _SUFFIX = {"": 1, "k": 1_000, "m": 1_000_000, "md": 1_000_000_000, "b": 1_000_000_000}
 _COUNT = re.compile(r"(\d[\d ]*)(?:[.,](\d+))?\s*([kKmMbB]|Md)?")
 _PERCENT = re.compile(r"(\d+(?:[.,]\d+)?)\s*%")
 _CLOCK = re.compile(r"(?:(\d+):)?(\d+):(\d{2})")
+_HMS = re.compile(r"(?:(\d+)\s*h\s*:?\s*)?(?:(\d+)\s*m\s*:?\s*)?(?:(\d+(?:[.,]\d+)?)\s*s)?")  # 0h:00m:00s, 12s
 _SECONDS = re.compile(r"(?:(\d+)\s*min\s*)?(?:(\d+(?:[.,]\d+)?)\s*s)?|(\d+)\s*min")
+
+
+def _squash(text: str) -> str:
+    return " ".join(text.replace("\u202f", " ").replace("\xa0", " ").split())
 
 
 def _text(value: Any) -> str:
@@ -271,13 +286,16 @@ def parse_percent(value: Any) -> float | None:
 
 
 def parse_duration(value: Any) -> float | None:
-    """« 12,5 s », « 1:05 », « 1 min 5 s » -> secondes ; tiret ou vide -> ``None`` ; autre -> ``ValueError``."""
+    """« 12,5 s », « 0h:01m:05s », « 1:05 », « 1 min 5 s » -> secondes ; tiret ou vide -> ``None`` ; autre -> ``ValueError``."""
     text = _text(value)
     if text in _ABSENT:
         return None
     clock = _CLOCK.fullmatch(text)
     if clock:
         return float(int(clock[1] or 0) * 3600 + int(clock[2]) * 60 + int(clock[3]))
+    hms = _HMS.fullmatch(text)
+    if hms is not None and any(hms.groups()):
+        return float(int(hms[1] or 0) * 3600 + int(hms[2] or 0) * 60 + float((hms[3] or "0").replace(",", ".")))
     match = _SECONDS.fullmatch(text)
     if match is None or not text or not any(match.groups()):
         raise ValueError(f"durée illisible : {text!r}")
@@ -510,6 +528,57 @@ class _Flow:
         button.click()
         self.pause()
 
+    def await_published(self, mode: str) -> None:
+        """Preuve de publication apres le clic final : navigation vers la page Publications (principale)
+        ou message « Video publiee » (secours), avant ``publish_confirm_timeout_s``. La fenetre « Continuer
+        a publier ? » (verification encore en cours) est annulee, la fin de la verification attendue, puis
+        le bouton re-clique UNE fois. Ni preuve ni fenetre : arret R4 ``publish_unconfirmed``, jamais un
+        succes suppose."""
+        sel, labels = self.sel["selectors"], self.sel["continue_publish"]
+        timeout, interval = float(self.settings["publish_confirm_timeout_s"]), float(self.settings["poll_interval_s"])
+        waited, retried = 0.0, False
+        while True:
+            self.guard(modals=False)  # la fenetre « Continuer a publier ? » est connue : traitee ci-dessous
+            dialog = self.continue_dialog()
+            if dialog is not None:
+                if retried:
+                    raise self.stop("publish_unconfirmed", f"la fenêtre « {labels['dialog']} ? » est revenue "
+                                                           f"après le nouvel essai : publication non confirmée")
+                button = dialog.query_selector(self.sel["modal"]["button"].format(label=labels["cancel"]))
+                if button is None:
+                    raise self.stop("element_missing", f"fenêtre « {labels['dialog']} ? » sans son bouton "
+                                                       f"« {labels['cancel']} »")
+                button.click()
+                logger.info("TikTok %s : fenêtre « %s ? » annulée, attente de la vérification de contenu avant "
+                            "un nouvel essai", self.account, labels["dialog"])
+                self.pause()
+                self.await_content_check()
+                self.post(mode)
+                retried, waited = True, 0.0
+                continue
+            if str(self.page.url).startswith(self.sel["expect"]["published_url_prefix"]):
+                logger.info("TikTok %s : publication prouvée par la navigation vers la page Publications", self.account)
+                return
+            if self.page.query_selector(sel["published_marker"]) is not None:
+                logger.info("TikTok %s : publication prouvée par le message de confirmation", self.account)
+                return
+            if waited >= timeout:
+                raise self.stop("publish_unconfirmed",
+                                f"aucune preuve de publication après {timeout:g} s ([tiktok] publish_confirm_timeout_s) : "
+                                f"ni navigation vers la page Publications ni message de confirmation ; la vidéo "
+                                f"est peut-être publiée, à vérifier à la main avant de réessayer")
+            self.page.wait_for_timeout(interval * 1000)
+            waited += interval
+            if self.on_tick is not None:
+                self.on_tick()
+
+    def continue_dialog(self) -> Any | None:
+        fragment = self.sel["continue_publish"]["dialog"].casefold()
+        for modal in self.page.query_selector_all(self.sel["modal"]["container"]):
+            if modal.is_visible() and fragment in " ".join(str(modal.inner_text()).split()).casefold():
+                return modal
+        return None
+
     def run(self, clip: dict[str, Any], mode: str, schedule_at: datetime | None) -> dict[str, Any]:
         self.page.goto(self.sel["urls"]["upload"])
         self.guard()
@@ -537,11 +606,35 @@ class _Flow:
         self.await_content_check()
         self.post(mode)
 
-        self.wait("success_marker", modals=False)  # la confirmation peut etre une fenetre : pas de controle de fenetre
-        return self.result(mode, schedule_at, effective, note)
+        self.await_published(mode)
+        return self.result(clip, mode, schedule_at, effective, note)
 
-    def stats(self) -> list[dict[str, Any]]:
-        """Releve les lignes de la liste des contenus (R7) : lecture seule, aucun clic."""
+    def find_post_link(self, clip: dict[str, Any]) -> tuple[str | None, str | None]:
+        """Page Publications : le premier lien de post dont le texte est le debut de la legende publiee.
+        Rend (adresse complete, id) ou (None, raison). Ne leve jamais : la publication est deja prouvee."""
+        try:
+            if not str(self.page.url).startswith(self.sel["expect"]["stats_url_prefix"]):
+                self.page.goto(self.sel["urls"]["stats"])
+            selector = self.sel["stats"]["post_link"]
+            try:
+                self.page.wait_for_selector(selector, timeout=float(self.settings["action_timeout_s"]) * 1000)
+            except Exception as exc:
+                if "Timeout" not in type(exc).__name__:
+                    raise
+                return None, f"aucun lien de post affiché après {float(self.settings['action_timeout_s']):g} s"
+            published = _squash(" ".join([clip["caption"], *clip["hashtags"]]))
+            for link in self.page.query_selector_all(selector):
+                text = _squash(str(link.inner_text())).rstrip("….").rstrip()
+                href = link.get_attribute("href") or ""
+                if text and (published.startswith(text) or text.startswith(published)) and _POST_ID_END.search(href):
+                    return urljoin(str(self.page.url), href), _POST_ID_END.search(href).group(1)
+            return None, "aucun lien dont le texte correspond à la légende publiée"
+        except Exception as exc:  # noqa: BLE001 - dit dans la note, jamais avale
+            return None, f"{type(exc).__name__} : {exc}"
+
+    def stats(self, post_ids: list[str]) -> list[dict[str, Any]]:
+        """Releve les posts ``post_ids`` (R7), lecture seule, aucun clic : likes et commentaires dans la
+        ligne de la page Publications, puis le reste sur l'analyse directe de chaque post."""
         self.page.goto(self.sel["urls"]["stats"])
         self.guard()
         if not str(self.page.url).startswith(self.sel["expect"]["stats_url_prefix"]):
@@ -549,46 +642,76 @@ class _Flow:
         self.pause()
         self.wait("row", table="stats")
         self.guard()
-        rows = self.page.query_selector_all(self.sel["stats"]["row"])
-        return [self.read_row(number, row) for number, row in enumerate(rows, start=1)]
+        rows = self.read_rows()
+        return [self.read_post(post_id, rows.get(post_id, {})) for post_id in post_ids]
 
-    def read_row(self, number: int, row: Any) -> dict[str, Any]:
+    def read_rows(self) -> dict[str, dict[str, Any]]:
         sel = self.sel["stats"]
-        link = row.query_selector(sel["post_link"])
-        url = (link.get_attribute("href") or None) if link is not None else None
-        match = _POST_ID.search(url) if url else None
-        if match is None:
-            raise self.stop("unexpected_page", f"ligne {number} de la liste sans lien de post exploitable : {url!r}")
-        post: dict[str, Any] = {"post_id": match.group(1), "post_url": url}
-        for key, parse in (*((k, parse_count) for k in _COUNTS), ("avg_watch", parse_duration),
-                           ("watched_full", parse_percent)):
-            cell = row.query_selector(sel[key])
-            if cell is None:  # non affichee par la page : null explicite, jamais un 0 invente
-                post[_STAT_FIELDS.get(key, key)] = None
-                continue
-            text = cell.inner_text()
-            try:
-                post[_STAT_FIELDS.get(key, key)] = parse(text)
-            except ValueError:
-                raise self.stop("unexpected_page",
-                                f"valeur illisible dans la ligne {number} ({key}) : {text!r}") from None
+        found: dict[str, dict[str, Any]] = {}
+        for number, row in enumerate(self.page.query_selector_all(sel["row"]), start=1):
+            link = row.query_selector(sel["post_link"])
+            href = (link.get_attribute("href") or "") if link is not None else ""
+            match = _POST_ID.search(href)
+            if match is None:
+                raise self.stop("unexpected_page", f"ligne {number} de la liste sans lien de post exploitable")
+            cells = {key: row.query_selector(sel[key]) for key in ("likes", "comments")}
+            found.setdefault(match.group(1), {
+                "post_url": urljoin(str(self.page.url), href),
+                **{key: self.read_value(None if cell is None else cell.inner_text(), key, parse_count, f"ligne {number}")
+                   for key, cell in cells.items()}})
+        return found
+
+    def read_value(self, text: Any, key: str, parse: Callable[[Any], Any], where: str) -> Any:
+        """Une valeur affichee, convertie ; absente de la page ou « en cours de traitement » : ``None``
+        explicite, jamais un 0 invente ; illisible : arret sur."""
+        if text is None:
+            return None
+        if isinstance(text, str) and self.sel["stats"]["processing"].casefold() in text.casefold():
+            return None
+        try:
+            return parse(text)
+        except ValueError:
+            raise self.stop("unexpected_page", f"valeur illisible ({where}, {key}) : {text!r}") from None
+
+    def read_post(self, post_id: str, row: dict[str, Any]) -> dict[str, Any]:
+        """Analyse directe d'un post : cartes de metriques lues par libelle."""
+        self.page.goto(self.sel["urls"]["analytics"].format(post_id=post_id))
+        self.guard()
+        if not str(self.page.url).startswith(self.sel["expect"]["analytics_url_prefix"]):
+            raise self.stop("unexpected_page", f"page inattendue : {self.page.url}")
+        self.pause()
+        self.wait("metric_card", table="stats")
+        self.guard()
+        cards: dict[str, str] = {}
+        for card in self.page.query_selector_all(self.sel["stats"]["metric_card"]):
+            parts = [part.strip() for part in re.split(r"\s*\|\s*|\n+", str(card.inner_text())) if part.strip()]
+            if len(parts) >= 2:
+                cards.setdefault(_squash(parts[0]).casefold(), " ".join(parts[1:]))
+        post: dict[str, Any] = {"post_id": post_id, "post_url": row.get("post_url")}
+        for key, field, parse in (("views", "views", parse_count), ("watch_total", "watch_total_s", parse_duration),
+                                  ("watch_avg", "avg_watch_s", parse_duration), ("watched_full", "watched_full", parse_percent),
+                                  ("new_followers", "new_followers", parse_count), ("retention", "retention", parse_percent)):
+            value = cards.get(_squash(self.sel["metrics"][key]).casefold())
+            post[field] = self.read_value(value, key, parse, f"post {post_id}")
+        post.update(likes=row.get("likes"), comments=row.get("comments"), shares=None)
+        sources = self.page.query_selector(self.sel["stats"]["traffic_sources"])
+        text = _squash(str(sources.inner_text())) if sources is not None else ""
+        post["traffic_sources"] = None if not text or self.sel["stats"]["processing"].casefold() in text.casefold() else text
         return post
 
-    def result(self, mode: str, schedule_at: datetime | None, effective: datetime | None = None,
-               rounding: str | None = None) -> dict[str, Any]:
-        url = None
-        link = self.page.query_selector(self.sel["selectors"]["post_link"])
-        if link is not None:
-            url = link.get_attribute("href") or None
-        match = _POST_ID.search(url) if url else None
+    def result(self, clip: dict[str, Any], mode: str, schedule_at: datetime | None,
+               effective: datetime | None = None, rounding: str | None = None) -> dict[str, Any]:
         notes = [rounding] if rounding else []
+        url, found = self.find_post_link(clip)
+        post_id = found if url is not None else None
         if url is None:
             notes.append("post programmé : son adresse publique n'existe pas encore" if mode == "scheduled"
-                         else "lien du post introuvable dans la confirmation TikTok : à vérifier à la main")
+                         else f"publication réussie mais lien du post introuvable sur la page Publications "
+                              f"({found}) : à vérifier à la main")
         when = (effective if rounding else schedule_at) if mode == "scheduled" else self.now
         return {
             "post_url": url,
-            "post_id": match.group(1) if match else None,
+            "post_id": post_id,
             "state": "scheduled_on_tiktok" if mode == "scheduled" else "published",
             "publish_at": when.isoformat(),
             "note": " ; ".join(notes) or None,
@@ -610,15 +733,15 @@ class BrowserBackend:
             except Exception as exc:  # noqa: BLE001 - erreur Playwright : arret sur avec capture
                 raise flow.stop("unexpected_page", f"page inattendue : {type(exc).__name__} : {exc}") from exc
 
-    def fetch_stats(self, account: str, *, settings: dict[str, Any], selectors: dict[str, Any], now: datetime,
-                    opener: Opener | None, sleep: Callable[[float], None], rng: Any,
+    def fetch_stats(self, account: str, post_ids: list[str], *, settings: dict[str, Any], selectors: dict[str, Any],
+                    now: datetime, opener: Opener | None, sleep: Callable[[float], None], rng: Any,
                     on_tick: Callable[[], None] | None) -> list[dict[str, Any]]:
         open_profile = opener or browser._open_context
         with open_profile(account, headless=False) as context:
             page = context.pages[0] if context.pages else context.new_page()
             flow = _Flow(page, account, selectors, settings, now=now, sleep=sleep, rng=rng, on_tick=on_tick)
             try:
-                return flow.stats()
+                return flow.stats(post_ids)
             except TikTokStop:
                 raise
             except Exception as exc:  # noqa: BLE001 - erreur Playwright : arret sur avec capture
@@ -660,6 +783,10 @@ def publish(
         raise TikTokError(f"mp4 introuvable : {clip['video_path']}")
     now = now or datetime.now(timezone.utc)
     if mode == "scheduled":
+        if settings["visibility"] == "private":
+            raise TikTokError("programmation refusée : TikTok ne programme pas une vidéo privée (« Les vidéos privées "
+                              "ne peuvent pas être programmées ») : règle [tiktok] visibility = \"public\" ou publie "
+                              "en mode immédiat")
         _check_schedule(schedule_at, settings, now)
     if isinstance(backend, ApiBackend):
         return backend.publish()
@@ -792,9 +919,10 @@ def fetch_stats(
     selectors: dict[str, Any] | None = None, opener: Opener | None = None,
     sleep: Callable[[float], None] = time.sleep, rng: Any = None, on_tick: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
-    """Releve les statistiques des posts publies de ``account`` dans TikTok Studio (R7, lecture
-    seule), les relie aux clips par l'id ou l'adresse enregistres a la publication et ecrit
-    ``<stats_dir>/<compte>.json`` (horodate, atomique). Une valeur absente de la page est ``None``.
+    """Releve les statistiques des posts publies de ``account`` (ids enregistres a la publication) dans
+    TikTok Studio (R7, lecture seule) : analyse directe de chaque post, likes et commentaires depuis la page
+    Publications ; les relie aux clips et ecrit ``<stats_dir>/<compte>.json`` (horodate, atomique). Une
+    valeur absente de la page ou « en cours de traitement » (retention, sources) est ``None``.
     Leve ``TikTokStop`` (R4 : l'echec est aussi ecrit a cote du dernier releve et signale a la
     console), ``BrowserError`` ou ``TikTokError``."""
     settings = get_settings(config)
@@ -805,14 +933,17 @@ def fetch_stats(
         return backend.fetch_stats()
     account = browser.validate_account(account)
     now = now or datetime.now(timezone.utc)
+    known = {p["post_id"]: p for p in _published_posts(account, config)}
+    if not known:
+        raise TikTokError(f"aucun post publié à mesurer pour le compte {account} : "
+                          f"aucun clip n'a d'id ou d'adresse de post enregistré (tiktok_post)")
     try:
         posts = backend.fetch_stats(
-            account, settings=settings, selectors=selectors or load_selectors(), now=now, opener=opener,
+            account, list(known), settings=settings, selectors=selectors or load_selectors(), now=now, opener=opener,
             sleep=sleep, rng=rng or random.Random(), on_tick=on_tick)
     except (TikTokStop, browser.BrowserError) as exc:
         _record_stats_failure(account, exc, config, settings, now)
         raise
-    known = {p["post_id"]: p for p in _published_posts(account, config)}
     linked = [{**post, "video_id": known.get(post["post_id"], {}).get("video_id"),
                "clip_id": known.get(post["post_id"], {}).get("clip_id")} for post in posts]
     return _write_stats(account, settings, lambda _prev: {
