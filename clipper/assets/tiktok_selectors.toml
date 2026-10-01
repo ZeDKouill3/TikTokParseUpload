@@ -25,6 +25,12 @@
 # trafic ([stats] traffic_sources). Le test reel (CLIPPER_TIKTOK_REAL=1, tests/integration/
 # test_tiktok_real.py) sert a les confirmer.
 #
+# VU SUR LA VRAIE PAGE SANS SELECTEUR CONFIRME (SPEC-86fe, releve FR du 2026-10-01) : les libelles de la page Donnees
+# analytiques (tuiles, bouton de periode « 7 derniers jours »), du tableau Publications et des onglets Spectateurs /
+# Engagement sont ceux de la page ; les reperes ([account] tile et menu des periodes, [stats] views, visibility, created,
+# retention_point, viewers_card, engagement_card, page_text) sont a confirmer sur la vraie page : tant qu'ils ne le sont
+# pas, une valeur introuvable est relevee « null » ou arrete le releve (jamais devinee).
+#
 # Un selecteur est une chaine CSS/Playwright. Une liste (captcha, verification,
 # connexion) est un ensemble de signes : un seul present suffit a arreter.
 
@@ -37,6 +43,11 @@ upload = "https://www.tiktok.com/tiktokstudio/upload?from=webapp"
 stats = "https://www.tiktok.com/tiktokstudio/content"
 # Analyse d'un post, adresse directe ({post_id} = fin de l'adresse du post) : vues, temps de lecture...
 analytics = "https://www.tiktok.com/tiktokstudio/analytics/{post_id}?qa_enter_from=analytics"
+# Onglets Spectateurs et Engagement de l'analyse d'un post (SPEC-86fe R1).
+analytics_viewers = "https://www.tiktok.com/tiktokstudio/analytics/{post_id}/viewers?qa_enter_from=analytics"
+analytics_engagement = "https://www.tiktok.com/tiktokstudio/analytics/{post_id}/engagement?qa_enter_from=analytics"
+# Page Donnees analytiques du compte (SPEC-86fe R1) : periode, tuiles vues / profil / j'aime / commentaires / partages.
+analytics_account = "https://www.tiktok.com/tiktokstudio/analytics"
 
 [expect]
 # Apres l'ouverture de la page d'envoi, l'adresse courante doit commencer par ceci ;
@@ -48,6 +59,8 @@ stats_url_prefix = "https://www.tiktok.com/tiktokstudio/content"
 published_url_prefix = "https://www.tiktok.com/tiktokstudio/content"
 # Page d'analyse d'un post : une autre adresse = page inattendue, arret.
 analytics_url_prefix = "https://www.tiktok.com/tiktokstudio/analytics/"
+# Page Donnees analytiques du compte : une autre adresse = page inattendue, arret.
+account_analytics_url_prefix = "https://www.tiktok.com/tiktokstudio/analytics"
 # Fragments d'adresse qui disent « connexion expiree » (redirection vers la connexion).
 login_url_markers = ["/login"]
 
@@ -160,6 +173,22 @@ metric_card = "[data-tt='VideoOverviewPage_VideoMetricsCard_FlexItem']"
 traffic_sources = "[data-tt='VideoOverviewPage_TrafficSourceCard_FlexRow']"
 # Valeur affichee tant que TikTok n'a pas fini de calculer (retention, sources) : relevee « null ».
 processing = "en cours de traitement"
+# Cellules de la ligne de la page Publications (SPEC-86fe R1) : vues (colonne 3), confidentialite (colonne 2),
+# date de creation (dans la cellule du contenu). A VERIFIER SUR LA VRAIE PAGE. La legende est le texte du lien du post.
+views = "td:nth-child(3)"
+visibility = "td:nth-child(2)"
+created = "td:nth-child(1) time"
+# Points de la courbe de retention d'un post, texte « instant | part encore presente ». A VERIFIER SUR LA VRAIE PAGE.
+retention_point = "[data-tt*='Retention'] [data-tt*='Point']"
+# Cartes des onglets Spectateurs et Engagement : titre puis couples « libelle | valeur ». A VERIFIER SUR LA VRAIE PAGE.
+viewers_card = "[data-tt*='Viewers'][data-tt*='Card']"
+engagement_card = "[data-tt*='Engagement'][data-tt*='Card']"
+# Texte de la page, lu seulement quand les cartes manquent, pour reconnaitre un onglet « pas encore disponible ».
+page_text = "body"
+# Messages de TikTok quand un onglet n'a pas encore de chiffres : relevee « null » (jamais un 0 invente).
+unavailable = ["dès 100 vues", "en cours de traitement"]
+# Faire defiler la liste des Publications pour charger les posts suivants : une lecture apres chaque defilement.
+scroll_script = "window.scrollTo(0, document.body.scrollHeight)"
 
 # Libelle de chaque metrique de l'analyse d'un post (langue de TikTok Studio : francais).
 [metrics]
@@ -187,3 +216,34 @@ login = [
   "form[data-e2e='login-form']",
   "[data-e2e='top-login-button']",
 ]
+
+# Page Donnees analytiques du compte (SPEC-86fe R1, releve FR) : le bouton de periode affiche « 7 derniers jours »,
+# chaque tuile est un bouton « libelle -- valeur (evolution) ». Une tuile ou une evolution absente (« -- ») = null.
+# A VERIFIER SUR LA VRAIE PAGE : le menu des periodes et le repere des tuiles.
+[account]
+period_button = "button:has-text('derniers jours')"
+period_option = "[role='option']:has-text('{days} derniers jours'), li:has-text('{days} derniers jours')"
+period_label = "{days} derniers jours"
+tile = "button:not([disabled])"
+
+# Libelle de chaque tuile du compte (langue de TikTok Studio : francais).
+[tiles]
+views = "Vues de la vidéo"
+profile_views = "Vues du profil"
+likes = "J'aime"
+comments = "Commentaires"
+shares = "Partages"
+
+# Titres des cartes de l'onglet Spectateurs d'un post (TikTok Studio, FR).
+[viewers]
+total = "Total des spectateurs"
+types = "Types de spectateurs"
+age = "Âge"
+gender = "Sexe"
+locations = "Lieux"
+
+# Titres des cartes de l'onglet Engagement d'un post (TikTok Studio, FR).
+[engagement]
+likes_over_time = "J'aime dans le temps"
+comment_words = "Mots les plus utilisés dans les commentaires"
+shares = "Partages"

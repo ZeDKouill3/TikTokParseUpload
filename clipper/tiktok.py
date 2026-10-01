@@ -31,7 +31,7 @@ import re
 import time
 import tomllib
 from contextlib import AbstractContextManager
-from datetime import datetime, timedelta, timezone, tzinfo
+from datetime import date, datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urljoin
@@ -67,7 +67,10 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "type_delay_ms": 50,               # delai entre deux touches de la legende
     "events_path": "state/tiktok/events.json",
     "stats_interval_h": 24,            # releve periodique des statistiques par le worker (R7)
-    "stats_dir": "state/stats/tiktok",  # un releve par compte : <stats_dir>/<compte>.json
+    "stats_dir": "state/stats/tiktok",  # historique par compte : <stats_dir>/<compte>/<horodatage>.json (SPEC-86fe R2)
+    "stats_detail_days": 7,            # un post publie depuis moins de N jours est relu en detail a chaque releve
+    "stats_detail_max": 50,            # plafond de posts relus en detail (3 pages chacun) par releve
+    "stats_scroll_rounds": 10,         # defilements de la liste des Publications pour la charger en entier
 }
 
 MODES = ("immediate", "scheduled")
@@ -86,8 +89,13 @@ REQUIRED_SELECTORS = (
 )
 MAX_POPUP_ROUNDS = 5   # fenetres successives fermees par un meme controle avant d'abandonner
 MAX_MONTH_STEPS = 24   # fleches du calendrier cliquees au plus avant d'abandonner
-REQUIRED_STATS_SELECTORS = ("row", "post_link", "likes", "comments", "metric_card", "traffic_sources", "processing")
+REQUIRED_STATS_SELECTORS = ("row", "post_link", "likes", "comments", "metric_card", "traffic_sources", "processing",
+                            "views", "visibility", "created", "retention_point", "viewers_card", "engagement_card",
+                            "page_text", "scroll_script")
 METRICS = ("views", "watch_total", "watch_avg", "watched_full", "new_followers", "retention")
+TILES = ("views", "profile_views", "likes", "comments", "shares")   # tuiles de la page Donnees analytiques (SPEC-86fe R1)
+PERIODS = (7, 28, 60)                                                # periodes relevees, en jours
+VIEWERS_SECTIONS = ("types", "age", "gender", "locations")
 _DETECT_KINDS = ("captcha", "verification", "login")
 _POST_ID = re.compile(r"/video/(\d+)")
 _POST_ID_END = re.compile(r"/video/(\d+)/?(?:[?#].*)?$")
@@ -131,6 +139,10 @@ def get_settings(config: Config | None) -> dict[str, Any]:
             raise TikTokError(f"[tiktok] {key} invalide : {settings[key]!r} (true ou false attendu)")
     if not isinstance(settings["stats_dir"], str) or not settings["stats_dir"]:
         raise TikTokError(f"[tiktok] stats_dir invalide : {settings['stats_dir']!r} (un chemin est attendu)")
+    for key, minimum in (("stats_detail_days", 0), ("stats_detail_max", 0), ("stats_scroll_rounds", 0)):
+        value = settings[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < minimum:
+            raise TikTokError(f"[tiktok] {key} invalide : {value!r} (un nombre >= {minimum} est attendu)")
     if settings["min_action_delay_s"] > settings["max_action_delay_s"]:
         raise TikTokError(
             f"[tiktok] min_action_delay_s ({settings['min_action_delay_s']}) dépasse max_action_delay_s "
@@ -199,12 +211,25 @@ def load_selectors(path: str | Path | None = None) -> dict[str, Any]:
                           f"(texte de la fenêtre -> libellé du bouton, sans guillemet double)")
     need("urls", "stats", str)
     need("urls", "analytics", str)
+    need("urls", "analytics_viewers", str)
+    need("urls", "analytics_engagement", str)
+    need("urls", "analytics_account", str)
     need("expect", "stats_url_prefix", str)
     need("expect", "analytics_url_prefix", str)
+    need("expect", "account_analytics_url_prefix", str)
     for key in REQUIRED_STATS_SELECTORS:
         need("stats", key, str)
+    need("stats", "unavailable", list)
     for key in METRICS:
         need("metrics", key, str)
+    for key in ("period_button", "period_option", "period_label", "tile"):
+        need("account", key, str)
+    for key in TILES:
+        need("tiles", key, str)
+    for key in ("total", *VIEWERS_SECTIONS):
+        need("viewers", key, str)
+    for key in ("likes_over_time", "comment_words", "shares"):
+        need("engagement", key, str)
     return data
 
 
@@ -298,6 +323,17 @@ def _squash(text: str) -> str:
     return " ".join(text.replace("\u202f", " ").replace("\xa0", " ").split())
 
 
+def _naive_utc(stamp: Any) -> datetime | None:
+    """Date ISO d'une ligne (sans fuseau : l'heure de la page) comme instant UTC approximatif, ``None`` si absente."""
+    if not isinstance(stamp, str):
+        return None
+    try:
+        moment = datetime.fromisoformat(stamp)
+    except ValueError:
+        return None
+    return moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
+
+
 def _text(value: Any) -> str:
     if not isinstance(value, str):
         raise ValueError(f"texte attendu, reçu {value!r}")
@@ -345,6 +381,51 @@ def parse_duration(value: Any) -> float | None:
     return float(int(minutes or 0) * 60 + float((match[2] or "0").replace(",", ".")))
 
 
+_CHANGE = re.compile(r"([+\-\u2212\u2013]?)\s*(\d+(?:[.,]\d+)?)\s*%")
+_SHORT_DATE = re.compile(r"(\d{1,2})\s+([^\W\d_]+)\.?\s+(\d{4})(?:[,\s]+(\d{1,2})[:h](\d{2}))?")
+
+
+def parse_change(value: Any) -> float | None:
+    """Evolution affichee par TikTok, « +12,5% » / « -3 % » / « 4% » -> pourcentage signe (12.5, -3.0, 4.0) ;
+    tiret ou vide -> ``None`` ; autre -> ``ValueError``."""
+    text = _text(value)
+    if text in _ABSENT:
+        return None
+    match = _CHANGE.fullmatch(text)
+    if match is None:
+        raise ValueError(f"évolution illisible : {text!r}")
+    number = float(match[2].replace(",", "."))
+    return -number if match[1] in ("-", "\u2212", "\u2013") else number
+
+
+def parse_date(value: Any, months: list[str]) -> str | None:
+    """Date de creation affichee (« 2026-10-01 14:05 », « 01/10/2026 14:05 », « 1 oct. 2026, 14:05 ») -> ISO 8601
+    sans fuseau (l'heure de la page) ; format inconnu -> ``None`` (le texte brut reste dans ``posted_at_text``)."""
+    text = _squash(value) if isinstance(value, str) else ""
+    for pattern, order in ((r"(\d{4})-(\d{2})-(\d{2})(?:[ T]+(\d{1,2}):(\d{2}))?", "ymd"),
+                           (r"(\d{1,2})/(\d{1,2})/(\d{4})(?:[ ,]+(\d{1,2}):(\d{2}))?", "dmy")):
+        match = re.fullmatch(pattern, text)
+        if match:
+            a, b, c = (int(match[i]) for i in (1, 2, 3))
+            year, month, day = (a, b, c) if order == "ymd" else (c, b, a)
+            return _iso_date(year, month, day, match[4], match[5])
+    match = _SHORT_DATE.fullmatch(text)
+    if match:
+        names = [m.casefold() for m in months]
+        word = match[2].casefold()
+        index = next((i for i, name in enumerate(names) if name == word or (len(word) >= 3 and name.startswith(word))), None)
+        if index is not None:
+            return _iso_date(int(match[3]), index + 1, int(match[1]), match[4], match[5])
+    return None
+
+
+def _iso_date(year: int, month: int, day: int, hour: str | None, minute: str | None) -> str | None:
+    try:
+        return datetime(year, month, day, int(hour or 0), int(minute or 0)).isoformat()
+    except ValueError:
+        return None
+
+
 # ---------------------------------------------------------------- backend browser
 
 
@@ -356,9 +437,11 @@ class _Flow:
     (captcha, verification, connexion) avant d'agir."""
 
     def __init__(self, page: Any, account: str, selectors: dict[str, Any], settings: dict[str, Any], *,
-                 now: datetime, sleep: Callable[[float], None], rng: Any, on_tick: Callable[[], None] | None) -> None:
+                 now: datetime, sleep: Callable[[float], None], rng: Any, on_tick: Callable[[], None] | None,
+                 harvest: bool = False) -> None:
         self.page, self.account, self.sel, self.settings = page, account, selectors, settings
         self.now, self._sleep, self.rng, self.on_tick = now, sleep, rng, on_tick
+        self.harvesting, self._harvested, self._lenient = harvest, False, False  # releve opportuniste (SPEC-86fe R4)
 
     # -- arret sur
     def stop(self, code: str, reason: str) -> TikTokStop:
@@ -373,6 +456,11 @@ class _Flow:
         logger.error("TikTok %s : %s", self.account, reason)
         return TikTokStop(code, reason, capture)
 
+    def reject(self, code: str, reason: str) -> Exception:
+        """Valeur ou page illisible : un arret R4 avec capture, sauf pendant un releve opportuniste (la
+        publication ou la verification en cours ne doit jamais s'arreter pour un releve en plus) : ``ValueError``."""
+        return ValueError(reason) if self._lenient else self.stop(code, reason)
+
     def guard(self, modals: bool = True) -> None:
         url = str(self.page.url)
         if any(marker in url for marker in self.sel["expect"]["login_url_markers"]):
@@ -385,6 +473,7 @@ class _Flow:
                     raise self.stop(code, label)
         if modals:
             self.close_popups()
+        self.harvest(only_if_rows=True)
 
     def close_popups(self) -> None:
         """Ferme les fenetres connues (``[popups]`` : texte -> bouton) et le journalise ; toute autre
@@ -416,7 +505,7 @@ class _Flow:
             self.on_tick()
 
     def wait(self, name: str, *, timeout_key: str = "action_timeout_s", state: str | None = None,
-             table: str = "selectors", modals: bool = True) -> Any:
+             table: str = "selectors", modals: bool = True, optional: bool = False) -> Any:
         self.guard(modals)
         timeout = float(self.settings[timeout_key])
         try:
@@ -426,6 +515,8 @@ class _Flow:
                 raise
             element = None
         if element is None:
+            if optional:
+                return None
             raise self.stop("element_missing", f"élément attendu absent après {timeout:g} s : {name}")
         return element
 
@@ -722,6 +813,7 @@ class _Flow:
                 if "Timeout" not in type(exc).__name__:
                     raise
                 return None, f"aucun lien de post affiché après {float(self.settings['action_timeout_s']):g} s"
+            self.harvest()
             published = _squash(" ".join([clip["caption"], *clip["hashtags"]]))
             for link in self.page.query_selector_all(selector):
                 text = _squash(str(link.inner_text())).rstrip("….").rstrip()
@@ -732,20 +824,96 @@ class _Flow:
         except Exception as exc:  # noqa: BLE001 - dit dans la note, jamais avale
             return None, f"{type(exc).__name__} : {exc}"
 
-    def stats(self, post_ids: list[str]) -> list[dict[str, Any]]:
-        """Releve les posts ``post_ids`` (R7), lecture seule, aucun clic : likes et commentaires dans la
-        ligne de la page Publications, puis le reste sur l'analyse directe de chaque post."""
-        self.page.goto(self.sel["urls"]["stats"])
+    # -- releve des statistiques (SPEC-86fe R1) : lecture seule, aucun clic hors le menu des periodes
+    def stats(self, previous: dict[str, dict[str, Any]]) -> dict[str, Any]:
+        """Page Donnees analytiques du compte (3 periodes), liste des Publications, puis l'analyse des posts
+        a lire en detail (``needs_detail``). ``previous`` : les posts deja releves (historique fusionne)."""
+        overview = self.account_overview()
+        rows = self.list_posts()
+        todo = self.pick_details(rows, previous)
+        posts = []
+        for post_id, row in rows.items():
+            posts.append(self.read_post(post_id, row) if post_id in todo else dict(row))
+        return {"overview": overview, "posts": posts}
+
+    def open_page(self, url: str, prefix: str) -> None:
+        self.page.goto(url)
         self.guard()
-        if not str(self.page.url).startswith(self.sel["expect"]["stats_url_prefix"]):
-            raise self.stop("unexpected_page", f"page inattendue : {self.page.url}")
+        if not str(self.page.url).startswith(prefix):
+            raise self.reject("unexpected_page", f"page inattendue : {self.page.url}")
         self.pause()
+
+    def account_overview(self) -> dict[str, dict[str, dict[str, Any]]]:
+        """Tuiles de la page Donnees analytiques pour 7, 28 et 60 jours : ``{periode: {tuile: {value, change_pct}}}``."""
+        self.open_page(self.sel["urls"]["analytics_account"], self.sel["expect"]["account_analytics_url_prefix"])
+        self.wait("tile", table="account")
+        out = {}
+        for days in PERIODS:
+            self.select_period(days)
+            out[str(days)] = self.read_tiles(days)
+        return out
+
+    def select_period(self, days: int) -> None:
+        acc = self.sel["account"]
+        label = acc["period_label"].format(days=days).casefold()
+        button = self.wait("period_button", table="account")
+        if label in _squash(str(button.inner_text())).casefold():
+            return  # deja la periode affichee : aucun clic
+        button.click()
+        self.pause()
+        selector = acc["period_option"].format(days=days)
+        timeout = float(self.settings["action_timeout_s"])
+        try:
+            option = self.page.wait_for_selector(selector, timeout=timeout * 1000)
+        except Exception as exc:
+            if "Timeout" not in type(exc).__name__:
+                raise
+            option = None
+        if option is None:
+            raise self.stop("element_missing", f"période « {acc['period_label'].format(days=days)} » absente du menu "
+                                               f"après {timeout:g} s")
+        option.click()
+        self.pause()
+        self.guard()
+        shown = self.page.query_selector(acc["period_button"])
+        if shown is None or label not in _squash(str(shown.inner_text())).casefold():
+            raise self.stop("unexpected_page", f"la période {days} jours n'est pas affichée après le choix")
+
+    def read_tiles(self, days: int) -> dict[str, dict[str, Any]]:
+        buttons = [_squash(str(b.inner_text())) for b in self.page.query_selector_all(self.sel["account"]["tile"])]
+        tiles: dict[str, dict[str, Any]] = {}
+        for key in TILES:
+            label = _squash(self.sel["tiles"][key])
+            found = next((b for b in buttons if b.casefold().startswith(label.casefold())), None)
+            if found is None:
+                tiles[key] = {"value": None, "change_pct": None}  # tuile absente de la page : null, jamais 0
+                continue
+            rest = found[len(label):].strip()
+            change = re.search(r"\(([^()]*)\)\s*$", rest)
+            body = rest[:change.start()].strip() if change else rest
+            body = re.sub(r"^(?:--|\|)\s+(?=\S)", "", body)  # « -- 0 » : le premier tiret est un separateur
+            where = f"tuile {key}, {days} jours"
+            tiles[key] = {"value": self.read_value(body, key, parse_count, where),
+                          "change_pct": self.read_value(change[1] if change else None, key, parse_change, where)}
+        return tiles
+
+    def list_posts(self) -> dict[str, dict[str, Any]]:
+        """Page Publications, defilee jusqu'a ce que la liste ne grandisse plus : un dict par post (id -> ligne)."""
+        self.open_page(self.sel["urls"]["stats"], self.sel["expect"]["stats_url_prefix"])
         self.wait("row", table="stats")
         self.guard()
         rows = self.read_rows()
-        return [self.read_post(post_id, rows.get(post_id, {})) for post_id in post_ids]
+        for _ in range(int(self.settings["stats_scroll_rounds"])):
+            self.page.evaluate(self.sel["stats"]["scroll_script"])
+            self.pause()
+            more = self.read_rows()
+            if len(more) <= len(rows):
+                break
+            rows = more
+        return rows
 
     def read_rows(self) -> dict[str, dict[str, Any]]:
+        """Une ligne par post de la page Publications : legende, date, visibilite, vues, likes, commentaires."""
         sel = self.sel["stats"]
         found: dict[str, dict[str, Any]] = {}
         for number, row in enumerate(self.page.query_selector_all(sel["row"]), start=1):
@@ -753,12 +921,20 @@ class _Flow:
             href = (link.get_attribute("href") or "") if link is not None else ""
             match = _POST_ID.search(href)
             if match is None:
-                raise self.stop("unexpected_page", f"ligne {number} de la liste sans lien de post exploitable")
-            cells = {key: row.query_selector(sel[key]) for key in ("likes", "comments")}
+                raise self.reject("unexpected_page", f"ligne {number} de la liste sans lien de post exploitable")
+            where = f"ligne {number}"
+            texts = {key: row.query_selector(sel[key]) for key in ("views", "likes", "comments", "visibility", "created")}
+            texts = {key: None if cell is None else cell.inner_text() for key, cell in texts.items()}
+            created = _squash(texts["created"]) if isinstance(texts["created"], str) and texts["created"].strip() else None
+            visibility = _squash(texts["visibility"]) if isinstance(texts["visibility"], str) and texts["visibility"].strip() else None
+            labels = self.sel["labels"]
+            visibility = next((name for name in VISIBILITIES if visibility == labels["visibility_" + name]), visibility)
             found.setdefault(match.group(1), {
-                "post_url": urljoin(str(self.page.url), href),
-                **{key: self.read_value(None if cell is None else cell.inner_text(), key, parse_count, f"ligne {number}")
-                   for key, cell in cells.items()}})
+                "post_id": match.group(1), "post_url": urljoin(str(self.page.url), href),
+                "caption": _squash(str(link.inner_text())) or None,
+                "posted_at": parse_date(created, self.sel["calendar"]["months"]), "posted_at_text": created,
+                "visibility": visibility,
+                **{key: self.read_value(texts[key], key, parse_count, where) for key in ("views", "likes", "comments")}})
         return found
 
     def read_value(self, text: Any, key: str, parse: Callable[[Any], Any], where: str) -> Any:
@@ -771,15 +947,30 @@ class _Flow:
         try:
             return parse(text)
         except ValueError:
-            raise self.stop("unexpected_page", f"valeur illisible ({where}, {key}) : {text!r}") from None
+            raise self.reject("unexpected_page", f"valeur illisible ({where}, {key}) : {text!r}") from None
+
+    def pick_details(self, rows: dict[str, dict[str, Any]], previous: dict[str, dict[str, Any]]) -> set[str]:
+        """Posts a lire en detail (analyse + spectateurs + engagement) : jamais lus, encore « en cours de
+        traitement » (vues nulles) ou publies depuis moins de ``stats_detail_days`` ; au plus ``stats_detail_max``."""
+        recent = timedelta(days=float(self.settings["stats_detail_days"]))
+        fresh, others = [], []
+        for post_id, row in rows.items():
+            old = previous.get(post_id)
+            if old is None or not old.get("detailed_at"):
+                fresh.append(post_id)
+                continue
+            posted = _naive_utc(row.get("posted_at"))
+            if old.get("views") is None or (posted is not None and self.now - posted < recent):
+                others.append(post_id)
+        picked = (fresh + others)[: int(self.settings["stats_detail_max"])]
+        if len(fresh) + len(others) > len(picked):
+            logger.warning("TikTok %s : %d posts à relire en détail, %d seulement ([tiktok] stats_detail_max)",
+                           self.account, len(fresh) + len(others), len(picked))
+        return set(picked)
 
     def read_post(self, post_id: str, row: dict[str, Any]) -> dict[str, Any]:
-        """Analyse directe d'un post : cartes de metriques lues par libelle."""
-        self.page.goto(self.sel["urls"]["analytics"].format(post_id=post_id))
-        self.guard()
-        if not str(self.page.url).startswith(self.sel["expect"]["analytics_url_prefix"]):
-            raise self.stop("unexpected_page", f"page inattendue : {self.page.url}")
-        self.pause()
+        """Analyse d'un post : cartes de metriques lues par libelle, puis onglets Spectateurs et Engagement."""
+        self.open_page(self.sel["urls"]["analytics"].format(post_id=post_id), self.sel["expect"]["analytics_url_prefix"])
         self.wait("metric_card", table="stats")
         self.guard()
         cards: dict[str, str] = {}
@@ -787,17 +978,115 @@ class _Flow:
             parts = [part.strip() for part in re.split(r"\s*\|\s*|\n+", str(card.inner_text())) if part.strip()]
             if len(parts) >= 2:
                 cards.setdefault(_squash(parts[0]).casefold(), " ".join(parts[1:]))
-        post: dict[str, Any] = {"post_id": post_id, "post_url": row.get("post_url")}
+        post: dict[str, Any] = dict(row)
         for key, field, parse in (("views", "views", parse_count), ("watch_total", "watch_total_s", parse_duration),
                                   ("watch_avg", "avg_watch_s", parse_duration), ("watched_full", "watched_full", parse_percent),
                                   ("new_followers", "new_followers", parse_count), ("retention", "retention", parse_percent)):
             value = cards.get(_squash(self.sel["metrics"][key]).casefold())
-            post[field] = self.read_value(value, key, parse, f"post {post_id}")
-        post.update(likes=row.get("likes"), comments=row.get("comments"), shares=None)
+            read = self.read_value(value, key, parse, f"post {post_id}")
+            post[field] = read if read is not None or field != "views" else row.get("views")
+        post["retention_curve"] = self.read_retention_curve(post_id)
         sources = self.page.query_selector(self.sel["stats"]["traffic_sources"])
         text = _squash(str(sources.inner_text())) if sources is not None else ""
         post["traffic_sources"] = None if not text or self.sel["stats"]["processing"].casefold() in text.casefold() else text
+        post["viewers"] = self.read_viewers(post_id)
+        engagement = self.read_engagement(post_id)
+        post["engagement"] = engagement
+        post["shares"] = None if engagement is None else engagement.get("shares")
+        post["detailed_at"] = self.now.isoformat()
         return post
+
+    def read_retention_curve(self, post_id: str) -> list[dict[str, Any]] | None:
+        """Courbe de retention : un point par element ``retention_point`` (« instant | part encore presente »)."""
+        points = []
+        for number, element in enumerate(self.page.query_selector_all(self.sel["stats"]["retention_point"]), start=1):
+            parts = [part.strip() for part in re.split(r"\s*\|\s*|\n+", str(element.inner_text())) if part.strip()]
+            if len(parts) != 2:
+                raise self.reject("unexpected_page", f"point {number} de la rétention illisible (post {post_id}) : "
+                                                     f"{str(element.inner_text())!r}")
+            where = f"post {post_id}, point {number} de la rétention"
+            points.append({"t_s": self.read_value(parts[0], "t_s", parse_duration, where),
+                           "share": self.read_value(parts[1], "share", parse_percent, where)})
+        return points or None
+
+    def read_cards(self, url_key: str, post_id: str, card_key: str) -> list[list[str]] | None:
+        """Cartes d'un onglet du post, chacune en lignes de texte ; ``None`` quand TikTok dit que l'onglet n'a pas
+        encore de chiffres (moins de 100 vues, en cours de traitement)."""
+        self.open_page(self.sel["urls"][url_key].format(post_id=post_id), self.sel["expect"]["analytics_url_prefix"])
+        if self.wait(card_key, table="stats", optional=True) is None:
+            body = self.page.query_selector(self.sel["stats"]["page_text"])
+            text = _squash(str(body.inner_text())).casefold() if body is not None else ""
+            if any(marker.casefold() in text for marker in self.sel["stats"]["unavailable"]):
+                return None
+            raise self.stop("element_missing", f"élément attendu absent après {float(self.settings['action_timeout_s']):g} s : {card_key}")
+        self.guard()
+        cards = []
+        for card in self.page.query_selector_all(self.sel["stats"][card_key]):
+            lines = [_squash(part) for part in re.split(r"\s*\|\s*|\n+", str(card.inner_text())) if part.strip()]
+            if lines:
+                cards.append(lines)
+        return cards
+
+    def card(self, cards: list[list[str]], heading: str) -> list[str] | None:
+        wanted = _squash(heading).casefold()
+        return next((c[1:] for c in cards if c[0].casefold() == wanted), None)
+
+    def entries(self, lines: list[str], where: str) -> list[dict[str, Any]]:
+        """Couples « libelle, valeur » d'une carte ; une valeur « x % » est une fraction, sinon un nombre."""
+        if len(lines) % 2:
+            raise self.reject("unexpected_page", f"carte illisible ({where}) : couples libellé / valeur attendus, reçu {lines!r}")
+        out = []
+        for label, value in zip(lines[0::2], lines[1::2]):
+            out.append({"label": label, "value": self.read_value(value, label, parse_percent if "%" in value else parse_count, where)})
+        return out
+
+    def read_viewers(self, post_id: str) -> dict[str, Any] | None:
+        cards = self.read_cards("analytics_viewers", post_id, "viewers_card")
+        if cards is None:
+            return None
+        where, labels = f"post {post_id}, spectateurs", self.sel["viewers"]
+        total = self.card(cards, labels["total"])
+        out: dict[str, Any] = {"total": self.read_value(total[0], "total", parse_count, where) if total else None}
+        for key in VIEWERS_SECTIONS:
+            lines = self.card(cards, labels[key])
+            out[key] = self.entries(lines, f"{where}, {key}") if lines else None
+        return out
+
+    def read_engagement(self, post_id: str) -> dict[str, Any] | None:
+        cards = self.read_cards("analytics_engagement", post_id, "engagement_card")
+        if cards is None:
+            return None
+        where, labels = f"post {post_id}, engagement", self.sel["engagement"]
+        shares = self.card(cards, labels["shares"])
+        out: dict[str, Any] = {"shares": self.read_value(shares[0], "shares", parse_count, where) if shares else None}
+        for key in ("likes_over_time", "comment_words"):
+            lines = self.card(cards, labels[key])
+            out[key] = self.entries(lines, f"{where}, {key}") if lines else None
+        return out
+
+    # -- releve opportuniste (SPEC-86fe R4) : la page Publications est deja affichee pour autre chose
+    def harvest(self, only_if_rows: bool = False) -> None:
+        """Lit au passage ce que la page Publications affiche (posts, vues, likes, commentaires) et l'ajoute a
+        l'historique : aucune navigation, aucune attente. Une seule fois par ouverture du navigateur ; ne leve
+        jamais (la publication ou la verification en cours prime), l'echec est journalise."""
+        if not self.harvesting or self._harvested or not str(self.page.url).startswith(self.sel["expect"]["stats_url_prefix"]):
+            return
+        if only_if_rows and not self.page.query_selector_all(self.sel["stats"]["row"]):
+            return
+        self._lenient = True
+        try:
+            rows = list(self.read_rows().values())
+            if rows:
+                append_snapshot(self.account, self.settings, {
+                    "account": self.account, "fetched_at": self.now.isoformat(), "source": "tiktok_studio",
+                    "origin": "opportunistic", "overview": None, "posts": rows})
+                self._harvested = True
+                logger.info("TikTok %s : %d post(s) relevés au passage sur la page Publications", self.account, len(rows))
+        except Exception as exc:  # noqa: BLE001 - jamais un arret : dit dans le journal
+            self._harvested = True
+            logger.warning("TikTok %s : relevé au passage impossible : %s", self.account, exc)
+        finally:
+            self._lenient = False
 
     def result(self, clip: dict[str, Any], mode: str, schedule_at: datetime | None,
                effective: datetime | None = None, rounding: str | None = None) -> dict[str, Any]:
@@ -825,7 +1114,8 @@ class BrowserBackend:
         open_profile = opener or browser._open_context
         with open_profile(account, headless=False) as context:  # visible : jamais de navigateur cache (ADR-1a58)
             page = context.pages[0] if context.pages else context.new_page()
-            flow = _Flow(page, account, selectors, settings, now=now, sleep=sleep, rng=rng, on_tick=on_tick)
+            flow = _Flow(page, account, selectors, settings, now=now, sleep=sleep, rng=rng, on_tick=on_tick,
+                         harvest=True)
             try:
                 return flow.run(clip, mode, schedule_at)
             except TikTokStop:
@@ -833,15 +1123,15 @@ class BrowserBackend:
             except Exception as exc:  # noqa: BLE001 - erreur Playwright : arret sur avec capture
                 raise flow.stop("unexpected_page", f"page inattendue : {type(exc).__name__} : {exc}") from exc
 
-    def fetch_stats(self, account: str, post_ids: list[str], *, settings: dict[str, Any], selectors: dict[str, Any],
-                    now: datetime, opener: Opener | None, sleep: Callable[[float], None], rng: Any,
-                    on_tick: Callable[[], None] | None) -> list[dict[str, Any]]:
+    def fetch_stats(self, account: str, previous: dict[str, dict[str, Any]], *, settings: dict[str, Any],
+                    selectors: dict[str, Any], now: datetime, opener: Opener | None, sleep: Callable[[float], None],
+                    rng: Any, on_tick: Callable[[], None] | None) -> dict[str, Any]:
         open_profile = opener or browser._open_context
         with open_profile(account, headless=False) as context:
             page = context.pages[0] if context.pages else context.new_page()
             flow = _Flow(page, account, selectors, settings, now=now, sleep=sleep, rng=rng, on_tick=on_tick)
             try:
-                return flow.stats(post_ids)
+                return flow.stats(previous)
             except TikTokStop:
                 raise
             except Exception as exc:  # noqa: BLE001 - erreur Playwright : arret sur avec capture
@@ -852,7 +1142,7 @@ class ApiBackend:
     def publish(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         raise TikTokError("backend api pas encore disponible : règle [tiktok] backend = \"browser\"")
 
-    def fetch_stats(self, *args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+    def fetch_stats(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         raise TikTokError("backend api pas encore disponible : statistiques seulement par le navigateur")
 
 
@@ -914,37 +1204,128 @@ def _check_schedule(schedule_at: datetime | None, settings: dict[str, Any], now:
         )
 
 
-# ---------------------------------------------------------------- statistiques (R7)
+# ---------------------------------------------------------------- historique des releves (SPEC-86fe R2)
+
+_ERROR_SUFFIX = ".error.json"
 
 
-def _stats_path(account: str, settings: dict[str, Any]) -> Path:
-    return Path(settings["stats_dir"]) / f"{browser.validate_account(account)}.json"
+def _history_dir(account: str, settings: dict[str, Any]) -> Path:
+    return Path(settings["stats_dir"]) / browser.validate_account(account)
 
 
-def read_stats(account: str, *, config: Config | None = None) -> dict[str, Any] | None:
-    """Le dernier releve de ``account`` (state/stats/tiktok/<compte>.json), ``None`` s'il n'y en a
-    pas encore ; un fichier illisible est une ``TikTokError`` (jamais ignore)."""
-    path = _stats_path(account, get_settings(config))
-    if not path.is_file():
-        return None
+def _stamp_name(stamp: str) -> str:
+    return datetime.fromisoformat(stamp).astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+
+
+def _append(account: str, settings: dict[str, Any], stamp: str, suffix: str, data: dict[str, Any]) -> Path:
+    """Ecrit ``data`` dans un fichier neuf de l'historique ; un fichier existant n'est jamais ecrase : en cas
+    d'horodatage identique, un numero est ajoute au nom."""
+    folder = _history_dir(account, settings)
+    base = _stamp_name(stamp)
+    with channel_mod.file_lock(folder / "history"):
+        number, path = 1, folder / f"{base}{suffix}"
+        while path.exists():
+            number += 1
+            path = folder / f"{base}-{number}{suffix}"
+        channel_mod.atomic_write_json(path, data)
+    return path
+
+
+def append_snapshot(account: str, settings: dict[str, Any], snapshot: dict[str, Any]) -> Path:
+    """Ajoute un releve (complet ou opportuniste) a l'historique du compte, horodate ; jamais d'ecrasement."""
+    return _append(account, settings, snapshot["fetched_at"], ".json", snapshot)
+
+
+def _read_json(path: Path) -> dict[str, Any]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(data, dict) or not isinstance(data.get("posts"), list):
-            raise ValueError("objet {posts: [...]} attendu")
+        if not isinstance(data, dict):
+            raise ValueError("objet JSON attendu")
         return data
     except (OSError, ValueError) as exc:
         raise TikTokError(f"relevé des statistiques TikTok illisible ({path}) : {exc}") from exc
 
 
-def read_all_stats(*, config: Config | None = None) -> list[dict[str, Any]]:
-    """Les releves de tous les comptes (un fichier par compte), tries par compte."""
-    root = Path(get_settings(config)["stats_dir"])
-    return [read_stats(path.stem, config=config) for path in sorted(root.glob("*.json"))] if root.is_dir() else []
+def read_history(account: str, *, config: Config | None = None) -> list[dict[str, Any]]:
+    """Tous les releves du compte (state/stats/tiktok/<compte>/), du plus ancien au plus recent ; liste vide
+    sans releve ; un fichier illisible est une ``TikTokError`` (jamais ignore)."""
+    folder = _history_dir(account, get_settings(config))
+    if not folder.is_dir():
+        return []
+    snapshots = []
+    for path in sorted(folder.glob("*.json")):
+        if path.name.endswith(_ERROR_SUFFIX):
+            continue
+        data = _read_json(path)
+        if not isinstance(data.get("posts"), list) or not isinstance(data.get("fetched_at"), str):
+            raise TikTokError(f"relevé des statistiques TikTok illisible ({path}) : posts et fetched_at attendus")
+        number = re.search(r"-(\d+)\.json$", path.name)  # horodatages identiques : l'ordre d'ajout
+        snapshots.append(((datetime.fromisoformat(data["fetched_at"]), int(number[1]) if number else 1), data))
+    return [data for _, data in sorted(snapshots, key=lambda item: item[0])]
+
+
+def read_error(account: str, *, config: Config | None = None) -> dict[str, Any] | None:
+    """Dernier arret du releve (R4) s'il est plus recent que le dernier releve complet, sinon ``None``."""
+    folder = _history_dir(account, get_settings(config))
+    errors = sorted(folder.glob(f"*{_ERROR_SUFFIX}")) if folder.is_dir() else []
+    if not errors:
+        return None
+    error = _read_json(errors[-1])
+    last = _last_full(read_history(account, config=config))
+    if last is not None and datetime.fromisoformat(last["fetched_at"]) >= datetime.fromisoformat(error["at"]):
+        return None
+    return error
+
+
+def _last_full(history: list[dict[str, Any]]) -> dict[str, Any] | None:
+    return next((s for s in reversed(history) if s.get("origin") == "full"), None)
+
+
+def stats_due(account: str, *, config: Config | None = None, now: datetime | None = None) -> bool:
+    """Vrai si le dernier essai de releve complet (reussi ou arrete) date de ``stats_interval_h`` ou plus, ou s'il
+    n'y en a jamais eu : un arret sur n'est pas retente a chaque passage du worker, et un releve opportuniste
+    (page Publications vue au passage) ne remplace pas le releve complet."""
+    stamps = []
+    last = _last_full(read_history(account, config=config))
+    if last is not None:
+        stamps.append(last["fetched_at"])
+    folder = _history_dir(account, get_settings(config))
+    for path in folder.glob(f"*{_ERROR_SUFFIX}") if folder.is_dir() else []:
+        stamps.append(_read_json(path)["at"])
+    if not stamps:
+        return True
+    interval = timedelta(hours=float(get_settings(config)["stats_interval_h"]))
+    return (now or datetime.now(timezone.utc)) - max(datetime.fromisoformat(s) for s in stamps) >= interval
+
+
+def _record_stats_failure(account: str, exc: Exception, config: Config | None, settings: dict[str, Any],
+                          now: datetime) -> None:
+    """R4 : l'echec est ajoute a l'historique (le dernier releve reste), et signale a la console."""
+    code = exc.code if isinstance(exc, TikTokStop) else "browser"
+    capture = str(exc.capture) if isinstance(exc, TikTokStop) and exc.capture else None
+    reason = exc.reason if isinstance(exc, TikTokStop) else str(exc)
+    _append(account, settings, now.isoformat(), _ERROR_SUFFIX,
+            {"at": now.isoformat(), "code": code, "reason": reason, "capture": capture})
+    emit_event({"level": "error", "account": account, "channel": None, "video_id": None, "clip_id": None,
+                "reason": f"relevé des statistiques : {reason}", "capture": capture}, config=config, now=now)
+
+
+def merged_posts(history: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Etat le plus recent de chaque post : les releves sont rejoues du plus ancien au plus recent, une cle presente
+    dans un releve (meme ``None`` : « TikTok ne l'affiche pas ») remplace l'ancienne, une cle absente (releve
+    opportuniste, sans detail) laisse l'ancienne valeur. ``first_seen`` / ``last_seen`` : dates de releve."""
+    merged: dict[str, dict[str, Any]] = {}
+    for snapshot in history:
+        for post in snapshot["posts"]:
+            known = merged.setdefault(post["post_id"], {"first_seen": snapshot["fetched_at"]})
+            known.update(post)
+            known["last_seen"] = snapshot["fetched_at"]
+    return merged
 
 
 def _published_posts(account: str, config: Config | None) -> list[dict[str, Any]]:
     """Posts publies de ``account`` connus par les sidecars de clips (``tiktok_post``, ecrit a la
-    publication) : ce qui relie un relevé aux clips, par l'id ou l'adresse du post."""
+    publication) : ce qui relie un post releve a son clip, par l'id ou l'adresse du post (R5)."""
     root = Path(config.output_dir if config is not None else "output")
     found = []
     for path in sorted(root.glob("*/*.json")) if root.is_dir() else []:
@@ -961,71 +1342,18 @@ def _published_posts(account: str, config: Config | None) -> list[dict[str, Any]
     return found
 
 
-def stats_accounts(*, config: Config | None = None) -> list[str]:
-    """Comptes ayant au moins un post publie a mesurer (id ou adresse enregistres a la publication)."""
-    root = Path(config.output_dir if config is not None else "output")
-    accounts: set[str] = set()
-    for path in sorted(root.glob("*/*.json")) if root.is_dir() else []:
-        try:
-            post = json.loads(path.read_text(encoding="utf-8")).get("tiktok_post")
-        except (OSError, ValueError, AttributeError) as exc:
-            raise TikTokError(f"sidecar illisible ({path}) : {exc}") from exc
-        if isinstance(post, dict) and post.get("account") and (post.get("id") or post.get("url")):
-            accounts.add(post["account"])
-    return sorted(accounts)
-
-
-def stats_due(account: str, *, config: Config | None = None, now: datetime | None = None) -> bool:
-    """Vrai si le dernier essai de releve (reussi ou arrete) date de ``stats_interval_h`` ou plus,
-    ou s'il n'y en a jamais eu : un arret sur n'est pas retente a chaque passage du worker."""
-    data = read_stats(account, config=config)
-    if data is None:
-        return True
-    stamps = [t for t in (data.get("fetched_at"), (data.get("error") or {}).get("at")) if t]
-    if not stamps:
-        return True
-    interval = timedelta(hours=float(get_settings(config)["stats_interval_h"]))
-    return (now or datetime.now(timezone.utc)) - max(datetime.fromisoformat(t) for t in stamps) >= interval
-
-
-def _write_stats(account: str, settings: dict[str, Any], update: Callable[[dict[str, Any] | None], dict[str, Any]]) -> dict[str, Any]:
-    path = _stats_path(account, settings)
-    with channel_mod.file_lock(path):
-        previous = None
-        if path.is_file():
-            try:
-                previous = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError) as exc:
-                raise TikTokError(f"relevé des statistiques TikTok illisible ({path}) : {exc}") from exc
-        data = update(previous)
-        channel_mod.atomic_write_json(path, data)
-    return data
-
-
-def _record_stats_failure(account: str, exc: Exception, config: Config | None, settings: dict[str, Any],
-                          now: datetime) -> None:
-    """R4 : l'echec est ecrit a cote du dernier releve (qui reste), et signale a la console."""
-    code = exc.code if isinstance(exc, TikTokStop) else "browser"
-    capture = str(exc.capture) if isinstance(exc, TikTokStop) and exc.capture else None
-    reason = exc.reason if isinstance(exc, TikTokStop) else str(exc)
-    error = {"at": now.isoformat(), "code": code, "reason": reason, "capture": capture}
-    _write_stats(account, settings, lambda prev: {
-        **(prev or {"account": account, "fetched_at": None, "posts": []}), "error": error})
-    emit_event({"level": "error", "account": account, "channel": None, "video_id": None, "clip_id": None,
-                "reason": f"relevé des statistiques : {reason}", "capture": capture}, config=config, now=now)
-
-
 def fetch_stats(
     account: str, *, config: Config | None = None, now: datetime | None = None,
     selectors: dict[str, Any] | None = None, opener: Opener | None = None,
     sleep: Callable[[float], None] = time.sleep, rng: Any = None, on_tick: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
-    """Releve les statistiques des posts publies de ``account`` (ids enregistres a la publication) dans
-    TikTok Studio (R7, lecture seule) : analyse directe de chaque post, likes et commentaires depuis la page
-    Publications ; les relie aux clips et ecrit ``<stats_dir>/<compte>.json`` (horodate, atomique). Une
-    valeur absente de la page ou « en cours de traitement » (retention, sources) est ``None``.
-    Leve ``TikTokStop`` (R4 : l'echec est aussi ecrit a cote du dernier releve et signale a la
-    console), ``BrowserError`` ou ``TikTokError``."""
+    """Releve complet de ``account`` dans TikTok Studio (SPEC-86fe R1, lecture seule) : page Donnees analytiques
+    (7, 28 et 60 jours), liste des Publications (tous les posts du compte, publies ou non par Clipper), puis
+    l'analyse, les spectateurs et l'engagement des posts a lire en detail. Ajoute le releve horodate a
+    l'historique ``<stats_dir>/<compte>/`` (jamais d'ecrasement) et le rend. Une valeur absente de la page ou
+    « en cours de traitement » est ``None``. Leve ``TikTokStop`` (R4 : l'echec est aussi ajoute a l'historique
+    et signale a la console), ``BrowserError`` ou ``TikTokError``. Le compte doit etre pret a publier : c'est a
+    l'appelant (console, worker) de le verifier."""
     settings = get_settings(config)
     backend = _BACKENDS[settings["backend"]]()
     if not account:
@@ -1034,18 +1362,116 @@ def fetch_stats(
         return backend.fetch_stats()
     account = browser.validate_account(account)
     now = now or datetime.now(timezone.utc)
-    known = {p["post_id"]: p for p in _published_posts(account, config)}
-    if not known:
-        raise TikTokError(f"aucun post publié à mesurer pour le compte {account} : "
-                          f"aucun clip n'a d'id ou d'adresse de post enregistré (tiktok_post)")
+    previous = merged_posts(read_history(account, config=config))
     try:
-        posts = backend.fetch_stats(
-            account, list(known), settings=settings, selectors=selectors or load_selectors(), now=now, opener=opener,
+        data = backend.fetch_stats(
+            account, previous, settings=settings, selectors=selectors or load_selectors(), now=now, opener=opener,
             sleep=sleep, rng=rng or random.Random(), on_tick=on_tick)
     except (TikTokStop, browser.BrowserError) as exc:
         _record_stats_failure(account, exc, config, settings, now)
         raise
-    linked = [{**post, "video_id": known.get(post["post_id"], {}).get("video_id"),
-               "clip_id": known.get(post["post_id"], {}).get("clip_id")} for post in posts]
-    return _write_stats(account, settings, lambda _prev: {
-        "account": account, "fetched_at": now.isoformat(), "source": "tiktok_studio", "posts": linked, "error": None})
+    snapshot = {"account": account, "fetched_at": now.isoformat(), "source": "tiktok_studio", "origin": "full",
+                "overview": data["overview"], "posts": data["posts"]}
+    append_snapshot(account, settings, snapshot)
+    return snapshot
+
+
+# ---------------------------------------------------------------- agregats pour la console (SPEC-86fe R2, R3, R5)
+
+VIDEO_SORTS = ("posted_at", "caption", "views", "likes", "comments", "shares", "avg_watch_s", "watched_full")
+_LIGHT_FIELDS = ("post_id", "post_url", "caption", "posted_at", "posted_at_text", "visibility", "views", "likes",
+                 "comments", "shares", "avg_watch_s", "watched_full")
+
+
+def _day(stamp: str) -> date:
+    return datetime.fromisoformat(stamp).astimezone(timezone.utc).date()
+
+
+def account_overview(account: str, period: int, *, config: Config | None = None) -> dict[str, Any]:
+    """Vue d'ensemble du compte pour ``period`` jours (7, 28 ou 60), calculee sur l'historique : les tuiles du dernier
+    releve complet (valeur, evolution donnee par TikTok ``change_pct``, evolution recalculee depuis l'historique
+    ``history_change_pct`` = valeur du releve d'il y a ``period`` jours) et, par tuile, la courbe par jour : un point
+    par jour (dernier releve complet du jour, la valeur de la tuile de la periode), vide un jour sans releve, et la
+    meme courbe decalee de ``period`` jours (periode precedente). Rien n'est invente : un jour sans releve, une tuile
+    que TikTok n'affichait pas ou une base nulle donnent ``None``."""
+    if period not in PERIODS:
+        raise TikTokError(f"période invalide : {period!r} (attendu : {' | '.join(str(p) for p in PERIODS)} jours)")
+    history = read_history(account, config=config)
+    last = _last_full(history)
+    out: dict[str, Any] = {
+        "account": account, "period": period, "snapshots": len(history),
+        "fetched_at": history[-1]["fetched_at"] if history else None,
+        "last_full_at": last["fetched_at"] if last else None, "error": read_error(account, config=config),
+        "tiles": None, "series": None}
+    if last is None:
+        return out
+    by_day: dict[str, dict[date, Any]] = {key: {} for key in TILES}
+    for snapshot in history:
+        if snapshot.get("origin") != "full":
+            continue
+        for key in TILES:
+            by_day[key][_day(snapshot["fetched_at"])] = ((snapshot["overview"] or {}).get(str(period)) or {}).get(key) or {}
+    end = _day(last["fetched_at"])
+    days = [end - timedelta(days=period - 1 - i) for i in range(period)]
+    gap = timedelta(days=period)
+
+    def value(key: str, day: date) -> Any:
+        return by_day[key].get(day, {}).get("value")
+
+    tiles, series = {}, {}
+    for key in TILES:
+        shown = by_day[key][end]
+        current, before = shown.get("value"), value(key, end - gap)
+        tiles[key] = {"value": current, "change_pct": shown.get("change_pct"),
+                      "history_change_pct": None if current is None or not before else (current - before) / before * 100}
+        series[key] = {"labels": [d.isoformat() for d in days], "values": [value(key, d) for d in days],
+                       "previous": [value(key, d - gap) for d in days]}
+    out.update(tiles=tiles, series=series)
+    return out
+
+
+def _clip_links(account: str, config: Config | None) -> dict[str, dict[str, str]]:
+    links: dict[str, dict[str, str]] = {}
+    for found in _published_posts(account, config):
+        links.setdefault(found["post_id"], {"video_id": found["video_id"], "clip_id": found["clip_id"]})
+    return links
+
+
+def list_videos(account: str, *, sort: str = "posted_at", descending: bool = True, query: str = "",
+                config: Config | None = None) -> list[dict[str, Any]]:
+    """Toutes les videos du compte vues dans TikTok Studio (dernier etat connu de chacune), triees par ``sort``
+    (une valeur absente est toujours en dernier) et filtrees par ``query`` (partie de la legende, sans la casse).
+    Chaque video porte son clip Clipper (``clip`` : video_id et clip_id enregistres a la publication) ou
+    ``outside_clipper`` : publiee hors de Clipper (R5)."""
+    if sort not in VIDEO_SORTS:
+        raise TikTokError(f"tri inconnu : {sort!r} (attendu : {' | '.join(VIDEO_SORTS)})")
+    links = _clip_links(account, config)
+    wanted = query.strip().casefold()
+    videos = []
+    for post in merged_posts(read_history(account, config=config)).values():
+        if wanted and wanted not in (post.get("caption") or "").casefold():
+            continue
+        light = {key: post.get(key) for key in _LIGHT_FIELDS}
+        clip = links.get(post["post_id"])
+        videos.append({**light, "processing": post.get("views") is None, "clip": clip, "outside_clipper": clip is None})
+
+    def key(video: dict[str, Any]) -> Any:
+        value = video[sort]
+        return value.casefold() if isinstance(value, str) else value
+
+    present = sorted((v for v in videos if v[sort] is not None), key=key, reverse=descending)
+    return present + [v for v in videos if v[sort] is None]
+
+
+def video_detail(account: str, post_id: str, *, config: Config | None = None) -> dict[str, Any]:
+    """Fiche d'une video : tout ce que le releve sait d'elle (chiffres, retention, spectateurs, engagement), son
+    clip Clipper ou ``outside_clipper``, et son historique (vues, likes, commentaires a chaque releve)."""
+    history = read_history(account, config=config)
+    post = merged_posts(history).get(str(post_id))
+    if post is None:
+        raise TikTokError(f"vidéo {post_id} introuvable dans les relevés du compte {account}")
+    clip = _clip_links(account, config).get(post["post_id"])
+    track = [{"fetched_at": s["fetched_at"], **{k: p.get(k) for k in ("views", "likes", "comments")}}
+             for s in history for p in s["posts"] if p["post_id"] == post["post_id"]]
+    return {**post, "processing": post.get("views") is None, "clip": clip, "outside_clipper": clip is None,
+            "history": track}

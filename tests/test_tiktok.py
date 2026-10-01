@@ -1123,7 +1123,7 @@ def test_corrupt_events_file_is_an_explicit_error(tmp_path, monkeypatch):
         tiktok.read_events()
 
 
-# ---------------------------------------------------------------- statistiques (SPEC-9225 R7)
+# ---------------------------------------------------------------- statistiques (SPEC-86fe)
 
 
 class FakeCell:
@@ -1145,43 +1145,12 @@ class FakeRow:
         return self.cells.get(selector)
 
 
-class FakeStatsPage(FakePage):
-    """Page Publications (une ligne par post) puis page d'analyse d'un post (cartes « libelle | valeur »)."""
-
-    def __init__(self, rows, cards, sources=None, **kwargs):
-        super().__init__(set(), **kwargs)
-        self.rows, self.cards, self.sources = rows, cards, sources or {}
-
-    def goto(self, url, **kwargs):
-        super().goto(url)
-        sel, expect = _sel()["stats"], _sel()["expect"]
-        for key in ("row", "metric_card", "traffic_sources"):
-            self.present.discard(sel[key])
-        self.texts.pop(sel["traffic_sources"], None)
-        if self.url.startswith(expect["stats_url_prefix"]) and self.rows:
-            self.present.add(sel["row"])
-        elif self.url.startswith(expect["analytics_url_prefix"]):
-            post_id = self.url.split("/analytics/")[1].split("?")[0]
-            if post_id in self.cards:
-                self.present.add(sel["metric_card"])
-            if post_id in self.sources:
-                self.present.add(sel["traffic_sources"])
-                self.texts[sel["traffic_sources"]] = self.sources[post_id]
-
-    def query_selector_all(self, selector):
-        self.calls.append(("all", selector))
-        sel = _sel()["stats"]
-        if selector == sel["row"]:
-            return list(self.rows)
-        if selector == sel["metric_card"] and sel["metric_card"] in self.present:
-            return list(self.cards[self.url.split("/analytics/")[1].split("?")[0]])
-        return []
-
-
-def _row(post_id, *, likes="85", comments="7", account="ma_chaine"):
+def _row(post_id, *, caption="Ma légende #gaming", created="2026-09-30 14:05", visibility="Tout le monde",
+         views="1 200", likes="85", comments="7", account="ma_chaine"):
     sel = _sel()["stats"]
-    cells = {sel["post_link"]: FakeCell(href=f"https://www.tiktok.com/@{account}/video/{post_id}")}
-    for key, value in (("likes", likes), ("comments", comments)):
+    cells = {sel["post_link"]: FakeCell(caption, href=f"https://www.tiktok.com/@{account}/video/{post_id}")}
+    for key, value in (("views", views), ("likes", likes), ("comments", comments), ("visibility", visibility),
+                       ("created", created)):
         if value is not None:
             cells[sel[key]] = FakeCell(value)
     return FakeRow(cells)
@@ -1197,32 +1166,162 @@ def _cards(*, views="1 200", total="1h:02m:03s", avg="12s", full="23%", follower
             if value is not None and (only is None or key in only)]
 
 
+def _tiles(**values):
+    """Les tuiles de la page Donnees analytiques : ``cle=(valeur, evolution)`` ou le texte brut ; le defaut est
+    « -- 0 (--) » comme sur la vraie page quand rien n'est encore affiche."""
+    labels = _sel()["tiles"]
+    out = {}
+    for key in labels:
+        value = values.get(key, ("0", "--"))
+        text = value if isinstance(value, str) else f"-- {value[0]} ({value[1]})"
+        out[key] = f"{labels[key]} {text}"
+    return out
+
+
+def _section(title, *lines):
+    return FakeCell("\n".join([title, *lines]))
+
+
+def _viewers():
+    labels = _sel()["viewers"]
+    return [_section(labels["total"], "1 200"),
+            _section(labels["types"], "Récurrents", "40%", "Nouveaux", "60%", "Followers", "25%", "Non followers", "75%"),
+            _section(labels["age"], "18-24", "50%", "25-34", "30%", "35+", "20%"),
+            _section(labels["gender"], "Femme", "35%", "Homme", "65%"),
+            _section(labels["locations"], "France", "80%", "Belgique", "20%")]
+
+
+def _engagement():
+    labels = _sel()["engagement"]
+    return [_section(labels["shares"], "12"),
+            _section(labels["likes_over_time"], "30 sept.", "40", "1 oct.", "45"),
+            _section(labels["comment_words"], "génial", "5", "clip", "3")]
+
+
+def _curve():
+    return [FakeCell("0:00 | 100%"), FakeCell("0:05 | 63%"), FakeCell("0:10 | 23%")]
+
+
 ID_A, ID_B, ID_C = "7300000000000000001", "7300000000000000002", "7300000000000000003"
 
 
-def analytics_url(post_id):
-    return _sel()["urls"]["analytics"].format(post_id=post_id)
+def analytics_url(post_id, tab=None):
+    key = {None: "analytics", "viewers": "analytics_viewers", "engagement": "analytics_engagement"}[tab]
+    return _sel()["urls"][key].format(post_id=post_id)
+
+
+class Post:
+    """Ce que TikTok Studio affiche pour un post : une ligne de la page Publications et ses pages d'analyse."""
+
+    def __init__(self, post_id, *, row=None, cards=None, curve=None, sources=None, viewers="ok", engagement="ok"):
+        self.id = post_id
+        self.row = _row(post_id) if row is None else row
+        self.cards = _cards() if cards is None else cards
+        self.curve = _curve() if curve is None else curve
+        self.sources = sources
+        self.viewers = _viewers() if viewers == "ok" else viewers  # « unavailable » : « dès 100 vues »
+        self.engagement = _engagement() if engagement == "ok" else engagement
+
+
+class FakeStudio(FakePage):
+    """Les pages de statistiques de TikTok Studio : Donnees analytiques du compte (menu des periodes, tuiles),
+    Publications (defilement par lots), analyse d'un post et ses onglets Spectateurs / Engagement."""
+
+    def __init__(self, posts, *, tiles=None, batches=None, **kwargs):
+        super().__init__(set(), **kwargs)
+        self.posts = {p.id: p for p in posts}
+        self.tiles = tiles if tiles is not None else {7: _tiles(), 28: _tiles(), 60: _tiles()}
+        self.batches = batches or [[p.id for p in posts]]  # identifiants affiches apres 0, 1, 2... defilements
+        self.scrolled, self.period, self.menu = 0, 7, False
+        self.view = ("other", None)
+
+    def goto(self, url, **kwargs):
+        super().goto(url)
+        urls, now = _sel()["urls"], self.url
+        if now.startswith(urls["stats"]):
+            self.view = ("content", None)
+        elif now.startswith(urls["analytics_account"]) and now[len(urls["analytics_account"]):][:1] in ("", "?"):
+            self.view, self.period, self.menu = ("account", None), 7, False
+        elif "/analytics/" in now:
+            rest = now.split("/analytics/")[1].split("?")[0].split("/")
+            self.view = ({"viewers": "viewers", "engagement": "engagement"}.get(rest[1] if len(rest) > 1 else None, "overview"), rest[0])
+        else:
+            self.view = ("other", None)
+
+    def _elements(self, selector):
+        sel, view, post = _sel(), *self.view
+        stats, acc = sel["stats"], sel["account"]
+        if selector == sel["modal"]["container"]:
+            return list(self.modals)
+        if view == "account":
+            if selector == acc["tile"]:
+                return [FakeCell(text) for text in self.tiles[self.period].values()]
+            if selector == acc["period_button"]:
+                return [FakeElement(self, selector, text=f"{self.period} derniers jours", on_click=lambda: setattr(self, "menu", True))]
+            for days in (7, 28, 60):
+                if selector == acc["period_option"].format(days=days) and self.menu:
+                    return [FakeElement(self, selector, on_click=lambda days=days: self.pick_period(days))]
+        if view == "content":
+            if selector == stats["row"]:
+                shown = {i for batch in self.batches[: self.scrolled + 1] for i in batch}
+                return [self.posts[i].row for i in dict.fromkeys(i for b in self.batches for i in b) if i in shown]
+        if view == "overview" and post in self.posts:
+            if selector == stats["metric_card"]:
+                return list(self.posts[post].cards)
+            if selector == stats["retention_point"]:
+                return list(self.posts[post].curve)
+            if selector == stats["traffic_sources"] and self.posts[post].sources is not None:
+                return [FakeCell(self.posts[post].sources)]
+        if view in ("viewers", "engagement") and post in self.posts:
+            data = getattr(self.posts[post], view)
+            if selector == stats["viewers_card" if view == "viewers" else "engagement_card"] and data != "unavailable":
+                return list(data)
+            if selector == stats["page_text"]:
+                return [FakeCell("Les données seront disponibles dès 100 vues." if data == "unavailable" else "")]
+        return [FakeElement(self, selector)] if selector in self.present else []
+
+    def pick_period(self, days):
+        self.period, self.menu = days, False
+
+    def query_selector(self, selector):
+        found = self._elements(selector)
+        return found[0] if found else None
+
+    def query_selector_all(self, selector):
+        return self._elements(selector)
+
+    def wait_for_selector(self, selector, timeout=None, state=None):
+        self.calls.append(("wait", selector))
+        found = self._elements(selector)
+        if not found:
+            raise TimeoutError(f"Timeout {timeout}ms exceeded waiting for {selector}")
+        return found[0]
+
+    def evaluate(self, script):
+        self.calls.append(("evaluate", script))
+        self.scrolled = min(self.scrolled + 1, len(self.batches) - 1)
+
+    def gotos(self):
+        return [c[1] for c in self.calls if c[0] == "goto"]
 
 
 class StatsEnv:
-    """Un releve complet contre une fausse page ; ``posts`` : id -> cartes de metriques. Un sidecar de clip
-    publie (``tiktok_post``) est ecrit pour chaque id, sauf ``clips=False`` ; ``rows`` : la page Publications."""
+    """Un releve complet contre de fausses pages ; un sidecar de clip publie (``tiktok_post``) est ecrit pour
+    chaque identifiant de ``clips``."""
 
-    def __init__(self, tmp_path, monkeypatch, posts, *, rows=None, sources=None, clips=True, detect=None,
-                 redirect=None, settings=None):
+    def __init__(self, tmp_path, monkeypatch, posts, *, clips=(), detect=None, redirect=None, settings=None, **page_kwargs):
+        tmp_path.mkdir(parents=True, exist_ok=True)
         monkeypatch.chdir(tmp_path)
-        rows = [_row(post_id) for post_id in posts] if rows is None else rows
-        self.page = FakeStatsPage(rows, posts, sources, redirect=redirect)
+        self.page = FakeStudio(posts, redirect=redirect, **page_kwargs)
         for kind in (detect or ()):
             self.page.present.add(_sel()["detect"][kind][0])
         self.sleeps: list[float] = []
         self.config = Config(mode="review", workspace_dir=tmp_path / "w", output_dir=tmp_path / "output",
                              _sections={"tiktok": settings or {}})
-        self.path = tmp_path / "state" / "stats" / "tiktok" / "ma_chaine.json"
+        self.folder = tmp_path / "state" / "stats" / "tiktok" / "ma_chaine"
         self.tmp = tmp_path
-        for number, post_id in enumerate(posts, start=1):
-            if clips:
-                self.clip("aaaaaaaaaaa", f"{number:02d}", post_id=post_id)
+        for number, post_id in enumerate(clips, start=1):
+            self.clip("aaaaaaaaaaa", f"{number:02d}", post_id=post_id)
 
     def clip(self, video_id, clip_id, post_id=None, url=None, account="ma_chaine", state="published"):
         out = self.tmp / "output" / video_id
@@ -1236,92 +1335,282 @@ class StatsEnv:
         self.opened = (account, headless)
         yield FakeContext(self.page)
 
-    def fetch(self, **kwargs):
-        return tiktok.fetch_stats("ma_chaine", config=self.config, now=NOW, opener=self.opener,
+    def fetch(self, now=NOW, **kwargs):
+        return tiktok.fetch_stats("ma_chaine", config=self.config, now=now, opener=self.opener,
                                   sleep=self.sleeps.append, rng=random.Random(1), **kwargs)
 
+    def files(self):
+        return sorted(p.name for p in self.folder.glob("*.json"))
 
-def test_stats_interval_default_is_24_hours_and_invalid_values_are_refused(tmp_path, monkeypatch):
-    assert tiktok.CONFIG_DEFAULTS["stats_interval_h"] == 24
-    assert tiktok.CONFIG_DEFAULTS["stats_dir"] == "state/stats/tiktok"
-    for bad in (0, -1, "24", True):
-        config = Config(mode="review", workspace_dir=tmp_path, output_dir=tmp_path,
-                        _sections={"tiktok": {"stats_interval_h": bad}})
-        with pytest.raises(tiktok.TikTokError, match="stats_interval_h"):
+
+# -- reglages
+
+
+def test_stats_settings_have_defaults_and_invalid_values_are_refused(tmp_path):
+    d = tiktok.CONFIG_DEFAULTS
+    assert d["stats_interval_h"] == 24 and d["stats_dir"] == "state/stats/tiktok"
+    assert (d["stats_detail_days"], d["stats_detail_max"], d["stats_scroll_rounds"]) == (7, 50, 10)
+    for key, bad in (("stats_interval_h", 0), ("stats_interval_h", "24"), ("stats_interval_h", True),
+                     ("stats_detail_days", -1), ("stats_detail_max", "50"), ("stats_scroll_rounds", True)):
+        config = Config(mode="review", workspace_dir=tmp_path, output_dir=tmp_path, _sections={"tiktok": {key: bad}})
+        with pytest.raises(tiktok.TikTokError, match=key):
             tiktok.get_settings(config)
 
 
-def test_fetch_stats_goes_straight_to_the_analytics_page_of_each_published_post(tmp_path, monkeypatch):
-    env = StatsEnv(tmp_path, monkeypatch, {ID_A: _cards(), ID_B: _cards(views="3,4 K")})
+# -- (1) le releve : compte (3 periodes), liste des posts, chaque post
 
-    result = env.fetch()
+
+def test_a_full_fetch_reads_the_account_page_then_the_posts_list_then_each_post_in_three_tabs(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [Post(ID_A), Post(ID_B)])
+
+    snapshot = env.fetch()
 
     assert env.opened == ("ma_chaine", False)  # navigateur visible
-    gotos = [c[1] for c in env.page.calls if c[0] == "goto"]
-    assert gotos == [_sel()["urls"]["stats"], analytics_url(ID_A), analytics_url(ID_B)]
-    assert analytics_url(ID_A) == f"https://www.tiktok.com/tiktokstudio/analytics/{ID_A}?qa_enter_from=analytics"
-    assert env.page.clicks() == [] and env.page.fills() == []  # lecture seule
-    assert [p["post_id"] for p in result["posts"]] == [ID_A, ID_B]
-    assert result["fetched_at"] == NOW.isoformat() and result["account"] == "ma_chaine"
+    assert env.page.gotos() == [
+        _sel()["urls"]["analytics_account"], _sel()["urls"]["stats"],
+        analytics_url(ID_A), analytics_url(ID_A, "viewers"), analytics_url(ID_A, "engagement"),
+        analytics_url(ID_B), analytics_url(ID_B, "viewers"), analytics_url(ID_B, "engagement")]
+    assert snapshot["account"] == "ma_chaine" and snapshot["fetched_at"] == NOW.isoformat()
+    assert snapshot["origin"] == "full" and snapshot["source"] == "tiktok_studio"
+    assert [p["post_id"] for p in snapshot["posts"]] == [ID_A, ID_B]
+    assert env.page.fills() == []
+
+
+def test_the_account_tiles_are_read_for_the_three_periods_with_the_evolution_given_by_tiktok(tmp_path, monkeypatch):
+    tiles = {7: _tiles(views=("1 200", "+12,5%"), profile_views=("85", "-3%"), likes=("40", "--"), comments=("0", "--"),
+                       shares=("--", "--")),
+             28: _tiles(views=("4,8 K", "+8%")), 60: _tiles(views=("9 000", "0%"))}
+    env = StatsEnv(tmp_path, monkeypatch, [Post(ID_A)], tiles=tiles)
+
+    overview = env.fetch()["overview"]
+
+    assert set(overview) == {"7", "28", "60"}
+    assert overview["7"]["views"] == {"value": 1200, "change_pct": 12.5}
+    assert overview["7"]["profile_views"] == {"value": 85, "change_pct": -3.0}
+    assert overview["7"]["likes"] == {"value": 40, "change_pct": None}  # « (--) » : TikTok ne donne pas l'evolution
+    assert overview["7"]["comments"] == {"value": 0, "change_pct": None}  # un vrai zero reste un zero
+    assert overview["7"]["shares"] == {"value": None, "change_pct": None}  # « -- » : null explicite
+    assert overview["28"]["views"] == {"value": 4800, "change_pct": 8.0}
+    assert overview["60"]["views"] == {"value": 9000, "change_pct": 0.0}
+
+
+def test_the_period_menu_is_only_clicked_when_the_period_is_not_already_shown(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [Post(ID_A)])
+    acc = _sel()["account"]
+
+    env.fetch()
+
+    assert env.page.clicks().count(acc["period_button"]) == 2  # 28 et 60 jours ; 7 jours est deja affiche
+    assert env.page.clicks().count(acc["period_option"].format(days=28)) == 1
+    assert env.page.clicks().count(acc["period_option"].format(days=60)) == 1
+    assert acc["period_option"].format(days=7) not in env.page.clicks()
+    assert set(env.page.clicks()) <= {acc["period_button"], acc["period_option"].format(days=28),
+                                      acc["period_option"].format(days=60)}  # rien d'autre n'est clique
+
+
+def test_a_tile_missing_from_the_page_is_an_explicit_null_never_an_invented_zero(tmp_path, monkeypatch):
+    tiles = {n: {k: v for k, v in _tiles().items() if k != "shares"} for n in (7, 28, 60)}
+    env = StatsEnv(tmp_path, monkeypatch, [Post(ID_A)], tiles=tiles)
+
+    assert env.fetch()["overview"]["7"]["shares"] == {"value": None, "change_pct": None}
+
+
+def test_an_unreadable_tile_is_an_unexpected_page_stop_not_a_guess(tmp_path, monkeypatch):
+    tiles = {7: _tiles(views="beaucoup (+1%)"), 28: _tiles(), 60: _tiles()}
+    env = StatsEnv(tmp_path, monkeypatch, [Post(ID_A)], tiles=tiles)
+
+    with pytest.raises(tiktok.TikTokStop) as stop:
+        env.fetch()
+
+    assert stop.value.code == "unexpected_page" and "tuile views" in stop.value.reason
+
+
+def test_a_period_missing_from_the_menu_is_an_element_missing_stop(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [Post(ID_A)])
+    env.page.pick_period = lambda days: None
+    real = env.page._elements
+    env.page._elements = lambda selector: [] if selector == _sel()["account"]["period_option"].format(days=28) else real(selector)
+
+    with pytest.raises(tiktok.TikTokStop) as stop:
+        env.fetch()
+
+    assert stop.value.code == "element_missing" and "28 derniers jours" in stop.value.reason
+
+
+def test_the_posts_list_comes_from_tiktok_and_includes_posts_published_outside_clipper(tmp_path, monkeypatch):
+    posts = [Post(ID_A, row=_row(ID_A, caption="Un clip Clipper #a", visibility="Toi uniquement")),
+             Post(ID_B, row=_row(ID_B, caption="Publié à la main", visibility="Ami(e)s", created="1 oct. 2026, 09:30"))]
+    env = StatsEnv(tmp_path, monkeypatch, posts, clips=[ID_A])
+
+    by_id = {p["post_id"]: p for p in env.fetch()["posts"]}
+
+    assert set(by_id) == {ID_A, ID_B}  # aucun sidecar pour B : il est quand meme releve
+    assert by_id[ID_A]["caption"] == "Un clip Clipper #a" and by_id[ID_A]["visibility"] == "private"
+    assert by_id[ID_B]["visibility"] == "friends"
+    assert by_id[ID_A]["post_url"] == f"https://www.tiktok.com/@ma_chaine/video/{ID_A}"
+    assert by_id[ID_A]["posted_at"] == "2026-09-30T14:05:00" and by_id[ID_A]["posted_at_text"] == "2026-09-30 14:05"
+    assert by_id[ID_B]["posted_at"] == "2026-10-01T09:30:00"
+
+
+def test_an_unknown_date_format_keeps_the_text_and_a_null_date(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [Post(ID_A, row=_row(ID_A, created="hier"))])
+
+    post = env.fetch()["posts"][0]
+
+    assert post["posted_at"] is None and post["posted_at_text"] == "hier"
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("2026-10-01 14:05", "2026-10-01T14:05:00"), ("2026-10-01", "2026-10-01T00:00:00"),
+    ("01/10/2026 14:05", "2026-10-01T14:05:00"), ("1 oct. 2026, 14:05", "2026-10-01T14:05:00"),
+    ("15 septembre 2026", "2026-09-15T00:00:00"), ("31/02/2026", None), ("hier", None), (None, None),
+])
+def test_dates_of_the_posts_list_are_parsed_or_null(text, expected):
+    assert tiktok.parse_date(text, _sel()["calendar"]["months"]) == expected
+
+
+def test_the_list_is_scrolled_until_it_stops_growing(tmp_path, monkeypatch):
+    posts = [Post(ID_A), Post(ID_B), Post(ID_C)]
+    env = StatsEnv(tmp_path, monkeypatch, posts, batches=[[ID_A], [ID_A, ID_B], [ID_A, ID_B, ID_C]])
+
+    snapshot = env.fetch()
+
+    assert [p["post_id"] for p in snapshot["posts"]] == [ID_A, ID_B, ID_C]
+    scrolls = [c for c in env.page.calls if c[0] == "evaluate"]
+    assert scrolls and all(c[1] == _sel()["stats"]["scroll_script"] for c in scrolls)
+    assert len(scrolls) == 3  # deux defilements qui ajoutent un post, un troisieme qui ne change rien
+
+
+def test_scrolling_is_bounded_by_the_configured_rounds(tmp_path, monkeypatch):
+    posts = [Post(ID_A), Post(ID_B), Post(ID_C)]
+    env = StatsEnv(tmp_path, monkeypatch, posts, batches=[[ID_A], [ID_A, ID_B], [ID_A, ID_B, ID_C]],
+                   settings={"stats_scroll_rounds": 1})
+
+    assert [p["post_id"] for p in env.fetch()["posts"]] == [ID_A, ID_B]
+    assert len([c for c in env.page.calls if c[0] == "evaluate"]) == 1
 
 
 def test_filled_metrics_are_read_by_label_and_converted(tmp_path, monkeypatch):
-    env = StatsEnv(tmp_path, monkeypatch, {ID_A: _cards(views="1 200", total="1h:02m:03s", avg="12s", full="23%",
-                                                        followers="4")},
-                   rows=[_row(ID_A, likes="85", comments="7")])
+    post = Post(ID_A, row=_row(ID_A, likes="85", comments="7"),
+                cards=_cards(views="1 200", total="1h:02m:03s", avg="12s", full="23%", followers="4"))
+    env = StatsEnv(tmp_path, monkeypatch, [post])
 
-    post = env.fetch()["posts"][0]
+    got = env.fetch()["posts"][0]
 
-    assert post["post_id"] == ID_A and post["post_url"] == f"https://www.tiktok.com/@ma_chaine/video/{ID_A}"
-    assert post["views"] == 1200 and isinstance(post["views"], int)
-    assert post["watch_total_s"] == 3723.0  # 1h 02m 03s
-    assert post["avg_watch_s"] == 12.0
-    assert post["watched_full"] == pytest.approx(0.23)  # part vue en entier : pourcentage lu
-    assert post["new_followers"] == 4
-    assert (post["likes"], post["comments"]) == (85, 7)  # depuis la ligne de la page Publications
+    assert got["views"] == 1200 and isinstance(got["views"], int)
+    assert got["watch_total_s"] == 3723.0  # 1h 02m 03s
+    assert got["avg_watch_s"] == 12.0
+    assert got["watched_full"] == pytest.approx(0.23)  # part vue en entier : pourcentage lu
+    assert got["new_followers"] == 4
+    assert (got["likes"], got["comments"]) == (85, 7)  # depuis la ligne de la page Publications
+    assert got["detailed_at"] == NOW.isoformat()
 
 
 def test_metrics_at_zero_are_real_zeros_not_nulls(tmp_path, monkeypatch):
-    env = StatsEnv(tmp_path, monkeypatch, {ID_A: _cards(views="0", total="0h:00m:00s", avg="0s", full="0%",
-                                                        followers="0")},
-                   rows=[_row(ID_A, likes="0", comments="0")])
+    post = Post(ID_A, row=_row(ID_A, views="0", likes="0", comments="0"),
+                cards=_cards(views="0", total="0h:00m:00s", avg="0s", full="0%", followers="0"))
+    env = StatsEnv(tmp_path, monkeypatch, [post])
 
-    post = env.fetch()["posts"][0]
+    got = env.fetch()["posts"][0]
 
-    assert post["views"] == 0 and post["watch_total_s"] == 0.0 and post["avg_watch_s"] == 0.0
-    assert post["watched_full"] == 0.0 and post["new_followers"] == 0
-    assert post["likes"] == 0 and post["comments"] == 0
-    assert post["watch_total_s"] is not None and post["watched_full"] is not None
+    assert got["views"] == 0 and got["watch_total_s"] == 0.0 and got["avg_watch_s"] == 0.0
+    assert got["watched_full"] == 0.0 and got["new_followers"] == 0
+    assert got["likes"] == 0 and got["comments"] == 0
 
 
-def test_retention_and_traffic_sources_still_processing_are_explicit_nulls(tmp_path, monkeypatch):
+def test_values_still_processing_are_explicit_nulls(tmp_path, monkeypatch):
     processing = _sel()["stats"]["processing"]
-    env = StatsEnv(tmp_path, monkeypatch, {ID_A: _cards(retention=processing)}, sources={ID_A: processing})
+    post = Post(ID_A, row=_row(ID_A, views=processing), cards=_cards(views=processing, retention=processing),
+                sources=processing, viewers="unavailable", engagement="unavailable")
+    env = StatsEnv(tmp_path, monkeypatch, [post])
 
-    post = env.fetch()["posts"][0]
+    got = env.fetch()["posts"][0]
 
-    assert "retention" in post and post["retention"] is None
-    assert "traffic_sources" in post and post["traffic_sources"] is None
-    assert post["views"] == 1200  # le reste est lu normalement
+    for key in ("views", "retention", "traffic_sources", "viewers", "engagement", "shares"):
+        assert key in got and got[key] is None
+    assert got["watch_total_s"] == 3723.0  # le reste est lu normalement
 
 
 def test_a_metric_the_page_does_not_show_is_an_explicit_null_never_an_invented_zero(tmp_path, monkeypatch):
-    env = StatsEnv(tmp_path, monkeypatch, {ID_A: _cards(only=("views",))},
-                   rows=[_row(ID_A, likes=None, comments="—")])
+    post = Post(ID_A, row=_row(ID_A, views=None, likes=None, comments="—", visibility=None, created=None),
+                cards=_cards(only=("views",)), curve=[])
+    env = StatsEnv(tmp_path, monkeypatch, [post])
 
-    post = env.fetch()["posts"][0]
+    got = env.fetch()["posts"][0]
 
-    assert post["views"] == 1200
-    for key in ("watch_total_s", "avg_watch_s", "watched_full", "new_followers", "retention", "likes", "comments"):
-        assert key in post and post[key] is None
+    assert got["views"] == 1200  # la carte d'analyse l'affiche
+    for key in ("watch_total_s", "avg_watch_s", "watched_full", "new_followers", "retention", "likes", "comments",
+                "visibility", "posted_at", "retention_curve"):
+        assert key in got and got[key] is None
 
 
-def test_a_post_missing_from_the_publications_list_has_null_likes_and_comments(tmp_path, monkeypatch):
-    env = StatsEnv(tmp_path, monkeypatch, {ID_A: _cards()}, rows=[_row(ID_B)])
+def test_the_retention_curve_is_read_point_by_point(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [Post(ID_A)])
 
-    post = env.fetch()["posts"][0]
+    assert env.fetch()["posts"][0]["retention_curve"] == [
+        {"t_s": 0.0, "share": 1.0}, {"t_s": 5.0, "share": 0.63}, {"t_s": 10.0, "share": 0.23}]
 
-    assert post["likes"] is None and post["comments"] is None and post["views"] == 1200
+
+def test_traffic_sources_are_kept_as_displayed_and_null_when_absent(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [Post(ID_A, sources="Pour toi 74 % Abonnés 12 %"), Post(ID_B)])
+
+    by_id = {p["post_id"]: p for p in env.fetch()["posts"]}
+
+    assert by_id[ID_A]["traffic_sources"] == "Pour toi 74 % Abonnés 12 %" and by_id[ID_B]["traffic_sources"] is None
+
+
+def test_the_viewers_tab_gives_types_age_gender_and_locations(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [Post(ID_A)])
+
+    viewers = env.fetch()["posts"][0]["viewers"]
+
+    assert viewers["total"] == 1200
+    assert viewers["types"] == [{"label": "Récurrents", "value": 0.4}, {"label": "Nouveaux", "value": 0.6},
+                                {"label": "Followers", "value": 0.25}, {"label": "Non followers", "value": 0.75}]
+    assert viewers["age"][0] == {"label": "18-24", "value": 0.5} and len(viewers["age"]) == 3
+    assert viewers["gender"] == [{"label": "Femme", "value": 0.35}, {"label": "Homme", "value": 0.65}]
+    assert viewers["locations"] == [{"label": "France", "value": 0.8}, {"label": "Belgique", "value": 0.2}]
+
+
+def test_the_engagement_tab_gives_likes_over_time_comment_words_and_shares(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [Post(ID_A)])
+
+    got = env.fetch()["posts"][0]
+
+    assert got["engagement"]["likes_over_time"] == [{"label": "30 sept.", "value": 40}, {"label": "1 oct.", "value": 45}]
+    assert got["engagement"]["comment_words"] == [{"label": "génial", "value": 5}, {"label": "clip", "value": 3}]
+    assert got["shares"] == 12 and got["engagement"]["shares"] == 12
+
+
+def test_a_tab_under_100_views_is_a_null_not_a_stop_but_a_tab_without_cards_or_notice_is_a_stop(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [Post(ID_A, viewers="unavailable")])
+    got = env.fetch()["posts"][0]
+    assert got["viewers"] is None and got["engagement"] is not None
+
+    broken = StatsEnv(tmp_path / "x", monkeypatch, [Post(ID_A, viewers=[])])
+    with pytest.raises(tiktok.TikTokStop) as stop:
+        broken.fetch()
+    assert stop.value.code == "element_missing" and "viewers_card" in stop.value.reason
+
+
+def test_an_unreadable_card_value_is_an_unexpected_page_stop_not_a_guess(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [Post(ID_A, cards=_cards(views="beaucoup"), row=_row(ID_A, views="5"))])
+
+    with pytest.raises(tiktok.TikTokStop) as stop:
+        env.fetch()
+
+    assert stop.value.code == "unexpected_page" and "views" in stop.value.reason
+    assert stop.value.capture is not None and stop.value.capture.is_file()
+
+
+def test_an_odd_card_is_an_unexpected_page_stop(tmp_path, monkeypatch):
+    labels = _sel()["viewers"]
+    env = StatsEnv(tmp_path, monkeypatch, [Post(ID_A, viewers=[_section(labels["age"], "18-24", "50%", "25-34")])])
+
+    with pytest.raises(tiktok.TikTokStop) as stop:
+        env.fetch()
+
+    assert stop.value.code == "unexpected_page" and "couples" in stop.value.reason
 
 
 @pytest.mark.parametrize("text,expected", [
@@ -1333,55 +1622,292 @@ def test_durations_are_converted_to_seconds(text, expected):
 
 
 @pytest.mark.parametrize("text,expected", [
-    ("1 200", 1200), ("1\u202f200", 1200), ("1,2 K", 1200), ("1.5M", 1500000), ("2,5 Md", 2500000000), ("987", 987),
+    ("1 200", 1200), ("1 200", 1200), ("1,2 K", 1200), ("1.5M", 1500000), ("2,5 Md", 2500000000), ("987", 987),
+    ("--", None),
 ])
-def test_counts_are_parsed_from_the_displayed_text(tmp_path, monkeypatch, text, expected):
-    env = StatsEnv(tmp_path, monkeypatch, {ID_A: _cards(views=text)})
-    assert env.fetch()["posts"][0]["views"] == expected
+def test_counts_are_parsed_from_the_displayed_text(text, expected):
+    assert tiktok.parse_count(text) == expected
 
 
-def test_an_unreadable_value_is_an_unexpected_page_stop_not_a_guess(tmp_path, monkeypatch):
-    env = StatsEnv(tmp_path, monkeypatch, {ID_A: _cards(views="beaucoup")})
-
-    with pytest.raises(tiktok.TikTokStop) as stop:
-        env.fetch()
-
-    assert stop.value.code == "unexpected_page" and "views" in stop.value.reason
-    assert stop.value.capture is not None and stop.value.capture.is_file()
+@pytest.mark.parametrize("text,expected", [
+    ("+12,5%", 12.5), ("-3 %", -3.0), ("−4%", -4.0), ("4%", 4.0), ("0%", 0.0), ("--", None), ("", None),
+])
+def test_evolutions_are_parsed_as_signed_percentages(text, expected):
+    assert tiktok.parse_change(text) == expected
 
 
-def test_the_report_is_written_atomically_and_linked_to_clips_by_post_id_and_url(tmp_path, monkeypatch):
-    env = StatsEnv(tmp_path, monkeypatch, {ID_A: _cards(), ID_B: _cards()}, clips=False)
-    env.clip("aaaaaaaaaaa", "01", post_id=ID_A)
-    env.clip("aaaaaaaaaaa", "02", url=f"https://www.tiktok.com/@ma_chaine/video/{ID_B}")
-    env.clip("bbbbbbbbbbb", "01", post_id=ID_C, account="autre")  # autre compte : jamais releve ici
+def test_an_unreadable_evolution_is_an_error():
+    with pytest.raises(ValueError):
+        tiktok.parse_change("beaucoup")
 
+
+# -- (2) l'historique : ajout horodate, jamais d'ecrasement
+
+
+def test_every_fetch_is_appended_to_the_account_history_and_never_overwrites(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [Post(ID_A, cards=_cards(views="10"))])
+    env.fetch()
+    first = {name: (env.folder / name).read_bytes() for name in env.files()}
+    env.page.posts[ID_A].cards = _cards(views="20")
+
+    env.fetch(now=NOW + timedelta(days=1))
+
+    assert len(env.files()) == 2 and tmp_path.joinpath("state/stats/tiktok/ma_chaine").is_dir()
+    assert all((env.folder / name).read_bytes() == data for name, data in first.items())  # le 1er releve est intact
+    history = tiktok.read_history("ma_chaine", config=env.config)
+    assert [s["fetched_at"] for s in history] == [NOW.isoformat(), (NOW + timedelta(days=1)).isoformat()]
+    assert [s["posts"][0]["views"] for s in history] == [10, 20]
+    assert not [p for p in env.folder.iterdir() if p.suffix == ".tmp"]  # aucun .tmp laisse
+
+
+def test_two_snapshots_with_the_same_timestamp_never_overwrite_each_other(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [Post(ID_A)])
+    env.fetch()
     env.fetch()
 
-    data = json.loads(env.path.read_text(encoding="utf-8"))
-    assert data["account"] == "ma_chaine" and data["fetched_at"] == NOW.isoformat() and data["error"] is None
-    linked = {(p["post_id"]): (p["video_id"], p["clip_id"]) for p in data["posts"]}
-    assert linked == {ID_A: ("aaaaaaaaaaa", "01"), ID_B: ("aaaaaaaaaaa", "02")}
-    assert ("goto", analytics_url(ID_C)) not in env.page.calls
-    assert not [p for p in env.path.parent.iterdir() if p.suffix == ".tmp"]  # aucun .tmp laisse
+    assert len(env.files()) == 2
+    assert len(tiktok.read_history("ma_chaine", config=env.config)) == 2
 
 
-def test_a_second_fetch_replaces_the_report(tmp_path, monkeypatch):
-    env = StatsEnv(tmp_path, monkeypatch, {ID_A: _cards(views="10")})
+def test_history_is_empty_without_a_fetch_and_a_corrupt_file_is_an_explicit_error(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [])
+    assert tiktok.read_history("ma_chaine", config=env.config) == []
+    env.folder.mkdir(parents=True)
+    (env.folder / "20261001T120000000000Z.json").write_text("{pas du json", encoding="utf-8")
+    with pytest.raises(tiktok.TikTokError, match="illisible"):
+        tiktok.read_history("ma_chaine", config=env.config)
+
+
+def _full(day, *, views=None, **posts):
+    """Un releve complet synthetique du jour ``day`` (1er octobre 2026 = jour 1) : ``views`` = vues de la tuile 7 jours."""
+    stamp = datetime(2026, 10, day, 12, 0, tzinfo=timezone.utc).isoformat()
+    labels = list(_sel()["tiles"])
+    overview = {str(n): {k: {"value": None if views is None else views * (n // 7) + i, "change_pct": 5.0 if k == "views" else None}
+                         for i, k in enumerate(labels)} for n in (7, 28, 60)}
+    return {"account": "ma_chaine", "fetched_at": stamp, "source": "tiktok_studio", "origin": "full",
+            "overview": overview, "posts": [{"post_id": pid, **fields} for pid, fields in posts.items()]}
+
+
+def _seed_history(env, *snapshots):
+    settings = tiktok.get_settings(env.config)
+    for snapshot in snapshots:
+        tiktok.append_snapshot("ma_chaine", settings, snapshot)
+
+
+def test_account_curves_are_computed_from_the_history_with_gaps_left_empty(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [])
+    _seed_history(env, _full(1, views=100), _full(2, views=110), _full(4, views=140), _full(10, views=200))
+
+    overview = tiktok.account_overview("ma_chaine", 7, config=env.config)
+
+    series = overview["series"]["views"]
+    assert series["labels"] == [f"2026-10-{d:02d}" for d in range(4, 11)]  # 7 jours finissant au dernier releve
+    assert series["values"] == [140, None, None, None, None, None, 200]  # jour sans releve : vide, jamais invente
+    # periode precedente = la meme courbe decalee de 7 jours : le 8/10 vaut le releve du 1/10, le 9/10 celui du 2/10
+    assert series["previous"] == [None, None, None, None, 100, 110, None]
+    assert overview["period"] == 7 and overview["snapshots"] == 4
+    assert overview["last_full_at"] == _full(10)["fetched_at"] and overview["fetched_at"] == _full(10)["fetched_at"]
+    assert set(overview["series"]) == set(_sel()["tiles"])
+
+
+def test_the_curve_of_a_longer_period_uses_the_matching_tile_of_each_snapshot(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [])
+    _seed_history(env, _full(1, views=100), _full(3, views=100))
+
+    series = tiktok.account_overview("ma_chaine", 28, config=env.config)["series"]["views"]
+
+    assert len(series["labels"]) == 28 and series["labels"][-1] == "2026-10-03"
+    assert [v for v in series["values"] if v is not None] == [400, 400]  # la tuile 28 jours de chaque releve
+
+
+def test_tile_evolutions_are_computed_from_the_history_next_to_the_one_given_by_tiktok(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [])
+    _seed_history(env, _full(1, views=100), _full(8, views=130))
+
+    tiles = tiktok.account_overview("ma_chaine", 7, config=env.config)["tiles"]
+
+    assert tiles["views"]["value"] == 130 and tiles["views"]["change_pct"] == 5.0  # celle de TikTok
+    assert tiles["views"]["history_change_pct"] == pytest.approx(30.0)  # (130 - 100) / 100 : releve d'il y a 7 jours
+    assert tiles["profile_views"]["history_change_pct"] == pytest.approx((131 - 101) / 101 * 100)
+
+
+def test_the_history_evolution_is_null_without_a_snapshot_one_period_earlier_or_a_zero_base(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [])
+    _seed_history(env, _full(3, views=100), _full(8, views=130))  # rien le 1er : pas de base
+    assert tiktok.account_overview("ma_chaine", 7, config=env.config)["tiles"]["views"]["history_change_pct"] is None
+
+    zero = StatsEnv(tmp_path / "z", monkeypatch, [])
+    _seed_history(zero, _full(1, views=0), _full(8, views=130))  # base nulle : jamais de division par zero
+    tiles = tiktok.account_overview("ma_chaine", 7, config=zero.config)["tiles"]
+    assert tiles["views"]["history_change_pct"] is None and tiles["profile_views"]["history_change_pct"] is not None
+
+
+def test_the_overview_is_empty_without_a_full_snapshot_and_an_unknown_period_is_refused(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [])
+    empty = tiktok.account_overview("ma_chaine", 28, config=env.config)
+    assert empty["tiles"] is None and empty["series"] is None and empty["fetched_at"] is None and empty["snapshots"] == 0
+    with pytest.raises(tiktok.TikTokError, match="période"):
+        tiktok.account_overview("ma_chaine", 14, config=env.config)
+
+
+def test_a_tile_never_shown_by_tiktok_stays_null_in_the_curve(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [])
+    _seed_history(env, _full(1))  # toutes les valeurs null
+
+    overview = tiktok.account_overview("ma_chaine", 7, config=env.config)
+
+    assert overview["tiles"]["views"]["value"] is None and set(overview["series"]["views"]["values"]) == {None}
+
+
+def test_posts_are_merged_oldest_to_newest_an_absent_key_keeps_the_old_value_but_a_null_replaces_it(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [])
+    _seed_history(env, _full(1, **{ID_A: {"views": 10, "viewers": {"total": 10}, "detailed_at": "x"}}),
+                  {**_full(2, **{ID_A: {"views": 15, "likes": 3}}), "origin": "opportunistic", "overview": None},
+                  _full(3, **{ID_B: {"views": None}}))
+
+    merged = tiktok.merged_posts(tiktok.read_history("ma_chaine", config=env.config))
+
+    assert merged[ID_A]["views"] == 15 and merged[ID_A]["likes"] == 3
+    assert merged[ID_A]["viewers"] == {"total": 10} and merged[ID_A]["detailed_at"] == "x"  # detail ancien conserve
+    assert merged[ID_A]["first_seen"].startswith("2026-10-01") and merged[ID_A]["last_seen"].startswith("2026-10-02")
+    assert merged[ID_B]["views"] is None
+
+
+def test_only_new_recent_or_processing_posts_are_read_in_detail(tmp_path, monkeypatch):
+    old = _row(ID_A, created="2026-08-01 10:00")  # ancien et complet : plus relu
+    recent = _row(ID_B, created="2026-09-30 10:00")  # moins de 7 jours : relu
+    env = StatsEnv(tmp_path, monkeypatch, [Post(ID_A, row=old), Post(ID_B, row=recent)])
     env.fetch()
-    env.page.cards = {ID_A: _cards(views="20")}
+    env.page.posts[ID_C] = Post(ID_C)
+    env.page.batches = [[ID_A, ID_B, ID_C]]
+    env.page.calls.clear()
+
+    snapshot = env.fetch(now=NOW + timedelta(hours=24))
+
+    overviews = [u for u in env.page.gotos() if u in (analytics_url(i) for i in (ID_A, ID_B, ID_C))]
+    assert overviews == [analytics_url(ID_B), analytics_url(ID_C)]
+    by_id = {p["post_id"]: p for p in snapshot["posts"]}
+    assert "detailed_at" not in by_id[ID_A] and by_id[ID_A]["views"] == 1200  # liste seule
+    merged = tiktok.merged_posts(tiktok.read_history("ma_chaine", config=env.config))
+    assert merged[ID_A]["viewers"]["total"] == 1200  # la vue fusionnee garde le detail du releve precedent
+
+
+def test_a_post_with_null_views_is_read_again_and_the_detail_count_is_capped(tmp_path, monkeypatch):
+    processing = _sel()["stats"]["processing"]
+    post = Post(ID_A, row=_row(ID_A, created="2026-08-01 10:00", views=processing), cards=_cards(views=processing))
+    env = StatsEnv(tmp_path, monkeypatch, [post])
     env.fetch()
-    assert json.loads(env.path.read_text(encoding="utf-8"))["posts"][0]["views"] == 20
+    env.page.calls.clear()
+    env.fetch(now=NOW + timedelta(days=1))
+    assert analytics_url(ID_A) in env.page.gotos()  # encore « en cours de traitement » : relu
+
+    capped = StatsEnv(tmp_path / "c", monkeypatch, [Post(ID_A), Post(ID_B), Post(ID_C)], settings={"stats_detail_max": 2})
+    snapshot = capped.fetch()
+    assert [p["post_id"] for p in snapshot["posts"] if "detailed_at" in p] == [ID_A, ID_B]
 
 
-def test_fetch_without_any_published_post_to_measure_is_an_explicit_error_before_the_browser(tmp_path, monkeypatch):
-    env = StatsEnv(tmp_path, monkeypatch, {}, clips=False)
-    env.opened = None
+# -- (3) liste des videos, fiche d'une video, liens (R3, R5)
 
-    with pytest.raises(tiktok.TikTokError, match="aucun post publié"):
-        env.fetch()
 
-    assert env.opened is None and env.page.calls == []
+def test_the_video_list_gives_each_post_with_its_clipper_link_or_outside_clipper(tmp_path, monkeypatch):
+    posts = [Post(ID_A, row=_row(ID_A, caption="Clip Clipper")), Post(ID_B, row=_row(ID_B, caption="À la main")),
+             Post(ID_C, row=_row(ID_C, caption="Par l'URL"))]
+    env = StatsEnv(tmp_path, monkeypatch, posts)
+    env.clip("vid1", "07", post_id=ID_A)
+    env.clip("vid2", "03", url=f"https://www.tiktok.com/@ma_chaine/video/{ID_C}")
+    env.clip("vid3", "01", post_id=ID_B, account="autre")  # un autre compte ne relie rien
+    env.fetch()
+
+    videos = {v["post_id"]: v for v in tiktok.list_videos("ma_chaine", config=env.config)}
+
+    assert videos[ID_A]["clip"] == {"video_id": "vid1", "clip_id": "07"} and videos[ID_A]["outside_clipper"] is False
+    assert videos[ID_C]["clip"] == {"video_id": "vid2", "clip_id": "03"}
+    assert videos[ID_B]["clip"] is None and videos[ID_B]["outside_clipper"] is True
+    assert videos[ID_A]["post_url"].endswith(ID_A) and videos[ID_A]["views"] == 1200
+    for key in ("caption", "posted_at", "visibility", "likes", "comments", "shares", "avg_watch_s", "watched_full", "processing"):
+        assert key in videos[ID_A]
+    assert "viewers" not in videos[ID_A]  # la liste reste legere : le detail est dans la fiche
+
+
+def _seed_videos(env):
+    rows = [("a", "Banane", "2026-09-01 10:00", 500, 5, 10.0, 0.5), ("b", "abricot", "2026-09-03 10:00", 100, 50, 30.0, 0.1),
+            ("c", "Cerise", "2026-09-02 10:00", None, None, None, None),
+            ("d", "Dattes #fruit", "2026-09-04 10:00", 900, 1, 20.0, 0.9)]
+    posts = [{"post_id": f"73{n}", "caption": cap, "posted_at": tiktok.parse_date(date, _sel()["calendar"]["months"]),
+              "views": views, "likes": likes, "avg_watch_s": avg, "watched_full": full, "visibility": "public",
+              "comments": 0, "shares": None}
+             for n, cap, date, views, likes, avg, full in rows]
+    _seed_history(env, {**_full(5), "posts": posts})
+
+
+@pytest.mark.parametrize("kwargs,expected", [
+    ({}, "dbca"),                                                # defaut : date de publication, la plus recente en premier
+    ({"sort": "posted_at", "descending": False}, "acbd"),
+    ({"sort": "views"}, "dabc"), ({"sort": "views", "descending": False}, "badc"),  # sans valeur : toujours en dernier
+    ({"sort": "likes"}, "badc"), ({"sort": "avg_watch_s"}, "bdac"), ({"sort": "watched_full"}, "dabc"),
+    ({"sort": "caption", "descending": False}, "bacd"), ({"sort": "caption"}, "dcab"),  # sans tenir compte de la casse
+    ({"query": "FRUIT"}, "d"), ({"query": "ban"}, "a"), ({"query": "zzz"}, ""), ({"query": "  "}, "dbca"),
+])
+def test_the_video_list_is_sortable_and_searchable(tmp_path, monkeypatch, kwargs, expected):
+    env = StatsEnv(tmp_path, monkeypatch, [])
+    _seed_videos(env)
+
+    got = tiktok.list_videos("ma_chaine", config=env.config, **kwargs)
+
+    assert "".join(v["post_id"][-1] for v in got) == expected
+
+
+def test_an_unknown_sort_column_is_an_explicit_error(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [])
+    with pytest.raises(tiktok.TikTokError, match="tri"):
+        tiktok.list_videos("ma_chaine", sort="couleur", config=env.config)
+
+
+def test_a_post_with_null_views_is_listed_as_processing(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [])
+    _seed_videos(env)
+    by_id = {v["post_id"][-1]: v for v in tiktok.list_videos("ma_chaine", config=env.config)}
+    assert by_id["c"]["processing"] is True and by_id["a"]["processing"] is False
+
+
+def test_the_video_sheet_gives_every_figure_the_links_and_the_history_of_the_post(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [Post(ID_A, cards=_cards(views="10"))])
+    env.clip("vid1", "07", post_id=ID_A)
+    env.fetch()
+    env.page.posts[ID_A].cards = _cards(views="20")
+    env.fetch(now=NOW + timedelta(days=1))
+
+    sheet = tiktok.video_detail("ma_chaine", ID_A, config=env.config)
+
+    assert sheet["post_id"] == ID_A and sheet["views"] == 20 and sheet["post_url"].endswith(ID_A)
+    assert sheet["clip"] == {"video_id": "vid1", "clip_id": "07"} and sheet["outside_clipper"] is False
+    assert sheet["viewers"]["total"] == 1200 and sheet["engagement"]["shares"] == 12
+    assert sheet["retention_curve"][1] == {"t_s": 5.0, "share": 0.63}
+    assert [h["views"] for h in sheet["history"]] == [10, 20]
+    assert [h["fetched_at"] for h in sheet["history"]] == [NOW.isoformat(), (NOW + timedelta(days=1)).isoformat()]
+    with pytest.raises(tiktok.TikTokError, match="introuvable"):
+        tiktok.video_detail("ma_chaine", "999", config=env.config)
+
+
+def test_a_post_published_outside_clipper_has_a_sheet_without_a_clip(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [Post(ID_B)])
+    env.fetch()
+
+    sheet = tiktok.video_detail("ma_chaine", ID_B, config=env.config)
+
+    assert sheet["clip"] is None and sheet["outside_clipper"] is True
+
+
+# -- (4) arret sur R4, compte, echecs
+
+
+def test_the_fetch_refuses_a_missing_account_and_the_api_backend(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [Post(ID_A)])
+    with pytest.raises(tiktok.TikTokError, match="compte"):
+        tiktok.fetch_stats("", config=env.config, opener=env.opener)
+    api = Config(mode="review", workspace_dir=tmp_path, output_dir=tmp_path, _sections={"tiktok": {"backend": "api"}})
+    with pytest.raises(tiktok.TikTokError, match="api"):
+        tiktok.fetch_stats("ma_chaine", config=api)
 
 
 @pytest.mark.parametrize("kwargs,code", [
@@ -1392,38 +1918,61 @@ def test_fetch_without_any_published_post_to_measure_is_an_explicit_error_before
     ({"redirect": "https://www.tiktok.com/erreur"}, "unexpected_page"),
 ])
 def test_r4_the_fetch_stops_safely_and_records_the_failure_keeping_the_last_report(tmp_path, monkeypatch, kwargs, code):
-    first = StatsEnv(tmp_path, monkeypatch, {ID_A: _cards()})
+    first = StatsEnv(tmp_path, monkeypatch, [Post(ID_A)])
     first.fetch()
-    env = StatsEnv(tmp_path, monkeypatch, {ID_A: _cards()}, **kwargs)
+    env = StatsEnv(tmp_path, monkeypatch, [Post(ID_A)], **kwargs)
 
     with pytest.raises(tiktok.TikTokStop) as stop:
-        tiktok.fetch_stats("ma_chaine", config=env.config, now=NOW + timedelta(hours=1), opener=env.opener,
-                           sleep=env.sleeps.append, rng=random.Random(1))
+        env.fetch(now=NOW + timedelta(hours=1))
 
     assert stop.value.code == code
     assert stop.value.capture is not None and stop.value.capture.is_file()
     assert env.page.clicks() == [] and env.page.fills() == []  # aucun clic, aucune saisie
-    data = json.loads(env.path.read_text(encoding="utf-8"))
-    assert data["fetched_at"] == NOW.isoformat() and data["posts"][0]["views"] == 1200  # dernier releve intact
-    assert data["error"]["code"] == code and data["error"]["reason"] == stop.value.reason
-    assert data["error"]["at"] == (NOW + timedelta(hours=1)).isoformat()
+    history = tiktok.read_history("ma_chaine", config=env.config)
+    assert [s["fetched_at"] for s in history] == [NOW.isoformat()]  # le dernier releve est intact, rien d'ajoute
+    error = tiktok.read_error("ma_chaine", config=env.config)
+    assert error["code"] == code and error["reason"] == stop.value.reason
+    assert error["at"] == (NOW + timedelta(hours=1)).isoformat() and error["capture"] == str(stop.value.capture)
+    assert len(list(env.folder.glob("*.error.json"))) == 1
     event = tiktok.read_events(config=env.config)[-1]
     assert event["level"] == "error" and event["account"] == "ma_chaine" and stop.value.reason in event["reason"]
     assert event["capture"] == str(stop.value.capture)
 
 
+def test_a_later_successful_fetch_clears_the_error(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [Post(ID_A)], detect=["captcha"])
+    with pytest.raises(tiktok.TikTokStop):
+        env.fetch()
+    assert tiktok.read_error("ma_chaine", config=env.config) is not None
+
+    env.page.present.clear()
+    env.fetch(now=NOW + timedelta(hours=1))
+
+    assert tiktok.read_error("ma_chaine", config=env.config) is None
+    assert len(list(env.folder.glob("*.error.json"))) == 1  # l'echec reste dans l'historique
+
+
 def test_r4_no_post_row_after_the_delay_is_an_element_missing_stop(tmp_path, monkeypatch):
-    env = StatsEnv(tmp_path, monkeypatch, {ID_A: _cards()}, rows=[])
+    env = StatsEnv(tmp_path, monkeypatch, [])
 
     with pytest.raises(tiktok.TikTokStop) as stop:
         env.fetch()
 
     assert stop.value.code == "element_missing" and "row" in stop.value.reason
-    assert json.loads(env.path.read_text(encoding="utf-8"))["error"]["code"] == "element_missing"
+    assert tiktok.read_error("ma_chaine", config=env.config)["code"] == "element_missing"
+
+
+def test_a_stop_in_the_middle_of_the_posts_writes_no_partial_snapshot(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [Post(ID_A), Post(ID_B, cards=_cards(views="beaucoup"))])
+
+    with pytest.raises(tiktok.TikTokStop):
+        env.fetch()
+
+    assert tiktok.read_history("ma_chaine", config=env.config) == []
 
 
 def test_a_missing_chrome_during_the_fetch_is_recorded_and_raised(tmp_path, monkeypatch):
-    env = StatsEnv(tmp_path, monkeypatch, {ID_A: _cards()})
+    env = StatsEnv(tmp_path, monkeypatch, [Post(ID_A)])
 
     @contextmanager
     def no_chrome(account, *, headless):
@@ -1433,20 +1982,11 @@ def test_a_missing_chrome_during_the_fetch_is_recorded_and_raised(tmp_path, monk
     with pytest.raises(browser.BrowserError):
         tiktok.fetch_stats("ma_chaine", config=env.config, now=NOW, opener=no_chrome)
 
-    assert "Chrome introuvable" in json.loads(env.path.read_text(encoding="utf-8"))["error"]["reason"]
+    assert "Chrome introuvable" in tiktok.read_error("ma_chaine", config=env.config)["reason"]
 
 
-def test_fetch_stats_refuses_a_missing_account_and_the_api_backend(tmp_path, monkeypatch):
-    env = StatsEnv(tmp_path, monkeypatch, {ID_A: _cards()})
-    with pytest.raises(tiktok.TikTokError, match="compte"):
-        tiktok.fetch_stats("", config=env.config, opener=env.opener)
-    api = Config(mode="review", workspace_dir=tmp_path, output_dir=tmp_path, _sections={"tiktok": {"backend": "api"}})
-    with pytest.raises(tiktok.TikTokError, match="api"):
-        tiktok.fetch_stats("ma_chaine", config=api)
-
-
-def test_stats_due_follows_the_interval_since_the_last_attempt_success_or_failure(tmp_path, monkeypatch):
-    env = StatsEnv(tmp_path, monkeypatch, {ID_A: _cards()})
+def test_stats_due_follows_the_interval_since_the_last_full_attempt_success_or_failure(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [Post(ID_A)])
     assert tiktok.stats_due("ma_chaine", config=env.config, now=NOW)  # jamais releve
 
     env.fetch()
@@ -1455,28 +1995,128 @@ def test_stats_due_follows_the_interval_since_the_last_attempt_success_or_failur
 
     env.page.present.add(_sel()["detect"]["captcha"][0])
     with pytest.raises(tiktok.TikTokStop):
-        tiktok.fetch_stats("ma_chaine", config=env.config, now=NOW + timedelta(hours=24), opener=env.opener,
-                           sleep=env.sleeps.append)
+        env.fetch(now=NOW + timedelta(hours=24))
     # l'echec compte comme une tentative : pas de nouvelle ouverture du navigateur avant l'intervalle
     assert not tiktok.stats_due("ma_chaine", config=env.config, now=NOW + timedelta(hours=30))
     assert tiktok.stats_due("ma_chaine", config=env.config, now=NOW + timedelta(hours=49))
 
 
-def test_stats_accounts_lists_accounts_with_a_post_to_measure_only(tmp_path, monkeypatch):
-    env = StatsEnv(tmp_path, monkeypatch, {}, clips=False)
-    env.clip("aaaaaaaaaaa", "01", post_id=ID_A)
-    env.clip("aaaaaaaaaaa", "02", post_id=None, url=None, state="scheduled_on_tiktok")  # pas d'adresse publique
-    env.clip("bbbbbbbbbbb", "01", post_id=ID_B, account="autre")
-    assert tiktok.stats_accounts(config=env.config) == ["autre", "ma_chaine"]
+def test_stats_due_ignores_opportunistic_snapshots(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [])
+    _seed_history(env, {**_full(1), "origin": "opportunistic", "overview": None})
+    assert tiktok.stats_due("ma_chaine", config=env.config, now=datetime(2026, 10, 1, 13, 0, tzinfo=timezone.utc))
 
 
-def test_read_stats_returns_none_without_a_report_and_refuses_a_corrupt_one(tmp_path, monkeypatch):
-    env = StatsEnv(tmp_path, monkeypatch, {}, clips=False)
-    assert tiktok.read_stats("ma_chaine", config=env.config) is None
-    env.path.parent.mkdir(parents=True)
-    env.path.write_text("{pas du json", encoding="utf-8")
-    with pytest.raises(tiktok.TikTokError, match="illisible"):
-        tiktok.read_stats("ma_chaine", config=env.config)
+# -- (5) releve opportuniste : la page Publications est deja affichee pour autre chose
+
+
+def _opportunistic_env(tmp_path, monkeypatch, rows=None):
+    env = Env(tmp_path, monkeypatch)
+    env.page.lists[_sel()["stats"]["row"]] = [_row(ID_A, caption="Ma legende #un #deux", views="1 200", likes="85",
+                                                   comments="7"), _row(ID_B, views="30", likes="2", comments="0")] if rows is None else rows
+    return env
+
+
+def _published_history(env):
+    return tiktok.read_history("ma_chaine", config=env.config)
+
+
+def test_a_finished_publication_reads_the_posts_list_on_the_page_and_appends_it_to_the_history(tmp_path, monkeypatch):
+    env = _opportunistic_env(tmp_path, monkeypatch)
+
+    result = env.publish()
+
+    assert result["state"] == "published" and result["post_id"] == ID_A  # la publication n'est pas touchee
+    history = _published_history(env)
+    assert len(history) == 1 and history[0]["origin"] == "opportunistic" and history[0]["overview"] is None
+    assert history[0]["fetched_at"] == NOW.isoformat()
+    posts = {p["post_id"]: p for p in history[0]["posts"]}
+    assert (posts[ID_A]["views"], posts[ID_A]["likes"], posts[ID_A]["comments"]) == (1200, 85, 7)
+    assert (posts[ID_B]["views"], posts[ID_B]["likes"], posts[ID_B]["comments"]) == (30, 2, 0)
+    assert "detailed_at" not in posts[ID_A] and "viewers" not in posts[ID_A]  # que ce que la page affiche
+
+
+def test_the_opportunistic_read_adds_no_navigation_and_no_click(tmp_path, monkeypatch):
+    (tmp_path / "plain").mkdir()
+    plain = Env(tmp_path / "plain", monkeypatch)
+    plain.publish()
+    env = _opportunistic_env(tmp_path, monkeypatch)
+
+    env.publish()
+
+    assert [c for c in env.page.calls if c[0] == "goto"] == [("goto", _sel()["urls"]["upload"])]
+    same = lambda page: [c for c in page.calls if c[0] != "upload"]  # le chemin du mp4 differe, rien d'autre
+    assert same(env.page) == same(plain.page)  # exactement les memes actions que sans releve
+    assert env.page.waits == plain.page.waits  # aucune attente en plus
+
+
+def test_the_opportunistic_read_happens_once_per_browser_session(tmp_path, monkeypatch):
+    env = _opportunistic_env(tmp_path, monkeypatch)
+    env.publish()
+    assert len(_published_history(env)) == 1
+
+
+def test_a_page_that_cannot_be_read_never_fails_the_publication_and_is_logged(tmp_path, monkeypatch, caplog):
+    broken = FakeRow({})  # une ligne sans lien de post
+    env = _opportunistic_env(tmp_path, monkeypatch, rows=[broken])
+
+    with caplog.at_level("WARNING"):
+        result = env.publish()
+
+    assert result["state"] == "published"
+    assert _published_history(env) == []
+    assert "relevé au passage impossible" in caplog.text
+
+
+def test_an_unreadable_value_on_the_page_is_not_a_stop_during_a_publication(tmp_path, monkeypatch):
+    env = _opportunistic_env(tmp_path, monkeypatch, rows=[_row(ID_A, views="beaucoup")])
+
+    result = env.publish()
+
+    assert result["state"] == "published" and _published_history(env) == []
+    assert not list((tmp_path / "state").rglob("*.png")) and not list(tmp_path.rglob("captures"))  # pas de capture
+
+
+def test_no_row_displayed_means_no_snapshot(tmp_path, monkeypatch):
+    env = _opportunistic_env(tmp_path, monkeypatch, rows=[])
+    env.publish()
+    assert _published_history(env) == []
+
+
+def test_any_visit_of_the_posts_page_with_the_robot_already_there_is_read_in_passing(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    page = FakeStudio([Post(ID_A), Post(ID_B)])
+    page.goto(_sel()["urls"]["stats"])  # la page Publications est deja affichee (verification de connexion...)
+    settings = tiktok.get_settings(None)
+    flow = tiktok._Flow(page, "ma_chaine", _sel(), settings, now=NOW, sleep=lambda s: None, rng=random.Random(1),
+                        on_tick=None, harvest=True)
+
+    flow.guard()
+    flow.guard()
+
+    config = Config(mode="review", workspace_dir=tmp_path, output_dir=tmp_path)
+    history = tiktok.read_history("ma_chaine", config=config)
+    assert len(history) == 1 and [p["post_id"] for p in history[0]["posts"]] == [ID_A, ID_B]
+    assert page.calls == [("goto", _sel()["urls"]["stats"])]  # aucune navigation ajoutee
+
+
+def test_a_full_fetch_does_not_also_write_an_opportunistic_snapshot(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [Post(ID_A)])
+    env.fetch()
+    assert [s["origin"] for s in tiktok.read_history("ma_chaine", config=env.config)] == ["full"]
+
+
+def test_opportunistic_posts_are_merged_into_the_video_list(tmp_path, monkeypatch):
+    env = _opportunistic_env(tmp_path, monkeypatch)
+    env.publish()
+
+    videos = {v["post_id"]: v for v in tiktok.list_videos("ma_chaine", config=env.config)}
+
+    assert videos[ID_A]["views"] == 1200 and videos[ID_B]["likes"] == 2
+    assert videos[ID_A]["avg_watch_s"] is None  # pas encore releve en detail : null explicite
+
+
+# -- selecteurs
 
 
 def test_stats_selectors_live_in_the_selectors_file_marked_to_verify():
@@ -1486,6 +2126,30 @@ def test_stats_selectors_live_in_the_selectors_file_marked_to_verify():
     for key in tiktok.REQUIRED_STATS_SELECTORS:
         assert data["stats"][key]
     assert text.count("A VERIFIER SUR LA VRAIE PAGE") >= 2  # un second marquage pour les pages de statistiques
+
+
+def test_the_account_page_selectors_and_labels_are_in_the_selectors_file():
+    data = _sel()
+    assert data["urls"]["analytics_account"] == "https://www.tiktok.com/tiktokstudio/analytics"
+    assert data["urls"]["analytics_viewers"].endswith("/{post_id}/viewers?qa_enter_from=analytics")
+    assert data["urls"]["analytics_engagement"].endswith("/{post_id}/engagement?qa_enter_from=analytics")
+    assert data["tiles"] == {"views": "Vues de la vidéo", "profile_views": "Vues du profil", "likes": "J'aime",
+                             "comments": "Commentaires", "shares": "Partages"}
+    assert "{days}" in data["account"]["period_label"] and "{days}" in data["account"]["period_option"]
+    assert data["stats"]["unavailable"] == ["dès 100 vues", "en cours de traitement"]
+    assert data["viewers"]["age"] == "Âge" and data["engagement"]["comment_words"].startswith("Mots les plus utilisés")
+
+
+@pytest.mark.parametrize("table,key", [("account", "tile"), ("tiles", "shares"), ("viewers", "locations"),
+                                       ("engagement", "likes_over_time")])
+def test_a_missing_account_or_tab_label_is_an_explicit_error(tmp_path, table, key):
+    text = SELECTORS.read_text(encoding="utf-8")
+    broken = text.replace(f"\n{key} = ", f"\n{key}_absent = ", 1)
+    assert broken != text
+    bad = tmp_path / "s.toml"
+    bad.write_text(broken, encoding="utf-8")
+    with pytest.raises(tiktok.TikTokError, match=rf"\[{table}\] {key}"):
+        tiktok.load_selectors(bad)
 
 
 def test_a_missing_stats_selector_is_an_explicit_error(tmp_path):

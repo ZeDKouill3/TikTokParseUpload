@@ -1190,6 +1190,21 @@ def test_a_broken_publish_file_is_logged_once_and_does_not_kill_the_worker(tmp_p
 # --------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _no_real_stats_fetch(monkeypatch):
+    """Un compte pret est releve par le worker (SPEC-86fe R4) : aucun test n'ouvre jamais le vrai navigateur,
+    ceux du releve injectent leur propre ``stats_fetcher``."""
+    monkeypatch.setattr(tiktok, "fetch_stats", lambda account, **kwargs: {"account": account})
+
+
+def _write_snapshot(tmp_path, account, at, origin="full"):
+    """Un releve de l'historique du compte (SPEC-86fe R2) : state/stats/tiktok/<compte>/<horodatage>.json."""
+    path = tmp_path / "state" / "stats" / "tiktok" / account / f"{at.strftime('%Y%m%dT%H%M%S%f')}Z.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"account": account, "fetched_at": at.isoformat(), "origin": origin, "overview": None,
+                                "posts": []}), encoding="utf-8")
+
+
 class FakeStatsFetcher:
     """Remplace tiktok.fetch_stats : enregistre les appels, ecrit un releve ou leve ``error``."""
 
@@ -1200,10 +1215,7 @@ class FakeStatsFetcher:
         self.calls.append({"account": account, "on_tick": on_tick})
         if self.error is not None:
             raise self.error
-        path = self.tmp / "state" / "stats" / "tiktok" / f"{account}.json"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"account": account, "fetched_at": datetime.now(timezone.utc).isoformat(),
-                                    "posts": [], "error": None}), encoding="utf-8")
+        _write_snapshot(self.tmp, account, datetime.now(timezone.utc))
         return {"account": account}
 
 
@@ -1220,9 +1232,9 @@ def _published_clip(tmp_path, clip_id, account=ACCOUNT, *, video_id="aaaaaaaaaaa
         "tiktok_post": {"url": LINK, "id": post_id, "state": "published", "account": account}}), encoding="utf-8")
 
 
-def test_tick_fetches_the_stats_of_an_account_with_a_published_post_then_waits_the_interval(tmp_path, monkeypatch):
+def test_tick_fetches_the_stats_of_a_ready_account_then_waits_the_interval(tmp_path, monkeypatch):
     config = _pub_env(tmp_path, monkeypatch)
-    _published_clip(tmp_path, "01")
+    _set_account_state(tmp_path, "ef34ab", ready_to_publish=False)
     fetcher = FakeStatsFetcher(tmp_path)
     w = _stats_worker(config, fetcher)
 
@@ -1235,11 +1247,8 @@ def test_tick_fetches_the_stats_of_an_account_with_a_published_post_then_waits_t
 
 def test_tick_refetches_once_the_configured_interval_has_passed(tmp_path, monkeypatch):
     config = _pub_env(tmp_path, monkeypatch, tiktok_settings={"stats_interval_h": 2})
-    _published_clip(tmp_path, "01")
-    old = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
-    path = tmp_path / "state" / "stats" / "tiktok" / f"{ACCOUNT}.json"
-    path.parent.mkdir(parents=True)
-    path.write_text(json.dumps({"account": ACCOUNT, "fetched_at": old, "posts": [], "error": None}), encoding="utf-8")
+    _set_account_state(tmp_path, "ef34ab", ready_to_publish=False)
+    _write_snapshot(tmp_path, ACCOUNT, datetime.now(timezone.utc) - timedelta(hours=3))
     fetcher = FakeStatsFetcher(tmp_path)
 
     _stats_worker(config, fetcher).tick()
@@ -1247,18 +1256,40 @@ def test_tick_refetches_once_the_configured_interval_has_passed(tmp_path, monkey
     assert len(fetcher.calls) == 1
 
 
-def test_tick_does_not_open_a_browser_for_an_account_with_nothing_to_measure(tmp_path, monkeypatch):
-    config = _pub_env(tmp_path, monkeypatch)
+def test_an_opportunistic_snapshot_does_not_postpone_the_periodic_fetch(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch, tiktok_settings={"stats_interval_h": 2})
+    _set_account_state(tmp_path, "ef34ab", ready_to_publish=False)
+    _write_snapshot(tmp_path, ACCOUNT, datetime.now(timezone.utc) - timedelta(minutes=5), origin="opportunistic")
     fetcher = FakeStatsFetcher(tmp_path)
 
     _stats_worker(config, fetcher).tick()
 
-    assert fetcher.calls == []
+    assert len(fetcher.calls) == 1
+
+
+def test_tick_does_not_open_a_browser_for_an_account_that_is_not_ready_to_publish(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    _set_account_state(tmp_path, ACCOUNT, ready_to_publish=False)
+    _set_account_state(tmp_path, "ef34ab", ready_to_publish=False)
+    fetcher = FakeStatsFetcher(tmp_path)
+
+    _stats_worker(config, fetcher).tick()
+
+    assert fetcher.calls == []  # SPEC-86fe R4 : un compte non prêt n'est pas relevé
+
+
+def test_a_ready_account_without_any_clipper_post_is_measured_too(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)  # aucun clip publie : la liste des posts vient de TikTok
+    fetcher = FakeStatsFetcher(tmp_path)
+
+    _stats_worker(config, fetcher).tick()
+
+    assert [c["account"] for c in fetcher.calls] == [ACCOUNT]
 
 
 def test_tick_skips_the_stats_of_an_account_halted_by_a_safe_stop(tmp_path, monkeypatch):
     config = _pub_env(tmp_path, monkeypatch, tiktok_settings={"max_posts_per_day": 5, "min_gap_minutes": 0})
-    _published_clip(tmp_path, "00", video_id="bbbbbbbbbbb")
+    _set_account_state(tmp_path, "ef34ab", ready_to_publish=False)
     _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1))
     w = worker.Worker(config=config, spawner=FakeSpawner(),
                       publisher=FakePublisher(error=tiktok.TikTokStop("captcha", "captcha détecté", None)),
@@ -1272,7 +1303,7 @@ def test_tick_skips_the_stats_of_an_account_halted_by_a_safe_stop(tmp_path, monk
 
 def test_tick_does_not_fetch_stats_in_the_tick_that_drove_a_publication(tmp_path, monkeypatch):
     config = _pub_env(tmp_path, monkeypatch, tiktok_settings={"max_posts_per_day": 5, "min_gap_minutes": 0})
-    _published_clip(tmp_path, "00", video_id="bbbbbbbbbbb")
+    _set_account_state(tmp_path, "ef34ab", ready_to_publish=False)
     _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1))
     fetcher = FakeStatsFetcher(tmp_path)
     pub = FakePublisher()
@@ -1286,8 +1317,6 @@ def test_tick_does_not_fetch_stats_in_the_tick_that_drove_a_publication(tmp_path
 
 def test_tick_fetches_one_account_per_iteration(tmp_path, monkeypatch):
     config = _pub_env(tmp_path, monkeypatch, channels=("ma_chaine", "autre"))
-    _published_clip(tmp_path, "01")
-    _published_clip(tmp_path, "02", account="ef34ab", video_id="bbbbbbbbbbb")
     fetcher = FakeStatsFetcher(tmp_path)
     w = _stats_worker(config, fetcher)
 
@@ -1305,7 +1334,7 @@ def test_tick_fetches_one_account_per_iteration(tmp_path, monkeypatch):
 def test_a_failed_stats_fetch_is_logged_once_not_retried_every_tick_and_never_kills_the_worker(
         tmp_path, monkeypatch, caplog, error):
     config = _pub_env(tmp_path, monkeypatch)
-    _published_clip(tmp_path, "01")
+    _set_account_state(tmp_path, "ef34ab", ready_to_publish=False)
     fetcher = FakeStatsFetcher(tmp_path, error=error)
     w = _stats_worker(config, fetcher)
 
@@ -1321,7 +1350,7 @@ def test_a_failed_stats_fetch_is_logged_once_not_retried_every_tick_and_never_ki
 
 def test_an_unexpected_error_in_the_stats_fetch_is_logged_not_fatal(tmp_path, monkeypatch, caplog):
     config = _pub_env(tmp_path, monkeypatch)
-    _published_clip(tmp_path, "01")
+    _set_account_state(tmp_path, "ef34ab", ready_to_publish=False)
     w = _stats_worker(config, FakeStatsFetcher(tmp_path, error=RuntimeError("boom")))
 
     with caplog.at_level(logging.ERROR):

@@ -399,10 +399,11 @@ class Worker:
         return False
 
     def _stats_due(self) -> None:
-        """Releve periodique des statistiques (SPEC-9225 R7) : un compte par iteration, jamais dans
-        l'iteration qui a pilote une publication (un seul pilotage du navigateur a la fois), jamais
-        pour un compte arrete (R4) ni sans post publie a mesurer. Un echec est journalise une fois et
-        n'est pas retente avant ``stats_interval_h`` (ADR-ad2e : jamais silencieux, jamais en boucle)."""
+        """Releve periodique des statistiques (SPEC-86fe R4) : un compte par iteration, jamais dans l'iteration
+        qui a pilote une publication (un seul pilotage du navigateur a la fois), seulement pour un compte
+        « pret a publier » (donc ni deconnecte ni arrete par R4 de SPEC-9225). La liste des posts vient de TikTok :
+        un compte sans clip publie par Clipper est releve aussi. Un echec est journalise une fois et n'est pas
+        retente avant ``stats_interval_h`` (ADR-ad2e : jamais silencieux, jamais en boucle)."""
         now = datetime.now(timezone.utc)
         try:
             settings = tiktok.get_settings(self.config)
@@ -410,7 +411,10 @@ class Worker:
             scope = {"state_dir": self.config.section("publish")["state_dir"],
                      "presets_dir": watch["presets_dir"], "base": watch["base_config"]}
             wait = timedelta(hours=float(settings["stats_interval_h"]))
-            for account in tiktok.stats_accounts(config=self.config):
+            for found in accounts_mod.list_accounts(self.config):
+                account = found["id"]
+                if not found["ready_to_publish"]:
+                    continue
                 tried = self._stats_attempts.get(account)
                 if tried is not None and now - tried < wait:
                     continue
@@ -425,7 +429,7 @@ class Worker:
         except Exception as exc:  # noqa: BLE001 - jamais un worker mort : l'echec est journalise une fois
             message = f"{type(exc).__name__} : {exc}" if not isinstance(
                 exc, (tiktok.TikTokError, browser.BrowserError, publish_mod.PublishError, channel_mod.ChannelError,
-                      ConfigError)) else str(exc)
+                      accounts_mod.AccountsError, ConfigError)) else str(exc)
             if message not in self._logged_stats_errors:
                 self._logged_stats_errors.add(message)
                 log.error("relevé des statistiques TikTok impossible : %s", message)

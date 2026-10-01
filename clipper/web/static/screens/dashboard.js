@@ -159,16 +159,170 @@ function dashKpis(data) {
     ["", "#/videos", "list-filter", "En file", dashKpi(waiting), ""],
     ["warn", "#/videos", "circle-pause", "À débloquer", dashKpi(blocked), ""],
     ["", "#/clips", "clapperboard", "Clips à valider", dashKpi(data.clips_to_review), ""],
-    ["", "#/stats", "coins", "LLM aujourd'hui", dashKpi(data.llm_cost ? data.llm_cost.today : null, dashMoney), ""],
+    ["", "#/dashboard", "coins", "LLM aujourd'hui", dashKpi(data.llm_cost ? data.llm_cost.today : null, dashMoney), ""],
   ];
   return `<div class="kpis">${cards.map(([cls, href, ic, label, value]) => `<a class="kpi ${cls}" href="${href}">
     <div class="kpi-label">${icon(ic)}${esc(label)}</div><div class="kpi-value">${esc(value)}</div></a>`).join("")}</div>`;
+}
+
+/* ---------- Mesures internes (ex-ecran Statistiques, SPEC-86fe R1) : couts du modele de langage, duree par etape,
+   videos par statut. Lit GET /api/measures?since=&until=&channel= ; rien de TikTok ici. ---------- */
+
+const DASH_PRESETS = [["7", "7 jours"], ["30", "30 jours"], ["90", "90 jours"], ["all", "Tout"]];
+const DASH_STATUS_LABELS = {
+  pending: "En attente", running: "En cours", awaiting_review: "À valider",
+  queued: "En file", done: "Terminées", failed: "En échec",
+};
+const DASH_NO_CHANNEL = "__none__"; // valeur de ?channel= pour « Sans chaine » (voir clipper/web/app.py)
+const dashMeasures = { data: null, error: null, loading: null, dirty: false, at: 0, preset: "30", since: "", until: "", channel: "" };
+const dashSeconds = (s) => (s >= 90 ? `${fr(s / 60, 1)} min` : `${fr(s, 1)} s`);
+
+function dashIso(date) {
+  const p = (n) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}-${p(date.getMonth() + 1)}-${p(date.getDate())}`;
+}
+
+/* Preset -> bornes (« Tout » = aucune borne, la periode reste ouverte). */
+function dashApplyPreset(preset) {
+  dashMeasures.preset = preset;
+  if (preset === "all") { dashMeasures.since = ""; dashMeasures.until = ""; return; }
+  const now = new Date();
+  dashMeasures.since = dashIso(new Date(now.getFullYear(), now.getMonth(), now.getDate() - (Number(preset) - 1)));
+  dashMeasures.until = dashIso(now);
+}
+dashApplyPreset(dashMeasures.preset);
+
+function loadMeasures() {
+  if (dashMeasures.loading) { dashMeasures.dirty = true; return dashMeasures.loading; }
+  const params = new URLSearchParams();
+  if (dashMeasures.since) params.set("since", dashMeasures.since);
+  if (dashMeasures.until) params.set("until", dashMeasures.until);
+  if (dashMeasures.channel) params.set("channel", dashMeasures.channel);
+  dashMeasures.loading = (async () => {
+    try {
+      dashMeasures.data = await api("/api/measures?" + params.toString());
+      dashMeasures.error = null;
+    } catch (err) {
+      dashMeasures.error = err;
+    } finally {
+      dashMeasures.loading = null;
+      dashMeasures.at = Date.now();
+    }
+    if (currentScreen === "dashboard") renderCurrent();
+    if (dashMeasures.dirty) { dashMeasures.dirty = false; loadMeasures(); }
+  })();
+  return dashMeasures.loading;
+}
+
+function dashKpiBlock(label, value, foot) {
+  return `<div class="kpi"><div class="kpi-label">${esc(label)}</div><div class="kpi-value">${value}</div><div class="kpi-foot">${esc(foot)}</div></div>`;
+}
+
+/* Barres horizontales : [libelle, valeur, texte de valeur]. */
+function dashBars(rows, emptyText) {
+  if (!rows.length) return `<p class="muted stats-empty">${esc(emptyText)}</p>`;
+  const max = Math.max(...rows.map((r) => r[1])) || 1;
+  return `<div class="stats-bars">${rows.map(([label, value, text]) => `
+    <div class="stats-bar"><span class="stats-bar-label">${esc(label)}</span>
+      <span class="stats-bar-track"><i style="width:${Math.max(2, Math.round((value / max) * 100))}%"></i></span>
+      <b class="num">${esc(text)}</b></div>`).join("")}</div>`;
+}
+
+/* Colonnes verticales par jour : [jour, valeur]. */
+function dashColumns(rows, emptyText) {
+  if (!rows.length) return `<p class="muted stats-empty">${esc(emptyText)}</p>`;
+  const max = Math.max(...rows.map((r) => r[1])) || 1;
+  return `<div class="stats-cols" role="img" aria-label="Coût par jour">${rows.map(([day, value]) => `
+    <div class="stats-col" title="${esc(day)} : ${esc(dashMoney(value))}"><i style="height:${Math.max(3, Math.round((value / max) * 100))}%"></i><span>${esc(day.slice(5))}</span></div>`).join("")}</div>`;
+}
+
+function dashMeasuresCost(data) {
+  const cost = data.llm_cost;
+  const unreported = cost.unreported_calls
+    ? `${cost.unreported_calls} appel${cost.unreported_calls > 1 ? "s" : ""} sans coût rapporté, non compté${cost.unreported_calls > 1 ? "s" : ""}`
+    : "tous les appels ont un coût rapporté";
+  const usages = Object.entries(cost.by_usage).sort((a, b) => b[1] - a[1]);
+  const videos = Object.entries(cost.by_video).sort((a, b) => b[1].cost - a[1].cost);
+  return `<section class="panel" data-block="llm"><div class="panel-head"><h2>Coûts du modèle de langage</h2><div class="right muted" style="font-size:12px">équivalent API</div></div>
+    <div class="panel-pad stats-cost">
+      ${dashKpiBlock("Total sur la période", `<span>${esc(fr(cost.total, 2))}</span><small>$</small>`, unreported)}
+      <div><div class="field-label">Par usage</div>${dashBars(usages.map(([u, v]) => [u, v, dashMoney(v)]), "Aucun appel sur cette période.")}</div>
+      <div><div class="field-label">Par jour</div>${dashColumns(Object.entries(cost.by_day), "Aucun appel sur cette période.")}</div>
+      <div><div class="field-label">Par vidéo</div>${videos.length
+        ? `<div class="table-scroll"><table class="table"><thead><tr><th>Vidéo</th><th class="r">Appels</th><th class="r">Coût</th></tr></thead><tbody>${videos.map(([id, v]) =>
+          `<tr><td class="mono">${esc(id)}</td><td class="r num">${esc(fr(v.calls))}${v.unreported_calls ? ` <span class="muted">(${esc(v.unreported_calls)} sans coût)</span>` : ""}</td><td class="r num">${esc(dashMoney(v.cost))}</td></tr>`).join("")}</tbody></table></div>`
+        : `<p class="muted stats-empty">Aucun appel sur cette période.</p>`}</div>
+    </div></section>`;
+}
+
+function dashMeasuresSteps(data) {
+  const rows = Object.entries(data.steps);
+  const bars = dashBars(rows.map(([name, s]) => [STEP_LABELS[name] || name, s.mean_s, `${dashSeconds(s.mean_s)} · dernière ${dashSeconds(s.last_s)}`]),
+    "Aucune vidéo terminée sur cette période : pas de durée à montrer.");
+  const total = rows.reduce((t, [, s]) => t + s.mean_s, 0);
+  const count = rows.length ? Math.max(...rows.map(([, s]) => s.count)) : 0;
+  return `<section class="panel" data-block="steps"><div class="panel-head"><h2>Durée par étape</h2><div class="right muted" style="font-size:12px">moyenne · dernière, vidéos terminées</div></div>
+    <div class="panel-pad">${bars}${rows.length ? `<p class="muted stats-note" style="padding:12px 0 0">Total moyen d'une vidéo : ${esc(dashSeconds(total))} (sur ${esc(count)} vidéo${count > 1 ? "s" : ""}).</p>` : ""}</div></section>`;
+}
+
+function dashMeasuresCounts(data) {
+  const chip = { pending: "pending", running: "running", awaiting_review: "review", queued: "queued", done: "done", failed: "failed" };
+  const total = Object.values(data.counts).reduce((t, n) => t + n, 0);
+  return `<section class="panel" data-block="counts"><div class="panel-head"><h2>Vidéos par statut</h2><div class="right muted" style="font-size:12px">${total} vidéo${total > 1 ? "s" : ""}</div></div>
+    <div class="panel-pad stats-counts">${Object.entries(data.counts).map(([status, n]) =>
+      `<div class="stats-count"><b class="num">${esc(fr(n))}</b><span class="chip ${chip[status] || "pending"}">${esc(DASH_STATUS_LABELS[status] || status)}</span></div>`).join("")}</div></section>`;
+}
+
+function dashMeasuresToolbar() {
+  const names = (store.channels || []).slice();
+  if (dashMeasures.channel && dashMeasures.channel !== DASH_NO_CHANNEL && !names.includes(dashMeasures.channel)) names.push(dashMeasures.channel);
+  const opt = (value, label) => `<option value="${esc(value)}"${dashMeasures.channel === value ? " selected" : ""}>${esc(label)}</option>`;
+  return `<div class="stats-toolbar">
+    <select class="input" data-measures-channel aria-label="Filtrer par chaîne">${opt("", "Toutes les chaînes")}${opt(DASH_NO_CHANNEL, "Sans chaîne")}${names.map((n) => opt(n, n)).join("")}</select>
+    <div class="seg stats-seg" role="group" aria-label="Période">${DASH_PRESETS.map(([id, label]) =>
+      `<button type="button" data-measures-preset="${id}" class="${dashMeasures.preset === id ? "on" : ""}">${label}</button>`).join("")}</div>
+    <div class="stats-range"><label>Du <input class="input" type="date" data-measures-since value="${esc(dashMeasures.since)}"></label>
+      <label>au <input class="input" type="date" data-measures-until value="${esc(dashMeasures.until)}"></label></div></div>`;
+}
+
+function dashMeasuresSection() {
+  const data = dashMeasures.data;
+  let content;
+  if (!data) {
+    content = dashMeasures.error
+      ? `<p class="reason bad">Mesures indisponibles : ${esc(dashMeasures.error.message || dashMeasures.error)}</p>`
+      : `<div class="skeleton skeleton-card"></div>`;
+  } else {
+    content = `<div class="stats-grid">${dashMeasuresCost(data)}${dashMeasuresSteps(data)}${dashMeasuresCounts(data)}</div>`;
+  }
+  return `<section data-section="measures" style="margin-top:32px">
+    <div class="section-title">${icon("chart-column")}Mesures internes</div>${dashMeasuresToolbar()}${content}</section>`;
+}
+
+function wireMeasures(body) {
+  const channel = $("[data-measures-channel]", body);
+  if (!channel) return;
+  channel.onchange = (e) => { dashMeasures.channel = e.target.value; loadMeasures(); };
+  $$("[data-measures-preset]", body).forEach((b) => (b.onclick = () => {
+    dashApplyPreset(b.dataset.measuresPreset);
+    renderCurrent();
+    loadMeasures();
+  }));
+  const onDates = () => {
+    dashMeasures.preset = "";
+    dashMeasures.since = $("[data-measures-since]", body).value;
+    dashMeasures.until = $("[data-measures-until]", body).value;
+    loadMeasures();
+  };
+  $("[data-measures-since]", body).onchange = onDates;
+  $("[data-measures-until]", body).onchange = onDates;
 }
 
 Screens.dashboard = {
   render(body, store) {
     const data = store.dashboard;
     if (Date.now() - dash.at > DASH_STALE_MS) loadDashboard();
+    if (Date.now() - dashMeasures.at > DASH_STALE_MS) loadMeasures();
     if (!data) {
       body.innerHTML = dash.error
         ? emptyState("circle-alert", "Chargement impossible", String(dash.error.message || dash.error))
@@ -201,7 +355,9 @@ Screens.dashboard = {
           ${dashSection("llm_cost", "coins", "Coût du modèle de langage", dashCostContent(data))}
           ${dashSection("hardware", "cpu", "Matériel", dashHardwareContent(data))}
         </div>
-      </div>`;
+      </div>
+      ${dashMeasuresSection()}`;
     wireWatch(body);
+    wireMeasures(body);
   },
 };
