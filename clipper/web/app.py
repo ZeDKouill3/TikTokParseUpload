@@ -37,7 +37,15 @@ from clipper import publish as publish_mod
 from clipper import reframe as reframe_mod
 from clipper import watch as watch_mod
 from clipper import worker as worker_mod
-from clipper.config import Config, ConfigError, _section_defaults, load_config
+from clipper.config import (
+    DEFAULTS as _CONFIG_FLAT_DEFAULTS,
+    VALID_MODES,
+    Config,
+    ConfigError,
+    _section_defaults,
+    load_config,
+    write_config,
+)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 # Video/clip ids sont soit des ids YouTube (11 caracteres alphanumeriques),
@@ -734,6 +742,158 @@ def _save_channel_preset(name: str, preset: dict[str, Any]) -> None:
 
 
 # --------------------------------------------------------------------------
+# Ecran Reglages (SPEC-c100 E8, ADR-4f6e §2 et §5) : config.toml en formulaire.
+# L'ecriture passe par config.write_config (relu par load_config avant le
+# remplacement atomique) ; le jeton [web] token n'est jamais lu ni ecrit par
+# l'interface : il se change dans le fichier, puis redemarrage.
+# --------------------------------------------------------------------------
+
+_SETTINGS_FLAT = tuple(_CONFIG_FLAT_DEFAULTS)
+_SETTINGS_SECTIONS = ("llm", "web", "worker")
+_SETTINGS_TOKEN_MASK = "•" * 8
+_SETTINGS_QUOTED = re.compile(r'"(?:[^"\\]|\\.)*"|\'[^\']*\'')
+
+
+def _settings_read_raw() -> tuple[dict[str, Any], bool, str]:
+    path = Path(_BASE_CONFIG)
+    if not path.is_file():
+        return {}, False, ""
+    try:
+        text = path.read_text(encoding="utf-8")
+        return tomllib.loads(text), True, text
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise HTTPException(status_code=422, detail=f"{_BASE_CONFIG} illisible : {exc}") from exc
+
+
+def _settings_has_comments(text: str) -> bool:
+    return any("#" in _SETTINGS_QUOTED.sub("", line) for line in text.splitlines())
+
+
+def _settings_without_token(web: dict[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in web.items() if k != "token"}
+
+
+def _settings_access(web_cfg: dict[str, Any]) -> dict[str, Any]:
+    """Acces tel que le serveur en cours l'applique (lecture seule) : l'hote et
+    le port ne changent qu'au redemarrage, le jeton n'est jamais renvoye."""
+    host, port, token = str(web_cfg["host"]), int(web_cfg["port"]), str(web_cfg["token"])
+    command = f"python -m clipper serve --port {port}"
+    if host != _LOOPBACK_HOST:
+        command = f"python -m clipper serve --host {host} --port {port}"
+    return {
+        "host": host, "port": port, "loopback": host == _LOOPBACK_HOST,
+        "token_set": bool(token), "token": _SETTINGS_TOKEN_MASK if token else None, "command": command,
+    }
+
+
+def _settings_detail(running_web: dict[str, Any]) -> dict[str, Any]:
+    """Valeurs effectives de config.toml (relu a chaque appel), brut du fichier
+    et CONFIG_DEFAULTS commentes des sections du formulaire."""
+    raw, exists, text = _settings_read_raw()
+    try:
+        config = load_config(_BASE_CONFIG) if exists else load_config()
+        effective: dict[str, Any] = {"mode": config.mode, "workspace_dir": str(config.workspace_dir),
+                                     "output_dir": str(config.output_dir)}
+        defaults: dict[str, Any] = {
+            "general": {k: {"default": v, "comment": ""} for k, v in _CONFIG_FLAT_DEFAULTS.items()},
+        }
+        from clipper import llm as llm_mod
+
+        for section in _SETTINGS_SECTIONS:
+            # [llm] est fusionne en profondeur avec ses defauts par clipper.llm : meme vue ici
+            effective[section] = llm_mod._settings(config) if section == "llm" else config.section(section)
+            defaults[section] = _defaults_documentation(section)
+    except ConfigError as exc:
+        raise HTTPException(status_code=422, detail=f"{_BASE_CONFIG} invalide : {exc}") from exc
+    file_web = effective["web"]
+    effective["web"] = _settings_without_token(file_web)
+    defaults["web"].pop("token", None)
+    if "web" in raw:
+        raw = {**raw, "web": _settings_without_token(raw["web"])}
+    restart = any(file_web[k] != running_web[k] for k in ("host", "port", "token"))
+    return {
+        "path": _BASE_CONFIG, "exists": exists, "comments_lost": _settings_has_comments(text),
+        "raw": raw, "effective": effective, "defaults": defaults,
+        "modes": list(VALID_MODES), "backends": list(llm_mod._BACKENDS),
+        "access": _settings_access(running_web), "restart_required": restart,
+    }
+
+
+def _settings_check_llm(llm: dict[str, Any]) -> None:
+    from clipper import llm as llm_mod
+
+    known = " | ".join(llm_mod._BACKENDS)
+
+    def backend(value: Any, where: str) -> None:
+        if value not in llm_mod._BACKENDS:
+            raise ConfigError(f"[llm] {where} : backend inconnu {value!r} (attendu : {known})")
+
+    if "backend" in llm:
+        backend(llm["backend"], "backend")
+    usages = llm.get("usages", {})
+    if not isinstance(usages, dict):
+        raise ConfigError("[llm] usages : table attendue")
+    for usage, table in usages.items():
+        if not isinstance(table, dict) or not all(isinstance(v, str) for v in table.values()):
+            raise ConfigError(f"[llm] usages.{usage} : table de textes attendue (backend, model)")
+        unknown = set(table) - {"backend", "model"}
+        if unknown:
+            raise ConfigError(f"[llm] usages.{usage} : cle(s) inconnue(s) {', '.join(sorted(unknown))}")
+        if "backend" in table:
+            backend(table["backend"], f"usages.{usage}.backend")
+    for key, value in llm.items():
+        if isinstance(_section_defaults("llm").get(key), dict) and key != "usages":
+            models = value.get("models", {}) if isinstance(value, dict) else None
+            if not isinstance(models, dict) or not all(isinstance(m, str) and m for m in models.values()):
+                raise ConfigError(f"[llm] {key}.models : table niveau -> nom de modele (textes non vides) attendue")
+
+
+def _settings_merge(raw: dict[str, Any], settings: dict[str, Any]) -> dict[str, Any]:
+    """Ce que le formulaire controle (mode, dossiers, [llm], [web], [worker])
+    remplace le fichier ; le reste (autres sections) et le jeton sont conserves."""
+    unknown = set(settings) - set(_SETTINGS_FLAT) - set(_SETTINGS_SECTIONS)
+    if unknown:
+        raise ConfigError(
+            f"{', '.join(sorted(unknown))} : non modifiable depuis les réglages "
+            f"(éditable : {', '.join((*_SETTINGS_FLAT, *_SETTINGS_SECTIONS))})"
+        )
+    for key in _SETTINGS_FLAT:
+        if key in settings and not (isinstance(settings[key], str) and settings[key].strip()):
+            raise ConfigError(f"{key} : texte non vide attendu, reçu {settings[key]!r}")
+    for section in _SETTINGS_SECTIONS:
+        if section in settings and not isinstance(settings[section], dict):
+            raise ConfigError(f"[{section}] : table attendue")
+    _check_preset_types({s: settings[s] for s in _SETTINGS_SECTIONS if s in settings})
+    web = settings.get("web", {})
+    if "token" in web:
+        raise ConfigError("[web] token : le jeton ne se modifie pas depuis l'interface (fichier + redémarrage)")
+    if "llm" in settings:
+        _settings_check_llm(settings["llm"])
+    port = web.get("port")
+    if port is not None and not 1 <= port <= 65535:
+        raise ConfigError(f"[web] port : entre 1 et 65535 attendu, reçu {port!r}")
+    data = {k: v for k, v in raw.items()}
+    for key in _SETTINGS_FLAT:
+        if key in settings:
+            data[key] = settings[key]
+    for section in _SETTINGS_SECTIONS:
+        if section in settings:
+            data[section] = dict(settings[section])
+    token = raw.get("web", {}).get("token", "")
+    if "web" in settings and token:
+        data["web"]["token"] = token
+    final_web = data.get("web", {})
+    if final_web.get("host", _section_defaults("web")["host"]) != _LOOPBACK_HOST and not final_web.get("token"):
+        raise ConfigError(
+            "[web] host hors bouclage : un jeton ([web] token) est exigé, à écrire dans config.toml "
+            "(sinon 'serve' refuserait de démarrer, ADR-4f6e §5)"
+        )
+    return data
+
+
+class SettingsBody(BaseModel):
+    settings: dict[str, Any]
+
 # Editeur d'agencement stream split (SPEC-c100 E5, SPEC-76dc) : memes cles et
 # memes validations que [reframe] (c'est reframe qui refuse, pas le JS).
 # L'image cle est un fichier deja produit par l'etape scenes.
@@ -1443,6 +1603,27 @@ def create_app(config: Config | None = None) -> FastAPI:
         os.replace(tmp, target)
         return {"name": name, "logo": f"{_PRESETS_DIR}/{name}.png"}
 
+    # ----------------------------------------------------------------
+    # Reglages (SPEC-c100 E8) : config.toml, relu a chaque requete
+    # ----------------------------------------------------------------
+
+    @app.get("/api/settings")
+    def get_settings() -> dict[str, Any]:
+        return _settings_detail(web_cfg)
+
+    @app.put("/api/settings")
+    def put_settings(body: SettingsBody) -> dict[str, Any]:
+        nonlocal config
+        raw, _exists, _text = _settings_read_raw()
+        try:
+            write_config(_BASE_CONFIG, _settings_merge(raw, body.settings))
+            config = load_config(_BASE_CONFIG)  # les entrees de file suivantes lisent le nouveau mode/backend
+        except ConfigError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=f"valeur non enregistrable : {exc}") from exc
+        app.state.config = config
+        return _settings_detail(web_cfg)
     @app.get("/api/channels/{name}/keyframe")
     def channel_keyframe(name: str, video_id: str | None = None) -> FileResponse:
         _channel_preset_path(name)
