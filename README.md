@@ -148,7 +148,7 @@ moitié activé.
   indisponible, quota, réseau) remet la vidéo en file d'attente au lieu
   d'abandonner ou de produire un résultat dégradé en silence.
 
-## Interface web (console de gestion v2)
+## Interface web : Console de gestion web (v2)
 
 `python -m clipper serve` lance la console (`http://127.0.0.1:8000`) et le
 worker qui traite une file de vidéos, une à la fois. Huit écrans : Accueil,
