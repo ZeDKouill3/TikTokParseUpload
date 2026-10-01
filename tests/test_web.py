@@ -2422,7 +2422,10 @@ PUB_NEXT_MON = "2026-10-12T18:30:00+02:00"
 
 
 def _publish_setup(tmp_path, entries=None, *, slots=True):
-    preset = ('[channel]\ndisplay_name = "Ma chaîne"\ntiktok_account = "@ma_chaine"\n'
+    (tmp_path / "state").mkdir(exist_ok=True)
+    (tmp_path / "state" / "accounts.json").write_text(
+        '{"accounts": [{"id": "ab12cd", "label": "Compte exemple", "platform": "TikTok"}]}', encoding="utf-8")
+    preset = ('[channel]\ndisplay_name = "Ma chaîne"\ntiktok_account = "ab12cd"\n'
               + ('slots = [{day = "mon", time = "18:30"}, {day = "thu", time = "12:00"}]\n' if slots else ""))
     _channels_setup(tmp_path, preset)
     _write_state(tmp_path, CLIPS_VIDEO, channel="ma_chaine")
@@ -2444,7 +2447,7 @@ def test_get_publish_returns_week_slots_with_clip_or_free(tmp_path, isolated_cwd
     assert resp.status_code == 200
     data = resp.json()
     assert data["channel"] == "ma_chaine" and data["timezone"] == "Europe/Paris"
-    assert data["tiktok_account"] == "@ma_chaine"
+    assert data["tiktok_account"] == "ab12cd"
     assert data["week_start"] == "2026-10-05" and data["week_end"] == "2026-10-11"
     assert [s["slot_at"] for s in data["slots"]] == [PUB_MON, PUB_THU]
     mon, thu = data["slots"]
@@ -4325,12 +4328,152 @@ def test_dashboard_lists_a_video_whose_worker_child_died(tmp_path, isolated_cwd)
 
 
 # --------------------------------------------------------------------------
+# TASK-e522 : navigateur par compte (SPEC-9225 R1) : etat du profil, « Se connecter »,
+# compte TikTok relie a la chaine. Aucun navigateur reel : clipper.browser est simule.
+# --------------------------------------------------------------------------
+
+BROWSER_ACCOUNT = "ab12cd"
+
+
+def _browser_setup(tmp_path):
+    (tmp_path / "state").mkdir(exist_ok=True)
+    (tmp_path / "state" / "accounts.json").write_text(
+        json.dumps({"accounts": [{"id": BROWSER_ACCOUNT, "label": "Compte exemple", "platform": "TikTok",
+                                  "username": "", "notes": "", "has_password": False}]}), encoding="utf-8")
+
+
+def local_client(tmp_path) -> TestClient:
+    return TestClient(create_app(config=make_config(tmp_path)), base_url="http://127.0.0.1:8000",
+                      client=("127.0.0.1", 50000))
+
+
+def test_accounts_list_carries_the_browser_profile_state(tmp_path, isolated_cwd):
+    _browser_setup(tmp_path)
+    c = local_client(tmp_path)
+
+    absent = c.get("/api/accounts").json()[0]
+    assert absent["browser"] == {"present": False, "modified_at": None}
+
+    profile = tmp_path / "state" / "browser" / BROWSER_ACCOUNT
+    profile.mkdir(parents=True)
+    (profile / "Local State").write_text("{}", encoding="utf-8")
+    present = c.get("/api/accounts").json()[0]
+    assert present["browser"]["present"] is True and present["browser"]["modified_at"]
+
+
+def test_get_account_browser_state_and_404(tmp_path, isolated_cwd):
+    _browser_setup(tmp_path)
+    c = local_client(tmp_path)
+
+    assert c.get(f"/api/accounts/{BROWSER_ACCOUNT}/browser").json() == {"present": False, "modified_at": None}
+    assert c.get("/api/accounts/inconnu/browser").status_code == 404
+
+
+def test_browser_login_route_opens_the_profile(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import browser
+
+    _browser_setup(tmp_path)
+    calls = []
+    monkeypatch.setattr(browser, "start_login", lambda account, url=None, **kw: calls.append((account, url)))
+    c = local_client(tmp_path)
+
+    resp = c.post(f"/api/accounts/{BROWSER_ACCOUNT}/browser/login", json={})
+    assert resp.status_code == 202 and resp.json()["account"] == BROWSER_ACCOUNT
+    resp = c.post(f"/api/accounts/{BROWSER_ACCOUNT}/browser/login", json={"url": "https://www.youtube.com"})
+    assert resp.status_code == 202
+
+    assert calls == [(BROWSER_ACCOUNT, None), (BROWSER_ACCOUNT, "https://www.youtube.com")]
+
+
+def test_browser_login_route_unknown_account_and_bad_body(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import browser
+
+    _browser_setup(tmp_path)
+    monkeypatch.setattr(browser, "start_login", lambda *a, **k: pytest.fail("ne doit pas s'ouvrir"))
+    c = local_client(tmp_path)
+
+    assert c.post("/api/accounts/inconnu/browser/login", json={}).status_code == 404
+    assert c.post(f"/api/accounts/{BROWSER_ACCOUNT}/browser/login", json={"url": 3}).status_code == 422
+    assert c.post(f"/api/accounts/{BROWSER_ACCOUNT}/browser/login", json={"autre": 1}).status_code == 422
+    assert c.post(f"/api/accounts/{BROWSER_ACCOUNT}/browser/login", json=[]).status_code == 422
+
+
+def test_browser_login_route_reports_browser_error_without_fallback(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import browser
+
+    _browser_setup(tmp_path)
+
+    def boom(*a, **k):
+        raise browser.BrowserError("Chrome est introuvable : playwright install chrome")
+
+    monkeypatch.setattr(browser, "start_login", boom)
+
+    resp = local_client(tmp_path).post(f"/api/accounts/{BROWSER_ACCOUNT}/browser/login", json={})
+
+    assert resp.status_code == 409
+    assert "playwright install chrome" in resp.json()["detail"]
+
+
+def test_browser_routes_keep_the_local_only_protections(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import browser
+
+    _browser_setup(tmp_path)
+    monkeypatch.setattr(browser, "start_login", lambda *a, **k: pytest.fail("ne doit pas s'ouvrir"))
+    path = f"/api/accounts/{BROWSER_ACCOUNT}/browser/login"
+
+    remote = TestClient(create_app(config=make_config(tmp_path)), base_url="http://127.0.0.1:8000",
+                        client=("192.168.1.20", 50000))
+    assert remote.post(path, json={}).status_code == 403
+    assert remote.get(f"/api/accounts/{BROWSER_ACCOUNT}/browser").status_code == 403
+
+    foreign = TestClient(create_app(config=make_config(tmp_path)), client=("127.0.0.1", 50000))
+    assert foreign.post(path, json={}, headers={"host": "evil.example.com"}).status_code == 403
+
+    assert local_client(tmp_path).post(path, content="{}", headers={"content-type": "text/plain"}).status_code == 415
+
+
+def test_channel_save_with_unknown_tiktok_account_is_refused(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path)
+    detail = client(tmp_path).get(f"/api/channels/{CH}").json()
+    preset = detail["raw"]
+    preset["channel"]["tiktok_account"] = "zz99"
+
+    resp = client(tmp_path).put(f"/api/channels/{CH}", json={"preset": preset})
+
+    assert resp.status_code == 422
+    assert "compte inconnu" in resp.json()["detail"]
+
+
+def test_channel_save_with_known_tiktok_account_is_accepted(tmp_path, isolated_cwd):
+    _browser_setup(tmp_path)
+    _channels_setup(tmp_path)
+    preset = client(tmp_path).get(f"/api/channels/{CH}").json()["raw"]
+    preset["channel"]["tiktok_account"] = BROWSER_ACCOUNT
+
+    resp = client(tmp_path).put(f"/api/channels/{CH}", json={"preset": preset})
+
+    assert resp.status_code == 200
+    assert resp.json()["effective"]["channel"]["tiktok_account"] == BROWSER_ACCOUNT
+
+
+def test_accounts_screen_has_the_browser_login_button_and_profile_state():
+    js = (STATIC / "screens" / "accounts.js").read_text(encoding="utf-8")
+
+    assert "Se connecter dans le navigateur" in js
+    assert "/browser/login" in js and "data-acc-browser-login" in js
+    assert "a.browser" in js and "Profil" in js and "absent" in js and "présent" in js
+    assert "modified_at" in js  # date du profil
+
+
+def test_channel_form_picks_the_linked_tiktok_account_from_the_accounts():
+    js = (STATIC / "screens" / "channels.js").read_text(encoding="utf-8")
+
+    assert '"tiktok_account"' in js and "/api/accounts" in js
+    assert "Compte TikTok" in js
+    assert "Aucun compte" in js  # option vide = aucun compte relie
 # TASK-4bfc : console v2, cinquième tour
 # --------------------------------------------------------------------------
 
-
-def _static(*parts: str) -> str:
-    return STATIC.joinpath(*parts).read_text(encoding="utf-8")
 
 
 def test_render_current_leaves_the_dom_alone_when_the_html_is_unchanged():

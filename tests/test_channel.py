@@ -287,3 +287,80 @@ def test_list_channels_raises_channel_error_naming_a_malformed_preset(isolated_c
 
     with pytest.raises(ChannelError, match="casse.toml"):
         list_channels(presets_dir)
+
+
+# --- TASK-e522 : [channel] tiktok_account valide contre clipper.accounts (SPEC-9225 R2) ---
+
+
+def _channel_with_account(isolated_cwd, account, accounts_json='{"accounts": [{"id": "ab12cd", "label": "Compte"}]}'):
+    (isolated_cwd / "config.toml").write_text('mode = "review"\n')
+    if accounts_json is not None:
+        (isolated_cwd / "state").mkdir(exist_ok=True)
+        (isolated_cwd / "state" / "accounts.json").write_text(accounts_json, encoding="utf-8")
+    presets = isolated_cwd / "presets"
+    presets.mkdir(exist_ok=True)
+    line = f'tiktok_account = "{account}"\n' if account is not None else ""
+    (presets / "ma_chaine.toml").write_text(f"[channel]\n{line}")
+
+
+def test_tiktok_account_empty_by_default_needs_no_accounts_file(isolated_cwd):
+    from clipper.channel import load_channel
+
+    _channel_with_account(isolated_cwd, None, accounts_json=None)
+
+    _config, channel = load_channel("ma_chaine")
+
+    assert channel["tiktok_account"] == ""
+
+
+def test_tiktok_account_known_account_is_accepted(isolated_cwd):
+    from clipper.channel import load_channel
+
+    _channel_with_account(isolated_cwd, "ab12cd")
+
+    _config, channel = load_channel("ma_chaine")
+
+    assert channel["tiktok_account"] == "ab12cd"
+
+
+def test_tiktok_account_unknown_account_is_a_config_error(isolated_cwd):
+    from clipper.channel import load_channel
+    from clipper.config import ConfigError
+
+    _channel_with_account(isolated_cwd, "zz99")
+
+    with pytest.raises(ConfigError, match=r"tiktok_account.*zz99.*compte inconnu"):
+        load_channel("ma_chaine")
+
+
+def test_tiktok_account_without_accounts_file_is_an_unknown_account(isolated_cwd):
+    from clipper.channel import load_channel
+    from clipper.config import ConfigError
+
+    _channel_with_account(isolated_cwd, "ab12cd", accounts_json=None)
+
+    with pytest.raises(ConfigError, match="compte inconnu"):
+        load_channel("ma_chaine")
+
+
+def test_tiktok_account_must_be_a_string(isolated_cwd):
+    from clipper.channel import load_channel
+    from clipper.config import ConfigError
+
+    (isolated_cwd / "config.toml").write_text('mode = "review"\n')
+    presets = isolated_cwd / "presets"
+    presets.mkdir()
+    (presets / "ma_chaine.toml").write_text("[channel]\ntiktok_account = 12\n")
+
+    with pytest.raises(ConfigError, match="tiktok_account"):
+        load_channel("ma_chaine")
+
+
+def test_tiktok_account_unreadable_accounts_file_is_a_config_error(isolated_cwd):
+    from clipper.channel import load_channel
+    from clipper.config import ConfigError
+
+    _channel_with_account(isolated_cwd, "ab12cd", accounts_json="pas du json")
+
+    with pytest.raises(ConfigError, match="tiktok_account"):
+        load_channel("ma_chaine")

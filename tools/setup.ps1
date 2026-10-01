@@ -77,6 +77,27 @@ if ($LASTEXITCODE -ne 0) {
     Fail "Une dependance du paquet clipper ne s'importe pas apres l'installation."
 }
 
+Write-Host "[setup] Verification de playwright (profils de navigateur, publier sur TikTok)..."
+& python -c "import playwright.sync_api"
+if ($LASTEXITCODE -ne 0) {
+    Fail "La dependance playwright ne s'importe pas : relance 'uv pip install -e .[test]' (elle est declaree dans pyproject.toml)."
+}
+
+# Chrome n'est necessaire que pour publier sur TikTok / exporter les cookies YouTube
+# (clipper browser login) : son absence n'arrete pas l'installation du pipeline, mais
+# elle est signalee clairement, jamais ignoree.
+$chromeCandidates = @(
+    (Join-Path $env:ProgramFiles "Google\Chrome\Application\chrome.exe"),
+    (Join-Path ${env:ProgramFiles(x86)} "Google\Chrome\Application\chrome.exe"),
+    (Join-Path $env:LOCALAPPDATA "Google\Chrome\Application\chrome.exe")
+)
+$chrome = $chromeCandidates | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+if ($chrome) {
+    Write-Host "[setup] Google Chrome : $chrome"
+} else {
+    Write-Host "[setup] ATTENTION : Google Chrome introuvable. Il est necessaire pour 'clipper browser login' (publier sur TikTok, cookies YouTube). Installe Google Chrome (https://www.google.com/chrome/) ou lance 'playwright install chrome', puis relance ce script." -ForegroundColor Yellow
+}
+
 Write-Host "[setup] Lancement de la suite de tests..."
 & pytest
 if ($LASTEXITCODE -ne 0) {

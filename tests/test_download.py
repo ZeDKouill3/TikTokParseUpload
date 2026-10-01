@@ -353,5 +353,112 @@ def test_config_section_download_resolves_via_clipper_config(isolated_cwd):
     assert config.section("download") == {
         "cookies_file": "cookies.txt",
         "cookies_from_browser": None,
+        "cookies_profile": "",
         "js_runtimes": "node",
     }
+
+
+# --- TASK-e522 : [download] cookies_profile (SPEC-9225 R8) ---
+
+
+def test_config_defaults_declares_cookies_profile_empty_by_default():
+    from clipper.download import CONFIG_DEFAULTS
+
+    assert CONFIG_DEFAULTS["cookies_profile"] == ""
+
+
+def test_download_without_cookies_profile_never_touches_the_browser(isolated_cwd, monkeypatch):
+    from clipper import browser
+    from clipper.download import download
+
+    monkeypatch.setattr(browser, "export_cookies", lambda *a, **k: pytest.fail("export inattendu"))
+    info = _load_fixture("info_dict_full.json")
+    captured_opts: dict = {}
+
+    download(f"https://youtu.be/{info['id']}", workspace_dir=isolated_cwd / "workspace",
+             ydl_factory=_make_fake_ydl(info, captured_opts))
+
+    assert "cookiefile" not in captured_opts
+
+
+def test_download_with_cookies_profile_exports_and_passes_the_file_to_ydl(isolated_cwd, monkeypatch):
+    from clipper import browser
+    from clipper.download import download
+
+    exported = isolated_cwd / "state" / "browser" / "yt01" / "cookies.txt"
+    calls = []
+
+    def fake_export(account, **kwargs):
+        calls.append(account)
+        return exported
+
+    monkeypatch.setattr(browser, "export_cookies", fake_export)
+    info = _load_fixture("info_dict_full.json")
+    captured_opts: dict = {}
+
+    download(f"https://youtu.be/{info['id']}", workspace_dir=isolated_cwd / "workspace",
+             cookies_profile="yt01", ydl_factory=_make_fake_ydl(info, captured_opts))
+
+    assert calls == ["yt01"]
+    assert captured_opts["cookiefile"] == str(exported)
+
+
+def test_cookies_profile_takes_priority_over_cookies_from_browser(isolated_cwd, monkeypatch):
+    from clipper import browser
+    from clipper.download import download
+
+    exported = isolated_cwd / "cookies.txt"
+    monkeypatch.setattr(browser, "export_cookies", lambda account, **k: exported)
+    info = _load_fixture("info_dict_full.json")
+    captured_opts: dict = {}
+
+    download(f"https://youtu.be/{info['id']}", workspace_dir=isolated_cwd / "workspace",
+             cookies_profile="yt01", cookies_from_browser="firefox",
+             ydl_factory=_make_fake_ydl(info, captured_opts))
+
+    assert captured_opts["cookiefile"] == str(exported)
+    assert "cookiesfrombrowser" not in captured_opts
+
+
+def test_cookies_profile_together_with_cookies_file_is_an_explicit_error(isolated_cwd, monkeypatch):
+    from clipper import browser
+    from clipper.download import DownloadError, download
+
+    monkeypatch.setattr(browser, "export_cookies", lambda *a, **k: pytest.fail("export inattendu"))
+    info = _load_fixture("info_dict_full.json")
+
+    with pytest.raises(DownloadError, match="cookies_profile.*cookies_file"):
+        download(f"https://youtu.be/{info['id']}", workspace_dir=isolated_cwd / "workspace",
+                 cookies_profile="yt01", cookies_file=isolated_cwd / "c.txt",
+                 ydl_factory=_make_fake_ydl(info, {}))
+
+
+def test_cookies_profile_export_failure_is_a_download_error_not_a_silent_fallback(isolated_cwd, monkeypatch):
+    from clipper import browser
+    from clipper.download import DownloadError, download
+
+    def boom(account, **kwargs):
+        raise browser.BrowserError("profil absent pour le compte yt01")
+
+    monkeypatch.setattr(browser, "export_cookies", boom)
+    info = _load_fixture("info_dict_full.json")
+
+    with pytest.raises(DownloadError, match="profil absent"):
+        download(f"https://youtu.be/{info['id']}", workspace_dir=isolated_cwd / "workspace",
+                 cookies_profile="yt01", cookies_from_browser="firefox",
+                 ydl_factory=_make_fake_ydl(info, {}))
+
+
+def test_cookies_profile_not_exported_when_video_already_downloaded(isolated_cwd, monkeypatch):
+    from clipper import browser
+    from clipper.download import download
+
+    monkeypatch.setattr(browser, "export_cookies", lambda *a, **k: pytest.fail("export inattendu"))
+    info = _load_fixture("info_dict_full.json")
+    video_dir = isolated_cwd / "workspace" / info["id"]
+    video_dir.mkdir(parents=True)
+    (video_dir / f"{info['id']}.mp4").write_bytes(b"x")
+    (video_dir / "meta.json").write_text("{}", encoding="utf-8")
+
+    assert download(f"https://youtu.be/{info['id']}", workspace_dir=isolated_cwd / "workspace",
+                    cookies_profile="yt01", ydl_factory=_make_fake_ydl(info, {})) == {}

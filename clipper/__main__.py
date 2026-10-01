@@ -65,6 +65,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("worker", help="Lance le worker seul (file state/queue.json, un enfant a la fois)")
 
+    p = sub.add_parser("browser", help="Profils de navigateur par compte (connexion manuelle)")
+    browser_sub = p.add_subparsers(dest="browser_command", required=True)
+    p = browser_sub.add_parser(
+        "login", help="Ouvre Chrome sur le profil du compte, page de connexion, et attend sa fermeture"
+    )
+    p.add_argument("account", help="Identifiant du compte (ecran Comptes de la console)")
+    p.add_argument("--url", default=None, help="Page a ouvrir (defaut : [browser] login_url, TikTok)")
+
     p = sub.add_parser("serve", help="Lance l'interface web (FastAPI ; 127.0.0.1 par defaut, --host exige un jeton)")
     p.add_argument(
         "--host", default=None,
@@ -232,7 +240,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "init":
         return _init(args.force)
 
-    from clipper import download, pipeline
+    from clipper import accounts, browser, download, pipeline
 
     try:
         config = load_config(args.config, base="config.toml") if args.config is not None else load_config()
@@ -260,6 +268,14 @@ def main(argv: list[str] | None = None) -> int:
             from clipper import worker as worker_mod
 
             worker_mod.Worker(config=config).loop()
+            return 0
+        elif args.command == "browser":
+            if args.account not in {a["id"] for a in accounts.list_accounts(config)}:
+                raise browser.BrowserError(
+                    f"compte inconnu : {args.account!r} (crée-le dans l'écran Comptes de la console)"
+                )
+            print(f"navigateur ouvert sur le profil de {args.account} : connecte-toi, puis ferme la fenêtre")
+            browser.login(args.account, args.url, config=config)
             return 0
         elif args.command == "serve":
             import uvicorn
@@ -293,7 +309,8 @@ def main(argv: list[str] | None = None) -> int:
             for state in states:
                 _report(state)
             return max((_exit_code(s) for s in states), default=0)
-    except (pipeline.PipelineError, ConfigError, download.DownloadError) as exc:
+    except (pipeline.PipelineError, ConfigError, download.DownloadError, browser.BrowserError,
+            accounts.AccountsError) as exc:
         print(f"erreur : {exc}", file=sys.stderr)
         return 1
 

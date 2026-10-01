@@ -34,6 +34,7 @@ from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
 from clipper import accounts as accounts_mod
+from clipper import browser as browser_mod
 from clipper import channel as channel_mod
 from clipper import gpu as gpu_mod
 from clipper import moments as moments_mod
@@ -1523,6 +1524,27 @@ def _accounts_call(fn, *args, **kwargs) -> Any:
         raise HTTPException(status_code=500, detail=str(exc)) from None
 
 
+def _browser_state(account_id: str) -> dict[str, Any]:
+    """Etat du profil de navigateur d'un compte : absent / present + date (SPEC-9225 R1)."""
+    try:
+        return browser_mod.profile_status(account_id)
+    except browser_mod.BrowserError as exc:
+        return {"present": False, "modified_at": None, "error": str(exc)}
+
+
+def _require_account(config: Config, account_id: str) -> None:
+    known = {a["id"] for a in _accounts_call(accounts_mod.list_accounts, config)}
+    if account_id not in known:
+        raise HTTPException(status_code=404, detail=f"compte introuvable : {account_id!r}")
+
+
+def _browser_login(config: Config, account_id: str, url: str | None) -> None:
+    try:
+        browser_mod.start_login(account_id, url, config=config)
+    except browser_mod.BrowserError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+
+
 def create_app(config: Config | None = None) -> FastAPI:
     config = config or load_config()
     web_cfg = config.section("web")
@@ -2007,7 +2029,8 @@ def create_app(config: Config | None = None) -> FastAPI:
 
     @app.get("/api/accounts")
     async def accounts_list() -> list[dict[str, Any]]:
-        return await run_in_threadpool(_accounts_call, accounts_mod.list_accounts, config)
+        listed = await run_in_threadpool(_accounts_call, accounts_mod.list_accounts, config)
+        return [{**a, "browser": _browser_state(a["id"])} for a in listed]
 
     @app.post("/api/accounts", status_code=201)
     async def accounts_add(request: Request) -> dict[str, Any]:
@@ -2041,6 +2064,24 @@ def create_app(config: Config | None = None) -> FastAPI:
     async def accounts_password(account_id: str) -> dict[str, str]:
         password = await run_in_threadpool(_accounts_call, accounts_mod.get_password, config, account_id)
         return {"password": password}
+
+    @app.get("/api/accounts/{account_id}/browser")
+    async def accounts_browser_state(account_id: str) -> dict[str, Any]:
+        await run_in_threadpool(_require_account, config, account_id)
+        return _browser_state(account_id)
+
+    @app.post("/api/accounts/{account_id}/browser/login", status_code=202)
+    async def accounts_browser_login(account_id: str, request: Request) -> dict[str, Any]:
+        await run_in_threadpool(_require_account, config, account_id)
+        raw = await request.body()
+        body = await _accounts_json(request) if raw.strip() else {}
+        if not isinstance(body, dict) or set(body) - {"url"}:
+            raise HTTPException(status_code=422, detail="corps invalide : un objet {\"url\": ...} facultatif est attendu")
+        url = body.get("url")
+        if url is not None and not isinstance(url, str):
+            raise HTTPException(status_code=422, detail="url : une chaîne est attendue")
+        await run_in_threadpool(_browser_login, config, account_id, url)
+        return {"account": account_id, "status": "opened"}
 
     @app.get("/api/events")
     def events_stream() -> StreamingResponse:
