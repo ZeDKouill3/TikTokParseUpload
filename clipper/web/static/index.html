@@ -1,94 +1,147 @@
 <!DOCTYPE html>
-<html lang="fr">
+<html lang="fr" data-theme="dark">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Clipper</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Clipper · Console</title>
+<meta name="theme-color" content="#0e0e0c">
 <link rel="icon" type="image/svg+xml" href="/static/logo.svg">
+<link rel="stylesheet" href="/static/fonts.css">
 <link rel="stylesheet" href="/static/style.css">
+<script>
+  // Theme avant le premier rendu : choix memorise, sinon preference du systeme.
+  (function () {
+    var t = null;
+    try { t = localStorage.getItem("clipper-theme"); } catch (e) { /* stockage indisponible */ }
+    if (t !== "light" && t !== "dark") {
+      t = window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+    }
+    document.documentElement.dataset.theme = t;
+  })();
+</script>
 </head>
 <body>
-<header>
-  <h1><img class="logo" src="/static/logo.svg" alt="" width="40" height="40">Clipper</h1>
-  <p class="tagline">Clips verticaux sous-titres, depuis une video YouTube ou une VOD Twitch</p>
-</header>
+<div class="app" id="app">
 
-<main>
-  <section id="submit-section">
-    <h2>Nouvelle video</h2>
-    <form id="submit-form">
-      <input type="url" id="submit-url" name="url" placeholder="https://www.youtube.com/watch?v=... ou https://www.twitch.tv/videos/..." required>
-      <button type="submit">Lancer le traitement</button>
-    </form>
-    <p id="submit-message" class="message" hidden></p>
-  </section>
+  <aside class="sidebar" aria-label="Navigation principale">
+    <a class="brand" href="#/dashboard">
+      <img src="/static/logo.svg" alt="" width="32" height="32">
+      <span class="brand-name">Clipper</span>
+      <span class="brand-env">local</span>
+    </a>
+    <nav class="nav" id="nav">
+      <div class="nav-group">Production</div>
+      <a href="#/dashboard" data-screen="dashboard"><span data-icon="layout-dashboard"></span><span>Tableau de bord</span><span class="count" data-count-for="dashboard" hidden></span></a>
+      <a href="#/videos" data-screen="videos"><span data-icon="film"></span><span>Vidéos</span><span class="count" data-count-for="videos" hidden></span></a>
+      <a href="#/review" data-screen="review"><span data-icon="sparkles"></span><span>Revue</span><span class="count" data-count-for="review" hidden></span></a>
+      <a href="#/clips" data-screen="clips"><span data-icon="clapperboard"></span><span>Clips</span><span class="count" data-count-for="clips" hidden></span></a>
+      <a href="#/publish" data-screen="publish"><span data-icon="send"></span><span>Publication</span><span class="count" data-count-for="publish" hidden></span></a>
+      <div class="nav-group">Configuration</div>
+      <a href="#/channels" data-screen="channels"><span data-icon="tv"></span><span>Chaînes</span><span class="count" data-count-for="channels" hidden></span></a>
+      <a href="#/stats" data-screen="stats"><span data-icon="chart-column"></span><span>Statistiques</span><span class="count" data-count-for="stats" hidden></span></a>
+      <a href="#/settings" data-screen="settings"><span data-icon="settings"></span><span>Réglages</span><span class="count" data-count-for="settings" hidden></span></a>
+    </nav>
+  </aside>
 
-  <section id="videos-section">
-    <h2>Videos</h2>
-    <ul id="videos-list"></ul>
-  </section>
-
-  <section id="detail-section" hidden>
-    <h2>Detail</h2>
-    <p id="detail-status"></p>
-    <ol id="detail-steps"></ol>
-
-    <div id="moments-block" hidden>
-      <h3>Moments proposes</h3>
-      <p class="hint">Acceptez, refusez ou ajustez le debut/la fin de chaque moment.</p>
-      <ul id="moments-list"></ul>
-      <button id="render-button" type="button">Lancer le rendu</button>
-      <p id="render-message" class="message" hidden></p>
-    </div>
-
-    <div id="clips-block" hidden>
-      <h3>Clips produits</h3>
-      <ul id="clips-list"></ul>
-    </div>
-  </section>
-</main>
-
-<template id="video-item-template">
-  <li class="video-item">
-    <button type="button" class="video-link"></button>
-    <span class="video-status"></span>
-  </li>
-</template>
-
-<template id="moment-item-template">
-  <li class="moment-item">
-    <video controls preload="metadata"></video>
-    <div class="moment-info">
-      <p class="moment-hook"></p>
-      <p class="moment-score">Score : <span class="score-value"></span></p>
-      <p class="moment-justification"></p>
-      <p class="moment-decision"></p>
-      <div class="moment-actions">
-        <button type="button" class="decide-accept">Accepter</button>
-        <button type="button" class="decide-reject">Refuser</button>
-        <details class="adjust-details">
-          <summary>Ajuster</summary>
-          <label>Debut (s) <input type="number" step="0.1" class="adjust-start"></label>
-          <label>Fin (s) <input type="number" step="0.1" class="adjust-end"></label>
-          <button type="button" class="decide-adjust">Valider l'ajustement</button>
-        </details>
+  <div class="main">
+    <header class="topbar">
+      <button class="icon-btn only-mobile" id="btn-menu" type="button" aria-label="Menu"><span data-icon="menu"></span></button>
+      <div class="crumbs" id="crumbs"><span class="cur" id="crumb-title">Tableau de bord</span></div>
+      <div class="top-actions">
+        <span class="live" id="live" title="Progression en temps réel"><span class="live-dot"></span><span class="live-label" id="live-label">En direct</span></span>
+        <button class="icon-btn" id="btn-theme" type="button" aria-label="Changer de thème"></button>
+        <button class="icon-btn notif-btn" id="btn-notif" type="button" aria-label="Notifications du navigateur" aria-pressed="false"><span data-icon="bell"></span></button>
+        <button class="btn btn-primary" id="btn-add" type="button"><span data-icon="plus"></span><span class="lbl">Ajouter une vidéo</span></button>
       </div>
-    </div>
-  </li>
-</template>
+    </header>
+    <div class="conn-banner" id="conn-banner" role="status" hidden><span data-icon="triangle-alert"></span>Connexion perdue : les données sont actualisées toutes les 5 secondes.</div>
 
-<template id="clip-item-template">
-  <li class="clip-item">
-    <video controls preload="metadata"></video>
-    <div class="clip-info">
-      <p class="clip-title"></p>
-      <p class="clip-caption"></p>
-      <p class="clip-hashtags"></p>
-      <p class="clip-qa"></p>
-    </div>
-  </li>
-</template>
+    <main class="view" id="view" tabindex="-1">
+    <section class="screen" id="screen-dashboard" data-title="Tableau de bord" hidden>
+      <div class="page-head reveal">
+        <div class="titles"><div class="eyebrow">Production</div><h1>Tableau de bord</h1><p class="sub">Ce qui tourne, ce qui attend et ce qui demande ta décision.</p></div>
+        <div class="actions" data-actions></div>
+      </div>
+      <div class="panel" data-body><div class="skeleton skeleton-line"></div><div class="skeleton skeleton-card"></div><div class="skeleton skeleton-card"></div></div>
+    </section>
+    <section class="screen" id="screen-videos" data-title="Vidéos" hidden>
+      <div class="page-head reveal">
+        <div class="titles"><div class="eyebrow">Production</div><h1>Vidéos</h1><p class="sub">Toutes les vidéos ajoutées, leur étape et leur statut.</p></div>
+        <div class="actions" data-actions></div>
+      </div>
+      <div class="panel" data-body><div class="skeleton skeleton-line"></div><div class="skeleton skeleton-card"></div><div class="skeleton skeleton-card"></div></div>
+    </section>
+    <section class="screen" id="screen-review" data-title="Revue des moments" hidden>
+      <div class="page-head reveal">
+        <div class="titles"><div class="eyebrow">Production</div><h1>Revue des moments</h1><p class="sub">Accepte, refuse ou ajuste les moments proposés avant le rendu.</p></div>
+        <div class="actions" data-actions></div>
+      </div>
+      <div class="panel" data-body><div class="skeleton skeleton-line"></div><div class="skeleton skeleton-card"></div></div>
+    </section>
+    <section class="screen" id="screen-clips" data-title="Clips" hidden>
+      <div class="page-head reveal">
+        <div class="titles"><div class="eyebrow">Production</div><h1>Clips</h1><p class="sub">Les clips rendus, prêts à valider et à publier.</p></div>
+        <div class="actions" data-actions></div>
+      </div>
+      <div class="panel" data-body><div class="skeleton skeleton-line"></div><div class="skeleton skeleton-card"></div></div>
+    </section>
+    <section class="screen" id="screen-publish" data-title="Publication" hidden>
+      <div class="page-head reveal">
+        <div class="titles"><div class="eyebrow">Production</div><h1>Publication</h1><p class="sub">La file des clips approuvés et les créneaux de la semaine.</p></div>
+        <div class="actions" data-actions></div>
+      </div>
+      <div class="panel" data-body><div class="skeleton skeleton-line"></div><div class="skeleton skeleton-card"></div></div>
+    </section>
+    <section class="screen" id="screen-channels" data-title="Chaînes" hidden>
+      <div class="page-head reveal">
+        <div class="titles"><div class="eyebrow">Configuration</div><h1>Chaînes</h1><p class="sub">Les presets de chaîne : source, agencement, titres et sous-titres.</p></div>
+        <div class="actions" data-actions></div>
+      </div>
+      <div class="panel" data-body><div class="skeleton skeleton-line"></div><div class="skeleton skeleton-card"></div></div>
+    </section>
+    <section class="screen" id="screen-stats" data-title="Statistiques" hidden>
+      <div class="page-head reveal">
+        <div class="titles"><div class="eyebrow">Configuration</div><h1>Statistiques</h1><p class="sub">Résultats des clips, coûts du modèle de langage et durée des étapes.</p></div>
+        <div class="actions" data-actions></div>
+      </div>
+      <div class="panel" data-body><div class="skeleton skeleton-line"></div><div class="skeleton skeleton-card"></div></div>
+    </section>
+    <section class="screen" id="screen-settings" data-title="Réglages" hidden>
+      <div class="page-head reveal">
+        <div class="titles"><div class="eyebrow">Configuration</div><h1>Réglages</h1><p class="sub">La configuration globale et l'accès à la console.</p></div>
+        <div class="actions" data-actions></div>
+      </div>
+      <div class="panel" data-body><div class="skeleton skeleton-line"></div><div class="skeleton skeleton-card"></div></div>
+    </section>
+    </main>
+  </div>
 
+  <nav class="tabbar" id="tabbar" aria-label="Navigation mobile">
+    <a href="#/dashboard" data-screen="dashboard"><span data-icon="layout-dashboard"></span><span>Accueil</span><span class="count" data-count-for="dashboard" hidden></span></a>
+    <a href="#/videos" data-screen="videos"><span data-icon="film"></span><span>Vidéos</span><span class="count" data-count-for="videos" hidden></span></a>
+    <a href="#/review" data-screen="review"><span data-icon="sparkles"></span><span>Revue</span><span class="count" data-count-for="review" hidden></span></a>
+    <a href="#/clips" data-screen="clips"><span data-icon="clapperboard"></span><span>Clips</span><span class="count" data-count-for="clips" hidden></span></a>
+    <a href="#/publish" data-screen="publish"><span data-icon="send"></span><span>Publication</span><span class="count" data-count-for="publish" hidden></span></a>
+  </nav>
+</div>
+
+<div class="token-view" id="token-view" hidden>
+  <form class="panel token-card" id="token-form" autocomplete="off">
+    <img src="/static/logo.svg" alt="" width="40" height="40">
+    <h1>Accès protégé</h1>
+    <p class="muted">Saisis le jeton d'accès de la console. Il est gardé dans un cookie de ce navigateur.</p>
+    <div class="field"><label for="token-input">Jeton d'accès</label><input class="input" id="token-input" name="token" type="password" required autocomplete="off"></div>
+    <p class="token-error" id="token-error" role="alert"></p>
+    <button class="btn btn-primary" type="submit">Entrer</button>
+  </form>
+</div>
+
+<div class="toasts" id="toasts" aria-live="polite"></div>
+<div class="overlay" id="overlay" hidden></div>
+
+<script src="/static/icons.js"></script>
+<script src="/static/ui.js"></script>
+<script src="/static/screens.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>

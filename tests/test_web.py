@@ -37,8 +37,8 @@ def test_serve_static_index_page(tmp_path, isolated_cwd):
     resp = client(tmp_path).get("/")
     assert resp.status_code == 200
     assert "text/html" in resp.headers["content-type"]
-    assert "<form" in resp.text
-    assert 'id="submit-form"' in resp.text
+    assert '<html lang="fr"' in resp.text
+    assert 'id="app"' in resp.text
 
 
 # --------------------------------------------------------------------------
@@ -478,13 +478,13 @@ def test_logo_is_served_as_standalone_svg(tmp_path, isolated_cwd):
     assert "href" not in resp.text and "font" not in resp.text
 
 
-def test_index_declares_logo_as_icon_and_shows_it_in_header(tmp_path, isolated_cwd):
+def test_index_declares_logo_as_icon_and_shows_it_in_the_brand(tmp_path, isolated_cwd):
     html = client(tmp_path).get("/").text
     assert '<link rel="icon" type="image/svg+xml" href="/static/logo.svg">' in html
-    header = html[html.index("<header>"):html.index("</header>")]
-    assert 'src="/static/logo.svg"' in header
-    assert 'alt=""' in header
-    assert "Clipper" in header
+    brand = html[html.index('<a class="brand"'):html.index("</a>", html.index('<a class="brand"'))]
+    assert 'src="/static/logo.svg"' in brand
+    assert 'alt=""' in brand
+    assert "Clipper" in brand
 
 
 # --------------------------------------------------------------------------
@@ -871,3 +871,192 @@ def test_loopback_host_requires_no_token(tmp_path, isolated_cwd):
     resp = test_client.get("/api/videos")
 
     assert resp.status_code == 200
+
+
+# --------------------------------------------------------------------------
+# M : coquille de la page v2 (SPEC-c100 T2..T8, TASK-f753) - verifications
+# statiques des fichiers servis ; le JS n'est pas execute ici.
+# --------------------------------------------------------------------------
+
+import re
+from html.parser import HTMLParser
+
+SCREENS = ["dashboard", "videos", "review", "clips", "channels", "publish", "stats", "settings"]
+TAB_SCREENS = ["dashboard", "videos", "review", "clips", "publish"]
+STATIC = Path(__file__).resolve().parent.parent / "clipper" / "web" / "static"
+
+
+def served(tmp_path, path: str) -> str:
+    resp = client(tmp_path).get(path)
+    assert resp.status_code == 200, path
+    return resp.text
+
+
+def test_index_has_navigation_to_the_eight_screens(tmp_path, isolated_cwd):
+    html = served(tmp_path, "/")
+    nav = html[html.index('<nav class="nav"'):html.index("</nav>", html.index('<nav class="nav"'))]
+    for screen in SCREENS:
+        assert f'href="#/{screen}"' in nav, screen
+        assert f'data-screen="{screen}"' in nav, screen
+        assert f'id="screen-{screen}"' in html, screen
+
+
+def test_index_has_a_mobile_tab_bar(tmp_path, isolated_cwd):
+    html = served(tmp_path, "/")
+    assert 'name="viewport"' in html
+    tabbar = html[html.index('<nav class="tabbar"'):html.index("</nav>", html.index('<nav class="tabbar"'))]
+    for screen in TAB_SCREENS:
+        assert f'href="#/{screen}"' in tabbar, screen
+    css = served(tmp_path, "/static/style.css")
+    assert ".tabbar" in css and "@media (max-width: 900px)" in css
+    assert "44px" in css  # zones de toucher (T6)
+
+
+def test_app_js_listens_to_sse_and_reloads_the_targeted_object(tmp_path, isolated_cwd):
+    js = served(tmp_path, "/static/app.js")
+    assert 'new EventSource("/api/events")' in js
+    for needle in ("JSON.parse(", "event.kind", "event.id", "/api/videos/${", "setInterval(", "POLL_MS = 5000"):
+        assert needle in js, needle
+    html = served(tmp_path, "/")
+    assert 'id="conn-banner"' in html and "connexion perdue" in html.lower()
+    assert "conn-banner" in js and "onerror" in js
+
+
+def test_app_js_notifies_on_video_status_changes(tmp_path, isolated_cwd):
+    js = served(tmp_path, "/static/app.js")
+    for status in ("done", "failed", "awaiting_review", "queued"):
+        assert status in js
+    assert "Notification" in js
+
+
+def _api_calls(js: str) -> list[tuple[str, str]]:
+    calls = []
+    for m in re.finditer(r"""api\(\s*["`](/api[^"`?]*)[^"`]*["`]\s*(?:,\s*\{\s*method:\s*"(\w+)")?""", js):
+        calls.append((m.group(2) or "GET", re.sub(r"\$\{[^}]*\}", "x", m.group(1))))
+    return calls
+
+
+def test_every_route_called_by_app_js_exists_in_the_app(tmp_path, isolated_cwd):
+    app = create_app(config=make_config(tmp_path))
+    js = "".join(p.read_text(encoding="utf-8") for p in sorted(STATIC.glob("*.js")))
+    calls = _api_calls(js)
+    assert len(calls) >= 6, calls
+    missing = []
+    for method, path in calls:
+        ok = any(
+            getattr(route, "path_regex", None) is not None
+            and route.path_regex.match(path)
+            and method in (getattr(route, "methods", None) or set())
+            for route in app.routes
+        )
+        if not ok:
+            missing.append(f"{method} {path}")
+    assert missing == []
+
+
+def test_toasts_with_undo_and_confirm_modal(tmp_path, isolated_cwd):
+    js = "".join(served(tmp_path, f"/static/{n}") for n in ("ui.js", "app.js"))
+    assert "function toast(" in js and "data-undo" in js and "Annuler" in js
+    assert "UNDO_MS = 5000" in js
+    assert "function confirmDialog(" in js and 'role", "dialog"' in js
+    html = served(tmp_path, "/")
+    assert 'id="toasts"' in html and 'id="overlay"' in html
+    css = served(tmp_path, "/static/style.css")
+    assert ".toast" in css and ".modal" in css
+
+
+def test_theme_follows_system_with_remembered_toggle(tmp_path, isolated_cwd):
+    html = served(tmp_path, "/")
+    js = served(tmp_path, "/static/app.js")
+    assert 'id="btn-theme"' in html
+    assert "prefers-color-scheme" in html and "prefers-color-scheme" in js
+    assert "localStorage" in html and "localStorage" in js
+    assert "data-theme" in html or "dataset.theme" in html
+    css = served(tmp_path, "/static/style.css")
+    assert ':root[data-theme="light"]' in css and ':root[data-theme="dark"]' in css
+
+
+def test_token_page_sets_cookie_and_replays_on_401(tmp_path, isolated_cwd):
+    html = served(tmp_path, "/")
+    js = served(tmp_path, "/static/app.js")
+    assert 'id="token-view"' in html and 'id="token-form"' in html and 'type="password"' in html
+    assert "clipper_token" in js and "document.cookie" in js
+    assert "401" in js and "askToken(" in js
+    # rejoue la requete apres saisie du jeton
+    assert js.count("fetch(") >= 1 and "return api(" in js
+
+
+class _TextAndLinks(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.text: list[str] = []
+        self.urls: list[str] = []
+        self._skip = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style"):
+            self._skip += 1
+        for k, v in attrs:
+            if k in ("src", "href", "srcset", "action") and v:
+                self.urls.append(v)
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style") and self._skip:
+            self._skip -= 1
+
+    def handle_data(self, data):
+        if not self._skip and data.strip():
+            self.text.append(data.strip())
+
+
+def test_no_external_resource_in_index_and_css(tmp_path, isolated_cwd):
+    html = served(tmp_path, "/")
+    parser = _TextAndLinks()
+    parser.feed(html)
+    external = [u for u in parser.urls if re.match(r"(?i)(https?:)?//", u)]
+    assert external == []
+    for name in ("style.css", "fonts.css"):
+        css = served(tmp_path, f"/static/{name}")
+        assert not re.search(r"(?i)https?://|@import|url\(\s*['\"]?//", css), name
+    # les polices sont des fichiers locaux servis, sous licence libre citee
+    fonts = served(tmp_path, "/static/fonts.css")
+    files = re.findall(r"url\(([^)]+\.woff2)\)", fonts)
+    assert files
+    for f in files:
+        assert f.startswith("/static/fonts/")
+        assert client(tmp_path).get(f).status_code == 200, f
+    licences = served(tmp_path, "/static/fonts/LICENSES.txt")
+    for name in ("Barlow", "JetBrains Mono", "OFL"):
+        assert name in licences
+
+
+def test_visible_strings_are_french_and_no_real_names(tmp_path, isolated_cwd):
+    html = served(tmp_path, "/")
+    parser = _TextAndLinks()
+    parser.feed(html)
+    visible = " ".join(parser.text)
+    for english in ("Loading", "Submit", "Cancel", "Dashboard", "Settings", "Save", "Search", "Connection lost"):
+        assert english not in visible, english
+    assert "Tableau de bord" in visible and "Réglages" in visible and "Chaînes" in visible
+    forbidden = ("contre-pied", "contrepied", "amelia", "zedk", "nicoc", "twitch.tv/", "youtube.com/@")
+    for path in sorted(STATIC.rglob("*")):
+        if path.suffix in {".html", ".css", ".js", ".txt", ".svg"}:
+            text = path.read_text(encoding="utf-8").lower()
+            for word in forbidden:
+                assert word not in text, f"{word!r} dans {path.name}"
+    assert "ma_chaine" in served(tmp_path, "/static/screens.js")
+
+
+def test_loading_skeletons_and_empty_states(tmp_path, isolated_cwd):
+    html = served(tmp_path, "/")
+    assert 'class="skeleton' in html
+    css = served(tmp_path, "/static/style.css")
+    assert ".skeleton" in css
+    screens = served(tmp_path, "/static/screens.js")
+    assert "Ajoute une vidéo" in screens and "Crée une chaîne" in screens
+
+
+def test_static_assets_are_served(tmp_path, isolated_cwd):
+    for name in ("app.js", "ui.js", "icons.js", "screens.js", "style.css", "fonts.css", "logo.svg"):
+        assert client(tmp_path).get(f"/static/{name}").status_code == 200, name
+    assert not (STATIC / "data.js").exists()

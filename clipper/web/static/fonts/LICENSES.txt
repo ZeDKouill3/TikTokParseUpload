@@ -1,0 +1,11 @@
+Polices embarquées (fichiers locaux, aucune ressource externe)
+
+- Barlow et Barlow Condensed (The Barlow Project Authors, Jeremy Tribby)
+  Licence SIL Open Font License 1.1 (OFL) — https://openfontlicense.org
+- JetBrains Mono (The JetBrains Mono Project Authors)
+  Licence SIL Open Font License 1.1 (OFL) — https://openfontlicense.org
+
+Icônes (icons.js) : Lucide, licence ISC.
+
+Les polices sont redistribuées sans modification, sous la licence OFL 1.1 :
+elles ne sont pas vendues seules et conservent leur nom d'origine.
