@@ -5,7 +5,7 @@ slug: console-v2-corrections-apr-s-le-premier-tour-min
 title: "console v2 : corrections après le premier tour (miniatures des clips, nouvelle chaîne, ANSI, VRAM, durées d'étapes)"
 created: 2026-10-01T10:26:40Z
 author: nicoc@zedk_ordi
-status: open
+status: in_progress
 scope:
   - clipper/web/app.py
   - clipper/web/static/**
@@ -23,7 +23,7 @@ criteria_by: creator
 verify: [tests]
 method: tdd
 schema: 4
-version: 1
+version: 2
 ---
 
 Premier tour de la console v2 avec l'utilisateur (2026-10-01) : la galerie Clips fait ramer le navigateur (105 balises video préchargées) ; le bouton Nouvelle chaîne n'ouvre rien ; les erreurs yt-dlp s'affichent avec leurs codes couleur ANSI ; le panneau Matériel lit la VRAM via torch (non installé) ; la fiche vidéo affiche 0 s pour les étapes déjà faites.
