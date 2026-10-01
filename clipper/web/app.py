@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import csv
 import importlib
 import inspect
 import json
@@ -30,6 +31,7 @@ from pydantic import BaseModel
 
 from clipper import channel as channel_mod
 from clipper import gpu as gpu_mod
+from clipper import outcomes as outcomes_mod
 from clipper import pipeline
 from clipper import publish as publish_mod
 from clipper import watch as watch_mod
@@ -745,6 +747,237 @@ def _png_from_multipart(content_type: str, body: bytes) -> bytes:
     raise HTTPException(status_code=422, detail="champ « file » absent de l'envoi multipart")
 
 
+# ----------------------------------------------------------------
+# Statistiques (SPEC-c100 E7, TASK-7d86)
+# ----------------------------------------------------------------
+
+_STATS_STEP_ORDER = tuple(pipeline.STEPS)
+
+
+def _stats_bound(name: str, value: str | None, *, end_of_day: bool) -> datetime | None:
+    """Borne de periode « AAAA-MM-JJ » ou horodatage ISO 8601 (UTC si sans fuseau)."""
+    if not value:
+        return None
+    try:
+        bound = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"date invalide pour {name} : {value!r} (attendu AAAA-MM-JJ ou horodatage ISO 8601)",
+        ) from exc
+    if end_of_day and len(value) == 10:
+        bound = bound.replace(hour=23, minute=59, second=59, microsecond=999999)
+    return bound if bound.tzinfo else bound.replace(tzinfo=timezone.utc)
+
+
+def _stats_period(since: str | None, until: str | None) -> tuple[datetime | None, datetime | None]:
+    lower = _stats_bound("since", since, end_of_day=False)
+    upper = _stats_bound("until", until, end_of_day=True)
+    if lower is not None and upper is not None and lower > upper:
+        raise HTTPException(status_code=422, detail=f"periode inversee : since={since!r} est apres until={until!r}")
+    return lower, upper
+
+
+def _stats_in_period(stamp: str | None, lower: datetime | None, upper: datetime | None, where: str) -> bool:
+    if lower is None and upper is None:
+        return True
+    if not stamp:
+        raise HTTPException(status_code=500, detail=f"horodatage absent ({where}) : impossible de le placer dans la periode")
+    try:
+        moment = datetime.fromisoformat(stamp)
+    except ValueError as exc:
+        raise HTTPException(status_code=500, detail=f"horodatage illisible ({where}) : {stamp!r}") from exc
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return (lower is None or moment >= lower) and (upper is None or moment <= upper)
+
+
+def _stats_read_jsonl(path: Path) -> list[dict[str, Any]]:
+    if not path.is_file():
+        return []
+    entries = []
+    for number, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not raw.strip():
+            continue
+        try:
+            entries.append(json.loads(raw))
+        except ValueError as exc:
+            raise HTTPException(status_code=500, detail=f"{path.name} ligne {number} illisible : {exc}") from exc
+    return entries
+
+
+def _stats_outcomes(config: Config) -> list[dict[str, Any]]:
+    path = Path(str(config.section("outcomes")["journal_path"]))
+    try:
+        return outcomes_mod.read(path)
+    except (ValueError, KeyError, TypeError) as exc:
+        raise HTTPException(status_code=500, detail=f"{path.name} illisible : {exc}") from exc
+
+
+def _stats_clips(config: Config, lower: datetime | None, upper: datetime | None) -> dict[str, Any]:
+    """Un element par sidecar de output/ cree dans la periode, joint aux resultats
+    d'outcomes (qa du sidecar, decision humaine, mesure de plateforme la plus
+    recente). Le CSV de plateforme ne porte que ``clip_id`` : une mesure n'est
+    rattachee que si un seul clip porte cet id, sinon elle est rendue a part
+    (``stats_unmatched``) avec la raison, jamais attribuee au hasard."""
+    journal = _stats_outcomes(config)
+    feedback_path = Path(str(config.section("feedback")["journal_path"]))
+    decisions: dict[tuple[str, Any], str] = {}
+    for entry in _stats_read_jsonl(feedback_path):
+        try:
+            decisions[(entry["video_id"], entry["moment"]["id"])] = entry["decision"]
+        except (KeyError, TypeError) as exc:
+            raise HTTPException(status_code=500, detail=f"{feedback_path.name} : entree sans video_id/moment/decision ({exc})") from exc
+    results: dict[tuple[Any, Any], Any] = {}
+    measures: dict[str, list[tuple[str, int, dict[str, Any]]]] = {}
+    for index, entry in enumerate(journal):
+        if entry.get("kind") == "result":
+            if entry.get("human_decision") is not None:
+                results[(entry["video_id"], entry["clip_id"])] = entry["human_decision"]
+        elif entry.get("kind") == "stats":
+            stats = entry["stats"]
+            measures.setdefault(entry["clip_id"], []).append((str(stats.get("date")), index, stats))
+
+    root = Path(config.output_dir)
+    sidecars: list[tuple[str, str, dict[str, Any]]] = []
+    for video_dir in sorted(p for p in root.iterdir() if p.is_dir()) if root.is_dir() else []:
+        for path in sorted(video_dir.glob("*.json")):
+            sidecar = _read_clip_sidecar(config, video_dir.name, path.stem)
+            sidecars.append((video_dir.name, path.stem, sidecar))
+    holders: dict[str, int] = {}
+    for _, clip_id, _ in sidecars:
+        holders[clip_id] = holders.get(clip_id, 0) + 1
+
+    clips = []
+    for video_id, clip_id, sidecar in sidecars:
+        if not _stats_in_period(sidecar.get("created_at"), lower, upper, f"sidecar {video_id}/{clip_id}"):
+            continue
+        qa = sidecar.get("qa") or {}
+        moment_id = sidecar.get("moment_id")
+        decision, source = results.get((video_id, clip_id)), "outcomes"
+        if decision is None:
+            decision, source = decisions.get((video_id, moment_id)), "feedback"
+        found = measures.get(clip_id) if holders[clip_id] == 1 else None
+        clips.append({
+            "video_id": video_id, "clip_id": clip_id, "moment_id": moment_id,
+            "channel": _channel_of(video_id, config), "screen_title": sidecar.get("screen_title"),
+            "created_at": sidecar.get("created_at"),
+            "qa_status": qa.get("status"), "issues": qa.get("issues"),
+            "human_decision": decision, "decision_source": source if decision is not None else None,
+            "stats": max(found)[2] if found else None,
+        })
+    unmatched = []
+    for clip_id in sorted(measures):
+        if holders.get(clip_id, 0) == 1:
+            continue
+        reason = (f"le clip {clip_id} existe dans plusieurs vidéos : le CSV n'a pas de video_id"
+                  if holders.get(clip_id) else f"aucun clip {clip_id} dans {config.output_dir}")
+        unmatched.append({"clip_id": clip_id, "reason": reason, "stats": max(measures[clip_id])[2]})
+    return {"clips": clips, "stats_unmatched": unmatched}
+
+
+def _stats_llm_cost(config: Config, lower: datetime | None, upper: datetime | None) -> dict[str, Any]:
+    """Couts de workspace/*/llm_usage.jsonl dans la periode : par video, par usage
+    et par jour (UTC) ; les appels sans cout rapporte sont comptes a part."""
+    cost: dict[str, Any] = {"total": 0.0, "unreported_calls": 0, "by_video": {}, "by_usage": {}, "by_day": {}}
+    root = Path(config.workspace_dir)
+    for path in sorted(root.glob("*/llm_usage.jsonl")) if root.is_dir() else []:
+        video_id = path.parent.name
+        for number, entry in enumerate(_stats_read_jsonl(path), start=1):
+            where = f"{video_id}/{path.name} ligne {number}"
+            stamp = entry.get("recorded_at") or entry.get("timestamp")
+            if not _stats_in_period(stamp, lower, upper, where):
+                continue
+            try:
+                usage = entry["usage"]
+                day = datetime.fromisoformat(stamp).astimezone(timezone.utc).date().isoformat()
+            except (KeyError, TypeError, ValueError) as exc:
+                raise HTTPException(status_code=500, detail=f"{where} : {exc}") from exc
+            video = cost["by_video"].setdefault(video_id, {"cost": 0.0, "calls": 0, "unreported_calls": 0})
+            video["calls"] += 1
+            amount = entry.get("cost_usd")
+            if amount is None:
+                video["unreported_calls"] += 1
+                cost["unreported_calls"] += 1
+                continue
+            video["cost"] += amount
+            cost["total"] += amount
+            cost["by_usage"][usage] = cost["by_usage"].get(usage, 0.0) + amount
+            cost["by_day"][day] = cost["by_day"].get(day, 0.0) + amount
+    cost["by_day"] = dict(sorted(cost["by_day"].items()))
+    return cost
+
+
+def _stats_steps_and_counts(config: Config, lower: datetime | None, upper: datetime | None) -> dict[str, Any]:
+    """Videos dont ``updated_at`` tombe dans la periode : comptes par statut, et
+    duree moyenne / derniere (fin la plus recente) de chaque etape sur les videos done."""
+    counts = {status: 0 for status in _VIDEO_STATUSES}
+    samples: dict[str, list[tuple[str, float]]] = {}
+    for state in _list_states(config):
+        video_id = state.get("video_id", "?")
+        if not _stats_in_period(state.get("updated_at"), lower, upper, f"pipeline.json de {video_id}"):
+            continue
+        status = state.get("status")
+        if status not in counts:
+            raise HTTPException(status_code=500, detail=f"statut inconnu {status!r} dans le pipeline.json de {video_id}")
+        counts[status] += 1
+        if status != "done":
+            continue
+        for name, seconds in _step_durations(state).items():
+            if seconds is not None:
+                samples.setdefault(name, []).append((state["steps"][name]["finished_at"], seconds))
+    steps = {}
+    for name in sorted(samples, key=lambda n: _STATS_STEP_ORDER.index(n) if n in _STATS_STEP_ORDER else len(_STATS_STEP_ORDER)):
+        durations = [seconds for _, seconds in samples[name]]
+        steps[name] = {"mean_s": sum(durations) / len(durations),
+                       "last_s": max(samples[name], key=lambda s: _parse_ts("?", name, "finished_at", s[0]))[1],
+                       "count": len(durations)}
+    return {"steps": steps, "counts": counts}
+
+
+def _stats(config: Config, since: str | None, until: str | None) -> dict[str, Any]:
+    lower, upper = _stats_period(since, until)
+    return {"period": {"since": since or None, "until": until or None},
+            **_stats_clips(config, lower, upper),
+            "llm_cost": _stats_llm_cost(config, lower, upper),
+            **_stats_steps_and_counts(config, lower, upper)}
+
+
+def _stats_csv_from_multipart(content_type: str, body: bytes) -> bytes:
+    """Contenu du champ « file » d'un POST multipart (stdlib, sans dependance)."""
+    if not content_type.lower().startswith("multipart/form-data"):
+        raise HTTPException(status_code=422, detail="envoi multipart/form-data attendu (champ « file », fichier CSV)")
+    message = BytesParser(policy=_EMAIL_HTTP).parsebytes(
+        b"Content-Type: " + content_type.encode("latin-1") + b"\r\n\r\n" + body)
+    for part in message.iter_parts() if message.is_multipart() else []:
+        if part.get_param("name", header="content-disposition") == "file":
+            return part.get_payload(decode=True) or b""
+    raise HTTPException(status_code=422, detail="champ « file » absent de l'envoi multipart")
+
+
+def _stats_import(config: Config, data: bytes) -> int:
+    """Importe le CSV via clipper.outcomes ; en cas d'echec le journal est remis
+    tel qu'il etait (import_stats ecrit ligne a ligne : pas d'import partiel)."""
+    try:
+        data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(status_code=422, detail=f"le CSV doit être encodé en UTF-8 : {exc}") from exc
+    journal = Path(str(config.section("outcomes")["journal_path"]))
+    size = journal.stat().st_size if journal.exists() else None
+    with tempfile.TemporaryDirectory() as tmp:
+        csv_path = Path(tmp) / "stats.csv"
+        csv_path.write_bytes(data)
+        try:
+            return len(outcomes_mod.import_stats(csv_path, path=journal))
+        except (outcomes_mod.OutcomesError, ValueError, KeyError, TypeError, csv.Error) as exc:
+            if size is None:
+                journal.unlink(missing_ok=True)
+            elif journal.stat().st_size != size:
+                with journal.open("r+b") as f:
+                    f.truncate(size)
+            raise HTTPException(status_code=422, detail=f"import du CSV impossible : {exc}") from exc
+
+
 class ChannelBody(BaseModel):
     preset: dict[str, Any]
 
@@ -1112,6 +1345,19 @@ def create_app(config: Config | None = None) -> FastAPI:
         tmp.write_bytes(data)
         os.replace(tmp, target)
         return {"name": name, "logo": f"{_PRESETS_DIR}/{name}.png"}
+
+    # ----------------------------------------------------------------
+    # Statistiques (SPEC-c100 E7)
+    # ----------------------------------------------------------------
+
+    @app.get("/api/stats")
+    def stats(since: str | None = None, until: str | None = None) -> dict[str, Any]:
+        return _stats(config, since, until)
+
+    @app.post("/api/stats/import")
+    async def stats_import(request: Request) -> dict[str, Any]:
+        data = _stats_csv_from_multipart(request.headers.get("content-type", ""), await request.body())
+        return {"imported": _stats_import(config, data)}
 
     @app.get("/api/events")
     def events_stream() -> StreamingResponse:

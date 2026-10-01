@@ -2405,3 +2405,234 @@ def test_channels_screen_previews_subtitles_style_with_a_300ms_debounce():
     assert "draft: JSON.stringify" in prev   # brouillon non enregistré envoyé tel quel
     assert ".chan-preview" in css
     assert "chSubsPreview" in js          # point d'accroche dans l'écran chaînes
+# TASK-7d86 : ecran Statistiques (GET /api/stats, POST /api/stats/import)
+# --------------------------------------------------------------------------
+
+STATS_A, STATS_B, STATS_C, STATS_D = "aaaaaaaaaaa", "bbbbbbbbbbb", "ccccccccccc", "ddddddddddd"
+STATS_CSV = (
+    "clip_id,views,retention_3s,watched_full,shares,date\n"
+    "02,1200,0.61,0.22,14,2026-09-25\n"
+)
+
+
+def _stats_jsonl(path: Path, lines) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8")
+
+
+def _stats_seed(tmp_path) -> None:
+    def steps(download, render, finished):
+        return {
+            "download": _step(f"{finished}T10:00:00+00:00", f"{finished}T10:00:{download:02d}+00:00"),
+            "render": _step(f"{finished}T10:05:00+00:00", f"{finished}T10:{5 + render // 60:02d}:{render % 60:02d}+00:00"),
+        }
+    _write_state(tmp_path, STATS_A, status="done", updated_at="2026-09-10T12:00:00+00:00",
+                 steps=steps(40, 100, "2026-09-10"))
+    _write_state(tmp_path, STATS_B, status="done", updated_at="2026-08-01T12:00:00+00:00",
+                 steps=steps(20, 200, "2026-08-01"))
+    _write_state(tmp_path, STATS_C, status="failed", updated_at="2026-09-12T12:00:00+00:00")
+    _write_state(tmp_path, STATS_D, status="running", updated_at="2026-09-15T12:00:00+00:00")
+    _write_sidecar(tmp_path, STATS_A, "01", moment_id=1, created_at="2026-09-10T12:00:00+00:00",
+                   qa={"status": "passed", "issues": []})
+    _write_sidecar(tmp_path, STATS_A, "02", moment_id=2, created_at="2026-09-20T12:00:00+00:00",
+                   qa={"status": "rejected", "issues": ["sous-titres hors cadre"]})
+    _write_sidecar(tmp_path, STATS_B, "01", moment_id=1, created_at="2026-08-01T12:00:00+00:00",
+                   qa={"status": "passed", "issues": []})
+    _stats_jsonl(tmp_path / "state" / "outcomes.jsonl", [
+        {"kind": "result", "video_id": STATS_A, "clip_id": "01", "moment_id": 1,
+         "qa": {"status": "passed", "issues": []}, "human_decision": "approved",
+         "recorded_at": "2026-09-11T08:00:00+00:00"},
+        {"kind": "stats", "video_id": None, "clip_id": "02", "moment_id": None,
+         "stats": {"views": 900, "retention_3s": 0.5, "watched_full": 0.2, "shares": 3, "date": "2026-09-22"},
+         "recorded_at": "2026-09-22T08:00:00+00:00"},
+        {"kind": "stats", "video_id": None, "clip_id": "02", "moment_id": None,
+         "stats": {"views": 1200, "retention_3s": 0.61, "watched_full": 0.22, "shares": 14, "date": "2026-09-25"},
+         "recorded_at": "2026-09-25T08:00:00+00:00"},
+        {"kind": "stats", "video_id": None, "clip_id": "01", "moment_id": None,
+         "stats": {"views": 50, "retention_3s": 0.4, "watched_full": 0.1, "shares": 0, "date": "2026-09-25"},
+         "recorded_at": "2026-09-25T08:00:00+00:00"},
+    ])
+    _stats_jsonl(tmp_path / "state" / "feedback.jsonl", [
+        {"video_id": STATS_A, "moment": {"id": 2}, "texte_moment": "t", "decision": "adjusted",
+         "commentaire": None, "horodatage": "2026-09-19T08:00:00+00:00"},
+        {"video_id": STATS_A, "moment": {"id": 1}, "texte_moment": "t", "decision": "rejected",
+         "commentaire": None, "horodatage": "2026-09-09T08:00:00+00:00"},
+    ])
+
+    def usage(usage_name, cost, when):
+        return {"recorded_at": f"{when}T12:00:00+00:00", "usage": usage_name, "model": "m",
+                "input_tokens": 10, "output_tokens": 5, "cache_read_tokens": 0, "cost_usd": cost, "duration_s": 1.0}
+    _stats_jsonl(tmp_path / "workspace" / STATS_A / "llm_usage.jsonl", [
+        usage("moments", 0.5, "2026-09-10"), usage("jury", 0.25, "2026-09-10"),
+        usage("moments", 1.0, "2026-09-20"), usage("jury", None, "2026-09-20"),
+    ])
+    _stats_jsonl(tmp_path / "workspace" / STATS_B / "llm_usage.jsonl", [usage("moments", 2.0, "2026-08-01")])
+
+
+def _stats(tmp_path, query=""):
+    resp = client(tmp_path).get(f"/api/stats{query}")
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+def test_stats_empty_state_has_explicit_empty_blocks(tmp_path, isolated_cwd):
+    data = _stats(tmp_path)
+
+    assert data["clips"] == [] and data["stats_unmatched"] == []
+    assert data["llm_cost"] == {"total": 0.0, "unreported_calls": 0, "by_video": {}, "by_usage": {}, "by_day": {}}
+    assert data["steps"] == {}
+    assert data["counts"] == {s: 0 for s in ("pending", "running", "awaiting_review", "queued", "done", "failed")}
+
+
+def test_stats_clips_join_sidecar_outcomes_and_human_decision(tmp_path, isolated_cwd):
+    _stats_seed(tmp_path)
+
+    data = _stats(tmp_path, "?since=2026-09-01&until=2026-09-30")
+    clips = {(c["video_id"], c["clip_id"]): c for c in data["clips"]}
+
+    assert sorted(clips) == [(STATS_A, "01"), (STATS_A, "02")]      # le clip d'août est hors période
+    one, two = clips[(STATS_A, "01")], clips[(STATS_A, "02")]
+    assert one["screen_title"] == "Titre 01" and one["moment_id"] == 1
+    assert one["qa_status"] == "passed" and one["issues"] == []
+    assert one["human_decision"] == "approved" and one["decision_source"] == "outcomes"
+    assert one["stats"] is None                                       # clip_id « 01 » existe dans 2 vidéos
+    assert two["qa_status"] == "rejected" and two["issues"] == ["sous-titres hors cadre"]
+    assert two["human_decision"] == "adjusted" and two["decision_source"] == "feedback"
+    assert two["stats"] == {"views": 1200, "retention_3s": 0.61, "watched_full": 0.22, "shares": 14,
+                            "date": "2026-09-25"}                    # la mesure la plus récente
+    assert [u["clip_id"] for u in data["stats_unmatched"]] == ["01"]
+    assert "plusieurs vidéos" in data["stats_unmatched"][0]["reason"]
+
+
+def test_stats_without_period_covers_everything(tmp_path, isolated_cwd):
+    _stats_seed(tmp_path)
+
+    data = _stats(tmp_path)
+
+    assert len(data["clips"]) == 3
+    assert data["llm_cost"]["total"] == pytest.approx(3.75)
+
+
+def test_stats_llm_cost_per_video_usage_and_day(tmp_path, isolated_cwd):
+    _stats_seed(tmp_path)
+
+    cost = _stats(tmp_path, "?since=2026-09-01&until=2026-09-30")["llm_cost"]
+
+    assert cost["total"] == pytest.approx(1.75)
+    assert cost["unreported_calls"] == 1                              # jamais compté pour 0
+    assert cost["by_usage"] == {"moments": pytest.approx(1.5), "jury": pytest.approx(0.25)}
+    assert cost["by_day"] == {"2026-09-10": pytest.approx(0.75), "2026-09-20": pytest.approx(1.0)}
+    assert list(cost["by_video"]) == [STATS_A]
+    assert cost["by_video"][STATS_A] == {"cost": pytest.approx(1.75), "calls": 4, "unreported_calls": 1}
+
+
+def test_stats_steps_mean_and_last_duration_on_done_videos(tmp_path, isolated_cwd):
+    _stats_seed(tmp_path)
+
+    steps = _stats(tmp_path)["steps"]
+
+    assert steps["download"] == {"mean_s": pytest.approx(30.0), "last_s": pytest.approx(40.0), "count": 2}
+    assert steps["render"] == {"mean_s": pytest.approx(150.0), "last_s": pytest.approx(100.0), "count": 2}
+    assert "transcribe" not in steps                                   # étape jamais terminée : pas de durée inventée
+    period = _stats(tmp_path, "?since=2026-09-01")["steps"]
+    assert period["download"]["count"] == 1 and period["download"]["mean_s"] == pytest.approx(40.0)
+
+
+def test_stats_counts_videos_by_status(tmp_path, isolated_cwd):
+    _stats_seed(tmp_path)
+
+    counts = _stats(tmp_path)["counts"]
+    assert counts == {"pending": 0, "running": 1, "awaiting_review": 0, "queued": 0, "done": 2, "failed": 1}
+    assert _stats(tmp_path, "?until=2026-08-31")["counts"]["done"] == 1
+
+
+@pytest.mark.parametrize("query", ["?since=hier", "?until=2026-13-45", "?since=2026-09-30&until=2026-09-01"])
+def test_stats_invalid_period_is_a_422_with_detail(tmp_path, isolated_cwd, query):
+    resp = client(tmp_path).get(f"/api/stats{query}")
+    assert resp.status_code == 422
+    assert resp.json()["detail"]
+
+
+def test_stats_unreadable_journal_is_a_500_naming_the_file(tmp_path, isolated_cwd):
+    (tmp_path / "state").mkdir()
+    (tmp_path / "state" / "outcomes.jsonl").write_text("{pas du json\n", encoding="utf-8")
+
+    resp = client(tmp_path).get("/api/stats")
+
+    assert resp.status_code == 500
+    assert "outcomes.jsonl" in resp.json()["detail"]
+
+
+def _stats_post(tmp_path, content, name="stats.csv", field="file"):
+    return client(tmp_path).post("/api/stats/import", files={field: (name, content, "text/csv")})
+
+
+def test_stats_import_calls_outcomes_import_stats_and_returns_the_row_count(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import outcomes
+
+    seen = {}
+    real = outcomes.import_stats
+
+    def spy(csv_path, *, path=None):
+        seen["text"] = Path(csv_path).read_text(encoding="utf-8")
+        seen["path"] = path
+        return real(csv_path, path=path)
+
+    monkeypatch.setattr(outcomes, "import_stats", spy)
+
+    resp = _stats_post(tmp_path, STATS_CSV.encode("utf-8"))
+
+    assert resp.status_code == 200
+    assert resp.json() == {"imported": 1}
+    assert seen["text"] == STATS_CSV
+    assert Path(seen["path"]) == Path("state/outcomes.jsonl")
+    journal = [json.loads(line) for line in (tmp_path / "state" / "outcomes.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert journal[0]["kind"] == "stats" and journal[0]["stats"]["views"] == 1200
+
+
+def test_stats_import_missing_column_is_a_422_with_detail_and_writes_nothing(tmp_path, isolated_cwd):
+    resp = _stats_post(tmp_path, b"clip_id,views\n01,10\n")
+
+    assert resp.status_code == 422
+    assert "colonne" in resp.json()["detail"] and "shares" in resp.json()["detail"]
+    assert not (tmp_path / "state" / "outcomes.jsonl").exists()
+
+
+def test_stats_import_bad_row_leaves_the_journal_untouched(tmp_path, isolated_cwd):
+    _stats_jsonl(tmp_path / "state" / "outcomes.jsonl", [{"kind": "result", "recorded_at": "2026-09-01T00:00:00+00:00"}])
+    before = (tmp_path / "state" / "outcomes.jsonl").read_bytes()
+    bad = STATS_CSV + "03,beaucoup,0.5,0.2,1,2026-09-26\n"
+
+    resp = _stats_post(tmp_path, bad.encode("utf-8"))
+
+    assert resp.status_code == 422 and resp.json()["detail"]
+    assert (tmp_path / "state" / "outcomes.jsonl").read_bytes() == before
+
+
+def test_stats_import_requires_a_multipart_file_field(tmp_path, isolated_cwd):
+    assert client(tmp_path).post("/api/stats/import", json={"x": 1}).status_code == 422
+    assert _stats_post(tmp_path, STATS_CSV.encode("utf-8"), field="autre").status_code == 422
+    assert _stats_post(tmp_path, b"\xff\xfe\x00").status_code == 422
+
+
+def test_stats_screen_shows_four_blocks_period_and_import():
+    page = (STATIC / "index.html").read_text(encoding="utf-8")
+    js = (STATIC / "screens" / "stats.js").read_text(encoding="utf-8")
+    css = (STATIC / "style.css").read_text(encoding="utf-8")
+
+    assert "/static/screens/stats.js" in page
+    assert page.index("/static/screens.js") < page.index("/static/screens/stats.js") < page.index("/static/app.js")
+    assert "Screens.stats" in js and "/api/stats" in js and "/api/stats/import" in js
+    assert "since" in js and "until" in js and 'type="file"' in js and "FormData" in js
+    for block in ("Résultats par clip", "Coûts du modèle", "Durée par étape", "Vidéos par statut"):
+        assert block in js
+    for field in ("llm_cost", "by_video", "by_usage", "by_day", "steps", "counts", "stats_unmatched"):
+        assert field in js
+    assert "toastError" in js                              # erreur d'API affichée, jamais avalée
+    assert "TASK-7d86" in css
+
+
+def test_style_css_braces_are_balanced():
+    # Une accolade manquante avale tout le CSS qui suit (écrans Surveillance, Statistiques).
+    css = re.sub(r"/\*.*?\*/", "", (STATIC / "style.css").read_text(encoding="utf-8"), flags=re.S)
+    assert css.count("{") == css.count("}")
