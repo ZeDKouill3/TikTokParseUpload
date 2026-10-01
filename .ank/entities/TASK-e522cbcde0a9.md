@@ -5,7 +5,7 @@ slug: navigateur-profils-par-compte-connexion-manuelle
 title: "Navigateur : profils par compte, connexion manuelle, export des cookies YouTube, installation pour tout utilisateur du dépôt (SPEC-9225 R1, R2, R8)"
 created: 2026-10-01T14:19:44Z
 author: nicoc@zedk_ordi
-status: in_progress
+status: done
 scope:
   - clipper/browser.py
   - clipper/channel.py
@@ -26,8 +26,15 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/2b45e5719461@de3e2c4
+    tree: scope/95e166a8f8ee
+    criteria: a19b30999442
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 2
+version: 3
 ---
 
 Première tâche de SPEC-922573c1e68f (ADR-1a581b7e721e) : socle navigateur. L'utilisateur exige que ça marche pour quelqu'un qui télécharge le dépôt (installation et doc).
