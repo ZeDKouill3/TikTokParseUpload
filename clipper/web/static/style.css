@@ -1194,3 +1194,12 @@ input[type="color"] { width: 36px; height: 36px; padding: 2px; border-radius: va
   .drawer-body { grid-template-columns: minmax(0, 1fr); }
   .drawer-foot .btn { min-height: 44px; }
 }
+
+/* ---------- Surveillance : VOD à confirmer (TASK-7508) ---------- */
+.watch-vod .watch-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.watch-vod .btn:disabled { opacity: 0.45; cursor: not-allowed; }
+@media (max-width: 900px) {
+  .watch-vod { flex-wrap: wrap; }
+  .watch-vod .watch-actions { width: 100%; justify-content: flex-end; }
+  .watch-vod .btn-xs { min-height: 44px; }
+}
