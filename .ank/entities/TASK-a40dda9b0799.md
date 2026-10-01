@@ -5,7 +5,7 @@ slug: console-v2-corrections-du-deuxi-me-tour-qa-objec
 title: "console v2 : corrections du deuxième tour (QA [object Object], compteurs, port réel, voyant worker, accents, tri vidéos, pagination stats)"
 created: 2026-10-01T10:52:30Z
 author: nicoc@zedk_ordi
-status: in_progress
+status: done
 scope:
   - clipper/web/app.py
   - clipper/web/__init__.py
@@ -22,8 +22,15 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/46c62e8921d4@42767aa
+    tree: scope/fbb97abcd7c2
+    criteria: 60e50ee072c5
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 2
+version: 3
 ---
 
 Deuxième tour de la console v2 (2026-10-01, après TASK-dc9d) : Statistiques affiche « [object Object] » dans la colonne Contrôle qualité ; tableau de bord 102 clips à valider contre 105 sur la page Clips (3 clips refusés par la QA rangés dans « À valider ») ; Réglages > Accès affiche le port de config.toml (8000) alors que serve tourne sur 8765 ; rien n'indique si le worker tourne (une vidéo mise en file attend sans signal) ; textes d'aide de Réglages sans accents (commentaires des CONFIG_DEFAULTS) ; liste Vidéos triée par identifiant ; tableau des clips de Statistiques non paginé.

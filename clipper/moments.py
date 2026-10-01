@@ -109,30 +109,30 @@ CONFIG_DEFAULTS: dict[str, object] = {
     # "jury" (clipper.jury, ADR-ff87). En mode auto, le jury note toujours.
     "selection": "single",
     # Grille de notation (SPEC-0eec), relative au dossier courant. "builtin"
-    # : grille embarquee dans le paquet (clipper/assets/rubric.toml), utile
-    # sans fichier local (ex. juste apres installation de la wheel, avant
-    # 'clipper init'). Toute autre valeur est un chemin utilise tel quel ;
+    # : grille embarquée dans le paquet (clipper/assets/rubric.toml), utile
+    # sans fichier local (ex. juste après installation de la wheel, avant
+    # 'clipper init'). Toute autre valeur est un chemin utilisé tel quel ;
     # fichier absent = erreur explicite (voir resolve_rubric_path), jamais de
     # repli silencieux (ADR-ad2e).
     "rubric_path": "rubric.toml",
-    # Au-dela, la transcription part en tranches (environ 4 caracteres par
-    # token : 400 000 caracteres ~ 100k tokens).
+    # Au-dela, la transcription part en tranches (environ 4 caractères par
+    # token : 400 000 caractères ~ 100k tokens).
     "max_transcript_chars": 400_000,
     "chunk_chars": 250_000,
-    # Recouvrement entre deux tranches : une histoire a cheval reste entiere
+    # Recouvrement entre deux tranches : une histoire à cheval reste entière
     # dans au moins une tranche.
     "chunk_overlap_seconds": 300,
-    # Pics audio envoyes au LLM (les plus forts).
+    # Pics audio envoyés au LLM (les plus forts).
     "max_audio_peaks": 200,
-    # Selection par jury : part des clips retenus ajoutee en exploration,
-    # prise parmi les candidats ou le jury hesite (ADR-1cf0). 0 : aucune.
+    # Sélection par jury : part des clips retenus ajoutée en exploration,
+    # prise parmi les candidats où le jury hésite (ADR-1cf0). 0 : aucune.
     "exploration_share": 0.1,
-    # Graine du tirage qui departage les candidats de meme dispersion.
+    # Graine du tirage qui départage les candidats de même dispersion.
     "exploration_seed": 0,
-    # Connecteurs de tete qui supposent la phrase d'avant : en tete de la
-    # premiere phrase d'un candidat, ils sont retires et le clip commence au
-    # mot qui suit (casse et ponctuation ignorees ; locutions de plusieurs
-    # mots comprises). [] : regle desactivee.
+    # Connecteurs de tête qui supposent la phrase d'avant : en tête de la
+    # première phrase d'un candidat, ils sont retirés et le clip commence au
+    # mot qui suit (casse et ponctuation ignorées ; locutions de plusieurs
+    # mots comprises). [] : règle désactivée.
     "leading_connectors": [
         "donc", "mais", "et", "alors", "du coup", "en fait", "parce que", "sauf que",
         "par contre", "puis", "ensuite", "pourtant", "sinon", "car", "en plus",

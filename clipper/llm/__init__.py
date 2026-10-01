@@ -95,10 +95,10 @@ DEFAULT_TIER = "fast"
 
 CONFIG_DEFAULTS: dict[str, object] = {
     "backend": "claude-cli",
-    # Nombre de fois ou une reponse refusee (schema ou check) est renvoyee au
-    # modele avec l'erreur pour qu'il la corrige.
+    # Nombre de fois où une réponse refusée (schéma ou check) est renvoyée au
+    # modèle avec l'erreur pour qu'il la corrige.
     "repair_attempts": 1,
-    # Modele fort pour le jugement lourd (moments, coupes), rapide ailleurs.
+    # Modèle fort pour le jugement lourd (moments, coupes), rapide ailleurs.
     "usages": {
         "moments": {"model": "strong"},
         "parts": {"model": "strong"},

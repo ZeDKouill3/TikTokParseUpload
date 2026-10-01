@@ -119,6 +119,19 @@ function dashHardwareContent(data) {
 /* Valeur d'un KPI : « — » (et non 0) quand la donnee est introuvable. */
 const dashKpi = (value, format) => (value === null || value === undefined ? "—" : format ? format(value) : fr(value));
 
+/* Voyant du worker : « worker actif » quand le battement est récent ; sinon « worker arrêté »
+   avec la raison et la commande pour le lancer (une vidéo mise en file attend sans lui). */
+function dashWorkerContent(data) {
+  const worker = data.worker;
+  if (worker === null || worker === undefined) return dashError(data.worker_error || "worker : donnée absente de la réponse.");
+  if (worker.state === "active") {
+    return `<div class="list-item"><span class="chip done">worker actif</span><div class="li-main"><div class="li-sub">pid ${esc(worker.pid)} · dernier battement il y a ${esc(fr(Math.round(worker.age_s)))} s</div></div></div>`;
+  }
+  return `<div class="list-item"><span class="chip failed">worker arrêté</span><div class="li-main"><p class="reason bad">${esc(worker.reason)}</p>
+      <div class="li-sub">Aucune vidéo mise en file ne démarre tant qu'il est arrêté. Lance-le :</div>
+      <code class="set-cmd mono">${esc(worker.command)}</code></div></div>`;
+}
+
 function dashKpis(data) {
   const waiting = data.queue === null ? null : data.queue.filter((e) => e.status === "waiting").length;
   const blocked = data.failed === null || data.queued === null ? null : data.failed.length + data.queued.length;
@@ -163,6 +176,7 @@ Screens.dashboard = {
           ${dashSection("watch_pending", "eye", "VOD à confirmer", dashList(data, "watch_pending", "Aucune VOD à confirmer.", watchVodRow))}
         </div>
         <div class="stack">
+          ${dashSection("worker", "activity", "Worker", dashWorkerContent(data))}
           ${dashSection("clips_to_review", "clapperboard", "Clips à valider", clips)}
           ${dashSection("next_publications", "send", "Prochaines publications", dashList(data, "next_publications", "Aucune publication programmée.", dashPublicationRow))}
           ${dashSection("llm_cost", "coins", "Coût du modèle de langage", dashCostContent(data))}

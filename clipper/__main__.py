@@ -274,8 +274,10 @@ def main(argv: list[str] | None = None) -> int:
                     f"[web] token : un jeton est exige pour ecouter sur {host!r} (hors bouclage) ; "
                     'ajoute token = "..." dans la table [web] de config.toml (ADR-4f6e §5)'
                 )
-            if host != web_cfg["host"]:
-                sections = {**config._sections, "web": {**config._sections.get("web", {}), "host": host}}
+            if host != web_cfg["host"] or int(port) != int(web_cfg["port"]):
+                # l'app voit l'hote et le port réellement écoutés (Réglages > Accès), pas ceux de config.toml
+                sections = {**config._sections,
+                            "web": {**config._sections.get("web", {}), "host": host, "port": int(port)}}
                 config = dataclasses.replace(config, _sections=sections)
             worker_proc = _popen([sys.executable, "-m", "clipper", "worker"])
             try:

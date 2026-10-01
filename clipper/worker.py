@@ -31,9 +31,49 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "poll_interval_s": 2,
     "cancel_grace_s": 10,
     "queue_path": "state/queue.json",
+    # Battement du worker (voyant « worker actif / arrêté » de l'interface web) :
+    # fichier d'état {pid, at} (worker.json, à côté de la file) réécrit au plus
+    # toutes les heartbeat_interval_s secondes ; l'interface le juge périmé après
+    # trois intervalles sans battement.
+    "heartbeat_interval_s": 5,
 }
 
+WORKER_COMMAND = "python -m clipper worker"
+HEARTBEAT_FILE = "worker.json"
+_STALE_AFTER_BEATS = 3
+
 _CANCEL_REASON = "annulée par l'utilisateur"
+
+
+def heartbeat_path(config: Config) -> Path:
+    return _queue_path(config).with_name(HEARTBEAT_FILE)
+
+
+def read_heartbeat(config: Config, now: datetime | None = None) -> dict[str, Any]:
+    """État du worker d'après son battement : ``active`` (battement récent, pid
+    vivant), ``stale`` (battement périmé : plus de trois intervalles) ou
+    ``stopped`` (aucun battement, ou pid mort). Toujours la commande pour le
+    lancer. Un fichier illisible lève ``WorkerError`` : jamais un état inventé."""
+    section = config.section("worker")
+    path = heartbeat_path(config)
+    out: dict[str, Any] = {"command": WORKER_COMMAND, "pid": None, "at": None, "age_s": None}
+    if not path.is_file():
+        return {**out, "state": "stopped", "reason": f"aucun battement ({path}) : le worker n'a jamais tourné ici"}
+    try:
+        beat = json.loads(path.read_text(encoding="utf-8"))
+        pid, at = int(beat["pid"]), datetime.fromisoformat(beat["at"])
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise WorkerError(f"battement du worker illisible ({path}) : {exc}") from exc
+    if at.tzinfo is None:
+        raise WorkerError(f"battement du worker illisible ({path}) : horodatage sans fuseau")
+    age = (now or datetime.now(timezone.utc)) - at
+    age_s = age.total_seconds()
+    out.update(pid=pid, at=beat["at"], age_s=age_s)
+    if not _pid_alive(pid):
+        return {**out, "state": "stopped", "reason": f"le processus {pid} du worker n'existe plus"}
+    if age_s > float(section["heartbeat_interval_s"]) * _STALE_AFTER_BEATS:
+        return {**out, "state": "stale", "reason": f"battement périmé : dernier il y a {int(age_s)} s"}
+    return {**out, "state": "active", "reason": None}
 
 
 class WorkerError(Exception):
@@ -210,7 +250,22 @@ class Worker:
         self._path = _queue_path(self.config)
         self._process: Any | None = None
         self._entry: dict[str, Any] | None = None
+        self._last_beat: float | None = None
         self._recover_orphans()
+
+    def _beat(self) -> None:
+        """Écrit ``{pid, at}`` dans ``heartbeat_path`` si ``heartbeat_interval_s``
+        s'est écoulé depuis le dernier battement (écriture atomique)."""
+        section = self.config.section("worker")
+        now = time.monotonic()
+        if self._last_beat is not None and now - self._last_beat < float(section["heartbeat_interval_s"]):
+            return
+        path = heartbeat_path(self.config)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps({"pid": os.getpid(), "at": datetime.now(timezone.utc).isoformat()}), encoding="utf-8")
+        os.replace(tmp, path)
+        self._last_beat = now
 
     def _recover_orphans(self) -> None:
         """Au demarrage, une entree ``running`` dont le pid est mort
@@ -233,7 +288,9 @@ class Worker:
         sinon lance la tete de file si aucun enfant ne vit, sinon reprend
         les videos ``queued`` dont ``retry_at`` est passe (SPEC-fc0c
         §2.3-2.4). La surveillance des chaines echues passe d'abord, enfant
-        en cours ou non (SPEC-fc0c §5.1)."""
+        en cours ou non (SPEC-fc0c §5.1). Chaque itération bat d'abord (voyant
+        de l'interface web)."""
+        self._beat()
         self._watch_channels()
 
         if self._process is not None:

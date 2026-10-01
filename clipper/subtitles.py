@@ -88,25 +88,25 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "outline": 6,
     "min_words_per_group": 2,
     "max_words_per_group": 4,
-    # Zone sure [haut, bas] (fraction de la hauteur) ou placer le texte :
+    # Zone sûre [haut, bas] (fraction de la hauteur) où placer le texte :
     # l'interface TikTok masque le haut (~15 %) et le bas (~20 %).
     "safe_zone": [0.20, 0.78],
-    # Ecart (px) entre deux hauteurs candidates, de bas en haut de la zone sure.
+    # Écart (px) entre deux hauteurs candidates, de bas en haut de la zone sûre.
     "position_step": 16,
-    # Hauteur (px) occupee par le texte (deux lignes et contour).
+    # Hauteur (px) occupée par le texte (deux lignes et contour).
     "text_band_height": 260,
     "margin_left": 60,
-    # Colonne des icones TikTok (j'aime, commentaires, partage) a droite.
+    # Colonne des icônes TikTok (j'aime, commentaires, partage) à droite.
     "margin_right": 150,
     "primary_color": "&H00FFFFFF&",   # blanc : mots deja prononces
     "secondary_color": "&H0080FFFF&", # jaune clair : mots pas encore prononces
     "outline_color": "&H00000000&",   # noir
     "emphasis_color": "&H0000A5FF&",  # orange : mots d'emphase
     "emphasis": True,
-    # Format letterbox (SPEC-6127, maquette validee) : texte dans la zone
+    # Format letterbox (SPEC-6127, maquette validée) : texte dans la zone
     # text_zones.subtitles du plan de recadrage.
     "letterbox_uppercase": True,
-    # Tailles en pixels d'em (comme Pillow) ; le .ass recoit la taille libass
+    # Tailles en pixels d'em (comme Pillow) ; le .ass reçoit la taille libass
     # (em x (usWinAscent + usWinDescent) / unitsPerEm).
     "letterbox_font_size": 68,
     "letterbox_min_font_size": 40,
@@ -115,28 +115,28 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "letterbox_line_height": 1.15,
     "letterbox_outline": 7,
     "letterbox_max_words_per_group": 8,
-    # Decalage (px) entre le haut de la zone subtitles et la premiere ligne
-    # (TASK-ea6e : les sous-titres etaient trop colles a la video sans lui).
+    # Décalage (px) entre le haut de la zone subtitles et la première ligne
+    # (TASK-ea6e : les sous-titres étaient trop collés à la vidéo sans lui).
     "letterbox_offset_y": 28,
-    # Clips generes en meme temps par l'etape subtitles de clipper.pipeline
-    # (TASK-ce6e : un appel LLM d'emphase par clip) ; 1 = un clip apres
-    # l'autre. Lu par le pipeline, jamais passe a generate.
+    # Clips générés en même temps par l'étape subtitles de clipper.pipeline
+    # (TASK-ce6e : un appel LLM d'emphase par clip) ; 1 = un clip après
+    # l'autre. Lu par le pipeline, jamais passé à generate.
     "parallel": 4,
-    # TASK-9ee7 : rien a l'ecran pendant les silences. hold_s : un groupe de
-    # mots reste affiche au plus ce temps apres la fin de son dernier mot
-    # (borne par le debut du groupe suivant, si plus proche). gap_s : un
-    # ecart de plus que ca avant le mot suivant coupe le groupe (rien
-    # n'est affiche pendant l'ecart). max_word_s : la fin d'un mot isole
-    # (faster-whisper l'etire parfois sur le silence qui suit, mesure
-    # jusqu'a plus de 10 s) est bornee a ce temps depuis son debut.
+    # TASK-9ee7 : rien à l'écran pendant les silences. hold_s : un groupe de
+    # mots reste affiché au plus ce temps après la fin de son dernier mot
+    # (borne par le début du groupe suivant, si plus proche). gap_s : un
+    # écart de plus que ça avant le mot suivant coupe le groupe (rien
+    # n'est affiché pendant l'écart). max_word_s : la fin d'un mot isolé
+    # (faster-whisper l'étire parfois sur le silence qui suit, mesure
+    # jusqu'à plus de 10 s) est bornée à ce temps depuis son début.
     "hold_s": 0.3,
     "gap_s": 0.6,
     "max_word_s": 1.5,
     # Style de l'agencement stream split (SPEC-76dc, generate(style="split")) :
     # deux couleurs seulement (texte, mot en cours), jamais d'appel LLM
-    # d'emphase (chaque mot est "en cours" a son propre instant). Couleurs au
+    # d'emphase (chaque mot est "en cours" à son propre instant). Couleurs au
     # format amical (#RRGGBB ou un nom, voir _NAMED_COLORS), pas le format
-    # ASS natif des reglages ci-dessus.
+    # ASS natif des réglages ci-dessus.
     "split_font_name": "Poppins ExtraBold",
     "split_font_size": 80,
     "split_min_font_size": 44,
@@ -146,7 +146,7 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "split_current_word_color": "#9146FF",
     "split_outline_color": "black",
     "split_outline": 10,
-    # Sans ombre par defaut (style de reference sans ombre, SPEC-76dc).
+    # Sans ombre par défaut (style de référence sans ombre, SPEC-76dc).
     "split_shadow_enabled": False,
     "split_shadow_color": "black",
     "split_shadow_offset": [2, 2],

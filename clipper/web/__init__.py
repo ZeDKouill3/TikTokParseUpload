@@ -35,10 +35,10 @@ from __future__ import annotations
 from clipper.web.app import create_app
 
 CONFIG_DEFAULTS: dict[str, object] = {
-    # Hote et port d'ecoute de 'python -m clipper serve' (ADR-4f6e §5).
+    # Hôte et port d'écoute de 'python -m clipper serve' (ADR-4f6e §5).
     "host": "127.0.0.1",
     "port": 8000,
-    # Jeton exige sur /api/* et /media/* des que l'hote n'est pas le bouclage ;
+    # Jeton exige sur /api/* et /media/* des que l'hôte n'est pas le bouclage ;
     # vide et bouclage = pas d'authentification.
     "token": "",
     # Intervalle (s) de scrutation des mtimes par /api/events (ADR-4f6e §4).
