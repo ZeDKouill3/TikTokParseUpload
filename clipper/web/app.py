@@ -217,6 +217,15 @@ def _enrich(state: dict[str, Any], config: Config) -> dict[str, Any]:
     return out
 
 
+def _rubric_used(video_dir: Path) -> str | None:
+    """Grille de notation utilisee par l'etape moments (rubric.path de
+    moments.json, SPEC-9216 R4) ; None tant que l'etape n'a rien ecrit."""
+    path = video_dir / "moments.json"
+    if not path.exists():
+        return None
+    return (_read_json(path).get("rubric") or {}).get("path")
+
+
 def _matches(video: dict[str, Any], channel: str | None, status: str | None, q: str | None) -> bool:
     if channel is not None and video.get("channel") != channel:
         return False
@@ -1598,6 +1607,7 @@ def create_app(config: Config | None = None) -> FastAPI:
         detail = _enrich(state, config)
         detail["clips"] = state.get("clips") or []
         detail["awaiting"] = state.get("awaiting") or []
+        detail["rubric"] = _rubric_used(Path(config.workspace_dir) / video_id)
         return detail
 
     @app.get("/api/videos/{video_id}/moments")

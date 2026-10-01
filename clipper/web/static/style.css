@@ -1231,6 +1231,8 @@ input[type="color"] { width: 36px; height: 36px; padding: 2px; border-radius: va
 .chan-slots { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
 .chan-slot { display: flex; gap: 8px; align-items: center; }
 .chan-logo { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; font-size: 12px; }
+.chan-rubric { display: flex; flex-direction: column; gap: 8px; align-items: stretch; }
+.chan-rubric [hidden] { display: none; }
 @media (max-width: 900px) {
   .chan-fields { grid-template-columns: minmax(0, 1fr); padding: 16px; }
   .chan-sec > summary { padding: 12px 16px; }

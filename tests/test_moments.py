@@ -1900,3 +1900,108 @@ def test_exploration_can_pick_a_moment_rejected_for_the_plafond(tmp_path, video_
     assert [(m["start"], m.get("exploration")) for m in by_start] == [(0.25, None), (50.25, True)]
     assert not [r for r in data["rejected"] if r["start"] == 50.25]
     assert data["exploration"] == {"share": 1.0, "seed": 0, "target": 1, "chosen": 1}
+
+
+# --------------------------------------------------------------------------
+# Grilles embarquees : "builtin" et "builtin:gaming" (SPEC-9216 R1-R3)
+# --------------------------------------------------------------------------
+
+
+def test_resolve_rubric_path_builtin_is_the_standard_rubric_unchanged():
+    from clipper import moments
+
+    resolved = moments.resolve_rubric_path("builtin")
+
+    assert resolved.read_text(encoding="utf-8") == (REPO / "clipper" / "assets" / "rubric.toml").read_text(encoding="utf-8")
+    assert moments.load_rubric(resolved)["min_score"] == 60
+
+
+def test_resolve_rubric_path_builtin_gaming_is_the_gaming_rubric():
+    from clipper import moments
+
+    resolved = moments.resolve_rubric_path("builtin:gaming")
+
+    assert resolved.read_text(encoding="utf-8") == (REPO / "clipper" / "assets" / "rubric-gaming.toml").read_text(encoding="utf-8")
+
+
+def test_resolve_rubric_path_unknown_builtin_lists_the_available_rubrics_without_fallback():
+    from clipper import moments
+
+    with pytest.raises(moments.MomentsError) as excinfo:
+        moments.resolve_rubric_path("builtin:inconnue")
+
+    message = str(excinfo.value)
+    assert "builtin:inconnue" in message
+    assert "builtin" in message and "builtin:gaming" in message  # grilles disponibles
+
+
+def test_resolve_rubric_path_other_values_stay_file_paths():
+    from clipper import moments
+
+    assert moments.resolve_rubric_path("ma_grille.toml") == Path("ma_grille.toml")
+    assert moments.resolve_rubric_path("builtin.toml") == Path("builtin.toml")
+
+
+def test_gaming_rubric_has_exactly_the_r2_values():
+    from clipper import moments
+
+    standard = moments.load_rubric(moments.resolve_rubric_path("builtin"))
+    gaming = moments.load_rubric(moments.resolve_rubric_path("builtin:gaming"))
+
+    assert gaming["min_score"] == 45
+    assert gaming["max_moments_per_hour"] == 6
+    assert gaming["always_keep_score"] == 70
+    assert {name: c["weight"] for name, c in gaming["criteria"].items()} == {
+        "hook": 3, "standalone": 2, "payoff": 3, "emotion": 4, "value": 0, "trend": 0,
+    }
+    d = gaming["durations"]
+    assert (d["single_min"], d["single_max"], d["part_min"], d["part_max"]) == (30, 90, 30, 90)
+    assert gaming["trend_keywords"] == []
+    # question du critere emotion propre au jeu
+    question = gaming["criteria"]["emotion"]["question"]
+    assert question != standard["criteria"]["emotion"]["question"]
+    for word in ("rire", "cri", "sursaut", "peur", "rage", "victoire", "defaite", "retournement", "jeu", "chat"):
+        assert word in question, word
+    # tout le reste identique a la grille standard
+    for table in ("bonus", "exclusions"):
+        assert gaming[table] == standard[table], table
+    for key in ("tolerance", "min_parts", "max_parts"):
+        assert d[key] == standard["durations"][key], key
+    for name in ("hook", "standalone", "payoff", "value", "trend"):
+        assert gaming["criteria"][name]["question"] == standard["criteria"][name]["question"], name
+    assert set(gaming["criteria"]) == set(standard["criteria"])
+
+
+def test_gaming_rubric_is_commented_in_french_without_real_names():
+    text = (REPO / "clipper" / "assets" / "rubric-gaming.toml").read_text(encoding="utf-8")
+
+    assert text.lstrip().startswith("#")
+    assert "grille" in text.lower()
+    for name in ("GTA", "Rockstar", "Lucia", "Jason"):
+        assert name not in text, name
+
+
+def test_embedded_rubrics_are_in_the_installed_package_data():
+    import importlib.resources
+
+    assets = importlib.resources.files("clipper").joinpath("assets")
+    for name in ("rubric.toml", "rubric-gaming.toml"):
+        assert assets.joinpath(name).is_file(), name
+    import tomllib
+
+    package_data = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))["tool"]["setuptools"]["package-data"]
+    # le motif de pyproject.toml (glob recursif, fichiers directs compris) couvre la grille gaming
+    package = REPO / "clipper"
+    covered = {path for pattern in package_data["clipper"] for path in package.glob(pattern)}
+    assert package / "assets" / "rubric-gaming.toml" in covered
+
+
+def test_rubric_info_of_the_gaming_rubric_names_its_file_and_weights():
+    from clipper import moments
+
+    rubric_path = moments.resolve_rubric_path("builtin:gaming")
+    info = moments._rubric_info(rubric_path, moments.load_rubric(rubric_path))
+
+    assert info["path"].endswith("rubric-gaming.toml")
+    assert info["min_score"] == 45
+    assert info["weights"]["emotion"] == 4
