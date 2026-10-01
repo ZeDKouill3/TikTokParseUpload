@@ -880,6 +880,126 @@ def _render_split(
     return _ass_document(style_line, events, header=SPLIT_HEADER + "\n")
 
 
+# Aperçu du style (TASK-dd3f, SPEC-c100 E5) : meme mise en page que
+# generate (_group_words / _place / _Box : memes tailles, memes coupures de
+# ligne), dessinee avec Pillow sur un fond neutre au lieu d'un .ass, donc
+# sans ffmpeg ni modele. Zone d'exemple : bande du bas d'un clip letterbox.
+_PREVIEW_ZONE = {"x0": 60, "y0": 1340, "x1": PLAY_RES_X - 60, "y1": 1620}
+_PREVIEW_BACKGROUND = (58, 60, 66)
+_PREVIEW_WORD_S = 0.4
+
+
+def _rgb_of_ass(color: str) -> tuple[int, int, int]:
+    """Couleur ASS ``&H[AA]BBGGRR&`` -> (R, V, B) ; autre forme = erreur explicite."""
+    spec = color.strip()
+    digits = spec[2:-1] if spec.upper().startswith("&H") and spec.endswith("&") else ""
+    if len(digits) not in (6, 8) or any(c not in "0123456789abcdefABCDEF" for c in digits):
+        raise SubtitlesError(f"couleur ASS invalide : {color!r} (attendu &H00BBGGRR&)")
+    b, g, r = (int(digits[-6:][i:i + 2], 16) for i in (0, 2, 4))
+    return r, g, b
+
+
+def _preview_words(text: str) -> list[dict[str, Any]]:
+    tokens = text.split()
+    if not tokens:
+        raise SubtitlesError("texte d'apercu vide : saisir une phrase d'exemple")
+    return [{"word": token if i == 0 else f" {token}", "start": i * _PREVIEW_WORD_S,
+             "end": (i + 1) * _PREVIEW_WORD_S, "probability": 1.0} for i, token in enumerate(tokens)]
+
+
+_PREVIEW_NUMBERS = {
+    "letterbox": ("letterbox_font_size", "letterbox_min_font_size", "letterbox_font_step", "letterbox_line_height",
+                  "letterbox_outline", "letterbox_max_words_per_group", "letterbox_offset_y"),
+    "split": ("split_font_size", "split_min_font_size", "split_font_step", "letterbox_line_height",
+              "split_outline", "letterbox_max_words_per_group", "letterbox_offset_y"),
+}
+
+
+def _check_preview_numbers(settings: dict[str, Any], style: str) -> None:
+    for key in ("min_words_per_group", "gap_s", *_PREVIEW_NUMBERS[style]):
+        value = settings[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise SubtitlesError(f"[subtitles] {key} doit etre un nombre, recu {value!r}")
+
+
+def _preview_style(settings: dict[str, Any], style: str) -> tuple[_Style, tuple[int, int, int], tuple[int, int, int] | None]:
+    """(style, couleur du mot mis en valeur, couleur d'ombre ou None)."""
+    if style == "split":
+        built = _split_style(settings)
+        highlight = _rgb_of_ass(_ass_color(str(settings["split_current_word_color"])))
+        shadow = _rgb_of_ass(built.back_color) if built.shadow else None
+        return built, highlight, shadow
+    built = _letterbox_style(settings)
+    highlight = _rgb_of_ass(str(settings["emphasis_color"])) if settings["emphasis"] else None
+    return built, highlight, None
+
+
+def render_preview(
+    config_section: dict[str, Any], text: str, size: tuple[int, int] = (PLAY_RES_X, PLAY_RES_Y), *,
+    style: str = "letterbox",
+) -> bytes:
+    """PNG (bytes) de ``text`` dans le style effectif de ``config_section``
+    (table [subtitles], CONFIG_DEFAULTS pour le reste) : police, couleurs,
+    contour, ombre ; le mot en valeur (emphase letterbox, mot courant du
+    style split) est dessine dans sa couleur. Ni ffmpeg ni modele ni LLM. Un
+    reglage invalide est une SubtitlesError explicite (ADR-ad2e)."""
+    import io
+
+    from PIL import Image, ImageDraw
+
+    if style not in _STYLES:
+        raise SubtitlesError(f"style de sous-titres inconnu {style!r} (attendu : {' | '.join(_STYLES)})")
+    settings = {**CONFIG_DEFAULTS, **config_section}
+    words = _preview_words(text)
+    _check_preview_numbers(settings, style)
+    try:
+        built, highlight, shadow = _preview_style(settings, style)
+        text_rgb = _rgb_of_ass(built.primary_color)
+        outline_rgb = _rgb_of_ass(built.outline_color)
+        gap_s = float(settings["gap_s"])
+        group = _group_words(words, int(settings["min_words_per_group"]), built.max_words_per_group, gap_s)[0]
+        lines, em = _place(_units(group, gap_s), built.font_size, _Box(_PREVIEW_ZONE, built, "apercu"), built, "apercu")[0]
+    except (TypeError, ValueError, KeyError) as exc:
+        raise SubtitlesError(f"reglage de sous-titres invalide : {exc!r}") from exc
+    except SubtitlesError:
+        raise
+
+    units = [u for line in lines for u in line]
+    if highlight is None:
+        marked = -1
+    elif style == "split":
+        marked = min(1, len(units) - 1)
+    else:
+        marked = max(range(len(units)), key=lambda i: len(_unit_text(units[i], built.uppercase).strip()))
+
+    img = Image.new("RGB", (PLAY_RES_X, PLAY_RES_Y), _PREVIEW_BACKGROUND)
+    draw = ImageDraw.Draw(img)
+    font = _pil_font(str(FONT_FILE), em)
+    box = _Box(_PREVIEW_ZONE, built, "apercu")
+    zone = _PREVIEW_ZONE
+    index = 0
+    for i, line in enumerate(lines):
+        texts = [_unit_text(u, built.uppercase) for u in line]
+        texts[0] = texts[0].lstrip()
+        x = zone["x0"] + (zone["x1"] - zone["x0"] - font.getlength("".join(texts))) / 2
+        baseline = zone["y0"] + box.offset + i * box.step(em) + round(em * box.ascent / box.upm)
+        for part in texts:
+            fill = highlight if index == marked else text_rgb
+            if shadow is not None:
+                dx, dy = (float(v) for v in settings["split_shadow_offset"])
+                draw.text((x + dx, baseline + dy), part, font=font, fill=shadow, anchor="ls",
+                          stroke_width=built.outline, stroke_fill=shadow)
+            draw.text((x, baseline), part, font=font, fill=fill, anchor="ls",
+                      stroke_width=built.outline, stroke_fill=outline_rgb)
+            x += font.getlength(part)
+            index += 1
+    if tuple(size) != (PLAY_RES_X, PLAY_RES_Y):
+        img = img.resize((int(size[0]), int(size[1])), Image.LANCZOS)
+    out = io.BytesIO()
+    img.save(out, format="PNG")
+    return out.getvalue()
+
+
 def _file_style(path: Path) -> str:
     """Format d'un .ass deja ecrit : "letterbox", "split" (SPEC-76dc) ou
     "recadre" (sans en-tete, format karaoke recadre)."""

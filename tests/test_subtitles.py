@@ -1282,3 +1282,83 @@ def test_generate_unknown_style_is_an_explicit_error(tmp_path, video_dir):
 
     with pytest.raises(SubtitlesError, match="style"):
         run_letterbox(tmp_path, video_dir, style="diagonal")
+
+
+# --------------------------------------------------------------------------
+# Aperçu du style (TASK-dd3f, SPEC-c100 E5) : render_preview -> PNG
+# --------------------------------------------------------------------------
+
+
+def _preview_image(section, text="Salut tout le monde", **kwargs):
+    import io
+
+    from PIL import Image
+
+    from clipper.subtitles import render_preview
+
+    data = render_preview(section, text, **kwargs)
+    assert isinstance(data, bytes) and data.startswith(b"\x89PNG\r\n\x1a\n")
+    return Image.open(io.BytesIO(data)).convert("RGB")
+
+
+def _count(img, rgb):
+    raw = img.tobytes()
+    return sum(1 for i in range(0, len(raw), 3) if tuple(raw[i:i + 3]) == rgb)
+
+
+def test_preview_is_a_png_of_the_requested_size_without_ffmpeg(monkeypatch):
+    monkeypatch.setenv("PATH", "")  # ni ffmpeg ni aucun binaire : Pillow seul
+    assert _preview_image({}).size == (1080, 1920)
+    assert _preview_image({}, size=(540, 960)).size == (540, 960)
+
+
+def test_preview_letterbox_draws_text_outline_and_emphasis_colors():
+    img = _preview_image({"primary_color": "&H00FFFFFF&", "outline_color": "&H000000FF&",
+                          "emphasis_color": "&H0000FF00&"})
+    assert _count(img, (255, 255, 255)) > 200   # texte blanc
+    assert _count(img, (255, 0, 0)) > 200       # contour : ASS &H000000FF& = rouge
+    assert _count(img, (0, 255, 0)) > 100       # mot d'emphase
+
+
+def test_preview_letterbox_without_emphasis_has_no_emphasis_color():
+    img = _preview_image({"emphasis": False, "emphasis_color": "&H0000FF00&"})
+    assert _count(img, (0, 255, 0)) == 0
+
+
+def test_preview_split_colors_current_word_and_shadow():
+    split = {"split_text_color": "#FFFFFF", "split_current_word_color": "#9146FF",
+             "split_outline_color": "#FF0000", "split_shadow_enabled": True,
+             "split_shadow_color": "#00FF00", "split_shadow_offset": [6, 6]}
+    img = _preview_image(split, style="split")
+    assert _count(img, (255, 255, 255)) > 200
+    assert _count(img, (0x91, 0x46, 0xFF)) > 100   # mot courant
+    assert _count(img, (255, 0, 0)) > 200          # contour
+    assert _count(img, (0, 255, 0)) > 50           # ombre
+    off = _preview_image({**split, "split_shadow_enabled": False}, style="split")
+    assert _count(off, (0, 255, 0)) == 0
+
+
+def test_preview_follows_the_effective_style():
+    small = _preview_image({"letterbox_font_size": 40})
+    big = _preview_image({"letterbox_font_size": 68})
+    assert _count(big, (255, 255, 255)) > _count(small, (255, 255, 255))
+
+
+@pytest.mark.parametrize("section, style, match", [
+    ({"split_text_color": "caca"}, "split", "couleur"),
+    ({"split_outline": "gros"}, "split", "split_outline"),
+    ({"letterbox_font_size": "x"}, "letterbox", "letterbox_font_size"),
+    ({}, "diagonal", "style"),
+])
+def test_preview_invalid_style_is_an_explicit_error(section, style, match):
+    from clipper.subtitles import SubtitlesError, render_preview
+
+    with pytest.raises(SubtitlesError, match=match):
+        render_preview(section, "Salut", style=style)
+
+
+def test_preview_empty_text_is_an_explicit_error():
+    from clipper.subtitles import SubtitlesError, render_preview
+
+    with pytest.raises(SubtitlesError, match="texte"):
+        render_preview({}, "   ")

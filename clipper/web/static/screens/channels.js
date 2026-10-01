@@ -195,6 +195,7 @@ function chSectionHtml(spec, ed) {
     <summary><div><h3>${esc(spec.title)}</h3><span class="muted">${esc(spec.sub)}</span></div><span class="mono muted">[${esc(spec.section)}]</span>
       <span class="chip ${redefinedCount ? "info" : "pending"} plain" data-count>${redefinedCount ? `${redefinedCount} redéfini${redefinedCount > 1 ? "s" : ""}` : "hérité"}</span></summary>
     <p class="field-error chan-sec-error" data-sec-error role="alert"></p>
+    ${spec.section === "subtitles" ? chSubsPreviewHtml(ed) : ""}
     <div class="chan-fields">${main.map((k) => chField(spec.section, k, docs[k], ed)).join("")}</div>
     ${rest.length ? `<details class="chan-more" data-more="${esc(spec.section)}"><summary>Autres réglages de [${esc(spec.section)}] (${rest.length})</summary><div class="chan-fields">${rest.map((k) => chField(spec.section, k, docs[k], ed)).join("")}</div></details>` : ""}
   </details>`;
@@ -205,6 +206,7 @@ function chEditHtml(ed) {
   return `<div class="chan-edit">
     <div class="toolbar"><a class="btn btn-sm btn-ghost" href="#/channels">${icon("chevron-left", "i-xs")}Toutes les chaînes</a>
       <h2 class="chan-title">${esc(c.display_name)} <span class="mono muted">${esc(ed.name)}</span></h2><span class="grow"></span>
+      <a class="btn btn-sm" href="#/channels/${encodeURIComponent(ed.name)}/layout">${icon("layers", "i-xs")}Éditeur d'agencement</a>
       <button type="button" class="btn btn-sm btn-bad" data-chan-delete>${icon("trash-2", "i-xs")}Supprimer</button>
       <button type="button" class="btn btn-primary" data-chan-save>Enregistrer</button></div>
     <p class="reason bad" data-form-error role="alert" hidden></p>
@@ -283,6 +285,7 @@ function chRepaintField(root, ed, section, key) {
   const chip = $("[data-count]", det);
   chip.textContent = n ? `${n} redéfini${n > 1 ? "s" : ""}` : "hérité";
   chip.className = `chip ${n ? "info" : "pending"} plain`;
+  if (section === "subtitles" || section === "reframe") chSubsPreview(root, ed);
 }
 
 async function chSave(root, ed) {
@@ -368,6 +371,7 @@ function chWireEdit(root, ed) {
       ed.draft[section][key] = chReadField(field);
       field.classList.remove("invalid");
       $(".field-error", field).textContent = "";
+      if (section === "subtitles" || section === "reframe") chSubsPreview(root, ed);
     } catch (err) {
       field.classList.add("invalid");
       $(".field-error", field).textContent = `[${section}] ${key} : JSON invalide (${err.message})`;
@@ -403,6 +407,7 @@ async function chOpenEdit(body, name) {
   if (chUi.edit !== edit || currentScreen !== "channels") return;
   body.innerHTML = chEditHtml(edit);
   chWireEdit(body, edit);
+  chSubsPreviewWire(body, edit);
 }
 
 Screens.channels = {
