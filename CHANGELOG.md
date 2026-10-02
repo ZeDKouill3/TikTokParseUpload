@@ -132,6 +132,9 @@ détaillées et marche à suivre pour migrer :
 
 ### Modifié
 
+- Statistiques TikTok : les onglets Spectateurs et Engagement ne sont ouverts qu'à
+  partir de 100 vues (`[tiktok] stats_audience_min_views`) ; un relevé détaillé
+  passe de 77 s à 13 s pour un post récent.
 - **Format stream** (SPEC-8257) : le choix stream ou letterbox d'un clip se fait
   sur la présence de la webcam elle-même (contenu non noir, bords retrouvés,
   non figé) et non plus sur la détection du visage ; la localisation de la
@@ -178,7 +181,8 @@ détaillées et marche à suivre pour migrer :
   refusés avant d'ouvrir le navigateur.
 - Statistiques TikTok : repères réels de la page Publications (lignes des
   posts, vues, likes, commentaires, visibilité, date) et du menu des périodes
-  de TikTok Studio.
+  de TikTok Studio ; date « 2 oct., 12:30 » sans année lue avec l'année du
+  relevé (un post récent est bien relu en détail).
 - Console, plusieurs séries de corrections : miniatures des clips et des
   vidéos, erreurs affichées en clair (plus de `[object Object]`), compteurs,
   voyant du worker, tri des vidéos, cache des fichiers statiques, échecs
