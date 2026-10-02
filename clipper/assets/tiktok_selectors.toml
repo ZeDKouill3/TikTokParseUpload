@@ -219,10 +219,11 @@ login = [
 
 # Page Donnees analytiques du compte (SPEC-86fe R1, releve FR) : le bouton de periode affiche « 7 derniers jours »,
 # chaque tuile est un bouton « libelle -- valeur (evolution) ». Une tuile ou une evolution absente (« -- ») = null.
-# A VERIFIER SUR LA VRAIE PAGE : le menu des periodes et le repere des tuiles.
+# Menu des periodes verifie en reel (2026-10-02) : bouton data-tt DateRangeSelector_Button, options
+# data-tt Select_Container dans la liste Select_FlexColumn (pas de role=option) : 7, 28, 60, 365 jours, Personnalise.
 [account]
-period_button = "button:has-text('derniers jours')"
-period_option = "[role='option']:has-text('{days} derniers jours'), li:has-text('{days} derniers jours')"
+period_button = "[data-tt='components_DateRangeSelector_Button'], button:has-text('derniers jours')"
+period_option = "[data-tt='components_Select_FlexColumn'] [data-tt='components_Select_Container']:has-text('{days} derniers jours')"
 period_label = "{days} derniers jours"
 tile = "button:not([disabled])"
 
