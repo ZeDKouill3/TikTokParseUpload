@@ -107,9 +107,15 @@ def test_readme_shows_the_project_logo():
     assert any("logo.svg" in target for target in _relative_link_targets(text))
 
 
+def _current_version() -> str:
+    import tomllib
+
+    return tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
+
+
 def test_readme_has_version_and_python_badges():
     text = _readme_text()
-    assert "0.2.0" in text
+    assert f"version-{_current_version()}" in text
     assert "3.11" in text
 
 
@@ -295,15 +301,13 @@ def test_readme_internal_anchors_point_to_existing_headings():
 
 
 def test_readme_version_badge_matches_pyproject():
-    import tomllib
-
-    version = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
-    assert f"version-{version}" in _readme_text()
+    assert f"version-{_current_version()}" in _readme_text()
 
 
 def test_readme_links_the_documentation_set():
     text = _readme_text()
-    for target in ("docs/GUIDE.md", "docs/versions.md", "docs/tiktok-cadence.md", "docs/releases/v0.2.0.md", "CHANGELOG.md"):
+    for target in ("docs/GUIDE.md", "docs/versions.md", "docs/tiktok-cadence.md",
+                   f"docs/releases/v{_current_version()}.md", "CHANGELOG.md"):
         assert f"]({target})" in text, f"lien vers {target} absent de README.md"
 
 
@@ -312,6 +316,20 @@ def test_readme_documents_install_quickstart_tiktok_risks_and_stats():
     for needle in ("tools/setup.ps1", "uv venv", "python -m clipper serve", "builtin:gaming", "captcha", "Statistiques TikTok",
                    "tools/readme_shots/capture.py"):
         assert needle in text, needle
+
+
+def test_readme_documents_the_clipper_bat_launcher_and_its_shortcut():
+    text = _readme_text()
+    assert (ROOT / "Clipper.bat").is_file() and (ROOT / "tools" / "creer-raccourci.ps1").is_file()
+    assert (ROOT / "tools" / "clipper.ico").is_file()
+    for needle in ("Clipper.bat", "tools/creer-raccourci.ps1", "Clipper.lnk", "http://127.0.0.1:8000"):
+        assert needle in text, needle
+    start = text.index("## Démarrage rapide")
+    assert "Clipper.bat" in text[start:text.index("## Formats")], "le lanceur doit etre dans la section de lancement"
+
+
+def test_readme_links_the_social_preview_image_that_exists():
+    assert (ROOT / "docs" / "assets" / "social-preview.png").is_file()
 
 
 # ---- le script de capture n'utilise que le dossier temporaire

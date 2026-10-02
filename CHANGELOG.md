@@ -10,6 +10,62 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ## [Non publié]
 
+## [0.3.0] - 2026-10-03
+
+Pré-version « prête pour l'usage réel » : corrections et réglages issus du
+premier usage de la 0.2.0, sans grosse nouveauté. Attention : la clé
+`[parts] rubric_path` est retirée. Notes détaillées et marche à suivre pour
+migrer : [`docs/releases/v0.3.0.md`](docs/releases/v0.3.0.md).
+
+### Ajouté
+
+- Lanceur `Clipper.bat` à la racine : démarre `clipper serve` s'il ne tourne
+  pas déjà puis ouvre `http://127.0.0.1:8000`. `tools/creer-raccourci.ps1`
+  crée `Clipper.lnk` avec le logo (`tools/clipper.ico`) ; décrits dans la
+  section de lancement du README.
+- Console, radar du jury : un moment retenu par le jury mais écarté au
+  découpage affiche « retenu par le jury, écarté au découpage : raison ».
+- README refait avec captures et animations de la console, et image d'aperçu
+  social du dépôt (`docs/assets/social-preview.png`).
+
+### Modifié
+
+- **Statistiques TikTok** (SPEC-47e2, remplace SPEC-86fe) : le relevé n'a lieu
+  que lorsque tu te sers de Clipper (ouverture de l'écran Statistiques si le
+  dernier relevé date de plus de `[tiktok] stats_stale_min` minutes, 60 par
+  défaut ; passage d'une publication ; bouton « Relever maintenant »), avec un
+  seul relevé à la fois par compte. Le relevé périodique du worker est coupé
+  par défaut (`[tiktok] stats_interval_h = 0`).
+- La liste Publications de TikTok Studio est lue en entier (défilement, plus
+  de 50 posts, avec une limite de sécurité).
+- Un compte neuf sans post est reconnu (liste vide) : plus d'attente de 30 s
+  ni de publication arrêtée. Les posts supprimés sur TikTok disparaissent de
+  l'affichage ; l'historique des relevés est conservé.
+- Console : Publication et Statistiques se filtrent par compte TikTok (« Tous
+  les comptes ») au lieu de la chaîne.
+- « Chaîne » devient « Style » dans la console et la documentation (les
+  identifiants internes ne changent pas : `presets/`, `[channel]`,
+  `/api/channels`).
+- Console, Publication : les cartes du calendrier tiennent sur deux lignes et
+  le titre complet s'affiche en info-bulle.
+
+### Corrigé
+
+- L'étape `parts` découpe avec la grille réellement utilisée par `moments`
+  (`rubric.path` de `moments.json`). Avant, une chaîne en grille gaming
+  (30 à 90 s) voyait des moments valides rejetés au découpage (grille
+  standard, 60 à 120 s) après avoir pris une place du plafond par heure.
+- Un post publié via Clipper sur un compte non lié à une chaîne n'apparaissait
+  pas dans Publication.
+- `clipper.__version__` valait encore `0.1.0` ; il suit désormais la version
+  du paquet.
+
+### Retiré
+
+- La clé `[parts] rubric_path` : la grille de découpage est celle de l'étape
+  `moments`. Si elle est encore dans `config.toml`, `parts` s'arrête avec une
+  erreur claire ; supprime la clé (règle `[moments] rubric_path` à la place).
+
 ## [0.2.0] - 2026-10-02
 
 Console web v2, publication et statistiques TikTok par navigateur, comptes
@@ -283,6 +339,7 @@ verticaux sous-titrés, en local.
 - Aucune publication automatique sur TikTok : le dépôt produit les clips
   et leurs métadonnées, la mise en ligne reste manuelle.
 
-[Non publié]: https://github.com/ZeDKouill3/TikTokParseUpload/compare/v0.2.0...HEAD
+[Non publié]: https://github.com/ZeDKouill3/TikTokParseUpload/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/ZeDKouill3/TikTokParseUpload/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/ZeDKouill3/TikTokParseUpload/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/ZeDKouill3/TikTokParseUpload/releases/tag/v0.1.0
