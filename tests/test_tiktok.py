@@ -1317,7 +1317,7 @@ class StatsEnv:
             self.page.present.add(_sel()["detect"][kind][0])
         self.sleeps: list[float] = []
         self.config = Config(mode="review", workspace_dir=tmp_path / "w", output_dir=tmp_path / "output",
-                             _sections={"tiktok": settings or {}})
+                             _sections={"tiktok": {"stats_audience_min_views": 0, **(settings or {})}})
         self.folder = tmp_path / "state" / "stats" / "tiktok" / "ma_chaine"
         self.tmp = tmp_path
         for number, post_id in enumerate(clips, start=1):
@@ -2322,3 +2322,12 @@ def test_publications_date_without_year_uses_the_year_of_the_reading():
     assert tiktok.parse_date("2 oct., 12:30", months, datetime(2026, 10, 2, 0, 5)) == "2026-10-02T12:30:00"
     assert tiktok.parse_date("28 déc., 09:00", months, datetime(2027, 1, 3)) == "2026-12-28T09:00:00"
     assert tiktok.parse_date("2 oct., 12:30", months) is None  # sans date de releve : pas d'annee inventee
+
+
+def test_viewers_and_engagement_are_skipped_below_the_audience_threshold(tmp_path, monkeypatch):
+    # Sous 100 vues, TikTok laisse ces onglets vides : les ouvrir coutait deux attentes de 30 s par post.
+    env = StatsEnv(tmp_path, monkeypatch, [Post(ID_A, cards=_cards(views="20"))], settings={"stats_audience_min_views": 100})
+    env.fetch()
+    post = tiktok.video_detail("ma_chaine", ID_A, config=env.config)
+    assert post["viewers"] is None and post["engagement"] is None
+    assert tiktok.CONFIG_DEFAULTS["stats_audience_min_views"] == 100
