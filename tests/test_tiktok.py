@@ -2315,3 +2315,10 @@ def test_a_setting_disabled_by_tiktok_is_logged_and_skipped_not_a_stop(tmp_path,
     env.publish()
     assert env.page.options["reuse_switch"] is False  # laissee telle quelle, aucun arret
     assert any("désactivée par TikTok" in r.getMessage() for r in caplog.records)
+
+
+def test_publications_date_without_year_uses_the_year_of_the_reading():
+    months = _sel()["calendar"]["months"]
+    assert tiktok.parse_date("2 oct., 12:30", months, datetime(2026, 10, 2, 0, 5)) == "2026-10-02T12:30:00"
+    assert tiktok.parse_date("28 déc., 09:00", months, datetime(2027, 1, 3)) == "2026-12-28T09:00:00"
+    assert tiktok.parse_date("2 oct., 12:30", months) is None  # sans date de releve : pas d'annee inventee

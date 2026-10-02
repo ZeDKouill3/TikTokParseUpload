@@ -383,6 +383,8 @@ def parse_duration(value: Any) -> float | None:
 
 _CHANGE = re.compile(r"([+\-\u2212\u2013]?)\s*(\d+(?:[.,]\d+)?)\s*%")
 _SHORT_DATE = re.compile(r"(\d{1,2})\s+([^\W\d_]+)\.?\s+(\d{4})(?:[,\s]+(\d{1,2})[:h](\d{2}))?")
+# Page Publications : « 2 oct., 12:30 » sans annee (annee de la page, deduite de la date du releve).
+_SHORT_DATE_NO_YEAR = re.compile(r"(\d{1,2})\s+([^\W\d_]+)\.?,?\s*(?:(\d{1,2})[:h](\d{2}))?")
 
 
 def parse_change(value: Any) -> float | None:
@@ -398,7 +400,7 @@ def parse_change(value: Any) -> float | None:
     return -number if match[1] in ("-", "\u2212", "\u2013") else number
 
 
-def parse_date(value: Any, months: list[str]) -> str | None:
+def parse_date(value: Any, months: list[str], today: datetime | None = None) -> str | None:
     """Date de creation affichee (« 2026-10-01 14:05 », « 01/10/2026 14:05 », « 1 oct. 2026, 14:05 ») -> ISO 8601
     sans fuseau (l'heure de la page) ; format inconnu -> ``None`` (le texte brut reste dans ``posted_at_text``)."""
     text = _squash(value) if isinstance(value, str) else ""
@@ -416,6 +418,17 @@ def parse_date(value: Any, months: list[str]) -> str | None:
         index = next((i for i, name in enumerate(names) if name == word or (len(word) >= 3 and name.startswith(word))), None)
         if index is not None:
             return _iso_date(int(match[3]), index + 1, int(match[1]), match[4], match[5])
+    match = _SHORT_DATE_NO_YEAR.fullmatch(text)
+    if match and today is not None:
+        names = [m.casefold() for m in months]
+        word = match[2].casefold()
+        index = next((i for i, name in enumerate(names) if name == word or (len(word) >= 3 and name.startswith(word))), None)
+        if index is not None:
+            # annee du releve ; une date a plus de 31 jours dans le futur appartient a l'annee precedente
+            iso = _iso_date(today.year, index + 1, int(match[1]), match[3], match[4])
+            if iso is not None and datetime.fromisoformat(iso) > today.replace(tzinfo=None) + timedelta(days=31):
+                iso = _iso_date(today.year - 1, index + 1, int(match[1]), match[3], match[4])
+            return iso
     return None
 
 
@@ -932,7 +945,7 @@ class _Flow:
             found.setdefault(match.group(1), {
                 "post_id": match.group(1), "post_url": urljoin(str(self.page.url), href),
                 "caption": _squash(str(link.inner_text())) or None,
-                "posted_at": parse_date(created, self.sel["calendar"]["months"]), "posted_at_text": created,
+                "posted_at": parse_date(created, self.sel["calendar"]["months"], self.now), "posted_at_text": created,
                 "visibility": visibility,
                 **{key: self.read_value(texts[key], key, parse_count, where) for key in ("views", "likes", "comments")}})
         return found
