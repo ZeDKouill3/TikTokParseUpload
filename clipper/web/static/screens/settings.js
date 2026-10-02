@@ -145,7 +145,7 @@ function setGeneral() {
   const mode = setEffective(["mode"]);
   return `<section class="panel" id="set-general"><div class="panel-head"><h2>Général</h2><span class="muted mono">mode</span></div><div class="panel-pad">
     <div class="toggle-row"><div class="li-main"><div class="li-title">Mode</div>
-      <div class="li-sub">review : tu valides les moments. auto : le jury décide. Relu par chaque nouvelle entrée de la file ; une chaîne peut le redéfinir dans son preset.</div></div>
+      <div class="li-sub">review : tu valides les moments. auto : le jury décide. Relu par chaque nouvelle entrée de la file ; un style peut le redéfinir dans son preset.</div></div>
       <div class="seg" data-set-mode role="group" aria-label="Mode">${setUi.data.modes.map((m) => `<button type="button" data-v="${esc(m)}" class="${m === mode ? "on" : ""}">${esc(m)}</button>`).join("")}</div></div>
     <span class="field-error" data-fpath="mode" role="alert"></span>
   </div></section>`;

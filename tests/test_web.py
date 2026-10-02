@@ -991,7 +991,7 @@ def test_index_has_navigation_to_the_eight_screens(tmp_path, isolated_cwd):
     html = served(tmp_path, "/")
     nav = html[html.index('<nav class="nav"'):html.index("</nav>", html.index('<nav class="nav"'))]
     for screen in SCREENS:
-        assert f'href="#/{screen}"' in nav, screen
+        assert f'href="#/{"styles" if screen == "channels" else screen}"' in nav, screen   # écran « Styles » : #/styles
         assert f'data-screen="{screen}"' in nav, screen
         assert f'id="screen-{screen}"' in html, screen
 
@@ -1132,7 +1132,7 @@ def test_visible_strings_are_french_and_no_real_names(tmp_path, isolated_cwd):
     visible = " ".join(parser.text)
     for english in ("Loading", "Submit", "Cancel", "Dashboard", "Settings", "Save", "Search", "Connection lost"):
         assert english not in visible, english
-    assert "Tableau de bord" in visible and "Réglages" in visible and "Chaînes" in visible
+    assert "Tableau de bord" in visible and "Réglages" in visible and "Styles" in visible
     forbidden = ("contre-pied", "contrepied", "amelia", "zedk", "nicoc", "twitch.tv/", "youtube.com/@")
     for path in sorted(STATIC.rglob("*")):
         if path.suffix in {".html", ".css", ".js", ".txt", ".svg"}:
@@ -1148,7 +1148,7 @@ def test_loading_skeletons_and_empty_states(tmp_path, isolated_cwd):
     css = served(tmp_path, "/static/style.css")
     assert ".skeleton" in css
     screens = served(tmp_path, "/static/screens.js")
-    assert "Ajoute une vidéo" in screens and "Crée une chaîne" in screens
+    assert "Ajoute une vidéo" in screens and "Crée un style" in screens
 
 
 def test_static_assets_are_served(tmp_path, isolated_cwd):
@@ -1273,7 +1273,7 @@ def test_index_loads_the_videos_screen_script_after_the_shell_screens(tmp_path, 
 
 def test_videos_screen_has_add_form_with_channel_selector_and_action(tmp_path, isolated_cwd):
     js = _videos_js(tmp_path)
-    for needle in ('name="url"', 'name="channel"', 'name="action"', "Sans chaîne", 'api("/api/channels"',
+    for needle in ('name="url"', 'name="channel"', 'name="action"', "Sans style", 'api("/api/channels"',
                    'value="run"', 'value="render"', '"/api/queue"', 'method: "POST"'):
         assert needle in js, needle
 
@@ -1902,7 +1902,7 @@ def test_approve_a_clip_of_a_video_without_channel_is_409(tmp_path, isolated_cwd
     resp = client(tmp_path).post(f"/api/clips/{CLIPS_VIDEO}/01/approve")
 
     assert resp.status_code == 409
-    assert "chaîne" in resp.json()["detail"]
+    assert "style" in resp.json()["detail"]
 
 
 def test_patch_caption_calls_edit_caption_and_never_writes_the_sidecar(tmp_path, isolated_cwd, monkeypatch):
@@ -2325,8 +2325,8 @@ def test_channels_screen_is_wired_with_list_form_inheritance_and_toast():
     assert "field-error" in js
     assert "jsonBody(\"PUT\"" in js and "jsonBody(\"POST\"" in js
     assert 'method: "DELETE"' in js and "confirm=true" in js and "confirmDialog" in js
-    assert "toast(" in js and "Chaîne enregistrée" in js
-    assert "Aucune chaîne" in js                       # état vide
+    assert "toast(" in js and "Style enregistré" in js
+    assert "Aucun style" in js                       # état vide
     assert "FormData" in js and "/logo" in js          # envoi du logo
     assert ".chan-" in css and ".inherited" in css
 # Surveillance : VOD à confirmer (TASK-7508, SPEC-fc0c §5, SPEC-c100)
@@ -2451,7 +2451,7 @@ def _publish_setup(tmp_path, entries=None, *, slots=True):
 
 
 def _get_publish(tmp_path, **params):
-    params = {"channel": "ma_chaine", "week": PUB_WEEK, **params}
+    params = {"account": "ab12cd", "week": PUB_WEEK, **params}
     return client(tmp_path).get("/api/publish", params=params)
 
 
@@ -2462,8 +2462,8 @@ def test_get_publish_returns_week_slots_with_clip_or_free(tmp_path, isolated_cwd
 
     assert resp.status_code == 200
     data = resp.json()
-    assert data["channel"] == "ma_chaine" and data["timezone"] == "Europe/Paris"
-    assert data["tiktok_account"] == "ab12cd"
+    assert data["account"] == "ab12cd" and data["channel"] == "ma_chaine"   # le style lié au compte porte les créneaux
+    assert data["timezone"] == "Europe/Paris"
     assert data["week_start"] == "2026-10-05" and data["week_end"] == "2026-10-11"
     assert [s["slot_at"] for s in data["slots"]] == [PUB_MON, PUB_THU]
     mon, thu = data["slots"]
@@ -2496,7 +2496,7 @@ def test_get_publish_week_is_taken_from_the_requested_week_and_defaults_to_this_
 
     this = _get_publish(tmp_path).json()
     nxt = _get_publish(tmp_path, week="2026-10-14").json()                 # un mercredi : on tombe sur sa semaine
-    now = client(tmp_path).get("/api/publish", params={"channel": "ma_chaine"}).json()
+    now = client(tmp_path).get("/api/publish", params={"account": "ab12cd"}).json()
 
     assert all(s["clip"] is None for s in this["slots"])
     assert nxt["week_start"] == "2026-10-12"
@@ -2517,11 +2517,11 @@ def test_get_publish_errors_are_french(tmp_path, isolated_cwd):
     _publish_setup(tmp_path)
     c = client(tmp_path)
 
-    assert c.get("/api/publish").status_code == 400                         # chaîne obligatoire
-    assert "chaîne" in c.get("/api/publish").json()["detail"]
-    assert c.get("/api/publish", params={"channel": "inconnue"}).status_code == 404
-    assert c.get("/api/publish", params={"channel": "Bad Name"}).status_code in (400, 422)
-    bad = c.get("/api/publish", params={"channel": "ma_chaine", "week": "demain"})
+    assert c.get("/api/publish").status_code == 200                         # sans compte : « tous les comptes »
+    unknown = c.get("/api/publish", params={"account": "inconnu"})
+    assert unknown.status_code == 404 and "compte" in unknown.json()["detail"]
+    assert c.get("/api/publish", params={"account": "Bad Name"}).status_code in (400, 404, 422)
+    bad = c.get("/api/publish", params={"account": "ab12cd", "week": "demain"})
     assert bad.status_code == 400 and "week" in bad.json()["detail"]
 
 
@@ -2580,7 +2580,7 @@ def test_publish_move_validates_input(tmp_path, isolated_cwd, monkeypatch):
     assert naive.status_code == 422 and "fuseau" in naive.json()["detail"]
     assert junk.status_code == 422 and "slot_at" in junk.json()["detail"]
     assert unsafe.status_code in (400, 404)
-    assert nochan.status_code == 409 and "chaîne" in nochan.json()["detail"]
+    assert nochan.status_code == 409 and "style" in nochan.json()["detail"]
 
 
 def test_publish_move_end_to_end_on_a_temporary_state(tmp_path, isolated_cwd):
@@ -2643,6 +2643,89 @@ def test_publish_published_and_unschedule_end_to_end(tmp_path, isolated_cwd):
     assert again.status_code == 409
 
 
+SECOND = "ef34gh"                              # 2e compte TikTok, lié à aucun style
+PUB_NOCHAN_VIDEO = "nochannel001"
+
+
+def _two_accounts_setup(tmp_path):
+    """Compte ab12cd lié au style ma_chaine ; compte ef34gh sans style ; une vidéo sans style publiée sur ef34gh."""
+    _publish_setup(tmp_path, [
+        _entry("01", "published", slot_at=PUB_MON, published_at="2026-10-05T18:40:00+02:00", account="ab12cd"),
+        _entry("02", "failed", slot_at=PUB_THU, error="quota depasse", account="ab12cd"),
+    ])
+    (tmp_path / "state" / "accounts.json").write_text(json.dumps({"accounts": [
+        {"id": "ab12cd", "label": "Compte exemple", "platform": "TikTok"},
+        {"id": SECOND, "label": "second_compte", "platform": "TikTok"}]}), encoding="utf-8")
+    _write_state(tmp_path, PUB_NOCHAN_VIDEO)                                  # aucune chaîne
+    _write_clip(tmp_path, PUB_NOCHAN_VIDEO, {**_clip_sidecar("01"), "video_id": PUB_NOCHAN_VIDEO})
+    _write_clip(tmp_path, PUB_NOCHAN_VIDEO, {**_clip_sidecar("02"), "video_id": PUB_NOCHAN_VIDEO})
+    _write_publish(tmp_path, "_sans_chaine", [
+        _entry("01", "published", video_id=PUB_NOCHAN_VIDEO, slot_at=PUB_MON,
+               published_at="2026-10-06T09:00:00+02:00", account=SECOND),
+        _entry("02", "scheduled", video_id=PUB_NOCHAN_VIDEO, slot_at=PUB_THU, account=SECOND),
+    ])
+
+
+def _ids(clips):
+    return sorted((c["video_id"], c["clip_id"]) for c in clips)
+
+
+def test_a_post_published_on_an_account_without_style_shows_in_that_account_and_in_all(tmp_path, isolated_cwd):
+    _two_accounts_setup(tmp_path)
+
+    second = _get_publish(tmp_path, account=SECOND).json()
+    everyone = client(tmp_path).get("/api/publish", params={"week": PUB_WEEK}).json()   # pas de compte : tous
+
+    assert _ids(second["done"]) == [(PUB_NOCHAN_VIDEO, "01")]
+    assert _ids(second["off_slot"]) == [(PUB_NOCHAN_VIDEO, "02")]             # programmé, sans créneau de style
+    assert second["account"] == SECOND and second["channel"] is None and second["slots"] == []
+    assert "style" in second["reason"] and "chaîne" not in second["reason"]  # le texte dit « style », plus « chaîne »
+    assert _ids(everyone["done"]) == [(CLIPS_VIDEO, "01"), (CLIPS_VIDEO, "02"), (PUB_NOCHAN_VIDEO, "01")]
+    assert everyone["account"] is None
+    assert {c["account"] for c in everyone["done"]} == {"ab12cd", SECOND}
+
+
+def test_the_publish_view_of_an_account_excludes_the_posts_of_another_account(tmp_path, isolated_cwd):
+    _two_accounts_setup(tmp_path)
+
+    a = _get_publish(tmp_path, account="ab12cd").json()
+    b = _get_publish(tmp_path, account=SECOND).json()
+
+    assert _ids(a["done"]) == [(CLIPS_VIDEO, "01"), (CLIPS_VIDEO, "02")]
+    assert all(c["video_id"] == CLIPS_VIDEO for c in a["done"])
+    assert all(c["video_id"] != CLIPS_VIDEO for c in [*b["done"], *b["off_slot"], *b["unscheduled"]])
+    assert [s["clip"]["clip_id"] for s in a["slots"] if s["clip"]] == ["01", "02"]
+    assert _ids(b["done"]) == [(PUB_NOCHAN_VIDEO, "01")]
+
+
+def test_a_post_created_through_the_form_on_a_second_account_appears_in_its_publish_view(tmp_path, isolated_cwd):
+    _publications_setup(tmp_path)
+    _write_state(tmp_path, PUB_NOCHAN_VIDEO)
+    _write_clip(tmp_path, PUB_NOCHAN_VIDEO, {**_clip_sidecar("01"), "video_id": PUB_NOCHAN_VIDEO})
+    c = _pub_client(tmp_path)
+
+    created = c.post("/api/publications", json={
+        "video_id": PUB_NOCHAN_VIDEO, "clip_id": "01", "account": SPARE, "mode": "immediate"})
+
+    assert created.status_code == 201, created.text
+    monday = (_dt.now(_tz.utc) - _td(days=_dt.now(_tz.utc).weekday())).date().isoformat()
+    for account in (SPARE, ""):
+        view = c.get("/api/publish", params={"account": account, "week": monday}).json()
+        rows = [*view["done"], *view["off_slot"], *view["unscheduled"]]
+        assert (PUB_NOCHAN_VIDEO, "01") in _ids(rows), account
+    other = c.get("/api/publish", params={"account": READY, "week": monday}).json()
+    assert (PUB_NOCHAN_VIDEO, "01") not in _ids([*other["done"], *other["off_slot"], *other["unscheduled"]])
+
+
+def test_get_publish_corrupt_file_of_a_styleless_video_is_a_500(tmp_path, isolated_cwd):
+    _two_accounts_setup(tmp_path)
+    (tmp_path / "state" / "publish" / "_sans_chaine.json").write_text("{pas du json", encoding="utf-8")
+
+    resp = client(tmp_path).get("/api/publish", params={"week": PUB_WEEK})
+
+    assert resp.status_code == 500 and "publication" in resp.json()["detail"]
+
+
 def test_publish_screen_is_wired_with_calendar_queue_and_actions():
     page = (STATIC / "index.html").read_text(encoding="utf-8")
     js = (STATIC / "screens" / "publish.js").read_text(encoding="utf-8")
@@ -2652,8 +2735,9 @@ def test_publish_screen_is_wired_with_calendar_queue_and_actions():
     assert page.index("/static/screens.js") < page.index("/static/screens/publish.js") < page.index("/static/app.js")
     assert "Screens.publish" in js
     assert "/api/publish" in js and "/move" in js and "/published" in js and "/unschedule" in js
-    assert "pub-channel" in js and "<select" in js                         # sélecteur de chaîne
-    assert "tiktok_account" in js                                          # compte cible affiché
+    assert "pub-account" in js and "<select" in js                         # sélecteur de compte TikTok
+    assert "Tous les comptes" in js and "account=" in js                    # « tous » + un compte par filtre
+    assert "publish?channel=" not in js                                    # plus aucun filtre par style
     assert "week" in js and "Semaine précédente" in js and "Semaine suivante" in js
     assert "cal-c" in js and "data-slot-at" in js and "slot_at" in js      # calendrier hebdomadaire des créneaux
     assert "unscheduled" in js and "À publier" in js                       # file des approuvés sans créneau
@@ -3360,7 +3444,7 @@ def _console_section() -> str:
 
 def test_guide_console_section_covers_screens_queue_presets_state_watch_and_remote_access():
     section = _console_section()
-    for screen in ("Accueil", "Vidéos", "Revue", "Clips", "Chaînes", "Publication", "Statistiques", "Réglages"):
+    for screen in ("Accueil", "Vidéos", "Revue", "Clips", "Styles", "Publication", "Statistiques", "Réglages"):
         assert screen in section, screen
     assert "Les 8 écrans" in section
     for needle in (
@@ -5017,7 +5101,9 @@ def test_publish_account_route_changes_the_account_among_the_ready_ones(tmp_path
     resp = c.post(f"/api/publish/{CLIPS_VIDEO}/01/account", json={"account": SPARE})
 
     assert resp.status_code == 200 and resp.json()["account"] == SPARE
-    assert _get_publish(tmp_path).json()["slots"][1]["clip"]["account"] == SPARE
+    moved = _get_publish(tmp_path, account=SPARE).json()                     # le post suit son nouveau compte
+    assert [c["account"] for c in moved["off_slot"]] == [SPARE]
+    assert _get_publish(tmp_path).json()["slots"][1]["clip"] is None
 
 
 def test_publish_account_route_refuses_a_not_ready_account_a_published_entry_and_a_bad_body(tmp_path, isolated_cwd):
@@ -5045,12 +5131,13 @@ def test_the_publication_calendar_shows_the_account_of_each_post_and_why_it_wait
     _accounts_state(tmp_path, ready=(READY,))
 
     data = _get_publish(tmp_path).json()
+    spare = _get_publish(tmp_path, account=SPARE).json()
 
-    thu = data["slots"][1]["clip"]
-    assert thu["account"] == SPARE and "non prêt à publier" in thu["waiting_reason"]
     assert data["unscheduled"][0]["account"] == READY and data["unscheduled"][0]["waiting_reason"] is None
+    assert data["account"] == READY and data["channel"] == "ma_chaine"  # le style lié au compte reste affiché
     assert [a["id"] for a in data["accounts"]] == [READY, SPARE]  # libellés et état, pour l'affichage
-    assert data["tiktok_account"] == READY  # le compte de la chaîne reste affiché
+    waiting = spare["off_slot"][0]                                  # le compte SPARE n'a pas de style : pas de créneau
+    assert waiting["account"] == SPARE and "non prêt à publier" in waiting["waiting_reason"]
 
 
 def test_the_clips_list_carries_the_account_of_the_entry(tmp_path, isolated_cwd):
@@ -5750,7 +5837,7 @@ def test_approving_without_a_channel_says_the_channel_can_be_chosen_right_there(
 
     assert resp.status_code == 409
     body = resp.json()
-    assert "n'a pas de chaîne" in body["detail"]
+    assert "n'a pas de style" in body["detail"]
     assert body["needs_channel"] is True and body["video_id"] == CLIPS_VIDEO and body["channels"] == [CH]
 
 
@@ -5962,7 +6049,7 @@ def test_assign_channel_dialog_lists_the_channels_and_posts_through_the_api():
 def test_video_page_offers_assign_channel_and_the_approval_error_offers_it_too():
     videos = (STATIC / "screens" / "videos.js").read_text(encoding="utf-8")
     ui = (STATIC / "ui.js").read_text(encoding="utf-8")
-    assert "data-assign-channel" in videos and "Attribuer une chaîne" in videos and "!video.channel" in videos
+    assert "data-assign-channel" in videos and "Attribuer un style" in videos and "!video.channel" in videos
     assert "openAssignChannel(videoId)" in videos or "openAssignChannel(video.video_id)" in videos
     # l'erreur 409 « pas de chaîne » (needs_channel) devient un toast avec le bouton de choix
     assert "needs_channel" in ui and "openAssignChannel(err.body.video_id, err.body.channels)" in ui
@@ -5990,7 +6077,7 @@ def test_channel_card_actions_build_the_preset_to_save_without_touching_the_rest
 def test_channel_card_has_direct_actions_and_channel_fields_are_editable_without_redefine():
     js = (STATIC / "screens" / "channels.js").read_text(encoding="utf-8")
     for marker in ("data-chan-add-slot", "data-chan-account", "data-chan-queue", "Ajouter un créneau", "Compte TikTok",
-                   "Mettre une vidéo en file pour cette chaîne", "openAddVideo(b.dataset.chanQueue)"):
+                   "Mettre une vidéo en file pour ce style", "openAddVideo(b.dataset.chanQueue)"):
         assert marker in js
     # [channel] : jamais « redéfinir » ni champ grisé (disabled) ; les autres sections gardent l'héritage
     assert "const chIsDirect = (section) => section === \"channel\"" in js
@@ -6084,19 +6171,20 @@ def test_finished_posts_leave_the_ongoing_list_and_an_approved_one_without_momen
 
 @_NODE
 def test_publication_layout_puts_the_calendar_in_the_main_column_next_to_the_list_with_one_no_slot_message():
-    week = {"channel": "ma_chaine", "timezone": "Europe/Paris", "tiktok_account": "ab12cd", "week_start": "2026-10-05", "week_end": "2026-10-11",
+    week = {"account": "ab12cd", "channel": "ma_chaine", "timezone": "Europe/Paris", "week_start": "2026-10-05", "week_end": "2026-10-11",
             "slots": [{"slot_at": "2026-10-05T18:30:00+02:00", "slot_at_paris": "2026-10-05T18:30:00+02:00", "clip": None, "free": True}],
             "unscheduled": [{"video_id": "v", "clip_id": "01", "publish_status": "approved", "screen_title": "T", "video_url": "/m", "thumbnail_url": "/t"}],
             "done": [], "off_slot": [{"video_id": "v", "clip_id": "02", "publish_status": "scheduled", "screen_title": "Manuel", "slot_at": "2026-10-07T12:15:00+00:00",
                                       "slot_at_paris": "2026-10-07T14:15:00+02:00", "video_url": "/m", "thumbnail_url": "/t"}],
-            "accounts": [], "reason": None}
+            "accounts": [{"id": "ab12cd", "label": "Compte exemple", "ready_to_publish": True},
+                         {"id": "ef34ab", "label": "second_compte", "ready_to_publish": True}], "reason": None}
     empty = {**week, "slots": [], "off_slot": [], "unscheduled": [{**week["unscheduled"][0]}], "reason": "aucun créneau défini dans [channel].slots"}
     out = _run_publish(f"""(() => {{
-      pubUi.channel = 'ma_chaine';
-      const withSlots = pubLayoutHtml(['ma_chaine'], {json.dumps(week)}, pubPostsSection());
-      const noSlots = pubLayoutHtml(['ma_chaine'], {json.dumps(empty)}, pubPostsSection());
-      const noChannel = pubLayoutHtml([], null, pubPostsSection());
-      return {{ withSlots, noSlots, noChannel }};
+      pubUi.account = 'ab12cd';
+      const withSlots = pubLayoutHtml({json.dumps(week)}, pubPostsSection());
+      const noSlots = pubLayoutHtml({json.dumps(empty)}, pubPostsSection());
+      const loading = pubLayoutHtml(null, pubPostsSection());
+      return {{ withSlots, noSlots, loading }};
     }})()""")
     html = out["withSlots"]
     grid = html[html.index('class="grid g-side pub-grid"'):]
@@ -6105,7 +6193,9 @@ def test_publication_layout_puts_the_calendar_in_the_main_column_next_to_the_lis
     assert "14:15" in grid and "Manuel" in grid                                      # une publication manuelle entre les créneaux est au calendrier, à l'heure de Paris
     assert out["noSlots"].lower().count("aucun créneau") == 1                        # le message n'apparaît qu'une fois
     assert 'id="pub-cal"' not in out["noSlots"] and "data-pub-new" in out["noSlots"]
-    assert "Aucune chaîne" in out["noChannel"] and "data-pub-new" in out["noChannel"]
+    assert "data-pub-new" in out["loading"]                                          # « Nouvelle publication » sans calendrier chargé
+    assert 'id="pub-account"' in html and "Tous les comptes" in html                 # sélecteur : tous les comptes + un par compte
+    assert '<option value="ab12cd" selected>Compte exemple</option>' in html and "second_compte" in html
 
 
 def test_publication_help_texts_describe_optional_slots_and_the_new_publication_flow():
@@ -6197,7 +6287,7 @@ def test_the_stats_screen_follows_the_mockup_account_period_scan_tabs_and_video_
     assert "Screens.stats" in js
     for route in ("/api/stats/tiktok", "/videos", "/api/stats/tiktok/refresh", "?period="):
         assert route in js
-    for text in ("Compte TikTok", "Chaîne Clipper liée", "Période", "Dernier relevé", "Relever maintenant",
+    for text in ("Compte TikTok", "Style Clipper lié", "Période", "Dernier relevé", "Relever maintenant",
                  "Vue d'ensemble", "Vidéos", "Spectateurs", "Engagement", "Ouvrir sur TikTok", "Voir le clip dans Clipper",
                  "Vidéo source", "publié hors Clipper", "Publié hors Clipper", "Compte non prêt à publier",
                  "Filtrer par légende", "Taux de rétention", "dès 100 vues", "Mots les plus utilisés dans les commentaires",
@@ -6235,7 +6325,7 @@ def test_the_dashboard_now_carries_the_internal_measures():
         assert block in js, block
     for field in ("llm_cost", "by_video", "by_usage", "by_day", "steps", "counts"):
         assert field in js
-    assert "data-measures-channel" in js and "data-measures-preset" in js and "Toutes les chaînes" in js
+    assert "data-measures-channel" in js and "data-measures-preset" in js and "Tous les styles" in js
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node absent du PATH")
@@ -6605,3 +6695,79 @@ def test_the_modified_stats_script_is_valid_javascript():
     path = Path(__file__).resolve().parent.parent / "clipper" / "web" / "static" / "screens" / "stats.js"
     done = subprocess.run(["node", "--check", str(path)], capture_output=True, text=True, encoding="utf-8")
     assert done.returncode == 0, done.stderr
+
+
+# --------------------------------------------------------------------------
+# TASK-0247 : « Chaîne » devient « Style » dans ce que l'utilisateur voit ; #/chaines redirige
+# --------------------------------------------------------------------------
+
+_NODE = shutil.which("node")
+
+
+def _strip_comments(text: str, suffix: str) -> str:
+    if suffix == ".html":
+        return re.sub(r"<!--.*?-->", "", text, flags=re.S)
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+    if suffix == ".js":
+        text = re.sub(r"(?m)(^|[\s;,)}{])//[^\n]*", r"\1", text)
+    return text
+
+
+def test_no_visible_chaine_wording_is_left_in_the_console():
+    allowed = ("ma_chaine", "_sans_chaine", "(chaines|channels)")            # exemple neutre, identifiants, ancienne URL
+    found = []
+    for path in sorted(STATIC.rglob("*")):
+        if path.suffix not in (".js", ".html", ".css"):
+            continue
+        text = _strip_comments(path.read_text(encoding="utf-8"), path.suffix)
+        for token in allowed:
+            text = text.replace(token, "")
+        found += [f"{path.relative_to(STATIC)}: {m.group(0)!r}" for m in re.finditer(r"(?i).{0,25}(?<![a-z])cha[iî]nes?.{0,25}", text)]
+    assert not found, "libellés « chaîne » restants :\n" + "\n".join(found)
+
+
+def test_the_menu_says_styles_and_the_styles_screen_has_a_styles_url():
+    page = (STATIC / "index.html").read_text(encoding="utf-8")
+    channels_js = (STATIC / "screens" / "channels.js").read_text(encoding="utf-8")
+
+    assert re.search(r'<a href="#/styles"[^>]*data-screen="channels"[^>]*>.*?<span>Styles</span>', page)
+    assert 'data-title="Styles"' in page
+    assert "#/styles" in channels_js and "#/channels" not in channels_js
+
+
+@pytest.mark.skipif(_NODE is None, reason="node absent du PATH")
+def test_the_old_chaines_and_channels_urls_redirect_to_styles(tmp_path):
+    app_js = (STATIC / "app.js").read_text(encoding="utf-8")
+    start, end = app_js.index("/* >>> hash-legacy */"), app_js.index("/* <<< hash-legacy */")
+    script = tmp_path / "hash_legacy.js"
+    script.write_text(
+        app_js[start:end]
+        + "\nconst cases = {'#/chaines': '#/styles', '#/chaines/ma_chaine': '#/styles/ma_chaine',"
+          " '#/channels': '#/styles', '#/channels/ma_chaine/layout': '#/styles/ma_chaine/layout',"
+          " '#/styles': null, '#/publish': null, '': null};\n"
+          "const bad = Object.entries(cases).filter(([k, v]) => legacyHash(k) !== v);\n"
+          "console.log(JSON.stringify(bad));\n", encoding="utf-8")
+
+    out = subprocess.run([_NODE, str(script)], capture_output=True, text=True, encoding="utf-8", check=True)
+
+    assert json.loads(out.stdout) == []
+    assert "legacyHash(location.hash)" in app_js and "SCREEN_IDS" in app_js
+
+
+@pytest.mark.skipif(_NODE is None, reason="node absent du PATH")
+@pytest.mark.parametrize("path", sorted(STATIC.rglob("*.js")), ids=lambda p: p.name)
+def test_every_console_script_passes_node_check(path):
+    out = subprocess.run([_NODE, "--check", str(path)], capture_output=True, text=True, encoding="utf-8")
+
+    assert out.returncode == 0, out.stderr
+
+
+def test_a_tiktok_account_without_style_is_listed_and_readable_in_the_stats_screen(tmp_path, isolated_cwd):
+    _tt_accounts(tmp_path, channel=False)                                     # aucun preset : le compte n'est lié à aucun style
+    web = _tt_client(tmp_path)
+
+    found = _tt_account_state(web)
+    overview = web.get(f"/api/stats/tiktok/{TT_ACCOUNT}")
+
+    assert found["channel"] is None and found["account"] == TT_ACCOUNT        # présent, pas masqué faute de style
+    assert overview.status_code == 200 and overview.json()["channel"] is None

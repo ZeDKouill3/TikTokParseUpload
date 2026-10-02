@@ -1,7 +1,7 @@
 /* Éditeur d'agencement stream split (SPEC-c100 E5, SPEC-76dc). Route
-   #/channels/<chaine>/layout : canevas 1080x1920 mis à l'échelle, quatre zones
+   #/styles/<chaine>/layout : canevas 1080x1920 mis à l'échelle, quatre zones
    (webcam, jeu, badge, sous-titres) à glisser et redimensionner sur une image
-   clé d'une vidéo de la chaîne, valeurs {x, y, w, h} éditables, enregistrées
+   clé d'une vidéo du style, valeurs {x, y, w, h} éditables, enregistrées
    dans [reframe] du preset. Aucune validation ici : c'est reframe qui refuse un
    agencement qui déborde, se chevauche ou sort de la zone sûre, et le serveur
    renvoie son message tel quel (422), affiché sous la barre d'outils.
@@ -13,7 +13,7 @@ const LY_MIN = 20;                 // taille minimale d'une zone (px du canevas)
 const LY_ZONES = [
   { key: "split_webcam_dest", label: "Webcam", icon: "scan-face", kind: "cam" },
   { key: "split_gameplay_dest", label: "Jeu", icon: "monitor", kind: "game" },
-  { key: "badge_dest", label: "Badge de chaîne", icon: "twitch", kind: "badge" },
+  { key: "badge_dest", label: "Badge de style", icon: "twitch", kind: "badge" },
   { key: "split_subtitle_dest", label: "Sous-titres", icon: "captions", kind: "subs" },
 ];
 const LY_SAMPLE = "EXEMPLE DE SOUS-TITRE";
@@ -22,7 +22,7 @@ const lyUi = { name: null, data: null, draft: null, saved: null, selected: LY_ZO
 
 const lyName = () => {
   const parts = location.hash.replace(/^#\/?/, "").split("?")[0].split("/");
-  return parts[0] === "channels" && parts[2] === "layout" ? decodeURIComponent(parts[1] || "") : "";
+  return parts[0] === "styles" && parts[2] === "layout" ? decodeURIComponent(parts[1] || "") : "";
 };
 const lyCopy = (v) => JSON.parse(JSON.stringify(v));
 const lyDirty = () => JSON.stringify(lyUi.draft) !== JSON.stringify(lyUi.saved);
@@ -57,10 +57,10 @@ function lyValuesHtml() {
 
 function lyHtml() {
   const frameNote = lyUi.frame
-    ? `<p class="muted ly-note">Aperçu sur une image clé d'une vidéo de la chaîne : le recadrage réel suit la webcam détectée, ici l'image entière sert de repère.</p>`
+    ? `<p class="muted ly-note">Aperçu sur une image clé d'une vidéo du style : le recadrage réel suit la webcam détectée, ici l'image entière sert de repère.</p>`
     : `<p class="reason bad ly-note" role="alert">${esc(lyUi.frameError || "Aucune image clé disponible.")}</p>`;
   return `<div class="ly">
-    <div class="toolbar"><a class="btn btn-sm btn-ghost" href="#/channels/${encodeURIComponent(lyUi.name)}">${icon("chevron-left", "i-xs")}Retour à la chaîne</a>
+    <div class="toolbar"><a class="btn btn-sm btn-ghost" href="#/styles/${encodeURIComponent(lyUi.name)}">${icon("chevron-left", "i-xs")}Retour au style</a>
       <h2 class="chan-title">Éditeur d'agencement <span class="mono muted">${esc(lyUi.name)}</span></h2><span class="grow"></span>
       <span class="muted ly-dirty" data-ly-dirty></span>
       <button type="button" class="btn btn-sm btn-ghost" data-ly-reset>${icon("rotate-ccw", "i-xs")}Réinitialiser aux défauts</button>
@@ -255,7 +255,7 @@ async function lyOpen(body, name) {
   lyScale(body); lyPlaceAll(body); lyWire(body);
 }
 
-/* Enveloppe de l'écran Chaînes : la sous-route /layout est à nous, le reste
+/* Enveloppe de l'écran Styles : la sous-route /layout est à nous, le reste
    (liste, formulaire d'un preset) reste à channels.js. */
 const lyChannelsRender = Screens.channels.render;
 Screens.channels.render = function (body, store) {

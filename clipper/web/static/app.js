@@ -202,12 +202,23 @@ function connectEvents() {
 }
 
 /* ---------- Routeur par hash ---------- */
+/* >>> hash-legacy */
+// L'ecran « Styles » (id interne « channels ») vit sous #/styles ; les anciennes URL #/chaines et #/channels
+// y redirigent (sous-routes comprises). Rend la nouvelle URL, ou null si le hash n'est pas une ancienne URL.
+function legacyHash(hash) {
+  const m = /^#\/?(chaines|channels)(?=$|[/?])(.*)$/.exec(hash);
+  return m ? `#/styles${m[2]}` : null;
+}
+/* <<< hash-legacy */
+
 function route() {
+  const moved = legacyHash(location.hash);
+  if (moved) { history.replaceState(null, "", moved); }
   const hashId = (location.hash.replace(/^#\/?/, "").split(/[/?]/)[0]) || "dashboard";
   // « #set-xxx » est l'ancre d'une section de Réglages, jamais un écran : on défile jusqu'à
   // elle (sans quitter l'écran), et seulement si Réglages n'est pas encore affiché on l'ouvre.
   const anchor = hashId.startsWith("set-") ? hashId : null;
-  const id = anchor ? "settings" : hashId;
+  const id = anchor ? "settings" : (hashId === "styles" ? "channels" : hashId);
   if (anchor && currentScreen === "settings") {
     const target = document.getElementById(anchor);
     if (target) target.scrollIntoView();
@@ -354,12 +365,12 @@ async function restoreVideo(id) {
   } catch (err) { toastError("Impossible de rétablir la vidéo", err); }
 }
 
-/* ---------- Attribuer une chaine a une video qui n'en a pas (fiche video, erreur d'approbation) ---------- */
+/* ---------- Attribuer un style a une video qui n'en a pas (fiche video, erreur d'approbation) ---------- */
 function assignChannelHtml(videoId, channels) {
   return `
-    <div class="modal-head"><h2>Attribuer une chaîne</h2><p class="muted" style="margin-top:4px">${esc(videoId)} n'a pas de chaîne : sans elle, ses clips ne peuvent être ni approuvés ni publiés. Le choix est journalisé et ne se change pas ensuite.</p></div>
+    <div class="modal-head"><h2>Attribuer un style</h2><p class="muted" style="margin-top:4px">${esc(videoId)} n'a pas de style : sans lui, ses clips ne peuvent être ni approuvés ni publiés. Le choix est journalisé et ne se change pas ensuite.</p></div>
     <form id="assign-form"><div class="modal-body">
-      <div class="field"><label for="assign-channel">Chaîne</label>
+      <div class="field"><label for="assign-channel">Style</label>
         <select class="input" id="assign-channel" name="channel" required>${channels.map((c) => `<option value="${esc(c)}">${esc(c)}</option>`).join("")}</select></div>
     </div>
     <div class="modal-foot"><button type="button" class="btn btn-ghost" data-dismiss>Annuler</button><button type="submit" class="btn btn-primary">Attribuer</button></div></form>`;
@@ -368,11 +379,11 @@ function assignChannelHtml(videoId, channels) {
 async function openAssignChannel(videoId, knownChannels) {
   let channels = knownChannels && knownChannels.length ? knownChannels : null;
   if (!channels) {
-    try { await loadChannels(); } catch (err) { toastError("Chaînes indisponibles", err); return; }
+    try { await loadChannels(); } catch (err) { toastError("Styles indisponibles", err); return; }
     channels = store.channels || [];
   }
   if (!channels.length) {
-    toast({ kind: "warn", title: "Aucune chaîne", body: "Crée une chaîne dans l'écran Chaînes avant de l'attribuer à une vidéo." });
+    toast({ kind: "warn", title: "Aucun style", body: "Crée un style dans l'écran Styles avant de l'attribuer à une vidéo." });
     return;
   }
   openPanel("modal", assignChannelHtml(videoId, channels), (el) => {
@@ -382,7 +393,7 @@ async function openAssignChannel(videoId, knownChannels) {
       closeLayer();
       try {
         await api(`/api/videos/${encodeURIComponent(videoId)}/channel`, jsonBody("POST", { channel }));
-        toast({ kind: "ok", title: "Chaîne attribuée", body: `${videoId} : ${channel}` });
+        toast({ kind: "ok", title: "Style attribué", body: `${videoId} : ${channel}` });
         await afterVideoAction(videoId);
         if (typeof loadClips === "function") loadClips();
       } catch (err) { toastError("Attribution impossible", err); }
@@ -392,15 +403,15 @@ async function openAssignChannel(videoId, knownChannels) {
 
 /* ---------- Ajout de video ---------- */
 async function openAddVideo(channel) {
-  try { if (store.channels === null) await loadChannels(); } catch (err) { toastError("Chaînes indisponibles", err); }
+  try { if (store.channels === null) await loadChannels(); } catch (err) { toastError("Styles indisponibles", err); }
   const channels = store.channels || [];
   openPanel("modal", `
-    <div class="modal-head"><h2>Ajouter une vidéo</h2><p class="muted" style="margin-top:4px">YouTube ou VOD Twitch. Elle passe en file avec le preset de sa chaîne.</p></div>
+    <div class="modal-head"><h2>Ajouter une vidéo</h2><p class="muted" style="margin-top:4px">YouTube ou VOD Twitch. Elle passe en file avec le preset de son style.</p></div>
     <form id="add-form"><div class="modal-body">
       <div class="field"><label for="add-url">Adresse (URL)</label><input class="input" id="add-url" name="url" type="url" required placeholder="https://…" autocomplete="off"></div>
-      <div class="field"><label for="add-channel">Chaîne</label>
-        <select class="input" id="add-channel" name="channel"><option value="">Sans chaîne (config.toml)</option>${channels.map((c) => `<option value="${esc(c)}"${c === channel ? " selected" : ""}>${esc(c)}</option>`).join("")}</select>
-        ${channels.length ? "" : `<span class="hint">Aucune chaîne : crée-en une dans l'écran Chaînes.</span>`}</div>
+      <div class="field"><label for="add-channel">Style</label>
+        <select class="input" id="add-channel" name="channel"><option value="">Sans style (config.toml)</option>${channels.map((c) => `<option value="${esc(c)}"${c === channel ? " selected" : ""}>${esc(c)}</option>`).join("")}</select>
+        ${channels.length ? "" : `<span class="hint">Aucun style : crée-en une dans l'écran Styles.</span>`}</div>
     </div>
     <div class="modal-foot"><button type="button" class="btn btn-ghost" data-dismiss>Annuler</button><button type="submit" class="btn btn-primary">Mettre en file</button></div></form>`,
   (el) => {

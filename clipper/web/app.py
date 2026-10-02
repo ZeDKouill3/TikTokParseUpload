@@ -449,7 +449,7 @@ def _validate_video_id(video_id: str) -> None:
 
 def _validate_channel_name(channel: str) -> None:
     if not channel_mod.NAME_RE.match(channel):
-        raise HTTPException(status_code=400, detail=f"nom de chaîne invalide : {channel!r}")
+        raise HTTPException(status_code=400, detail=f"nom de style invalide : {channel!r}")
 
 
 def _channel_of(video_id: str, config: Config) -> str | None:
@@ -869,7 +869,7 @@ def _require_channel(video_id: str, clip_id: str, config: Config, *, or_no_chann
         if or_no_channel:
             return publish_mod.NO_CHANNEL
         raise _NoChannel(
-            f"la vidéo {video_id} n'a pas de chaîne : publier {clip_id} demande une chaîne (presets/<chaîne>.toml)",
+            f"la vidéo {video_id} n'a pas de style : publier {clip_id} demande un style (presets/<style>.toml)",
             video_id, _channel_names())
     return channel
 
@@ -987,7 +987,7 @@ def _check_channel_name(name: str) -> None:
     if not channel_mod.NAME_RE.match(name):
         raise HTTPException(
             status_code=422,
-            detail=f"nom de chaîne invalide : {name!r} (attendu : lettres minuscules, chiffres, _ ou -, 1 à 40 caractères)",
+            detail=f"nom de style invalide : {name!r} (attendu : lettres minuscules, chiffres, _ ou -, 1 à 40 caractères)",
         )
 
 
@@ -995,7 +995,7 @@ def _channel_preset_path(name: str) -> Path:
     _check_channel_name(name)
     path = Path(_PRESETS_DIR) / f"{name}.toml"
     if not path.is_file():
-        raise HTTPException(status_code=404, detail=f"chaîne inconnue : {name!r}")
+        raise HTTPException(status_code=404, detail=f"style inconnu : {name!r}")
     return path
 
 
@@ -1271,7 +1271,7 @@ def _layout_keyframe_path(config: Config, name: str, video_id: str | None) -> Pa
         if not _SAFE_ID.fullmatch(video_id):
             raise HTTPException(status_code=404, detail=f"identifiant invalide : {video_id!r}")
         if _channel_of(video_id, config) != name:
-            raise HTTPException(status_code=404, detail=f"la vidéo {video_id!r} n'appartient pas à la chaîne {name!r}")
+            raise HTTPException(status_code=404, detail=f"la vidéo {video_id!r} n'appartient pas au style {name!r}")
         frames = _layout_keyframes(config, video_id)
         if not frames:
             raise HTTPException(status_code=404, detail=f"aucune image clé pour la vidéo {video_id!r} (étape scenes non faite)")
@@ -1283,7 +1283,7 @@ def _layout_keyframe_path(config: Config, name: str, video_id: str | None) -> Pa
                 return frames[len(frames) // 2]
     raise HTTPException(
         status_code=404,
-        detail=f"aucune image clé : aucune vidéo de la chaîne {name!r} n'a passé l'étape scenes",
+        detail=f"aucune image clé : aucune vidéo du style {name!r} n'a passé l'étape scenes",
     )
 
 
@@ -2146,10 +2146,10 @@ def create_app(config: Config | None = None) -> FastAPI:
     # ----------------------------------------------------------------
 
     @app.get("/api/publish")
-    def publish_week(channel: str | None = None, week: str | None = None) -> dict[str, Any]:
-        if not channel:
-            raise HTTPException(status_code=400, detail="paramètre channel obligatoire : choisis une chaîne")
-        return _publish_week_view(config, channel, week)
+    def publish_week(account: str | None = None, week: str | None = None) -> dict[str, Any]:
+        """Calendrier et publications d'un compte TikTok (``account``), ou de tous les comptes sans ``account`` :
+        un post publie via Clipper y figure quel que soit son style (ou l'absence de style)."""
+        return _publish_week_view(config, account or None, week)
 
     def _publish_action(video_id: str, clip_id: str, action: str, *args: Any, **kwargs: Any) -> dict[str, Any]:
         _validate_video_id(video_id)
@@ -2360,7 +2360,7 @@ def create_app(config: Config | None = None) -> FastAPI:
     def create_channel(body: ChannelCreateBody) -> dict[str, Any]:
         _check_channel_name(body.name)
         if (Path(_PRESETS_DIR) / f"{body.name}.toml").exists():
-            raise HTTPException(status_code=409, detail=f"la chaîne {body.name!r} existe déjà")
+            raise HTTPException(status_code=409, detail=f"le style {body.name!r} existe déjà")
         Path(_PRESETS_DIR).mkdir(parents=True, exist_ok=True)
         _save_channel_preset(body.name, body.preset or {"channel": {}})
         return _channel_detail(body.name)
@@ -2385,7 +2385,7 @@ def create_app(config: Config | None = None) -> FastAPI:
         if not confirm:
             raise HTTPException(
                 status_code=409,
-                detail=f"confirmation requise (confirm=true) : supprimer la chaîne {name!r} efface son preset",
+                detail=f"confirmation requise (confirm=true) : supprimer le style {name!r} efface son preset",
             )
         try:
             channel_mod.delete_channel(name, presets_dir=_PRESETS_DIR)
@@ -2762,7 +2762,10 @@ def _publish_entry_instant(entry: dict[str, Any], key: str) -> datetime | None:
         ) from exc
 
 
-def _publish_clip_view(clips: dict[tuple[str, str], dict[str, Any]], channel: str, entry: dict[str, Any]) -> dict[str, Any]:
+_PUBLISH_DEFAULT_TZ = "Europe/Paris"
+
+
+def _publish_clip_view(clips: dict[tuple[str, str], dict[str, Any]], channel: str | None, entry: dict[str, Any]) -> dict[str, Any]:
     clip = clips.get((entry["video_id"], entry["clip_id"]))
     if clip is not None:
         return clip
@@ -2774,50 +2777,87 @@ def _publish_clip_view(clips: dict[tuple[str, str], dict[str, Any]], channel: st
     }
 
 
-def _publish_week_view(config: Config, channel_name: str, week: str | None) -> dict[str, Any]:
-    _config, channel = _load_channel(channel_name)
-    tz = ZoneInfo(str(channel["timezone"]))
+def _publish_account_entries(config: Config, account: str | None) -> list[tuple[str | None, dict[str, Any]]]:
+    """(style du fichier ou None, entree) de toute la file de publication dont le compte est ``account`` (tous
+    les comptes si None). Le compte d'une entree est celui enregistre dedans, a defaut celui de son style : un
+    post d'un compte sans style, ou d'une video sans style, y figure donc aussi."""
+    try:
+        found = publish_mod.all_entries(state_dir=_publish_dir(config), presets_dir=_PRESETS_DIR)
+    except publish_mod.PublishError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=500, detail=f"fichier de publication illisible : {exc}") from exc
+    channel_accounts: dict[str, str | None] = {}
+    rows: list[tuple[str | None, dict[str, Any]]] = []
+    for name, entry in found:
+        if name not in channel_accounts:
+            channel_accounts[name] = None if name == publish_mod.NO_CHANNEL else _load_channel(name)[1]["tiktok_account"] or None
+        if account is not None and publish_mod.entry_account(entry, channel_accounts[name]) != account:
+            continue
+        rows.append((None if name == publish_mod.NO_CHANNEL else name, entry))
+    return rows
+
+
+def _publish_slot_channel(account: str | None) -> tuple[str | None, dict[str, Any] | None, str | None]:
+    """(style, ses reglages, raison sans creneau) : les creneaux viennent du seul style lie au compte."""
+    if account is None:
+        return None, None, "choisis un compte pour voir les créneaux de son style"
+    linked = [name for name in _channel_names() if _load_channel(name)[1]["tiktok_account"] == account]
+    if not linked:
+        return None, None, "ce compte n'est lié à aucun style : pas de créneaux (publie à la date choisie)"
+    if len(linked) > 1:
+        return None, None, f"plusieurs styles sont liés à ce compte ({', '.join(linked)}) : pas de créneaux"
+    channel = _load_channel(linked[0])[1]
+    return linked[0], channel, None if channel["slots"] else "aucun créneau défini dans [channel].slots"
+
+
+def _publish_week_view(config: Config, account: str | None, week: str | None) -> dict[str, Any]:
+    if account is not None and not any(a["id"] == account for a in _publish_accounts(config)):
+        raise HTTPException(status_code=404, detail=f"compte inconnu : {account!r} (écran Comptes)")
+    style, channel, reason = _publish_slot_channel(account)
+    tz = ZoneInfo(str(channel["timezone"]) if channel else _PUBLISH_DEFAULT_TZ)
     monday = _publish_week_start(week, tz)
     start = datetime.combine(monday, time(0, 0), tzinfo=tz)
     end = datetime.combine(monday + timedelta(days=7), time(0, 0), tzinfo=tz)
 
-    entries = _publish_entries(config, channel_name)
-    clips = {(c["video_id"], c["clip_id"]): c for c in _list_clip_views(config, channel_name, None, None)}
+    rows = _publish_account_entries(config, account)
+    clips = {(c["video_id"], c["clip_id"]): c for c in _list_clip_views(config, None, None, None)}
+    slots_def = channel["slots"] if channel else []
     by_slot: dict[datetime, dict[str, Any]] = {}
     unscheduled, done, off_slot = [], [], []
-    slot_instants = {s for s in channel_mod.next_slots(channel, start - timedelta(microseconds=1), len(channel["slots"]) + 1)
-                     if s < end} if channel["slots"] else set()
-    for entry in entries.values():
+    slot_instants = {s for s in channel_mod.next_slots(channel, start - timedelta(microseconds=1), len(slots_def) + 1)
+                     if s < end} if slots_def else set()
+    for file_channel, entry in rows:
         slot = _publish_entry_instant(entry, "slot_at")
         published = _publish_entry_instant(entry, "published_at")
         if slot is not None and entry["status"] in ("scheduled", "published", "failed"):
             by_slot[slot] = entry
         if entry["status"] == "scheduled" and slot is not None and start <= slot < end and slot not in slot_instants:
-            off_slot.append(_publish_clip_view(clips, channel_name, entry))  # publication manuelle entre les créneaux
+            off_slot.append(_publish_clip_view(clips, file_channel, entry))  # publication manuelle entre les créneaux
         if entry["status"] == "approved" and slot is None:
-            unscheduled.append(_publish_clip_view(clips, channel_name, entry))
+            unscheduled.append(_publish_clip_view(clips, file_channel, entry))
         elif entry["status"] in ("published", "failed"):
             when = published or slot
             if when is not None and start <= when < end:
-                done.append(_publish_clip_view(clips, channel_name, entry))
+                done.append(_publish_clip_view(clips, file_channel, entry))
 
     slots = []
-    if channel["slots"]:
+    if slots_def:
         seen: set[datetime] = set()
-        for slot in channel_mod.next_slots(channel, start - timedelta(microseconds=1), len(channel["slots"]) + 1):
+        by_key = {(e["video_id"], e["clip_id"]): f for f, e in rows}
+        for slot in channel_mod.next_slots(channel, start - timedelta(microseconds=1), len(slots_def) + 1):
             if slot >= end or slot in seen:
                 continue
             seen.add(slot)
             entry = by_slot.get(slot)
             slots.append({
                 "slot_at": slot.isoformat(), "slot_at_paris": _paris(slot.isoformat()),
-                "clip": _publish_clip_view(clips, channel_name, entry) if entry is not None else None,
+                "clip": _publish_clip_view(clips, by_key[(entry["video_id"], entry["clip_id"])], entry) if entry is not None else None,
                 "free": entry is None,
             })
     return {
-        "channel": channel_name, "timezone": str(channel["timezone"]), "tiktok_account": channel["tiktok_account"],
+        "account": account, "channel": style, "timezone": str(tz.key),
         "week_start": monday.isoformat(), "week_end": (monday + timedelta(days=6)).isoformat(),
         "slots": slots, "unscheduled": unscheduled, "done": done, "off_slot": sorted(off_slot, key=lambda c: datetime.fromisoformat(c["slot_at"])),
-        "accounts": _publish_accounts(config),
-        "reason": None if channel["slots"] else "aucun créneau défini dans [channel].slots",
+        "accounts": _publish_accounts(config), "reason": reason,
     }
