@@ -337,6 +337,19 @@ def _jury_reason(moment: dict[str, Any], reject_reason: str | None, threshold: A
     return "autre", reject_reason
 
 
+def _parts_rejected_reasons(config: Config, video_id: str) -> dict[Any, str]:
+    """{id du moment: raison} des moments que l'etape parts a ecartes au decoupage ;
+    vide tant que parts.json n'existe pas (etape pas encore faite)."""
+    path = Path(config.workspace_dir) / video_id / "parts.json"
+    if not path.exists():
+        return {}
+    try:
+        rejected = _read_json(path).get("rejected") or []
+        return {r["id"]: str(r["reason"]) for r in rejected}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        raise HTTPException(status_code=500, detail=f"parts.json illisible pour {video_id} : {exc!r}") from exc
+
+
 def _jury_view(config: Config, video_id: str) -> dict[str, Any]:
     """Moments retenus puis non retenus avec le detail du jury (lecture seule)."""
     path = Path(config.workspace_dir) / video_id / "moments.json"
@@ -352,6 +365,7 @@ def _jury_view(config: Config, video_id: str) -> dict[str, Any]:
         return {**empty, "reason": f"moments.json de {video_id} sans grille (rubric.weights)"}
     if not any("jury" in m for m in [*data.get("moments", []), *data.get("rejected", [])]):
         return {**empty, "reason": f"moments.json de {video_id} sans jury (selection : {data.get('selection', 'inconnue')})"}
+    cut_rejected = _parts_rejected_reasons(config, video_id)
     threshold = rubric.get("min_score")
     rows = [(m, None, f"kept-{i}") for i, m in enumerate(data.get("moments", []))]
     rows += [(m, m.get("reason") or "rejeté sans raison dans moments.json", f"rejected-{i}")
@@ -362,6 +376,9 @@ def _jury_view(config: Config, video_id: str) -> dict[str, Any]:
         if not jury:
             continue
         kind, reason = _jury_reason(m, reject_reason, threshold)
+        cut_reason = cut_rejected.get(m.get("id")) if reject_reason is None else None
+        if cut_reason is not None:
+            kind, reason = "decoupage", cut_reason
         moments.append({
             "key": key, "id": m.get("id"), "retained": reject_reason is None,
             "start": m["start"], "end": m["end"], "format": m.get("format"),
@@ -372,6 +389,7 @@ def _jury_view(config: Config, video_id: str) -> dict[str, Any]:
             "rounds": _jury_rounds(jury),
             "reason_kind": kind, "reason": reason,
             "justification": m.get("justification"), "hook_text": m.get("hook_text"),
+            **({"cut_rejected": cut_reason} if cut_reason is not None else {}),
         })
     return {
         "video_id": video_id, "available": True, "reason": None,

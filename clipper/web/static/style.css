@@ -1657,3 +1657,10 @@ input[type="color"] { width: 36px; height: 36px; padding: 2px; border-radius: va
 .ch-actions { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; }
 .ch-actions .btn { justify-content: flex-start; }
 .chan-field.direct .chan-head { margin-bottom: 4px; }
+
+/* Calendrier : titre du clip sur 2 lignes, coupure de mot (TASK-fc6f). Ni miniature de 18 px ni pastille de
+   compte sur la meme ligne que le titre : ils lui prenaient toute la largeur des colonnes a 1280 px. */
+.cal .post { flex-wrap: wrap; align-items: flex-start; min-width: 0; }
+.cal .post .mini-clip { display: none; }
+.cal .post .pt { flex: 1 1 100%; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; overflow-wrap: anywhere; hyphens: auto; min-width: 0; }
+.cal .post .pub-acct { flex: 1 1 100%; }
