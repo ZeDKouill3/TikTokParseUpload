@@ -5,7 +5,7 @@ slug: web-radar-cart-au-d-coupage-parts-json-rejected
 title: "web : radar « écarté au découpage » (parts.json rejected) + cartes du calendrier lisibles (2 lignes, info-bulle)"
 created: 2026-10-02T19:46:27Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/web/app.py
   - clipper/web/static/**
@@ -15,8 +15,15 @@ done_criteria: |
   Test API : parts.json avec rejected [{id: 0, reason: ...}] -> /api/videos/{id}/jury marque le moment 0 écarté au découpage avec la raison ; sans parts.json -> sortie inchangée. Test statique : jury-radar.js contient le libellé « écarté au découpage » ; la carte du calendrier porte le titre complet dans un attribut title ; style.css applique un line-clamp 2 au titre des cartes. node --check passe sur chaque JS modifié. Tests unitaires seulement, sans réseau.
 criteria_by: creator
 verify: [tests]
+proof:
+  - type: test
+    ref: local/2f48792bc2ca@d9014c5
+    tree: scope/f3c999b48d09
+    criteria: 6038ce70fac9
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 1
+version: 2
 ---
 
 ## 1. Radar du jury : « retenu puis écarté au découpage »
