@@ -5,7 +5,7 @@ slug: parts-d-couper-avec-la-grille-r-ellement-utilis
 title: "parts : découper avec la grille réellement utilisée par moments (moments.json rubric.path), pas [parts] rubric_path"
 created: 2026-10-02T19:45:16Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/parts.py
   - tests/test_parts.py
@@ -15,8 +15,15 @@ done_criteria: |
   Test : moments.json avec rubric.path = grille gaming (30-90 s) et un moment single de 41,8 s -> parts le garde (aucun rejet de durée) ; même test avec grille standard -> rejet. Test : rubric.path absent ou fichier introuvable -> erreur explicite. Test : [parts] rubric_path dans la config -> erreur claire. Test de cohérence : pour chaque grille embarquée, une durée à la limite acceptée par moments (single_min - tolerance, single_max + tolerance, min_parts*part_min) est acceptée par parts. Tests unitaires seulement, CPU, sans réseau ni LLM réel.
 criteria_by: creator
 verify: [tests]
+proof:
+  - type: test
+    ref: local/50e3877401b6@6e40386
+    tree: scope/0f4a388bcadb
+    criteria: b2e693456bd6
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 1
+version: 2
 ---
 
 ## Constat (tour 7, point 2)
