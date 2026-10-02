@@ -70,6 +70,7 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "stats_dir": "state/stats/tiktok",  # historique par compte : <stats_dir>/<compte>/<horodatage>.json (SPEC-86fe R2)
     "stats_detail_days": 7,            # un post publie depuis moins de N jours est relu en detail a chaque releve
     "stats_detail_max": 50,            # plafond de posts relus en detail (3 pages chacun) par releve
+    "stats_audience_min_views": 100,   # Spectateurs / Engagement : TikTok ne les remplit qu'a partir de 100 vues
     "stats_scroll_rounds": 10,         # defilements de la liste des Publications pour la charger en entier
 }
 
@@ -139,7 +140,8 @@ def get_settings(config: Config | None) -> dict[str, Any]:
             raise TikTokError(f"[tiktok] {key} invalide : {settings[key]!r} (true ou false attendu)")
     if not isinstance(settings["stats_dir"], str) or not settings["stats_dir"]:
         raise TikTokError(f"[tiktok] stats_dir invalide : {settings['stats_dir']!r} (un chemin est attendu)")
-    for key, minimum in (("stats_detail_days", 0), ("stats_detail_max", 0), ("stats_scroll_rounds", 0)):
+    for key, minimum in (("stats_detail_days", 0), ("stats_detail_max", 0), ("stats_scroll_rounds", 0),
+                         ("stats_audience_min_views", 0)):
         value = settings[key]
         if isinstance(value, bool) or not isinstance(value, (int, float)) or value < minimum:
             raise TikTokError(f"[tiktok] {key} invalide : {value!r} (un nombre >= {minimum} est attendu)")
@@ -383,6 +385,8 @@ def parse_duration(value: Any) -> float | None:
 
 _CHANGE = re.compile(r"([+\-\u2212\u2013]?)\s*(\d+(?:[.,]\d+)?)\s*%")
 _SHORT_DATE = re.compile(r"(\d{1,2})\s+([^\W\d_]+)\.?\s+(\d{4})(?:[,\s]+(\d{1,2})[:h](\d{2}))?")
+# Page Publications : « 2 oct., 12:30 » sans annee (annee de la page, deduite de la date du releve).
+_SHORT_DATE_NO_YEAR = re.compile(r"(\d{1,2})\s+([^\W\d_]+)\.?,?\s*(?:(\d{1,2})[:h](\d{2}))?")
 
 
 def parse_change(value: Any) -> float | None:
@@ -398,7 +402,7 @@ def parse_change(value: Any) -> float | None:
     return -number if match[1] in ("-", "\u2212", "\u2013") else number
 
 
-def parse_date(value: Any, months: list[str]) -> str | None:
+def parse_date(value: Any, months: list[str], today: datetime | None = None) -> str | None:
     """Date de creation affichee (« 2026-10-01 14:05 », « 01/10/2026 14:05 », « 1 oct. 2026, 14:05 ») -> ISO 8601
     sans fuseau (l'heure de la page) ; format inconnu -> ``None`` (le texte brut reste dans ``posted_at_text``)."""
     text = _squash(value) if isinstance(value, str) else ""
@@ -416,6 +420,17 @@ def parse_date(value: Any, months: list[str]) -> str | None:
         index = next((i for i, name in enumerate(names) if name == word or (len(word) >= 3 and name.startswith(word))), None)
         if index is not None:
             return _iso_date(int(match[3]), index + 1, int(match[1]), match[4], match[5])
+    match = _SHORT_DATE_NO_YEAR.fullmatch(text)
+    if match and today is not None:
+        names = [m.casefold() for m in months]
+        word = match[2].casefold()
+        index = next((i for i, name in enumerate(names) if name == word or (len(word) >= 3 and name.startswith(word))), None)
+        if index is not None:
+            # annee du releve ; une date a plus de 31 jours dans le futur appartient a l'annee precedente
+            iso = _iso_date(today.year, index + 1, int(match[1]), match[3], match[4])
+            if iso is not None and datetime.fromisoformat(iso) > today.replace(tzinfo=None) + timedelta(days=31):
+                iso = _iso_date(today.year - 1, index + 1, int(match[1]), match[3], match[4])
+            return iso
     return None
 
 
@@ -932,7 +947,7 @@ class _Flow:
             found.setdefault(match.group(1), {
                 "post_id": match.group(1), "post_url": urljoin(str(self.page.url), href),
                 "caption": _squash(str(link.inner_text())) or None,
-                "posted_at": parse_date(created, self.sel["calendar"]["months"]), "posted_at_text": created,
+                "posted_at": parse_date(created, self.sel["calendar"]["months"], self.now), "posted_at_text": created,
                 "visibility": visibility,
                 **{key: self.read_value(texts[key], key, parse_count, where) for key in ("views", "likes", "comments")}})
         return found
@@ -989,8 +1004,14 @@ class _Flow:
         sources = self.page.query_selector(self.sel["stats"]["traffic_sources"])
         text = _squash(str(sources.inner_text())) if sources is not None else ""
         post["traffic_sources"] = None if not text or self.sel["stats"]["processing"].casefold() in text.casefold() else text
-        post["viewers"] = self.read_viewers(post_id)
-        engagement = self.read_engagement(post_id)
+        # Spectateurs et Engagement restent vides (« en cours de traitement », « dès 100 vues ») sous le seuil :
+        # les ouvrir coute deux attentes inutiles par post. Releves seulement a partir de stats_audience_min_views.
+        views = post.get("views")
+        if isinstance(views, (int, float)) and views >= int(self.settings["stats_audience_min_views"]):
+            post["viewers"] = self.read_viewers(post_id)
+            engagement = self.read_engagement(post_id)
+        else:
+            post["viewers"], engagement = None, None
         post["engagement"] = engagement
         post["shares"] = None if engagement is None else engagement.get("shares")
         post["detailed_at"] = self.now.isoformat()
