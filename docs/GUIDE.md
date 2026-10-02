@@ -440,8 +440,9 @@ formats).
 `[vision]` — `window_seconds` = 10, `batch_size` = 8, `max_width` = 768,
 `parallel` = 4.
 
-`[parts]` — `rubric_path` = `"rubric.toml"`, `part_overlap_seconds` = 3,
-`parallel` = 4.
+`[parts]` — `part_overlap_seconds` = 3, `parallel` = 4. La grille des durées
+est celle de l'étape moments (`rubric.path` de `moments.json`) ; l'ancienne clé
+`rubric_path` de `[parts]` est refusée.
 
 `[captions]` — `title_max_chars` = 100, `caption_max_chars` = 300,
 `hashtags_max` = 8, `hook_words_max` = 8, `screen_title_words_max` = 6,

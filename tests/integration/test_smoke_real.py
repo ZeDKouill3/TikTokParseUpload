@@ -459,7 +459,6 @@ def test_smoke_mini_video_end_to_end(tmp_path: Path) -> None:
         output_dir=tmp_path / "output",
         _sections={
             "moments": {"rubric_path": str(rubric_path)},
-            "parts": {"rubric_path": str(rubric_path)},
         },
     )
     url = f"https://www.youtube.com/watch?v={_SMOKE_VIDEO_ID}"

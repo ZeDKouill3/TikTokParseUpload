@@ -5,9 +5,11 @@ import logging
 import random
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
+import clipper
 from clipper import llm
 from clipper.config import Config
 from clipper.llm.fake import FakeBackend
@@ -108,8 +110,9 @@ S246 = moment(5, 100.2, 346.2, "multipart")
 TIGHT = moment(6, 100.2, 279.7, "multipart")
 
 
-def moments_json(*moments):
-    return {"video_id": VIDEO_ID, "rubric": {}, "chunked": False, "moments": list(moments), "rejected": []}
+def moments_json(*moments, rubric_path=None):
+    rubric = {} if rubric_path is None else {"path": str(rubric_path)}
+    return {"video_id": VIDEO_ID, "rubric": rubric, "chunked": False, "moments": list(moments), "rejected": []}
 
 
 @pytest.fixture
@@ -120,8 +123,14 @@ def workspace(tmp_path):
     return tmp_path / "workspace"
 
 
-def write_moments(workspace, *moments):
-    (workspace / VIDEO_ID / "moments.json").write_text(json.dumps(moments_json(*moments)), encoding="utf-8")
+def write_moments(workspace, *moments, rubric_path=None):
+    """moments.json avec, par defaut, la grille que make_config ecrit a cote
+    du workspace (la grille de l'etape moments, rubric.path)."""
+    if rubric_path is None:
+        rubric_path = workspace.parent / "rubric.toml"
+    (workspace / VIDEO_ID / "moments.json").write_text(
+        json.dumps(moments_json(*moments, rubric_path=rubric_path)), encoding="utf-8"
+    )
 
 
 def write_transcript(workspace, transcript):
@@ -136,7 +145,7 @@ def make_config(tmp_path, single_min=20, single_max=45, part_min=60, part_max=90
         ),
         encoding="utf-8",
     )
-    section: dict[str, object] = {"rubric_path": str(rubric)}
+    section: dict[str, object] = {}
     if parallel is not None:
         section["parallel"] = parallel
     return Config(
@@ -549,10 +558,103 @@ def test_missing_moments_is_an_error(workspace, tmp_path):
         run(workspace, make_config(tmp_path), [])
 
 
-def test_default_rubric_path_is_the_repo_rubric():
-    from clipper.parts import CONFIG_DEFAULTS
+# --------------------------------------------------------------------------
+# Grille = celle de moments.json (TASK-4e3a)
+# --------------------------------------------------------------------------
 
-    assert CONFIG_DEFAULTS["rubric_path"] == "rubric.toml"
+ASSETS = Path(clipper.__file__).parent / "assets"
+EMBEDDED_RUBRICS = {"standard": ASSETS / "rubric.toml", "gaming": ASSETS / "rubric-gaming.toml"}
+# Moment de 41,8 s (single en grille gaming 30-90 s) : phrases 8 a 15.
+SINGLE_41 = moment(7, 40.25, 82.05)
+
+
+def run_with_rubric(workspace, tmp_path, rubric_path):
+    write_moments(workspace, SINGLE_41, rubric_path=rubric_path)
+    run(workspace, make_config(tmp_path), [])
+    return read_parts(workspace)
+
+
+def test_parts_uses_the_rubric_of_moments_json_gaming_keeps_a_41_s_single(workspace, tmp_path):
+    data = run_with_rubric(workspace, tmp_path, EMBEDDED_RUBRICS["gaming"])
+    assert data["rejected"] == []
+    m = by_id(data, 7)
+    assert m["format"] == "single"
+    assert m["duration"] == 41.8
+    assert data["rubric"]["path"] == str(EMBEDDED_RUBRICS["gaming"])
+    assert data["rubric"]["durations"]["single_min"] == 30
+
+
+def test_parts_uses_the_rubric_of_moments_json_standard_rejects_the_41_s_moment(workspace, tmp_path):
+    data = run_with_rubric(workspace, tmp_path, EMBEDDED_RUBRICS["standard"])
+    assert data["moments"] == []
+    assert [r["id"] for r in data["rejected"]] == [7]
+    assert "duree 41.8 s" in data["rejected"][0]["reason"]
+    assert data["rubric"]["path"] == str(EMBEDDED_RUBRICS["standard"])
+
+
+def test_rubric_path_absent_from_moments_json_is_an_explicit_error(workspace, tmp_path):
+    from clipper.parts import PartsError
+
+    for rubric in ({}, {"path": None}, {"path": ""}):
+        payload = moments_json(SINGLE_41)
+        payload["rubric"] = rubric
+        (workspace / VIDEO_ID / "moments.json").write_text(json.dumps(payload), encoding="utf-8")
+        with pytest.raises(PartsError, match="rubric.path"):
+            run(workspace, make_config(tmp_path), [])
+    payload = moments_json(SINGLE_41)
+    del payload["rubric"]
+    (workspace / VIDEO_ID / "moments.json").write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(PartsError, match="rubric.path"):
+        run(workspace, make_config(tmp_path), [])
+    assert not (workspace / VIDEO_ID / "parts.json").exists()
+
+
+def test_rubric_file_of_moments_json_not_found_is_an_explicit_error(workspace, tmp_path):
+    from clipper.parts import PartsError
+
+    write_moments(workspace, SINGLE_41, rubric_path=tmp_path / "absente.toml")
+    # Aucun repli sur un rubric.toml du dossier courant ou du workspace.
+    make_config(tmp_path)
+    (tmp_path / "rubric.toml").write_text(EMBEDDED_RUBRICS["standard"].read_text(encoding="utf-8"), encoding="utf-8")
+    with pytest.raises(PartsError, match="introuvable.*absente.toml"):
+        run(workspace, make_config(tmp_path), [])
+    assert not (workspace / VIDEO_ID / "parts.json").exists()
+
+
+def test_parts_rubric_path_setting_is_removed_with_a_clear_error(workspace, tmp_path):
+    from clipper.parts import CONFIG_DEFAULTS, PartsError
+
+    assert "rubric_path" not in CONFIG_DEFAULTS
+    write_moments(workspace, SINGLE_41)
+    config = make_config(tmp_path)
+    config = Config(
+        mode=config.mode, workspace_dir=config.workspace_dir, output_dir=config.output_dir,
+        _sections={"parts": {"rubric_path": "rubric.toml"}},
+    )
+    with pytest.raises(PartsError, match=r"\[parts\] rubric_path.*\[moments\]"):
+        run(workspace, config, [])
+    assert not (workspace / VIDEO_ID / "parts.json").exists()
+
+
+@pytest.mark.parametrize("grid", sorted(EMBEDDED_RUBRICS))
+def test_every_duration_moments_accepts_at_the_limit_is_accepted_by_parts(grid):
+    """Coherence avec _normalize (moments.py) : single_min - tolerance,
+    single_max + tolerance, min_parts x part_min (et - tolerance), borne
+    haute des series : parts ne les rejette pas pour leur duree."""
+    from clipper.parts import CONFIG_DEFAULTS, accepts_duration, load_durations
+
+    d = load_durations(EMBEDDED_RUBRICS[grid])
+    tol = d["tolerance"]
+    overlap = CONFIG_DEFAULTS["part_overlap_seconds"]
+    limits = {
+        "single_min - tolerance": d["single_min"] - tol,
+        "single_max + tolerance": d["single_max"] + tol,
+        "min_parts x part_min": d["min_parts"] * d["part_min"],
+        "min_parts x part_min - tolerance": d["min_parts"] * d["part_min"] - tol,
+        "max_parts x part_max + tolerance": d["max_parts"] * d["part_max"] + tol,
+    }
+    refused = {name: v for name, v in limits.items() if not accepts_duration(v, d, overlap)}
+    assert refused == {}
 
 
 # --------------------------------------------------------------------------
