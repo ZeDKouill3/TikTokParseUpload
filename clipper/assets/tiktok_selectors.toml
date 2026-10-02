@@ -160,24 +160,24 @@ button = "button:has-text(\"{label}\"), [role='button']:has-text(\"{label}\")"
 # ligne du post (celle qui contient son lien). Une valeur que la page n'affiche pas (selecteur sans
 # resultat) est relevee « null » ; une valeur affichee mais illisible arrete le releve (page inattendue).
 [stats]
-# Une ligne du tableau « Contenu | Politique de confidentialite | Vues | J'aime | Commentaires | Actions ».
-row = "tr:has(a[href*='/video/'])"
+# Une ligne de la page Publications (verifie en reel 2026-10-02 : blocs div, pas de tableau HTML).
+row = "[data-tt='components_RowLayout_FlexRow']:has(a[href*='/video/'])"
 # Lien du post (/@<compte>/video/<id>, texte = legende) : sert a la ligne et a la recherche du lien apres publication.
 post_link = "a[href*='/video/']"
-# Cellules de la ligne (colonnes 4 et 5 du tableau). A VERIFIER SUR LA VRAIE PAGE.
-likes = "td:nth-child(4)"
-comments = "td:nth-child(5)"
+# Cellules de la ligne (verifie en reel) : vues _6, j'aime _7, commentaires _8.
+likes = "[data-tt='components_RowLayout_FlexRow_7']"
+comments = "[data-tt='components_RowLayout_FlexRow_8']"
 # Page d'analyse d'un post : une carte par metrique, texte « libelle | valeur ».
 metric_card = "[data-tt='VideoOverviewPage_VideoMetricsCard_FlexItem']"
 # Bloc des sources de trafic (visibles a partir de 100 vues). A VERIFIER SUR LA VRAIE PAGE.
 traffic_sources = "[data-tt='VideoOverviewPage_TrafficSourceCard_FlexRow']"
 # Valeur affichee tant que TikTok n'a pas fini de calculer (retention, sources) : relevee « null ».
 processing = "en cours de traitement"
-# Cellules de la ligne de la page Publications (SPEC-86fe R1) : vues (colonne 3), confidentialite (colonne 2),
-# date de creation (dans la cellule du contenu). A VERIFIER SUR LA VRAIE PAGE. La legende est le texte du lien du post.
-views = "td:nth-child(3)"
-visibility = "td:nth-child(2)"
-created = "td:nth-child(1) time"
+# Cellules de la ligne de la page Publications (verifie en reel 2026-10-02) : vues _6, visibilite (bouton de la
+# cellule de confidentialite), date affichee « 2 oct., 12:30 ». La legende est le texte du lien du post.
+views = "[data-tt='components_RowLayout_FlexRow_6']"
+visibility = "[data-tt='components_PrivacyCell_TUXButton']"
+created = "[data-tt='components_PublishStageLabel_TUXText']"
 # Points de la courbe de retention d'un post, texte « instant | part encore presente ». A VERIFIER SUR LA VRAIE PAGE.
 retention_point = "[data-tt*='Retention'] [data-tt*='Point']"
 # Cartes des onglets Spectateurs et Engagement : titre puis couples « libelle | valeur ». A VERIFIER SUR LA VRAIE PAGE.
