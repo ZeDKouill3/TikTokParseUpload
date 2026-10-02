@@ -6385,3 +6385,223 @@ def test_calendar_card_layout_gives_the_title_the_width():
     assert "flex-wrap: wrap" in post                           # la pastille de compte passe à la ligne
     assert re.search(r"\.cal \.post \.mini-clip\s*\{[^}]*display: none", css)  # pas de miniature de 18 px
     assert re.search(r"\.cal \.post \.pt\s*\{[^}]*flex: 1 1 100%", css)
+
+
+# --------------------------------------------------------------------------
+# Statistiques TikTok : releve seulement a l'usage (SPEC-47e2 R4), posts supprimes
+# --------------------------------------------------------------------------
+
+import threading  # noqa: E402
+import time  # noqa: E402
+from datetime import timedelta  # noqa: E402
+
+
+class SlowFetch(FakeFetch):
+    """Un releve qui dure : bloque jusqu'a ``release()`` ; ``started`` dit qu'il a commence."""
+
+    def __init__(self, error=None):
+        super().__init__(error)
+        self.started, self.gate = threading.Event(), threading.Event()
+
+    def __call__(self, account, *, config=None, **kwargs):
+        self.started.set()
+        assert self.gate.wait(10), "le releve n'a jamais ete libere"
+        return super().__call__(account, config=config, **kwargs)
+
+    def release(self):
+        self.gate.set()
+
+
+def _tt_fresh_snapshot(tmp_path, *, minutes_ago, account=TT_ACCOUNT, posts=()):
+    at = datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)
+    _write_json(tmp_path / "state" / "stats" / "tiktok" / account / f"{at.strftime('%Y%m%dT%H%M%S%f')}Z.json",
+                {"account": account, "fetched_at": at.isoformat(), "source": "tiktok_studio", "origin": "full",
+                 "overview": None, "posts": list(posts)})
+
+
+def _tt_client(tmp_path, *, stale_min=None):
+    """Un seul client (donc une seule application) : le verrou des releves vit dans l'application."""
+    sections = {} if stale_min is None else {"tiktok": {"stats_stale_min": stale_min}}
+    return TestClient(create_app(config=Config(mode="review", workspace_dir=tmp_path / "workspace",
+                                               output_dir=tmp_path / "output", _sections=sections)))
+
+
+def _tt_open(web, account=TT_ACCOUNT):
+    return web.post("/api/stats/tiktok/open", json={"account": account})
+
+
+def _tt_account_state(web, account=TT_ACCOUNT):
+    return {a["account"]: a for a in web.get("/api/stats/tiktok").json()["accounts"]}[account]
+
+
+def _tt_wait_idle(web, account=TT_ACCOUNT):
+    for _ in range(100):
+        found = _tt_account_state(web, account)
+        if not found["refreshing"]:
+            return found
+        time.sleep(0.05)
+    raise AssertionError("le releve en tache de fond ne se termine pas")
+
+
+def test_opening_the_stats_screen_starts_a_background_fetch_when_the_last_one_is_stale(tmp_path, isolated_cwd, monkeypatch):
+    _tt_accounts(tmp_path)
+    _tt_fresh_snapshot(tmp_path, minutes_ago=61)
+    fetch = SlowFetch()
+    monkeypatch.setattr(tiktok_mod, "fetch_stats", fetch)
+    web = _tt_client(tmp_path)
+
+    resp = _tt_open(web)
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["started"] is True and resp.json()["running"] is True and resp.json()["stale"] is True
+    assert fetch.started.wait(5)  # en tache de fond : la reponse n'a pas attendu la fin
+    assert _tt_account_state(web)["refreshing"] is True
+    fetch.release()
+    assert _tt_wait_idle(web)["refreshing"] is False
+    assert fetch.calls == [TT_ACCOUNT]
+
+
+def test_opening_the_stats_screen_with_a_fresh_snapshot_fetches_nothing(tmp_path, isolated_cwd, monkeypatch):
+    _tt_accounts(tmp_path)
+    _tt_fresh_snapshot(tmp_path, minutes_ago=30)
+    fetch = FakeFetch()
+    monkeypatch.setattr(tiktok_mod, "fetch_stats", fetch)
+
+    resp = _tt_open(_tt_client(tmp_path))
+
+    assert resp.status_code == 200 and resp.json() == {
+        "account": TT_ACCOUNT, "started": False, "running": False, "stale": False, "reason": None}
+    assert fetch.calls == []
+
+
+def test_a_never_fetched_account_is_stale_and_stats_stale_min_zero_disables_the_opening_fetch(tmp_path, isolated_cwd, monkeypatch):
+    _tt_accounts(tmp_path)
+    fetch = FakeFetch()
+    monkeypatch.setattr(tiktok_mod, "fetch_stats", fetch)
+
+    assert _tt_open(_tt_client(tmp_path, stale_min=0)).json()["started"] is False and fetch.calls == []
+    web = _tt_client(tmp_path)
+    assert _tt_open(web).json()["started"] is True  # jamais releve : perime
+    _tt_wait_idle(web)
+    assert fetch.calls == [TT_ACCOUNT]
+
+
+def test_two_simultaneous_opens_start_a_single_fetch_and_the_second_gets_the_running_state(tmp_path, isolated_cwd, monkeypatch):
+    _tt_accounts(tmp_path)
+    fetch = SlowFetch()
+    monkeypatch.setattr(tiktok_mod, "fetch_stats", fetch)
+    web = _tt_client(tmp_path)
+
+    first = _tt_open(web)
+    assert fetch.started.wait(5)
+    second = _tt_open(web)
+    manual = web.post("/api/stats/tiktok/refresh", json={"account": TT_ACCOUNT})  # « Relever maintenant » aussi
+
+    assert first.json()["started"] is True
+    assert second.status_code == 200 and second.json()["running"] is True and second.json()["started"] is False
+    assert manual.status_code == 200 and manual.json()["accounts"][TT_ACCOUNT]["running"] is True
+    fetch.release()
+    _tt_wait_idle(web)
+    assert fetch.calls == [TT_ACCOUNT]  # un seul releve pour les trois demandes
+
+
+def test_the_lock_is_per_account_and_released_once_the_fetch_is_over(tmp_path, isolated_cwd, monkeypatch):
+    _tt_accounts(tmp_path, ready=(TT_ACCOUNT, TT_OTHER))
+    fetch = SlowFetch()
+    monkeypatch.setattr(tiktok_mod, "fetch_stats", fetch)
+    web = _tt_client(tmp_path)
+
+    assert _tt_open(web, TT_ACCOUNT).json()["started"] is True
+    assert _tt_open(web, TT_OTHER).json()["started"] is True
+    fetch.release()
+    _tt_wait_idle(web, TT_ACCOUNT)
+    _tt_wait_idle(web, TT_OTHER)
+    assert sorted(fetch.calls) == [TT_ACCOUNT, TT_OTHER]
+
+    sync = web.post("/api/stats/tiktok/refresh", json={"account": TT_ACCOUNT})  # verrou libere : relance possible
+    assert sync.status_code == 200 and sync.json()["accounts"][TT_ACCOUNT]["posts"] == 2
+    assert fetch.calls.count(TT_ACCOUNT) == 2
+
+
+def test_a_failed_manual_fetch_frees_the_lock(tmp_path, isolated_cwd, monkeypatch):
+    _tt_accounts(tmp_path)
+    fetch = FakeFetch(error=tiktok_mod.TikTokStop("captcha", "captcha détecté", None))
+    monkeypatch.setattr(tiktok_mod, "fetch_stats", fetch)
+    web = _tt_client(tmp_path)
+
+    assert web.post("/api/stats/tiktok/refresh", json={"account": TT_ACCOUNT}).status_code == 409
+    assert web.post("/api/stats/tiktok/refresh", json={"account": TT_ACCOUNT}).status_code == 409  # relance, pas « en cours »
+    assert fetch.calls == [TT_ACCOUNT, TT_ACCOUNT] and _tt_account_state(web)["refreshing"] is False
+
+
+def test_opening_the_stats_screen_of_an_account_not_ready_fetches_nothing_and_says_why(tmp_path, isolated_cwd, monkeypatch):
+    _tt_accounts(tmp_path, ready=(TT_ACCOUNT,))
+    fetch = FakeFetch()
+    monkeypatch.setattr(tiktok_mod, "fetch_stats", fetch)
+    web = _tt_client(tmp_path)
+
+    resp = _tt_open(web, TT_OTHER)
+
+    assert resp.status_code == 200 and resp.json()["started"] is False and "expirée" in resp.json()["reason"]
+    assert fetch.calls == []
+    assert _tt_open(web, "inconnu").status_code == 404
+    assert web.post("/api/stats/tiktok/open", json={"autre": 1}).status_code == 422
+    assert web.post("/api/stats/tiktok/open").status_code == 422
+    assert web.post("/api/stats/tiktok/open", json={"account": "../x"}).status_code == 422
+
+
+@pytest.mark.parametrize("error,words", [
+    (tiktok_mod.TikTokStop("captcha", "captcha détecté : arrêt immédiat", None), "captcha"),
+    (tiktok_mod.TikTokError("réglage invalide"), "réglage"),
+    (RuntimeError("boom"), "boom"),
+])
+def test_a_background_fetch_that_fails_is_reported_on_the_account_and_frees_the_lock(tmp_path, isolated_cwd, monkeypatch, error, words, caplog):
+    _tt_accounts(tmp_path)
+    monkeypatch.setattr(tiktok_mod, "fetch_stats", FakeFetch(error=error))
+    web = _tt_client(tmp_path)
+
+    with caplog.at_level("ERROR"):
+        assert _tt_open(web).json()["started"] is True
+        found = _tt_wait_idle(web)
+
+    assert words in found["refresh_error"] and found["refreshing"] is False
+    assert words in caplog.text  # journalise (ADR-ad2e)
+    assert _tt_open(web).json()["started"] is True  # verrou libere : une nouvelle ouverture relance
+    _tt_wait_idle(web)
+
+
+def test_the_accounts_list_says_whether_the_snapshot_is_stale(tmp_path, isolated_cwd):
+    _tt_accounts(tmp_path)
+    _tt_fresh_snapshot(tmp_path, minutes_ago=90)
+
+    accounts = {a["account"]: a for a in _tt_get(tmp_path, "").json()["accounts"]}
+
+    assert accounts[TT_ACCOUNT]["stale"] is True and accounts[TT_ACCOUNT]["refreshing"] is False
+    assert accounts[TT_ACCOUNT]["refresh_error"] is None
+
+
+def test_a_post_deleted_on_tiktok_disappears_from_the_videos_and_the_sheet_but_not_from_the_history(tmp_path, isolated_cwd):
+    _tt_accounts(tmp_path)
+    _tt_snapshot(tmp_path, 1, posts=[_tt_post(TT_ID_A, "Un"), _tt_post(TT_ID_B, "Deux")])
+    _tt_snapshot(tmp_path, 2, posts=[_tt_post(TT_ID_A, "Un")])
+
+    videos = _tt_get(tmp_path, f"/{TT_ACCOUNT}/videos").json()["videos"]
+
+    assert [v["post_id"] for v in videos] == [TT_ID_A]
+    assert _tt_get(tmp_path, f"/{TT_ACCOUNT}/videos/{TT_ID_B}").status_code == 404
+    assert _tt_get(tmp_path, f"/{TT_ACCOUNT}/videos/{TT_ID_A}").status_code == 200
+    assert len(list((tmp_path / "state" / "stats" / "tiktok" / TT_ACCOUNT).glob("*.json"))) == 2  # historique intact
+
+
+def test_the_stats_screen_triggers_the_opening_fetch_and_shows_the_running_state():
+    js = (Path(__file__).resolve().parent.parent / "clipper" / "web" / "static" / "screens" / "stats.js").read_text(encoding="utf-8")
+    assert "/api/stats/tiktok/open" in js and "refreshing" in js and "Relevé en cours" in js
+    assert "Relever maintenant" in js and "/api/stats/tiktok/refresh" in js
+
+
+def test_the_modified_stats_script_is_valid_javascript():
+    if shutil.which("node") is None:
+        pytest.skip("node absent du PATH")
+    path = Path(__file__).resolve().parent.parent / "clipper" / "web" / "static" / "screens" / "stats.js"
+    done = subprocess.run(["node", "--check", str(path)], capture_output=True, text=True, encoding="utf-8")
+    assert done.returncode == 0, done.stderr

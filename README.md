@@ -426,9 +426,14 @@ j'aime, commentaires, partages) sur 7, 28 et 60 jours, courbes par jour, et la
 liste de toutes les vidéos du compte, y compris celles publiées hors de
 Clipper. Le relevé ouvre le Chrome du profil (lecture seule) :
 
-- **« Relever maintenant »** lance un relevé à la demande ; le worker en fait
-  un périodiquement (`[tiktok] stats_interval_h`, 24 h par défaut) pour les
-  comptes prêts à publier ;
+- le relevé n'a lieu que quand tu te sers de Clipper : à l'ouverture de l'écran
+  si le dernier a plus de `[tiktok] stats_stale_min` minutes (60 par défaut,
+  0 = jamais), au passage pendant une publication, et par **« Relever
+  maintenant »** ; un seul relevé à la fois par compte. Le relevé périodique
+  du worker est coupé (`[tiktok] stats_interval_h = 0` ; N > 0 = toutes les N
+  heures pour les comptes prêts à publier) ;
+- une vidéo supprimée sur TikTok (absente du dernier relevé de la page
+  Publications) n'est plus affichée ; son historique est conservé ;
 - chaque relevé est ajouté à l'historique `state/stats/tiktok/<compte>/` et
   n'écrase jamais le précédent : les courbes sont calculées sur cet
   historique, un jour sans relevé reste vide ;

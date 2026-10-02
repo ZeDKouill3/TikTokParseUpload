@@ -1,13 +1,17 @@
-/* Ecran « Statistiques » (SPEC-86fe) : un tableau de bord TikTok par compte, alimente UNIQUEMENT par le releve de
-   TikTok Studio. Lit GET /api/stats/tiktok (comptes), /api/stats/tiktok/<compte>?period= (vue d'ensemble),
-   /api/stats/tiktok/<compte>/videos (liste triable) et /api/stats/tiktok/<compte>/videos/<id> (fiche) ; le bouton
-   « Relever maintenant » fait POST /api/stats/tiktok/refresh. Adresses : #/stats[/<compte>[/videos[/<id>]]].
+/* Ecran « Statistiques » (SPEC-47e2) : un tableau de bord TikTok par compte, alimente UNIQUEMENT par le releve de
+   TikTok Studio, releve seulement quand on s'en sert. Lit GET /api/stats/tiktok (comptes, avec `refreshing`),
+   /api/stats/tiktok/<compte>?period= (vue d'ensemble), /api/stats/tiktok/<compte>/videos (liste triable) et
+   /api/stats/tiktok/<compte>/videos/<id> (fiche). A l'ouverture, POST /api/stats/tiktok/open lance un releve en tache
+   de fond si le dernier est perime (le dernier releve connu reste affiche, « Relevé en cours » jusqu'a la fin) ; le
+   bouton « Relever maintenant » fait POST /api/stats/tiktok/refresh. Un seul releve a la fois par compte (serveur). Adresses : #/stats[/<compte>[/videos[/<id>]]].
    Graphiques en SVG calcule ici, sans bibliotheque (ADR-09ad). Une valeur que TikTok n'affiche pas (null) est un
    tiret, jamais un 0. Les mesures internes (couts LLM, durees d'etapes, videos par statut) sont dans le Tableau
    de bord. Charge apres screens.js dont il remplace l'entree Screens.stats. */
 "use strict";
 
 const STATS_STALE_MS = 4000;
+const STATS_POLL_MS = 3000; // pendant un releve en tache de fond : relecture de l'etat des comptes
+const STATS_VISIT_GAP_MS = 30000; // ecran quitte plus longtemps que ca : nouvelle ouverture, donc nouvelle demande
 const STATS_PERIODS = [7, 28, 60];
 const STATS_METRICS = [
   { id: "views", label: "Vues de vidéo", icon: "eye" },
@@ -29,6 +33,7 @@ const STATS_VIEWER_SECTIONS = [["types", "Types de spectateurs"], ["age", "Âge"
 const statsUi = {
   accounts: null, overview: null, videos: null, videosAccount: "", video: null, videoAccount: "", error: null, loading: null, dirty: false, at: 0, key: "",
   period: 28, metric: "views", sort: { key: "posted_at", dir: "desc" }, q: "", vtab: "overview", refreshing: false,
+  opened: {}, lastRender: 0, poll: null, wasRefreshing: {},
 };
 
 /* ---------- formats ---------- */
@@ -127,10 +132,55 @@ function statsLoad() {
       statsUi.loading = null;
       statsUi.at = Date.now();
     }
-    if (currentScreen === "stats") renderCurrent();
+    if (currentScreen === "stats") {
+      statsNotifyDone();
+      renderCurrent();
+      const account = statsAccount();
+      if (account) statsOpen(account);
+      statsSchedulePoll();
+    }
     if (statsUi.dirty) { statsUi.dirty = false; statsLoad(); }
   })();
   return statsUi.loading;
+}
+
+/* Releve en cours pour ce compte : lance depuis l'ecran (bouton) ou en tache de fond sur le serveur. */
+const statsRefreshing = (account) => statsUi.refreshing || Boolean(account && account.refreshing);
+
+/* A l'ouverture de l'ecran (une fois par compte et par visite) : le serveur lance un releve en tache de fond si le
+   dernier est perime ou absent (R4a) ; on affiche tout de suite le dernier releve connu, « Relevé en cours » jusqu'a la fin. */
+async function statsOpen(account) {
+  if (statsUi.opened[account.account] || !account.ready) return;
+  statsUi.opened[account.account] = Date.now();
+  try {
+    const sent = await api("/api/stats/tiktok/open", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ account: account.account }) });
+    if (!sent.started) return;
+  } catch (err) {
+    toastError("Relevé TikTok impossible", err);
+    return;
+  }
+  statsUi.at = 0;
+  statsLoad();
+}
+
+/* Tant qu'un releve tourne sur le serveur : on relit les comptes ; a la fin le dernier releve est recharge. */
+function statsSchedulePoll() {
+  clearTimeout(statsUi.poll);
+  statsUi.poll = null;
+  const account = statsAccount();
+  if (currentScreen !== "stats" || !account || !account.refreshing) return;
+  statsUi.poll = setTimeout(() => { statsUi.poll = null; statsUi.at = 0; statsLoad(); }, STATS_POLL_MS);
+}
+
+/* Un releve en tache de fond qui vient de finir : dit s'il a reussi ou pourquoi il a echoue (jamais silencieux). */
+function statsNotifyDone() {
+  for (const a of statsUi.accounts || []) {
+    const was = statsUi.wasRefreshing[a.account];
+    statsUi.wasRefreshing[a.account] = Boolean(a.refreshing);
+    if (!was || a.refreshing) continue;
+    if (a.refresh_error) toast({ kind: "bad", title: "Relevé TikTok impossible", body: `${a.label} : ${a.refresh_error}`, ms: 7000 });
+    else toast({ kind: "ok", title: "Relevé terminé", body: `${a.label} : statistiques à jour.` });
+  }
 }
 
 // Un evenement serveur (publication, releve) rend les chiffres obsoletes.
@@ -205,7 +255,7 @@ function statsChartWidth() {
 
 function statsEmpty(iconName, title, text, action) { return `<div class="panel">${emptyState(iconName, title, text, action)}</div>`; }
 
-const statsScanButton = (account) => `<button class="btn btn-primary" type="button" data-stats-scan${statsUi.refreshing || !account.ready ? " disabled" : ""}>${icon("refresh-cw", statsUi.refreshing ? "spin" : "")}${statsUi.refreshing ? "Relevé en cours" : "Relever maintenant"}</button>`;
+const statsScanButton = (account) => `<button class="btn btn-primary" type="button" data-stats-scan${statsRefreshing(account) || !account.ready ? " disabled" : ""}>${icon("refresh-cw", statsRefreshing(account) ? "spin" : "")}${statsRefreshing(account) ? "Relevé en cours" : "Relever maintenant"}</button>`;
 
 function statsControls(account) {
   const accounts = statsUi.accounts;
@@ -218,13 +268,14 @@ function statsControls(account) {
     ? `Dernier relevé : <b>${esc(statsWhen(account.fetched_at))}</b><br><span class="faint">${esc(fr(account.snapshots))} relevé${account.snapshots > 1 ? "s" : ""} enregistré${account.snapshots > 1 ? "s" : ""}</span>`
     : "Dernier relevé : <b>jamais</b>";
   const notReady = account.ready ? "" : `<div class="banner warn" role="status" data-stats-notready>${icon("lock", "i-sm")}<div><b>Compte non prêt à publier : aucun relevé n'est lancé.</b><br><span class="muted">${esc(account.not_ready_reason)}</span></div></div>`;
+  const running = statsRefreshing(account) ? `<div class="banner" role="status" data-stats-running>${icon("refresh-cw", "i-sm spin")}<div><b>Relevé en cours.</b><br><span class="muted">${account.fetched_at ? "Les chiffres affichés sont ceux du dernier relevé ; ils se mettent à jour à la fin." : "Aucun relevé enregistré pour l'instant ; les chiffres apparaissent à la fin."}</span></div></div>` : "";
   const failed = account.error ? `<div class="banner bad" role="alert" data-stats-error>${icon("circle-alert", "i-sm")}<div><b>Dernier relevé arrêté (${esc(account.error.code)}).</b><br><span class="muted">${esc(account.error.reason)}</span></div></div>` : "";
   return `<section class="ctl" aria-label="Compte et période">
       <div class="acct field"><label for="stats-account">Compte TikTok</label><select class="input" id="stats-account" data-stats-account>${options}</select></div>
       ${linked}
       <div class="field"><span class="field-label" id="stats-lbl-period">Période</span><div class="seg stats-seg" data-stats-periods role="group" aria-labelledby="stats-lbl-period">${periods}</div></div>
       <div class="scan"><div class="scan-when">${when}</div>${statsScanButton(account)}</div>
-    </section>${notReady}${failed}`;
+    </section>${notReady}${running}${failed}`;
 }
 
 function statsTabs(account, tab, count) {
@@ -371,8 +422,9 @@ async function statsScan(account) {
   renderCurrent();
   try {
     const sent = await api("/api/stats/tiktok/refresh", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ account: account.account }) });
-    const posts = Object.values(sent.accounts).reduce((t, a) => t + a.posts, 0);
-    toast({ kind: "ok", title: "Relevé terminé", body: `${account.label} : ${posts} publication${posts > 1 ? "s" : ""} relevée${posts > 1 ? "s" : ""}.` });
+    const posts = Object.values(sent.accounts).reduce((t, a) => t + (a.posts || 0), 0);
+    if (Object.values(sent.accounts).some((a) => a.running)) toast({ kind: "info", title: "Relevé déjà en cours", body: `${account.label} : un relevé tourne déjà, rien n'est relancé.` });
+    else toast({ kind: "ok", title: "Relevé terminé", body: `${account.label} : ${posts} publication${posts > 1 ? "s" : ""} relevée${posts > 1 ? "s" : ""}.` });
   } catch (err) {
     toastError("Relevé TikTok impossible", err);
   } finally {
@@ -422,6 +474,8 @@ function statsWire(body, account) {
 
 Screens.stats = {
   render(body) {
+    if (Date.now() - statsUi.lastRender > STATS_VISIT_GAP_MS) statsUi.opened = {}; // ecran rouvert : nouvelle ouverture
+    statsUi.lastRender = Date.now();
     if (!statsUi.accounts || statsUi.key !== statsKey() || Date.now() - statsUi.at > STATS_STALE_MS) statsLoad();
     if (!statsUi.accounts) {
       body.innerHTML = statsUi.error

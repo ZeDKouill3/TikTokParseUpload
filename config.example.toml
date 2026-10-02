@@ -29,6 +29,12 @@ output_dir = "output"
 #
 # [captions]
 # screen_title_allow_emoji = false   # SPEC-6a86 (defaut) : titre d'ecran sobre, sans emoji
+#
+# [tiktok]   # releves de statistiques (SPEC-47e2) : seulement quand on se sert de Clipper
+# stats_stale_min = 60      # ecran Statistiques : releve a l'ouverture si le dernier a plus de N minutes (0 = jamais)
+# stats_interval_h = 0      # releve periodique du worker toutes les N heures ; 0 = coupe (defaut), negatif refuse
+# stats_scroll_rounds = 10  # limite de securite du defilement de la liste des posts (atteinte : releve arrete, journalise)
+# stats_empty_wait_s = 8    # attente de la liste avant de conclure « aucun post » (compte neuf)
 
 # Reglages retenus apres le banc RTX 3050 4 Go (docs/benchmarks/rtx3050.md) :
 # deja les valeurs par defaut de CONFIG_DEFAULTS, rappelees ici pour memoire,

@@ -5,7 +5,7 @@ slug: stats-tiktok-relev-seulement-l-usage-ouverture-s
 title: "stats TikTok : relevé seulement à l'usage (ouverture si périmé, verrou par compte), worker coupé par défaut, liste complète des posts (SPEC-47e2)"
 created: 2026-10-02T20:23:25Z
 author: nicoc@zedk_ordi
-status: in_progress
+status: done
 scope:
   - clipper/tiktok.py
   - clipper/worker.py
@@ -18,8 +18,15 @@ done_criteria: |
   Tests unitaires (fausses pages, sans navigateur ni réseau) : ouverture de Statistiques avec relevé périmé -> relevé lancé, frais -> aucun ; deux demandes simultanées -> un seul relevé ; stats_interval_h = 0 -> le worker ne relève jamais, > 0 -> comportement actuel ; stats_interval_h < 0 -> erreur ; défilement : fausse liste en 3 lots (20+20+15) -> 55 posts lus, limite atteinte -> erreur journalisée ; publication relève toujours au passage. node --check sur chaque JS modifié.
 criteria_by: creator
 verify: [tests]
+proof:
+  - type: test
+    ref: local/bb93a6a31bb3@74bfcb1
+    tree: scope/caf3ab6660ee
+    criteria: c6c149853f20
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 2
+version: 3
 ---
 
 Implémenter SPEC-47e2 (remplace SPEC-86fe ; lire `ank show SPEC-47e2`). Ce qui change par rapport au code actuel :

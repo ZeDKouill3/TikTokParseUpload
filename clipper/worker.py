@@ -399,7 +399,8 @@ class Worker:
         return False
 
     def _stats_due(self) -> None:
-        """Releve periodique des statistiques (SPEC-86fe R4) : un compte par iteration, jamais dans l'iteration
+        """Releve periodique des statistiques (SPEC-47e2 R4) : coupe quand ``stats_interval_h`` vaut 0 (defaut :
+        le releve se fait a l'usage, pas en fond) ; sinon un compte par iteration, jamais dans l'iteration
         qui a pilote une publication (un seul pilotage du navigateur a la fois), seulement pour un compte
         « pret a publier » (donc ni deconnecte ni arrete par R4 de SPEC-9225). La liste des posts vient de TikTok :
         un compte sans clip publie par Clipper est releve aussi. Un echec est journalise une fois et n'est pas
@@ -410,6 +411,8 @@ class Worker:
             watch = self.config.section("watch")
             scope = {"state_dir": self.config.section("publish")["state_dir"],
                      "presets_dir": watch["presets_dir"], "base": watch["base_config"]}
+            if float(settings["stats_interval_h"]) == 0:
+                return
             wait = timedelta(hours=float(settings["stats_interval_h"]))
             for found in accounts_mod.list_accounts(self.config):
                 account = found["id"]

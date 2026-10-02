@@ -66,12 +66,14 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "poll_interval_s": 5,              # pas d'attente entre deux lectures de la verification
     "type_delay_ms": 50,               # delai entre deux touches de la legende
     "events_path": "state/tiktok/events.json",
-    "stats_interval_h": 24,            # releve periodique des statistiques par le worker (R7)
+    "stats_interval_h": 0,             # releve periodique du worker, en heures : 0 = coupe (releve seulement a l'usage, SPEC-47e2 R4)
+    "stats_stale_min": 60,             # ecran Statistiques : releve a l'ouverture si le dernier a plus de N minutes (0 = jamais)
     "stats_dir": "state/stats/tiktok",  # historique par compte : <stats_dir>/<compte>/<horodatage>.json (SPEC-86fe R2)
     "stats_detail_days": 7,            # un post publie depuis moins de N jours est relu en detail a chaque releve
     "stats_detail_max": 50,            # plafond de posts relus en detail (3 pages chacun) par releve
     "stats_audience_min_views": 100,   # Spectateurs / Engagement : TikTok ne les remplit qu'a partir de 100 vues
-    "stats_scroll_rounds": 10,         # defilements de la liste des Publications pour la charger en entier
+    "stats_scroll_rounds": 10,         # limite de securite : defilements de la liste des Publications ; atteinte = arret journalise
+    "stats_empty_wait_s": 8,           # attente des lignes (ou de l'etat vide) de la page Publications avant de conclure « aucun post »
 }
 
 MODES = ("immediate", "scheduled")
@@ -133,15 +135,15 @@ def get_settings(config: Config | None) -> dict[str, Any]:
         if isinstance(value, bool) or not isinstance(value, (int, float)) or value < minimum:
             raise TikTokError(f"[tiktok] {key} invalide : {value!r} (un nombre >= {minimum} est attendu)")
     hours = settings["stats_interval_h"]
-    if isinstance(hours, bool) or not isinstance(hours, (int, float)) or hours <= 0:
-        raise TikTokError(f"[tiktok] stats_interval_h invalide : {hours!r} (un nombre d'heures > 0 est attendu)")
+    if isinstance(hours, bool) or not isinstance(hours, (int, float)) or hours < 0:
+        raise TikTokError(f"[tiktok] stats_interval_h invalide : {hours!r} (un nombre d'heures >= 0 est attendu, 0 = coupé)")
     for key in ("allow_comments", "allow_reuse", "ai_generated"):
         if not isinstance(settings[key], bool):
             raise TikTokError(f"[tiktok] {key} invalide : {settings[key]!r} (true ou false attendu)")
     if not isinstance(settings["stats_dir"], str) or not settings["stats_dir"]:
         raise TikTokError(f"[tiktok] stats_dir invalide : {settings['stats_dir']!r} (un chemin est attendu)")
-    for key, minimum in (("stats_detail_days", 0), ("stats_detail_max", 0), ("stats_scroll_rounds", 0),
-                         ("stats_audience_min_views", 0)):
+    for key, minimum in (("stats_stale_min", 0), ("stats_detail_days", 0), ("stats_detail_max", 0),
+                         ("stats_scroll_rounds", 1), ("stats_empty_wait_s", 0), ("stats_audience_min_views", 0)):
         value = settings[key]
         if isinstance(value, bool) or not isinstance(value, (int, float)) or value < minimum:
             raise TikTokError(f"[tiktok] {key} invalide : {value!r} (un nombre >= {minimum} est attendu)")
@@ -222,6 +224,9 @@ def load_selectors(path: str | Path | None = None) -> dict[str, Any]:
     for key in REQUIRED_STATS_SELECTORS:
         need("stats", key, str)
     need("stats", "unavailable", list)
+    if not isinstance(data["stats"].get("empty_state"), str):
+        raise TikTokError(f"fichier de sélecteurs TikTok ({target.name}) : [stats] empty_state manquant ou invalide "
+                          f"(un sélecteur, ou \"\" tant qu'il n'est pas vérifié en réel)")
     for key in METRICS:
         need("metrics", key, str)
     for key in ("period_button", "period_option", "period_label", "tile"):
@@ -913,18 +918,41 @@ class _Flow:
         return tiles
 
     def list_posts(self) -> dict[str, dict[str, Any]]:
-        """Page Publications, defilee jusqu'a ce que la liste ne grandisse plus : un dict par post (id -> ligne)."""
+        """Page Publications, defilee jusqu'a ce que la liste ne grandisse plus : un dict par post (id -> ligne).
+        Un compte sans aucun post (page vide) rend ``{}`` sans erreur. Si la liste grandit encore apres
+        ``stats_scroll_rounds`` defilements, c'est un arret journalise (R7 : jamais une liste tronquee en silence)."""
         self.open_page(self.sel["urls"]["stats"], self.sel["expect"]["stats_url_prefix"])
-        self.wait("row", table="stats")
-        self.guard()
-        rows = self.read_rows()
-        for _ in range(int(self.settings["stats_scroll_rounds"])):
+        rows = self.wait_rows_or_empty()
+        if not rows:
+            return {}
+        rounds = int(self.settings["stats_scroll_rounds"])
+        for _ in range(rounds):
             self.page.evaluate(self.sel["stats"]["scroll_script"])
             self.pause()
             more = self.read_rows()
             if len(more) <= len(rows):
-                break
+                return rows
             rows = more
+        raise self.stop("scroll_limit", f"la liste des Publications grandit encore après {rounds} défilements ({len(rows)} posts "
+                                        f"lus) : relevé arrêté pour ne pas garder une liste tronquée, augmente "
+                                        f"[tiktok] stats_scroll_rounds")
+
+    def wait_rows_or_empty(self) -> dict[str, dict[str, Any]]:
+        """Attend les lignes de la page Publications OU son etat vide, en course et quelques secondes seulement
+        (``stats_empty_wait_s``, pas les 30 s d'un repere manquant) : un compte neuf n'a aucune ligne. Rend les
+        lignes lues, ``{}`` si la page n'en affiche aucune."""
+        sel = self.sel["stats"]
+        self.guard()
+        selector = f"{sel['row']}, {sel['empty_state']}" if sel["empty_state"] else sel["row"]
+        try:
+            self.page.wait_for_selector(selector, timeout=float(self.settings["stats_empty_wait_s"]) * 1000)
+        except Exception as exc:
+            if "Timeout" not in type(exc).__name__:
+                raise
+        self.guard()
+        rows = self.read_rows()
+        if not rows:
+            logger.info("TikTok %s : la page Publications n'affiche aucun post (compte sans publication)", self.account)
         return rows
 
     def read_rows(self) -> dict[str, dict[str, Any]]:
@@ -1302,10 +1330,9 @@ def _last_full(history: list[dict[str, Any]]) -> dict[str, Any] | None:
     return next((s for s in reversed(history) if s.get("origin") == "full"), None)
 
 
-def stats_due(account: str, *, config: Config | None = None, now: datetime | None = None) -> bool:
-    """Vrai si le dernier essai de releve complet (reussi ou arrete) date de ``stats_interval_h`` ou plus, ou s'il
-    n'y en a jamais eu : un arret sur n'est pas retente a chaque passage du worker, et un releve opportuniste
-    (page Publications vue au passage) ne remplace pas le releve complet."""
+def _last_attempt(account: str, config: Config | None) -> datetime | None:
+    """Date du dernier essai de releve complet, reussi ou arrete ; ``None`` s'il n'y en a jamais eu. Un releve
+    opportuniste (page Publications vue au passage) n'est pas un essai de releve complet."""
     stamps = []
     last = _last_full(read_history(account, config=config))
     if last is not None:
@@ -1313,10 +1340,29 @@ def stats_due(account: str, *, config: Config | None = None, now: datetime | Non
     folder = _history_dir(account, get_settings(config))
     for path in folder.glob(f"*{_ERROR_SUFFIX}") if folder.is_dir() else []:
         stamps.append(_read_json(path)["at"])
-    if not stamps:
-        return True
-    interval = timedelta(hours=float(get_settings(config)["stats_interval_h"]))
-    return (now or datetime.now(timezone.utc)) - max(datetime.fromisoformat(s) for s in stamps) >= interval
+    return max(datetime.fromisoformat(s) for s in stamps) if stamps else None
+
+
+def stats_due(account: str, *, config: Config | None = None, now: datetime | None = None) -> bool:
+    """Releve periodique du worker (SPEC-47e2 R4) : jamais si ``stats_interval_h`` vaut 0 (coupe, defaut) ; sinon
+    vrai si le dernier essai de releve complet (reussi ou arrete) date de ``stats_interval_h`` ou plus, ou s'il n'y
+    en a jamais eu : un arret sur n'est pas retente a chaque passage du worker."""
+    hours = float(get_settings(config)["stats_interval_h"])
+    if hours == 0:
+        return False
+    last = _last_attempt(account, config)
+    return last is None or (now or datetime.now(timezone.utc)) - last >= timedelta(hours=hours)
+
+
+def stats_stale(account: str, *, config: Config | None = None, now: datetime | None = None) -> bool:
+    """Ouverture de l'ecran Statistiques (SPEC-47e2 R4a) : vrai si le dernier essai de releve complet date de
+    ``stats_stale_min`` minutes ou plus, ou s'il n'y en a jamais eu ; jamais si ``stats_stale_min`` vaut 0. Un arret
+    sur compte comme un essai : le navigateur n'est pas rouvert a chaque ouverture de l'ecran."""
+    minutes = float(get_settings(config)["stats_stale_min"])
+    if minutes == 0:
+        return False
+    last = _last_attempt(account, config)
+    return last is None or (now or datetime.now(timezone.utc)) - last >= timedelta(minutes=minutes)
 
 
 def _record_stats_failure(account: str, exc: Exception, config: Config | None, settings: dict[str, Any],
@@ -1342,6 +1388,17 @@ def merged_posts(history: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
             known.update(post)
             known["last_seen"] = snapshot["fetched_at"]
     return merged
+
+
+def deleted_post_ids(history: list[dict[str, Any]]) -> set[str]:
+    """Posts supprimes sur TikTok : releves un jour mais absents du DERNIER releve complet (la page Publications
+    defilee en entier). Un releve opportuniste ne voit qu'une partie de la liste : il ne supprime rien ; sans releve
+    complet, rien n'est declare supprime. L'historique n'est jamais modifie (SPEC-47e2 R2)."""
+    last = _last_full(history)
+    if last is None:
+        return set()
+    shown = {post["post_id"] for post in last["posts"]}
+    return {post["post_id"] for snapshot in history for post in snapshot["posts"]} - shown
 
 
 def _published_posts(account: str, config: Config | None) -> list[dict[str, Any]]:
@@ -1468,8 +1525,12 @@ def list_videos(account: str, *, sort: str = "posted_at", descending: bool = Tru
         raise TikTokError(f"tri inconnu : {sort!r} (attendu : {' | '.join(VIDEO_SORTS)})")
     links = _clip_links(account, config)
     wanted = query.strip().casefold()
+    history = read_history(account, config=config)
+    deleted = deleted_post_ids(history)
     videos = []
-    for post in merged_posts(read_history(account, config=config)).values():
+    for post in merged_posts(history).values():
+        if post["post_id"] in deleted:
+            continue  # supprime sur TikTok : absent du dernier releve complet
         if wanted and wanted not in (post.get("caption") or "").casefold():
             continue
         light = {key: post.get(key) for key in _LIGHT_FIELDS}
@@ -1491,6 +1552,8 @@ def video_detail(account: str, post_id: str, *, config: Config | None = None) ->
     post = merged_posts(history).get(str(post_id))
     if post is None:
         raise TikTokError(f"vidéo {post_id} introuvable dans les relevés du compte {account}")
+    if str(post_id) in deleted_post_ids(history):
+        raise TikTokError(f"vidéo {post_id} introuvable : supprimée de TikTok (absente du dernier relevé du compte {account})")
     clip = _clip_links(account, config).get(post["post_id"])
     track = [{"fetched_at": s["fetched_at"], **{k: p.get(k) for k in ("views", "likes", "comments")}}
              for s in history for p in s["posts"] if p["post_id"] == post["post_id"]]
