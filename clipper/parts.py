@@ -8,6 +8,11 @@ Entrees (workspace/<video_id>/) :
   repris dans le prompt ;
 - transcript.json (transcribe) : segments et mots horodates.
 
+La grille est celle de l'etape moments, lue dans moments.json
+(``rubric.path``, deja resolue, ``builtin:*`` compris) : une seule grille par
+video, jamais une cle de [parts]. ``rubric.path`` absent ou fichier
+introuvable : PartsError, jamais de repli sur rubric.toml (ADR-ad2e).
+
 Sortie : workspace/<video_id>/parts.json
 
     {"video_id", "rubric": {"path", "durations"},
@@ -17,7 +22,7 @@ Sortie : workspace/<video_id>/parts.json
                              "overlap", "hook_text", "suspense"}]}],
      "rejected": [{"id", "start", "end", "duration", "reason"}]}
 
-Decision, bornes de [durations] dans rubric.toml, ``tolerance`` comprise
+Decision, bornes de [durations] de la grille, ``tolerance`` comprise
 (la marge de recalage sur des frontieres de phrase) :
 - duree dans single_min..single_max : clip unique, sans appel au LLM ;
 - sinon N parties de part_min..part_max, reprise comprise, N entre
@@ -65,9 +70,6 @@ from clipper import llm
 log = logging.getLogger(__name__)
 
 CONFIG_DEFAULTS: dict[str, object] = {
-    # Grille (SPEC-0eec) dont [durations] fixe les bornes, relative au
-    # dossier courant ; la meme que [moments] rubric_path.
-    "rubric_path": "rubric.toml",
     # Reprise (SPEC-0eec, regle 3) : la partie k+1 recommence environ
     # part_overlap_seconds s avant la fin de la partie k, de preference sur
     # un debut de phrase situe entre part_overlap_min et part_overlap_max s
@@ -89,7 +91,8 @@ _EPS = 1e-6
 
 
 class PartsError(Exception):
-    """Entree manquante, grille (rubric.toml) ou reglages invalides."""
+    """Entree manquante, grille (rubric.path de moments.json) ou reglages
+    invalides."""
 
 
 # --------------------------------------------------------------------------
@@ -98,7 +101,7 @@ class PartsError(Exception):
 
 
 def load_durations(path: str | Path) -> dict[str, float]:
-    """Table [durations] de rubric.toml ; cle manquante ou mal typee :
+    """Table [durations] de la grille ; cle manquante ou mal typee :
     PartsError qui la nomme."""
     path = Path(path)
     if not path.exists():
@@ -153,6 +156,19 @@ def parallel_workers(settings: dict[str, Any]) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value < 1:
         raise PartsError(f"[parts] parallel doit etre un entier >= 1, recu {value!r}")
     return value
+
+
+def rubric_path_of(moments: dict[str, Any], moments_file: Path) -> Path:
+    """Grille utilisee par l'etape moments : ``rubric.path`` de moments.json.
+    Absent ou vide : PartsError (aucun repli sur rubric.toml)."""
+    rubric = moments.get("rubric")
+    path = rubric.get("path") if isinstance(rubric, dict) else None
+    if not isinstance(path, str) or not path.strip():
+        raise PartsError(
+            f"{moments_file} : rubric.path absent, impossible de savoir quelle grille l'etape moments a "
+            "utilisee ; relance l'etape moments (--force)"
+        )
+    return Path(path)
 
 
 # --------------------------------------------------------------------------
@@ -231,6 +247,22 @@ def part_count_range(duration: float, d: dict[str, float], overlap: float = 0.0)
         max(int(d["min_parts"]), math.ceil(span / (high - overlap) - _EPS)),
         min(int(d["max_parts"]), math.floor(span / (low - overlap) + _EPS)),
     )
+
+
+def is_single(duration: float, d: dict[str, float]) -> bool:
+    """Duree d'un clip unique : single_min..single_max, tolerance comprise."""
+    tol = d["tolerance"]
+    return d["single_min"] - tol - _EPS <= duration <= d["single_max"] + tol + _EPS
+
+
+def accepts_duration(duration: float, d: dict[str, float], overlap: float = 0.0) -> bool:
+    """Parts ne rejette pas ce moment pour sa duree : clip unique, ou un
+    nombre de parties possible. Jamais plus strict que _normalize (moments)
+    pour la meme grille."""
+    if is_single(duration, d):
+        return True
+    low, high = part_count_range(duration, d, overlap)
+    return low <= high
 
 
 @dataclass(frozen=True)
@@ -418,7 +450,7 @@ def _split(
     if not inside:
         return None, "aucune phrase de la transcription dans le moment"
 
-    if d["single_min"] - tol - _EPS <= duration <= d["single_max"] + tol + _EPS:
+    if is_single(duration, d):
         return {**record, "format": "single", "parts_total": 1, "proposed_cuts": [],
                 "parts": [_part(1, start, end, 0, inside[0].text, None)]}, None
 
@@ -482,7 +514,13 @@ def _settings(config: Any) -> dict[str, Any]:
         from clipper.config import load_config
 
         config = load_config()
-    return {**CONFIG_DEFAULTS, **config.section("parts")}
+    settings = {**CONFIG_DEFAULTS, **config.section("parts")}
+    if "rubric_path" in settings:
+        raise PartsError(
+            "[parts] rubric_path n'existe plus : la grille est celle de l'etape moments "
+            "([moments] rubric_path, relevee dans moments.json) ; supprime cette cle de la config"
+        )
+    return settings
 
 
 def run(
@@ -505,7 +543,7 @@ def run(
     moments = _read_json(video_dir / "moments.json")
     transcript = _read_json(video_dir / "transcript.json")
     settings = _settings(config)
-    rubric_path = Path(settings["rubric_path"])
+    rubric_path = rubric_path_of(moments, video_dir / "moments.json")
     durations = load_durations(rubric_path)
     overlap = overlap_settings(settings, durations)
     workers = parallel_workers(settings)

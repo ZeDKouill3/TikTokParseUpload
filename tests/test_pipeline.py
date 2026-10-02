@@ -257,7 +257,6 @@ def make_config(tmp_path, mode="auto", **sections):
         shutil.copyfile(ROOT / "rubric.toml", rubric)
     base = {
         "moments": {"rubric_path": str(rubric)},
-        "parts": {"rubric_path": str(rubric)},
         "feedback": {"journal_path": str(tmp_path / "state" / "feedback.jsonl")},
         "render": {"x264_preset": "ultrafast"},
     }
