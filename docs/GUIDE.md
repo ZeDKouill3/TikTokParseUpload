@@ -117,14 +117,14 @@ Deux réglages indépendants dans `config.toml` :
   Une fois un clip en stream, `stream_variant` (SPEC-76dc) choisit
   l'agencement visuel : `"top"` (défaut, comportement inchangé, décrit
   ci-dessus) ou `"split"` (webcam en haut sur ~1/3 de la hauteur, jeu en bas
-  pleine largeur, badge de chaîne optionnel à la jonction) — voir *Agencement
+  pleine largeur, badge de style optionnel à la jonction) — voir *Agencement
   stream split* ci-dessous.
 
 Le contrat de sortie d'un clip (`SPEC-6a47`, succède à `SPEC-6127`) :
 `.mp4` vertical 1080x1920 + `.json` sidecar (titre, légende, hashtags,
 rapport qa...). En letterbox, titre d'écran en haut, sous-titres dans la
-bande floue du bas. Voir *Appel à l'abonnement* ci-dessous pour le pseudo de
-chaîne et la carte de fin optionnels.
+bande floue du bas. Voir *Appel à l'abonnement* ci-dessous pour le pseudo
+d'affichage et la carte de fin optionnels.
 
 ```toml
 [reframe]
@@ -132,18 +132,18 @@ format = "letterbox"
 layout = "stream_auto"   # ou "letterbox"
 ```
 
-## Appel à l'abonnement (SPEC-6a47, `preset` par chaîne)
+## Appel à l'abonnement (SPEC-6a47, `preset` par style)
 
 Désactivé par défaut : sans configuration explicite, le rendu, le sidecar et
-la légende restent identiques à `SPEC-6127`. Utile pour une chaîne tierce
-(ex. un·e streameur·se dont on republie les meilleurs moments) : pseudo de
-chaîne discret sous le titre d'écran pendant tout le clip, carte de fin
+la légende restent identiques à `SPEC-6127`. Utile pour un contenu tiers
+(ex. un·e streameur·se dont on republie les meilleurs moments) : pseudo
+d'affichage discret sous le titre d'écran pendant tout le clip, carte de fin
 « Abonne-toi ! » sur les dernières secondes, ligne d'appel et hashtags
 supplémentaires dans la description. S'applique en letterbox et en stream
 (`layout = "stream_auto"`) ; ignoré en `format = "crop"` (option figée,
 `cta` reste `false` dans le sidecar, ce n'est pas une erreur).
 
-Un preset par chaîne est un fichier de config séparé, passé avec `--config` :
+Un preset par style est un fichier de config séparé, passé avec `--config` :
 
 ```powershell
 python -m clipper run https://www.twitch.tv/videos/<id> --config presets/ma-chaine.toml
@@ -170,14 +170,14 @@ pseudo tronqué ou absent en silence. Les réglages de mise en page (tailles de
 police, marges) vivent dans `CONFIG_DEFAULTS` de `clipper/render.py`
 (`cta_handle_font_size`, `cta_card_font_size`...).
 
-## Agencement stream split (SPEC-76dc, `preset` par chaîne)
+## Agencement stream split (SPEC-76dc, `preset` par style)
 
 Un second agencement visuel pour les clips déjà en stream (`stream_variant`,
 voir *Formats de sortie* ci-dessus), pensé pour reproduire le montage
 « webcam en haut, jeu en bas » qu'une streameuse ou un streamer fait
 déjà lui-même : deux zones fixes qui se partagent toute la hauteur (jamais de
 déformation, chaque zone est recadrée au ratio de son rectangle de
-destination), un badge de chaîne optionnel (logo + pseudo, fond noir par
+destination), un badge de style optionnel (logo + pseudo, fond noir par
 défaut ou sans fond) à leur jonction, et un style de sous-titres à deux
 couleurs (mot en train
 d'être prononcé dans une couleur distincte, pas de fond). `title_enabled`
@@ -212,7 +212,7 @@ TikTok (badge, sous-titres) est une erreur explicite au chargement
 (ADR-ad2e). `badge_enabled` sans `badge_logo` (fichier
 introuvable inclus) ou sans `badge_name`, ou activé sur un layout qui n'a pas
 de zone badge (letterbox, stream `"top"`, format crop), est aussi une erreur
-explicite : le badge remplace le pseudo de chaîne de l'appel à l'abonnement
+explicite : le badge remplace le pseudo d'affichage de l'appel à l'abonnement
 quand les deux sont actifs, sans toucher à la carte de fin.
 
 Le groupe logo + nom est toujours centré horizontalement sur `badge_dest`
@@ -249,8 +249,8 @@ La navigation (barre latérale, onglets en bas sur téléphone) donne :
    raison, VOD « à confirmer » issues de la surveillance, clips à valider,
    prochaines publications, coût LLM du jour et de la semaine par usage, état
    matériel (GPU ou CPU).
-2. **Vidéos** : liste filtrable (chaîne, statut, texte) ; ajout par URL avec
-   choix de la chaîne (ou « sans chaîne » pour `config.toml` seul) ; fiche
+2. **Vidéos** : liste filtrable (style, statut, texte) ; ajout par URL avec
+   choix du style (ou « sans style » pour `config.toml` seul) ; fiche
    avec la frise des 12 étapes, le journal suivi en direct, « relancer depuis
    cette étape » et « annuler ».
 3. **Revue** (mode `review`) : lecteur de la source calé sur le moment, score,
@@ -258,20 +258,20 @@ La navigation (barre latérale, onglets en bas sur téléphone) donne :
    `A` (accepter), `R` (refuser), `J`/`K` (suivant/précédent), espace
    (lecture). « Lancer le rendu » n'est actif que quand chaque moment a une
    décision ; sinon la raison s'affiche.
-4. **Clips** : galerie 9:16 par vidéo et par chaîne, lecteur, fiche du clip
+4. **Clips** : galerie 9:16 par vidéo et par style, lecteur, fiche du clip
    (titre d'écran, description, hashtags, partie N/M, `qa_status`, `issues`),
    édition de la description et des hashtags, du titre d'écran (re-rendu),
    approuver / refuser, re-rendre, télécharger le mp4, copier la description.
-5. **Chaînes** : liste (nom, source, surveillance, mode, prochains créneaux),
+5. **Styles** : liste (nom, source, surveillance, mode, prochains créneaux),
    création et édition d'un preset par formulaire, chaque champ montrant sa
    valeur héritée de `config.toml` tant que le preset ne la redéfinit pas ; une
    erreur de validation s'affiche sous le champ. Deux outils : l'**éditeur
    d'agencement** (canevas 1080×1920 : zones webcam, jeu, badge, sous-titres à
-   glisser et redimensionner sur une image clé d'une vidéo de la chaîne,
+   glisser et redimensionner sur une image clé d'une vidéo du style,
    enregistrées dans `[reframe]` ; un agencement qui déborde ou se chevauche
    est refusé avec le message de `reframe`) et l'**aperçu du style des
    sous-titres** sur une phrase d'exemple, rendu par le pipeline.
-6. **Publication** : par chaîne, clips `approved` / `scheduled`, calendrier
+6. **Publication** : par style, clips `approved` / `scheduled`, calendrier
    hebdomadaire des créneaux (glisser-déposer sur un créneau libre),
    télécharger, copier la description, « marquer publié », « repasser en
    attente ». La mise en ligne reste manuelle : le dépôt ne publie rien sur
@@ -287,7 +287,7 @@ La navigation (barre latérale, onglets en bas sur téléphone) donne :
 Toute erreur de l'API s'affiche en clair (toast et à la place de l'objet),
 jamais un tiret muet. Les actions qui ont un inverse (décision de revue,
 approbation) proposent « Annuler » pendant 5 secondes ; les autres (annuler un
-traitement, refuser une série, supprimer une chaîne) demandent confirmation.
+traitement, refuser une série, supprimer un style) demandent confirmation.
 
 ### La file de traitement
 
@@ -299,12 +299,12 @@ remet la vidéo en file avec sa raison et l'heure de reprise (`retry_at`) ;
 une erreur définitive la passe en `failed`. Le worker lit les mêmes fichiers
 `state/` que le serveur, sous verrou de fichier.
 
-### Presets de chaîne en surcouche
+### Presets de style en surcouche
 
-Une chaîne est un fichier `presets/<nom>.toml` : une **surcouche** fusionnée
+Un style est un fichier `presets/<nom>.toml` : une **surcouche** fusionnée
 clé par clé sur `config.toml`. Seules les clés redéfinies figurent dans le
 fichier ; tout le reste est hérité. La table `[channel]` (validée par
-`CONFIG_DEFAULTS` de `clipper/channel.py`) décrit la chaîne elle-même :
+`CONFIG_DEFAULTS` de `clipper/channel.py`) décrit le style lui-même :
 `display_name`, `source_url`, `watch`, `watch_interval_s`,
 `watch_min_duration_s`, `mode`, `slots`, `timezone`, `tiktok_account`,
 `logo`. Exemple `presets/ma_chaine.toml` :
@@ -323,7 +323,7 @@ stream_variant = "split"
 ```
 
 Le nom (`ma_chaine`, minuscules, chiffres, `_` et `-`) est celui du fichier.
-Le formulaire de l'écran Chaînes lit et écrit ce même fichier ; le même
+Le formulaire de l'écran Styles lit et écrit ce même fichier ; le même
 preset s'utilise en ligne de commande avec
 `--config presets/ma_chaine.toml`.
 
@@ -342,13 +342,13 @@ elles-mêmes restent sous `workspace/<video_id>/` et `output/<video_id>/`.
 
 ### Surveillance des VOD
 
-Avec `watch = true` dans `[channel]`, le worker interroge la `source_url` de
-la chaîne toutes les `watch_interval_s` secondes (rien n'est téléchargé pour
+Avec `watch = true` dans `[channel]`, le worker interroge la `source_url` du
+style toutes les `watch_interval_s` secondes (rien n'est téléchargé pour
 lister). Il ignore les VOD plus courtes que `watch_min_duration_s`, les
 directs en cours et celles déjà vues. En mode `auto` les nouvelles VOD sont
 mises en file ; en mode `review` elles apparaissent « à confirmer » sur
 l'Accueil, où l'on choisit de les confirmer (mise en file) ou de les ignorer.
-Une erreur de listage est affichée (`last_error`), la chaîne reste surveillée.
+Une erreur de listage est affichée (`last_error`), le style reste surveillé.
 
 ### Notifications
 
@@ -451,7 +451,7 @@ explicite, un `screen_title` avec un emoji est refusé — activer l'option ne
 le rend pas obligatoire, elle permet seulement d'en accepter un au plus),
 `screen_title_forbidden_words` (liste de mots d'emphase clickbait refusés
 dans `screen_title`, insensible à la casse et aux accents, mot entier ;
-réglable par preset de chaîne), `parallel` = 4 (moments traités en
+réglable par preset de style), `parallel` = 4 (moments traités en
 parallèle), `cta_line`/`cta_hashtags` (SPEC-6a47, vides par défaut, voir
 *Appel à l'abonnement* ci-dessus).
 
@@ -488,7 +488,7 @@ détecté, sinon `libx264`). `title_enabled` (SPEC-76dc, défaut `true` —
 comportement inchangé) : désactive le titre d'écran, sur tout layout.
 `cta_enabled`/`cta_handle`/`cta_seconds`/`cta_text` (SPEC-6a47, désactivé par
 défaut, voir *Appel à l'abonnement* ci-dessus) et leurs réglages de mise en
-page (`cta_handle_font_size`, `cta_card_font_size`...). Badge de chaîne
+page (`cta_handle_font_size`, `cta_card_font_size`...). Badge de style
 (SPEC-76dc, voir *Agencement stream split* ci-dessus) : `badge_enabled`
 (défaut `false`), `badge_logo`, `badge_name`, `badge_logo_size` = 100,
 `badge_glyph_scale` = 0.65, `badge_logo_fill` = `""` (échantillonné au coin

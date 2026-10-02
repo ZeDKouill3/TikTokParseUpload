@@ -36,7 +36,7 @@ REQUIRED_SECTIONS = [
     "Installation",
     "Démarrage rapide",
     "Formats",
-    "Chaînes, grille gaming et CTA abonnement",
+    "Styles, grille gaming et CTA abonnement",
     "Modes review/auto",
     "La console en images",
     "Interface web",

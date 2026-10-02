@@ -1,4 +1,4 @@
-/* Aperçu du style des sous-titres de l'écran « Chaînes » (SPEC-c100 E5, SPEC-76dc).
+/* Aperçu du style des sous-titres de l'écran « Styles » (SPEC-c100 E5, SPEC-76dc).
    Le PNG est rendu par le pipeline (GET /api/channels/{nom}/subtitles-preview) :
    aucun rendu de texte ici. Chaque changement d'un champ de style est envoyé
    tel quel (brouillon non enregistré) après PREVIEW_DELAY_MS sans nouvelle
@@ -7,7 +7,7 @@
 "use strict";
 
 const PREVIEW_DELAY_MS = 300;
-const CHAN_PREVIEW_TEXT = "Salut tout le monde, bienvenue sur ma chaîne";
+const CHAN_PREVIEW_TEXT = "Salut tout le monde, bienvenue sur mon live";
 
 function chSubsPreviewHtml() {
   return `<div class="chan-preview" data-subs-preview>

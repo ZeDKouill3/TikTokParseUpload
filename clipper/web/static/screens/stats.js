@@ -261,8 +261,8 @@ function statsControls(account) {
   const accounts = statsUi.accounts;
   const options = accounts.map((a) => `<option value="${esc(a.account)}"${a.account === account.account ? " selected" : ""}>${esc(a.label)} · ${esc(a.account)}</option>`).join("");
   const linked = account.channel
-    ? `<div class="linked">${icon("link", "i-sm")}<span>Chaîne Clipper liée : <b>${esc(account.channel)}</b></span></div>`
-    : `<div class="linked none">${icon("link", "i-sm")}<span>Aucune chaîne Clipper liée</span></div>`;
+    ? `<div class="linked">${icon("link", "i-sm")}<span>Style Clipper lié : <b>${esc(account.channel)}</b></span></div>`
+    : `<div class="linked none">${icon("link", "i-sm")}<span>Aucun style Clipper lié</span></div>`;
   const periods = `${STATS_PERIODS.map((n) => `<button type="button" data-stats-period="${n}" class="${n === statsUi.period ? "on" : ""}" aria-pressed="${n === statsUi.period}">${n} jours</button>`).join("")}`;
   const when = account.fetched_at
     ? `Dernier relevé : <b>${esc(statsWhen(account.fetched_at))}</b><br><span class="faint">${esc(fr(account.snapshots))} relevé${account.snapshots > 1 ? "s" : ""} enregistré${account.snapshots > 1 ? "s" : ""}</span>`

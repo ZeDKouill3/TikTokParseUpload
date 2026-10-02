@@ -138,7 +138,7 @@ const Screens = {
   review: soon("sparkles", "Aucun moment à valider", "Ajoute une vidéo : ses moments à valider apparaîtront ici."),
   clips: soon("clapperboard", "Aucun clip", "Ajoute une vidéo : les clips rendus apparaîtront ici."),
   publish: soon("send", "Rien à publier", "Approuve des clips : ils apparaîtront ici avec leurs créneaux."),
-  channels: soon("tv", "Aucune chaîne", "Crée une chaîne, par exemple « ma_chaine », pour lui donner son agencement et ses créneaux.", (store) => {
+  channels: soon("tv", "Aucun style", "Crée un style, par exemple « ma_chaine », pour lui donner son agencement et ses créneaux.", (store) => {
     const names = store.channels || [];
     return names.length ? names.map((n) => `<div class="list-item"><span class="tag">${esc(n)}</span></div>`).join("") : null;
   }),
@@ -147,7 +147,7 @@ const Screens = {
 };
 
 /* Ecran d'attente : message vide utile ; peut etre surchargé par une liste
-   de donnees deja disponibles (ex. noms de chaines). */
+   de donnees deja disponibles (ex. noms de styles). */
 function soon(iconName, title, text, listFn) {
   return {
     render(body, store) {

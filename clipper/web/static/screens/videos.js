@@ -50,8 +50,8 @@
           <form class="vadd" data-add-form autocomplete="off">
             <div class="field vadd-url"><label for="vadd-url">Adresse de la vidéo (URL)</label>
               <input class="input" id="vadd-url" name="url" type="url" required placeholder="https://…"></div>
-            <div class="field"><label for="vadd-channel">Chaîne</label>
-              <select class="input" id="vadd-channel" name="channel"><option value="">Sans chaîne (config.toml)</option></select></div>
+            <div class="field"><label for="vadd-channel">Style</label>
+              <select class="input" id="vadd-channel" name="channel"><option value="">Sans style (config.toml)</option></select></div>
             <div class="field"><label for="vadd-action">Action</label>
               <select class="input" id="vadd-action" name="action">
                 <option value="run">Traitement complet</option><option value="render">Rendu seul</option></select></div>
@@ -59,7 +59,7 @@
           </form>
           <div class="toolbar vfilters">
             <label class="input-ico">${icon("search")}<input class="input" name="q" type="search" placeholder="Titre, identifiant ou adresse" aria-label="Filtrer par texte"></label>
-            <select class="input" name="filter-channel" aria-label="Filtrer par chaîne"><option value="">Toutes les chaînes</option></select>
+            <select class="input" name="filter-channel" aria-label="Filtrer par style"><option value="">Tous les styles</option></select>
             <select class="input" name="filter-status" aria-label="Filtrer par statut"><option value="">Tous les statuts</option>
               ${Object.keys(STATUS_LABELS).map((k) => `<option value="${k}">${esc(STATUS_LABELS[k])}</option>`).join("")}</select>
             <span class="grow"></span><span class="muted" data-vcount></span>
@@ -87,7 +87,7 @@
 
   const skeletonRows = () => Array.from({ length: 3 }, () => `<div class="job vrow"><div><div class="skeleton skeleton-line"></div><div class="skeleton skeleton-line"></div></div></div>`).join("");
 
-  /* ---------- Chaines : selecteurs d'ajout et de filtre ---------- */
+  /* ---------- Styles : selecteurs d'ajout et de filtre ---------- */
   async function ensureChannels() {
     if (state.channelsAsked) return;
     state.channelsAsked = true;
@@ -95,7 +95,7 @@
       store.channels = await api("/api/channels");
     } catch (err) {
       state.channelsAsked = false;
-      toastError("Chaînes indisponibles", err);
+      toastError("Styles indisponibles", err);
       return;
     }
     paintChannelSelects();
@@ -108,8 +108,8 @@
     state.formChannels = key;
     const options = (first) => `<option value="">${first}</option>` + names.map((n) => `<option value="${esc(n)}">${esc(n)}</option>`).join("");
     const keep = (sel, html) => { const v = sel.value; sel.innerHTML = html; sel.value = v; };
-    keep($('[name="channel"]', state.root), options("Sans chaîne (config.toml)"));
-    keep($('[name="filter-channel"]', state.root), options("Toutes les chaînes"));
+    keep($('[name="channel"]', state.root), options("Sans style (config.toml)"));
+    keep($('[name="filter-channel"]', state.root), options("Tous les styles"));
   }
 
   /* ---------- Ajout par URL ---------- */
@@ -164,7 +164,7 @@
       ${videoThumb(video.video_id, video.platform_thumbnail)}
       <div style="min-width:0">
         <div class="job-title">${esc(video.title)}</div>
-        <div class="job-meta"><span class="mono">${esc(video.video_id)}</span>${video.channel ? `<span class="tag">${esc(video.channel)}</span>` : `<span class="muted">sans chaîne</span>`}${where}</div>
+        <div class="job-meta"><span class="mono">${esc(video.video_id)}</span>${video.channel ? `<span class="tag">${esc(video.channel)}</span>` : `<span class="muted">sans style</span>`}${where}</div>
         <div style="margin-top:10px">${segs(video)}</div>
         ${video.reason ? `<p class="reason ${video.status === "failed" ? "bad" : ""}">${esc(video.reason)}</p>` : ""}
       </div>
@@ -309,12 +309,12 @@
         <div style="min-width:0">
           <h2 class="vtitle">${esc(video.title)}</h2>
           ${video.title_reason ? `<p class="muted vsub">${esc(video.title_reason)}</p>` : ""}
-          <div class="job-meta"><span class="mono">${esc(video.video_id)}</span>${video.channel ? `<span class="tag">${esc(video.channel)}</span>` : `<span class="muted">sans chaîne</span>`}${video.source_url ? `<span class="mono">${esc(video.source_url)}</span>` : ""}${statusChip(video.status)}${video.rubric ? `<span class="muted">Grille : <span class="mono">${esc(video.rubric)}</span></span>` : ""}</div>
+          <div class="job-meta"><span class="mono">${esc(video.video_id)}</span>${video.channel ? `<span class="tag">${esc(video.channel)}</span>` : `<span class="muted">sans style</span>`}${video.source_url ? `<span class="mono">${esc(video.source_url)}</span>` : ""}${statusChip(video.status)}${video.rubric ? `<span class="muted">Grille : <span class="mono">${esc(video.rubric)}</span></span>` : ""}</div>
         </div>
         <div class="vactions">
           ${review ? `<a class="btn btn-primary" href="#/review/${enc}">${icon("sparkles")}Revoir les moments${(video.awaiting || []).length ? ` (${video.awaiting.length})` : ""}</a>` : ""}
           ${(video.clips || []).length ? `<a class="btn" href="#/clips/${enc}">${icon("clapperboard")}Voir les ${video.clips.length} clips</a>` : ""}
-          ${!video.channel && video.status !== "running" ? `<button type="button" class="btn" data-assign-channel="${esc(video.video_id)}">${icon("tv")}Attribuer une chaîne</button>` : ""}
+          ${!video.channel && video.status !== "running" ? `<button type="button" class="btn" data-assign-channel="${esc(video.video_id)}">${icon("tv")}Attribuer un style</button>` : ""}
           ${video.status === "running" ? `<button type="button" class="btn btn-bad" data-cancel-video>${icon("ban")}Annuler le traitement</button>` : ""}
           ${(video.status === "failed" || video.status === "queued") && !video.dismissed_at ? `<button type="button" class="btn" data-retry-video="${esc(video.video_id)}" data-from-step="${esc(video.current_step || "")}">${icon("rotate-ccw")}Relancer</button>
             <button type="button" class="btn btn-ghost" data-dismiss-video="${esc(video.video_id)}">Retirer</button>` : ""}

@@ -278,7 +278,7 @@ function dashMeasuresToolbar() {
   if (dashMeasures.channel && dashMeasures.channel !== DASH_NO_CHANNEL && !names.includes(dashMeasures.channel)) names.push(dashMeasures.channel);
   const opt = (value, label) => `<option value="${esc(value)}"${dashMeasures.channel === value ? " selected" : ""}>${esc(label)}</option>`;
   return `<div class="stats-toolbar">
-    <select class="input" data-measures-channel aria-label="Filtrer par chaîne">${opt("", "Toutes les chaînes")}${opt(DASH_NO_CHANNEL, "Sans chaîne")}${names.map((n) => opt(n, n)).join("")}</select>
+    <select class="input" data-measures-channel aria-label="Filtrer par style">${opt("", "Tous les styles")}${opt(DASH_NO_CHANNEL, "Sans style")}${names.map((n) => opt(n, n)).join("")}</select>
     <div class="seg stats-seg" role="group" aria-label="Période">${DASH_PRESETS.map(([id, label]) =>
       `<button type="button" data-measures-preset="${id}" class="${dashMeasures.preset === id ? "on" : ""}">${label}</button>`).join("")}</div>
     <div class="stats-range"><label>Du <input class="input" type="date" data-measures-since value="${esc(dashMeasures.since)}"></label>

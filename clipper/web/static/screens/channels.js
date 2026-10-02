@@ -1,4 +1,4 @@
-/* Ecran « Chaînes » (SPEC-c100 E5, SPEC-74e9 §1). Liste des chaînes (nom,
+/* Ecran « Styles » (SPEC-c100 E5, SPEC-74e9 §1). Liste des styles (nom,
    source, surveillance, mode, prochains créneaux) et formulaire d'un preset par
    sections. Le serveur fournit pour chaque section le preset brut (ce qui est
    redéfini), les valeurs effectives et les CONFIG_DEFAULTS commentés : un champ
@@ -10,9 +10,9 @@
 // Sections du formulaire ; « only » restreint une section aux clés qui
 // correspondent (le reste va dans « Autres réglages », replié).
 const CHAN_SECTIONS = [
-  { section: "channel", title: "Chaîne", sub: "Source, surveillance, mode et créneaux", open: true },
+  { section: "channel", title: "Style", sub: "Source, surveillance, mode et créneaux", open: true },
   { section: "reframe", title: "Agencement", sub: "Format du clip, webcam, jeu, zoom" },
-  { section: "render", title: "Titre, appel à l'abonnement et badge", sub: "Titre d'écran, carte de fin, badge de chaîne", only: /^(title_|hook_|cta_|badge_|part_|emoji_)/ },
+  { section: "render", title: "Titre, appel à l'abonnement et badge", sub: "Titre d'écran, carte de fin, badge de style", only: /^(title_|hook_|cta_|badge_|part_|emoji_)/ },
   { section: "subtitles", title: "Sous-titres", sub: "Police, couleurs, position" },
   { section: "moments", title: "Grille de notation et moments", sub: "Sélection des moments, grille et jury" },
 ];
@@ -22,7 +22,7 @@ const CHAN_MODES = [["review", "review (tu valides les moments)"], ["auto", "aut
 // Toute autre valeur est un chemin de fichier (« Fichier personnalisé »).
 const CHAN_RUBRICS = [["builtin", "Standard"], ["builtin:gaming", "Gaming"]];
 const CHAN_RUBRIC_CUSTOM = "custom";
-// Modèles proposés à la création d'une chaîne. « Standard » n'écrit rien de plus que [channel] ;
+// Modèles proposés à la création d'un style. « Standard » n'écrit rien de plus que [channel] ;
 // « Stream gaming » écrit la grille gaming et l'agencement stream (webcam en haut, jeu en bas).
 const CHAN_MODELS = [
   { id: "standard", label: "Standard", help: "Réglages par défaut de config.toml.", preset: {} },
@@ -32,7 +32,7 @@ const CHAN_MODELS = [
 const CHAN_STALE_MS = 4000;
 const CHAN_SLOTS_SHOWN = 3;
 
-// Comptes du carnet (écran Comptes) proposés pour relier un compte TikTok à la chaîne ;
+// Comptes du carnet (écran Comptes) proposés pour relier un compte TikTok au style ;
 // list = null quand GET /api/accounts est refusé (console ouverte à distance) : le message
 // d'erreur est alors affiché, jamais un champ libre de repli.
 const chAccounts = { list: null, error: "" };
@@ -60,7 +60,7 @@ function chLoadList() {
       }));
     } catch (err) {
       chUi.names = chUi.names || [];
-      toastError("Chaînes indisponibles", err);
+      toastError("Styles indisponibles", err);
     } finally {
       chUi.loading = null;
       chUi.at = Date.now();
@@ -86,7 +86,7 @@ function chCard(name) {
     return `<article class="panel ch-card chan-card" data-chan="${esc(name)}">${head}<div class="ch-body">
       <div><div class="ch-name">${esc(name)}</div></div>
       <p class="reason bad">Preset illisible : ${esc(err.message)}</p>
-      <div class="ch-foot"><a class="btn btn-sm grow" href="#/channels/${encodeURIComponent(name)}">${icon("sliders-horizontal")}Ouvrir</a></div></div></article>`;
+      <div class="ch-foot"><a class="btn btn-sm grow" href="#/styles/${encodeURIComponent(name)}">${icon("sliders-horizontal")}Ouvrir</a></div></div></article>`;
   }
   const c = detail.effective.channel;
   const info = chUi.slots[name];
@@ -108,9 +108,9 @@ function chCard(name) {
       <div class="ch-actions">
         <button type="button" class="btn btn-sm" data-chan-add-slot="${esc(name)}">${icon("calendar-days", "i-xs")}Ajouter un créneau</button>
         <button type="button" class="btn btn-sm" data-chan-account="${esc(name)}">${icon("user", "i-xs")}Compte TikTok${c.tiktok_account ? ` : ${esc(c.tiktok_account)}` : ""}</button>
-        <button type="button" class="btn btn-sm" data-chan-queue="${esc(name)}">${icon("plus", "i-xs")}Mettre une vidéo en file pour cette chaîne</button>
+        <button type="button" class="btn btn-sm" data-chan-queue="${esc(name)}">${icon("plus", "i-xs")}Mettre une vidéo en file pour ce style</button>
       </div>
-      <div class="ch-foot"><a class="btn btn-sm grow" href="#/channels/${encodeURIComponent(name)}">${icon("sliders-horizontal")}Éditer le preset</a></div>
+      <div class="ch-foot"><a class="btn btn-sm grow" href="#/styles/${encodeURIComponent(name)}">${icon("sliders-horizontal")}Éditer le preset</a></div>
     </div></article>`;
 }
 
@@ -123,7 +123,7 @@ function chPresetWithChannel(detail, key, value) {
   return preset;
 }
 
-/* Créneaux de la chaîne (ceux du preset, sinon les effectifs) plus le nouveau. */
+/* Créneaux du style (ceux du preset, sinon les effectifs) plus le nouveau. */
 function chSlotsWith(detail, day, time) {
   const current = (detail.raw.channel && detail.raw.channel.slots) || detail.effective.channel.slots || [];
   return [...current, { day, time }];
@@ -183,25 +183,25 @@ async function chOpenAccount(name) {
 
 function chListHtml() {
   const names = chUi.names || [];
-  const add = `<button type="button" class="btn btn-primary" data-chan-new>${icon("plus")}Nouvelle chaîne</button>`;
+  const add = `<button type="button" class="btn btn-primary" data-chan-new>${icon("plus")}Nouveau style</button>`;
   if (!names.length) {
-    return emptyState("tv", "Aucune chaîne", "Crée une chaîne, par exemple « ma_chaine », pour lui donner son agencement et ses créneaux.", add);
+    return emptyState("tv", "Aucun style", "Crée un style, par exemple « ma_chaine », pour lui donner son agencement et ses créneaux.", add);
   }
-  return `<div class="toolbar"><span class="muted">${names.length} chaîne${names.length > 1 ? "s" : ""}</span><span class="grow"></span>${add}</div>
+  return `<div class="toolbar"><span class="muted">${names.length} style${names.length > 1 ? "s" : ""}</span><span class="grow"></span>${add}</div>
     <div class="channels">${names.map(chCard).join("")}</div>`;
 }
 
 function chOpenNew() {
   openPanel("modal", `
-    <div class="modal-head"><h2>Nouvelle chaîne</h2><p class="muted" style="margin-top:4px">Le nom est celui du fichier presets/&lt;nom&gt;.toml : minuscules, chiffres, _ ou -, jamais renommé ensuite.</p></div>
+    <div class="modal-head"><h2>Nouveau style</h2><p class="muted" style="margin-top:4px">Le nom est celui du fichier presets/&lt;nom&gt;.toml : minuscules, chiffres, _ ou -, jamais renommé ensuite.</p></div>
     <form id="chan-new-form"><div class="modal-body">
       <div class="field"><label for="chan-new-name">Nom</label><input class="input mono" id="chan-new-name" name="name" required maxlength="40" placeholder="ma_chaine" autocomplete="off"><span class="field-error" id="chan-new-error" role="alert"></span></div>
-      <div class="field"><label for="chan-new-url">Adresse de la chaîne (YouTube ou Twitch, facultatif)</label><input class="input" id="chan-new-url" name="source_url" type="url" placeholder="https://…" autocomplete="off"></div>
+      <div class="field"><label for="chan-new-url">Adresse source (YouTube ou Twitch, facultatif)</label><input class="input" id="chan-new-url" name="source_url" type="url" placeholder="https://…" autocomplete="off"></div>
       <fieldset class="field chan-models"><legend>Modèle</legend>
         ${CHAN_MODELS.map((m, i) => `<label class="chan-model"><input type="radio" name="model" value="${m.id}"${i === 0 ? " checked" : ""}><span><b>${esc(m.label)}</b><span class="hint">${esc(m.help)}</span></span></label>`).join("")}
       </fieldset>
     </div>
-    <div class="modal-foot"><button type="button" class="btn btn-ghost" data-dismiss>Annuler</button><button type="submit" class="btn btn-primary">Créer la chaîne</button></div></form>`,
+    <div class="modal-foot"><button type="button" class="btn btn-ghost" data-dismiss>Annuler</button><button type="submit" class="btn btn-primary">Créer le style</button></div></form>`,
   (el) => {
     setTimeout(() => $("#chan-new-name", el).focus(), 60);
     $("#chan-new-form", el).onsubmit = async (e) => {
@@ -217,10 +217,10 @@ function chOpenNew() {
         return;
       }
       closeLayer();
-      toast({ kind: "ok", title: "Chaîne créée", body: name });
+      toast({ kind: "ok", title: "Style créé", body: name });
       chUi.at = 0;
       chUi.edit = null;
-      location.hash = `#/channels/${encodeURIComponent(name)}`;
+      location.hash = `#/styles/${encodeURIComponent(name)}`;
     };
   });
 }
@@ -300,7 +300,7 @@ function chAccountEditor(id, value, dis) {
     .concat(chAccounts.list.map((a) => `<option value="${esc(a.id)}"${a.id === value ? " selected" : ""}>${esc(a.label)}${a.platform ? ` (${esc(a.platform)})` : ""}</option>`))
     .concat(value && !known ? [`<option value="${esc(value)}" selected>${esc(value)} (compte inconnu)</option>`] : []);
   return `<select class="input" id="${id}" aria-label="Compte TikTok relié"${dis}>${options.join("")}</select>
-    <span class="hint">Compte TikTok relié à la chaîne, créé dans l'écran Comptes ; « Se connecter dans le navigateur » s'y trouve aussi.</span>`;
+    <span class="hint">Compte TikTok relié au style, créé dans l'écran Comptes ; « Se connecter dans le navigateur » s'y trouve aussi.</span>`;
 }
 
 function chControl(id, kind, value, locked, rubric) {
@@ -317,7 +317,7 @@ function chControl(id, kind, value, locked, rubric) {
   }
 }
 
-/* Les champs de [channel] (créneaux, compte TikTok, source, mode...) n'ont de sens que pour la chaîne : ils se modifient
+/* Les champs de [channel] (créneaux, compte TikTok, source, mode...) n'ont de sens que pour le style : ils se modifient
    directement, sans « redéfinir » (rien à hériter de config.toml). Le brouillon ne les reçoit qu'à la première modification. */
 const chIsDirect = (section) => section === "channel";
 
@@ -344,14 +344,14 @@ function chField(section, key, info, ed) {
 function chSectionHtml(spec, ed) {
   const docs = ed.detail.defaults[spec.section];
   const keys = Object.keys(docs);
-  // La grille de notation est tout en haut de la section Chaîne : pas répétée dans « moments ».
+  // La grille de notation est tout en haut de la section Style : pas répétée dans « moments ».
   const main = (spec.only ? keys.filter((k) => spec.only.test(k)) : keys).filter((k) => k !== "rubric_path");
   const rest = spec.only ? keys.filter((k) => !spec.only.test(k)) : [];
   const redefinedCount = Object.keys(ed.draft[spec.section] || {}).length;
   const open = spec.open || ed.open.has(spec.section) ? " open" : "";
   return `<details class="panel chan-sec" data-sec="${esc(spec.section)}"${open}>
     <summary><div><h3>${esc(spec.title)}</h3><span class="muted">${esc(spec.sub)}</span></div><span class="mono muted">[${esc(spec.section)}]</span>
-      <span class="chip ${chIsDirect(spec.section) ? "info" : redefinedCount ? "info" : "pending"} plain" data-count>${chIsDirect(spec.section) ? "propre à la chaîne" : redefinedCount ? `${redefinedCount} redéfini${redefinedCount > 1 ? "s" : ""}` : "hérité"}</span></summary>
+      <span class="chip ${chIsDirect(spec.section) ? "info" : redefinedCount ? "info" : "pending"} plain" data-count>${chIsDirect(spec.section) ? "propre au style" : redefinedCount ? `${redefinedCount} redéfini${redefinedCount > 1 ? "s" : ""}` : "hérité"}</span></summary>
     <p class="field-error chan-sec-error" data-sec-error role="alert"></p>
     ${spec.section === "subtitles" ? chSubsPreviewHtml(ed) : ""}
     <div class="chan-fields">${spec.section === "channel" ? chField("moments", "rubric_path", ed.detail.defaults.moments.rubric_path, ed) : ""}${main.map((k) => chField(spec.section, k, docs[k], ed)).join("")}</div>
@@ -362,13 +362,13 @@ function chSectionHtml(spec, ed) {
 function chEditHtml(ed) {
   const c = ed.detail.effective.channel;
   return `<div class="chan-edit">
-    <div class="toolbar"><a class="btn btn-sm btn-ghost" href="#/channels">${icon("chevron-left", "i-xs")}Toutes les chaînes</a>
+    <div class="toolbar"><a class="btn btn-sm btn-ghost" href="#/styles">${icon("chevron-left", "i-xs")}Tous les styles</a>
       <h2 class="chan-title">${esc(c.display_name)} <span class="mono muted">${esc(ed.name)}</span></h2><span class="grow"></span>
-      <a class="btn btn-sm" href="#/channels/${encodeURIComponent(ed.name)}/layout">${icon("layers", "i-xs")}Éditeur d'agencement</a>
+      <a class="btn btn-sm" href="#/styles/${encodeURIComponent(ed.name)}/layout">${icon("layers", "i-xs")}Éditeur d'agencement</a>
       <button type="button" class="btn btn-sm btn-bad" data-chan-delete>${icon("trash-2", "i-xs")}Supprimer</button>
       <button type="button" class="btn btn-primary" data-chan-save>Enregistrer</button></div>
     <p class="reason bad" data-form-error role="alert" hidden></p>
-    <p class="muted chan-intro">Les champs de « Chaîne » (source, mode, créneaux, compte TikTok) se modifient directement. Dans les autres sections, un champ grisé n'est pas redéfini : il prend la valeur de config.toml (ou le défaut du module) ; « redéfinir » le copie dans ce preset pour le modifier.</p>
+    <p class="muted chan-intro">Les champs de « Style » (source, mode, créneaux, compte TikTok) se modifient directement. Dans les autres sections, un champ grisé n'est pas redéfini : il prend la valeur de config.toml (ou le défaut du module) ; « redéfinir » le copie dans ce preset pour le modifier.</p>
     <div class="chan-sections">${CHAN_SECTIONS.map((s) => chSectionHtml(s, ed)).join("")}</div></div>`;
 }
 
@@ -468,7 +468,7 @@ async function chSave(root, ed) {
     chUi.details[ed.name] = ed.detail;
     chUi.at = 0;
     chClearErrors(root);
-    toast({ kind: "ok", title: "Chaîne enregistrée", body: ed.name });
+    toast({ kind: "ok", title: "Style enregistré", body: ed.name });
     CHAN_SECTIONS.forEach(({ section }) => $$(`.chan-field[data-section="${section}"]`, root).forEach((f) => chRepaintField(root, ed, section, f.dataset.key)));
   } catch (err) {
     chShowError(root, ed, err.message);
@@ -479,19 +479,19 @@ async function chSave(root, ed) {
 }
 
 async function chDelete(ed) {
-  if (!(await confirmDialog({ title: "Supprimer la chaîne ?", body: `Le preset ${ed.name} sera effacé. Les vidéos déjà traitées restent, mais ne seront plus rattachées à cette chaîne.`, confirmLabel: "Supprimer la chaîne" }))) return;
+  if (!(await confirmDialog({ title: "Supprimer le style ?", body: `Le preset ${ed.name} sera effacé. Les vidéos déjà traitées restent, mais ne seront plus rattachées à ce style.`, confirmLabel: "Supprimer le style" }))) return;
   try {
     await api(`/api/channels/${encodeURIComponent(ed.name)}?confirm=true`, { method: "DELETE" });
   } catch (err) {
     toastError("Suppression impossible", err);
     return;
   }
-  toast({ kind: "ok", title: "Chaîne supprimée", body: ed.name });
+  toast({ kind: "ok", title: "Style supprimé", body: ed.name });
   delete chUi.details[ed.name];
   delete chUi.slots[ed.name];
   chUi.at = 0;
   chUi.edit = null;
-  location.hash = "#/channels";
+  location.hash = "#/styles";
 }
 
 async function chSendLogo(root, ed, field) {
@@ -503,7 +503,7 @@ async function chSendLogo(root, ed, field) {
     const sent = await api(`/api/channels/${encodeURIComponent(ed.name)}/logo`, { method: "POST", body: form });
     (ed.draft.channel = ed.draft.channel || {}).logo = sent.logo;
     chRepaintField(root, ed, "channel", "logo");
-    toast({ kind: "ok", title: "Logo envoyé", body: `${sent.logo} : enregistre la chaîne pour l'appliquer.` });
+    toast({ kind: "ok", title: "Logo envoyé", body: `${sent.logo} : enregistre le style pour l'appliquer.` });
   } catch (err) {
     toastError("Envoi du logo impossible", err);
   }
@@ -581,7 +581,7 @@ async function chOpenEdit(body, name) {
   try {
     edit.detail = await api(`/api/channels/${encodeURIComponent(name)}`);
   } catch (err) {
-    if (chUi.edit === edit) body.innerHTML = emptyState("circle-alert", "Chaîne illisible", err.message);
+    if (chUi.edit === edit) body.innerHTML = emptyState("circle-alert", "Style illisible", err.message);
     edit.failed = true;
     return;
   }

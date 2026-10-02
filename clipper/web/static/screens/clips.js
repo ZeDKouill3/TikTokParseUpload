@@ -25,7 +25,7 @@ const clipsUi = { data: null, error: null, loading: null, dirty: false, at: 0, f
 /* Vidéo visée par l'adresse : #/clips/<video_id> (lien « Voir les N clips » de la fiche vidéo), sinon "". */
 const clipsHashVideo = () => decodeURIComponent((location.hash.replace(/^#\/?/, "").split("?")[0].split("/")[1] || ""));
 
-/* Clips affichés : statut, chaîne et vidéo choisis (chaque filtre vide = pas de filtre). L'ordre reçu (plus récents en haut) est gardé. */
+/* Clips affichés : statut, style et vidéo choisis (chaque filtre vide = pas de filtre). L'ordre reçu (plus récents en haut) est gardé. */
 function clipsFiltered(all, ui) {
   return all.filter((c) => (ui.filter === "all" || c.publish_status === ui.filter) && (!ui.channel || c.channel === ui.channel) && (!ui.video || c.video_id === ui.video));
 }
@@ -91,7 +91,7 @@ function clipsView(body) {
   const rest = filtered.length - clipsUi.shown;
   const more = rest > 0
     ? `<div class="row" style="justify-content:center;margin-top:24px"><button type="button" class="btn" data-clips-more>Afficher plus<span class="n">${esc(Math.min(rest, CLIPS_PAGE_SIZE))}</span></button></div>` : "";
-  const scoped = clipsFiltered(all, { filter: "all", channel: clipsUi.channel, video: clipsUi.video }); // les compteurs suivent les filtres vidéo et chaîne
+  const scoped = clipsFiltered(all, { filter: "all", channel: clipsUi.channel, video: clipsUi.video }); // les compteurs suivent les filtres vidéo et style
   const count = (k) => (k === "all" ? scoped.length : scoped.filter((c) => c.publish_status === k).length);
   const html = `
     ${clipsUi.error ? `<p class="reason bad">Actualisation impossible : ${esc(clipsUi.error.message || clipsUi.error)}</p>` : ""}
@@ -100,7 +100,7 @@ function clipsView(body) {
       <span class="grow"></span>
       <select class="input" id="clips-video" aria-label="Vidéo"><option value="">Toutes les vidéos</option>${videos.map((v) => `<option value="${esc(v)}"${v === clipsUi.video ? " selected" : ""}>${esc(v)}</option>`).join("")}</select>
       ${clipsUi.video ? `<button type="button" class="btn btn-xs" data-clear-video aria-label="Retirer le filtre vidéo">${icon("x", "i-xs")}Vidéo : ${esc(clipsUi.video)}</button>` : ""}
-      <select class="input" id="clips-channel" aria-label="Chaîne"><option value="">Toutes les chaînes</option>${channels.map((n) => `<option value="${esc(n)}"${n === clipsUi.channel ? " selected" : ""}>${esc(n)}</option>`).join("")}</select>
+      <select class="input" id="clips-channel" aria-label="Style"><option value="">Tous les styles</option>${channels.map((n) => `<option value="${esc(n)}"${n === clipsUi.channel ? " selected" : ""}>${esc(n)}</option>`).join("")}</select>
     </div>
     ${filtered.length ? `<div class="clips">${filtered.slice(0, clipsUi.shown).map(clipCard).join("")}</div>${more}` : clipsEmpty(all)}`;
   if (clipsUi.html === html && body.childElementCount) return; // rien de change : on garde les vignettes en place
@@ -179,7 +179,7 @@ function clipDrawerHtml(c) {
         ${lockHint}
         <div class="field" data-clip-account-field><label for="clip-account">Compte de publication</label>
           <select class="input" id="clip-account" data-clip-account><option value="">Chargement…</option></select>
-          <span class="hint" data-clip-account-hint>Prérempli avec le compte de la chaîne ; seuls les comptes « prêts à publier » (écran Comptes) sont proposés.</span></div>
+          <span class="hint" data-clip-account-hint>Prérempli avec le compte du style ; seuls les comptes « prêts à publier » (écran Comptes) sont proposés.</span></div>
         <div><button type="button" class="btn btn-xs" data-save-caption${locked ? " disabled" : ""}>${icon("check", "i-xs")}Enregistrer la description et les hashtags</button></div>
         <div class="field"><span class="field-label">Contrôle qualité</span>${clipQaBlock(c)}</div>
         <div class="field"><span class="field-label">Confiance du jury</span><div data-jury-confidence>${juryConfidenceHtml(c.jury_confidence, c.jury_judge_confidences)}</div></div>
@@ -197,7 +197,7 @@ function clipDrawerHtml(c) {
     </div>`;
 }
 
-/* Compte de publication (SPEC-00d1 R4) : les comptes prêts, préremplis avec celui de la chaîne. */
+/* Compte de publication (SPEC-00d1 R4) : les comptes prêts, préremplis avec celui du style. */
 async function clipFillAccounts(c, d) {
   const select = $("#clip-account", d), hint = $("[data-clip-account-hint]", d);
   try {
@@ -207,8 +207,8 @@ async function clipFillAccounts(c, d) {
     const options = ready.map((a) => `<option value="${esc(a.id)}">${esc(a.label || a.id)}</option>`);
     if (!known || !known.ready_to_publish) {
       const name = known ? (known.label || known.id) : "aucun";
-      options.unshift(`<option value="">Compte de la chaîne : ${esc(name)} (non prêt à publier)</option>`);
-      hint.textContent = out.default ? "Le compte de la chaîne n'est pas prêt à publier : le clip restera en attente tant qu'il ne l'est pas, ou choisis un autre compte." : "Cette chaîne n'a pas de compte (tiktok_account) : choisis un compte prêt.";
+      options.unshift(`<option value="">Compte du style : ${esc(name)} (non prêt à publier)</option>`);
+      hint.textContent = out.default ? "Le compte du style n'est pas prêt à publier : le clip restera en attente tant qu'il ne l'est pas, ou choisis un autre compte." : "Ce style n'a pas de compte (tiktok_account) : choisis un compte prêt.";
     }
     select.innerHTML = options.join("");
     if (known && known.ready_to_publish) select.value = known.id;
@@ -266,7 +266,7 @@ async function openClipDrawer(key) {
     // « Publier maintenant » ouvre le formulaire de l'ecran Publication, prerempli avec ce clip (SPEC-1ed3 R5)
     if (now) now.onclick = () => { closeLayer(); setTimeout(() => pubOpenForm({ video_id: c.video_id, clip_id: c.clip_id }), 340); };
     $("[data-approve]", d).onclick = async () => {
-      const chosen = $("#clip-account", d).value; // vide : le compte de la chaîne (peut ne pas être prêt : le clip attend)
+      const chosen = $("#clip-account", d).value; // vide : le compte du style (peut ne pas être prêt : le clip attend)
       try {
         await api(clipUrl(c, "/approve"), chosen ? jsonBody("POST", { account: chosen }) : { method: "POST" });
         closeLayer();

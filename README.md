@@ -26,7 +26,7 @@
 TikTok** :
 
 1. **Entrée** : une URL YouTube ou une VOD Twitch (live, podcast, reportage,
-   stream de jeu...), seule ou surveillée automatiquement par chaîne.
+   stream de jeu...), seule ou surveillée automatiquement par style.
 2. **Sélection** : la vidéo est transcrite, découpée en scènes, puis les
    moments forts sont choisis par un LLM noté selon une grille et un jury à
    cinq juges ; en mode `review`, tu acceptes, refuses ou ajustes chaque
@@ -66,7 +66,7 @@ Les 12 étapes, du téléchargement au clip prêt :
 ## La console en images
 
 Chaque capture existe en thème sombre et en thème clair (GitHub choisit selon
-ton thème). Toutes montrent des données de démonstration neutres : une chaîne
+ton thème). Toutes montrent des données de démonstration neutres : un style
 `ma_chaine`, un compte `mon_compte`, des titres inventés.
 
 ### Tableau de bord
@@ -87,8 +87,8 @@ publications, état du worker et coût LLM.
   <img src="docs/assets/readme/videos-light.webp" alt="Liste des vidéos avec leur statut et leur frise d'étapes" width="100%">
 </picture>
 
-La liste se filtre par chaîne, statut et texte ; l'ajout d'une vidéo se fait
-par URL avec le choix de la chaîne.
+La liste se filtre par style, statut et texte ; l'ajout d'une vidéo se fait
+par URL avec le choix du style.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/video-fiche-dark.webp">
@@ -128,11 +128,11 @@ hashtags et titre d'écran, d'approuver, de refuser ou de relancer le rendu.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/publication-dark.webp">
-  <img src="docs/assets/readme/publication-light.webp" alt="Publication : liste des publications en cours et calendrier hebdomadaire des créneaux de la chaîne" width="100%">
+  <img src="docs/assets/readme/publication-light.webp" alt="Publication : liste des publications en cours et calendrier hebdomadaire des créneaux du style" width="100%">
 </picture>
 
 À gauche, « Nouvelle publication » et les publications en cours ; à droite, le
-calendrier de la semaine avec les créneaux de la chaîne (clips planifiés,
+calendrier de la semaine avec les créneaux du style (clips planifiés,
 publiés, en échec). Un clip se publie maintenant ou à une date, sans créneau
 obligatoire.
 
@@ -179,9 +179,9 @@ toute seule.
   erreurs sans uniformiser les avis.
 - **Deux formats de recadrage** — `letterbox` (zoom fixe, défaut) et
   `stream` (facecam fixe agrandie + jeu, pour les VOD de streamers).
-- **Appel à l'abonnement optionnel** — pseudo de chaîne discret et carte de
-  fin « Abonne-toi ! », désactivé par défaut, activable par preset de chaîne.
-- **Console web en neuf écrans** — vidéos, revue, clips, chaînes, publication,
+- **Appel à l'abonnement optionnel** — pseudo d'affichage discret et carte de
+  fin « Abonne-toi ! », désactivé par défaut, activable par preset de style.
+- **Console web en neuf écrans** — vidéos, revue, clips, styles, publication,
   statistiques, comptes et réglages, avec progression en temps réel (voir
   [La console en images](#la-console-en-images)).
 - **Publication et statistiques TikTok** par un vrai Chrome (risques assumés,
@@ -246,12 +246,12 @@ Voir [`docs/GUIDE.md`](docs/GUIDE.md) pour le détail des commandes.
 Contrat de sortie complet (zones sûres TikTok, style des sous-titres...) :
 `SPEC-6a47` et `SPEC-3a88` dans `AGENTS.md`.
 
-## Chaînes, grille gaming et CTA abonnement
+## Styles, grille gaming et CTA abonnement
 
-Un fichier de config par chaîne (`presets/<nom>.toml`) active des réglages
+Un fichier de config par style (`presets/<nom>.toml`) active des réglages
 spécifiques sans toucher `config.toml` ; il se crée aussi dans l'écran
-**Chaînes** de la console (formulaire, éditeur d'agencement, aperçu des
-sous-titres). Exemple avec la chaîne neutre `ma_chaine` :
+**Styles** de la console (formulaire, éditeur d'agencement, aperçu des
+sous-titres). Exemple avec le style neutre `ma_chaine` :
 
 ```toml
 [channel]
@@ -308,10 +308,10 @@ moitié activé.
 `python -m clipper serve` lance la console (`http://127.0.0.1:8000`) et le
 worker qui traite une file de vidéos, une à la fois. Neuf écrans : Accueil,
 Vidéos, Revue des moments, Clips, Publication (nouvelle publication,
-calendrier de créneaux), Chaînes (presets en surcouche, éditeur d'agencement,
+calendrier de créneaux), Styles (presets en surcouche, éditeur d'agencement,
 aperçu des sous-titres), Statistiques (relevé de TikTok Studio par compte),
 Comptes (coffre de l'OS) et Réglages ; progression en temps réel, surveillance
-des VOD d'une chaîne, notifications du navigateur. La page est statique
+des VOD d'un style, notifications du navigateur. La page est statique
 (HTML/CSS/JS, sans étape de build) et ne fait aucun traitement vidéo, audio ou
 LLM. Les écrans sont montrés dans [La console en images](#la-console-en-images).
 
@@ -329,7 +329,7 @@ identifiant ni ton mot de passe : tu te connectes à la main, une fois, dans un
 **Chrome normal** (voir ci-dessous).
 
 1. **Relier un compte** — dans la console, écran **Comptes**, ajoute le compte
-   TikTok (libellé, plateforme) ; dans l'écran **Chaînes**, ouvre la chaîne et
+   TikTok (libellé, plateforme) ; dans l'écran **Styles**, ouvre le style et
    choisis ce compte dans `tiktok_account` (ou écris `tiktok_account = "<id>"`
    dans la table `[channel]` du preset). Un identifiant inconnu est refusé.
 2. **Se connecter une fois** — bouton **Se connecter dans le navigateur** du
@@ -359,7 +359,7 @@ laisse la main à l'utilisateur et remonte l'échec.
 ### Publication automatique (worker)
 
 Le worker (`python -m clipper worker`, lancé par `serve`) publie, une à la
-fois et un compte à la fois, les clips **dus** de `state/publish/<chaîne>.json`
+fois et un compte à la fois, les clips **dus** de `state/publish/<style>.json`
 (statut `scheduled`) avec le mp4, la légende et les hashtags du sidecar. Deux
 modes, réglés par `[tiktok] publish_mode` (ou par clip) :
 

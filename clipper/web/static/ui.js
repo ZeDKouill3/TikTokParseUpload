@@ -63,11 +63,11 @@ function toast(opts) {
 
 /* Erreur d'API : toast rouge portant le detail en francais envoyé par le serveur (T2). */
 function toastError(title, err) {
-  // 409 « la vidéo n'a pas de chaîne » (approbation, publication) : le choix de la chaîne se fait depuis l'erreur.
+  // 409 « la vidéo n'a pas de style » (approbation, publication) : le choix du style se fait depuis l'erreur.
   const needs = err && err.body && err.body.needs_channel;
   toast({
     kind: "bad", title, body: err && err.message ? err.message : String(err), ms: 7000,
-    action: needs ? { label: "Attribuer une chaîne", run: () => openAssignChannel(err.body.video_id, err.body.channels) } : null,
+    action: needs ? { label: "Attribuer un style", run: () => openAssignChannel(err.body.video_id, err.body.channels) } : null,
   });
 }
 
