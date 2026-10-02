@@ -916,7 +916,8 @@ def _pub_env(tmp_path, monkeypatch, *, tiktok_settings=None, account=ACCOUNT, ch
         _sections={
             "worker": {"queue_path": str(tmp_path / "state" / "queue.json")},
             "watch": {"presets_dir": str(presets), "base_config": str(tmp_path / "config.toml")},
-            "tiktok": tiktok_settings or {},
+            # relevé périodique actif dans ces tests (24 h) : le défaut réel est 0 = coupé (SPEC-47e2 R4)
+            "tiktok": {"stats_interval_h": 24, **(tiktok_settings or {})},
         })
 
 
@@ -1243,6 +1244,27 @@ def test_tick_fetches_the_stats_of_a_ready_account_then_waits_the_interval(tmp_p
 
     assert [c["account"] for c in fetcher.calls] == [ACCOUNT]  # une fois : le releve est recent
     assert callable(fetcher.calls[0]["on_tick"])  # le battement du worker continue pendant le releve
+
+
+def test_tick_never_fetches_stats_when_the_interval_is_zero(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch, tiktok_settings={"stats_interval_h": 0})
+    fetcher = FakeStatsFetcher(tmp_path)
+    w = _stats_worker(config, fetcher)
+
+    for _ in range(3):
+        w.tick()
+
+    assert fetcher.calls == []  # releve seulement a l'usage (SPEC-47e2 R4) : le worker ne releve jamais
+
+
+def test_a_negative_stats_interval_is_a_logged_error_and_no_fetch(tmp_path, monkeypatch, caplog):
+    config = _pub_env(tmp_path, monkeypatch, tiktok_settings={"stats_interval_h": -1})
+    fetcher = FakeStatsFetcher(tmp_path)
+
+    with caplog.at_level(logging.ERROR):
+        _stats_worker(config, fetcher).tick()
+
+    assert fetcher.calls == [] and "stats_interval_h" in caplog.text
 
 
 def test_tick_refetches_once_the_configured_interval_has_passed(tmp_path, monkeypatch):

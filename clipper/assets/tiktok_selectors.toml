@@ -187,6 +187,10 @@ engagement_card = "[data-tt*='Engagement'][data-tt*='Card']"
 page_text = "body"
 # Messages de TikTok quand un onglet n'a pas encore de chiffres : relevee « null » (jamais un 0 invente).
 unavailable = ["dès 100 vues", "en cours de traitement"]
+# Etat vide de la page Publications (compte sans aucun post). À VÉRIFIER EN RÉEL : sélecteur non connu, donc vide.
+# Vide = on n'invente rien : le relevé attend les lignes quelques secondes ([tiktok] stats_empty_wait_s) puis rend 0 post.
+# Renseigné = attendu en course avec les lignes (le relevé n'attend plus rien dès qu'il s'affiche).
+empty_state = ""
 # Faire defiler la liste des Publications pour charger les posts suivants : une lecture apres chaque defilement.
 scroll_script = "window.scrollTo(0, document.body.scrollHeight)"
 

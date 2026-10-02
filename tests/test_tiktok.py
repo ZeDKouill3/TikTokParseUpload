@@ -14,6 +14,7 @@ import tomllib
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -1078,7 +1079,8 @@ def test_no_selector_or_url_is_hardcoded_in_tiktok_py():
 
     def collect(node):
         if isinstance(node, str):
-            values.add(node)
+            if node:  # un selecteur pas encore verifie (« ») n'est pas un selecteur code en dur
+                values.add(node)
         elif isinstance(node, dict):
             for v in node.values():
                 collect(v)
@@ -1234,6 +1236,7 @@ class FakeStudio(FakePage):
         self.batches = batches or [[p.id for p in posts]]  # identifiants affiches apres 0, 1, 2... defilements
         self.scrolled, self.period, self.menu = 0, 7, False
         self.view = ("other", None)
+        self.timeouts: list[tuple[str, Any]] = []  # (selecteur, delai) de chaque attente
 
     def goto(self, url, **kwargs):
         super().goto(url)
@@ -1249,6 +1252,9 @@ class FakeStudio(FakePage):
             self.view = ("other", None)
 
     def _elements(self, selector):
+        row = _sel()["stats"]["row"]
+        if selector.startswith(row + ", "):  # lignes OU etat vide, attendus en course
+            return self._elements(row) + self._elements(selector[len(row) + 2:])
         sel, view, post = _sel(), *self.view
         stats, acc = sel["stats"], sel["account"]
         if selector == sel["modal"]["container"]:
@@ -1292,6 +1298,7 @@ class FakeStudio(FakePage):
 
     def wait_for_selector(self, selector, timeout=None, state=None):
         self.calls.append(("wait", selector))
+        self.timeouts.append((selector, timeout))
         found = self._elements(selector)
         if not found:
             raise TimeoutError(f"Timeout {timeout}ms exceeded waiting for {selector}")
@@ -1348,13 +1355,19 @@ class StatsEnv:
 
 def test_stats_settings_have_defaults_and_invalid_values_are_refused(tmp_path):
     d = tiktok.CONFIG_DEFAULTS
-    assert d["stats_interval_h"] == 24 and d["stats_dir"] == "state/stats/tiktok"
+    assert d["stats_interval_h"] == 0 and d["stats_dir"] == "state/stats/tiktok"  # SPEC-47e2 R4 : coupe par defaut
+    assert d["stats_stale_min"] == 60
     assert (d["stats_detail_days"], d["stats_detail_max"], d["stats_scroll_rounds"]) == (7, 50, 10)
-    for key, bad in (("stats_interval_h", 0), ("stats_interval_h", "24"), ("stats_interval_h", True),
+    for key, bad in (("stats_interval_h", -1), ("stats_interval_h", "24"), ("stats_interval_h", True),
+                     ("stats_stale_min", -1), ("stats_stale_min", "60"), ("stats_stale_min", True),
+                     ("stats_empty_wait_s", -1), ("stats_empty_wait_s", True),
                      ("stats_detail_days", -1), ("stats_detail_max", "50"), ("stats_scroll_rounds", True)):
         config = Config(mode="review", workspace_dir=tmp_path, output_dir=tmp_path, _sections={"tiktok": {key: bad}})
         with pytest.raises(tiktok.TikTokError, match=key):
             tiktok.get_settings(config)
+    for key, good in (("stats_interval_h", 0), ("stats_interval_h", 2.5), ("stats_stale_min", 0)):
+        config = Config(mode="review", workspace_dir=tmp_path, output_dir=tmp_path, _sections={"tiktok": {key: good}})
+        assert tiktok.get_settings(config)[key] == good  # 0 = coupe, ce n'est pas une erreur
 
 
 # -- (1) le releve : compte (3 periodes), liste des posts, chaque post
@@ -1481,13 +1494,76 @@ def test_the_list_is_scrolled_until_it_stops_growing(tmp_path, monkeypatch):
     assert len(scrolls) == 3  # deux defilements qui ajoutent un post, un troisieme qui ne change rien
 
 
-def test_scrolling_is_bounded_by_the_configured_rounds(tmp_path, monkeypatch):
+def test_a_list_of_three_batches_is_read_in_full(tmp_path, monkeypatch):
+    ids = [f"73000000000000{n:05d}" for n in range(55)]
+    env = StatsEnv(tmp_path, monkeypatch, [Post(i) for i in ids],
+                   batches=[ids[:20], ids[:40], ids])  # 20 + 20 + 15 posts apres 0, 1, 2 defilements
+
+    snapshot = env.fetch()
+
+    assert [p["post_id"] for p in snapshot["posts"]] == ids  # 55 posts lus, aucun perdu
+    assert len([c for c in env.page.calls if c[0] == "evaluate"]) == 3  # le 3e defilement ne change rien : fin
+
+
+def test_reaching_the_scroll_limit_is_a_logged_error_never_a_silently_truncated_list(tmp_path, monkeypatch, caplog):
     posts = [Post(ID_A), Post(ID_B), Post(ID_C)]
     env = StatsEnv(tmp_path, monkeypatch, posts, batches=[[ID_A], [ID_A, ID_B], [ID_A, ID_B, ID_C]],
                    settings={"stats_scroll_rounds": 1})
 
-    assert [p["post_id"] for p in env.fetch()["posts"]] == [ID_A, ID_B]
+    with caplog.at_level("ERROR"), pytest.raises(tiktok.TikTokStop) as stop:
+        env.fetch()
+
+    assert stop.value.code == "scroll_limit" and "stats_scroll_rounds" in stop.value.reason
+    assert "stats_scroll_rounds" in caplog.text  # journalisee
     assert len([c for c in env.page.calls if c[0] == "evaluate"]) == 1
+    assert env.files() == [p.name for p in env.folder.glob("*.error.json")]  # aucun releve tronque dans l'historique
+    assert tiktok.read_history("ma_chaine", config=env.config) == []
+    assert tiktok.read_error("ma_chaine", config=env.config)["code"] == "scroll_limit"
+
+
+def test_the_scroll_limit_is_not_reached_when_the_list_stops_growing_just_in_time(tmp_path, monkeypatch):
+    posts = [Post(ID_A), Post(ID_B)]
+    env = StatsEnv(tmp_path, monkeypatch, posts, batches=[[ID_A], [ID_A, ID_B]], settings={"stats_scroll_rounds": 2})
+
+    assert [p["post_id"] for p in env.fetch()["posts"]] == [ID_A, ID_B]
+
+
+# -- liste vide : compte neuf sans aucun post (SPEC-47e2 R7)
+
+
+def test_an_account_without_any_post_gives_zero_posts_quickly_and_no_error(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [])  # /tiktokstudio/content vide : aucune ligne
+
+    snapshot = env.fetch()
+
+    assert snapshot["posts"] == [] and snapshot["origin"] == "full"
+    assert tiktok.read_error("ma_chaine", config=env.config) is None
+    row_waits = [c for c in env.page.timeouts if c[0] == _sel()["stats"]["row"]]  # pas de selecteur d'etat vide
+    short = float(tiktok.CONFIG_DEFAULTS["stats_empty_wait_s"]) * 1000
+    assert row_waits and all(t is not None and t <= short < 30000 for _, t in row_waits)  # jamais les 30 s
+    assert [c for c in env.page.calls if c[0] == "evaluate"] == []  # rien a defiler
+    assert tiktok.list_videos("ma_chaine", config=env.config) == []
+
+
+def test_the_empty_state_selector_is_unverified_and_marked_so_and_a_set_one_is_raced_with_the_rows(tmp_path, monkeypatch):
+    text = SELECTORS.read_text(encoding="utf-8")
+    assert _sel()["stats"]["empty_state"] == ""  # pas de selecteur invente
+    assert "empty_state" in text and "À VÉRIFIER EN RÉEL" in text
+    empty = "[data-tt='EmptyState']"
+    selectors = _sel()
+    selectors["stats"] = {**selectors["stats"], "empty_state": empty}
+    env = StatsEnv(tmp_path, monkeypatch, [])
+    env.page.present.add(empty)
+
+    snapshot = env.fetch(selectors=selectors)
+
+    assert snapshot["posts"] == []
+    assert any(empty in c[0] for c in env.page.timeouts)  # attendu en course avec les lignes, pas apres 30 s
+
+
+def test_the_snapshot_of_an_account_with_posts_still_waits_for_the_rows_then_scrolls(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [Post(ID_A)])
+    assert [p["post_id"] for p in env.fetch()["posts"]] == [ID_A]
 
 
 def test_filled_metrics_are_read_by_label_and_converted(tmp_path, monkeypatch):
@@ -1952,16 +2028,6 @@ def test_a_later_successful_fetch_clears_the_error(tmp_path, monkeypatch):
     assert len(list(env.folder.glob("*.error.json"))) == 1  # l'echec reste dans l'historique
 
 
-def test_r4_no_post_row_after_the_delay_is_an_element_missing_stop(tmp_path, monkeypatch):
-    env = StatsEnv(tmp_path, monkeypatch, [])
-
-    with pytest.raises(tiktok.TikTokStop) as stop:
-        env.fetch()
-
-    assert stop.value.code == "element_missing" and "row" in stop.value.reason
-    assert tiktok.read_error("ma_chaine", config=env.config)["code"] == "element_missing"
-
-
 def test_a_stop_in_the_middle_of_the_posts_writes_no_partial_snapshot(tmp_path, monkeypatch):
     env = StatsEnv(tmp_path, monkeypatch, [Post(ID_A), Post(ID_B, cards=_cards(views="beaucoup"))])
 
@@ -1986,7 +2052,7 @@ def test_a_missing_chrome_during_the_fetch_is_recorded_and_raised(tmp_path, monk
 
 
 def test_stats_due_follows_the_interval_since_the_last_full_attempt_success_or_failure(tmp_path, monkeypatch):
-    env = StatsEnv(tmp_path, monkeypatch, [Post(ID_A)])
+    env = StatsEnv(tmp_path, monkeypatch, [Post(ID_A)], settings={"stats_interval_h": 24})
     assert tiktok.stats_due("ma_chaine", config=env.config, now=NOW)  # jamais releve
 
     env.fetch()
@@ -2002,9 +2068,106 @@ def test_stats_due_follows_the_interval_since_the_last_full_attempt_success_or_f
 
 
 def test_stats_due_ignores_opportunistic_snapshots(tmp_path, monkeypatch):
-    env = StatsEnv(tmp_path, monkeypatch, [])
+    env = StatsEnv(tmp_path, monkeypatch, [], settings={"stats_interval_h": 24})
     _seed_history(env, {**_full(1), "origin": "opportunistic", "overview": None})
     assert tiktok.stats_due("ma_chaine", config=env.config, now=datetime(2026, 10, 1, 13, 0, tzinfo=timezone.utc))
+
+
+# -- (4b) releve seulement a l'usage : periment a l'ouverture de l'ecran Statistiques (SPEC-47e2 R4)
+
+
+def test_stats_are_stale_when_never_fetched_or_older_than_stats_stale_min(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [Post(ID_A)])
+    assert tiktok.stats_stale("ma_chaine", config=env.config, now=NOW)  # jamais releve
+
+    env.fetch()
+    assert not tiktok.stats_stale("ma_chaine", config=env.config, now=NOW + timedelta(minutes=59))  # frais : rien
+    assert tiktok.stats_stale("ma_chaine", config=env.config, now=NOW + timedelta(minutes=60))  # perime : releve
+
+
+def test_stats_stale_min_zero_means_never_on_opening(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [Post(ID_A)], settings={"stats_stale_min": 0})
+    assert not tiktok.stats_stale("ma_chaine", config=env.config, now=NOW)  # meme jamais releve
+    env.fetch()
+    assert not tiktok.stats_stale("ma_chaine", config=env.config, now=NOW + timedelta(days=30))
+
+
+def test_stats_stale_follows_the_configured_minutes_and_ignores_opportunistic_snapshots(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [], settings={"stats_stale_min": 10})
+    _seed_history(env, {**_full(1), "origin": "opportunistic", "overview": None})
+    assert tiktok.stats_stale("ma_chaine", config=env.config, now=datetime(2026, 10, 1, 12, 5, tzinfo=timezone.utc))
+
+    _seed_history(env, _full(1))
+    assert not tiktok.stats_stale("ma_chaine", config=env.config, now=datetime(2026, 10, 1, 12, 9, tzinfo=timezone.utc))
+    assert tiktok.stats_stale("ma_chaine", config=env.config, now=datetime(2026, 10, 1, 12, 10, tzinfo=timezone.utc))
+
+
+def test_a_failed_attempt_is_not_retried_on_every_opening(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [Post(ID_A)])
+    env.page.present.add(_sel()["detect"]["captcha"][0])
+    with pytest.raises(tiktok.TikTokStop):
+        env.fetch()  # arret sur : le navigateur n'est pas rouvert a chaque ouverture de l'ecran
+    assert not tiktok.stats_stale("ma_chaine", config=env.config, now=NOW + timedelta(minutes=30))
+    assert tiktok.stats_stale("ma_chaine", config=env.config, now=NOW + timedelta(minutes=61))
+
+
+def test_the_worker_stats_interval_defaults_to_off(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [Post(ID_A)])
+    assert not tiktok.stats_due("ma_chaine", config=env.config, now=NOW)  # coupe par defaut, meme jamais releve
+    env.fetch()
+    assert not tiktok.stats_due("ma_chaine", config=env.config, now=NOW + timedelta(days=30))
+
+
+def test_the_stats_interval_of_zero_is_off_and_negative_is_an_error(tmp_path, monkeypatch):
+    off = StatsEnv(tmp_path / "a", monkeypatch, [], settings={"stats_interval_h": 0})
+    assert tiktok.get_settings(off.config)["stats_interval_h"] == 0
+    bad = Config(mode="review", workspace_dir=tmp_path, output_dir=tmp_path, _sections={"tiktok": {"stats_interval_h": -2}})
+    with pytest.raises(tiktok.TikTokError, match="stats_interval_h"):
+        tiktok.stats_due("ma_chaine", config=bad, now=NOW)
+
+
+# -- (4c) posts supprimes sur TikTok : absents du dernier releve complet (SPEC-47e2 R2 : l'historique reste)
+
+
+def test_a_post_missing_from_the_latest_full_snapshot_is_no_longer_listed_but_the_history_is_kept(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [])
+    _seed_history(env, _full(1, **{ID_A: {"views": 10}, ID_B: {"views": 20}}), _full(2, **{ID_A: {"views": 15}}))
+
+    videos = tiktok.list_videos("ma_chaine", config=env.config)
+
+    assert [v["post_id"] for v in videos] == [ID_A]  # b supprime : n'apparait plus
+    history = tiktok.read_history("ma_chaine", config=env.config)
+    assert [[p["post_id"] for p in s["posts"]] for s in history] == [[ID_A, ID_B], [ID_A]]  # rien d'efface
+    assert tiktok.deleted_post_ids(history) == {ID_B}
+    with pytest.raises(tiktok.TikTokError, match="introuvable"):
+        tiktok.video_detail("ma_chaine", ID_B, config=env.config)
+    assert tiktok.video_detail("ma_chaine", ID_A, config=env.config)["views"] == 15
+
+
+def test_every_post_is_listed_while_no_full_snapshot_exists_and_an_opportunistic_one_deletes_nothing(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [])
+    only_a = {**_full(2, **{ID_A: {"views": 15}}), "origin": "opportunistic", "overview": None}
+    _seed_history(env, {**_full(1, **{ID_A: {"views": 10}, ID_B: {"views": 20}}), "origin": "opportunistic", "overview": None}, only_a)
+    assert {v["post_id"] for v in tiktok.list_videos("ma_chaine", config=env.config)} == {ID_A, ID_B}  # pas de releve complet
+
+    _seed_history(env, _full(3, **{ID_A: {"views": 1}, ID_B: {"views": 2}}), {**only_a, "fetched_at": _full(4)["fetched_at"]})
+    assert {v["post_id"] for v in tiktok.list_videos("ma_chaine", config=env.config)} == {ID_A, ID_B}  # la page vue au passage est partielle
+
+
+def test_a_deleted_post_that_comes_back_in_a_later_full_snapshot_is_listed_again(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [])
+    _seed_history(env, _full(1, **{ID_A: {}, ID_B: {}}), _full(2, **{ID_A: {}}), _full(3, **{ID_A: {}, ID_B: {}}))
+    assert {v["post_id"] for v in tiktok.list_videos("ma_chaine", config=env.config)} == {ID_A, ID_B}
+
+
+def test_two_real_fetches_where_a_post_disappears(tmp_path, monkeypatch):
+    first = StatsEnv(tmp_path, monkeypatch, [Post(ID_A), Post(ID_B)])
+    first.fetch()
+    second = StatsEnv(tmp_path, monkeypatch, [Post(ID_A)])
+    second.fetch(now=NOW + timedelta(hours=1))
+
+    assert [v["post_id"] for v in tiktok.list_videos("ma_chaine", config=second.config)] == [ID_A]
+    assert len(tiktok.read_history("ma_chaine", config=second.config)) == 2
 
 
 # -- (5) releve opportuniste : la page Publications est deja affichee pour autre chose
@@ -2075,6 +2238,21 @@ def test_an_unreadable_value_on_the_page_is_not_a_stop_during_a_publication(tmp_
 
     assert result["state"] == "published" and _published_history(env) == []
     assert not list((tmp_path / "state").rglob("*.png")) and not list(tmp_path.rglob("captures"))  # pas de capture
+
+
+def test_a_history_write_failure_during_a_publication_never_fails_the_publication(tmp_path, monkeypatch, caplog):
+    env = _opportunistic_env(tmp_path, monkeypatch)
+
+    def full_disk(*args, **kwargs):
+        raise OSError("disque plein")
+
+    monkeypatch.setattr(tiktok, "append_snapshot", full_disk)
+
+    with caplog.at_level("WARNING"):
+        result = env.publish()
+
+    assert result["state"] == "published" and result["post_id"] == ID_A
+    assert "disque plein" in caplog.text  # dit dans le journal, jamais avale
 
 
 def test_no_row_displayed_means_no_snapshot(tmp_path, monkeypatch):
