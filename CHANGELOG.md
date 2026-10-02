@@ -1,34 +1,210 @@
 # Changelog
 
-Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/).
-Ce dépôt n'utilise pas (encore) de versionnage sémantique strict : la
-version 0.1.0 est une pré-version, avant tout tag ou publication.
+Toutes les évolutions notables de ce dépôt sont consignées ici. Format inspiré
+de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/). Depuis la 0.2.0,
+le dépôt suit le [versionnage sémantique](https://semver.org/lang/fr/) :
+`MAJEUR.MINEUR.CORRECTIF`, avec le plan de versions et les critères de la 1.0.0
+dans [`docs/versions.md`](docs/versions.md). Tant que la version reste en `0.x`,
+la configuration, les écrans et les fichiers d'état peuvent encore changer.
+Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ## [Non publié]
 
+## [0.2.0] - 2026-10-02
+
+Console web v2, publication et statistiques TikTok par navigateur, comptes
+rangés dans le coffre de l'OS, grille gaming et confiance du jury. Notes
+détaillées et marche à suivre pour migrer :
+[`docs/releases/v0.2.0.md`](docs/releases/v0.2.0.md).
+
 ### Ajouté
 
-- Publication TikTok par le worker (`clipper/tiktok.py`, SPEC-9225 R3-R6) : mode
-  immédiat ou programmé côté TikTok, arrêt sûr avec capture et bouton Réessayer,
-  plafonds par compte, sélecteurs dans `clipper/assets/tiktok_selectors.toml`.
-- Console de gestion web v2 (`python -m clipper serve`, `clipper/web/`) :
-  huit écrans (Accueil, Vidéos, Revue, Clips, Chaînes, Publication,
-  Statistiques, Réglages), temps réel par SSE avec repli sur polling,
-  utilisable sur téléphone (ADR-4f6e, SPEC-c100).
-- Worker séparé (`python -m clipper worker`, lancé par `serve`) : file
-  `state/queue.json`, une vidéo à la fois dans un processus enfant,
-  annulation, reprise au redémarrage.
-- Chaînes : presets `presets/<nom>.toml` en surcouche de `config.toml`,
-  éditeur d'agencement visuel, aperçu du style des sous-titres.
-- Surveillance des VOD d'une chaîne (`[channel] watch`) avec confirmation des
-  VOD en mode `review`, et publication par créneaux hebdomadaires
-  (`state/publish/`).
-- Accès distant : `serve --host` hors `127.0.0.1` exige `[web] token` (refus
-  de démarrer sinon) ; page de saisie du jeton, cookie, 401 sur `/api` et
-  `/media`. Réseau local seulement, pas de TLS.
+**Console web**
+
+- Console de gestion web v2 (`python -m clipper serve`, `clipper/web/`) en neuf
+  écrans : Tableau de bord, Vidéos, Revue, Clips, Publication, Chaînes,
+  Statistiques, Comptes et Réglages. Page statique sans étape de build,
+  temps réel par SSE avec repli sur interrogation toutes les 5 s,
+  utilisable sur téléphone, polices embarquées.
+- Écran Vidéos : liste filtrable, ajout par URL avec choix de la chaîne, fiche
+  avec la frise des 12 étapes (durées, progression, journal suivi en direct),
+  « relancer depuis cette étape », annulation.
+- Écran Revue : lecteur calé sur le moment, timeline aux bornes glissables,
+  justification du jury, raccourcis `A` / `R` / `J` / `K` / espace, « Annuler »
+  pendant 5 s ; le rendu n'est proposé que lorsque chaque moment a une décision.
+- Écran Clips : galerie 9:16, fiche du clip (QA, partie N/M), édition de la
+  description, des hashtags et du titre d'écran (avec nouveau rendu),
+  approuver / refuser, télécharger, copier.
+- Diagramme en étoile du jury par moment dans la fiche vidéo (étape Moments).
+- Accès distant par jeton : `serve --host` hors `127.0.0.1` exige `[web] token`
+  (refus de démarrer sinon) ; page de saisie du jeton, cookie, 401 sur `/api`
+  et `/media`. Réseau local seulement, pas de TLS.
 - Notifications du navigateur (permission demandée depuis un réglage local,
   jamais au chargement) sur `done`, `failed`, `awaiting_review`, `queued`.
-- `docs/GUIDE.md` : section « Console de gestion ».
+- Sortie console détaillée : `-v` (progression par étape, une ligne par appel
+  LLM, résumé final) et `-vv` (détail) ; relance ciblée d'étapes par
+  `--force-step` ; journal `workspace/<video_id>/events.jsonl`.
+
+**Chaînes**
+
+- Une chaîne = un preset `presets/<nom>.toml` fusionné clé par clé sur
+  `config.toml` (table `[channel]` : nom, source, surveillance, mode, créneaux,
+  fuseau, compte TikTok, logo), utilisable aussi par `--config`. `presets/`
+  est ignoré par git.
+- Écran Chaînes : création et édition par formulaire (valeurs héritées
+  visibles, erreurs de validation sous le champ), éditeur d'agencement visuel
+  (zones webcam, jeu, badge et sous-titres sur une image clé), aperçu du style
+  des sous-titres, choix de la grille de notation.
+- Surveillance des VOD d'une chaîne (`[channel] watch`) : mise en file
+  automatique en mode `auto`, VOD « à confirmer » sur le tableau de bord en
+  mode `review`.
+- Agencement stream `split` (`[reframe] stream_variant = "split"`, SPEC-76dc) :
+  webcam en haut, jeu en bas, badge de chaîne optionnel (logo et nom) à leur
+  jonction, titre d'écran désactivable (`[render] title_enabled`), style des
+  sous-titres réglable (police, couleurs, contour, ombre, position).
+
+**Comptes et coffre**
+
+- Écran Comptes : carnet local des comptes (libellé, plateforme, identifiant,
+  notes), boutons Copier, générateur de mot de passe (12 à 64 caractères).
+  Les mots de passe ne vont que dans le coffre de l'OS (`keyring`), jamais
+  dans un fichier.
+- Profil de navigateur par compte (`state/browser/<compte>/`), connexion
+  manuelle par `python -m clipper browser login <compte>` ou depuis l'écran
+  Comptes, état de connexion TikTok vérifié localement (jamais connecté,
+  connecté, session expirée).
+- Case « prêt à publier » calculée automatiquement : cochée quand la connexion
+  est vérifiée et qu'aucun arrêt (captcha, vérification) n'est en attente.
+
+**Publication TikTok**
+
+- Publication par pilotage d'un vrai Chrome (Playwright, `clipper/tiktok.py`,
+  `[tiktok]`) : immédiate ou programmée côté TikTok, avec lien du post
+  récupéré, arrêt sûr sur captcha ou page inattendue (capture d'écran, bouton
+  Réessayer), plafond de posts par jour et écart minimal par compte, délais
+  aléatoires entre actions. Repères de la page dans
+  `clipper/assets/tiktok_selectors.toml`.
+- Écran Publication : formulaire « Nouvelle publication » (clip, compte,
+  maintenant ou programmé, légende, visibilité, commentaires, réutilisation,
+  étiquette IA), calendrier hebdomadaire des créneaux, statut de chaque
+  entrée, « Déclarer publié (hors Clipper) ». Une vidéo sans chaîne reste
+  publiable.
+- Cookies YouTube lus depuis un profil de navigateur (`[download]
+  cookies_profile`) pour les vidéos qui exigent une connexion.
+- Test réel optionnel, publication privée sur un compte de test :
+  `CLIPPER_TIKTOK_REAL=1 pytest tests/integration/test_tiktok_real.py`.
+- Étude de cadence de publication : `docs/tiktok-cadence.md`.
+
+**Statistiques TikTok**
+
+- Écran Statistiques par compte, alimenté par TikTok Studio : vue d'ensemble
+  (7 / 28 / 60 jours, évolution, courbe par jour), liste des vidéos triable,
+  fiche de statistiques par vidéo, y compris les posts publiés hors Clipper.
+- Relevé à la demande et périodique par le worker (`[tiktok] stats_interval_h`),
+  historique horodaté sous `state/stats/tiktok/<compte>/` jamais écrasé ; une
+  valeur que TikTok n'affiche pas encore reste vide, jamais 0.
+
+**Jury et grille gaming**
+
+- Confiance de chaque juge (0 à 100) par candidat : un débat s'ouvre si une
+  confiance passe sous `[jury] debate_confidence_below` (40), la médiane est
+  pondérée par la confiance (plancher `min_confidence_weight`, 0,2).
+- Grille gaming embarquée : `[moments] rubric_path = "builtin:gaming"`, choisie
+  par chaîne (émotion pondérée en tête, clips de 30 à 90 s).
+
+**Worker et file**
+
+- Worker (`python -m clipper worker`, lancé par `serve`) : file
+  `state/queue.json`, une vidéo à la fois dans un processus enfant, annulation,
+  reprise au redémarrage, voyant « worker actif » dans la console ; il pilote
+  aussi la surveillance des VOD, la publication et le relevé des statistiques.
+- Dossier `state/` : tout l'état hors vidéo en fichiers JSON sous verrou
+  inter-processus (file, surveillance, publication, comptes, statistiques).
+
+**Documentation et outils**
+
+- `docs/GUIDE.md` : section « Console de gestion » ; `docs/versions.md` : plan
+  de versions et critères de la 1.0.0 ; `docs/benchmarks/whisper-modeles.md` :
+  banc `small` contre `large-v3-turbo`.
+- `tools/setup.ps1` vérifie aussi `playwright` et Google Chrome.
+- `clipper.gpu.vram_used_mb()` (mesure par `nvidia-smi`) affichée sur le
+  tableau de bord.
+
+### Modifié
+
+- **Format stream** (SPEC-8257) : le choix stream ou letterbox d'un clip se fait
+  sur la présence de la webcam elle-même (contenu non noir, bords retrouvés,
+  non figé) et non plus sur la détection du visage ; la localisation de la
+  facecam, une fois par vidéo, garde le visage comme indice avec un seuil plus
+  bas (`facecam_localize_min_share`, 0,1).
+- **Titre d'écran sobre** (SPEC-6a86) : sans emoji ni superlatif par défaut
+  (`[captions] screen_title_allow_emoji`, `screen_title_forbidden_words`) ;
+  la légende et l'accroche suivent la même sobriété (`caption_allow_emoji`).
+- **Sous-titres** : plus rien à l'écran pendant les silences.
+- **Jury** : chaque juge doit renvoyer sa confiance par candidat ; une réponse
+  sans confiance est invalide, comme tout champ manquant.
+- **Détection de scènes** : seules les plages de parole (marge
+  `speech_margin_seconds`) sont décodées ; elle exige désormais la
+  transcription faite.
+- **Rythme de publication** : défauts d'un compte neuf (`max_posts_per_day = 1`,
+  `min_gap_minutes = 480`) ; délais entre actions de 0,3 à 1 s ; vérification
+  de contenu de TikTok coupée par défaut (`[tiktok] content_check = "off"`,
+  `"wait"` pour l'attendre).
+- **Transcription** : modèle `small` conservé par défaut ; `large-v3-turbo`
+  (pic VRAM 3,29 Go) reste une option au cas par cas.
+- **`--config`** : le fichier passé est désormais un preset fusionné clé par clé
+  sur `config.toml` (qui doit exister) au lieu de le remplacer ; un preset de
+  la 0.1.0 continue de fonctionner.
+- **Configuration** : `config.toml` s'écrit depuis la console, validé avant
+  remplacement atomique ; nouvelles sections `[web]`, `[worker]`, `[watch]`,
+  `[publish]`, `[channel]`, `[browser]`, `[accounts]`, `[tiktok]`.
+- **Dépendances** : `playwright`, `keyring`, `tomli-w`, et `tzdata` sous
+  Windows ; `pytest-xdist` pour les tests (`-n 6` par défaut).
+- Le dépôt suit le versionnage sémantique (`docs/versions.md`).
+
+### Corrigé
+
+- Sous-titres : un jeton collé par apostrophe ou ponctuation isolée n'est plus
+  fusionné avec le mot précédent à travers un vrai silence.
+- Titre d'écran : le schéma JSON envoyé au LLM contredisait encore la règle
+  « sans emoji ».
+- Worker : `--config` placé avant la sous-commande est pris en compte, et un
+  processus enfant qui meurt n'efface plus la vidéo en silence.
+- Publication TikTok, corrigé après les premiers tests réels : fenêtres
+  connues fermées, menus déroulants ne sont plus pris pour des fenêtres,
+  vidéo privée (« Maintenant » grisé), cases de réglage cochées par clic,
+  suggestions de hashtags refermées, case désactivée par TikTok journalisée
+  et laissée, succès prouvé par la page Publications, privé et programmé
+  refusés avant d'ouvrir le navigateur.
+- Statistiques TikTok : repères réels de la page Publications (lignes des
+  posts, vues, likes, commentaires, visibilité, date) et du menu des périodes
+  de TikTok Studio.
+- Console, plusieurs séries de corrections : miniatures des clips et des
+  vidéos, erreurs affichées en clair (plus de `[object Object]`), compteurs,
+  voyant du worker, tri des vidéos, cache des fichiers statiques, échecs
+  actionnables, marges et libellés.
+
+### Sécurité
+
+- Accès distant refusé sans jeton, 401 sur `/api` et `/media` ; le jeton ne
+  se modifie pas depuis l'interface, seulement dans `config.toml`.
+- Mots de passe des comptes uniquement dans le coffre de l'OS : erreur
+  explicite plutôt que repli vers un fichier si aucun coffre sûr n'est
+  disponible ; jamais renvoyés par la liste, ni écrits dans un journal.
+- Routes `/api/accounts*` accessibles depuis le PC seulement (adresse de
+  bouclage et en-tête `Host` vérifiés, même avec un jeton valide).
+- Clipper ne saisit jamais ton identifiant ni ton mot de passe TikTok : la
+  connexion se fait à la main dans un Chrome normal ; captcha ou vérification
+  = arrêt immédiat, jamais de contournement.
+- Seuls les cookies YouTube et Google d'un profil sont exportés vers
+  `cookies.txt` ; `state/` et `presets/` sont ignorés par git.
+
+### Retiré
+
+- Aucune commande, route ni réglage de la 0.1.0 n'est retiré.
+- Ne s'appliquent plus : « aucune publication automatique sur TikTok » et
+  « surveillance d'une chaîne Twitch pas encore couverte » (limites de la
+  0.1.0).
 
 ## [0.1.0] - 2026-09-30
 
@@ -102,3 +278,7 @@ verticaux sous-titrés, en local.
   parole : un moment fort sans dialogue marquant peut être sous-noté.
 - Aucune publication automatique sur TikTok : le dépôt produit les clips
   et leurs métadonnées, la mise en ligne reste manuelle.
+
+[Non publié]: https://github.com/ZeDKouill3/TikTokParseUpload/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/ZeDKouill3/TikTokParseUpload/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/ZeDKouill3/TikTokParseUpload/releases/tag/v0.1.0

@@ -94,7 +94,7 @@ def test_readme_shows_the_project_logo():
 
 def test_readme_has_version_and_python_badges():
     text = _readme_text()
-    assert "0.1.0" in text
+    assert "0.2.0" in text
     assert "3.11" in text
 
 

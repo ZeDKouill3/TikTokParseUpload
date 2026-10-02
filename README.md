@@ -6,7 +6,7 @@
   Vidéo YouTube ou VOD Twitch → clips verticaux TikTok sous-titrés, prêts à publier.
 
   <p>
-    <img alt="Version" src="https://img.shields.io/badge/version-0.1.0%20pr%C3%A9--version-orange">
+    <img alt="Version" src="https://img.shields.io/badge/version-0.2.0%20pr%C3%A9--version-orange">
     <img alt="Python" src="https://img.shields.io/badge/python-3.11-blue">
     <img alt="Plateforme" src="https://img.shields.io/badge/plateforme-Windows-lightgrey">
     <img alt="GPU" src="https://img.shields.io/badge/GPU-CUDA%20optionnel-76b900">
@@ -15,7 +15,8 @@
 
 > ⚠️ **Pré-version.** Pas encore de garantie de stabilité de la ligne de
 > commande ni du format de configuration. Voir
-> [`docs/releases/v0.1.0.md`](docs/releases/v0.1.0.md).
+> [`docs/releases/v0.2.0.md`](docs/releases/v0.2.0.md) et le plan de versions
+> [`docs/versions.md`](docs/versions.md).
 
 ## Ce que ça fait
 
@@ -57,6 +58,11 @@ Les 12 étapes, du téléchargement au clip prêt :
   `stream` (facecam fixe agrandie + jeu, pour les VOD de streamers).
 - **Appel à l'abonnement optionnel** — pseudo de chaîne discret et carte de
   fin « Abonne-toi ! », désactivé par défaut, activable par preset de chaîne.
+- **Console web en neuf écrans** — vidéos, revue, clips, chaînes, publication,
+  statistiques, comptes et réglages, avec progression en temps réel.
+- **Publication et statistiques TikTok** par un vrai Chrome (risques assumés,
+  voir [Publier sur TikTok](#publier-sur-tiktok)), comptes rangés dans le
+  coffre de l'OS.
 - **Tout tourne sur CPU** si besoin (`clipper.gpu` détecte CUDA
   automatiquement, jamais codé en dur), un seul modèle lourd en VRAM à la
   fois.
@@ -80,8 +86,8 @@ Python 3.11, ffmpeg, `claude`, `ank`, GPU optionnel, Google Chrome pour
 [publier sur TikTok](#publier-sur-tiktok)).
 
 Depuis la release (sans cloner le dépôt) : télécharge le `.whl` de la
-[dernière release](docs/releases/v0.1.0.md), `uv pip install
-clipper-0.1.0-py3-none-any.whl` puis `clipper init` (écrit `config.toml` et
+[dernière release](docs/releases/v0.2.0.md), `uv pip install
+clipper-0.2.0-py3-none-any.whl` puis `clipper init` (écrit `config.toml` et
 `rubric.toml` — la grille par défaut, embarquée dans la wheel — dans le
 dossier courant). La commande `clipper` s'ajoute à `python -m clipper`.
 
@@ -152,10 +158,11 @@ moitié activé.
 ## Interface web : Console de gestion web (v2)
 
 `python -m clipper serve` lance la console (`http://127.0.0.1:8000`) et le
-worker qui traite une file de vidéos, une à la fois. Huit écrans : Accueil,
-Vidéos, Revue des moments, Clips, Chaînes (presets en surcouche, éditeur
-d'agencement, aperçu des sous-titres), Publication (calendrier de créneaux),
-Statistiques et Réglages ; progression en temps réel, surveillance des VOD
+worker qui traite une file de vidéos, une à la fois. Neuf écrans : Accueil,
+Vidéos, Revue des moments, Clips, Publication (nouvelle publication,
+calendrier de créneaux), Chaînes (presets en surcouche, éditeur d'agencement,
+aperçu des sous-titres), Statistiques (relevé de TikTok Studio par compte),
+Comptes (coffre de l'OS) et Réglages ; progression en temps réel, surveillance des VOD
 d'une chaîne, notifications du navigateur. La page est statique (HTML/CSS/JS,
 sans étape de build) et ne fait aucun traitement vidéo, audio ou LLM.
 
@@ -228,8 +235,7 @@ publie en privé sur un compte de test.
 
 Détails du pilotage de TikTok Studio :
 
-- la légende (pré-remplie du nom du fichier) est vidée puis tapée touche par
-  touche ;
+- la légende (pré-remplie du nom du fichier) est vidée puis insérée d'un coup ;
 - en mode `scheduled`, la date et l'heure se règlent par les sélecteurs de
   TikTok (calendrier, flèches de mois, liste des heures) ; les minutes sont
   arrondies au pas proposé par TikTok (journalisé, noté dans l'entrée) ;
@@ -305,6 +311,10 @@ commentaire.
 - [`AGENTS.md`](AGENTS.md) — conventions du dépôt et décisions ratifiées
   (ADR/SPEC), pour qui contribue au code.
 - [`CHANGELOG.md`](CHANGELOG.md) — historique des versions.
+- [`docs/versions.md`](docs/versions.md) — plan de versions et critères de la
+  1.0.0.
+- [`docs/releases/v0.2.0.md`](docs/releases/v0.2.0.md) — notes de la
+  pré-version 0.2.0 (mise à jour depuis la 0.1.0, avertissements).
 - [`docs/releases/v0.1.0.md`](docs/releases/v0.1.0.md) — notes de la
   pré-version 0.1.0.
 
