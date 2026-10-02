@@ -5,7 +5,7 @@ slug: statistiques-tableau-de-bord-tiktok-par-compte-u
 title: "Statistiques : tableau de bord TikTok par compte, uniquement à partir du relevé de TikTok Studio"
 created: 2026-10-01T22:23:45Z
 author: nicoc@zedk_ordi
-status: accepted
+status: superseded
 scope:
   - clipper/tiktok.py
   - clipper/assets/tiktok_selectors.toml
@@ -17,7 +17,7 @@ verified:
   - by: nicoc@zedk_ordi
     at: 2026-10-01T22:24:08Z
 schema: 4
-version: 2
+version: 3
 ---
 
 ## Objet
