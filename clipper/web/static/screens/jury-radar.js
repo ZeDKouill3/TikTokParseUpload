@@ -90,11 +90,11 @@ function jrTable(data, moment, rnd) {
   return `<div class="jr-table-wrap"><table class="jr-table"><thead>${head}</thead><tbody>${rows}</tbody></table></div>`;
 }
 
-const JR_KIND_LABEL = { retenu: "Retenu", exploration: "Exploration", score: "Sous le seuil", plafond: "Plafond par heure", veto: "Veto", autre: "Rejeté" };
+const JR_KIND_LABEL = { retenu: "Retenu", decoupage: "Écarté au découpage", exploration: "Exploration", score: "Sous le seuil", plafond: "Plafond par heure", veto: "Veto", autre: "Rejeté" };
 
 function jrRow(m, selected) {
-  const tone = m.retained ? "ok" : m.reason_kind === "veto" ? "bad" : "pending";
-  return `<button type="button" class="jr-item${m.key === selected ? " sel" : ""}" data-jr-pick="${jrEsc(m.key)}" aria-pressed="${m.key === selected}">`
+  const tone = m.reason_kind === "decoupage" ? "warn" : m.retained ? "ok" : m.reason_kind === "veto" ? "bad" : "pending";
+  return `<button type="button" class="jr-item${m.key === selected ? " sel" : ""}" data-jr-pick="${jrEsc(m.key)}" aria-pressed="${m.key === selected}"${m.cut_rejected ? ` title="${jrEsc(`Retenu par le jury, écarté au découpage : ${m.cut_rejected}`)}"` : ""}>`
     + `<span class="mono">${jrTime(m.start)}–${jrTime(m.end)}</span><span class="jr-item-hook">${jrEsc(m.hook_text || "sans phrase d'accroche")}</span>`
     + `<span class="jr-item-score">${m.final_score != null ? jrEsc(jrNum(m.final_score)) : "–"}</span><span class="chip ${tone} plain">${jrEsc(JR_KIND_LABEL[m.reason_kind] || m.reason_kind)}</span></button>`;
 }
@@ -108,7 +108,8 @@ function juryPanelHtml(data, ui) {
     const moment = data.moments.find((m) => m.key === ui.key) || data.moments[0];
     const ri = jrRoundIndex(moment, ui.round);
     const rnd = moment.rounds[ri];
-    const kept = data.moments.filter((m) => m.retained);
+    const kept = data.moments.filter((m) => m.retained && !m.cut_rejected);
+    const cut = data.moments.filter((m) => m.cut_rejected);
     const rest = data.moments.filter((m) => !m.retained);
     const toggle = moment.debated && moment.rounds.length > 1
       ? `<div class="seg jr-toggle" role="group" aria-label="Tour du jury">${moment.rounds.map((r, i) => `<button type="button" class="${i === ri ? "on" : ""}" data-jr-round="${i}" aria-pressed="${i === ri}">${i === 0 ? "Avant débat" : "Après débat"}</button>`).join("")}</div>`
@@ -118,6 +119,7 @@ function juryPanelHtml(data, ui) {
     return `<div class="jr">
       <div class="jr-list" role="group" aria-label="Moments notés par le jury">
         <div class="jr-group">Retenus <span class="muted">${kept.length}</span></div>${kept.map((m) => jrRow(m, moment.key)).join("") || `<p class="muted">Aucun.</p>`}
+        ${cut.length ? `<div class="jr-group">Retenus, écartés au découpage <span class="muted">${cut.length}</span></div>${cut.map((m) => jrRow(m, moment.key)).join("")}` : ""}
         <div class="jr-group">Non retenus <span class="muted">${rest.length}</span></div>${rest.map((m) => jrRow(m, moment.key)).join("") || `<p class="muted">Aucun.</p>`}
       </div>
       <div class="jr-main">
@@ -127,7 +129,7 @@ function juryPanelHtml(data, ui) {
         <dl class="kv jr-facts">
           <dt>Score final</dt><dd>${moment.final_score != null ? `<b>${jrEsc(jrNum(moment.final_score))}</b>` : "aucun (rejeté avant le score final)"}${moment.confidence != null ? ` · confiance du jury ${jrEsc(moment.confidence)} %` : ""}</dd>
           <dt>Seuil</dt><dd>${data.threshold != null ? jrEsc(data.threshold) : "inconnu : rubric.min_score absent de moments.json"}</dd>
-          <dt>${moment.retained ? "Retenu" : "Rejeté"}</dt><dd>${jrEsc(moment.reason)}</dd>
+          <dt>${moment.cut_rejected ? "Retenu puis écarté" : moment.retained ? "Retenu" : "Rejeté"}</dt><dd>${moment.cut_rejected ? `Retenu par le jury, écarté au découpage : ${jrEsc(moment.cut_rejected)}` : jrEsc(moment.reason)}</dd>
           ${moment.justification ? `<dt>Justification</dt><dd>${jrEsc(moment.justification)}</dd>` : ""}
           ${moment.hook_text ? `<dt>Phrase d'accroche</dt><dd>${jrEsc(moment.hook_text)}</dd>` : ""}
         </dl>

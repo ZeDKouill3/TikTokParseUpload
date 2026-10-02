@@ -6295,3 +6295,93 @@ def test_stats_css_carries_the_mockup_layout():
                      ".ptable", ".thumb-p", ".figs", ".src-row", ".poster-big", ".video-sheet", ".dlinks", ".sort-m"):
         assert selector in css, selector
     assert "@media (max-width: 720px)" in css and ".ptable thead { display: none; }" in css  # liste en cartes sur mobile
+
+
+# --------------------------------------------------------------------------
+# Radar : « retenu puis écarté au découpage » + calendrier lisible (TASK-fc6f)
+# --------------------------------------------------------------------------
+
+_CUT_REASON = "duree 41.8 s : ni clip unique (60-120 s) ni 2 a 12 parties"
+
+
+def _write_parts_rejected(tmp_path, rejected):
+    _write_json(tmp_path / "workspace" / JURY_VID / "parts.json",
+                {"video_id": JURY_VID, "moments": [], "rejected": rejected})
+
+
+def test_api_jury_marks_the_moment_rejected_by_parts_with_its_reason(tmp_path, isolated_cwd):
+    _write_jury_moments(tmp_path)
+    _write_parts_rejected(tmp_path, [{"id": 0, "start": 10.0, "end": 40.0, "duration": 30.0, "reason": _CUT_REASON}])
+
+    moments = _jury(tmp_path)["moments"]
+
+    assert moments[0]["cut_rejected"] == _CUT_REASON
+    assert moments[0]["reason_kind"] == "decoupage"
+    assert moments[0]["retained"] is True                      # retenu par le jury : le fait reste visible
+    assert "cut_rejected" not in moments[1] and moments[1]["reason_kind"] == "exploration"
+
+
+def test_api_jury_without_parts_json_is_unchanged(tmp_path, isolated_cwd):
+    _write_jury_moments(tmp_path)
+
+    moments = _jury(tmp_path)["moments"]
+
+    assert all("cut_rejected" not in m for m in moments)      # sortie inchangée : aucune clé nouvelle
+    assert [m["reason_kind"] for m in moments] == ["retenu", "exploration", "score", "plafond", "veto"]
+
+
+def test_api_jury_ignores_parts_rejected_ids_of_moments_not_retained(tmp_path, isolated_cwd):
+    _write_jury_moments(tmp_path)
+    _write_parts_rejected(tmp_path, [{"id": 99, "start": 0, "end": 1, "duration": 1, "reason": "x"}])
+
+    assert all("cut_rejected" not in m for m in _jury(tmp_path)["moments"])
+
+
+def test_api_jury_unreadable_parts_json_is_an_explicit_error(tmp_path, isolated_cwd):
+    _write_jury_moments(tmp_path)
+    path = tmp_path / "workspace" / JURY_VID / "parts.json"
+    path.write_text("{pas du json", encoding="utf-8")
+
+    resp = client(tmp_path).get(f"/api/videos/{JURY_VID}/jury")
+
+    assert resp.status_code == 500 and "parts.json" in resp.json()["detail"]
+
+
+def test_radar_panel_shows_cut_rejected_distinct_from_a_real_retained(tmp_path, isolated_cwd):
+    _write_jury_moments(tmp_path)
+    _write_parts_rejected(tmp_path, [{"id": 0, "start": 10.0, "end": 40.0, "duration": 30.0, "reason": _CUT_REASON}])
+    payload = _jury(tmp_path)
+    js = _radar_js()
+    assert "écarté au découpage" in js
+
+    script = js + (
+        "\nconst data = JSON.parse(process.argv[1]);"
+        "\nprocess.stdout.write(juryPanelHtml(data, { key: data.moments[0].key, round: null }));"
+    )
+    html = _node_run(script, json.dumps(payload))
+
+    assert "Retenu par le jury, écarté au découpage" in html
+    assert _CUT_REASON in html
+    assert html.count("écarté au découpage") >= 2              # liste et détail
+
+
+def test_calendar_card_has_full_title_attribute_and_two_line_clamp():
+    js = (STATIC / "screens" / "publish.js").read_text(encoding="utf-8")
+    css = (STATIC / "style.css").read_text(encoding="utf-8")
+
+    card = js[js.index("function pubPost"):js.index("function pubCalendar")]
+    assert 'title="${esc(pubTitle(c))}"' in card               # titre complet en info-bulle sur la carte
+    import re
+    rules = re.findall(r"\.cal \.post \.pt\s*\{([^}]*)\}", css)
+    assert rules, "règle .cal .post .pt absente de style.css"
+    assert "-webkit-line-clamp: 2" in rules[-1] and "overflow-wrap" in rules[-1]
+    assert "line-clamp: 2" in rules[-1].replace("-webkit-line-clamp", "")
+
+
+def test_calendar_card_layout_gives_the_title_the_width():
+    css = (STATIC / "style.css").read_text(encoding="utf-8")
+    import re
+    post = " ".join(re.findall(r"\.cal \.post\s*\{([^}]*)\}", css))
+    assert "flex-wrap: wrap" in post                           # la pastille de compte passe à la ligne
+    assert re.search(r"\.cal \.post \.mini-clip\s*\{[^}]*display: none", css)  # pas de miniature de 18 px
+    assert re.search(r"\.cal \.post \.pt\s*\{[^}]*flex: 1 1 100%", css)
