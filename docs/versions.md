@@ -12,7 +12,7 @@ Numérotation : versionnage sémantique, `MAJEUR.MINEUR.CORRECTIF`.
 |---|---|---|
 | v0.1.0 | Pipeline vidéo longue -> clips 9:16 (letterbox, stream), jury, sous-titres, première console | publiée |
 | v0.2.0 | Console web v2 en neuf écrans (tableau de bord, vidéos, revue, clips, publication, chaînes, statistiques, comptes, réglages), chaînes par preset avec surveillance des VOD, agencement stream `split`, comptes dans le coffre de l'OS, publication TikTok par navigateur (immédiate ou programmée, testée en réel), statistiques TikTok par compte, jury à confiance pondérée, grille gaming, worker et file ([notes](releases/v0.2.0.md)) | publiée |
-| v0.3.0 | À définir : le contenu prévu au départ (publication pilotée depuis l'écran Publication, « prêt à publier » automatique, corrections du sixième tour de la console) est livré dans la 0.2.0 | à planifier |
+| v0.3.0 | Prête pour l'usage réel : l'étape `parts` découpe avec la grille de `moments` (clé `[parts] rubric_path` retirée), statistiques TikTok relevées seulement à l'usage (`stats_interval_h = 0`), liste Publications lue en entier, console filtrée par compte TikTok (« Chaîne » devient « Style »), radar du jury et calendrier plus lisibles, lanceur `Clipper.bat`, README refait ([notes](releases/v0.3.0.md)) | publiée |
 | v0.4.0 | Mode auto de bout en bout : vidéo en entrée, clips publiés sans intervention | après une semaine d'usage réel |
 | v1.0.0 | Stable | quand tous les critères ci-dessous sont tenus |
 
