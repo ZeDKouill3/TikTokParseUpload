@@ -1173,7 +1173,10 @@ def test_in_progress_is_cleared_on_success_and_failure(isolated_cwd):
     assert failed["in_progress_since"] is None
     publish.retry("vid1", "03", "ma_chaine")
     publish.mark_in_progress("vid1", "03", "ma_chaine", now=NOW)
-    done = publish.mark_published("vid1", "03", "ma_chaine", now=NOW)
+    # succes du worker : il enregistre son post (tiktok_state) ; une declaration a la main est refusee pendant
+    # le pilotage (revue fable-publication I2)
+    done = publish.mark_published("vid1", "03", "ma_chaine", now=NOW, tiktok_state="published",
+                                  publish_at=NOW.isoformat(), account="compte1")
     assert done["in_progress_since"] is None
 
 
@@ -2045,3 +2048,96 @@ def test_create_series_lists_and_logs_the_entries_the_worker_already_took_and_co
     assert "vid1/a" in caplog.text  # journalise (ADR-ad2e), pas avale en silence
     entries = {e["clip_id"]: e for e in _read_state(isolated_cwd, "ma_chaine")}
     assert entries["a"]["in_progress_since"] is not None  # l'entree prise par le worker reste intacte, pas annulee
+
+
+# --------------------------------------------------------------------------
+# Revue Fable (TASK-4c3d) : fable-comptes 3, 4, 6 ; fable-publication I2, I3, M4
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("form", [
+    {"manual": True},
+    {"publish_mode": "immediate"},
+    {"post_options": {"visibility": "friends", "allow_comments": False}},
+])
+def test_approve_refuses_an_entry_carrying_form_settings_and_writes_nothing(isolated_cwd, form):
+    """fable-comptes 3 / fable-publication I3 : « Approuver » reconstruisait l'entree et jetait en silence le mode,
+    la visibilite... d'une publication du formulaire ; elle se reprend par « Réessayer » ou « Modifier »."""
+    from clipper import publish
+
+    entry = _seed_full_entry(isolated_cwd, "ma_chaine", "failed", error="Chrome introuvable",
+                             slot_at="2026-10-02T18:00:00+00:00", service="tiktok", **form)
+
+    with pytest.raises(publish.PublishError, match="Réessayer"):
+        publish.approve("vid1", "03", "ma_chaine", account=_ACCOUNT, schedule=_MON9, now=_MON)
+
+    assert _read_state(isolated_cwd, "ma_chaine") == [entry]
+
+
+def test_approve_part_two_never_gets_a_slot_before_part_one(isolated_cwd):
+    """fable-comptes 6 : la partie 2 prenait le prochain creneau libre depuis « maintenant », avant la partie 1."""
+    from clipper import publish
+
+    _series(isolated_cwd)
+    part_one_at = "2026-10-08T12:00:00+02:00"  # jeudi : le lundi 5 etait pris par un clip annule depuis
+    _state_file(isolated_cwd, "ma_chaine").parent.mkdir(parents=True, exist_ok=True)
+    _state_file(isolated_cwd, "ma_chaine").write_text(json.dumps([{
+        "video_id": "vid1", "clip_id": "03-p1", "series_id": "vid1:03", "part": 1, "status": "scheduled",
+        "slot_at": part_one_at, "decided_at": None, "published_at": None, "error": None, "account": _ACCOUNT,
+    }]), encoding="utf-8")
+    schedule = {"slots": [{"day": "mon", "time": "18:30"}, {"day": "thu", "time": "12:00"}], "timezone": "Europe/Paris"}
+
+    entry = publish.approve("vid1", "03-p2", "ma_chaine", now=datetime(2026, 10, 3, 10, tzinfo=timezone.utc),
+                            account=_ACCOUNT, schedule=schedule)
+
+    assert datetime.fromisoformat(entry["slot_at"]) > datetime.fromisoformat(part_one_at)
+    assert datetime.fromisoformat(entry["slot_at"]) == datetime(2026, 10, 12, 18, 30, tzinfo=ZoneInfo("Europe/Paris"))
+
+
+def test_a_deleted_style_still_counts_for_the_account_and_the_publications(isolated_cwd):
+    """fable-comptes 4 : le fichier de publication d'un style supprime n'etait plus lu par personne : plafonds du
+    compte sous-comptes, publications invisibles."""
+    from clipper import publish
+
+    entry = _seed_full_entry(isolated_cwd, "ma_chaine", "published", published_at="2026-10-01T10:00:00+00:00",
+                             tiktok_state="published", tiktok_publish_at="2026-10-01T10:00:00+00:00")
+    (isolated_cwd / "presets" / "ma_chaine.toml").unlink()  # le style est supprime, sa file reste
+
+    assert publish.account_publish_times(_ACCOUNT) == [datetime(2026, 10, 1, 10, tzinfo=timezone.utc)]
+    assert publish.all_entries() == [("ma_chaine", entry)]
+
+
+def test_mark_published_by_hand_is_refused_while_the_worker_drives_the_entry(isolated_cwd):
+    """fable-publication I2 : « Déclarer publié » pendant le pilotage effacait l'entree en cours ; le vrai post du
+    worker n'etait plus enregistre (URL, etat, sidecar perdus)."""
+    publish = _tiktok_env(isolated_cwd, ("01",))
+    publish.mark_in_progress("vid1", "01", "ma_chaine", now=_MON)
+    before = _read_state(isolated_cwd, "ma_chaine")
+
+    with pytest.raises(publish.PublishError, match="en cours"):
+        publish.mark_published("vid1", "01", "ma_chaine", now=_MON)
+    assert _read_state(isolated_cwd, "ma_chaine") == before
+
+    # le worker, lui, enregistre son post (tiktok_state donne) pendant qu'il pilote
+    entry = publish.mark_published("vid1", "01", "ma_chaine", now=_MON, tiktok_state="published",
+                                   post_url="https://example.invalid/@x/video/1", publish_at=_MON.isoformat(),
+                                   account=_ACCOUNT)
+    assert entry["post_url"] == "https://example.invalid/@x/video/1" and entry["in_progress_since"] is None
+
+
+@pytest.mark.parametrize("case", ["in_progress", "published", "rejected"])
+def test_set_mode_refuses_an_entry_in_progress_published_or_rejected(isolated_cwd, case):
+    """fable-publication M4 : le mode d'une entree pilotee, publiee ou refusee ne change plus."""
+    publish = _tiktok_env(isolated_cwd, ("01",))
+    if case == "in_progress":
+        publish.mark_in_progress("vid1", "01", "ma_chaine", now=_MON)
+    elif case == "published":
+        publish.mark_published("vid1", "01", "ma_chaine", now=_MON)
+    else:
+        publish.reject("vid1", "01", "ma_chaine")
+    before = _read_state(isolated_cwd, "ma_chaine")
+
+    with pytest.raises(publish.PublishError, match="mode"):
+        publish.set_mode("vid1", "01", "ma_chaine", "immediate")
+
+    assert _read_state(isolated_cwd, "ma_chaine") == before

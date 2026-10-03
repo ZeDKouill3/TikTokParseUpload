@@ -1771,7 +1771,7 @@ def _verify_login(config: Config, account: dict[str, Any]) -> dict[str, Any]:
     try:
         observed = browser_mod.login_state(account["id"], config=config)
         result = accounts_mod.record_login(config, account["id"], observed)
-    except browser_mod.BrowserError as exc:
+    except (browser_mod.BrowserError, accounts_mod.AccountsError) as exc:  # jamais tout l'ecran : fable-comptes 8
         return {**account, "login_error": str(exc)}
     if result.pop("auto_unchecked"):
         _emit_unchecked(config, account["id"], result["ready_note"])
@@ -2123,7 +2123,9 @@ def create_app(config: Config | None = None) -> FastAPI:
         try:
             worker_mod.cancel(video_id, config=config)  # par le pid de la file : jamais un Worker ici
         except worker_mod.WorkerError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+            # rien en cours : 404 ; processus impossible a arreter : la video existe, 409 (revue fable-comptes 9)
+            raise HTTPException(status_code=404 if "aucune video en cours" in str(exc) else 409,
+                                detail=str(exc)) from exc
         return {"video_id": video_id, "cancelled": True}
 
     @app.post("/api/videos/{video_id}/retry", status_code=202)
@@ -2223,6 +2225,10 @@ def create_app(config: Config | None = None) -> FastAPI:
             return getattr(publish_mod, action)(video_id, clip_id, channel, **kwargs)
         except publish_mod.PublishError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except channel_mod.ChannelError as exc:  # style sans preset (supprime) : revue fable-comptes 7
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ConfigError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.post("/api/clips/{video_id}/{clip_id}/approve")
     def approve_clip(video_id: str, clip_id: str, body: AccountBody | None = None) -> dict[str, Any]:
@@ -2247,8 +2253,9 @@ def create_app(config: Config | None = None) -> FastAPI:
         l'écran Clips, TASK-e99b) : exactement la même décision que POST /api/clips/{v}/{c}/approve
         pour chacun (même compte, mêmes créneaux du compte). Cocher une partie de série entraîne
         toute la série (ordre des parties respecté, _require_previous_part de publish.approve).
-        Validation de tous les clips (séries comprises) avant la première approbation : tout ou
-        rien, aucune valeur de secours (ADR-ad2e)."""
+        Validation de tous les clips (séries comprises) avant la première approbation, avec la règle
+        même de publish.approve (publish.approval_refusal) : tout ou rien, aucune valeur de secours
+        (ADR-ad2e). Une partie déjà publiée entraînée par sa série (pas cochée) est laissée telle quelle."""
         if not body.clips:
             raise HTTPException(status_code=400, detail="sélection vide : choisis au moins un clip")
         if not body.account:
@@ -2277,6 +2284,8 @@ def create_app(config: Config | None = None) -> FastAPI:
                     seen.add(key)
                     expanded.append(key)
 
+        chosen = {(item.video_id, item.clip_id) for item in body.clips}
+        to_approve: list[tuple[str, str]] = []
         channel_of_video: dict[str, str | None] = {}
         entries_by_channel: dict[str, dict[tuple[str, str], dict[str, Any]]] = {}
         for video_id, clip_id in expanded:
@@ -2292,17 +2301,33 @@ def create_app(config: Config | None = None) -> FastAPI:
             if channel not in entries_by_channel:
                 entries_by_channel[channel] = _publish_entries(config, channel)
             entry = entries_by_channel[channel].get((video_id, clip_id))
+            if entry and entry["status"] == "published" and (video_id, clip_id) not in chosen:
+                continue  # partie deja publiee entrainee par sa serie : laissee telle quelle (fable-comptes 5)
             if entry and entry["status"] in ("published", "rejected"):
                 refused.append(f"{video_id}/{clip_id} : déjà {entry['status']}")
+                continue
+            refusal = publish_mod.approval_refusal(entry)  # planifie, en cours, formulaire (fable-comptes 2)
+            if refusal is not None:
+                refused.append(f"{video_id}/{clip_id} : {refusal}")
                 continue
             sidecar = publish_mod.read_sidecar(config.output_dir, video_id, clip_id)
             if not sidecar.get("ready"):
                 refused.append(f"{video_id}/{clip_id} : pas prêt pour publication")
+                continue
+            to_approve.append((video_id, clip_id))
 
         if refused:
             raise _BulkApproveRefused(refused)
 
-        return [_decide(video_id, clip_id, "approve", account=account, schedule=schedule) for video_id, clip_id in expanded]
+        approved: list[dict[str, Any]] = []
+        for video_id, clip_id in to_approve:
+            try:
+                approved.append(_decide(video_id, clip_id, "approve", account=account, schedule=schedule))
+            except HTTPException as exc:  # change entre la validation et l'ecriture : le dire, jamais en silence
+                done = ", ".join(f"{e['video_id']}/{e['clip_id']}" for e in approved) or "aucun"
+                raise HTTPException(status_code=exc.status_code,
+                                    detail=f"{exc.detail} ; déjà approuvés avant cet échec : {done}") from exc
+        return approved
 
     @app.post("/api/clips/{video_id}/{clip_id}/rerender", status_code=202)
     def rerender_clip(video_id: str, clip_id: str) -> JSONResponse:
@@ -2459,7 +2484,12 @@ def create_app(config: Config | None = None) -> FastAPI:
                 rows.append(_publication_view(channel, entry))
             except HTTPException:
                 rows.append(_publish_clip_view({}, channel, entry))
-        rows.sort(key=lambda r: r.get("slot_at") or "", reverse=True)
+        def slot_instant(row: dict[str, Any]) -> float:
+            # par instant, jamais par texte ISO : +00:00 (formulaire) et +02:00 (creneaux) (fable-publication M3)
+            instant = _publish_entry_instant(row, "slot_at")
+            return instant.timestamp() if instant is not None else float("-inf")
+
+        rows.sort(key=slot_instant, reverse=True)
         return {
             "publications": rows,
             "accounts": _publish_accounts(config),
@@ -2683,8 +2713,14 @@ def create_app(config: Config | None = None) -> FastAPI:
                 status_code=409,
                 detail=f"confirmation requise (confirm=true) : supprimer le style {name!r} efface son preset",
             )
-        pending = [e for e in publish_mod.list_entries(name, state_dir=_publish_dir(config))
-                   if e["status"] in publish_mod.UNFINISHED_STATUSES]
+        try:
+            entries = publish_mod.list_entries(name, state_dir=_publish_dir(config))
+        except (publish_mod.PublishError, OSError, ValueError) as exc:  # fichier illisible : fable-comptes 4
+            raise HTTPException(status_code=409, detail=f"file de publication du style {name!r} illisible "
+                                f"({name}.json) : {exc}") from exc
+        # Les entrees terminees restent dans state/publish/<style>.json : publish les lit toujours (plafonds du
+        # compte, ecran Publication), meme sans preset (revue fable-comptes 4).
+        pending = [e for e in entries if e["status"] in publish_mod.UNFINISHED_STATUSES]
         if pending:
             clips = ", ".join(f"{e['video_id']}/{e['clip_id']}" for e in pending)
             raise HTTPException(
