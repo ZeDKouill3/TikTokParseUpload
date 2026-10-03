@@ -356,6 +356,21 @@ def test_claude_cli_cache_control_block_limit_is_not_transient(fake_run):
     assert not isinstance(exc.value, TransientLLMError)
 
 
+def test_claude_cli_permanent_400_whose_text_happens_to_contain_503_is_not_transient(fake_run):
+    # "215034" contient la sous-chaine "503" : seul un vrai code 503/529
+    # (statut absent) doit etre transitoire, jamais un nombre qui le
+    # contient par hasard dans un texte d'erreur permanente (statut 400
+    # present, Mineur 2, revue r-transcription).
+    bad = dict(
+        RECORDED_CLAUDE_CLI_QUOTA, api_error_status=400,
+        result="API Error: 400 prompt is too long: 215034 tokens > 200000 maximum",
+    )
+    fake_run(json.dumps(bad), returncode=1)
+    with pytest.raises(LLMError) as exc:
+        llm.ask("qa", "p", [], COLOR_SCHEMA, config=make_config())
+    assert not isinstance(exc.value, TransientLLMError)
+
+
 def test_claude_cli_timeout_is_transient(monkeypatch):
     def boom(cmd, **kwargs):
         raise subprocess.TimeoutExpired(cmd, 1)
@@ -932,6 +947,26 @@ def test_usage_log_records_a_line_even_when_the_answer_is_finally_refused(tmp_pa
     lines = [json.loads(line) for line in usage_log_path.read_text(encoding="utf-8").splitlines()]
     assert len(lines) == 1
     assert lines[0]["usage"] == "qa"
+
+
+def test_usage_log_records_a_line_with_an_error_field_when_a_later_call_raises(tmp_path):
+    # Si backend.complete leve (quota, reseau, LLMError...) apres au moins
+    # un appel reussi de ce meme ask() (ici une reponse refusee puis timeout
+    # de la reparation), les tokens/cout deja consommes ne doivent pas
+    # disparaitre du journal de consommation (Mineur 3, revue
+    # r-transcription) : jusqu'ici, l'exception sortait de ask() sans
+    # qu'aucune ligne ne soit ecrite.
+    usage_log_path = tmp_path / "llm_usage.jsonl"
+    fake = FakeBackend(["pas du json", TransientLLMError("timeout")])
+    with llm.use_backend(fake):
+        with pytest.raises(TransientLLMError):
+            llm.ask("qa", "p", [], COLOR_SCHEMA, config=make_config(), usage_log_path=usage_log_path)
+
+    assert len(fake.calls) == 2
+    lines = [json.loads(line) for line in usage_log_path.read_text(encoding="utf-8").splitlines()]
+    assert len(lines) == 1
+    assert lines[0]["usage"] == "qa"
+    assert "TransientLLMError" in lines[0]["error"]
 
 
 def test_usage_log_path_not_given_writes_nothing(tmp_path):

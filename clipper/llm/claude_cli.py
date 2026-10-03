@@ -142,7 +142,7 @@ MAX_COMMAND_LINE = 32_000
 _TRANSIENT_STATUS = {408, 429}
 _TRANSIENT_TEXT = re.compile(
     r"usage limit|rate.?limit|overloaded|quota|timed? ?out|timeout|network|"
-    r"connection|ECONNRESET|ECONNREFUSED|ENOTFOUND|ETIMEDOUT|503|529",
+    r"connection|ECONNRESET|ECONNREFUSED|ENOTFOUND|ETIMEDOUT|\b503\b|\b529\b",
     re.IGNORECASE,
 )
 
@@ -150,10 +150,13 @@ _TRANSIENT_TEXT = re.compile(
 def _is_transient(status: Any, text: str) -> bool:
     """Un statut connu (408/429/5xx) est toujours transitoire ; les autres
     statuts (ex. 400, y compris la limite de blocs cache_control -- voir la
-    docstring du module, TASK-f89f) sont permanents sauf un texte reconnu
-    comme transitoire malgre eux (quota, reseau, surcharge)."""
-    if isinstance(status, int) and (status in _TRANSIENT_STATUS or status >= 500):
-        return True
+    docstring du module, TASK-f89f) sont permanents, point final : le texte
+    n'est consulte (quota, reseau, surcharge, bornes de mot pour 503/529)
+    que si le statut est absent (``None``), jamais pour outrepasser un
+    statut permanent deja connu -- un texte d'erreur peut contenir "503"
+    par hasard (ex. "215034 tokens", Mineur 2, revue r-transcription)."""
+    if status is not None:
+        return isinstance(status, int) and (status in _TRANSIENT_STATUS or status >= 500)
     return bool(_TRANSIENT_TEXT.search(text))
 
 

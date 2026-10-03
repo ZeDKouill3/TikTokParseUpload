@@ -665,6 +665,86 @@ def test_fix_correction_matching_ignoring_attached_punctuation_and_case_is_appli
     assert data["transcript_fix_refused"] == 0
 
 
+def test_fix_correction_carrying_attached_punctuation_does_not_double_it(tmp_path, video_dir, cpu):
+    """Le prompt montre le mot avec sa ponctuation collee (_fix_chunk,
+    ``f"{i}\\t{w['word'].strip()}"``) : le LLM renvoie donc naturellement
+    ``word`` lui-meme ponctue (``"Alstner,"``). _apply_word_correction garde
+    deja la ponctuation d'origine autour du mot : appliquer ``word`` sans en
+    retirer son propre coeur double la ponctuation (Important 2, revue
+    r-transcription)."""
+    segments = [_segment(1, [_word(" Alsner,", 0.0, 0.4)])]
+    fake = FakeBackend([VOCAB, {"corrections": [{"i": 0, "old": "Alsner,", "word": "Alstner,"}]}])
+    with llm.use_backend(fake):
+        run(tmp_path, ModelFactory(segments=segments))
+
+    data = read_transcript(video_dir)
+    assert data["segments"][0]["words"][0]["word"] == " Alstner,"
+    assert data["transcript_fix_refused"] == 0
+
+
+def test_fix_majority_refused_chunks_are_not_cached_a_relaunch_asks_the_llm_again(
+    tmp_path, video_dir, cpu
+):
+    """Une tranche dont les corrections sont majoritairement refusees
+    (etape en echec explicite) ne doit jamais rester en cache : sinon une
+    relance (sans force) relit le cache et echoue a l'identique, sans jamais
+    redemander au LLM -- meme si celui-ci repondrait bien cette fois
+    (Important 1, revue r-transcription)."""
+    from clipper.transcribe import TranscribeError
+
+    segments = _many_word_segments(4)  # fix_chunk_words=1 -> 4 tranches d'un mot
+
+    def refuse_all(request):
+        return {"corrections": [{"i": 0, "old": "mot-inexistant", "word": "X"}]}
+
+    config = make_config(tmp_path, fix_chunk_words=1)
+    fake = FakeBackend([VOCAB, refuse_all, refuse_all, refuse_all, refuse_all])
+    with llm.use_backend(fake), pytest.raises(TranscribeError, match="corrections refusees"):
+        run(tmp_path, ModelFactory(segments=segments), config=config)
+
+    # 2e passage (relance sans force) : le LLM repondrait bien cette fois --
+    # le cache ne doit pas rejouer les anciens refus a l'identique.
+    retry = FakeBackend([{"corrections": []}] * 4)
+    with llm.use_backend(retry):
+        run(tmp_path, ModelFactory(segments=segments), config=config)
+    assert len(retry.calls) == 4  # chaque tranche redemandee, aucune ne vient du cache
+    assert read_transcript(video_dir)["transcript_fix_refused"] == 0
+
+
+def test_fix_duplicate_identical_correction_is_ignored_without_counting_as_refused(
+    tmp_path, video_dir, cpu
+):
+    """La deuxieme occurrence d'une correction identique ({old, word} memes)
+    visant le meme index n'est qu'une repetition du modele, pas un refus :
+    ``actual`` ne correspond plus apres la premiere application, ce qui la
+    faisait compter comme refusee a tort (Mineur 4, revue r-transcription)."""
+    segments = [_segment(1, [_word(" Alsner", 0.0, 0.4)])]
+    dup = {"i": 0, "old": "Alsner", "word": "Alstner"}
+    fake = FakeBackend([VOCAB, {"corrections": [dup, dup]}])
+    with llm.use_backend(fake):
+        run(tmp_path, ModelFactory(segments=segments))
+
+    data = read_transcript(video_dir)
+    assert data["transcript_fix_refused"] == 0
+    assert data["segments"][0]["words"][0]["word"] == " Alstner"
+
+
+def test_fix_contradictory_duplicate_correction_is_a_schema_error(tmp_path, video_dir, cpu):
+    """Deux corrections visant le meme index mais qui different (``word``
+    different pour un meme ``old``) ne sont pas une repetition silencieuse :
+    c'est contradictoire, donc une reponse hors schema (Mineur 4, revue
+    r-transcription)."""
+    segments = [_segment(1, [_word(" Alsner", 0.0, 0.4)])]
+    answer = {"corrections": [
+        {"i": 0, "old": "Alsner", "word": "Alstner"},
+        {"i": 0, "old": "Alsner", "word": "Alston"},
+    ]}
+    with llm.use_backend(FakeBackend([VOCAB, answer])):
+        with pytest.raises(llm.SchemaError):
+            run(tmp_path, ModelFactory(segments=segments))
+    assert not (video_dir / "transcript.json").exists()
+
+
 def test_fix_majority_of_corrections_refused_is_an_explicit_failure(tmp_path, video_dir, cpu):
     """Si une part anormale des corrections d'une video est refusee (ici 3
     sur 4, une majorite d'au moins 2), la correction semble decalee dans son
@@ -938,6 +1018,31 @@ def test_one_chunk_failure_fails_the_step_with_its_reason_others_may_run(
                 config=make_config(tmp_path, fix_chunk_words=2, fix_parallel=4),
             )
     assert not (video_dir / "transcript.json").exists()
+
+
+def test_first_definitive_chunk_failure_cancels_the_chunks_not_yet_started(tmp_path, video_dir, cpu):
+    """Au premier echec definitif d'une tranche, les tranches pas encore
+    lancees sont annulees plutot que toutes demandees avant que l'erreur ne
+    remonte (Mineur 1, revue r-transcription) : sinon, avec de nombreuses
+    tranches et ``claude -p`` qui ne repond plus, l'echec remonte bien plus
+    tard que prevu (TASK-db6f)."""
+    segments = _many_word_segments(10)
+    calls: list[str] = []
+    lock = threading.Lock()
+
+    def respond(request):
+        line = next(l for l in request.prompt.splitlines() if "\t" in l)
+        with lock:
+            calls.append(line)
+        if line.endswith("mot1"):
+            raise llm.LLMError("echec definitif tranche mot1")
+        return {"corrections": []}
+
+    fake = FakeBackend([VOCAB, respond])
+    with llm.use_backend(fake), pytest.raises(llm.LLMError):
+        run(tmp_path, ModelFactory(segments=segments),
+            config=make_config(tmp_path, fix_chunk_words=1, fix_parallel=1))
+    assert len(calls) < 10  # certaines tranches jamais demandees (annulees)
 
 
 # --------------------------------------------------------------------------
