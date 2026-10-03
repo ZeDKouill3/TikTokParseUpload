@@ -1076,6 +1076,7 @@ def create_post(
     base: str | Path = "config.toml",
     service: str = "tiktok",
     schedule: dict[str, Any] | None = None,
+    parts_together: bool | None = None,
 ) -> dict[str, Any]:
     """Cree l'entree de publication d'un clip depuis le formulaire (SPEC-1ed3 R3) : valider = approuver. ``channel``
     est None pour une video sans chaine (file ``NO_CHANNEL``). ``mode`` ``immediate`` : due tout de suite ;
@@ -1085,7 +1086,9 @@ def create_post(
     ``service`` (``tiktok`` | ``youtube``, celui du compte) choisit les reglages, options et plafonds valides
     (``settings`` : ceux de ce service). ``schedule`` (``accounts.schedule_of``) : les plafonds par jour (R6) se
     comptent dans le fuseau du COMPTE, pas du style (revue r-comptes 9) ; sans ``schedule``, celui du style sert
-    encore (compatibilite)."""
+    encore (compatibilite). ``parts_together`` (TASK-fc561e4dc7e9) : ``None`` (par defaut, hors formulaire
+    série) laisse le champ absent de l'entree (le worker garde l'attente « partie N-1 non publiée ») ; un
+    booleen explicite (``create_series``) le fixe dans l'entree, et False leve cette attente pour cette partie."""
     sidecar = _read_sidecar(output_dir, video_id, clip_id)
     if not sidecar.get("ready"):
         raise PublishError(f"clip non prêt pour publication : {video_id}/{clip_id}")
@@ -1119,6 +1122,8 @@ def create_post(
             "published_at": None, "error": None, "account": account,
             "publish_mode": mode, "post_options": options, "manual": True, "service": service,
         }
+        if parts_together is not None:
+            entry["parts_together"] = parts_together
         _upsert_entry(entries, entry)
         _save_entries(path, entries)
     return entry
@@ -1358,9 +1363,11 @@ def _unit_members(output_dir: str | Path, video_id: str, clip_id: str, sidecar: 
 
 def _eligible_units(
     output_dir: str | Path, video_id: str, channel: str | None, entries: dict[tuple[str, str], dict[str, Any]],
+    *, together: bool = True,
 ) -> list[dict[str, Any]]:
-    """Unites (une serie entiere) de ce ``video_id`` pretes a publier (``ready``) et absentes de
-    ``entries`` (jamais publiees, en file ni programmees) ; une partie indisponible exclut toute la serie.
+    """Unites de ce ``video_id`` pretes a publier (``ready``) et absentes de ``entries`` (jamais publiees, en
+    file ni programmees). ``together`` (coche « Parties ensemble », TASK-fc561e4dc7e9) : groupees en series
+    entieres (une partie indisponible exclut toute la serie), ou chacune sa propre unite independante si faux.
     Jamais validees (``validated`` : False) : un clip pret n'est pas encore approuve (TASK-16eeaccfaf09)."""
     out_dir = Path(output_dir) / video_id
     seen: set[str] = set()
@@ -1370,13 +1377,19 @@ def _eligible_units(
         if clip_id in seen:
             continue
         sidecar = _read_sidecar(output_dir, video_id, clip_id)
-        members = _unit_members(output_dir, video_id, clip_id, sidecar)
-        seen.update(members)
-        member_sidecars = [sidecar if m == clip_id else _read_sidecar(output_dir, video_id, m) for m in members]
-        if not all(s.get("ready") is True for s in member_sidecars):
-            continue
-        if any((video_id, m) in entries for m in members):
-            continue
+        if together:
+            members = _unit_members(output_dir, video_id, clip_id, sidecar)
+            seen.update(members)
+            member_sidecars = [sidecar if m == clip_id else _read_sidecar(output_dir, video_id, m) for m in members]
+            if not all(s.get("ready") is True for s in member_sidecars):
+                continue
+            if any((video_id, m) in entries for m in members):
+                continue
+        else:
+            seen.add(clip_id)
+            if not sidecar.get("ready") or (video_id, clip_id) in entries:
+                continue
+            members = [clip_id]
         units.append({
             "video_id": video_id, "channel": channel, "clip_ids": members, "score": sidecar.get("score"),
             "validated": False,
@@ -1390,12 +1403,13 @@ def _entry_matches_account(entry: dict[str, Any], account: str | None) -> bool:
 
 def _validated_units(
     output_dir: str | Path, video_id: str, channel: str | None, entries: dict[tuple[str, str], dict[str, Any]],
-    account: str | None,
+    account: str | None, *, together: bool = True,
 ) -> list[dict[str, Any]]:
-    """Unites (une serie entiere) de ce ``video_id`` DEJA validees : toutes leurs parties ont une entree de
-    publication 'approved', sans creneau (``slot_at`` None) et pas en cours (TASK-16eeaccfaf09). Si ``account``
-    est donne, chaque entree doit avoir ce compte ou aucun ; jamais un clip valide pour un autre compte. Une
-    partie non validee exclut toute la serie, comme pour ``_eligible_units``."""
+    """Unites de ce ``video_id`` DEJA validees : entree de publication 'approved', sans creneau (``slot_at``
+    None) et pas en cours (TASK-16eeaccfaf09). Si ``account`` est donne, chaque entree doit avoir ce compte ou
+    aucun ; jamais un clip valide pour un autre compte. ``together`` (TASK-fc561e4dc7e9) : une unite est une
+    serie entiere, toutes ses parties validees (une partie non validee exclut toute la serie, comme pour
+    ``_eligible_units``) ; si faux, chaque partie validee compte seule, meme si sa soeur ne l'est pas."""
     out_dir = Path(output_dir) / video_id
     seen: set[str] = set()
     units: list[dict[str, Any]] = []
@@ -1404,16 +1418,25 @@ def _validated_units(
         if clip_id in seen:
             continue
         sidecar = _read_sidecar(output_dir, video_id, clip_id)
-        members = _unit_members(output_dir, video_id, clip_id, sidecar)
-        seen.update(members)
-        member_entries = [entries.get((video_id, m)) for m in members]
-        if any(
-            e is None or e["status"] != "approved" or e.get("slot_at") is not None or e.get("in_progress_since")
-            for e in member_entries
-        ):
-            continue
-        if any(not _entry_matches_account(e, account) for e in member_entries):
-            continue
+        if together:
+            members = _unit_members(output_dir, video_id, clip_id, sidecar)
+            seen.update(members)
+            member_entries = [entries.get((video_id, m)) for m in members]
+            if any(
+                e is None or e["status"] != "approved" or e.get("slot_at") is not None or e.get("in_progress_since")
+                for e in member_entries
+            ):
+                continue
+            if any(not _entry_matches_account(e, account) for e in member_entries):
+                continue
+        else:
+            seen.add(clip_id)
+            entry = entries.get((video_id, clip_id))
+            if entry is None or entry["status"] != "approved" or entry.get("slot_at") is not None or entry.get("in_progress_since"):
+                continue
+            if not _entry_matches_account(entry, account):
+                continue
+            members = [clip_id]
         units.append({
             "video_id": video_id, "channel": channel, "clip_ids": members, "score": sidecar.get("score"),
             "validated": True,
@@ -1422,15 +1445,17 @@ def _validated_units(
 
 
 def available_series_clips(
-    style: str | None, *, account: str | None = None, workspace_dir: str | Path = "workspace",
-    output_dir: str | Path = "output", state_dir: str | Path | None = None,
+    style: str | None, *, account: str | None = None, together: bool = True,
+    workspace_dir: str | Path = "workspace", output_dir: str | Path = "output",
+    state_dir: str | Path | None = None,
 ) -> list[dict[str, Any]]:
     """Unites de clips (chacune une serie entiere, parties triees), optionnellement filtrees par ``style``
     (``None`` = tous les styles, y compris les videos sans style). Chaque unite porte ``validated`` : False pour
     un clip pret jamais entre en file (comme avant), True pour un clip deja approuve sans creneau
     (TASK-16eeaccfaf09 : mode manuel = les deux). Avec ``account`` donne, une unite validee pour un AUTRE compte
-    est exclue (les unites non validees n'ont pas encore de compte, jamais filtrees). L'ordre rendu n'est PAS
-    trie par score (voir ``preview_series``)."""
+    est exclue (les unites non validees n'ont pas encore de compte, jamais filtrees). ``together``=False (coche
+    « Parties ensemble » decochee, TASK-fc561e4dc7e9) : chaque partie est sa propre unite independante, jamais
+    groupee avec ses soeurs. L'ordre rendu n'est PAS trie par score (voir ``preview_series``)."""
     workspace_root = Path(workspace_dir)
     if not workspace_root.is_dir():
         return []
@@ -1453,9 +1478,23 @@ def available_series_clips(
         if not out_dir.is_dir():
             continue
         entries = entries_cache[file_channel]
-        units.extend(_eligible_units(output_dir, video_dir.name, channel, entries))
-        units.extend(_validated_units(output_dir, video_dir.name, channel, entries, account))
+        units.extend(_eligible_units(output_dir, video_dir.name, channel, entries, together=together))
+        units.extend(_validated_units(output_dir, video_dir.name, channel, entries, account, together=together))
     return units
+
+
+def auto_series_capacity(
+    style: str | None, account: str, *, together: bool = True, workspace_dir: str | Path = "workspace",
+    output_dir: str | Path = "output", state_dir: str | Path | None = None,
+) -> int:
+    """Nombre de posts disponibles pour ``account`` en mode auto (clips valides, une partie = un post,
+    TASK-fc561e4dc7e9) : le max du champ « Nombre de vidéos » du formulaire série. ``together``=True ne compte
+    que des series entieres (comme ``preview_series`` mode auto) ; False compte chaque partie validee seule."""
+    pool = available_series_clips(
+        style, account=account, together=together, workspace_dir=workspace_dir, output_dir=output_dir,
+        state_dir=state_dir,
+    )
+    return sum(len(u["clip_ids"]) for u in pool if u["validated"])
 
 
 def _series_item_refusal(when: datetime, settings: dict[str, Any], now_dt: datetime, service: str) -> str | None:
@@ -1537,6 +1576,7 @@ def preview_series(
     start_at: datetime,
     count: int | None = None,
     selection: list[tuple[str, str]] | None = None,
+    together: bool = True,
     settings: dict[str, Any] | None = None,
     now: datetime | None = None,
     workspace_dir: str | Path = "workspace",
@@ -1546,7 +1586,10 @@ def preview_series(
     base: str | Path = "config.toml",
     schedule: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Apercu d'une serie programmee (SPEC-1ed3, SPEC-6076 R3/R6), sans rien creer. ``mode`` ``auto`` :
+    """Apercu d'une serie programmee (SPEC-1ed3, SPEC-6076 R3/R6), sans rien creer. ``together`` (coche
+    « Parties ensemble », TASK-fc561e4dc7e9, par defaut True) : True groupe chaque serie en une seule unite
+    (une partie indisponible exclut toute la serie, le max ne compte que des series entieres) ; False traite
+    chaque partie comme une unite independante, en auto comme en manuel. ``mode`` ``auto`` :
     uniquement des clips DEJA VALIDES (approuves, sans creneau) pour ``account`` (ou aucun compte) -- jamais un
     clip pret mais non valide, ni valide pour un autre compte (TASK-16eeaccfaf09) -- les meilleurs par score
     jusqu'a ``count`` posts (une partie = un post, une serie incomplete est sautee entiere) ; si aucun clip
@@ -1570,7 +1613,7 @@ def preview_series(
     # Mode auto : seules les unites deja validees (approuvees, sans creneau) pour CE compte (ou aucun) sont
     # eligibles (TASK-16eeaccfaf09) ; mode manuel : aucune restriction de compte, ready et validees proposees.
     pool = available_series_clips(
-        style, account=(account if mode == "auto" else None),
+        style, account=(account if mode == "auto" else None), together=together,
         workspace_dir=workspace_dir, output_dir=output_dir, state_dir=state_dir,
     )
 
@@ -1646,6 +1689,7 @@ def create_series(
     start_at: datetime,
     count: int | None = None,
     selection: list[tuple[str, str]] | None = None,
+    together: bool = True,
     settings: dict[str, Any] | None = None,
     now: datetime | None = None,
     workspace_dir: str | Path = "workspace",
@@ -1660,10 +1704,12 @@ def create_series(
     clips que demande, et RIEN n'est cree ; si la creation echoue en cours de route (etat change entre
     l'apercu et la creation), les entrees deja creees sont annulees avant de relever l'erreur. ``schedule`` :
     le meme que celui passe a ``preview_series`` (revue r-comptes 9), sinon un item accepte a l'apercu
-    pourrait etre refuse ici (fuseaux differents)."""
+    pourrait etre refuse ici (fuseaux differents). ``together`` (TASK-fc561e4dc7e9) : le meme que celui passe
+    a ``preview_series`` ; chaque entree creee porte ``parts_together`` a cette valeur (le worker n'attend la
+    partie precedente que si elle vaut True)."""
     preview = preview_series(
         mode=mode, style=style, account=account, service=service, interval_hours=interval_hours,
-        start_at=start_at, count=count, selection=selection, settings=settings, now=now,
+        start_at=start_at, count=count, selection=selection, together=together, settings=settings, now=now,
         workspace_dir=workspace_dir, output_dir=output_dir, state_dir=state_dir, presets_dir=presets_dir, base=base,
         schedule=schedule,
     )
@@ -1683,7 +1729,7 @@ def create_series(
             entry = create_post(
                 item["video_id"], item["clip_id"], item["channel"], account=account, mode="scheduled",
                 publish_at=when, settings=settings, now=now, output_dir=output_dir, state_dir=state_dir,
-                presets_dir=presets_dir, base=base, service=service, schedule=schedule,
+                presets_dir=presets_dir, base=base, service=service, schedule=schedule, parts_together=together,
             )
             created.append((item["channel"], entry))
     except Exception as exc:  # toute exception (ADR-ad2e) : pas seulement PublishError/ChannelError/ConfigError,

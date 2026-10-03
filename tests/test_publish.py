@@ -1828,6 +1828,141 @@ def test_create_series_manual_respects_the_chosen_order(isolated_cwd):
 
 
 # --------------------------------------------------------------------------
+# TASK-fc561e4dc7e9 : coche « Parties ensemble » du formulaire série (together=False) --
+# chaque partie devient une unité indépendante (auto et manuel), et auto_series_capacity
+# donne le max du champ « Nombre de vidéos ».
+# --------------------------------------------------------------------------
+
+
+def test_available_series_clips_together_false_lists_each_part_as_its_own_unit(isolated_cwd):
+    from clipper import publish
+
+    _series_env(isolated_cwd)
+    _write_video_channel(isolated_cwd, "vid1", "ma_chaine")
+    _write_sidecar(isolated_cwd, "vid1", "x-p1", score=95, part=1, parts_total=2)
+    _write_sidecar(isolated_cwd, "vid1", "x-p2", score=95, part=2, parts_total=2)
+
+    grouped = publish.available_series_clips("ma_chaine")
+    apart = publish.available_series_clips("ma_chaine", together=False)
+
+    assert [u["clip_ids"] for u in grouped] == [["x-p1", "x-p2"]]
+    assert sorted(u["clip_ids"] for u in apart) == [["x-p1"], ["x-p2"]]
+
+
+def test_available_series_clips_together_false_validates_a_part_without_its_sibling(isolated_cwd):
+    """ON exige que toute la serie soit validee (une partie non validee exclut tout) ; OFF valide
+    chaque partie seule, meme si sa soeur n'est pas encore approuvee."""
+    from clipper import publish
+
+    _series_env(isolated_cwd)
+    _write_video_channel(isolated_cwd, "vid1", "ma_chaine")
+    _write_sidecar(isolated_cwd, "vid1", "x-p1", score=95, part=1, parts_total=2)
+    _write_sidecar(isolated_cwd, "vid1", "x-p2", score=95, part=2, parts_total=2)
+    publish.approve("vid1", "x-p1", "ma_chaine", now=SERIES_NOW, account=_ACCOUNT)  # seule la partie 1 est validee
+
+    assert publish.available_series_clips("ma_chaine") == []  # ON : la serie entiere est exclue
+
+    apart = publish.available_series_clips("ma_chaine", together=False)
+    by_clip = {tuple(u["clip_ids"]): u["validated"] for u in apart}
+    assert by_clip[("x-p1",)] is True  # validee seule, sans attendre sa soeur
+    assert by_clip[("x-p2",)] is False  # prete, jamais entree en file, pas encore validee
+
+
+def test_auto_series_capacity_counts_validated_parts_for_the_account(isolated_cwd):
+    from clipper import publish
+
+    _series_env(isolated_cwd)
+    _write_video_channel(isolated_cwd, "vid1", "ma_chaine")
+    _write_sidecar(isolated_cwd, "vid1", "x-p1", score=95, part=1, parts_total=2)
+    _write_sidecar(isolated_cwd, "vid1", "x-p2", score=95, part=2, parts_total=2)
+    _write_sidecar(isolated_cwd, "vid1", "y", score=70)
+    publish.approve("vid1", "x-p1", "ma_chaine", now=SERIES_NOW, account=_ACCOUNT)  # x-p2 jamais valide
+    publish.approve("vid1", "y", "ma_chaine", now=SERIES_NOW, account=_ACCOUNT)
+
+    # ON : la serie x (partie 2 manquante) ne compte pas, seul y (serie entiere a lui seul) compte
+    assert publish.auto_series_capacity("ma_chaine", _ACCOUNT) == 1
+    # OFF : x-p1 compte seule en plus de y
+    assert publish.auto_series_capacity("ma_chaine", _ACCOUNT, together=False) == 2
+
+
+def test_auto_series_capacity_is_zero_without_any_validated_clip(isolated_cwd):
+    from clipper import publish
+
+    _series_env(isolated_cwd)
+    _write_video_channel(isolated_cwd, "vid1", "ma_chaine")
+    _write_sidecar(isolated_cwd, "vid1", "a", score=90)  # pret, jamais approuve
+
+    assert publish.auto_series_capacity("ma_chaine", _ACCOUNT) == 0
+
+
+def test_preview_series_auto_together_false_picks_individual_parts_by_score(isolated_cwd):
+    from clipper import publish
+
+    _series_env(isolated_cwd)
+    _write_video_channel(isolated_cwd, "vid1", "ma_chaine")
+    _write_sidecar(isolated_cwd, "vid1", "x-p1", score=95, part=1, parts_total=2)
+    _write_sidecar(isolated_cwd, "vid1", "x-p2", score=95, part=2, parts_total=2)
+    _write_sidecar(isolated_cwd, "vid1", "y", score=90)
+    publish.approve("vid1", "x-p1", "ma_chaine", now=SERIES_NOW, account=_ACCOUNT)  # x-p2 jamais valide
+    publish.approve("vid1", "y", "ma_chaine", now=SERIES_NOW, account=_ACCOUNT)
+
+    preview = _auto_preview(isolated_cwd, count=2, together=False)
+
+    # x-p1 (score 95) et y (score 90) : x-p2, jamais valide, n'est jamais pris (pas de repli silencieux)
+    assert [it["clip_id"] for it in preview["items"]] == ["x-p1", "y"]
+    assert preview["ok"] is True and preview["insufficient"] is False
+
+
+def test_create_series_together_false_tags_entries_parts_together_false(isolated_cwd):
+    from clipper import publish
+
+    _series_env(isolated_cwd)
+    _write_video_channel(isolated_cwd, "vid1", "ma_chaine")
+    _write_sidecar(isolated_cwd, "vid1", "x-p1", score=95, part=1, parts_total=2)
+    _write_sidecar(isolated_cwd, "vid1", "x-p2", score=95, part=2, parts_total=2)
+    publish.approve("vid1", "x-p1", "ma_chaine", now=SERIES_NOW, account=_ACCOUNT)
+    start = SERIES_NOW + timedelta(hours=1)
+
+    created = publish.create_series(
+        mode="auto", style="ma_chaine", account=_ACCOUNT, service="tiktok", interval_hours=2,
+        start_at=start, count=1, settings=_series_settings(), now=SERIES_NOW, together=False)
+
+    assert [e["clip_id"] for e in created] == ["x-p1"]
+    assert created[0]["parts_together"] is False
+
+
+def test_create_series_default_tags_entries_parts_together_true(isolated_cwd):
+    from clipper import publish
+
+    _series_env(isolated_cwd)
+    _write_video_channel(isolated_cwd, "vid1", "ma_chaine")
+    _write_sidecar(isolated_cwd, "vid1", "a", score=90)
+    _approve_all(isolated_cwd, "vid1", ["a"])
+    start = SERIES_NOW + timedelta(hours=1)
+
+    created = publish.create_series(
+        mode="auto", style="ma_chaine", account=_ACCOUNT, service="tiktok", interval_hours=2,
+        start_at=start, count=1, settings=_series_settings(), now=SERIES_NOW)
+
+    assert created[0]["parts_together"] is True
+
+
+def test_create_post_outside_a_series_leaves_parts_together_unset(isolated_cwd):
+    """Hors formulaire série (« Nouvelle publication »), le champ reste absent : comportement ON
+    inchangé pour les entrées existantes et les publications a l'unite (criterion clause 2)."""
+    from clipper import publish
+
+    _series_env(isolated_cwd)
+    _write_video_channel(isolated_cwd, "vid1", "ma_chaine")
+    _write_sidecar(isolated_cwd, "vid1", "a", score=90)
+
+    entry = publish.create_post(
+        "vid1", "a", "ma_chaine", account=_ACCOUNT, mode="immediate", settings=_series_settings(), now=SERIES_NOW)
+
+    assert "parts_together" not in entry
+
+
+# --------------------------------------------------------------------------
 # TASK-2456 (revue r-publication I4) : mark_in_progress = prise en main atomique sous verrou
 # --------------------------------------------------------------------------
 

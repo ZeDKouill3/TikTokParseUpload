@@ -604,6 +604,7 @@ function pubSeriesFormHtml(f) {
   const ready = f.accounts.filter((a) => a.ready_to_publish);
   const styles = pubSeriesStyles(f.units);
   const count = f.mode === "auto" ? (f.count || 0) : pubSeriesPostCount(f.selected);
+  const available = f.available != null ? f.available : null;
   return `
     <div class="modal-head"><h2>Programmer une série</h2>
       <p class="muted" style="margin-top:4px">Publie plusieurs clips à un rythme régulier (une publication toutes les X heures), après un aperçu.</p></div>
@@ -612,6 +613,8 @@ function pubSeriesFormHtml(f) {
         <div class="row wrap" style="gap:16px">
           <label class="row" style="gap:6px"><input type="radio" name="pubs-mode" value="auto"${f.mode === "auto" ? " checked" : ""}> Automatique (les meilleurs clips)</label>
           <label class="row" style="gap:6px"><input type="radio" name="pubs-mode" value="manual"${f.mode === "manual" ? " checked" : ""}> Manuel (je choisis)</label></div></div>
+      <div class="field"><label class="row" style="gap:6px"><input type="checkbox" id="pubs-together"${f.together !== false ? " checked" : ""}> Parties ensemble</label>
+        <span class="hint">Les parties d'un clip découpé partent toujours groupées et dans l'ordre. Décoche pour les traiter comme des publications indépendantes.</span></div>
       <div class="field"><label for="pubs-style">Style</label>
         <select class="input" id="pubs-style"><option value="">Tous les styles</option>${styles.map((s) => `<option value="${esc(s)}"${s === f.style ? " selected" : ""}>${esc(s || "sans style")}</option>`).join("")}</select></div>
       <div class="field"><label for="pubs-account">Compte</label>
@@ -623,7 +626,7 @@ function pubSeriesFormHtml(f) {
         <div class="field"><label for="pubs-interval">Toutes les (heures)</label>
           <input class="input" id="pubs-interval" type="number" min="1" step="1" value="${f.intervalH}" style="width:8ch"></div>
         ${f.mode === "auto" ? `<div class="field"><label for="pubs-count">Nombre de vidéos</label>
-          <input class="input" id="pubs-count" type="number" min="1" step="1" value="${f.count}" style="width:8ch"></div>` : ""}
+          <input class="input" id="pubs-count" type="number" min="1" step="1" value="${f.count}" style="width:8ch"${available != null ? ` max="${available}"` : ""}${available === 0 ? " disabled" : ""}></div>` : ""}
       </div>
       ${f.mode === "manual" ? `
         <div class="field"><span class="field-label">Clips disponibles</span>
@@ -646,13 +649,69 @@ function pubSeriesBody(f, d) {
   const account = $("#pubs-account", d).value;
   const interval_hours = Number($("#pubs-interval", d).value);
   const startLocal = $("#pubs-start", d).value;
+  const parts_together = $("#pubs-together", d).checked;
   const body = {
-    mode, style: style || null, account, interval_hours,
+    mode, style: style || null, account, interval_hours, parts_together,
     start_at: startLocal ? pubParisInstant(startLocal).toISOString() : "",
   };
   if (mode === "auto") body.count = Number($("#pubs-count", d).value);
   else body.selection = f.selected.map((u) => ({ video_id: u.video_id, clip_id: u.clip_ids[0] }));
   return body;
+}
+
+/* Borne la valeur du champ « Nombre de vidéos » au max disponible (TASK-fc561e4dc7e9) : au moins 1, au plus
+   ``available`` (0 si aucun clip valide), inchangee si ``available`` est inconnu (aucun compte choisi). */
+function pubSeriesClampCount(value, available) {
+  if (available == null) return Number.isFinite(value) && value >= 1 ? value : 1;
+  if (available <= 0) return 0;
+  const v = Number.isFinite(value) && value >= 1 ? value : 1;
+  return Math.min(v, available);
+}
+
+/* Message sous le champ « Nombre de vidéos » : explique pourquoi il est desactive, pourquoi il est au max,
+   ou ce que l'automatique choisira sinon. */
+function pubSeriesCountNote(count, available) {
+  if (available === 0) return "Aucun clip validé disponible : valide d'abord des clips dans l'écran Clips.";
+  if (available != null && count >= available) {
+    return `Maximum disponible : ${available} vidéo${available > 1 ? "s" : ""}.`;
+  }
+  return `${count} vidéo${count > 1 ? "s" : ""} validée${count > 1 ? "s" : ""} seront choisies, par score décroissant.`;
+}
+
+/* Applique le max courant (``f.available``) au champ, le borne si besoin, et met a jour le message. */
+function pubSeriesApplyCountMax(f, d) {
+  const countEl = $("#pubs-count", d);
+  if (!countEl) return;
+  const clamped = pubSeriesClampCount(Number(countEl.value) || 0, f.available);
+  if (String(clamped) !== countEl.value) countEl.value = clamped;
+  f.count = clamped;
+  if (f.available != null) countEl.max = String(f.available); else countEl.removeAttribute("max");
+  countEl.disabled = f.available === 0;
+  const note = $("[data-pubs-count-note]", d);
+  if (note) note.textContent = pubSeriesCountNote(clamped, f.available);
+}
+
+/* Reinterroge le pool de clips (style, compte et coche « Parties ensemble » courants) : met a jour
+   f.units (mode manuel) et f.available (max du mode auto pour le compte choisi, TASK-fc561e4dc7e9). */
+async function pubSeriesFetchClips(f, d) {
+  const style = $("#pubs-style", d).value;
+  const accountEl = $("#pubs-account", d);
+  const account = accountEl ? accountEl.value : "";
+  const together = $("#pubs-together", d).checked;
+  f.together = together;
+  try {
+    const q = `style=${pubEnc(style)}&together=${together}${account ? `&account=${pubEnc(account)}` : ""}`;
+    const data = await api(`/api/publications/series/clips?${q}`);
+    f.units = data.units;
+    f.available = account ? data.available : null;
+  } catch (e) {
+    f.available = null;
+  }
+  if (f.mode === "manual") {
+    f.selected = [];
+    pubSeriesRenderManual(f, d);
+  }
+  pubSeriesApplyCountMax(f, d);
 }
 
 function pubSeriesRenderPreview(f, d) {
@@ -711,12 +770,7 @@ async function pubSeriesSubmit(f, d) {
 
 function pubSeriesWire(f, d) {
   $$("input[name='pubs-mode']", d).forEach((r) => (r.onchange = () => { f.mode = r.value; pubSeriesRerender(f, d); }));
-  const style = $("#pubs-style", d);
-  style.onchange = () => {
-    f.style = style.value;
-    f.selected = [];
-    if (f.mode === "manual") pubSeriesRenderManual(f, d);
-  };
+  $("#pubs-style", d).onchange = () => { f.style = $("#pubs-style", d).value; };
   $("#pubs-check", d).onclick = () => pubSeriesPreview(f, d);
   $("#pubs-submit", d).onclick = () => pubSeriesSubmit(f, d);
   // L'apercu se relance tout seul (500 ms apres la derniere saisie) : « Valider » ne reste plus grise
@@ -725,22 +779,23 @@ function pubSeriesWire(f, d) {
   const refresh = () => {
     f.preview = null;
     pubSeriesRenderPreview(f, d);
-    const countEl = $("#pubs-count", d);
-    const note = $("[data-pubs-count-note]", d);
-    if (countEl && note) {
-      const n = Number(countEl.value) || 0;
-      f.count = n;
-      note.textContent = `${n} vidéo${n > 1 ? "s" : ""} validée${n > 1 ? "s" : ""} seront choisies, par score décroissant.`;
-    }
+    pubSeriesApplyCountMax(f, d);
     clearTimeout(timer);
     if (f.mode === "auto" || f.selected.length) timer = setTimeout(() => pubSeriesPreview(f, d), 500);
   };
-  ["#pubs-start", "#pubs-interval", "#pubs-count", "#pubs-account", "#pubs-style"].forEach((sel) => {
+  ["#pubs-start", "#pubs-interval", "#pubs-count"].forEach((sel) => {
     const el = $(sel, d);
-    if (el) el.addEventListener(el.tagName === "SELECT" ? "change" : "input", refresh);
+    if (el) el.addEventListener("input", refresh);
   });
-  if (f.mode === "auto") pubSeriesPreview(f, d);
-  if (f.mode === "manual") pubSeriesRenderManual(f, d);
+  // Style, compte et coche « Parties ensemble » changent la composition du pool et le max du compte
+  // (TASK-fc561e4dc7e9) : re-interroge le serveur avant de relancer l'apercu.
+  ["#pubs-style", "#pubs-account", "#pubs-together"].forEach((sel) => {
+    const el = $(sel, d);
+    if (el) el.addEventListener("change", () => pubSeriesFetchClips(f, d).then(refresh));
+  });
+  pubSeriesFetchClips(f, d).then(() => {
+    if (f.mode === "auto") pubSeriesPreview(f, d);
+  });
 }
 
 function pubSeriesRerender(f, d) {
@@ -757,7 +812,7 @@ async function pubOpenSeriesForm() {
   const f = {
     mode: "auto", style: "", units: clipsData.units, accounts: data.accounts,
     start: pubSeriesDefaultStart(), intervalH: clipsData.default_interval_h || 4,
-    count: 1, selected: [], preview: null,
+    count: 1, selected: [], preview: null, together: true, available: null,
   };
   return openPanel("modal pub-modal pub-form", pubSeriesFormHtml(f), (d) => pubSeriesWire(f, d));
 }

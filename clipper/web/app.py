@@ -2572,14 +2572,17 @@ def create_app(config: Config | None = None) -> FastAPI:
                 "settings": _publication_settings(config, service)}
 
     @app.get("/api/publications/series/clips")
-    def series_clips(style: str | None = None) -> dict[str, Any]:
+    def series_clips(style: str | None = None, account: str | None = None, together: bool = True) -> dict[str, Any]:
         """Clips disponibles pour le mode manuel du formulaire : une unite par serie (parties regroupees et
         triees), les clips deja valides (approuves, sans creneau) ET les clips prets jamais entres en file
         (``validated`` les distingue) ; aucune restriction de compte ici (TASK-16eeaccfaf09 : la restriction de
-        compte ne vaut que pour le choix automatique, voir ``preview_series_endpoint``)."""
-        units = publish_mod.available_series_clips(
-            style or None, workspace_dir=Path(config.workspace_dir), output_dir=Path(config.output_dir),
-            state_dir=_publish_dir(config))
+        compte ne vaut que pour le choix automatique, voir ``preview_series_endpoint``). ``together``=False
+        (coche « Parties ensemble » decochee, TASK-fc561e4dc7e9) : chaque partie est sa propre unite. ``account``
+        donne ``available`` : le nombre de posts disponibles en mode auto pour ce compte (le max du champ
+        « Nombre de vidéos »), ``None`` sans compte."""
+        scope = {"workspace_dir": Path(config.workspace_dir), "output_dir": Path(config.output_dir),
+                 "state_dir": _publish_dir(config)}
+        units = publish_mod.available_series_clips(style or None, together=together, **scope)
         out = []
         for unit in units:
             lead = _read_clip_sidecar(config, unit["video_id"], unit["clip_ids"][0])
@@ -2590,7 +2593,9 @@ def create_app(config: Config | None = None) -> FastAPI:
                 "thumbnail_url": f"/media/clip/{unit['video_id']}/{unit['clip_ids'][0]}/thumbnail",
                 "validated": unit["validated"],
             })
-        return {"units": out, "default_interval_h": config.section("publish")["series_default_interval_h"]}
+        available = publish_mod.auto_series_capacity(style or None, account, together=together, **scope) if account else None
+        return {"units": out, "default_interval_h": config.section("publish")["series_default_interval_h"],
+                "available": available}
 
     def _series_view(item: dict[str, Any]) -> dict[str, Any]:
         sidecar = _read_clip_sidecar(config, item["video_id"], item["clip_id"])
@@ -2610,7 +2615,8 @@ def create_app(config: Config | None = None) -> FastAPI:
         return dict(
             mode=body.mode, style=body.style or None, account=account, service=service,
             interval_hours=body.interval_hours, start_at=_publish_parse_slot(body.start_at),
-            count=body.count, selection=selection, schedule=_account_schedule(config, account),
+            count=body.count, selection=selection, together=body.parts_together,
+            schedule=_account_schedule(config, account),
             **_series_scope(service),
         )
 
@@ -3083,6 +3089,7 @@ class SeriesBody(BaseModel):
     start_at: str
     count: int | None = None                    # requis en mode auto
     selection: list[SeriesSelectionItem] | None = None  # requis en mode manuel, dans l'ordre choisi
+    parts_together: bool = True                 # coche « Parties ensemble » (TASK-fc561e4dc7e9), ON par defaut
 
 
 class PublicationPatchBody(BaseModel):
