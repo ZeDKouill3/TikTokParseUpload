@@ -6087,17 +6087,22 @@ def test_clips_are_listed_newest_first_by_sidecar_creation_date(tmp_path, isolat
     assert [c["clip_id"] for c in only] == ["02", "01"]  # filtre par vidéo : seulement cette vidéo
 
 
-def test_approving_without_a_channel_says_the_channel_can_be_chosen_right_there(tmp_path, isolated_cwd):
+def test_approving_a_clip_of_a_video_without_style_uses_the_account_only(tmp_path, isolated_cwd):
+    # SPEC-6076 R2 / SPEC-1ed3 R3 : un style ne porte plus de compte ni de créneaux, le compte suffit ;
+    # l'entrée va dans la file _sans_chaine (lue par le worker), seule ou en groupe.
     _channels_setup(tmp_path)
     _write_state(tmp_path, CLIPS_VIDEO)
     _write_clip(tmp_path, CLIPS_VIDEO, _clip_sidecar("01"))
+    _write_clip(tmp_path, CLIPS_VIDEO, _clip_sidecar("02"))
+    _accounts_state(tmp_path, ready=(READY,))
 
-    resp = client(tmp_path).post(f"/api/clips/{CLIPS_VIDEO}/01/approve")
+    one = client(tmp_path).post(f"/api/clips/{CLIPS_VIDEO}/01/approve", json={"account": READY})
+    bulk = client(tmp_path).post("/api/clips/approve", json={"account": READY, "clips": [{"video_id": CLIPS_VIDEO, "clip_id": "02"}]})
 
-    assert resp.status_code == 409
-    body = resp.json()
-    assert "n'a pas de style" in body["detail"]
-    assert body["needs_channel"] is True and body["video_id"] == CLIPS_VIDEO and body["channels"] == [CH]
+    assert one.status_code == 200, one.text
+    assert bulk.status_code == 200, bulk.text
+    entries = json.loads((tmp_path / "state" / "publish" / "_sans_chaine.json").read_text(encoding="utf-8"))
+    assert sorted((e["clip_id"], e["account"]) for e in entries) == [("01", READY), ("02", READY)]
 
 
 def test_assigning_a_channel_to_a_video_writes_pipeline_json_and_unblocks_approval(tmp_path, isolated_cwd, caplog):

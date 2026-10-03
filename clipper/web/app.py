@@ -2186,7 +2186,8 @@ def create_app(config: Config | None = None) -> FastAPI:
     def _decide(video_id: str, clip_id: str, action: str, **extra: Any) -> dict[str, Any]:
         _validate_video_id(video_id)
         _validate_clip_id(clip_id)
-        channel = _require_channel(video_id, clip_id, config)
+        # Vidéo sans style : file _sans_chaine, le compte suffit (SPEC-6076 R2, SPEC-1ed3 R3).
+        channel = _require_channel(video_id, clip_id, config, or_no_channel=True)
         kwargs: dict[str, Any] = {"output_dir": Path(config.output_dir), "state_dir": _publish_dir(config), **extra}
         if action == "approve":
             kwargs["presets_dir"] = _PRESETS_DIR
@@ -2202,7 +2203,6 @@ def create_app(config: Config | None = None) -> FastAPI:
         sont ceux du compte."""
         _validate_video_id(video_id)
         _validate_clip_id(clip_id)
-        _require_channel(video_id, clip_id, config)
         if body is None or body.account is None:
             raise HTTPException(status_code=409, detail="compte de publication manquant : choisis un compte prêt à publier "
                                 "(un style n'a plus de compte associé)")
@@ -2254,7 +2254,7 @@ def create_app(config: Config | None = None) -> FastAPI:
         for video_id, clip_id in expanded:
             if video_id not in channel_of_video:
                 try:
-                    channel_of_video[video_id] = _require_channel(video_id, clip_id, config)
+                    channel_of_video[video_id] = _require_channel(video_id, clip_id, config, or_no_channel=True)
                 except HTTPException as exc:
                     channel_of_video[video_id] = None
                     refused.append(f"{video_id}/{clip_id} : {exc.detail}")
