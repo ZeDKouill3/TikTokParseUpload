@@ -972,9 +972,6 @@ input[type="color"] { width: 36px; height: 36px; padding: 2px; border-radius: va
 .post.published { border-color: color-mix(in srgb, var(--ok) 40%, transparent); background: var(--ok-soft); cursor: default; }
 .post.failed { border-color: color-mix(in srgb, var(--bad) 50%, transparent); background: var(--bad-soft); }
 .post.ch-ma_chaine { box-shadow: inset 3px 0 0 #9146ff; }
-.queue { display: flex; flex-direction: column; gap: 8px; }
-.queue .post { padding: 8px; font-size: 13px; }
-.queue .post .mini-clip { width: 32px; }
 .banner { display: flex; gap: 16px; align-items: center; padding: 16px 24px; border-radius: var(--r-lg); background: var(--info-soft); border: 1px solid color-mix(in srgb, var(--info) 25%, transparent); margin-bottom: 24px; }
 .banner .i { color: var(--info); }
 .banner p { font-size: 14px; color: var(--text-2); }
@@ -1331,11 +1328,6 @@ input[type="color"] { width: 36px; height: 36px; padding: 2px; border-radius: va
 .post.failed { border-color: color-mix(in srgb, var(--bad) 50%, transparent); background: var(--bad-soft); }
 .post.missing { opacity: 0.6; }
 .post-ghost { position: fixed; z-index: 120; width: 180px; transform: translate(-50%, -120%); pointer-events: none; box-shadow: var(--shadow); opacity: 0.95; }
-.queue { display: flex; flex-direction: column; gap: 8px; }
-.queue .post { padding: 8px; font-size: 13px; }
-.queue .post .mini-clip { width: 32px; }
-.pub-done { cursor: pointer; }
-.pub-done .mini-clip { width: 28px; }
 .pub-caption { white-space: pre-wrap; font-size: 14px; color: var(--text-2); padding: 12px; border: 1px solid var(--line); border-radius: var(--r-md, 8px); background: var(--surface-2); max-height: 40vh; overflow: auto; }
 @media (max-width: 900px) {
   .pub-grid { grid-template-columns: minmax(0, 1fr); }
@@ -1597,6 +1589,8 @@ input[type="color"] { width: 36px; height: 36px; padding: 2px; border-radius: va
 /* Compte de publication d'un post (SPEC-00d1 R5) : petit libellé sous le titre ; ambre quand le post attend son compte. */
 .post .pub-acct { font-size: 10px; color: var(--muted); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .post .pub-acct.waiting { color: var(--warn); font-weight: 600; }
+/* Service (TikTok / YouTube) d'une case du calendrier (TASK-5c00). */
+.post .pub-service { font-size: 10px; color: var(--muted); }
 .reason.warn { border-color: var(--warn); }
 
 /* Ecran Clips : marge interieure du panneau (onglets et vignettes plus colles aux bords). */

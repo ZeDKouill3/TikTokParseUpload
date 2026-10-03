@@ -1045,6 +1045,19 @@ def planned_times(
     return sorted(times)
 
 
+def after_last_schedule(
+    account: str, interval_hours: float, *, now: datetime | None = None, state_dir: str | Path | None = None,
+    presets_dir: str | Path = "presets", base: str | Path = "config.toml",
+) -> datetime:
+    """Date « Après la dernière programmation + N h » (SPEC-1ed3) : la derniere publication A VENIR du
+    compte (``planned_times``, programmee dans Clipper ou sur le service) plus ``interval_hours`` heures ;
+    maintenant plus ``interval_hours`` heures s'il n'y en a aucune."""
+    now_dt = _now(now)
+    future = [t for t in planned_times(account, state_dir=state_dir, presets_dir=presets_dir, base=base) if t > now_dt]
+    base_time = max(future) if future else now_dt
+    return base_time + timedelta(hours=interval_hours)
+
+
 def _check_caps(
     account: str, target: datetime, exclude: tuple[str, str], settings: dict[str, Any], tz: ZoneInfo,
     state_dir: str | Path | None, presets_dir: str | Path, base: str | Path,

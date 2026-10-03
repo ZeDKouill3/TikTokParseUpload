@@ -156,16 +156,27 @@ function pubPost(c, extra) {
     <div class="mini-clip">${c.video_url ? `<img loading="lazy" decoding="async" width="36" height="64" src="${esc(c.thumbnail_url)}" alt="" tabindex="-1">` : ""}</div>
     <span class="pt">${esc(c.missing ? `Clip introuvable (${c.clip_id})` : pubTitle(c))}</span>
     ${c.account ? `<span class="pub-acct${c.waiting_reason ? " waiting" : ""}" data-post-account title="${esc(c.waiting_reason || `Compte : ${pubAccountLabel(c.account)}`)}">${esc(pubAccountLabel(c.account))}</span>` : ""}
+    ${c.missing ? "" : `<span class="pub-service" data-post-service>${esc(pubServiceName(c))}</span>`}
     ${extra || ""}${icoName ? icon(icoName, "i-xs") : ""}</div>`;
 }
 
+/* Calendrier de la semaine (TASK-5c00) : toujours affiché, les créneaux réguliers (SPEC-6076 R2), les
+   publications programmées hors créneau et les publications terminées (publiées, échecs) de la semaine
+   partagent les mêmes cases, à l'heure de Paris du clip (`slot_at_paris`, jamais réécrit après coup) ; une
+   publication déjà sur un créneau régulier n'y figure qu'une fois (jamais dupliquée avec les terminées). */
 function pubCalendar(d) {
   const off = d.off_slot || [];
-  const times = Array.from(new Set([...d.slots.map((s) => pubTime(s.slot_at_paris)), ...off.map((c) => pubTime(c.slot_at_paris))])).sort();
+  const done = d.done || [];
+  const times = Array.from(new Set([
+    ...d.slots.map((s) => pubTime(s.slot_at_paris)), ...off.map((c) => pubTime(c.slot_at_paris)), ...done.map((c) => pubTime(c.slot_at_paris)),
+  ])).sort();
   const bySlot = {};
   d.slots.forEach((s) => { bySlot[`${pubDayIndex(pubDate(s.slot_at_paris), d.week_start)}|${pubTime(s.slot_at_paris)}`] = s; });
   const byOff = {};
-  off.forEach((c) => { byOff[`${pubDayIndex(pubDate(c.slot_at_paris), d.week_start)}|${pubTime(c.slot_at_paris)}`] = c; });
+  [...off, ...done].forEach((c) => {
+    const key = `${pubDayIndex(pubDate(c.slot_at_paris), d.week_start)}|${pubTime(c.slot_at_paris)}`;
+    if (!bySlot[key]) byOff[key] = c;
+  });
   const today = new Date().toLocaleDateString("sv-SE", { timeZone: PUB_TZ });
   const days = Array.from({ length: 7 }, (_, i) => pubShift(d.week_start, i));
   let h = `<div class="cal-h"></div>${days.map((ymd) => `<div class="cal-h${ymd === today ? " today" : ""}"><div class="d">${esc(pubFmt(ymd, { weekday: "short" }))}</div><div class="n">${esc(pubFmt(ymd, { day: "numeric" }))}</div></div>`).join("")}`;
@@ -177,22 +188,11 @@ function pubCalendar(d) {
         const past = Date.parse(s.slot_at) < Date.now();
         h += `<div class="cal-c slot${past ? " past" : ""}${s.free ? " free" : ""}" data-slot-at="${esc(s.slot_at)}" data-slot="${esc(time)}" aria-label="Créneau ${esc(pubSlotLabel(s.slot_at_paris))}${s.free ? ", libre" : ""}">${s.clip ? pubPost(s.clip) : ""}</div>`;
       } else if (manual) {
-        h += `<div class="cal-c manual" aria-label="Publication programmée ${esc(pubSlotLabel(manual.slot_at_paris))}">${pubPost(manual)}</div>`;
+        h += `<div class="cal-c manual" aria-label="Publication ${esc(pubSlotLabel(manual.slot_at_paris))}">${pubPost(manual)}</div>`;
       } else h += `<div class="cal-c off"></div>`;
     });
   });
   return `<div class="cal-wrap"><div class="cal" id="pub-cal">${h}</div></div>`;
-}
-
-/* Clips approuves sans moment : « Publier maintenant » ouvre le formulaire, ou glisse-les sur un creneau libre. */
-function pubQueue(d) {
-  const items = d.unscheduled;
-  return `<section>
-    <div class="section-title">${icon("inbox")}À publier <span class="more">${items.length ? `${items.length} clip${items.length > 1 ? "s" : ""}` : ""}</span></div>
-    <div class="queue" id="pub-queue">${items.length ? items.map((c) => pubPost(c, `<button type="button" class="btn btn-xs btn-primary" data-publish-now="${esc(pubKey(c))}">Publier maintenant</button>`)).join("")
-      : `<div class="panel empty" style="padding:24px"><div class="empty-art">${icon("circle-check")}</div><p>Rien à publier en attente.</p></div>`}</div>
-    ${items.length && d.slots.length ? `<p class="hint muted" style="font-size:12px;margin-top:8px">Ou glisse un clip sur un créneau libre du calendrier (appui long sur mobile).</p>` : ""}
-  </section>`;
 }
 
 /* Ligne de detail d'une publication terminee : « programmee » tant que l'heure n'est pas passee, « publie » ensuite. */
@@ -202,18 +202,6 @@ function pubDoneLine(c) {
     : live ? "publié" : `programmée sur ${pubServiceName(c)}${c.tiktok_publish_at ? `, en ligne le ${pubWhen(c.tiktok_publish_at)}` : ""}`;
   const at = c.publish_status === "published" && !live ? "" : (c.publish_status === "published" ? (c.published_at_paris || c.slot_at_paris) : c.slot_at_paris);
   return `${state}${at ? ` · ${pubSlotLabel(at)}` : ""}`;
-}
-
-function pubDone(d) {
-  if (!d.done.length) return "";
-  return `<section>
-    <div class="section-title">${icon("circle-check")}Publiés et échecs de la semaine <span class="more">${d.done.length}</span></div>
-    <div class="panel">${d.done.map((c) => `<div class="list-item pub-done" data-post="${esc(pubKey(c))}" tabindex="0" role="button">
-      <div class="mini-clip">${c.video_url ? `<img loading="lazy" decoding="async" width="36" height="64" src="${esc(c.thumbnail_url)}" alt="">` : ""}</div>
-      <div class="li-main grow"><div class="li-title">${esc(pubTitle(c))}</div>
-        <div class="li-sub muted">${esc(pubDoneLine(c))}${c.account ? ` · ${esc(pubAccountLabel(c.account))}` : ""}${c.publish_error ? ` · ${esc(c.publish_error)}` : ""}${c.post_url ? ` · <a href="${esc(c.post_url)}" target="_blank" rel="noopener">voir sur ${pubServiceName(c)}</a>` : ""}</div></div>
-      ${pubChip(c)}</div>`).join("")}</div>
-  </section>`;
 }
 
 /* Comptes TikTok proposes au selecteur : ceux de l'ecran Comptes (le serveur les rend avec chaque reponse). */
@@ -238,20 +226,22 @@ function pubToolbar(d) {
 
 const PUB_HELP = `<div class="banner">${icon("info", "i-lg")}<p><b>Publier :</b> « Nouvelle publication » choisit un clip, un compte, puis Maintenant ou une date ; le worker publie sur TikTok (Chrome visible). Un arrêt (captcha, connexion expirée...) met la publication en échec avec une capture : « Réessayer » la relance. Le sélecteur en haut choisit le compte TikTok (ou tous les comptes). Les créneaux du style lié au compte sont facultatifs : ils servent à planifier un clip approuvé en le glissant sur le calendrier.</p></div>`;
 
-/* Zone principale : le calendrier de la semaine. Le message « aucun creneau » n'y apparait qu'une fois. */
+/* Zone principale : le calendrier de la semaine, toujours affiché (TASK-5c00), même sans compte choisi ni
+   créneaux réguliers. Le message « aucun creneau » n'y apparait qu'une fois, en indication au-dessus du calendrier
+   (jamais à sa place : la semaine garde ses publications passées et à venir). */
 function pubCalendarZone(d) {
   if (pubUi.error) return `<p class="reason bad">Chargement impossible : ${esc(pubUi.error.message || pubUi.error)}</p>`;
   if (!d) return `<div class="skeleton skeleton-line"></div><div class="skeleton skeleton-card"></div>`;
-  if (d.slots.length || (d.off_slot || []).length) return `<section>${pubCalendar(d)}</section>`;
-  return `<p class="reason" data-no-slot>${esc(d.reason || "Aucun créneau cette semaine.")} (facultatif : « Nouvelle publication » publie sans créneau.)</p>`;
+  const hint = d.reason ? `<p class="reason" data-no-slot>${esc(d.reason)} (facultatif : « Nouvelle publication » publie sans créneau.)</p>` : "";
+  return `<section>${hint}${pubCalendar(d)}</section>`;
 }
 
-/* Agencement de la maquette : a gauche Nouvelle publication, les publications en cours et les clips a publier ;
-   a droite le calendrier de la semaine, puis les publies et echecs de la semaine. */
+/* Agencement de la maquette : a gauche « Nouvelle publication » et la liste unique « En attente » (TASK-5c00,
+   validés sans date + publications en cours/échecs) ; a droite le calendrier de la semaine (toujours affiché,
+   passé et futur : créneaux réguliers, programmations hors créneau, publiés et échecs). */
 function pubLayoutHtml(d, postsHtml) {
-  const side = `${postsHtml}${d ? pubQueue(d) : ""}`;
-  const main = `${pubToolbar(d)}${pubCalendarZone(d)}${d ? pubDone(d) : ""}`;
-  return `<div class="pub-pad">${PUB_HELP}<div class="grid g-side pub-grid" style="align-items:start"><div class="stack pub-side">${side}</div><div class="stack pub-main">${main}</div></div></div>`;
+  const main = `${pubToolbar(d)}${pubCalendarZone(d)}`;
+  return `<div class="pub-pad">${PUB_HELP}<div class="grid g-side pub-grid" style="align-items:start"><div class="stack pub-side">${postsHtml}</div><div class="stack pub-main">${main}</div></div></div>`;
 }
 
 function pubView(body) {
@@ -285,22 +275,26 @@ function pubPostRow(p) {
       ${p.capture_url ? `<a href="${esc(p.capture_url)}" target="_blank" rel="noopener">voir la capture d'écran</a>` : ""}</div>
     ${pubChip(p)}
     <div class="row wrap" style="gap:6px">
+      ${pubNeedsMoment(p) ? `<button type="button" class="btn btn-xs btn-primary" data-publish-now="${esc(pubKey(p))}">Publier maintenant</button>` : ""}
       ${p.publish_status === "failed" ? `<button type="button" class="btn btn-xs btn-primary" data-pub-retry>Réessayer</button>` : ""}
       ${p.editable ? `<button type="button" class="btn btn-xs" data-pub-edit>Modifier</button><button type="button" class="btn btn-xs btn-ghost" data-pub-cancel>Annuler</button>` : ""}
     </div></div>`;
 }
 
+/* Liste unique « En attente » (TASK-5c00, SPEC-1ed3) : les clips validés sans date et les publications en
+   cours ou en échec ne sont listés qu'une fois ici (la section « À publier » faisait doublon avec celle-ci :
+   un clip validé sans date y apparaissait aussi, cf. `pubNeedsMoment`, avec son propre « Publier maintenant »). */
 function pubPostsSection() {
   const rows = pubPosts.data ? pubPosts.data.publications.filter((p) => pubIsOngoing(p) && (!pubUi.account || p.account === pubUi.account)) : [];
   // Boutons sur leur propre ligne : dans le titre, ils debordaient sur la colonne de droite (colonne etroite).
-  const head = `<div class="section-title">${icon("send")}Publications <span class="more">${rows.length || ""}</span></div>
+  const head = `<div class="section-title">${icon("inbox")}En attente <span class="more">${rows.length || ""}</span></div>
     <div class="row wrap" style="gap:8px;margin-bottom:10px">
     <button type="button" class="btn btn-primary btn-xs grow" data-pub-new>${icon("plus", "i-xs")}Nouvelle publication</button>
     <button type="button" class="btn btn-xs grow" data-pub-series>${icon("calendar-days", "i-xs")}Programmer une série</button></div>`;
   if (pubPosts.error) return `<section>${head}<p class="reason bad">Chargement impossible : ${esc(pubPosts.error.message || pubPosts.error)}</p></section>`;
   if (!pubPosts.data) return `<section>${head}<div class="skeleton skeleton-line"></div></section>`;
   return `<section>${head}${rows.length ? `<div class="panel" id="pub-posts">${rows.map(pubPostRow).join("")}</div>`
-    : `<p class="muted" style="font-size:13px">Aucune publication en cours : « Nouvelle publication » choisit un clip, le compte, maintenant ou à une date. Les publications terminées sont dans le calendrier.</p>`}</section>`;
+    : `<p class="muted" style="font-size:13px">Aucune publication en attente : « Nouvelle publication » choisit un clip, le compte, maintenant ou à une date. Les publications terminées sont dans le calendrier.</p>`}</section>`;
 }
 
 async function pubPostCancel(p) {
@@ -366,8 +360,13 @@ function pubFormHtml(f) {
         <div class="row wrap" style="gap:16px">
           <label class="row" style="gap:6px"><input type="radio" name="pub-form-when" value="immediate" id="pub-form-now"${f.mode === "immediate" ? " checked" : ""}> Maintenant</label>
           <label class="row" style="gap:6px"><input type="radio" name="pub-form-when" value="scheduled" id="pub-form-later"${f.mode === "scheduled" ? " checked" : ""}> Programmer</label>
-          <input class="input" id="pub-form-at" type="datetime-local" aria-label="Date et heure"${f.mode === "scheduled" ? "" : " hidden"} value="${esc(f.at || "")}"></div>
-        <span class="hint" id="pub-form-when-hint">${esc(pubWhenHint(f, "tiktok"))}</span></div>
+          <input class="input" id="pub-form-at" type="datetime-local" aria-label="Date et heure"${f.mode === "scheduled" ? "" : " hidden"} value="${esc(f.at || "")}">
+          <label class="row" style="gap:6px"><input type="radio" name="pub-form-when" value="after_last" id="pub-form-after"${f.mode === "after_last" ? " checked" : ""}> Après la dernière programmation</label>
+          <input class="input" id="pub-form-interval" type="number" min="1" step="1" aria-label="Intervalle (heures)"${f.mode === "after_last" ? "" : " hidden"} value="${esc(String(f.intervalH || 4))}" style="width:8ch"></div>
+        <span class="hint" id="pub-form-when-hint"${f.mode === "after_last" ? " hidden" : ""}>${esc(pubWhenHint(f, "tiktok"))}</span>
+        <p class="hint" id="pub-form-after-hint"${f.mode === "after_last" ? "" : " hidden"}>${f.afterAt
+          ? `Programmée ${esc(pubSlotLabel(f.afterAt))} (dernière programmation du compte + ${esc(String(f.intervalH || 4))} h).`
+          : "Choisis un compte et un intervalle."}</p></div>
       <div class="field"><label for="pub-form-caption">Légende</label><textarea class="input" id="pub-form-caption" rows="3">${esc(f.caption)}</textarea></div>
       <div class="field"><label for="pub-form-tags">Hashtags</label><input class="input" id="pub-form-tags" value="${esc(f.tags)}"><span class="hint">Séparés par des espaces.</span></div>
       <div class="stack" id="pub-form-tiktok" style="gap:16px">
@@ -423,7 +422,7 @@ async function pubFormSelect(f, d, key) {
 }
 
 function pubFormBody(f, d) {
-  const now = $("#pub-form-now", d).checked;
+  const mode = $("input[name='pub-form-when']:checked", d).value;
   const youtube = pubFormService(d) === "youtube";
   const title = $("#pub-form-yt-title", d).value.trim();
   const options = youtube
@@ -434,20 +433,47 @@ function pubFormBody(f, d) {
       content_check: $("#pub-form-check", d).value,
     };
   const body = {
-    account: $("#pub-form-account", d).value, mode: now ? "immediate" : "scheduled",
+    account: $("#pub-form-account", d).value, mode: mode === "after_last" ? "scheduled" : mode,
     description: $("#pub-form-caption", d).value, hashtags: parseHashtags($("#pub-form-tags", d).value),
     options,
   };
-  if (!now) {
+  if (mode === "scheduled") {
     const at = $("#pub-form-at", d).value;
     body.publish_at = at ? pubParisInstant(at).toISOString() : null; // l'heure saisie est celle de Paris
+  } else if (mode === "after_last") {
+    body.publish_at = f.afterAt || null; // calculée côté serveur (/api/publications/after-last), affichée avant validation
   }
   return body;
+}
+
+/* « Après la dernière programmation + N h » (SPEC-1ed3) : la date est calculée côté Python, affichée avant
+   validation ; les refus habituels (fenêtre, avance minimale, plafonds) se vérifient à la création, comme
+   toute publication programmée. */
+async function pubFormRefreshAfterLast(f, d) {
+  const hint = $("#pub-form-after-hint", d);
+  const account = $("#pub-form-account", d).value;
+  const interval = Number($("#pub-form-interval", d).value);
+  f.intervalH = interval;
+  if (!account || !(interval > 0)) {
+    f.afterAt = null;
+    hint.textContent = "Choisis un compte et un intervalle.";
+    return;
+  }
+  try {
+    const res = await api(`/api/publications/after-last?account=${pubEnc(account)}&interval_hours=${pubEnc(interval)}`);
+    f.afterAt = res.publish_at;
+    hint.textContent = `Programmée ${pubSlotLabel(res.publish_at_paris)} (dernière programmation du compte + ${interval} h).`;
+  } catch (err) {
+    f.afterAt = null;
+    hint.textContent = err.message || String(err);
+  }
 }
 
 async function pubFormSubmit(f, d) {
   const err = $("#pub-form-error", d);
   err.hidden = true;
+  const afterLast = $("#pub-form-after", d).checked;
+  if (afterLast && !f.afterAt) { err.textContent = "Choisis un compte et un intervalle valides avant de valider."; err.hidden = false; return; }
   const body = pubFormBody(f, d);
   if (!body.account) { err.textContent = "Choisis un compte prêt à publier (écran Comptes)."; err.hidden = false; return; }
   if (!f.edit && !f.selected) { err.textContent = "Choisis un clip."; err.hidden = false; return; }
@@ -489,6 +515,7 @@ async function pubOpenForm(preset, edit) {
     at: edit && edit.publish_mode === "scheduled" && edit.slot_at ? pubLocalInput(edit.slot_at) : "",
     caption: base ? (base.description || "") : "", tags: base ? (base.hashtags || []).join(" ") : "",
     minMinutes: data.defaults.schedule_min_minutes, maxDays: data.defaults.schedule_max_days,
+    intervalH: 4, afterAt: null,
   };
   if (preset && !edit && base && !f.clips.some((c) => pubKey(c) === pubKey(base))) {
     toastError("Ce clip ne peut pas être publié", new Error("Il n'est ni à valider ni approuvé (refusé, déjà publié ou déjà en file)."));
@@ -502,9 +529,21 @@ async function pubOpenForm(preset, edit) {
       if (f.selected) pubFormSelect(f, d, f.selected);
     }
     if (edit && edit.account) $("#pub-form-account", d).value = edit.account;
-    $("#pub-form-account", d).onchange = () => pubFormShowService(f, d);
+    $("#pub-form-account", d).onchange = () => { pubFormShowService(f, d); if ($("#pub-form-after", d).checked) pubFormRefreshAfterLast(f, d); };
     pubFormShowService(f, d);
-    $$("input[name='pub-form-when']", d).forEach((r) => (r.onchange = () => { $("#pub-form-at", d).hidden = !$("#pub-form-later", d).checked; }));
+    $$("input[name='pub-form-when']", d).forEach((r) => (r.onchange = () => {
+      const afterLast = $("#pub-form-after", d).checked;
+      $("#pub-form-at", d).hidden = !$("#pub-form-later", d).checked;
+      $("#pub-form-interval", d).hidden = !afterLast;
+      $("#pub-form-after-hint", d).hidden = !afterLast;
+      $("#pub-form-when-hint", d).hidden = afterLast;
+      if (afterLast) pubFormRefreshAfterLast(f, d);
+    }));
+    let afterTimer = null;
+    $("#pub-form-interval", d).addEventListener("input", () => {
+      clearTimeout(afterTimer);
+      afterTimer = setTimeout(() => pubFormRefreshAfterLast(f, d), 400);
+    });
     $("#pub-form-submit", d).onclick = () => pubFormSubmit(f, d);
   });
 }
