@@ -629,7 +629,7 @@ function pubSeriesFormHtml(f) {
           <div class="pubf-clips" id="pubs-pool" role="listbox" aria-label="Clips disponibles"></div></div>
         <div class="field"><span class="field-label">Sélection (<span id="pubs-sel-count">${count}</span> vidéo(s), ordre de publication)</span>
           <div class="panel" id="pubs-selected"></div></div>`
-        : `<p class="muted" style="font-size:13px">${count} vidéo${count > 1 ? "s" : ""} seront choisies automatiquement, par score décroissant.</p>`}
+        : `<p class="muted" style="font-size:13px" data-pubs-count-note>${count} vidéo${count > 1 ? "s" : ""} seront choisies automatiquement, par score décroissant.</p>`}
       <p class="hint">${PUBS_WHEN_HINT}</p>
       <p class="reason bad" id="pubs-error" hidden role="alert"></p>
       <div id="pubs-preview"></div>
@@ -718,10 +718,27 @@ function pubSeriesWire(f, d) {
   };
   $("#pubs-check", d).onclick = () => pubSeriesPreview(f, d);
   $("#pubs-submit", d).onclick = () => pubSeriesSubmit(f, d);
-  ["#pubs-start", "#pubs-interval", "#pubs-count"].forEach((sel) => {
+  // L'apercu se relance tout seul (500 ms apres la derniere saisie) : « Valider » ne reste plus grise
+  // faute d'avoir clique « Apercu », et le nombre annonce suit le champ.
+  let timer = null;
+  const refresh = () => {
+    f.preview = null;
+    pubSeriesRenderPreview(f, d);
+    const countEl = $("#pubs-count", d);
+    const note = $("[data-pubs-count-note]", d);
+    if (countEl && note) {
+      const n = Number(countEl.value) || 0;
+      f.count = n;
+      note.textContent = `${n} vidéo${n > 1 ? "s" : ""} seront choisies automatiquement, par score décroissant.`;
+    }
+    clearTimeout(timer);
+    if (f.mode === "auto" || f.selected.length) timer = setTimeout(() => pubSeriesPreview(f, d), 500);
+  };
+  ["#pubs-start", "#pubs-interval", "#pubs-count", "#pubs-account", "#pubs-style"].forEach((sel) => {
     const el = $(sel, d);
-    if (el) el.oninput = () => { f.preview = null; pubSeriesRenderPreview(f, d); };
+    if (el) el.addEventListener(el.tagName === "SELECT" ? "change" : "input", refresh);
   });
+  if (f.mode === "auto") pubSeriesPreview(f, d);
   if (f.mode === "manual") pubSeriesRenderManual(f, d);
 }
 
