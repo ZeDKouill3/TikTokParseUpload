@@ -15,9 +15,6 @@ version = 1
 # Page ouverte pour la connexion a la main et pour la verification « pret a publier ».
 # vérifié 2026-10-03
 studio = "https://studio.youtube.com"
-# Page d'envoi d'une chaine ({channel_id} = identifiant UC lu dans l'adresse de Studio) : ouvre la dialog d'envoi.
-# vérifié 2026-10-03
-upload = "https://studio.youtube.com/channel/{channel_id}/videos/upload?d=ud"
 # Adresse publique d'un Short ({id} = identifiant lu dans le lien affiche des l'etape Details).
 # vérifié 2026-10-03
 short = "https://youtube.com/shorts/{id}"
@@ -32,9 +29,6 @@ login_url_markers = ["accounts.google.com"]
 # Fragments d'adresse des verifications Google (« confirmez votre identite ») : arret « verification », pas « login ».
 # NON VÉRIFIÉ
 verification_url_markers = ["/signin/challenge", "/speedbump", "/v3/signin/challenge"]
-# La dialog d'envoi est ouverte (adresse de la page d'envoi).
-# NON VÉRIFIÉ
-upload_url_marker = "/videos/upload"
 # Lien du Short affiche des l'etape Details : le groupe capture l'identifiant de la video.
 # vérifié 2026-10-03
 short_id_pattern = 'youtube\.com/shorts/([\w-]+)'
@@ -49,6 +43,14 @@ time_value_pattern = '^\d{1,2}:\d{2}$'
 # La navigation affiche « Votre chaîne <nom de la chaine> ».
 # vérifié 2026-10-03
 channel_prefix = "Votre chaîne"
+# Bouton d'ouverture du menu d'envoi (banniere) et entree de ce menu qui ouvre la dialog d'envoi : le chemin reel
+# (l'URL /videos/upload redirige vers le tableau de bord, elle n'ouvre jamais la dialog), chemin confirme par
+# clipper.browser sur la vraie page, releve des entrees : « Importer des vidéos », « Passer au direct »,
+# « Nouvelle playlist », « Nouveau podcast ».
+# vérifié 2026-10-03 (Chrome piloté)
+create = "Créer"
+# vérifié 2026-10-03 (Chrome piloté)
+upload_menu = "Importer des vidéos"
 # Libelles des boutons, radios et sections de la dialog d'envoi (YouTube Studio en francais, vérifié 2026-10-03).
 next = "Suivant"
 kids_yes = "Oui, elle est conçue pour les enfants"
@@ -74,6 +76,10 @@ navigation = "[role='navigation']"
 # Champ de fichier de la dialog d'envoi (set_input_files).
 # vérifié 2026-10-03
 file_input = "input[type='file']"
+# Entrees du menu ouvert par « Créer » (role ARIA menuitem) : « Importer des vidéos », « Passer au direct »,
+# « Nouvelle playlist », « Nouveau podcast ».
+# vérifié 2026-10-03 (Chrome piloté)
+menu_item = "[role='menuitem']"
 # Zones de texte de l'etape Details : 1re = titre, 2e = description (div#textbox role=textbox).
 # vérifié 2026-10-03
 text_box = "div#textbox[role='textbox']"
