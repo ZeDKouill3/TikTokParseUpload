@@ -1129,6 +1129,15 @@ def cancel_post(
         _save_entries(path, [e for e in entries if e is not entry])
 
 
+# Ce qui doit etre identique entre l'instantane du worker et l'entree relue pour qu'il la pilote.
+_TAKEOVER_FIELDS: tuple[tuple[str, Callable[[dict[str, Any]], Any]], ...] = (
+    ("compte", entry_account),
+    ("date", lambda e: e.get("slot_at")),
+    ("mode", lambda e: e.get("publish_mode")),
+    ("réglages", lambda e: e.get("post_options")),
+)
+
+
 def mark_in_progress(
     video_id: str,
     clip_id: str,
@@ -1136,15 +1145,29 @@ def mark_in_progress(
     *,
     now: datetime | None = None,
     state_dir: str | Path | None = None,
+    expected: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Le worker pilote TikTok pour cette entree (« en cours ») : plus modifiable ni annulable ; efface par
-    ``mark_published`` / ``mark_failed``."""
+    """Le worker prend la main sur cette entree (« en cours ») : plus modifiable ni annulable ; efface par
+    ``mark_published`` / ``mark_failed``. Prise atomique sous le verrou : l'entree doit etre ``scheduled``,
+    pas deja en cours, et (``expected`` : l'instantane lu par le worker) avoir le meme compte, la meme date et
+    les memes reglages ; sinon ``PublishError`` et rien n'est ecrit. Rend l'entree relue sous le verrou."""
     path = _state_path(channel, state_dir)
     with _locked(path):
         entries = _load_entries(path)
         entry = _find_entry(entries, video_id, clip_id)
         if entry is None:
             raise PublishError(f"clip absent de la file de publication : {video_id}/{clip_id}")
+        if entry["status"] != "scheduled":
+            raise PublishError(f"prise en main refusée pour {video_id}/{clip_id} : statut {entry['status']!r} "
+                               "(attendu : 'scheduled')")
+        if entry.get("in_progress_since"):
+            raise PublishError(f"prise en main refusée pour {video_id}/{clip_id} : déjà en cours depuis "
+                               f"{entry['in_progress_since']}")
+        if expected is not None:
+            changed = [label for label, read in _TAKEOVER_FIELDS if read(entry) != read(expected)]
+            if changed:
+                raise PublishError(f"prise en main refusée pour {video_id}/{clip_id} : publication modifiée "
+                                   f"depuis sa lecture ({', '.join(changed)}), relue au prochain passage")
         entry = dict(entry)
         entry["in_progress_since"] = _iso(_now(now))
         _upsert_entry(entries, entry)

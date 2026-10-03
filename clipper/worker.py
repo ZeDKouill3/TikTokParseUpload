@@ -17,6 +17,7 @@ import ctypes
 import json
 import logging
 import os
+import signal
 import sys
 import time
 import uuid
@@ -217,6 +218,53 @@ def remove(video_id: str, *, config: Config | None = None) -> None:
         _write_queue(path, remaining)
 
 
+def cancel(video_id: str, *, config: Config | None = None) -> None:
+    """Annule la video en cours (SPEC-74e9 §2.3) depuis n'importe quel processus (API web), sans construire de
+    ``Worker`` : l'enfant est arrete par le pid lu dans la file (``cancel_grace_s`` puis kill), l'entree quitte
+    la file et ``pipeline.json`` passe ``failed``. Le vrai worker, en voyant son enfant termine, garde cette
+    raison (ecrite apres le lancement). Rien d'autre n'est touche : ni les publications, ni les reprises."""
+    config = config or load_config()
+    path = _queue_path(config)
+    with _locked(path):
+        entry = next((e for e in _read_queue(path) if e["video_id"] == video_id and e["status"] == "running"), None)
+    if entry is None:
+        raise WorkerError(f"aucune video en cours pour {video_id!r}")
+
+    _terminate_pid(entry["pid"], float(config.section("worker")["cancel_grace_s"]))
+    with _locked(path):
+        _write_queue(path, [e for e in _read_queue(path) if e["id"] != entry["id"]])
+
+    from clipper import pipeline
+
+    try:
+        state = pipeline.load_state(video_id, config=config)
+    except pipeline.PipelineError:
+        state = pipeline.new_state(video_id, entry["url"], config.mode, channel=entry.get("channel"))
+    state.pop("dismissed_at", None)
+    state.update(status="failed", reason=_CANCEL_REASON, retry_at=None)
+    pipeline.save_state(state, config=config)
+
+
+def _terminate_pid(pid: int | None, grace: float) -> None:
+    """Arrete le processus ``pid`` s'il vit encore : demande d'arret, ``grace`` secondes, puis kill."""
+    if not _pid_alive(pid):
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)  # Windows : TerminateProcess
+    except OSError as exc:
+        if _pid_alive(pid):
+            raise WorkerError(f"processus {pid} impossible à arrêter : {exc}") from exc
+        return
+    deadline = time.monotonic() + grace
+    while _pid_alive(pid) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if _pid_alive(pid):
+        try:
+            os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+        except OSError as exc:
+            log.error("processus %s : kill impossible après %g s : %s", pid, grace, exc)
+
+
 _STILL_ACTIVE = 259
 
 
@@ -292,6 +340,11 @@ class Worker:
         self._process: Any | None = None
         self._entry: dict[str, Any] | None = None
         self._last_beat: float | None = None
+
+    def startup(self) -> None:
+        """Reprises de demarrage du vrai worker (``clipper worker``, appelees par ``loop`` seulement) : orphelins
+        de la file, publications interrompues, migration des anciens styles. Jamais dans le constructeur : un
+        autre processus qui construirait un Worker passerait en echec la publication que le worker pilote."""
         self._recover_orphans()
         self._recover_interrupted_publications()
         self._migrate_legacy_presets()
@@ -496,6 +549,11 @@ class Worker:
                        "aucun compte de publication choisi : modifie la publication et choisis un compte prêt à publier",
                        halted=False, account=None, state_dir=paths["state_dir"])
             return False
+        target = slot if mode == "scheduled" else now
+        waiting_for = self._previous_part_missing(entry, name, target, paths["state_dir"])
+        if waiting_for is not None:
+            self._wait(entry, name, account, waiting_for, paths["state_dir"])
+            return False
         if not self._account_ready(entry, name, account, paths["state_dir"]):
             return False
         scope = {"state_dir": paths["state_dir"], "presets_dir": paths["presets_dir"], "base": paths["base"]}
@@ -531,10 +589,16 @@ class Worker:
         if entry.get("waiting_reason"):
             publish_mod.set_waiting_reason(video_id, clip_id, name, None, state_dir=paths["state_dir"])
         try:
+            # prise en main atomique : l'entree a pu changer (compte, date, reglages, refus) pendant la verification
+            # de connexion ; sinon elle n'est pas pilotee et sera relue au prochain passage
+            publish_mod.mark_in_progress(video_id, clip_id, name, expected=entry, state_dir=paths["state_dir"])
+        except publish_mod.PublishError as exc:
+            log.warning("%s/%s : non pilotée : %s", video_id, clip_id, exc)
+            return False
+        try:
             payload = youtube.clip_payload if service == "youtube" else tiktok.clip_payload
             clip = payload(publish_mod.read_sidecar(self.config.output_dir, video_id, clip_id), self.config.output_dir)
             extra = {"options": entry["post_options"]} if entry.get("post_options") else {}
-            publish_mod.mark_in_progress(video_id, clip_id, name, state_dir=paths["state_dir"])
             publisher = self.youtube_publisher if service == "youtube" else self.publisher
             result = publisher(clip, account, mode=mode, schedule_at=slot if mode == "scheduled" else None,
                                config=self.config, on_tick=self._beat, **extra)
@@ -560,6 +624,29 @@ class Worker:
                                "reason": f"{done} : {result['post_url'] or result['note']}", "capture": None},
                               config=self.config)
         return True
+
+    @staticmethod
+    def _previous_part_missing(entry: dict[str, Any], channel: str, target: datetime,
+                               state_dir: str | Path) -> str | None:
+        """Une serie part entiere et dans l'ordre : la partie N>1 attend que la partie N-1 soit publiee, ou
+        programmee sur le service a une date qui ne passe pas apres ``target`` (date visee de la partie N).
+        Rend la raison de l'attente, None si la partie peut partir."""
+        series_id, part = entry.get("series_id"), entry.get("part")
+        if not series_id or not isinstance(part, int) or part <= 1:
+            return None
+        previous = next((e for e in publish_mod.list_entries(channel, state_dir=state_dir)
+                         if e["video_id"] == entry["video_id"] and e.get("series_id") == series_id
+                         and e.get("part") == part - 1), None)
+        reason = f"partie {part - 1} non publiée"
+        if previous is None:
+            return f"{reason} (absente de la file) : la série part entière et dans l'ordre"
+        if previous["status"] != "published":
+            return f"{reason} (statut {previous['status']}) : la série part entière et dans l'ordre"
+        if str(previous.get("tiktok_state") or "").startswith("scheduled_on_"):
+            at = previous.get("tiktok_publish_at")
+            if not at or datetime.fromisoformat(at) > target:
+                return f"{reason} : programmée sur le service le {at or 'date inconnue'}, après cette partie"
+        return None
 
     def _wait(self, entry: dict[str, Any], channel: str, account: str, reason: str, state_dir: str | Path) -> None:
         """Entree non tentee (SPEC-00d1 R4) : elle reste ``scheduled`` avec la raison visible ; journal et
@@ -702,40 +789,11 @@ class Worker:
             self._process = None
             self._entry = None
 
-    def _terminate_process(self) -> None:
-        self._process.terminate()
-        grace = float(self.config.section("worker")["cancel_grace_s"])
-        deadline = time.monotonic() + grace
-        while self._process.poll() is None and time.monotonic() < deadline:
-            time.sleep(0.05)
-        if self._process.poll() is None:
-            self._process.kill()
-
-    def cancel(self, video_id: str) -> None:
-        """Termine l'enfant en cours pour ``video_id`` et fait passer
-        ``pipeline.json`` en ``failed`` (SPEC-74e9 §2.3)."""
-        entries = _read_queue(self._path)
-        entry = next((e for e in entries if e["video_id"] == video_id and e["status"] == "running"), None)
-        if entry is None:
-            raise WorkerError(f"aucune video en cours pour {video_id!r}")
-
-        self._terminate_process()
-        with _locked(self._path):
-            entries = [e for e in _read_queue(self._path) if e["id"] != entry["id"]]
-            _write_queue(self._path, entries)
-        self._process = None
-        self._entry = None
-
-        from clipper import pipeline
-
-        state = pipeline.load_state(video_id, config=self.config)
-        state.update(status="failed", reason=_CANCEL_REASON, retry_at=None)
-        pipeline.save_state(state, config=self.config)
-
     def loop(self) -> None:
         """Boucle jusqu'a interruption, a l'intervalle ``poll_interval_s``
         de CONFIG_DEFAULTS (SPEC-74e9 §2.3)."""
         interval = float(self.config.section("worker")["poll_interval_s"])
+        self.startup()
         while True:
             self.tick()
             time.sleep(interval)

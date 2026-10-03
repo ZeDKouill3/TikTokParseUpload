@@ -477,45 +477,18 @@ def test_tick_calls_pipeline_process_queue_when_nothing_to_launch(tmp_path, monk
 # --------------------------------------------------------------------------
 
 
-def test_cancel_terminates_child_and_marks_pipeline_failed(tmp_path):
-    config = _config(tmp_path)
-    worker.enqueue(URL_A, None, "run", config=config)
-    process = FakeProcess()
-    spawner = FakeSpawner(process)
-    _pipeline_state(VIDEO_A, config, status="running")
-
-    w = worker.Worker(config=config, spawner=spawner)
-    w.tick()
-    w.cancel(VIDEO_A)
-
-    assert process.terminate_calls == 1
-    assert _queue(config) == []
-    state = pipeline.load_state(VIDEO_A, config=config)
-    assert state["status"] == "failed"
-    assert state["reason"] == "annulée par l'utilisateur"
-
-
-def test_cancel_kills_after_grace_if_still_alive(tmp_path):
+def test_cancel_kills_after_grace_if_still_alive(tmp_path, monkeypatch):
     config = _config(tmp_path, cancel_grace_s=0)
-    worker.enqueue(URL_A, None, "run", config=config)
-    process = FakeProcess(alive_after_terminate=True)
-    spawner = FakeSpawner(process)
+    _write_queue(config, [_entry(VIDEO_A, URL_A, status="running", pid=4242)])
     _pipeline_state(VIDEO_A, config, status="running")
+    signals = []
+    monkeypatch.setattr(worker, "_pid_alive", lambda pid: len(signals) < 2)  # survit a la demande d'arret
+    monkeypatch.setattr(worker.os, "kill", lambda pid, sig: signals.append((pid, sig)))
 
-    w = worker.Worker(config=config, spawner=spawner)
-    w.tick()
-    w.cancel(VIDEO_A)
+    worker.cancel(VIDEO_A, config=config)
 
-    assert process.terminate_calls == 1
-    assert process.kill_calls == 1
-
-
-def test_cancel_raises_when_video_not_running(tmp_path):
-    config = _config(tmp_path)
-    worker.enqueue(URL_A, None, "run", config=config)
-
-    with pytest.raises(worker.WorkerError):
-        worker.Worker(config=config, spawner=FakeSpawner()).cancel(VIDEO_A)
+    assert [pid for pid, _ in signals] == [4242, 4242]  # demande d'arret, puis kill apres le delai de grace
+    assert pipeline.load_state(VIDEO_A, config=config)["status"] == "failed"
 
 
 # --------------------------------------------------------------------------
@@ -535,7 +508,7 @@ def test_worker_startup_recovers_dead_orphan_to_waiting_front(tmp_path):
     other = _entry("B", "https://youtu.be/B", status="waiting")
     _write_queue(config, [other, orphan])
 
-    worker.Worker(config=config, spawner=FakeSpawner())
+    worker.Worker(config=config, spawner=FakeSpawner()).startup()
 
     entries = _queue(config)
     assert entries[0]["video_id"] == VIDEO_A
@@ -1778,7 +1751,7 @@ def test_starting_the_worker_fails_an_entry_left_in_progress(tmp_path, monkeypat
     config = _pub_env(tmp_path, monkeypatch)
     _manual(tmp_path, "01", datetime.now(timezone.utc), in_progress_since="2026-10-01T10:00:00+00:00")
 
-    _pub_worker(config, FakePublisher())
+    _pub_worker(config, FakePublisher()).startup()
 
     entry = _entries(tmp_path, NO_CHANNEL)[0]
     assert entry["status"] == "failed" and "interrompue" in entry["error"] and entry["in_progress_since"] is None
@@ -1961,3 +1934,261 @@ def test_the_worker_never_fetches_tiktok_stats_for_a_youtube_account(tmp_path, m
     _yt_worker(config, FakeYouTubePublisher(), fetcher=fetcher).tick()
 
     assert [c["account"] for c in fetcher.calls] == ["ef34ab"]  # le compte TikTok seulement
+
+
+# --------------------------------------------------------------------------
+# TASK-2456 (revues r-publication I1, I4, I5 et r-comptes 1) : annulation sans Worker neuf, reprises de
+# demarrage hors du constructeur, prise en main atomique, ordre des parties d'une serie
+# --------------------------------------------------------------------------
+
+import subprocess  # noqa: E402
+
+_SLEEPER = [sys.executable, "-c", "import time; time.sleep(60)"]
+
+
+def _no_worker_built(monkeypatch):
+    def refuse(self, *args, **kwargs):
+        raise AssertionError("un Worker a été construit hors de « clipper worker »")
+
+    monkeypatch.setattr(worker.Worker, "__init__", refuse)
+
+
+def test_building_a_worker_recovers_nothing_until_startup(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    _manual(tmp_path, "01", datetime.now(timezone.utc) + timedelta(hours=1),
+            in_progress_since="2026-10-01T10:00:00+00:00")
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    _write_queue(config, [_entry(VIDEO_B, URL_B, status="waiting"),
+                          _entry(VIDEO_A, URL_A, status="running", pid=dead.pid)])
+
+    w = _pub_worker(config, FakePublisher())
+
+    assert _entries(tmp_path, NO_CHANNEL)[0]["in_progress_since"] == "2026-10-01T10:00:00+00:00"
+    assert [e["status"] for e in _queue(config)] == ["waiting", "running"]
+
+    w.startup()
+
+    entry = _entries(tmp_path, NO_CHANNEL)[0]
+    assert entry["status"] == "failed" and "interrompue" in entry["error"]
+    assert [(e["video_id"], e["status"]) for e in _queue(config)] == [(VIDEO_A, "waiting"), (VIDEO_B, "waiting")]
+
+
+def test_the_worker_loop_runs_the_startup_recovery_once_before_ticking(tmp_path, monkeypatch):
+    config = _config(tmp_path, poll_interval_s=0)
+    calls = []
+    monkeypatch.setattr(worker.Worker, "startup", lambda self: calls.append("startup"), raising=False)
+    monkeypatch.setattr(worker.Worker, "tick", lambda self: calls.append("tick"))
+
+    class _Stop(Exception):
+        pass
+
+    def sleep(seconds):
+        if calls.count("tick") >= 2:
+            raise _Stop
+
+    monkeypatch.setattr(worker.time, "sleep", sleep)
+    with pytest.raises(_Stop):
+        worker.Worker(config=config, spawner=FakeSpawner()).loop()
+
+    assert calls == ["startup", "tick", "tick"]
+
+
+def test_cancel_kills_the_child_by_the_pid_of_the_queue_without_building_a_worker(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    _manual(tmp_path, "01", datetime.now(timezone.utc), in_progress_since="2026-10-03T10:00:00+00:00")
+    child = subprocess.Popen(_SLEEPER)
+    try:
+        _write_queue(config, [_entry(VIDEO_A, URL_A, status="running", pid=child.pid),
+                              _entry(VIDEO_B, URL_B, status="waiting")])
+        _pipeline_state(VIDEO_A, config, status="running")
+        _no_worker_built(monkeypatch)
+
+        worker.cancel(VIDEO_A, config=config)
+
+        assert child.wait(timeout=10) is not None  # l'enfant est arrete
+    finally:
+        if child.poll() is None:
+            child.kill()
+    assert [e["video_id"] for e in _queue(config)] == [VIDEO_B]
+    state = pipeline.load_state(VIDEO_A, config=config)
+    assert (state["status"], state["reason"]) == ("failed", "annulée par l'utilisateur")
+    entry = _entries(tmp_path, NO_CHANNEL)[0]  # la publication en cours du vrai worker n'est pas touchee
+    assert entry["status"] == "scheduled" and entry["in_progress_since"] == "2026-10-03T10:00:00+00:00"
+
+
+def test_cancel_of_a_video_that_is_not_running_is_an_error(tmp_path):
+    config = _config(tmp_path)
+    worker.enqueue(URL_A, None, "run", config=config)
+
+    with pytest.raises(worker.WorkerError, match="aucune video en cours"):
+        worker.cancel(VIDEO_A, config=config)
+
+
+def test_the_real_worker_keeps_the_cancel_reason_when_it_sees_its_child_killed(tmp_path):
+    config = _config(tmp_path)
+    worker.enqueue(URL_A, None, "run", config=config)
+    _pipeline_state(VIDEO_A, config, status="running")
+    children = []
+
+    def spawner(cmd):
+        children.append(subprocess.Popen(_SLEEPER))
+        return children[-1]
+
+    w = worker.Worker(config=config, spawner=spawner)
+    try:
+        w.tick()
+        worker.cancel(VIDEO_A, config=config)
+        children[0].wait(timeout=10)
+        w.tick()
+    finally:
+        for child in children:
+            if child.poll() is None:
+                child.kill()
+
+    assert _queue(config) == []
+    state = pipeline.load_state(VIDEO_A, config=config)
+    assert (state["status"], state["reason"]) == ("failed", "annulée par l'utilisateur")
+
+
+def _edit_entry(tmp_path, channel, clip_id, **fields):
+    path = tmp_path / "state" / "publish" / f"{channel}.json"
+    entries = json.loads(path.read_text(encoding="utf-8"))
+    for e in entries:
+        if e["clip_id"] == clip_id:
+            e.update(fields)
+    path.write_text(json.dumps(entries), encoding="utf-8")
+
+
+class _EditingLogin(FakeLogin):
+    """Verification de connexion pendant laquelle l'utilisateur modifie la publication (ecran Publication)."""
+
+    def __init__(self, edit):
+        super().__init__()
+        self.edit = edit
+
+    def __call__(self, account, *, config=None, now=None):
+        if not self.calls:
+            self.edit()
+        return super().__call__(account, config=config, now=now)
+
+
+def test_an_account_changed_during_the_login_check_is_not_driven_with_the_old_account(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    _manual(tmp_path, "01", datetime.now(timezone.utc), account="ef34ab")
+    pub = FakePublisher()
+    login = _EditingLogin(lambda: _edit_entry(tmp_path, NO_CHANNEL, "01", account=ACCOUNT))
+    w = _pub_worker(config, pub, login)
+
+    w.tick()
+
+    assert pub.calls == []  # jamais l'ancien compte
+    entry = _entries(tmp_path, NO_CHANNEL)[0]
+    assert entry["status"] == "scheduled" and entry["account"] == ACCOUNT and not entry.get("in_progress_since")
+
+    w.tick()  # au passage suivant : le nouveau compte, relu
+
+    assert [c["account"] for c in pub.calls] == [ACCOUNT]
+    assert _entries(tmp_path, NO_CHANNEL)[0]["status"] == "published"
+
+
+def test_a_clip_rejected_during_the_login_check_is_never_driven(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    _manual(tmp_path, "01", datetime.now(timezone.utc))
+    pub = FakePublisher()
+    login = _EditingLogin(lambda: _edit_entry(tmp_path, NO_CHANNEL, "01", status="rejected"))
+
+    _pub_worker(config, pub, login).tick()
+
+    assert pub.calls == []
+    assert _entries(tmp_path, NO_CHANNEL)[0]["status"] == "rejected"
+
+
+def test_options_changed_during_the_login_check_are_not_driven_with_the_old_options(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    _manual(tmp_path, "01", datetime.now(timezone.utc))
+    pub = FakePublisher()
+    changed = {**_OPTIONS, "allow_comments": True}
+    login = _EditingLogin(lambda: _edit_entry(tmp_path, NO_CHANNEL, "01", post_options=changed))
+    w = _pub_worker(config, pub, login)
+
+    w.tick()
+    w.tick()
+
+    assert [c["options"] for c in pub.calls] == [changed]
+
+
+_NO_CAP = {"max_posts_per_day": 10, "min_gap_minutes": 0}
+
+
+def _series_part(tmp_path, clip_id, part, slot_at, **extra):
+    _seed(tmp_path, "ma_chaine", clip_id, slot_at, series_id="s1", **extra)
+    _edit_entry(tmp_path, "ma_chaine", clip_id, part=part)
+
+
+def test_part_two_waits_while_part_one_has_failed(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    _series_part(tmp_path, "c01-p1", 1, _ago(hours=2), status="failed", error="mp4 introuvable")
+    _series_part(tmp_path, "c01-p2", 2, _ago(minutes=1))
+    pub = FakePublisher()
+
+    _pub_worker(config, pub).tick()
+
+    assert pub.calls == []
+    entry = next(e for e in _entries(tmp_path) if e["clip_id"] == "c01-p2")
+    assert entry["status"] == "scheduled" and "partie 1 non publiée" in entry["waiting_reason"]
+
+
+def test_part_two_waits_while_part_one_is_still_to_publish(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    _series_part(tmp_path, "c01-p1", 1, datetime.now(timezone.utc) + timedelta(hours=3))
+    _series_part(tmp_path, "c01-p2", 2, _ago(minutes=1))
+    pub = FakePublisher()
+
+    _pub_worker(config, pub).tick()
+
+    assert pub.calls == []
+    entry = next(e for e in _entries(tmp_path) if e["clip_id"] == "c01-p2")
+    assert "partie 1 non publiée" in entry["waiting_reason"]
+
+
+def test_part_two_goes_once_part_one_is_published(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch, tiktok_settings=_NO_CAP)
+    _series_part(tmp_path, "c01-p1", 1, _ago(hours=9), status="published", tiktok_state="published",
+                 published_at=_ago(hours=9).isoformat(), tiktok_publish_at=_ago(hours=9).isoformat())
+    _series_part(tmp_path, "c01-p2", 2, _ago(minutes=1))
+    pub = FakePublisher()
+
+    _pub_worker(config, pub).tick()
+
+    assert len(pub.calls) == 1
+    assert next(e for e in _entries(tmp_path) if e["clip_id"] == "c01-p2")["status"] == "published"
+
+
+def test_part_two_waits_when_part_one_is_scheduled_on_the_service_after_it(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    later = datetime.now(timezone.utc) + timedelta(days=1)
+    _series_part(tmp_path, "c01-p1", 1, later, status="published", tiktok_state="scheduled_on_tiktok",
+                 published_at=_ago(minutes=5).isoformat(), tiktok_publish_at=later.isoformat())
+    _series_part(tmp_path, "c01-p2", 2, _ago(minutes=1))
+    pub = FakePublisher()
+
+    _pub_worker(config, pub).tick()
+
+    assert pub.calls == []
+    entry = next(e for e in _entries(tmp_path) if e["clip_id"] == "c01-p2")
+    assert "partie 1 non publiée" in entry["waiting_reason"]
+
+
+def test_part_two_goes_when_part_one_is_scheduled_on_the_service_before_it(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch, tiktok_settings=_NO_CAP)
+    earlier = datetime.now(timezone.utc) + timedelta(hours=2)
+    when = datetime.now(timezone.utc) + timedelta(hours=6)
+    _series_part(tmp_path, "c01-p1", 1, earlier, status="published", tiktok_state="scheduled_on_tiktok",
+                 published_at=_ago(minutes=5).isoformat(), tiktok_publish_at=earlier.isoformat())
+    _series_part(tmp_path, "c01-p2", 2, when, publish_mode="scheduled", manual=True)
+    pub = FakePublisher()
+
+    _pub_worker(config, pub).tick()
+
+    assert [(c["mode"], c["schedule_at"]) for c in pub.calls] == [("scheduled", when)]

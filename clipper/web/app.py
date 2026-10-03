@@ -2093,7 +2093,7 @@ def create_app(config: Config | None = None) -> FastAPI:
     def cancel_video(video_id: str) -> dict[str, Any]:
         _validate_video_id(video_id)
         try:
-            worker_mod.Worker(config=config).cancel(video_id)
+            worker_mod.cancel(video_id, config=config)  # par le pid de la file : jamais un Worker ici
         except worker_mod.WorkerError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return {"video_id": video_id, "cancelled": True}

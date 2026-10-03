@@ -24,6 +24,7 @@ Module d'etape isole : n'importe aucune autre etape ni ``clipper.web`` (ADR-b16b
 
 from __future__ import annotations
 
+import functools
 import logging
 import random
 import re
@@ -285,7 +286,7 @@ def verify_login(
     browser.validate_account(account)
     settings = get_settings(config)
     sel = selectors or load_selectors()
-    open_profile = opener or browser._open_context
+    open_profile = opener or functools.partial(browser._open_context, config=config)  # pilot_wait_s du config
     with open_profile(account, headless=False) as context:  # visible : jamais de navigateur cache (ADR-58c0)
         page = context.pages[0] if context.pages else context.new_page()
         check = _Check(page, account, sel, settings, now=now or datetime.now(timezone.utc), sleep=sleep,
@@ -719,7 +720,7 @@ def publish(
         _check_schedule(schedule_at, settings, now)
     browser.validate_account(account)
     sel = selectors or load_selectors()
-    open_profile = opener or browser._open_context
+    open_profile = opener or functools.partial(browser._open_context, config=config)  # pilot_wait_s du config
     with open_profile(account, headless=False) as context:  # visible : jamais de navigateur cache (ADR-58c0)
         page = context.pages[0] if context.pages else context.new_page()
         flow = _Flow(page, account, sel, settings, now=now, sleep=sleep, rng=rng or random.Random(), on_tick=on_tick)

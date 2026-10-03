@@ -1435,3 +1435,26 @@ def test_the_unverified_landmarks_are_flagged_in_the_toml():
     # le repere du bouton final est ecrit sans releve reel : signale ; le lien du Short est releve
     assert "NON VÉRIFIÉ" in text[text.index("# Bouton final de la dialog"):text.index("final_button =")]
     assert "vérifié 2026-10-03" in text[text.index("# Lien youtube.com/shorts/<id> affiche"):text.index("video_link =")]
+
+
+# ---------------------------------------------------------------- [browser] pilot_wait_s (TASK-2456, revue M5)
+
+
+def test_the_pilot_wait_of_the_config_reaches_the_browser_for_publishing_and_login_check(tmp_path, monkeypatch):
+    import time
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setitem(browser.CONFIG_DEFAULTS, "pilot_wait_s", 5)  # le defaut ne doit pas s'appliquer
+    config = Config(mode="review", workspace_dir=tmp_path / "w", output_dir=tmp_path / "output",
+                    _sections={"browser": {"pilot_wait_s": 0.2}})
+    clip = _clip(tmp_path)
+    calls = {
+        "publish": lambda: youtube.publish(clip, "ma_chaine", mode="immediate", config=config, now=NOW),
+        "verify_login": lambda: youtube.verify_login("ma_chaine", config=config, now=NOW),
+    }
+    with browser._pilot_lock("compte_occupe", 1):  # un autre compte est en cours de pilotage
+        for name, call in calls.items():
+            started = time.monotonic()
+            with pytest.raises(browser.BrowserError, match="compte_occupe"):
+                call()
+            assert time.monotonic() - started < 2, f"{name} : pilot_wait_s de config.toml ignoré"
