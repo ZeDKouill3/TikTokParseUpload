@@ -7,16 +7,20 @@
 # signaux mesures plafonne a [bonus] max_total.
 # Retenus : les moments dont le score final >= min_score, avec un plafond
 # souple : au plus max_moments_per_hour moments par heure de video source
-# (plafond = arrondi superieur de max_moments_per_hour x duree en heures, au
-# moins 1), pris par score decroissant ; un moment dont le score atteint
-# always_keep_score est toujours retenu, meme au-dela du plafond, et compte
-# dans le plafond. Entre un passage en serie (multipart) et un clip unique
-# qui se chevauchent, le passage ; entre deux moments du meme format, le
-# mieux note.
+# (plafond = arrondi superieur de max_moments_per_hour x duree en heures),
+# jamais moins que min_moments_cap (plancher pour les videos courtes : sans
+# lui, une video de 7,5 min n'aurait droit qu'a 1 moment), pris par score
+# decroissant ; un moment dont le score atteint always_keep_score est
+# toujours retenu, meme au-dela du plafond, et compte dans le plafond. Entre
+# un passage en serie (multipart) et un clip unique qui se chevauchent, le
+# passage ; entre deux moments du meme format, le mieux note.
 
 min_score = 60
 max_moments_per_hour = 6
 always_keep_score = 70
+# Plancher du plafond ci-dessus (au moins ce nombre de moments, quelle que
+# soit la duree de la video). 1 = ancien comportement (aucun plancher).
+min_moments_cap = 3
 
 # Mots-cles tendance (critere trend) : a mettre a jour avec l'actualite.
 trend_keywords = [
