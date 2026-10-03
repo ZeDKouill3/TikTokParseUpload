@@ -46,6 +46,10 @@ cette version : cette section du changelog suffit.
   vidéos demandé est plafonné au nombre de clips réellement disponibles, et
   une coche « Parties ensemble » (activée par défaut) impose qu'un clip
   découpé en plusieurs parties soit toujours programmé ou publié en entier.
+- « Programmer une série » : coche « À la suite de la dernière
+  programmation » (décochée par défaut) ; la série démarre à la dernière
+  publication à venir du compte + l'intervalle, date calculée côté serveur
+  et affichée à l'heure de Paris.
 
 **Approbation**
 
