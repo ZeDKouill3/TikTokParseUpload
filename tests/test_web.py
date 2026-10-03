@@ -8055,6 +8055,82 @@ def test_series_manual_reorder_moves_a_unit_up_or_down():
 
 
 # --------------------------------------------------------------------------
+# TASK-8c4818a974fa : coche « À la suite de la dernière programmation » dans le formulaire « Programmer
+# une série » : réutilise publish.after_last_schedule via /api/publications/after-last (déjà servi pour
+# « Nouvelle publication », TASK-5c00), jamais de calcul de date dans le JS.
+# --------------------------------------------------------------------------
+
+
+_PUBS_FORM_BASE = {
+    "mode": "auto", "style": "", "units": [], "accounts": [{"id": "ab12cd", "label": "Compte", "ready_to_publish": True}],
+    "start": "2026-10-08T16:00", "intervalH": 3, "count": 1, "selected": [], "preview": None,
+    "together": True, "available": None,
+}
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node absent du PATH")
+def test_series_form_after_last_checkbox_is_unchecked_by_default_with_start_enabled():
+    out = _run_publish(f"pubSeriesFormHtml({json.dumps(_PUBS_FORM_BASE)})")
+    start_tag = re.search(r'<input[^>]*id="pubs-start"[^>]*>', out).group(0)
+    checkbox_tag = re.search(r'<input[^>]*id="pubs-after-last"[^>]*>', out).group(0)
+    assert "disabled" not in start_tag
+    assert 'value="2026-10-08T16:00"' in start_tag                      # décochée : la date saisie reste affichée
+    assert "checked" not in checkbox_tag
+    assert "À la suite de la dernière programmation" in out
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node absent du PATH")
+def test_series_form_after_last_checked_disables_start_and_shows_the_computed_paris_date():
+    body = {**_PUBS_FORM_BASE, "afterLast": True,
+            "afterAt": "2026-10-08T12:00:00+00:00", "afterAtParis": "2026-10-08T14:00:00+02:00"}
+    out = _run_publish(f"pubSeriesFormHtml({json.dumps(body)})")
+    start_tag = re.search(r'<input[^>]*id="pubs-start"[^>]*>', out).group(0)
+    checkbox_tag = re.search(r'<input[^>]*id="pubs-after-last"[^>]*>', out).group(0)
+    hint_span = re.search(r'<span[^>]*id="pubs-after-last-hint"[^>]*>([^<]*)</span>', out)
+    assert " disabled" in start_tag
+    assert 'value="2026-10-08T14:00"' in start_tag                      # heure de Paris calculée, pas l'instant UTC brut
+    assert " checked" in checkbox_tag
+    assert "hidden" not in re.search(r'<span[^>]*id="pubs-after-last-hint"[^>]*>', out).group(0)
+    assert "8 octobre" in hint_span.group(1) and "14:00" in hint_span.group(1) and "3 h" in hint_span.group(1)
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node absent du PATH")
+def test_series_form_after_last_hint_asks_for_an_account_and_interval_before_any_computed_date():
+    out = _run_publish(f"pubSeriesFormHtml({json.dumps({**_PUBS_FORM_BASE, 'afterLast': True})})")
+    hint_span = re.search(r'<span[^>]*id="pubs-after-last-hint"[^>]*>([^<]*)</span>', out)
+    assert "Choisis un compte et un intervalle" in hint_span.group(1)
+
+
+def test_series_after_last_reuses_the_existing_after_last_endpoint_server_side():
+    js = (STATIC / "screens" / "publish.js").read_text(encoding="utf-8")
+    refresh = js[js.index("async function pubSeriesRefreshAfterLast"):js.index("function pubSeriesWire")]
+    assert "/api/publications/after-last" in refresh and "interval_hours" in refresh
+    assert "publish_at_paris" in refresh and "res.publish_at" in refresh
+
+
+def test_series_after_last_checkbox_recomputes_when_account_or_interval_changes():
+    js = (STATIC / "screens" / "publish.js").read_text(encoding="utf-8")
+    assert 'id="pubs-after-last"' in js and "afterLastEl.onchange" in js
+    wire = js[js.index("function pubSeriesWire"):js.index("function pubSeriesRerender")]
+    assert "f.afterLast" in wire
+    assert wire.count("pubSeriesRefreshAfterLast(f, d)") >= 3           # coche, intervalle, compte
+
+
+def test_series_body_uses_the_server_computed_after_last_date_not_a_js_recalculation():
+    js = (STATIC / "screens" / "publish.js").read_text(encoding="utf-8")
+    body = js[js.index("function pubSeriesBody"):js.index("function pubSeriesClampCount")]
+    assert 'afterLast ? (f.afterAt || "")' in body
+    assert "pubParisInstant(startLocal).toISOString()" in body          # décochée : comportement actuel inchangé
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node absent du PATH")
+def test_series_open_form_starts_with_the_after_last_checkbox_unchecked():
+    js = (STATIC / "screens" / "publish.js").read_text(encoding="utf-8")
+    open_form = js[js.index("async function pubOpenSeriesForm"):]
+    assert "afterLast: false" in open_form and "afterAt: null" in open_form
+
+
+# --------------------------------------------------------------------------
 # Journal (TASK-8067) : middleware de journalisation des requetes + GET /api/journal.
 # Le middleware journalise via le logger normal (clipper.web.app) ; c'est le
 # handler de clipper.journal, installe par clipper.__main__ independamment de
