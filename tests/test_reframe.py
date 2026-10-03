@@ -1096,6 +1096,98 @@ def test_unknown_reframe_format_is_an_error(tmp_path, video_dir):
         run(tmp_path, static(), [], format="vertical")
 
 
+# --------------------------------------------------------------------------
+# Éditeur d'agencement letterbox (TASK-3be3) : zones du titre d'écran et des
+# sous-titres réglables par style, {} = zones déduites comme avant.
+# --------------------------------------------------------------------------
+
+
+def test_letterbox_text_dests_default_to_empty_so_the_default_render_is_unchanged():
+    from clipper.reframe import CONFIG_DEFAULTS
+
+    assert CONFIG_DEFAULTS["letterbox_title_dest"] == {}
+    assert CONFIG_DEFAULTS["letterbox_subtitle_dest"] == {}
+    assert CONFIG_DEFAULTS["letterbox_top"] == 440 and CONFIG_DEFAULTS["letterbox_zoom"] == 1.3
+
+
+def test_letterbox_explicit_title_dest_becomes_the_title_zone(tmp_path, video_dir):
+    out, _, _ = run(tmp_path, static(), [], format="letterbox",
+                    letterbox_title_dest={"x": 200, "y": 240, "w": 680, "h": 150})
+
+    zones = load(out)["text_zones"]
+    assert zones["title"] == {"x0": 200, "y0": 240, "x1": 880, "y1": 390}
+    assert zones["subtitles"] == {"x0": 150, "y0": 1246, "x1": 930, "y1": 1448}   # inchangée
+
+
+def test_letterbox_explicit_subtitle_dest_becomes_the_subtitles_zone(tmp_path, video_dir):
+    out, _, _ = run(tmp_path, static(), [], format="letterbox",
+                    letterbox_subtitle_dest={"x": 180, "y": 1260, "w": 720, "h": 120})
+
+    zones = load(out)["text_zones"]
+    assert zones["subtitles"] == {"x0": 180, "y0": 1260, "x1": 900, "y1": 1380}
+    assert zones["title"] == {"x0": 150, "y0": 160, "x1": 930, "y1": 424}          # inchangée
+
+
+def test_letterbox_top_and_zoom_move_and_size_the_sharp_video(tmp_path, video_dir):
+    out, _, _ = run(tmp_path, static(), [], format="letterbox", letterbox_top=400, letterbox_zoom=1.5)
+
+    data = load(out)
+    main = letterbox_panels(letterbox_plan(data))["main"]
+    assert main["dest"] == {"x": 0, "y": 400, "w": 1080, "h": 910}   # 1080 * 1080 / 1280
+    assert data["text_zones"]["title"] == {"x0": 150, "y0": 160, "x1": 930, "y1": 384}
+
+
+@pytest.mark.parametrize("key, rect, fragment", [
+    ("letterbox_title_dest", {"x": 150, "y": 160, "w": 1000, "h": 100}, "deborde du canevas"),
+    ("letterbox_title_dest", {"x": 100, "y": 200, "w": 400, "h": 100}, "zone sure"),
+    ("letterbox_subtitle_dest", {"x": 150, "y": 1300, "w": 780, "h": 300}, "zone sure"),
+    ("letterbox_subtitle_dest", {"x": 150, "y": 1400, "w": 780, "h": 100}, "Partie"),
+    ("letterbox_title_dest", {"x": 150, "y": 160, "w": 780}, "rectangle"),
+])
+def test_letterbox_text_dest_outside_the_frame_or_safe_zone_is_refused_at_load(key, rect, fragment):
+    from clipper.reframe import ReframeError, _settings
+
+    config = Config(mode="review", workspace_dir="workspace", output_dir="output", _sections={"reframe": {key: rect}})
+    with pytest.raises(ReframeError, match=fragment) as err:
+        _settings(config)
+    assert key in str(err.value)
+
+
+def test_letterbox_title_and_subtitle_dests_must_not_overlap():
+    from clipper.reframe import ReframeError, _settings
+
+    config = Config(mode="review", workspace_dir="workspace", output_dir="output", _sections={"reframe": {
+        "letterbox_title_dest": {"x": 150, "y": 200, "w": 780, "h": 300},
+        "letterbox_subtitle_dest": {"x": 150, "y": 400, "w": 780, "h": 200},
+    }})
+    with pytest.raises(ReframeError, match="se chevauchent"):
+        _settings(config)
+
+
+def test_letterbox_explicit_zone_over_the_video_is_an_error(tmp_path, video_dir):
+    from clipper.reframe import ReframeError
+
+    with pytest.raises(ReframeError, match="chevauche le panneau video"):
+        run(tmp_path, static(), [], format="letterbox",
+            letterbox_title_dest={"x": 150, "y": 300, "w": 780, "h": 200})
+
+
+def test_letterbox_video_leaving_the_frame_is_an_error(tmp_path, video_dir):
+    from clipper.reframe import ReframeError
+
+    with pytest.raises(ReframeError, match="sort du cadre"):
+        run(tmp_path, static(), [], format="letterbox", letterbox_top=1200,
+            letterbox_title_dest={"x": 150, "y": 160, "w": 780, "h": 300},
+            letterbox_subtitle_dest={"x": 150, "y": 600, "w": 780, "h": 200})
+
+
+def test_letterbox_top_outside_the_canvas_is_refused_at_load():
+    from clipper.reframe import ReframeError, _settings
+
+    with pytest.raises(ReframeError, match="letterbox_top"):
+        _settings(Config(mode="review", workspace_dir="workspace", output_dir="output", _sections={"reframe": {"letterbox_top": -10}}))
+
+
 def test_letterbox_does_not_require_scenes_json(tmp_path, video_dir):
     (video_dir / "scenes.json").unlink()
     out, _, _ = run(tmp_path, static(), [], format="letterbox")

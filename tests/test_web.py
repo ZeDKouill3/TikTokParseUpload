@@ -3589,6 +3589,159 @@ def test_put_layout_without_any_key_or_with_bad_rect_is_422(tmp_path, isolated_c
     assert c.put("/api/channels/inconnue/layout", json={"badge_dest": _LAYOUT_DEFAULTS["badge_dest"]}).status_code == 404
 
 
+# --- Éditeur d'agencement letterbox (TASK-3be3) -----------------------------
+
+_LB_KEYS = ("letterbox_top", "letterbox_zoom", "letterbox_title_dest", "letterbox_subtitle_dest", "cta_handle_gap")
+_LB_URL = f"/api/channels/{CH}/layout/letterbox"
+
+
+def _preset_of(tmp_path):
+    return tomllib.loads((tmp_path / "presets" / f"{CH}.toml").read_text(encoding="utf-8"))
+
+
+def test_get_layout_names_the_mode_of_the_style(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path)
+    assert client(tmp_path).get(f"/api/channels/{CH}/layout").json()["mode"] == "letterbox"
+    _channels_setup(tmp_path, _CH_PRESET + 'layout = "stream_auto"\nstream_variant = "split"\n')
+    assert client(tmp_path).get(f"/api/channels/{CH}/layout").json()["mode"] == "split"
+    _channels_setup(tmp_path, _CH_PRESET + 'format = "crop"\n')
+    assert client(tmp_path).get(f"/api/channels/{CH}/layout").json()["mode"] == "crop"
+
+
+def test_get_letterbox_layout_gives_values_standard_and_overrides(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path)
+    (tmp_path / "config.toml").write_text('mode = "review"\n[reframe]\nletterbox_top = 460\n', encoding="utf-8")
+
+    data = client(tmp_path).get(_LB_URL).json()
+
+    assert data["values"] == {"letterbox_top": 460, "letterbox_zoom": 1.5, "letterbox_title_dest": {},
+                              "letterbox_subtitle_dest": {}, "cta_handle_gap": 8}
+    # standard = config.toml puis défauts, sans le preset
+    assert data["standard"] == {"letterbox_top": 460, "letterbox_zoom": 1.3, "letterbox_title_dest": {},
+                                "letterbox_subtitle_dest": {}, "cta_handle_gap": 8}
+    assert data["overridden"] == ["letterbox_zoom"]
+    assert data["canvas"] == {"w": 1080, "h": 1920}
+    assert data["safe"] == {"left": 150, "top": 160, "right": 930, "bottom": 1520}
+    assert (data["text_gap"], data["part_height"], data["title_lift"]) == (16, 56, 40)
+    assert data["cta"] == {"enabled": False, "handle": "", "font_size": 32}
+    assert data["title_enabled"] is True
+
+
+def test_put_letterbox_layout_writes_only_the_values_that_differ_from_the_standard(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path)
+    title = {"x": 200, "y": 200, "w": 680, "h": 200}
+
+    resp = client(tmp_path).put(_LB_URL, json={"letterbox_top": 470, "letterbox_title_dest": title})
+
+    assert resp.status_code == 200, resp.text
+    saved = _preset_of(tmp_path)
+    assert saved["reframe"] == {"letterbox_zoom": 1.5, "letterbox_top": 470, "letterbox_title_dest": title}
+    assert "render" not in saved                                        # cta_handle_gap non envoyé : hérité
+    assert saved["channel"]["display_name"] == "Ma chaîne"
+    assert resp.json()["values"]["letterbox_top"] == 470
+    assert sorted(resp.json()["overridden"]) == ["letterbox_title_dest", "letterbox_top", "letterbox_zoom"]
+
+
+def test_put_letterbox_layout_value_back_to_standard_removes_the_override(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path)
+
+    resp = client(tmp_path).put(_LB_URL, json={"letterbox_zoom": 1.3, "cta_handle_gap": 14})
+
+    assert resp.status_code == 200, resp.text
+    saved = _preset_of(tmp_path)
+    assert "letterbox_zoom" not in saved.get("reframe", {})            # égal au standard : plus surchargé
+    assert saved["render"] == {"cta_handle_gap": 14}                    # [render] du preset
+    assert resp.json()["overridden"] == ["cta_handle_gap"]
+
+
+def test_delete_letterbox_layout_goes_back_to_the_standard(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path, _CH_PRESET + 'letterbox_top = 480\nstream_exclude_margin = 60\n'
+                    '\n[render]\ncta_handle_gap = 20\ncrf = 20\n')
+
+    resp = client(tmp_path).delete(_LB_URL)
+
+    assert resp.status_code == 200, resp.text
+    saved = _preset_of(tmp_path)
+    assert saved["reframe"] == {"stream_exclude_margin": 60}            # le reste du preset est gardé
+    assert saved["render"] == {"crf": 20}
+    assert resp.json()["overridden"] == []
+    assert resp.json()["values"]["letterbox_zoom"] == 1.3
+
+
+@pytest.mark.parametrize("body, fragment", [
+    ({"letterbox_title_dest": {"x": 150, "y": 160, "w": 1000, "h": 100}}, "letterbox_title_dest deborde du canevas"),
+    ({"letterbox_subtitle_dest": {"x": 100, "y": 1250, "w": 700, "h": 100}}, "letterbox_subtitle_dest hors de la zone sure"),
+    ({"letterbox_title_dest": {"x": 150, "y": 300, "w": 780, "h": 300}}, "chevauche le panneau video"),
+    ({"letterbox_top": 1300}, "sort du cadre"),
+    ({"cta_handle_gap": -2}, "cta_handle_gap"),
+])
+def test_put_letterbox_layout_invalid_is_422_with_the_module_message_and_keeps_the_file(
+    tmp_path, isolated_cwd, body, fragment
+):
+    _channels_setup(tmp_path)
+    path = tmp_path / "presets" / f"{CH}.toml"
+    before = path.read_text(encoding="utf-8")
+
+    resp = client(tmp_path).put(_LB_URL, json=body)
+
+    assert resp.status_code == 422, resp.text
+    assert fragment in resp.json()["detail"], resp.json()["detail"]
+    assert path.read_text(encoding="utf-8") == before
+
+
+def test_put_letterbox_layout_refuses_unknown_keys_and_empty_body(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path)
+    c = client(tmp_path)
+    assert c.put(_LB_URL, json={"split_webcam_dest": {"x": 0, "y": 0, "w": 10, "h": 10}}).status_code == 422
+    resp = c.put(_LB_URL, json={})
+    assert resp.status_code == 422 and "letterbox_top" in resp.json()["detail"]
+    assert c.put("/api/channels/inconnue/layout/letterbox", json={"letterbox_top": 400}).status_code == 404
+
+
+def test_letterbox_layout_editor_is_reachable_from_a_letterbox_style_and_wired():
+    page = (STATIC / "index.html").read_text(encoding="utf-8")
+    channels = (STATIC / "screens" / "channels.js").read_text(encoding="utf-8")
+    js = (STATIC / "screens" / "layout-letterbox.js").read_text(encoding="utf-8")
+    layout = (STATIC / "screens" / "layout.js").read_text(encoding="utf-8")
+
+    assert page.index("/static/screens/layout.js") < page.index("/static/screens/layout-letterbox.js")
+    # bouton visible pour un style letterbox comme pour un style stream split
+    assert "isLetterbox" in channels and "isSplit || isLetterbox" in channels
+    assert 'data.mode === "letterbox"' in layout and "lbOpen(" in layout
+    for key in _LB_KEYS:
+        assert key in js, key
+    for label in ("Vidéo", "Titre d'écran", "Sous-titres", "Pseudo"):
+        assert label in js, label
+    assert "Revenir au standard" in js and '"DELETE"' in js and 'jsonBody("PUT"' in js
+    assert "/layout/letterbox" in js and "lyScale(" in js and "pointerdown" in js and "setPointerCapture" in js
+    assert "standard" in js
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node absent du PATH")
+def test_letterbox_editor_geometry_matches_the_reframe_defaults():
+    """Les rectangles affichés par l'éditeur (zones déduites) sont ceux que
+    reframe calcule pour une source 1920x1080 (text_zones par défaut)."""
+    js = (STATIC / "screens" / "layout-letterbox.js").read_text(encoding="utf-8")
+    start = js.index("/* GEOMETRIE */")
+    end = js.index("/* FIN GEOMETRIE */")
+    script = js[start:end] + """
+const view = {canvas: {w: 1080, h: 1920}, safe: {left: 150, top: 160, right: 930, bottom: 1520},
+              text_gap: 16, part_height: 56};
+const v = {letterbox_top: 440, letterbox_zoom: 1.3, letterbox_title_dest: {}, letterbox_subtitle_dest: {}};
+const out = lbRects(view, v, {w: 1920, h: 1080});
+const v2 = Object.assign({}, v, {letterbox_title_dest: {x: 200, y: 200, w: 600, h: 150}});
+const back = lbFromVideoRect(view, {x: 0, y: 400, w: 1080, h: 910}, {w: 1920, h: 1080});
+console.log(JSON.stringify([out, lbRects(view, v2, {w: 1920, h: 1080}).title, back]));
+"""
+    out, title, back = json.loads(_node_run(script))
+    assert out["video"] == {"x": 0, "y": 440, "w": 1080, "h": 790}
+    assert out["title"] == {"x": 150, "y": 160, "w": 780, "h": 264}
+    assert out["subtitles"] == {"x": 150, "y": 1246, "w": 780, "h": 202}
+    assert out["part"] == {"x": 150, "y": 1464, "w": 780, "h": 56}
+    assert title == {"x": 200, "y": 200, "w": 600, "h": 150}
+    assert back == {"letterbox_top": 400, "letterbox_zoom": 1.5}
+
+
 def test_layout_editor_screen_is_wired_with_canvas_zones_handles_and_actions():
     page = (STATIC / "index.html").read_text(encoding="utf-8")
     js = (STATIC / "screens" / "layout.js").read_text(encoding="utf-8")

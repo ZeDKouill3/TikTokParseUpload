@@ -838,6 +838,22 @@ def test_letterbox_two_lines_at_default_size_are_two_dialogues_in_the_default_zo
     assert [ev["margin_v"] for ev in events] == [1246 + offset, 1246 + offset + STEP_68]
 
 
+def test_letterbox_subtitles_follow_the_band_chosen_by_the_style(tmp_path, video_dir):
+    """Éditeur d'agencement letterbox (TASK-3be3) : [reframe]
+    letterbox_subtitle_dest {x 180, y 1260, w 720, h 120} devient
+    text_zones.subtitles, et le texte y est posé (marges, hauteur)."""
+    zone = {"x0": 180, "y0": 1260, "x1": 900, "y1": 1380}
+    path = run_letterbox(tmp_path, video_dir, zone=zone)
+
+    events = lb_events(path)
+    assert events
+    offset = CONFIG_DEFAULTS["letterbox_offset_y"]
+    for ev in events:
+        assert (ev["margin_l"], ev["margin_r"]) == (180, 1080 - 900)
+        assert_ink_in_zone(ev, 120, zone)
+    assert events[0]["margin_v"] == 1260 + offset
+
+
 def test_letterbox_second_line_karaoke_counts_from_the_group_start(tmp_path, video_dir):
     path = run_letterbox(tmp_path, video_dir)
     first, second = lb_events(path)

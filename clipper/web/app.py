@@ -45,6 +45,7 @@ from clipper import moments as moments_mod
 from clipper import pipeline
 from clipper import publish as publish_mod
 from clipper import reframe as reframe_mod
+from clipper import render as render_mod
 from clipper import tiktok as tiktok_mod
 from clipper import youtube as youtube_mod
 from clipper import watch as watch_mod
@@ -1330,8 +1331,11 @@ def _layout_view(name: str) -> dict[str, Any]:
     config, _channel = _load_channel(name)
     reframe = config.section("reframe")
     defaults = _section_defaults("reframe")
+    split = reframe["layout"] == "stream_auto" and reframe["stream_variant"] == "split"
     return {
         "name": name,
+        # editeur a ouvrir : split (ci-dessous), letterbox (/layout/letterbox) ; crop n'en a pas
+        "mode": "split" if split else "letterbox" if reframe["format"] == "letterbox" else "crop",
         **{key: reframe[key] for key in _LAYOUT_KEYS},
         "defaults": {key: defaults[key] for key in _LAYOUT_KEYS},
         "canvas": {"w": reframe["output_width"], "h": reframe["output_height"]},
@@ -1374,6 +1378,96 @@ def _layout_save(name: str, body: dict[str, Any]) -> None:
     except ConfigError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     _save_channel_preset(name, preset)
+
+
+# Editeur d'agencement letterbox (TASK-3be3) : reglages existants du rendu
+# letterbox, par style, sur la base du « standard » (config.toml puis
+# CONFIG_DEFAULTS, sans le preset). Le preset ne garde que ce qui differe du
+# standard ; reframe et render refusent, leur message est renvoye tel quel.
+_LETTERBOX_KEYS = {
+    "letterbox_top": "reframe",
+    "letterbox_zoom": "reframe",
+    "letterbox_title_dest": "reframe",
+    "letterbox_subtitle_dest": "reframe",
+    "cta_handle_gap": "render",
+}
+# Source de reference pour verifier, a l'enregistrement, que la video nette
+# ne recouvre pas une zone de texte (reframe le reverifie sur la vraie source).
+_LETTERBOX_REFERENCE_SOURCE = (1920, 1080)
+
+
+def _letterbox_standard() -> dict[str, Any]:
+    base = Path(_BASE_CONFIG)
+    config = load_config(base) if base.is_file() else load_config()
+    return {key: config.section(section)[key] for key, section in _LETTERBOX_KEYS.items()}
+
+
+def _letterbox_view(name: str) -> dict[str, Any]:
+    config, _channel = _load_channel(name)
+    preset = tomllib.loads(_channel_preset_path(name).read_text(encoding="utf-8"))
+    reframe, render = config.section("reframe"), config.section("render")
+    return {
+        "name": name,
+        "values": {key: config.section(section)[key] for key, section in _LETTERBOX_KEYS.items()},
+        "standard": _letterbox_standard(),
+        "overridden": [key for key, section in _LETTERBOX_KEYS.items() if key in preset.get(section, {})],
+        "canvas": {"w": reframe["output_width"], "h": reframe["output_height"]},
+        "safe": {"left": reframe["safe_left"], "top": reframe["safe_top"],
+                 "right": reframe["safe_right"], "bottom": reframe["safe_bottom"]},
+        "text_gap": reframe["text_gap"],
+        "part_height": reframe["part_height"],
+        "title_lift": render["title_lift"],
+        "title_enabled": render["title_enabled"],
+        "cta": {"enabled": render["cta_enabled"], "handle": render["cta_handle"],
+                "font_size": render["cta_handle_font_size"]},
+    }
+
+
+def _letterbox_check(name: str, preset: dict[str, Any]) -> None:
+    """Fait relire ``preset`` par reframe (zones dans le canevas et la zone
+    sure, video nette dans le cadre sans recouvrir le texte pour la source de
+    reference) et par render (ecart du pseudo) ; leur message tel quel."""
+    _check_preset_types(preset)
+    with tempfile.TemporaryDirectory() as tmp:
+        channel_mod.save_channel(name, preset, presets_dir=tmp, base=_BASE_CONFIG)
+        config, _channel = channel_mod.load_channel(name, presets_dir=tmp, base=_BASE_CONFIG)
+    try:
+        settings = reframe_mod._settings(config)
+        reframe_mod._letterbox_geometry(*_LETTERBOX_REFERENCE_SOURCE, settings)
+        render_mod.check_cta_handle_gap(render_mod._settings(config))
+    except (reframe_mod.ReframeError, render_mod.RenderError) as exc:
+        raise ConfigError(str(exc)) from exc
+
+
+def _letterbox_write(name: str, body: dict[str, Any] | None) -> None:
+    """``body`` (cles de _LETTERBOX_KEYS) : une valeur egale au standard est
+    retiree du preset (de nouveau heritee), une autre y est ecrite ; None
+    retire toutes les cles de l'editeur (« Revenir au standard »)."""
+    path = _channel_preset_path(name)
+    _load_channel(name)  # 404 si le style n'existe pas
+    try:
+        preset = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise HTTPException(status_code=422, detail=f"preset illisible ({path.name}) : {exc}") from exc
+    standard = _letterbox_standard()
+    for key, section in _LETTERBOX_KEYS.items():
+        table = dict(preset.get(section, {}))
+        if body is None or (key in body and body[key] == standard[key]):
+            table.pop(key, None)
+        elif key in body:
+            table[key] = body[key]
+        else:
+            continue
+        if table:
+            preset[section] = table
+        else:
+            preset.pop(section, None)
+    try:
+        _letterbox_check(name, preset)
+    except ConfigError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    _save_channel_preset(name, preset)
+
 
 def _png_from_multipart(content_type: str, body: bytes) -> bytes:
     """Contenu du champ « file » d'un POST multipart (stdlib, sans dependance)."""
@@ -1654,6 +1748,16 @@ class LayoutBody(BaseModel):
     split_gameplay_dest: dict[str, Any] | None = None
     badge_dest: dict[str, Any] | None = None
     split_subtitle_dest: dict[str, Any] | None = None
+
+
+class LetterboxLayoutBody(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    letterbox_top: int | None = None
+    letterbox_zoom: float | None = None
+    letterbox_title_dest: dict[str, Any] | None = None
+    letterbox_subtitle_dest: dict[str, Any] | None = None
+    cta_handle_gap: int | None = None
 
 
 # --------------------------------------------------------------------------
@@ -2820,6 +2924,23 @@ def create_app(config: Config | None = None) -> FastAPI:
     def put_channel_layout(name: str, body: LayoutBody) -> dict[str, Any]:
         _layout_save(name, body.model_dump())
         return _layout_view(name)
+
+    @app.get("/api/channels/{name}/layout/letterbox")
+    def get_channel_letterbox_layout(name: str) -> dict[str, Any]:
+        return _letterbox_view(name)
+
+    @app.put("/api/channels/{name}/layout/letterbox")
+    def put_channel_letterbox_layout(name: str, body: LetterboxLayoutBody) -> dict[str, Any]:
+        given = {k: v for k, v in body.model_dump(exclude_unset=True).items() if v is not None}
+        if not given:
+            raise HTTPException(status_code=422, detail=f"aucun réglage à enregistrer (attendu : {', '.join(_LETTERBOX_KEYS)})")
+        _letterbox_write(name, given)
+        return _letterbox_view(name)
+
+    @app.delete("/api/channels/{name}/layout/letterbox")
+    def delete_channel_letterbox_layout(name: str) -> dict[str, Any]:
+        _letterbox_write(name, None)
+        return _letterbox_view(name)
     # ----------------------------------------------------------------
     # Statistiques (SPEC-c100 E7)
     # ----------------------------------------------------------------
