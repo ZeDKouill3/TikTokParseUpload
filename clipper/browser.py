@@ -49,11 +49,15 @@ CONFIG_DEFAULTS: dict[str, object] = {
     # Un profil est connecte quand un de ces cookies de session existe, sur l'un de ces domaines.
     "login_domains": ["tiktok.com"],
     "login_cookies": ["sessionid", "sessionid_ss"],
+    # Un seul compte piloté à la fois, tous services confondus (ADR-58c0) : attente (s) du compte en cours
+    # avant d'abandonner avec une erreur explicite.
+    "pilot_wait_s": 300,
 }
 
 STATE_DIR = Path("state") / "browser"
 COOKIES_FILE = "cookies.txt"
 CHANNEL = "chrome"  # le vrai Chrome, jamais un Chromium embarque (SPEC-9225 R1)
+TIMEZONE = "Europe/Paris"  # fuseau de tout contexte piloté (SPEC-5e50 R8), jamais celui du PC
 INSTALL_PLAYWRIGHT = "uv pip install playwright"
 INSTALL_CHROME = "playwright install chrome"
 
@@ -65,6 +69,8 @@ _cookie_reader: Callable[[str], list[dict[str, Any]]] | None = None  # remplace 
 _popen: Callable[..., Any] = subprocess.Popen  # remplace par les tests : aucun vrai Chrome
 _lock = threading.Lock()
 _active: dict[str, Any] = {}  # comptes dont la fenetre de connexion est ouverte
+_pilot = threading.Lock()  # un seul compte piloté par Playwright à la fois, TikTok comme YouTube
+_pilot_account: str | None = None
 
 
 class BrowserError(Exception):
@@ -209,31 +215,45 @@ def _is_missing_chrome(message: str) -> bool:
 
 
 @contextmanager
-def _open_context(account: str, *, headless: bool) -> Iterator[Any]:
+def _open_context(account: str, *, headless: bool, config: Config | None = None) -> Iterator[Any]:
+    """Contexte Playwright du profil, en heure de Paris (R8). Un seul compte est piloté à la fois, tous
+    services confondus : un second appel attend ``[browser] pilot_wait_s`` puis échoue explicitement."""
+    global _pilot_account
     directory = profile_dir(account)
-    manager = _playwright_factory()()
-    pw = manager.start()
+    wait = float(_settings(config)["pilot_wait_s"])
+    if not _pilot.acquire(timeout=wait):
+        raise BrowserError(
+            f"le compte {_pilot_account} est déjà piloté (un seul compte à la fois, tous services confondus) : "
+            f"attente de {wait:g} s dépassée pour {account}, réessaie quand il a fini"
+        )
+    _pilot_account = account
     try:
+        manager = _playwright_factory()()
+        pw = manager.start()
         try:
-            context = pw.chromium.launch_persistent_context(
-                str(directory), channel=CHANNEL, headless=headless, no_viewport=True,
-            )
-        except Exception as exc:  # noqa: BLE001 - erreur Playwright : retraduite, jamais avalee
-            message = str(exc)
-            if _is_missing_chrome(message):
-                raise BrowserError(
-                    "Chrome est introuvable : installe Google Chrome, ou lance « " + INSTALL_CHROME + " »"
-                ) from None
-            raise BrowserError(f"ouverture du navigateur impossible : {message.strip().splitlines()[0] if message.strip() else type(exc).__name__}") from None
-        try:
-            yield context
-        finally:
             try:
-                context.close()
-            except Exception as exc:  # noqa: BLE001 - fenetre deja fermee par l'utilisateur
-                logger.debug("fermeture du contexte : %s", type(exc).__name__)
+                context = pw.chromium.launch_persistent_context(
+                    str(directory), channel=CHANNEL, headless=headless, no_viewport=True, timezone_id=TIMEZONE,
+                )
+            except Exception as exc:  # noqa: BLE001 - erreur Playwright : retraduite, jamais avalee
+                message = str(exc)
+                if _is_missing_chrome(message):
+                    raise BrowserError(
+                        "Chrome est introuvable : installe Google Chrome, ou lance « " + INSTALL_CHROME + " »"
+                    ) from None
+                raise BrowserError(f"ouverture du navigateur impossible : {message.strip().splitlines()[0] if message.strip() else type(exc).__name__}") from None
+            try:
+                yield context
+            finally:
+                try:
+                    context.close()
+                except Exception as exc:  # noqa: BLE001 - fenetre deja fermee par l'utilisateur
+                    logger.debug("fermeture du contexte : %s", type(exc).__name__)
+        finally:
+            pw.stop()
     finally:
-        pw.stop()
+        _pilot_account = None
+        _pilot.release()
 
 
 def _login_url(url: str | None, config: Config | None) -> str:

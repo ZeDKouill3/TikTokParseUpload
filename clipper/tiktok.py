@@ -35,6 +35,7 @@ from datetime import date, datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urljoin
+from zoneinfo import ZoneInfo
 
 from clipper import browser
 from clipper import channel as channel_mod
@@ -607,7 +608,7 @@ class _Flow:
     def schedule_later(self, target: datetime) -> tuple[datetime, str | None]:
         """Programmation par les champs de TikTok : Programmer, date (calendrier), heure (selecteur).
         Rend l'instant reellement programme (minutes arrondies au pas propose) et une note ou None."""
-        local = target.astimezone()
+        local = target.astimezone(ZoneInfo(browser.TIMEZONE))  # heure de Paris, jamais le fuseau du PC (R8)
         self.click("schedule_later")
         if len(self.all("schedule_inputs")) != 2 or ":" not in str(self.field(0).input_value()):
             raise self.stop("unexpected_page", "champs de programmation inattendus : l'heure (valeur avec « : »), "

@@ -10,11 +10,14 @@ from __future__ import annotations
 import ast
 import json
 import random
+import os
+import time
 import tomllib
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -25,6 +28,7 @@ ROOT = Path(__file__).resolve().parent.parent
 SELECTORS = ROOT / "clipper" / "assets" / "tiktok_selectors.toml"
 NOW = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
 LINK = "https://www.tiktok.com/@ma_chaine/video/7300000000000000001"
+PARIS = ZoneInfo("Europe/Paris")
 
 
 def _sel() -> dict:
@@ -480,7 +484,7 @@ def test_visibility_options_are_targeted_by_option_id_with_the_text_as_fallback(
 
 
 def test_scheduled_publish_sets_the_time_and_date_through_the_pickers(env):
-    when = (NOW + timedelta(days=2)).astimezone().replace(hour=15, minute=30, second=0, microsecond=0)
+    when = (NOW + timedelta(days=2)).astimezone(PARIS).replace(hour=15, minute=30, second=0, microsecond=0)
     result = env.publish("scheduled", when)
 
     sel = _sel()["selectors"]
@@ -496,6 +500,41 @@ def test_scheduled_publish_sets_the_time_and_date_through_the_pickers(env):
     assert result["publish_at"] == when.isoformat() and result["note"] is None
 
 
+@pytest.fixture
+def pc_in_london(monkeypatch):
+    """Le PC de l'utilisateur est regle sur Londres (SPEC-5e50 R8) : TZ simule quand l'OS sait le faire."""
+    previous = os.environ.get("TZ")
+    monkeypatch.setenv("TZ", "Europe/London")
+    if hasattr(time, "tzset"):
+        time.tzset()
+    yield
+    if previous is None:
+        os.environ.pop("TZ", None)
+    else:
+        os.environ["TZ"] = previous
+    if hasattr(time, "tzset"):
+        time.tzset()
+
+
+@pytest.mark.parametrize("target, expected_date, expected_time", [
+    (datetime(2026, 10, 5, 15, 30, tzinfo=ZoneInfo("Europe/London")), "2026-10-05", "16:30"),   # 14:30 UTC -> Paris +2
+    (datetime(2026, 10, 5, 23, 30, tzinfo=timezone.utc), "2026-10-06", "01:30"),                # Paris passe minuit
+    (datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc), "2026-10-05", "14:00"),
+])
+def test_the_scheduled_date_typed_in_the_page_is_paris_time_whatever_the_pc_timezone(
+        tmp_path, monkeypatch, pc_in_london, target, expected_date, expected_time):
+    env = Env(tmp_path, monkeypatch)
+    result = env.publish("scheduled", target)
+
+    assert (env.page.date_value, env.page.time_value) == (expected_date, expected_time)
+    assert datetime.fromisoformat(result["publish_at"]) == target  # meme instant
+
+
+def test_no_page_date_is_taken_from_the_pc_timezone():
+    source = Path(tiktok.__file__).read_text(encoding="utf-8")
+    assert ".astimezone()" not in source  # fuseau du PC jamais utilise (R8)
+
+
 @pytest.mark.parametrize("start, target_days, arrows", [
     ((2026, 10), 35, ["next"]),                 # 5 novembre : un mois plus tard
     ((2027, 1), 35, ["prev", "prev"]),          # le calendrier affiche janvier 2027 : deux fleches arriere
@@ -503,7 +542,7 @@ def test_scheduled_publish_sets_the_time_and_date_through_the_pickers(env):
 ])
 def test_scheduled_publish_navigates_months_with_the_arrows_to_the_target_month(tmp_path, monkeypatch, start, target_days, arrows):
     env = Env(tmp_path, monkeypatch, page_kwargs={"calendar": start}, settings={"schedule_max_days": 40})
-    when = (NOW + timedelta(days=target_days)).astimezone().replace(hour=9, minute=15, second=0, microsecond=0)
+    when = (NOW + timedelta(days=target_days)).astimezone(PARIS).replace(hour=9, minute=15, second=0, microsecond=0)
 
     env.publish("scheduled", when)
 
@@ -514,7 +553,7 @@ def test_scheduled_publish_navigates_months_with_the_arrows_to_the_target_month(
 
 def test_scheduled_minutes_are_rounded_to_the_step_offered_by_tiktok_and_logged(tmp_path, monkeypatch, caplog):
     env = Env(tmp_path, monkeypatch, page_kwargs={"minute_step": 15})
-    when = (NOW + timedelta(days=2)).astimezone().replace(hour=12, minute=7, second=0, microsecond=0)
+    when = (NOW + timedelta(days=2)).astimezone(PARIS).replace(hour=12, minute=7, second=0, microsecond=0)
 
     with caplog.at_level("WARNING"):
         result = env.publish("scheduled", when)

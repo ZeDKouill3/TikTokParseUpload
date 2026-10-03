@@ -12,6 +12,9 @@ const ACC_REVEAL_MS = 30 * 1000; // un mot de passe affiché est masqué à nouv
 const ACC_COPIED_MS = 1500;
 const ACC_LOCAL_HOSTS = ["127.0.0.1", "localhost"];
 const ACC_PLATFORMS = ["TikTok", "YouTube", "Twitch", "E-mail"];
+// Service de publication d'un compte (SPEC-5e50 R1) : choisi à la création, ne change plus ensuite.
+const ACC_SERVICES = { tiktok: "TikTok", youtube: "YouTube" };
+const accService = (a) => ACC_SERVICES[a.service] ? a.service : "tiktok";
 
 // revealed : id -> { value, timer } ; gen : état du générateur autonome.
 const accUi = { list: null, error: null, loading: null, revealed: {}, gen: { length: "", symbols: false, ambiguous: false, value: "" } };
@@ -187,7 +190,9 @@ function accLoginState(a) {
   const s = ACC_LOGIN[l.state] || ACC_LOGIN.never;
   const when = l.state === "connected" && l.checked_at ? ` · vérifié le ${esc(accFmtDate(l.checked_at))}` : "";
   const err = a.login_error ? `<div class="li-sub bad">Connexion non vérifiable : ${esc(a.login_error)}</div>` : "";
-  return `<div class="li-sub" data-acc-login><span class="chip ${s.cls}">TikTok : ${esc(s.label)}</span><span class="muted">${when}</span></div>${err}`;
+  const channel = accService(a) === "youtube" && a.channel
+    ? `<div class="li-sub muted" data-acc-channel>Compte YouTube : <b>${esc(a.channel.name)}</b> <span class="mono">${esc(a.channel.id)}</span></div>` : "";
+  return `<div class="li-sub" data-acc-login><span class="chip ${s.cls}">${esc(ACC_SERVICES[accService(a)])} : ${esc(s.label)}</span><span class="muted">${when}</span></div>${channel}${err}`;
 }
 
 /* « Prêt à publier » est un état (SPEC-e500 R3) : case en lecture seule, jamais cochée à la main. Cliquer
@@ -195,7 +200,7 @@ function accLoginState(a) {
    revérifie la connexion et efface l'arrêt. */
 function accReadyBox(a) {
   const reason = !a.ready_to_publish ? a.ready_blocked_reason : "";
-  const state = a.ready_to_publish ? "Prêt à publier : connexion TikTok vérifiée" : "Pas prêt à publier";
+  const state = a.ready_to_publish ? `Prêt à publier : connexion ${ACC_SERVICES[accService(a)]} vérifiée` : "Pas prêt à publier";
   return `<div class="li-sub acc-ready" data-acc-ready-cell>
     <label class="acc-check"><input type="checkbox" data-acc-ready="${esc(a.id)}" aria-readonly="true"${a.ready_to_publish ? " checked" : ""} title="${esc(state)}${a.ready_to_publish ? "" : " : clique pour te connecter"}"> Prêt à publier</label>
     ${reason ? `<span class="muted" data-acc-ready-reason>${esc(reason)}</span>` : ""}
@@ -229,6 +234,21 @@ async function accResolve(account, button) {
   await accLoad();
 }
 
+/* Compte YouTube : la connexion se lit dans YouTube Studio (chaîne affichée), pas dans des cookies ; la
+   vérification ouvre le navigateur sur le profil du compte. */
+async function accVerifyYoutube(account, button) {
+  button.disabled = true;
+  try {
+    const out = await api(`/api/accounts/${encodeURIComponent(account.id)}/verify`, jsonBody("POST", {}));
+    toast({ kind: out.ready_to_publish ? "ok" : "warn", title: out.ready_to_publish ? "YouTube vérifié" : "Pas prêt à publier",
+            body: out.ready_to_publish ? `${account.label} : ${out.channel.name}` : `${account.label} : ${out.ready_blocked_reason}` });
+  } catch (err) {
+    toastError("Vérification impossible", err);
+  }
+  button.disabled = false;
+  await accLoad();
+}
+
 async function accRefreshStats(account, button) {
   button.disabled = true;
   try {
@@ -255,7 +275,7 @@ function accRow(a) {
     : "";
   return `<div class="list-item acc-row" data-acc="${esc(a.id)}">
     <div class="acc-main">
-      <div class="li-title">${a.platform ? `<span class="tag">${esc(a.platform)}</span> ` : ""}${esc(a.label)}</div>
+      <div class="li-title"><span class="tag" data-acc-service>${esc(ACC_SERVICES[accService(a)])}</span> ${a.platform ? `<span class="tag">${esc(a.platform)}</span> ` : ""}${esc(a.label)}</div>
       <div class="li-sub muted mono">${a.username ? esc(a.username) : "—"}</div>
       ${a.notes ? `<div class="li-sub faint">${esc(a.notes)}</div>` : ""}
       ${accBrowserState(a)}
@@ -269,7 +289,9 @@ function accRow(a) {
       ${a.username ? `<button type="button" class="btn btn-xs" data-acc-copy-user="${esc(a.id)}">${icon("copy", "i-xs")}Copier l'identifiant</button>` : ""}
       ${copyPass}
       <button type="button" class="btn btn-xs" data-acc-browser-login="${esc(a.id)}" title="Se connecter dans le navigateur (Chrome normal, à la main)">${icon("external-link", "i-xs")}Se connecter</button>
-      <button type="button" class="btn btn-xs" data-acc-stats="${esc(a.id)}">${icon("refresh-cw", "i-xs")}Relever les stats</button>
+      ${accService(a) === "youtube"
+        ? `<button type="button" class="btn btn-xs" data-acc-verify="${esc(a.id)}" title="Ouvre YouTube Studio sur le profil et lit le compte YouTube">${icon("check", "i-xs")}Vérifier YouTube</button>`
+        : `<button type="button" class="btn btn-xs" data-acc-stats="${esc(a.id)}">${icon("refresh-cw", "i-xs")}Relever les stats</button>`}
       <button type="button" class="btn btn-xs" data-acc-edit="${esc(a.id)}">${icon("pencil", "i-xs")}Modifier</button>
       <button type="button" class="btn btn-xs btn-bad" data-acc-delete="${esc(a.id)}">${icon("trash-2", "i-xs")}Supprimer</button>
     </div>
@@ -294,6 +316,7 @@ function accWireList(body) {
     } catch (err) { toastError("Mot de passe indisponible", err); }
   }));
   $$("[data-acc-browser-login]", body).forEach((b) => (b.onclick = () => accBrowserLogin(find(b.dataset.accBrowserLogin), b)));
+  $$("[data-acc-verify]", body).forEach((b) => (b.onclick = () => accVerifyYoutube(find(b.dataset.accVerify), b)));
   $$("[data-acc-stats]", body).forEach((b) => (b.onclick = () => accRefreshStats(find(b.dataset.accStats), b)));
   $$("[data-acc-ready]", body).forEach((b) => (b.onclick = (e) => {
     e.preventDefault();  // lecture seule : jamais de coche à la main
@@ -324,12 +347,15 @@ function accWireList(body) {
 
 function accOpenForm(account) {
   const editing = Boolean(account);
-  const a = account || { label: "", platform: "", username: "", notes: "", has_password: false };
+  const a = account || { label: "", platform: "", username: "", notes: "", has_password: false, service: "tiktok" };
   openPanel("modal acc-modal", `
     <div class="modal-head"><h2>${editing ? "Modifier le compte" : "Ajouter un compte"}</h2>
       <p class="muted" style="margin-top:4px">Le mot de passe est rangé dans le coffre de l'OS, jamais dans un fichier du projet.</p></div>
     <form id="acc-form" autocomplete="off"><div class="modal-body acc-form">
       <div class="field"><label for="acc-label">Libellé</label><input class="input" id="acc-label" name="label" required maxlength="120" value="${esc(a.label)}" placeholder="Compte principal"></div>
+      <div class="field"><label for="acc-service">Service de publication</label>
+        <select class="input" id="acc-service" name="service"${editing ? " disabled" : ""}>${Object.entries(ACC_SERVICES).map(([k, v]) => `<option value="${k}"${accService(a) === k ? " selected" : ""}>${esc(v)}</option>`).join("")}</select>
+        ${editing ? `<span class="muted">Le service d'un compte ne change pas.</span>` : ""}</div>
       <div class="field"><label for="acc-platform">Plateforme</label><input class="input" id="acc-platform" name="platform" maxlength="60" list="acc-platforms" value="${esc(a.platform)}" placeholder="TikTok">
         <datalist id="acc-platforms">${ACC_PLATFORMS.map((p) => `<option value="${esc(p)}">`).join("")}</datalist></div>
       <div class="field"><label for="acc-username">E-mail ou identifiant</label><input class="input" id="acc-username" name="username" maxlength="254" value="${esc(a.username)}" placeholder="exemple@example.com"></div>
@@ -360,7 +386,7 @@ function accOpenForm(account) {
     };
     $("#acc-form", el).onsubmit = async (e) => {
       e.preventDefault();
-      const payload = { label: $("#acc-label", el).value, platform: $("#acc-platform", el).value, username: $("#acc-username", el).value, notes: $("#acc-notes", el).value };
+      const payload = { service: $("#acc-service", el).value, label: $("#acc-label", el).value, platform: $("#acc-platform", el).value, username: $("#acc-username", el).value, notes: $("#acc-notes", el).value };
       const password = $("#acc-password", el).value;
       const clear = $("#acc-clear", el);
       if (password) payload.password = password;
