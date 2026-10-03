@@ -7000,3 +7000,193 @@ def test_the_accounts_screen_renders_reads_and_summarises_the_slots_of_an_accoun
     assert out["read"] == [{"day": "mon", "time": "18:30"}, {"day": "fri", "time": "09:00"}]
     assert "Lundi 18:30" in out["summary"] and "Vendredi 09:00" in out["summary"] and "(UTC)" in out["summary"]
     assert "aucun" in out["none"]
+
+
+# --------------------------------------------------------------------------
+# TASK-5bbf : série programmée (SPEC-1ed3, SPEC-6076 R3/R6) : GET .../series/clips,
+# POST .../series/preview, POST .../series (création tout ou rien)
+# --------------------------------------------------------------------------
+
+
+def _series_client(tmp_path, ready=(READY, SPARE), **tiktok_settings):
+    _publish_setup(tmp_path)
+    _accounts_state(tmp_path, ready=ready)
+    return Config(mode="review", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output",
+                 _sections={"tiktok": {"max_posts_per_day": 10, "min_gap_minutes": 0, **tiktok_settings}})
+
+
+def _series_scored(tmp_path, scores):
+    """Re-ecrit le score de chaque clip existant (``_publish_setup`` les met tous a 80)."""
+    for clip_id, score in scores.items():
+        path = tmp_path / "output" / CLIPS_VIDEO / f"{clip_id}.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["score"] = score
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+
+def test_series_clips_endpoint_groups_series_and_gives_the_default_interval(tmp_path, isolated_cwd):
+    config = _series_client(tmp_path)
+    c = TestClient(create_app(config=config))
+
+    resp = c.get("/api/publications/series/clips")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert {u["clip_id"] for u in data["units"]} == {"01", "02", "03", "04", "05", "06"}
+    assert data["default_interval_h"] == 4
+    assert all(u["parts_total"] == 1 for u in data["units"])
+
+
+def test_series_preview_picks_the_best_clips_shows_their_paris_dates_and_is_ok(tmp_path, isolated_cwd):
+    config = _series_client(tmp_path)
+    _series_scored(tmp_path, {"01": 95, "02": 90, "03": 50, "04": 40, "05": 30, "06": 20})
+    c = TestClient(create_app(config=config))
+    start = _soon(hours=1)
+
+    resp = c.post("/api/publications/series/preview", json={
+        "mode": "auto", "account": READY, "interval_hours": 2, "start_at": start, "count": 2})
+
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert [it["clip_id"] for it in data["items"]] == ["01", "02"]
+    assert data["ok"] is True and data["insufficient"] is False
+    assert all(it["publish_at_paris"] for it in data["items"])
+    assert json.loads((tmp_path / "state" / "publish" / "ma_chaine.json").read_text(encoding="utf-8")) == []  # rien cree
+
+
+def test_series_create_schedules_the_n_best_clips_two_hours_apart(tmp_path, isolated_cwd):
+    config = _series_client(tmp_path)
+    _series_scored(tmp_path, {"01": 95, "02": 90, "03": 50, "04": 40, "05": 30, "06": 20})
+    c = TestClient(create_app(config=config))
+    start = _soon(hours=1)
+
+    resp = c.post("/api/publications/series", json={
+        "mode": "auto", "account": READY, "interval_hours": 2, "start_at": start, "count": 3})
+
+    assert resp.status_code == 201, resp.text
+    assert resp.json() == {"created": 3}
+    entries = sorted(json.loads((tmp_path / "state" / "publish" / "ma_chaine.json").read_text(encoding="utf-8")),
+                     key=lambda e: e["slot_at"])
+    assert [e["clip_id"] for e in entries] == ["01", "02", "03"]
+    assert [e["account"] for e in entries] == [READY, READY, READY]
+    assert entries[1]["slot_at"] == (_dt.fromisoformat(start) + _td(hours=2)).isoformat()
+
+
+def test_series_preview_reports_insufficient_clips_without_creating_anything(tmp_path, isolated_cwd):
+    config = _series_client(tmp_path)
+    c = TestClient(create_app(config=config))
+
+    resp = c.post("/api/publications/series/preview", json={
+        "mode": "auto", "account": READY, "interval_hours": 1, "start_at": _soon(hours=1), "count": 50})
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["ok"] is False and data["insufficient"] is True and data["available"] == 6
+    assert "6" in data["insufficient_reason"] and "50" in data["insufficient_reason"]
+
+
+def test_series_create_is_all_or_nothing_on_a_cap_violation(tmp_path, isolated_cwd):
+    config = _series_client(tmp_path, max_posts_per_day=1)
+    c = TestClient(create_app(config=config))
+
+    resp = c.post("/api/publications/series", json={
+        "mode": "auto", "account": READY, "interval_hours": 1, "start_at": _soon(hours=1), "count": 2})
+
+    assert resp.status_code == 409
+    assert json.loads((tmp_path / "state" / "publish" / "ma_chaine.json").read_text(encoding="utf-8")) == []
+
+
+def test_series_create_refuses_an_account_that_is_not_ready(tmp_path, isolated_cwd):
+    config = _series_client(tmp_path, ready=(READY,))
+    c = TestClient(create_app(config=config))
+
+    resp = c.post("/api/publications/series", json={
+        "mode": "auto", "account": SPARE, "interval_hours": 1, "start_at": _soon(hours=1), "count": 1})
+
+    assert resp.status_code == 409 and "prêt" in resp.json()["detail"]
+
+
+def test_series_preview_manual_mode_follows_the_chosen_order(tmp_path, isolated_cwd):
+    config = _series_client(tmp_path)
+    c = TestClient(create_app(config=config))
+    start = _soon(hours=1)
+
+    resp = c.post("/api/publications/series/preview", json={
+        "mode": "manual", "account": READY, "interval_hours": 1, "start_at": start,
+        "selection": [{"video_id": CLIPS_VIDEO, "clip_id": "05"}, {"video_id": CLIPS_VIDEO, "clip_id": "02"}]})
+
+    assert resp.status_code == 200, resp.text
+    assert [it["clip_id"] for it in resp.json()["items"]] == ["05", "02"]
+
+
+def test_series_preview_filters_by_style(tmp_path, isolated_cwd):
+    config = _series_client(tmp_path)
+    _write_state(tmp_path, "othervideo01", channel="autre")
+    _write_clip(tmp_path, "othervideo01", {**_clip_sidecar("01"), "video_id": "othervideo01", "score": 99})
+    c = TestClient(create_app(config=config))
+
+    resp = c.post("/api/publications/series/preview", json={
+        "mode": "auto", "style": "ma_chaine", "account": READY, "interval_hours": 1,
+        "start_at": _soon(hours=1), "count": 10})
+
+    assert resp.status_code == 200
+    assert all(it["video_id"] == CLIPS_VIDEO for it in resp.json()["items"])
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node absent du PATH")
+def test_every_static_javascript_file_parses_including_the_series_form():
+    # couvert aussi par test_every_static_javascript_file_parses (toute l'arborescence) ; conserve ici pour
+    # que l'echec pointe directement vers l'ecran Publication si publish.js casse.
+    run = subprocess.run(["node", "--check", str(STATIC / "screens" / "publish.js")],
+                        capture_output=True, text=True, encoding="utf-8")
+    assert run.returncode == 0, run.stderr
+
+
+def test_publish_screen_has_a_schedule_series_button_next_to_new_publication():
+    js = (STATIC / "screens" / "publish.js").read_text(encoding="utf-8")
+    assert "data-pub-series" in js and "Programmer une série" in js
+    assert "/api/publications/series/preview" in js and "/api/publications/series" in js
+    assert "pubOpenSeriesForm" in js
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node absent du PATH")
+def test_series_default_start_is_the_next_full_paris_hour_plus_one():
+    out = _run_publish("""(() => ({
+      exact: pubSeriesDefaultStart('2026-10-01T12:00:00Z'),      // Paris 14:00 (ete) -> 16:00
+      mid: pubSeriesDefaultStart('2026-10-01T12:23:00Z'),        // Paris 14:23 -> 16:00
+    }))()""")
+    assert out["exact"] == "2026-10-01T16:00" and out["mid"] == "2026-10-01T16:00"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node absent du PATH")
+def test_series_manual_toggle_adds_or_removes_a_whole_unit_in_selection_order():
+    out = _run_publish("""(() => {
+      const a = { video_id: 'v1', clip_ids: ['a-p1', 'a-p2'] };
+      const b = { video_id: 'v1', clip_ids: ['b'] };
+      let sel = pubSeriesToggleUnit([], a);
+      sel = pubSeriesToggleUnit(sel, b);
+      const withBoth = sel.map((u) => u.clip_ids);
+      sel = pubSeriesToggleUnit(sel, a);  // decoche a : b reste seul
+      return { withBoth, afterUncheckA: sel.map((u) => u.clip_ids), countBoth: pubSeriesPostCount([a, b]) };
+    })()""")
+    assert out["withBoth"] == [["a-p1", "a-p2"], ["b"]]
+    assert out["afterUncheckA"] == [["b"]]
+    assert out["countBoth"] == 3
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node absent du PATH")
+def test_series_manual_reorder_moves_a_unit_up_or_down():
+    out = _run_publish("""(() => {
+      const u = (id) => ({ video_id: 'v1', clip_ids: [id] });
+      const sel = [u('a'), u('b'), u('c')];
+      return {
+        up: pubSeriesMoveUnit(sel, 2, -1).map((x) => x.clip_ids[0]),
+        down: pubSeriesMoveUnit(sel, 0, 1).map((x) => x.clip_ids[0]),
+        clampTop: pubSeriesMoveUnit(sel, 0, -1).map((x) => x.clip_ids[0]),
+        clampBottom: pubSeriesMoveUnit(sel, 2, 1).map((x) => x.clip_ids[0]),
+      };
+    })()""")
+    assert out["up"] == ["a", "c", "b"]
+    assert out["down"] == ["b", "a", "c"]
+    assert out["clampTop"] == ["a", "b", "c"]
+    assert out["clampBottom"] == ["a", "b", "c"]

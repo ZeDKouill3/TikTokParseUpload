@@ -293,7 +293,9 @@ function pubPostRow(p) {
 function pubPostsSection() {
   const rows = pubPosts.data ? pubPosts.data.publications.filter((p) => pubIsOngoing(p) && (!pubUi.account || p.account === pubUi.account)) : [];
   const head = `<div class="section-title">${icon("send")}Publications <span class="more">${rows.length || ""}</span>
-    <span class="grow"></span><button type="button" class="btn btn-primary btn-xs" data-pub-new>${icon("plus", "i-xs")}Nouvelle publication</button></div>`;
+    <span class="grow"></span>
+    <button type="button" class="btn btn-ghost btn-xs" data-pub-series>${icon("calendar-days", "i-xs")}Programmer une série</button>
+    <button type="button" class="btn btn-primary btn-xs" data-pub-new>${icon("plus", "i-xs")}Nouvelle publication</button></div>`;
   if (pubPosts.error) return `<section>${head}<p class="reason bad">Chargement impossible : ${esc(pubPosts.error.message || pubPosts.error)}</p></section>`;
   if (!pubPosts.data) return `<section>${head}<div class="skeleton skeleton-line"></div></section>`;
   return `<section>${head}${rows.length ? `<div class="panel" id="pub-posts">${rows.map(pubPostRow).join("")}</div>`
@@ -504,6 +506,236 @@ async function pubOpenForm(preset, edit) {
     $$("input[name='pub-form-when']", d).forEach((r) => (r.onchange = () => { $("#pub-form-at", d).hidden = !$("#pub-form-later", d).checked; }));
     $("#pub-form-submit", d).onclick = () => pubFormSubmit(f, d);
   });
+}
+
+/* ---------- Formulaire « Programmer une série » (TASK-5bbf, SPEC-1ed3, SPEC-6076 R3/R6) : une
+   publication toutes les X heures, N clips choisis automatiquement (meilleur score) ou a la main. Tout
+   le calcul (dates, choix des clips, refus) vient de l'API ; ce fichier n'affiche que sa reponse. */
+
+const PUBS_WHEN_HINT = "Une partie d'un clip découpé est toujours prise avec les autres, à la suite et dans l'ordre : si la série ne tient pas dans les places restantes, elle est sautée en entier (jamais coupée).";
+
+/* Heure pleine de Paris suivante, puis +1h (reglage par defaut du debut de la serie). `nowIso` : pour les tests,
+   sinon l'instant present. Rendu directement au format d'un champ datetime-local (heure murale de Paris). */
+function pubSeriesDefaultStart(nowIso) {
+  const parisLocal = pubLocalInput(nowIso || new Date().toISOString());
+  const [ymd, hm] = parisLocal.split("T");
+  const [y, m, d] = ymd.split("-").map(Number);
+  const [h] = hm.split(":").map(Number);
+  const rolled = new Date(Date.UTC(y, m - 1, d, h, 0));
+  rolled.setUTCHours(rolled.getUTCHours() + 2); // heure pleine suivante (+1h), puis +1h de marge
+  return rolled.toISOString().slice(0, 16);
+}
+
+const pubSeriesStyles = (units) => Array.from(new Set(units.map((u) => u.channel || ""))).sort();
+const pubSeriesUnitKey = (u) => `${u.video_id}/${u.clip_ids.join(",")}`;
+const pubSeriesUnitLabel = (u) => {
+  const title = u.screen_title || u.title || u.clip_ids[0];
+  return u.parts_total > 1 ? `${title} (${u.parts_total} parties)` : title;
+};
+const pubSeriesPostCount = (units) => units.reduce((n, u) => n + (u.clip_ids ? u.clip_ids.length : 1), 0);
+
+/* Coche / decoche une unite entiere (toutes ses parties ensemble) : cocher une partie ajoute la serie
+   complete, la decocher la retire entierement. L'ordre d'ajout est l'ordre de publication. */
+function pubSeriesToggleUnit(selected, unit) {
+  const key = pubSeriesUnitKey(unit);
+  if (selected.some((u) => pubSeriesUnitKey(u) === key)) return selected.filter((u) => pubSeriesUnitKey(u) !== key);
+  return [...selected, unit];
+}
+
+/* Deplace l'unite a `index` de `delta` positions (reordonnancement manuel « monter » / « descendre ») ;
+   les parties d'une serie restent soudees puisqu'elles forment une seule entree. Sans effet en bord de liste. */
+function pubSeriesMoveUnit(selected, index, delta) {
+  const to = index + delta;
+  if (to < 0 || to >= selected.length) return selected;
+  const copy = selected.slice();
+  [copy[index], copy[to]] = [copy[to], copy[index]];
+  return copy;
+}
+
+function pubSeriesPoolCards(f, d) {
+  const pool = f.units.filter((u) => !f.style || u.channel === f.style);
+  const box = $("#pubs-pool", d);
+  if (!box) return;
+  const picked = new Set(f.selected.map(pubSeriesUnitKey));
+  box.innerHTML = pool.length ? pool.map((u) => {
+    const key = pubSeriesUnitKey(u), on = picked.has(key);
+    return `<button type="button" class="pubf-clip${on ? " on" : ""}" role="option" aria-selected="${on}" data-pubs-pick="${esc(key)}">
+      <span class="mini-clip">${u.thumbnail_url ? `<img loading="lazy" decoding="async" width="36" height="64" src="${esc(u.thumbnail_url)}" alt="">` : ""}</span>
+      <span class="pubf-clip-main"><b>${esc(pubSeriesUnitLabel(u))}</b><span class="muted">${esc(u.video_id)} · ${u.channel ? esc(u.channel) : "sans style"}</span></span>
+      <span class="num" title="Score">${u.score != null ? esc(fr(u.score)) : ""}</span></button>`;
+  }).join("") : `<p class="muted" style="padding:8px">Aucun clip disponible pour ce style.</p>`;
+  $$("[data-pubs-pick]", box).forEach((b) => (b.onclick = () => {
+    const unit = pool.find((u) => pubSeriesUnitKey(u) === b.dataset.pubsPick);
+    if (!unit) return;
+    f.selected = pubSeriesToggleUnit(f.selected, unit);
+    pubSeriesRenderManual(f, d);
+  }));
+}
+
+function pubSeriesSelectedRows(f, d) {
+  const box = $("#pubs-selected", d);
+  if (!box) return;
+  const last = f.selected.length - 1;
+  box.innerHTML = f.selected.length ? f.selected.map((u, i) => `<div class="list-item">
+      <span class="mini-clip">${u.thumbnail_url ? `<img loading="lazy" decoding="async" width="36" height="64" src="${esc(u.thumbnail_url)}" alt="">` : ""}</span>
+      <div class="li-main grow"><div class="li-title">${esc(pubSeriesUnitLabel(u))}</div><div class="li-sub muted">${esc(u.video_id)}</div></div>
+      <div class="row" style="gap:4px">
+        <button type="button" class="btn btn-xs" data-pubs-up="${i}" aria-label="Monter"${i === 0 ? " disabled" : ""}>↑</button>
+        <button type="button" class="btn btn-xs" data-pubs-down="${i}" aria-label="Descendre"${i === last ? " disabled" : ""}>↓</button>
+        <button type="button" class="btn btn-xs btn-ghost" data-pubs-remove="${i}" aria-label="Retirer">${icon("x", "i-xs")}</button>
+      </div></div>`).join("") : `<p class="muted" style="padding:8px">Aucun clip sélectionné.</p>`;
+  $$("[data-pubs-up]", box).forEach((b) => (b.onclick = () => { f.selected = pubSeriesMoveUnit(f.selected, Number(b.dataset.pubsUp), -1); pubSeriesRenderManual(f, d); }));
+  $$("[data-pubs-down]", box).forEach((b) => (b.onclick = () => { f.selected = pubSeriesMoveUnit(f.selected, Number(b.dataset.pubsDown), 1); pubSeriesRenderManual(f, d); }));
+  $$("[data-pubs-remove]", box).forEach((b) => (b.onclick = () => { f.selected = f.selected.filter((_, idx) => idx !== Number(b.dataset.pubsRemove)); pubSeriesRenderManual(f, d); }));
+}
+
+function pubSeriesRenderManual(f, d) {
+  pubSeriesPoolCards(f, d);
+  pubSeriesSelectedRows(f, d);
+  const count = $("#pubs-sel-count", d);
+  if (count) count.textContent = String(pubSeriesPostCount(f.selected));
+  f.preview = null;
+  pubSeriesRenderPreview(f, d);
+}
+
+function pubSeriesFormHtml(f) {
+  const ready = f.accounts.filter((a) => a.ready_to_publish);
+  const styles = pubSeriesStyles(f.units);
+  const count = f.mode === "auto" ? (f.count || 0) : pubSeriesPostCount(f.selected);
+  return `
+    <div class="modal-head"><h2>Programmer une série</h2>
+      <p class="muted" style="margin-top:4px">Publie plusieurs clips à un rythme régulier (une publication toutes les X heures), après un aperçu.</p></div>
+    <div class="modal-body stack" style="gap:16px">
+      <div class="field"><span class="field-label">Mode</span>
+        <div class="row wrap" style="gap:16px">
+          <label class="row" style="gap:6px"><input type="radio" name="pubs-mode" value="auto"${f.mode === "auto" ? " checked" : ""}> Automatique (les meilleurs clips)</label>
+          <label class="row" style="gap:6px"><input type="radio" name="pubs-mode" value="manual"${f.mode === "manual" ? " checked" : ""}> Manuel (je choisis)</label></div></div>
+      <div class="field"><label for="pubs-style">Style</label>
+        <select class="input" id="pubs-style"><option value="">Tous les styles</option>${styles.map((s) => `<option value="${esc(s)}"${s === f.style ? " selected" : ""}>${esc(s || "sans style")}</option>`).join("")}</select></div>
+      <div class="field"><label for="pubs-account">Compte</label>
+        <select class="input" id="pubs-account">${ready.length ? ready.map((a) => `<option value="${esc(a.id)}"${a.id === f.account ? " selected" : ""}>${esc(pubAccountText(a))}</option>`).join("") : `<option value="">Aucun compte prêt à publier</option>`}</select>
+        <span class="hint">Seuls les comptes « prêts à publier » (écran Comptes) sont proposés.</span></div>
+      <div class="row wrap" style="gap:16px">
+        <div class="field"><label for="pubs-start">Début (heure de Paris)</label>
+          <input class="input" id="pubs-start" type="datetime-local" value="${esc(f.start)}"></div>
+        <div class="field"><label for="pubs-interval">Toutes les (heures)</label>
+          <input class="input" id="pubs-interval" type="number" min="1" step="1" value="${f.intervalH}" style="width:8ch"></div>
+        ${f.mode === "auto" ? `<div class="field"><label for="pubs-count">Nombre de vidéos</label>
+          <input class="input" id="pubs-count" type="number" min="1" step="1" value="${f.count}" style="width:8ch"></div>` : ""}
+      </div>
+      ${f.mode === "manual" ? `
+        <div class="field"><span class="field-label">Clips disponibles</span>
+          <div class="pubf-clips" id="pubs-pool" role="listbox" aria-label="Clips disponibles"></div></div>
+        <div class="field"><span class="field-label">Sélection (<span id="pubs-sel-count">${count}</span> vidéo(s), ordre de publication)</span>
+          <div class="panel" id="pubs-selected"></div></div>`
+        : `<p class="muted" style="font-size:13px">${count} vidéo${count > 1 ? "s" : ""} seront choisies automatiquement, par score décroissant.</p>`}
+      <p class="hint">${PUBS_WHEN_HINT}</p>
+      <p class="reason bad" id="pubs-error" hidden role="alert"></p>
+      <div id="pubs-preview"></div>
+    </div>
+    <div class="modal-foot"><button type="button" class="btn btn-ghost" data-dismiss>Fermer</button><span class="grow"></span>
+      <button type="button" class="btn" id="pubs-check">Aperçu</button>
+      <button type="button" class="btn btn-primary" id="pubs-submit" disabled>Valider</button></div>`;
+}
+
+function pubSeriesBody(f, d) {
+  const mode = $("input[name='pubs-mode']:checked", d).value;
+  const style = $("#pubs-style", d).value;
+  const account = $("#pubs-account", d).value;
+  const interval_hours = Number($("#pubs-interval", d).value);
+  const startLocal = $("#pubs-start", d).value;
+  const body = {
+    mode, style: style || null, account, interval_hours,
+    start_at: startLocal ? pubParisInstant(startLocal).toISOString() : "",
+  };
+  if (mode === "auto") body.count = Number($("#pubs-count", d).value);
+  else body.selection = f.selected.map((u) => ({ video_id: u.video_id, clip_id: u.clip_ids[0] }));
+  return body;
+}
+
+function pubSeriesRenderPreview(f, d) {
+  const box = $("#pubs-preview", d);
+  if (!box) return;
+  const submit = $("#pubs-submit", d);
+  if (!f.preview) { box.innerHTML = ""; if (submit) submit.disabled = true; return; }
+  const p = f.preview;
+  const rows = p.items.map((it) => `<div class="list-item${it.refusal ? " bad" : ""}">
+      <span class="mini-clip">${it.thumbnail_url ? `<img loading="lazy" decoding="async" width="36" height="64" src="${esc(it.thumbnail_url)}" alt="">` : ""}</span>
+      <div class="li-main grow"><div class="li-title">${esc(it.screen_title || it.title || it.clip_id)}</div>
+        <div class="li-sub muted">${esc(pubSlotLabel(it.publish_at_paris))}</div>
+        ${it.refusal ? `<div class="li-sub bad">${esc(it.refusal)}</div>` : ""}</div></div>`).join("");
+  box.innerHTML = `<div class="panel">${rows || `<p class="muted" style="padding:8px">Aucune publication.</p>`}</div>
+    ${p.insufficient ? `<p class="reason bad" style="margin-top:8px">${esc(p.insufficient_reason)}</p>` : ""}`;
+  if (submit) submit.disabled = !p.ok;
+}
+
+async function pubSeriesPreview(f, d) {
+  const err = $("#pubs-error", d);
+  err.hidden = true;
+  const body = pubSeriesBody(f, d);
+  if (!body.account) { err.textContent = "Choisis un compte prêt à publier."; err.hidden = false; return; }
+  if (!body.start_at) { err.textContent = "Choisis une date de début."; err.hidden = false; return; }
+  if (body.mode === "manual" && !body.selection.length) { err.textContent = "Choisis au moins un clip."; err.hidden = false; return; }
+  try {
+    f.preview = await api("/api/publications/series/preview", jsonBody("POST", body));
+  } catch (e) {
+    f.preview = null;
+    err.textContent = e.message || String(e);
+    err.hidden = false;
+  }
+  pubSeriesRenderPreview(f, d);
+}
+
+async function pubSeriesSubmit(f, d) {
+  if (!f.preview || !f.preview.ok) return;
+  const err = $("#pubs-error", d);
+  err.hidden = true;
+  try {
+    const res = await api("/api/publications/series", jsonBody("POST", pubSeriesBody(f, d)));
+    closeLayer();
+    toast({ kind: "ok", title: "Série programmée", body: `${res.created} publication${res.created > 1 ? "s" : ""}`, ms: 3200 });
+    pubPosts.at = 0;
+    pubPostsLoad();
+  } catch (e) {
+    err.textContent = e.message || String(e);
+    err.hidden = false;
+  }
+}
+
+function pubSeriesWire(f, d) {
+  $$("input[name='pubs-mode']", d).forEach((r) => (r.onchange = () => { f.mode = r.value; pubSeriesRerender(f, d); }));
+  const style = $("#pubs-style", d);
+  style.onchange = () => {
+    f.style = style.value;
+    f.selected = [];
+    if (f.mode === "manual") pubSeriesRenderManual(f, d);
+  };
+  $("#pubs-check", d).onclick = () => pubSeriesPreview(f, d);
+  $("#pubs-submit", d).onclick = () => pubSeriesSubmit(f, d);
+  ["#pubs-start", "#pubs-interval", "#pubs-count"].forEach((sel) => {
+    const el = $(sel, d);
+    if (el) el.oninput = () => { f.preview = null; pubSeriesRenderPreview(f, d); };
+  });
+  if (f.mode === "manual") pubSeriesRenderManual(f, d);
+}
+
+function pubSeriesRerender(f, d) {
+  d.innerHTML = pubSeriesFormHtml(f);
+  pubSeriesWire(f, d);
+}
+
+/* ouvre le formulaire « Programmer une série » */
+async function pubOpenSeriesForm() {
+  let clipsData, data;
+  try {
+    [clipsData, data] = await Promise.all([api("/api/publications/series/clips"), api("/api/publications")]);
+  } catch (err) { toastError("Impossible d'ouvrir le formulaire", err); return null; }
+  const f = {
+    mode: "auto", style: "", units: clipsData.units, accounts: data.accounts,
+    start: pubSeriesDefaultStart(), intervalH: clipsData.default_interval_h || 4,
+    count: 1, selected: [], preview: null,
+  };
+  return openPanel("modal pub-modal pub-form", pubSeriesFormHtml(f), (d) => pubSeriesWire(f, d));
 }
 
 /* ---------- Actions ---------- */
@@ -769,6 +1001,8 @@ function pubWireTouch(body) {
 function pubWire(body) {
   const fresh = $("[data-pub-new]", body);
   if (fresh) fresh.onclick = () => pubOpenForm(null);
+  const series = $("[data-pub-series]", body);
+  if (series) series.onclick = () => pubOpenSeriesForm();
   $$("[data-pub-row]", body).forEach((row) => {
     const p = pubPosts.data.publications.find((x) => pubKey(x) === row.dataset.pubRow);
     if (!p) return;

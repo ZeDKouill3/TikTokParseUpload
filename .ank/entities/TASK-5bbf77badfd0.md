@@ -5,7 +5,7 @@ slug: publication-programmer-une-s-rie-n-clips-choisis
 title: "Publication : programmer une série (N clips choisis automatiquement, un toutes les X h, aperçu puis validation ; SPEC-1ed3, SPEC-6076 R3/R6)"
 created: 2026-10-03T11:13:47Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/publish.py
   - clipper/web/**
@@ -16,8 +16,15 @@ done_criteria: |
   tests/test_publish.py et tests/test_web.py verts : dates début + k×X h en durée réelle (passage heure d'hiver 25/10/2026 couvert), N meilleurs clips par score hors publiés/en file/programmés, parties d'un clip ensemble et dans l'ordre, filtre style, refus explicites (clips insuffisants, hors fenêtre, plafonds du compte) sans décalage silencieux, création tout ou rien, endpoints aperçu + création ; node --check du JS modifié. Tests unitaires sans navigateur ni réseau.
 criteria_by: creator
 verify: [tests]
+proof:
+  - type: test
+    ref: local/ad779a42299a@dd71d71
+    tree: scope/ce6f8d63940e
+    criteria: 47dc87bc8982
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---
 
 ## Demande utilisateur (2026-10-03)

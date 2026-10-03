@@ -1291,3 +1291,374 @@ def test_cancelling_a_publication_scheduled_on_youtube_points_to_youtube_studio(
                                publish_at=NOW.isoformat(), service="youtube")
     with pytest.raises(publish.PublishError, match="YouTube Studio"):
         publish.cancel_post("vid1", "01", "ma_chaine")
+
+
+# --------------------------------------------------------------------------
+# TASK-5bbf : série programmée (SPEC-1ed3, SPEC-6076 R3/R6) : plan_series_dates,
+# available_series_clips, preview_series, create_series.
+# --------------------------------------------------------------------------
+
+SERIES_NOW = datetime(2026, 10, 1, 8, 0, tzinfo=timezone.utc)
+
+
+def _write_video_channel(cwd: Path, video_id: str, channel: str | None) -> None:
+    video_dir = cwd / "workspace" / video_id
+    video_dir.mkdir(parents=True, exist_ok=True)
+    data = {"channel": channel} if channel is not None else {}
+    (video_dir / "pipeline.json").write_text(json.dumps(data), encoding="utf-8")
+
+
+def _series_env(cwd: Path, channel: str = "ma_chaine") -> None:
+    _write_config(cwd)
+    _write_preset(cwd, channel)
+    (cwd / "state").mkdir(exist_ok=True)
+    (cwd / "state" / "accounts.json").write_text(
+        json.dumps({"accounts": [{"id": _ACCOUNT, "label": "Compte"}]}), encoding="utf-8")
+
+
+def _series_settings(**over):
+    from clipper import tiktok
+    return {**tiktok.CONFIG_DEFAULTS, "max_posts_per_day": 10, "min_gap_minutes": 0, **over}
+
+
+# ---------- plan_series_dates ----------
+
+
+def test_plan_series_dates_spaces_posts_by_the_interval_in_real_duration(isolated_cwd):
+    from clipper import publish
+
+    start = datetime(2026, 10, 1, 9, 0, tzinfo=timezone.utc)
+    dates = publish.plan_series_dates(start, 3, 4)
+
+    assert dates == [start, start + timedelta(hours=3), start + timedelta(hours=6), start + timedelta(hours=9)]
+
+
+def test_plan_series_dates_crosses_the_2026_dst_fallback_without_drifting_the_real_gap(isolated_cwd):
+    from clipper import publish
+
+    paris = ZoneInfo("Europe/Paris")
+    start = datetime(2026, 10, 24, 20, 0, tzinfo=paris)  # CEST (+02:00), avant le passage a l'heure d'hiver
+
+    dates = publish.plan_series_dates(start, 24, 3)
+
+    assert dates[1] - dates[0] == timedelta(hours=24)  # duree reelle constante malgre le changement d'heure
+    assert dates[2] - dates[1] == timedelta(hours=24)
+    assert dates[0].astimezone(paris).strftime("%H:%M %z") == "20:00 +0200"
+    assert dates[1].astimezone(paris).strftime("%H:%M %z") == "19:00 +0100"  # heure murale decalee par le changement
+    assert dates[2].astimezone(paris).strftime("%H:%M %z") == "19:00 +0100"
+
+
+def test_plan_series_dates_refuses_invalid_interval_count_or_naive_start(isolated_cwd):
+    from clipper import publish
+
+    start = datetime(2026, 10, 1, 9, 0, tzinfo=timezone.utc)
+    with pytest.raises(publish.PublishError, match="intervalle"):
+        publish.plan_series_dates(start, 0, 2)
+    with pytest.raises(publish.PublishError, match="intervalle"):
+        publish.plan_series_dates(start, 1.5, 2)  # pas de 0,5 heure
+    with pytest.raises(publish.PublishError, match="nombre"):
+        publish.plan_series_dates(start, 1, 0)
+    with pytest.raises(publish.PublishError, match="fuseau"):
+        publish.plan_series_dates(datetime(2026, 10, 1, 9, 0), 1, 2)
+
+
+# ---------- available_series_clips ----------
+
+
+def test_available_series_clips_excludes_not_ready_queued_or_published(isolated_cwd):
+    from clipper import publish
+
+    _series_env(isolated_cwd)
+    _write_video_channel(isolated_cwd, "vid1", "ma_chaine")
+    _write_sidecar(isolated_cwd, "vid1", "a", score=90)
+    _write_sidecar(isolated_cwd, "vid1", "b", score=80, ready=False)  # pas pret
+    _write_sidecar(isolated_cwd, "vid1", "c", score=70)
+    publish.approve("vid1", "c", "ma_chaine", now=SERIES_NOW, account=_ACCOUNT)  # deja en file
+
+    units = publish.available_series_clips("ma_chaine")
+
+    assert [u["clip_ids"] for u in units] == [["a"]]
+
+
+def test_available_series_clips_groups_the_parts_of_a_clip_together_in_order(isolated_cwd):
+    from clipper import publish
+
+    _series_env(isolated_cwd)
+    _write_video_channel(isolated_cwd, "vid1", "ma_chaine")
+    _write_sidecar(isolated_cwd, "vid1", "x-p2", score=95, part=2, parts_total=2)
+    _write_sidecar(isolated_cwd, "vid1", "x-p1", score=95, part=1, parts_total=2)
+
+    units = publish.available_series_clips("ma_chaine")
+
+    assert len(units) == 1
+    assert units[0]["clip_ids"] == ["x-p1", "x-p2"]  # triees par numero de partie, jamais dans l'ordre du disque
+    assert units[0]["score"] == 95
+
+
+def test_available_series_clips_drops_a_whole_series_if_one_part_is_not_available(isolated_cwd):
+    from clipper import publish
+
+    _series_env(isolated_cwd)
+    _write_video_channel(isolated_cwd, "vid1", "ma_chaine")
+    _write_sidecar(isolated_cwd, "vid1", "x-p1", score=95, part=1, parts_total=2)
+    _write_sidecar(isolated_cwd, "vid1", "x-p2", score=95, part=2, parts_total=2)
+    publish.create_post("vid1", "x-p2", "ma_chaine", account=_ACCOUNT, mode="immediate",
+                        now=SERIES_NOW)  # partie 2 deja en file
+
+    assert publish.available_series_clips("ma_chaine") == []
+
+
+def test_available_series_clips_filters_by_style_none_means_every_style(isolated_cwd):
+    from clipper import publish
+
+    _series_env(isolated_cwd, "style_a")
+    _write_preset(isolated_cwd, "style_b")
+    _write_video_channel(isolated_cwd, "vid1", "style_a")
+    _write_video_channel(isolated_cwd, "vid2", "style_b")
+    _write_video_channel(isolated_cwd, "vid3", None)  # video sans style
+    _write_sidecar(isolated_cwd, "vid1", "a", score=90)
+    _write_sidecar(isolated_cwd, "vid2", "b", score=80)
+    _write_sidecar(isolated_cwd, "vid3", "c", score=70)
+
+    assert [u["video_id"] for u in publish.available_series_clips("style_a")] == ["vid1"]
+    assert sorted(u["video_id"] for u in publish.available_series_clips(None)) == ["vid1", "vid2", "vid3"]
+
+
+# ---------- preview_series : mode auto ----------
+
+
+def _auto_preview(cwd, **kwargs):
+    from clipper import publish
+
+    kwargs.setdefault("mode", "auto")
+    kwargs.setdefault("style", "ma_chaine")
+    kwargs.setdefault("account", _ACCOUNT)
+    kwargs.setdefault("service", "tiktok")
+    kwargs.setdefault("interval_hours", 2)
+    kwargs.setdefault("start_at", SERIES_NOW + timedelta(hours=1))
+    kwargs.setdefault("now", SERIES_NOW)
+    kwargs.setdefault("settings", _series_settings())
+    return publish.preview_series(**kwargs)
+
+
+def test_preview_series_auto_picks_the_n_best_clips_by_score(isolated_cwd):
+    _series_env(isolated_cwd)
+    _write_video_channel(isolated_cwd, "vid1", "ma_chaine")
+    _write_sidecar(isolated_cwd, "vid1", "a", score=90)
+    _write_sidecar(isolated_cwd, "vid1", "b", score=70)
+    _write_sidecar(isolated_cwd, "vid1", "c", score=50)
+
+    preview = _auto_preview(isolated_cwd, count=2)
+
+    assert [it["clip_id"] for it in preview["items"]] == ["a", "b"]
+    assert preview["ok"] is True and preview["available"] == 2 and preview["insufficient"] is False
+
+
+def test_preview_series_auto_dates_are_start_plus_k_times_interval_per_post(isolated_cwd):
+    _series_env(isolated_cwd)
+    _write_video_channel(isolated_cwd, "vid1", "ma_chaine")
+    _write_sidecar(isolated_cwd, "vid1", "a", score=90)
+    _write_sidecar(isolated_cwd, "vid1", "b", score=70)
+    start = SERIES_NOW + timedelta(hours=1)
+
+    preview = _auto_preview(isolated_cwd, count=2, start_at=start, interval_hours=3)
+
+    assert [it["publish_at"] for it in preview["items"]] == [
+        start.isoformat(), (start + timedelta(hours=3)).isoformat()]
+
+
+def test_preview_series_auto_counts_posts_not_clips_a_multipart_clip_takes_several_slots(isolated_cwd):
+    _series_env(isolated_cwd)
+    _write_video_channel(isolated_cwd, "vid1", "ma_chaine")
+    _write_sidecar(isolated_cwd, "vid1", "x-p1", score=95, part=1, parts_total=2)
+    _write_sidecar(isolated_cwd, "vid1", "x-p2", score=95, part=2, parts_total=2)
+    _write_sidecar(isolated_cwd, "vid1", "y", score=90)
+    _write_sidecar(isolated_cwd, "vid1", "z", score=80)
+
+    preview = _auto_preview(isolated_cwd, count=3)
+
+    assert [it["clip_id"] for it in preview["items"]] == ["x-p1", "x-p2", "y"]  # z laisse de cote : N=3 atteint
+
+
+def test_preview_series_auto_skips_a_series_that_does_not_fit_and_takes_the_next_clip(isolated_cwd):
+    _series_env(isolated_cwd)
+    _write_video_channel(isolated_cwd, "vid1", "ma_chaine")
+    _write_sidecar(isolated_cwd, "vid1", "a-p1", score=95, part=1, parts_total=3)
+    _write_sidecar(isolated_cwd, "vid1", "a-p2", score=95, part=2, parts_total=3)
+    _write_sidecar(isolated_cwd, "vid1", "a-p3", score=95, part=3, parts_total=3)
+    _write_sidecar(isolated_cwd, "vid1", "b", score=90)
+    _write_sidecar(isolated_cwd, "vid1", "c", score=85)
+
+    preview = _auto_preview(isolated_cwd, count=2)
+
+    # la serie de 3 parties (meilleur score) ne tient pas dans les 2 places : jamais coupee, on prend b puis c
+    assert [it["clip_id"] for it in preview["items"]] == ["b", "c"]
+    assert preview["ok"] is True
+
+
+def test_preview_series_auto_reports_when_not_enough_clips_are_available(isolated_cwd):
+    _series_env(isolated_cwd)
+    _write_video_channel(isolated_cwd, "vid1", "ma_chaine")
+    _write_sidecar(isolated_cwd, "vid1", "a", score=90)
+    _write_sidecar(isolated_cwd, "vid1", "b", score=80)
+
+    preview = _auto_preview(isolated_cwd, count=5)
+
+    assert preview["ok"] is False and preview["insufficient"] is True and preview["available"] == 2
+    assert "2" in preview["insufficient_reason"] and "5" in preview["insufficient_reason"]
+
+
+def test_preview_series_auto_filters_by_style(isolated_cwd):
+    _series_env(isolated_cwd, "style_a")
+    _write_preset(isolated_cwd, "style_b")
+    _write_video_channel(isolated_cwd, "vid1", "style_a")
+    _write_video_channel(isolated_cwd, "vid2", "style_b")
+    _write_sidecar(isolated_cwd, "vid1", "a", score=90)
+    _write_sidecar(isolated_cwd, "vid2", "b", score=99)
+
+    preview = _auto_preview(isolated_cwd, count=5, style="style_a")
+
+    assert [it["clip_id"] for it in preview["items"]] == ["a"]
+    assert preview["insufficient"] is True and preview["available"] == 1
+
+
+def test_preview_series_refuses_a_date_under_the_minimum_advance(isolated_cwd):
+    _series_env(isolated_cwd)
+    _write_video_channel(isolated_cwd, "vid1", "ma_chaine")
+    _write_sidecar(isolated_cwd, "vid1", "a", score=90)
+
+    preview = _auto_preview(isolated_cwd, count=1, start_at=SERIES_NOW + timedelta(minutes=5))
+
+    assert preview["ok"] is False
+    assert "minutes" in preview["items"][0]["refusal"]
+
+
+def test_preview_series_refuses_a_date_beyond_the_scheduling_window(isolated_cwd):
+    _series_env(isolated_cwd)
+    _write_video_channel(isolated_cwd, "vid1", "ma_chaine")
+    _write_sidecar(isolated_cwd, "vid1", "a", score=90)
+    _write_sidecar(isolated_cwd, "vid1", "b", score=80)
+
+    preview = _auto_preview(isolated_cwd, count=2, interval_hours=24 * 10)  # 2e post a plus de 10 j : hors fenetre
+
+    assert preview["items"][0]["refusal"] is None
+    assert preview["items"][1]["refusal"] is not None and "fenêtre" in preview["items"][1]["refusal"]
+    assert preview["ok"] is False
+
+
+def test_preview_series_refuses_a_series_that_violates_the_account_caps(isolated_cwd):
+    _series_env(isolated_cwd)
+    _write_video_channel(isolated_cwd, "vid1", "ma_chaine")
+    _write_sidecar(isolated_cwd, "vid1", "a", score=90)
+    _write_sidecar(isolated_cwd, "vid1", "b", score=80)
+
+    preview = _auto_preview(isolated_cwd, count=2, interval_hours=1, settings=_series_settings(max_posts_per_day=1))
+
+    assert preview["items"][0]["refusal"] is None
+    assert "plafond de 1 publication" in preview["items"][1]["refusal"]
+    assert preview["ok"] is False
+
+
+# ---------- preview_series : mode manuel ----------
+
+
+def test_preview_series_manual_follows_the_selection_order(isolated_cwd):
+    _series_env(isolated_cwd)
+    _write_video_channel(isolated_cwd, "vid1", "ma_chaine")
+    _write_sidecar(isolated_cwd, "vid1", "a", score=50)
+    _write_sidecar(isolated_cwd, "vid1", "b", score=99)
+
+    preview = _auto_preview(isolated_cwd, mode="manual", selection=[("vid1", "a"), ("vid1", "b")])
+
+    assert [it["clip_id"] for it in preview["items"]] == ["a", "b"]  # ordre de selection, pas le score
+    assert preview["available"] == 2 and preview["requested"] == 2
+
+
+def test_preview_series_manual_checking_one_part_adds_the_whole_series_in_order(isolated_cwd):
+    _series_env(isolated_cwd)
+    _write_video_channel(isolated_cwd, "vid1", "ma_chaine")
+    _write_sidecar(isolated_cwd, "vid1", "x-p1", score=50, part=1, parts_total=2)
+    _write_sidecar(isolated_cwd, "vid1", "x-p2", score=50, part=2, parts_total=2)
+
+    preview = _auto_preview(isolated_cwd, mode="manual", selection=[("vid1", "x-p2")])  # coche la partie 2
+
+    assert [it["clip_id"] for it in preview["items"]] == ["x-p1", "x-p2"]  # les deux, dans l'ordre
+
+
+def test_preview_series_manual_ignores_a_second_pick_of_the_same_series(isolated_cwd):
+    _series_env(isolated_cwd)
+    _write_video_channel(isolated_cwd, "vid1", "ma_chaine")
+    _write_sidecar(isolated_cwd, "vid1", "x-p1", score=50, part=1, parts_total=2)
+    _write_sidecar(isolated_cwd, "vid1", "x-p2", score=50, part=2, parts_total=2)
+    _write_sidecar(isolated_cwd, "vid1", "y", score=60)
+
+    preview = _auto_preview(isolated_cwd, mode="manual", selection=[("vid1", "x-p1"), ("vid1", "y"), ("vid1", "x-p2")])
+
+    assert [it["clip_id"] for it in preview["items"]] == ["x-p1", "x-p2", "y"]
+
+
+def test_preview_series_manual_refuses_an_unavailable_selection(isolated_cwd):
+    from clipper import publish
+
+    _series_env(isolated_cwd)
+    _write_video_channel(isolated_cwd, "vid1", "ma_chaine")
+    _write_sidecar(isolated_cwd, "vid1", "a", score=50)
+    publish.approve("vid1", "a", "ma_chaine", now=SERIES_NOW, account=_ACCOUNT)
+
+    with pytest.raises(publish.PublishError, match="vid1/a"):
+        _auto_preview(isolated_cwd, mode="manual", selection=[("vid1", "a")])
+
+
+# ---------- create_series ----------
+
+
+def test_create_series_creates_the_scheduled_entries_at_the_computed_dates(isolated_cwd):
+    from clipper import publish
+
+    _series_env(isolated_cwd)
+    _write_video_channel(isolated_cwd, "vid1", "ma_chaine")
+    _write_sidecar(isolated_cwd, "vid1", "a", score=90)
+    _write_sidecar(isolated_cwd, "vid1", "b", score=80)
+    start = SERIES_NOW + timedelta(hours=1)
+
+    created = publish.create_series(
+        mode="auto", style="ma_chaine", account=_ACCOUNT, service="tiktok", interval_hours=4,
+        start_at=start, count=2, settings=_series_settings(), now=SERIES_NOW)
+
+    assert [(e["clip_id"], e["status"], e["slot_at"], e["account"]) for e in created] == [
+        ("a", "scheduled", start.isoformat(), _ACCOUNT), ("b", "scheduled", (start + timedelta(hours=4)).isoformat(), _ACCOUNT)]
+    assert len(_read_state(isolated_cwd, "ma_chaine")) == 2
+
+
+def test_create_series_is_all_or_nothing_when_a_date_is_refused(isolated_cwd):
+    from clipper import publish
+
+    _series_env(isolated_cwd)
+    _write_video_channel(isolated_cwd, "vid1", "ma_chaine")
+    _write_sidecar(isolated_cwd, "vid1", "a", score=90)
+    _write_sidecar(isolated_cwd, "vid1", "b", score=80)
+
+    with pytest.raises(publish.PublishError):
+        publish.create_series(
+            mode="auto", style="ma_chaine", account=_ACCOUNT, service="tiktok", interval_hours=1,
+            start_at=SERIES_NOW + timedelta(hours=1), count=2, now=SERIES_NOW,
+            settings=_series_settings(max_posts_per_day=1))
+
+    assert _read_state(isolated_cwd, "ma_chaine") == []  # aucune publication creee
+
+
+def test_create_series_manual_respects_the_chosen_order(isolated_cwd):
+    from clipper import publish
+
+    _series_env(isolated_cwd)
+    _write_video_channel(isolated_cwd, "vid1", "ma_chaine")
+    _write_sidecar(isolated_cwd, "vid1", "a", score=50)
+    _write_sidecar(isolated_cwd, "vid1", "b", score=99)
+    start = SERIES_NOW + timedelta(hours=1)
+
+    created = publish.create_series(
+        mode="manual", style="ma_chaine", account=_ACCOUNT, service="tiktok", interval_hours=2,
+        start_at=start, selection=[("vid1", "a"), ("vid1", "b")], settings=_series_settings(), now=SERIES_NOW)
+
+    assert [e["clip_id"] for e in created] == ["a", "b"]
+    assert [e["slot_at"] for e in created] == [start.isoformat(), (start + timedelta(hours=2)).isoformat()]
