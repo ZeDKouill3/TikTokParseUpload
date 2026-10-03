@@ -7246,9 +7246,16 @@ def test_the_accounts_screen_renders_reads_and_summarises_the_slots_of_an_accoun
 # --------------------------------------------------------------------------
 
 
-def _series_client(tmp_path, ready=(READY, SPARE), **tiktok_settings):
+def _series_client(tmp_path, ready=(READY, SPARE), approved_account=READY, **tiktok_settings):
+    """TASK-16eeaccfaf09 : le mode auto ne prend que des clips deja valides (approuves, sans creneau) pour le
+    compte choisi ; les 6 clips de ``_publish_setup`` sont donc approuves pour ``approved_account`` par defaut
+    (``None`` pour les tests qui veulent des clips prets mais non valides)."""
     _publish_setup(tmp_path)
     _accounts_state(tmp_path, ready=ready)
+    if approved_account is not None:
+        _write_publish(tmp_path, "ma_chaine", [
+            _entry(cid, "approved", account=approved_account) for cid in ("01", "02", "03", "04", "05", "06")
+        ])
     return Config(mode="review", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output",
                  _sections={"tiktok": {"max_posts_per_day": 10, "min_gap_minutes": 0, **tiktok_settings}})
 
@@ -7289,7 +7296,9 @@ def test_series_preview_picks_the_best_clips_shows_their_paris_dates_and_is_ok(t
     assert [it["clip_id"] for it in data["items"]] == ["01", "02"]
     assert data["ok"] is True and data["insufficient"] is False
     assert all(it["publish_at_paris"] for it in data["items"])
-    assert json.loads((tmp_path / "state" / "publish" / "ma_chaine.json").read_text(encoding="utf-8")) == []  # rien cree
+    # rien cree : les clips restent 'approved' (deja valides avant l'appel), un aperçu ne programme rien
+    entries = json.loads((tmp_path / "state" / "publish" / "ma_chaine.json").read_text(encoding="utf-8"))
+    assert {e["status"] for e in entries} == {"approved"}
 
 
 def test_series_create_schedules_the_n_best_clips_two_hours_apart(tmp_path, isolated_cwd):
@@ -7303,11 +7312,14 @@ def test_series_create_schedules_the_n_best_clips_two_hours_apart(tmp_path, isol
 
     assert resp.status_code == 201, resp.text
     assert resp.json() == {"created": 3}
-    entries = sorted(json.loads((tmp_path / "state" / "publish" / "ma_chaine.json").read_text(encoding="utf-8")),
-                     key=lambda e: e["slot_at"])
+    all_entries = json.loads((tmp_path / "state" / "publish" / "ma_chaine.json").read_text(encoding="utf-8"))
+    entries = sorted((e for e in all_entries if e["status"] == "scheduled"), key=lambda e: e["slot_at"])
     assert [e["clip_id"] for e in entries] == ["01", "02", "03"]
     assert [e["account"] for e in entries] == [READY, READY, READY]
     assert entries[1]["slot_at"] == (_dt.fromisoformat(start) + _td(hours=2)).isoformat()
+    # les clips 04-06, restes 'approved' (non choisis par le score), ne sont pas touches
+    assert {e["clip_id"]: e["status"] for e in all_entries if e["clip_id"] not in ("01", "02", "03")} == {
+        "04": "approved", "05": "approved", "06": "approved"}
 
 
 def test_series_preview_reports_insufficient_clips_without_creating_anything(tmp_path, isolated_cwd):
@@ -7331,7 +7343,9 @@ def test_series_create_is_all_or_nothing_on_a_cap_violation(tmp_path, isolated_c
         "mode": "auto", "account": READY, "interval_hours": 1, "start_at": _soon(hours=1), "count": 2})
 
     assert resp.status_code == 409
-    assert json.loads((tmp_path / "state" / "publish" / "ma_chaine.json").read_text(encoding="utf-8")) == []
+    # tout ou rien : les clips restent 'approved' (deja valides avant l'appel), rien n'est passe en 'scheduled'
+    entries = json.loads((tmp_path / "state" / "publish" / "ma_chaine.json").read_text(encoding="utf-8"))
+    assert {e["status"] for e in entries} == {"approved"}
 
 
 def test_series_create_refuses_an_account_that_is_not_ready(tmp_path, isolated_cwd):
@@ -7369,6 +7383,47 @@ def test_series_preview_filters_by_style(tmp_path, isolated_cwd):
 
     assert resp.status_code == 200
     assert all(it["video_id"] == CLIPS_VIDEO for it in resp.json()["items"])
+
+
+# ---------- TASK-16eeaccfaf09 : le mode auto ne pioche que dans les clips valides ----------
+
+
+def test_series_preview_auto_never_takes_a_ready_but_unvalidated_clip(tmp_path, isolated_cwd):
+    config = _series_client(tmp_path, approved_account=None)  # clips prets, aucun valide
+    c = TestClient(create_app(config=config))
+
+    resp = c.post("/api/publications/series/preview", json={
+        "mode": "auto", "account": READY, "interval_hours": 1, "start_at": _soon(hours=1), "count": 1})
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["items"] == [] and data["available"] == 0
+    assert "valide d'abord des clips dans l'écran Clips" in data["insufficient_reason"]
+
+
+def test_series_preview_auto_never_takes_a_clip_validated_for_another_account(tmp_path, isolated_cwd):
+    config = _series_client(tmp_path, approved_account=SPARE)  # valide, mais pour l'autre compte
+    c = TestClient(create_app(config=config))
+
+    resp = c.post("/api/publications/series/preview", json={
+        "mode": "auto", "account": READY, "interval_hours": 1, "start_at": _soon(hours=1), "count": 1})
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["items"] == [] and data["available"] == 0
+
+
+def test_series_clips_endpoint_marks_validated_clips_and_still_lists_unvalidated_ones(tmp_path, isolated_cwd):
+    config = _series_client(tmp_path, approved_account=None)  # tous prets, aucun valide au depart
+    _write_publish(tmp_path, "ma_chaine", [_entry("01", "approved", account=READY)])  # seul "01" est valide
+    c = TestClient(create_app(config=config))
+
+    resp = c.get("/api/publications/series/clips")
+
+    assert resp.status_code == 200
+    validated = {u["clip_id"]: u["validated"] for u in resp.json()["units"]}
+    assert validated["01"] is True
+    assert validated["02"] is False
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node absent du PATH")
