@@ -556,7 +556,7 @@ class Worker:
             return False
         if not self._account_ready(entry, name, account, paths["state_dir"]):
             return False
-        scope ={"state_dir": paths["state_dir"], "presets_dir": paths["presets_dir"], "base": paths["base"]}
+        scope = {"state_dir": paths["state_dir"], "presets_dir": paths["presets_dir"], "base": paths["base"]}
         if publish_mod.halted_account(account, **scope) is not None:
             return False  # arret sur en cours (R4) : rien ne part avant « Reessayer »
 
