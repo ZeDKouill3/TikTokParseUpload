@@ -1662,3 +1662,300 @@ def test_create_series_manual_respects_the_chosen_order(isolated_cwd):
 
     assert [e["clip_id"] for e in created] == ["a", "b"]
     assert [e["slot_at"] for e in created] == [start.isoformat(), (start + timedelta(hours=2)).isoformat()]
+
+
+# --------------------------------------------------------------------------
+# TASK-f66a4166f966 : garde-fous de statut et créneaux (revues r-publication
+# et r-comptes, partie publish.py)
+# --------------------------------------------------------------------------
+
+
+def _seed_full_entry(cwd: Path, channel: str, status: str, **extra) -> dict:
+    _write_config(cwd)
+    if not (cwd / "presets" / f"{channel}.toml").exists():
+        _write_preset(cwd, channel, _SLOT_PRESET)
+    _write_sidecar(cwd, "vid1", "03")
+    state = _state_file(cwd, channel)
+    state.parent.mkdir(parents=True, exist_ok=True)
+    entry = {
+        "video_id": "vid1", "clip_id": "03", "series_id": None, "part": None,
+        "status": status, "slot_at": "2026-10-05T09:00:00+00:00" if status in ("scheduled", "published") else None,
+        "decided_at": "2026-09-28T00:00:00+00:00", "published_at": None, "error": None, "account": _ACCOUNT,
+    }
+    entry.update(extra)
+    state.write_text(json.dumps([entry]), encoding="utf-8")
+    return entry
+
+
+# ---------- (1) approve refuse published / scheduled / en cours, sans rien ecrire ----------
+
+
+@pytest.mark.parametrize("status", ["published", "scheduled"])
+def test_approve_refuses_a_published_or_scheduled_clip_and_writes_nothing(isolated_cwd, status):
+    from clipper import publish
+
+    entry = _seed_full_entry(isolated_cwd, "ma_chaine", status)
+
+    with pytest.raises(publish.PublishError, match=status):
+        publish.approve("vid1", "03", "ma_chaine", account=_ACCOUNT)
+
+    assert _read_state(isolated_cwd, "ma_chaine") == [entry]  # rien n'est reecrit
+
+
+def test_approve_refuses_a_clip_in_progress_and_writes_nothing(isolated_cwd):
+    from clipper import publish
+
+    entry = _seed_full_entry(isolated_cwd, "ma_chaine", "scheduled",
+                             in_progress_since="2026-10-01T00:00:00+00:00")
+
+    with pytest.raises(publish.PublishError, match="en cours"):
+        publish.approve("vid1", "03", "ma_chaine", account=_ACCOUNT)
+
+    assert _read_state(isolated_cwd, "ma_chaine") == [entry]
+
+
+def test_approve_is_still_allowed_on_an_approved_or_a_failed_entry(isolated_cwd):
+    publish = _tiktok_env(isolated_cwd, ("01",))
+    publish.mark_failed("vid1", "01", "ma_chaine", "raison")
+
+    entry = publish.approve("vid1", "01", "ma_chaine", account=_ACCOUNT)
+
+    assert entry["status"] == "approved"  # ni erreur ni republication automatique
+
+
+# ---------- (2) reject refuse published / en cours, y compris une partie sœur, avant toute ecriture ----------
+
+
+def test_reject_refuses_a_published_clip_and_writes_nothing(isolated_cwd):
+    publish = _tiktok_env(isolated_cwd, ("01",))
+    publish.mark_published("vid1", "01", "ma_chaine", now=_MON)
+    before = _read_state(isolated_cwd, "ma_chaine")
+
+    with pytest.raises(publish.PublishError, match="published"):
+        publish.reject("vid1", "01", "ma_chaine")
+
+    assert _read_state(isolated_cwd, "ma_chaine") == before
+
+
+def test_reject_refuses_a_clip_in_progress_and_writes_nothing(isolated_cwd):
+    publish = _tiktok_env(isolated_cwd, ("01",))
+    publish.mark_in_progress("vid1", "01", "ma_chaine", now=_MON)
+    before = _read_state(isolated_cwd, "ma_chaine")
+
+    with pytest.raises(publish.PublishError, match="en cours"):
+        publish.reject("vid1", "01", "ma_chaine")
+
+    assert _read_state(isolated_cwd, "ma_chaine") == before
+
+
+def test_reject_refuses_a_series_part_when_a_sibling_is_already_published_and_writes_nothing(isolated_cwd):
+    from clipper import publish
+
+    _write_config(isolated_cwd)
+    _write_preset(isolated_cwd, "ma_chaine", _SLOT_PRESET)
+    _write_sidecar(isolated_cwd, "vid1", "03-p1", part=1, parts_total=2)
+    _write_sidecar(isolated_cwd, "vid1", "03-p2", part=2, parts_total=2)
+    publish.approve("vid1", "03-p1", "ma_chaine", now=_MON, account=_ACCOUNT, schedule=_MON9)
+    publish.mark_published("vid1", "03-p1", "ma_chaine", now=_MON)
+    publish.approve("vid1", "03-p2", "ma_chaine", now=_MON, account=_ACCOUNT)
+    before = _read_state(isolated_cwd, "ma_chaine")
+
+    with pytest.raises(publish.PublishError, match="published"):
+        publish.reject("vid1", "03-p2", "ma_chaine")  # refuse la partie 2 elle-meme : la sœur p1 est publiee
+
+    assert _read_state(isolated_cwd, "ma_chaine") == before  # aucune ecriture, meme sur p2
+
+
+# ---------- (3) unschedule refuse rejected et published-avec-tiktok_state, garde l'annulation manuelle ----------
+
+
+def test_unschedule_refuses_a_rejected_entry(isolated_cwd):
+    from clipper import publish
+
+    entry = _seed_full_entry(isolated_cwd, "ma_chaine", "rejected")
+
+    with pytest.raises(publish.PublishError, match="rejected"):
+        publish.unschedule("vid1", "03", "ma_chaine")
+
+    assert _read_state(isolated_cwd, "ma_chaine") == [entry]
+
+
+def test_unschedule_refuses_a_published_entry_with_a_tiktok_state(isolated_cwd):
+    publish = _tiktok_env(isolated_cwd, ("01",))
+    publish.mark_published("vid1", "01", "ma_chaine", now=_MON, tiktok_state="published",
+                           post_url="https://example.invalid/@ma_chaine/video/1", publish_at=_MON.isoformat(),
+                           account=_ACCOUNT)
+    before = _read_state(isolated_cwd, "ma_chaine")
+
+    with pytest.raises(publish.PublishError, match="published"):
+        publish.unschedule("vid1", "01", "ma_chaine")
+
+    assert _read_state(isolated_cwd, "ma_chaine") == before
+
+
+def test_unschedule_still_cancels_a_manually_declared_publication(isolated_cwd):
+    publish = _tiktok_env(isolated_cwd, ("01",))
+    publish.mark_published("vid1", "01", "ma_chaine", now=_MON)  # declaration manuelle : aucun tiktok_state
+
+    entry = publish.unschedule("vid1", "01", "ma_chaine")
+
+    assert entry["status"] == "approved" and entry["slot_at"] is None
+
+
+# ---------- (4) la partie N s'approuve quand la partie N-1 est published ----------
+
+
+def test_approve_part_n_accepts_when_previous_part_is_published(isolated_cwd):
+    from clipper import publish
+
+    _series(isolated_cwd)
+    publish.approve("vid1", "03-p1", "ma_chaine", now=_MON, account=_ACCOUNT, schedule=_MON9)
+    publish.mark_published("vid1", "03-p1", "ma_chaine", now=_MON)
+
+    entry = publish.approve("vid1", "03-p2", "ma_chaine", account=_ACCOUNT)
+
+    assert entry["part"] == 2
+
+
+# ---------- (5) update_post passe une entree approved a scheduled ----------
+
+
+def test_update_post_moves_an_approved_entry_to_scheduled(isolated_cwd):
+    from clipper import publish
+
+    _write_config(isolated_cwd)
+    _write_preset(isolated_cwd, "ma_chaine", _SLOT_PRESET)
+    _write_sidecar(isolated_cwd, "vid1", "03")
+    entry = publish.approve("vid1", "03", "ma_chaine", now=NOW, account=_ACCOUNT)
+    assert entry["status"] == "approved"  # compte sans creneau
+
+    updated = publish.update_post("vid1", "03", "ma_chaine", mode="scheduled",
+                                  publish_at=NOW + timedelta(days=1), now=NOW)
+
+    assert updated["status"] == "scheduled"  # sinon le worker (qui ne prend que 'scheduled') l'ignore pour toujours
+
+
+# ---------- (6) creneaux pris = instants du compte, toutes chaines, dans _next_free_slot/move/postpone ----------
+
+
+def test_approve_skips_an_instant_already_taken_by_another_style_of_the_same_account(isolated_cwd):
+    from clipper import publish
+
+    _write_config(isolated_cwd)
+    _write_preset(isolated_cwd, "style_a", _TWO_SLOTS)
+    _write_preset(isolated_cwd, "style_b", _TWO_SLOTS)
+    _write_sidecar(isolated_cwd, "vid1", "01")
+    _write_sidecar(isolated_cwd, "vid2", "02")
+    schedule_one_slot = _sched(("mon", "09:00"))
+
+    first = publish.approve("vid1", "01", "style_a", now=_MON, account=_ACCOUNT, schedule=schedule_one_slot)
+    second = publish.approve("vid2", "02", "style_b", now=_MON, account=_ACCOUNT, schedule=schedule_one_slot)
+
+    assert first["slot_at"] == datetime(2026, 9, 28, 9, 0, tzinfo=ZoneInfo("UTC")).isoformat()
+    # meme compte, autre style : l'instant du 28 est deja pris, 02 saute a la semaine suivante
+    assert second["slot_at"] == datetime(2026, 10, 5, 9, 0, tzinfo=ZoneInfo("UTC")).isoformat()
+
+
+def test_move_refuses_a_slot_taken_by_another_style_of_the_same_account(isolated_cwd):
+    from clipper import publish
+
+    _write_config(isolated_cwd)
+    _write_preset(isolated_cwd, "style_a", _TWO_SLOTS)
+    _write_preset(isolated_cwd, "style_b", _TWO_SLOTS)
+    _write_sidecar(isolated_cwd, "vid1", "01")
+    _write_sidecar(isolated_cwd, "vid2", "02")
+    now = datetime(2026, 9, 28, 12, 0, tzinfo=timezone.utc)  # monday, past 09:00
+    taken_slot = datetime(2026, 10, 5, 9, 0, tzinfo=timezone.utc)
+    publish.approve("vid1", "01", "style_a", now=now, account=_ACCOUNT, schedule=_MON9)  # -> 2026-10-05T09:00
+    publish.approve("vid2", "02", "style_b", now=now, account=_ACCOUNT)  # approved, sans creneau
+
+    with pytest.raises(publish.PublishError, match="vid2/02"):
+        publish.move("vid2", "02", "style_b", taken_slot, schedule=_MON9)
+
+
+def test_move_sees_the_same_instant_with_a_different_utc_offset_as_taken(isolated_cwd):
+    from clipper import publish
+
+    _write_config(isolated_cwd)
+    _write_preset(isolated_cwd, "ma_chaine")
+    _write_sidecar(isolated_cwd, "vid1", "01")
+    _write_sidecar(isolated_cwd, "vid1", "02")
+    schedule = {"slots": [{"day": "mon", "time": "18:00"}], "timezone": "Europe/Paris"}
+    paris_slot = datetime(2026, 10, 5, 18, 0, tzinfo=ZoneInfo("Europe/Paris"))  # +02:00 (CEST)
+    # publication manuelle du formulaire, enregistree en UTC (le navigateur envoie toISOString())
+    publish.create_post("vid1", "01", "ma_chaine", account=_ACCOUNT, mode="scheduled",
+                        publish_at=paris_slot.astimezone(timezone.utc), now=_MON)
+    publish.approve("vid1", "02", "ma_chaine", now=_MON, account=_ACCOUNT)  # approved, sans creneau
+
+    with pytest.raises(publish.PublishError, match="vid1/02"):
+        publish.move("vid1", "02", "ma_chaine", paris_slot, schedule=schedule)  # meme instant que 01, offset different
+
+
+def test_postpone_sees_a_slot_taken_by_another_style_of_the_same_account(isolated_cwd):
+    from clipper import publish
+
+    _write_config(isolated_cwd)
+    _write_preset(isolated_cwd, "style_a", _TWO_SLOTS)
+    _write_preset(isolated_cwd, "style_b", _TWO_SLOTS)
+    _write_sidecar(isolated_cwd, "vid1", "01")
+    _write_sidecar(isolated_cwd, "vid2", "02")
+    publish.approve("vid1", "01", "style_a", now=_MON, account=_ACCOUNT, schedule=_TWO_SCHED)  # -> lun 09:00
+    publish.approve("vid2", "02", "style_b", now=_MON, account=_ACCOUNT, schedule=_TWO_SCHED)  # -> lun 18:00
+
+    moved = publish.postpone(
+        "vid1", "01", "style_a", "plafond atteint",
+        allowed=lambda slot: None, now=_MON, schedule=_TWO_SCHED)
+
+    # le 18:00 de style_b (meme compte) est vu comme pris : le prochain creneau libre est le lundi suivant
+    assert moved["slot_at"] == "2026-10-05T09:00:00+00:00"
+
+
+# ---------- (7) preview_series refuse chaque item si les reglages seraient refuses a la creation ----------
+
+
+def test_preview_series_refuses_every_item_when_the_default_visibility_would_be_refused_at_creation(isolated_cwd):
+    _series_env(isolated_cwd)
+    _write_video_channel(isolated_cwd, "vid1", "ma_chaine")
+    _write_sidecar(isolated_cwd, "vid1", "a", score=90)
+    _write_sidecar(isolated_cwd, "vid1", "b", score=80)
+
+    preview = _auto_preview(isolated_cwd, count=2, settings=_series_settings(visibility="private"))
+
+    assert preview["ok"] is False
+    assert all(it["refusal"] is not None and "privée" in it["refusal"] for it in preview["items"])
+
+
+# ---------- (8) create_series : annulation tout-ou-rien, journalisee, couvre toute Exception ----------
+
+
+def test_create_series_lists_and_logs_the_entries_the_worker_already_took_and_covers_any_exception(
+    isolated_cwd, monkeypatch, caplog,
+):
+    from clipper import publish
+
+    _series_env(isolated_cwd)
+    _write_video_channel(isolated_cwd, "vid1", "ma_chaine")
+    _write_sidecar(isolated_cwd, "vid1", "a", score=90)
+    _write_sidecar(isolated_cwd, "vid1", "b", score=80)
+    start = SERIES_NOW + timedelta(hours=1)
+
+    real_create_post = publish.create_post
+
+    def fake_create_post(video_id, clip_id, channel, **kwargs):
+        if clip_id == "b":
+            raise ValueError("sidecar JSON corrompu")  # pas un PublishError/ChannelError/ConfigError
+        entry = real_create_post(video_id, clip_id, channel, **kwargs)
+        # le worker prend la main sur "a" avant que la boucle n'atteigne "b"
+        publish.mark_in_progress(video_id, clip_id, channel or publish.NO_CHANNEL, now=SERIES_NOW)
+        return entry
+
+    monkeypatch.setattr(publish, "create_post", fake_create_post)
+
+    with pytest.raises(publish.PublishError, match="vid1/a"):
+        publish.create_series(
+            mode="auto", style="ma_chaine", account=_ACCOUNT, service="tiktok", interval_hours=4,
+            start_at=start, count=2, settings=_series_settings(), now=SERIES_NOW)
+
+    assert "vid1/a" in caplog.text  # journalise (ADR-ad2e), pas avale en silence
+    entries = {e["clip_id"]: e for e in _read_state(isolated_cwd, "ma_chaine")}
+    assert entries["a"]["in_progress_since"] is not None  # l'entree prise par le worker reste intacte, pas annulee
