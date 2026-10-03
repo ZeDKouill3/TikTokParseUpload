@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import os
+import sys
+
+import pytest
+
 
 def test_get_device_returns_cuda_when_cuda_device_count_positive(fake_ctranslate2):
     fake_ctranslate2(cuda_device_count=1)
@@ -41,6 +46,98 @@ def test_get_device_returns_cpu_when_ctranslate2_raises(fake_ctranslate2):
 
     assert device.type == "cpu"
     assert device.compute_type == "int8"
+
+
+# --- PATH des DLL nvidia (TASK-f6c495f901c0, SPEC-38f7 R4) ------------------
+
+
+def test_ensure_cuda_dlls_on_path_adds_bin_dirs_at_head_in_order(tmp_path, monkeypatch):
+    from clipper import gpu
+
+    monkeypatch.setattr(gpu, "_cuda_path_initialized", False)
+    cublas_bin = tmp_path / "nvidia" / "cublas" / "bin"
+    cudnn_bin = tmp_path / "nvidia" / "cudnn" / "bin"
+    cublas_bin.mkdir(parents=True)
+    cudnn_bin.mkdir(parents=True)
+    monkeypatch.setenv("PATH", "C:\\existant")
+
+    gpu.ensure_cuda_dlls_on_path(tmp_path)
+
+    entries = os.environ["PATH"].split(os.pathsep)
+    assert entries[:2] == [str(cublas_bin), str(cudnn_bin)]
+    assert entries[2:] == ["C:\\existant"]
+
+
+def test_ensure_cuda_dlls_on_path_empty_tree_leaves_path_unchanged(tmp_path, monkeypatch):
+    from clipper import gpu
+
+    monkeypatch.setattr(gpu, "_cuda_path_initialized", False)
+    monkeypatch.setenv("PATH", "C:\\existant")
+
+    gpu.ensure_cuda_dlls_on_path(tmp_path)
+
+    assert os.environ["PATH"] == "C:\\existant"
+
+
+def test_ensure_cuda_dlls_on_path_no_duplicate_when_already_on_path(tmp_path, monkeypatch):
+    from clipper import gpu
+
+    bin_dir = tmp_path / "nvidia" / "cublas" / "bin"
+    bin_dir.mkdir(parents=True)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}C:\\existant")
+    monkeypatch.setattr(gpu, "_cuda_path_initialized", False)
+
+    gpu.ensure_cuda_dlls_on_path(tmp_path)
+
+    entries = os.environ["PATH"].split(os.pathsep)
+    assert entries.count(str(bin_dir)) == 1
+
+
+def test_ensure_cuda_dlls_on_path_runs_once_per_process(tmp_path, monkeypatch):
+    from clipper import gpu
+
+    monkeypatch.setattr(gpu, "_cuda_path_initialized", False)
+    bin_dir = tmp_path / "nvidia" / "cublas" / "bin"
+    bin_dir.mkdir(parents=True)
+    monkeypatch.setenv("PATH", "C:\\existant")
+
+    gpu.ensure_cuda_dlls_on_path(tmp_path)
+    after_first = os.environ["PATH"]
+
+    other_root = tmp_path / "autre"
+    other_bin = other_root / "nvidia" / "cudnn" / "bin"
+    other_bin.mkdir(parents=True)
+    gpu.ensure_cuda_dlls_on_path(other_root)
+
+    assert os.environ["PATH"] == after_first
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="os.add_dll_directory est Windows seulement")
+def test_ensure_cuda_dlls_on_path_registers_dll_directory_on_windows(tmp_path, monkeypatch):
+    from clipper import gpu
+
+    monkeypatch.setattr(gpu, "_cuda_path_initialized", False)
+    bin_dir = tmp_path / "nvidia" / "cudnn" / "bin"
+    bin_dir.mkdir(parents=True)
+    monkeypatch.setenv("PATH", "")
+    calls = []
+    monkeypatch.setattr(gpu.os, "add_dll_directory", lambda p: calls.append(p), raising=False)
+
+    gpu.ensure_cuda_dlls_on_path(tmp_path)
+
+    assert calls == [str(bin_dir)]
+
+
+def test_get_device_calls_ensure_cuda_dlls_on_path(fake_ctranslate2, monkeypatch):
+    from clipper import gpu
+
+    calls = []
+    monkeypatch.setattr(gpu, "ensure_cuda_dlls_on_path", lambda *a, **k: calls.append(True))
+    fake_ctranslate2(cuda_device_count=0)
+
+    gpu.get_device()
+
+    assert calls == [True]
 
 
 # --- VRAM (TASK-dc9d) : jamais torch, toujours via clipper.gpu --------------

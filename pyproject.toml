@@ -35,6 +35,15 @@ test = [
     "pytest-xdist>=3",
     "httpx",
 ]
+# GPU (SPEC-38f7 R4) : CTranslate2 >= 4.8 (utilisé par faster-whisper) lie
+# cuBLAS 12.x et cuDNN 9.x lui-même mais ne les installe pas (AGENTS.md,
+# Pièges) ; bornes minimales compatibles avec ces versions. nvrtc (JIT CUDA)
+# n'est pas dans cette liste : CTranslate2 n'utilise que des kernels CUDA
+# précompilés, jamais de compilation à l'exécution.
+cuda = [
+    "nvidia-cublas-cu12>=12.0",
+    "nvidia-cudnn-cu12>=9.0",
+]
 
 [project.scripts]
 clipper = "clipper.__main__:main"
