@@ -44,6 +44,7 @@ from clipper import pipeline
 from clipper import publish as publish_mod
 from clipper import reframe as reframe_mod
 from clipper import tiktok as tiktok_mod
+from clipper import youtube as youtube_mod
 from clipper import watch as watch_mod
 from clipper import worker as worker_mod
 from clipper.config import (
@@ -1712,30 +1713,73 @@ def _require_account(config: Config, account_id: str) -> None:
         raise HTTPException(status_code=404, detail=f"compte introuvable : {account_id!r}")
 
 
+def _find_account(config: Config, account_id: str) -> dict[str, Any]:
+    account = next((a for a in _accounts_call(accounts_mod.list_accounts, config) if a["id"] == account_id), None)
+    if account is None:
+        raise HTTPException(status_code=404, detail=f"compte introuvable : {account_id!r}")
+    return account
+
+
 def _browser_login(config: Config, account_id: str, url: str | None) -> None:
+    """« Se connecter » : Chrome normal sur le profil. Un compte YouTube s'ouvre sur YouTube Studio (R1) et
+    est verifie a la fermeture de la fenetre (chaine visible = pret a publier)."""
+    account = _find_account(config, account_id)
+    youtube_account = account.get("service") == "youtube"
     try:
-        browser_mod.start_login(account_id, url, config=config, on_close=lambda: _verify_login(
-            config, {"id": account_id}))
-    except browser_mod.BrowserError as exc:
+        if youtube_account and url is None:
+            url = youtube_mod.studio_url()
+        browser_mod.start_login(account_id, url, config=config, on_close=lambda: _verify_account(config, account))
+    except (browser_mod.BrowserError, youtube_mod.YouTubeError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from None
 
 
 def _verify_login(config: Config, account: dict[str, Any]) -> dict[str, Any]:
-    """Connexion TikTok d'un compte, lue dans les cookies de son profil sans naviguer (SPEC-00d1 R2) et
+    """Connexion d'un compte TikTok, lue dans les cookies de son profil sans naviguer (SPEC-00d1 R2) et
     enregistree ; une session expiree decoche « pret a publier » (R3) et le signale a la console.
-    Une lecture impossible (profil verrouille...) garde l'etat connu et le dit dans ``login_error``."""
+    Une lecture impossible (profil verrouille...) garde l'etat connu et le dit dans ``login_error``.
+    Un compte YouTube n'est jamais lu dans les cookies : sa connexion vient de la derniere verification
+    de YouTube Studio (``_verify_youtube``), l'ecran ne lance pas de navigateur a chaque ouverture."""
+    if account.get("service") == "youtube":
+        return account
     try:
         observed = browser_mod.login_state(account["id"], config=config)
         result = accounts_mod.record_login(config, account["id"], observed)
     except browser_mod.BrowserError as exc:
         return {**account, "login_error": str(exc)}
     if result.pop("auto_unchecked"):
-        try:
-            tiktok_mod.emit_event({"level": "warn", "account": account["id"], "channel": None, "video_id": None,
-                                   "clip_id": None, "reason": result["ready_note"], "capture": None}, config=config)
-        except tiktok_mod.TikTokError as exc:
-            logger.error("evenement « prêt à publier décoché » non écrit : %s", exc)
+        _emit_unchecked(config, account["id"], result["ready_note"])
     return result
+
+
+def _emit_unchecked(config: Config, account_id: str, note: str | None) -> None:
+    try:
+        tiktok_mod.emit_event({"level": "warn", "account": account_id, "channel": None, "video_id": None,
+                               "clip_id": None, "reason": note, "capture": None}, config=config)
+    except tiktok_mod.TikTokError as exc:
+        logger.error("evenement « prêt à publier décoché » non écrit : %s", exc)
+
+
+def _verify_youtube(config: Config, account: dict[str, Any]) -> dict[str, Any]:
+    """Verification « pret a publier » d'un compte YouTube (SPEC-5e50 R1) : ouvre YouTube Studio sur le
+    profil, enregistre la chaine vue (nom, identifiant) ou la raison du refus. Chrome/Playwright absent ou
+    reglage invalide : l'erreur remonte (``BrowserError`` / ``YouTubeError``), rien n'est invente."""
+    seen = youtube_mod.verify_login(account["id"], config=config)
+    observed: dict[str, Any] = {"state": "connected" if seen["ready"] else "never", "channel": seen["channel"]}
+    if not seen["ready"]:
+        observed["reason"] = seen["reason"]
+    result = accounts_mod.record_login(config, account["id"], observed)
+    if result.pop("auto_unchecked"):
+        _emit_unchecked(config, account["id"], result["ready_note"])
+    result.pop("auto_checked", None)
+    result["capture"] = seen.get("capture")
+    return result
+
+
+def _verify_account(config: Config, account: dict[str, Any]) -> dict[str, Any]:
+    """A la fermeture de la fenetre de connexion : YouTube Studio pour un compte YouTube, les cookies pour TikTok."""
+    if account.get("service") == "youtube":
+        return _verify_youtube(config, account)
+    return _verify_login(config, account)
 
 
 def _account_overview(config: Config, account: dict[str, Any]) -> dict[str, Any]:
@@ -1747,7 +1791,8 @@ def _account_overview(config: Config, account: dict[str, Any]) -> dict[str, Any]
     scope = {"state_dir": _publish_dir(config), "presets_dir": _PRESETS_DIR, "base": _BASE_CONFIG}
     out.update(posts_today=None, max_posts_per_day=None, last_failure=None, publish_error=None)
     try:
-        out["max_posts_per_day"] = tiktok_mod.get_settings(config)["max_posts_per_day"]
+        settings_of = youtube_mod.get_settings if out.get("service") == "youtube" else tiktok_mod.get_settings
+        out["max_posts_per_day"] = settings_of(config)["max_posts_per_day"]
         tz = ZoneInfo("UTC")
         for name in channel_mod.list_channels(_PRESETS_DIR):
             _config, settings = channel_mod.load_channel(name, presets_dir=_PRESETS_DIR, base=_BASE_CONFIG)
@@ -1764,13 +1809,27 @@ def _account_overview(config: Config, account: dict[str, Any]) -> dict[str, Any]
                 "reason": failure.get("error"), "failed_at": failure.get("failed_at"),
                 "capture_url": f"/api/publish/{failure['video_id']}/{failure['clip_id']}/capture" if failure.get("capture") else None,
             }
-    except (publish_mod.PublishError, channel_mod.ChannelError, ConfigError, tiktok_mod.TikTokError) as exc:
+    except (publish_mod.PublishError, channel_mod.ChannelError, ConfigError, tiktok_mod.TikTokError,
+            youtube_mod.YouTubeError) as exc:
         out["publish_error"] = str(exc)
     return out
 
 
 def _accounts_overview(config: Config) -> list[dict[str, Any]]:
     return [_account_overview(config, a) for a in _accounts_call(accounts_mod.list_accounts, config)]
+
+
+def _account_verify(config: Config, account_id: str) -> dict[str, Any]:
+    account = _find_account(config, account_id)
+    if account.get("service") != "youtube":
+        raise HTTPException(status_code=409, detail="seul un compte YouTube se vérifie dans le navigateur : "
+                            "la connexion TikTok se lit dans les cookies du profil à l'ouverture de l'écran")
+    try:
+        out = _verify_youtube(config, account)
+    except (browser_mod.BrowserError, youtube_mod.YouTubeError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    out["ready_blocked_reason"] = accounts_mod.ready_blocked_reason(out)
+    return out
 
 
 def _account_resolve(config: Config, account_id: str) -> dict[str, Any]:
@@ -2586,6 +2645,12 @@ def create_app(config: Config | None = None) -> FastAPI:
     @app.post("/api/accounts/{account_id}/resolve")
     async def accounts_resolve(account_id: str) -> dict[str, Any]:
         return await run_in_threadpool(_account_resolve, config, account_id)
+
+    @app.post("/api/accounts/{account_id}/verify")
+    async def accounts_verify(account_id: str) -> dict[str, Any]:
+        """Revérifie un compte YouTube (R1) : ouvre YouTube Studio sur son profil et enregistre la chaîne vue,
+        ou la raison du refus. Compte TikTok : 409 (sa connexion se lit dans ses cookies, sans navigation)."""
+        return await run_in_threadpool(_account_verify, config, account_id)
 
     @app.post("/api/accounts", status_code=201)
     async def accounts_add(request: Request) -> dict[str, Any]:

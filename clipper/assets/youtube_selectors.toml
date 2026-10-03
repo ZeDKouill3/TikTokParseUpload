@@ -1,0 +1,49 @@
+# Reperes et URL de YouTube Studio (SPEC-5e50 R4, ADR-58c0).
+#
+# Seul fichier ou vivent les adresses et les reperes de la page YouTube Studio :
+# clipper/youtube.py n'en contient aucun. Un changement de page se corrige ici, sans toucher
+# la logique. Meme forme que tiktok_selectors.toml.
+#
+# Chaque cle porte sa provenance :
+#   « vérifié 2026-10-03 » = releve sur la vraie page (YouTube Studio en francais, ce jour-la) ;
+#   « NON VÉRIFIÉ »        = ecrit sans releve reel : a confirmer sur la vraie page avant de s'y fier
+#                            (jamais livre comme verifie, R4). Un repere introuvable arrete la verification.
+
+version = 1
+
+[urls]
+# Page ouverte pour la connexion a la main et pour la verification « pret a publier ».
+# vérifié 2026-10-03
+studio = "https://studio.youtube.com"
+
+[expect]
+# Connecte : l'adresse devient studio.youtube.com/channel/<UC...>/... ; le groupe capture l'identifiant de la chaine.
+# vérifié 2026-10-03
+channel_url_pattern = 'studio\.youtube\.com/channel/(UC[\w-]+)'
+# Fragments d'adresse de la connexion Google (aussi ses pages de verification) : non connecte = pas pret.
+# vérifié 2026-10-03
+login_url_markers = ["accounts.google.com"]
+
+[labels]
+# La navigation affiche « Votre chaîne <nom de la chaine> ».
+# vérifié 2026-10-03
+channel_prefix = "Votre chaîne"
+
+[selectors]
+# Navigation de Studio (ARIA : navigation > img dont le nom est le nom de la chaine) ; son texte porte
+# « Votre chaîne <nom> ». Le role ARIA est celui releve ; le selecteur CSS qui le vise n'a pas ete relu
+# sur la vraie page.
+# NON VÉRIFIÉ
+navigation = "[role='navigation']"
+
+[modal]
+# Fenetre surgissante (role ARIA dialog) et son bouton, vise par libelle ({label}, sans guillemet double).
+# NON VÉRIFIÉ
+container = "[role='dialog']"
+# NON VÉRIFIÉ
+button = "button:has-text(\"{label}\")"
+
+[popups]
+# Fenetres connues : fragment de leur texte -> libelle du bouton qui les ferme. Toute autre fenetre = arret.
+# Dialog « Bienvenue dans YouTube Studio » de la 1re visite, bouton « Continuer » (textes : vérifié 2026-10-03).
+"Bienvenue dans YouTube Studio" = "Continuer"

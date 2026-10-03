@@ -14,6 +14,11 @@ en attente (``r4_halt``) et la case « pret a publier », qui n'est PAS un choix
 (connexion verifiee ET aucun arret R4 en attente), cochee et decochee d'elle-meme avec journal +
 ``ready_note`` ; un arret R4 ne s'efface que par ``clear_halt`` (« J'ai regle le probleme »).
 
+Service (SPEC-5e50 R1) : chaque compte de publication porte un ``service`` (``tiktok`` | ``youtube``) ; les
+comptes existants, sans ce champ, sont lus ``tiktok`` (migration a la lecture, ecrite au prochain
+enregistrement). Un compte YouTube est « pret » quand une verification a vu YouTube Studio ouvert sur une
+chaine (``channel`` : nom + identifiant UC...), calculee par l'appelant : ce module ne navigue pas.
+
 Module d'etape isole : n'importe aucune autre etape (ADR-b16b) ; la route web
 passe par ici, le generateur de mot de passe aussi (secrets, CSPRNG).
 """
@@ -55,6 +60,9 @@ _FIELDS = ("label", "platform", "username", "notes")
 _MAX_LEN = {"label": 120, "platform": 60, "username": 254, "notes": 2000}
 _MAX_PASSWORD = 512
 LOGIN_STATES = ("never", "connected", "expired")
+SERVICES = ("tiktok", "youtube")
+DEFAULT_SERVICE = "tiktok"
+SERVICE_LABELS = {"tiktok": "TikTok", "youtube": "YouTube"}
 _REPLACE_ATTEMPTS = 5
 _REPLACE_DELAY_S = 0.05
 
@@ -161,6 +169,9 @@ def _read(config: Config) -> list[dict[str, Any]]:
         raise AccountsError(f"fichier des comptes illisible : {path} ({type(exc).__name__})") from None
     if not isinstance(data, dict) or not isinstance(data.get("accounts"), list):
         raise AccountsError(f"fichier des comptes invalide : {path} (attendu : {{\"accounts\": [...]}})")
+    for account in data["accounts"]:
+        if isinstance(account, dict):
+            account.setdefault("service", DEFAULT_SERVICE)  # migration : comptes d'avant YouTube = tiktok
     return data["accounts"]
 
 
@@ -190,7 +201,8 @@ def _now() -> str:
 
 def _public(account: dict[str, Any]) -> dict[str, Any]:
     out = {k: account.get(k, "") for k in ("id", *_FIELDS)}
-    out.update(has_password=bool(account.get("has_password")),
+    out["service"] = account.get("service") or DEFAULT_SERVICE
+    out.update(has_password=bool(account.get("has_password")), channel=account.get("channel"),
                created_at=account.get("created_at"), updated_at=account.get("updated_at"),
                ready_to_publish=bool(account.get("ready_to_publish")),
                ready_note=account.get("ready_note"), login=account.get("login"),
@@ -201,7 +213,7 @@ def _public(account: dict[str, Any]) -> dict[str, Any]:
 def _clean(data: Any, *, creating: bool) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise AccountsError("corps invalide : un objet JSON est attendu")
-    unknown = set(data) - {*_FIELDS, "password"}
+    unknown = set(data) - {*_FIELDS, "password", "service"}
     if unknown:
         raise AccountsError(f"champ(s) inconnu(s) : {', '.join(sorted(unknown))}")
     out: dict[str, Any] = {}
@@ -219,6 +231,10 @@ def _clean(data: Any, *, creating: bool) -> dict[str, Any]:
         raise AccountsError("label : un libellé est obligatoire")
     if not creating and "label" in out and not out["label"]:
         raise AccountsError("label : un libellé est obligatoire")
+    if "service" in data:
+        if data["service"] not in SERVICES:
+            raise AccountsError(f"service : {data['service']!r} invalide (attendu : {' | '.join(SERVICES)})")
+        out["service"] = data["service"]
     if "password" in data:
         password = data["password"]
         if not isinstance(password, str):
@@ -255,7 +271,7 @@ def add_account(config: Config, data: Any) -> dict[str, Any]:
             _vault_set(account_id, password)
         now = _now()
         account = {"id": account_id, **{k: fields.get(k, "") for k in _FIELDS},
-                   "has_password": bool(password), "created_at": now, "updated_at": now}
+                   "service": fields.get("service", DEFAULT_SERVICE), "has_password": bool(password), "created_at": now, "updated_at": now}
         try:
             _write(config, [*accounts, account])
         except AccountsError:
@@ -273,6 +289,8 @@ def update_account(config: Config, account_id: str, data: Any) -> dict[str, Any]
     with _lock:
         accounts = _read(config)
         account = _find(accounts, account_id)
+        if "service" in fields and fields["service"] != account.get("service"):
+            raise AccountsError("service : le service d'un compte ne change pas (supprime-le et recrée-le)")
         if password:
             _vault_set(account_id, password)
             account["has_password"] = True
@@ -316,12 +334,19 @@ def get_password(config: Config, account_id: str) -> str:
 
 
 def ready_blocked_reason(account: dict[str, Any]) -> str | None:
-    """Pourquoi le compte n'est pas « pret a publier » (None : il l'est) : connexion TikTok non verifiee
+    """Pourquoi le compte n'est pas « pret a publier » (None : il l'est) : connexion du service non verifiee
     ou expiree, ou arret R4 en attente (R3)."""
+    service = account.get("service") or DEFAULT_SERVICE
+    label = SERVICE_LABELS.get(service, service)
     login = account.get("login") or {}
     if login.get("state") == "expired":
-        return "session TikTok expirée : reconnecte-toi (Se connecter)"
+        return f"session {label} expirée : reconnecte-toi (Se connecter)"
     if login.get("state") != "connected":
+        if login.get("reason"):
+            return f"connexion {label} non vérifiée : {login['reason']}"
+        if service == "youtube":
+            return ("connexion YouTube non vérifiée : clique sur Se connecter, connecte-toi à la main à "
+                    "YouTube Studio puis ferme la fenêtre")
         return "connexion TikTok non vérifiée : clique sur Se connecter, connecte-toi à la main puis ferme la fenêtre"
     halt = account.get("r4_halt")
     if halt:
@@ -336,8 +361,8 @@ def _sync_ready(account: dict[str, Any], account_id: str) -> str | None:
     reason = ready_blocked_reason(account)
     if reason is None and not account.get("ready_to_publish"):
         account.update(ready_to_publish=True, ready_note=None)
-        logger.info("compte %s : « prêt à publier » coché automatiquement : connexion TikTok vérifiée, "
-                    "aucun arrêt en attente", account_id)
+        logger.info("compte %s : « prêt à publier » coché automatiquement : connexion %s vérifiée, "
+                    "aucun arrêt en attente", account_id, SERVICE_LABELS.get(account.get("service"), "TikTok"))
         return "checked"
     if reason is not None and account.get("ready_to_publish"):
         account.update(ready_to_publish=False, ready_note=f"décoché automatiquement le {_now()} : {reason}")
@@ -355,16 +380,26 @@ def record_login(config: Config, account_id: str, observed: dict[str, Any]) -> d
     state = observed.get("state") if isinstance(observed, dict) else None
     if state not in LOGIN_STATES:
         raise AccountsError(f"état de connexion invalide : {state!r} (attendu : {' | '.join(LOGIN_STATES)})")
+    channel = observed.get("channel")
+    if channel is not None and not (isinstance(channel, dict) and all(
+            isinstance(channel.get(k), str) and channel[k] for k in ("name", "id"))):
+        raise AccountsError("chaîne invalide : {\"name\": nom, \"id\": identifiant} attendu")
     with _lock:
         accounts = _read(config)
         account = _find(accounts, account_id)
+        if account.get("service") == "youtube" and state == "connected" and channel is None:
+            raise AccountsError("connexion YouTube sans chaîne : le nom et l'identifiant de la chaîne sont requis")
         previous = (account.get("login") or {}).get("state")
         if state == "never" and previous in ("connected", "expired"):
             state = "expired"  # Chrome a purge le cookie expire : le compte etait connecte
         login = {"state": state, "checked_at": observed.get("checked_at") or _now(),
                  "expires_at": observed.get("expires_at")}
+        if observed.get("reason"):
+            login["reason"] = str(observed["reason"])
         changed = login != account.get("login")
         account["login"] = login
+        if channel is not None:
+            account["channel"] = {"name": channel["name"], "id": channel["id"]}
         change = _sync_ready(account, account_id)
         if changed or change:
             _write(config, accounts)

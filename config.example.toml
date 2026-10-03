@@ -36,6 +36,19 @@ output_dir = "output"
 # stats_scroll_rounds = 10  # limite de securite du defilement de la liste des posts (atteinte : releve arrete, journalise)
 # stats_empty_wait_s = 8    # attente de la liste avant de conclure « aucun post » (compte neuf)
 
+# [youtube]  # comptes YouTube (SPEC-5e50) : YouTube Studio dans un vrai Chrome, un seul compte pilote a la fois
+# max_posts_per_day = 3      # plafond de publications par compte et par jour
+# min_gap_minutes = 120      # ecart minimal entre deux publications d'un compte
+# min_action_delay_s = 0.3   # pause humaine entre deux actions sur la page
+# max_action_delay_s = 1
+# action_timeout_s = 30      # attente de l'adresse de chaine apres l'ouverture de YouTube Studio
+#
+# Toute date ou heure saisie dans une page (TikTok comme YouTube) est en heure de Paris (Europe/Paris),
+# quel que soit le fuseau du PC : le navigateur pilote est lance avec ce fuseau.
+#
+# [browser]
+# pilot_wait_s = 300         # un seul compte pilote a la fois : attente du compte en cours avant d'echouer
+
 # Reglages retenus apres le banc RTX 3050 4 Go (docs/benchmarks/rtx3050.md) :
 # deja les valeurs par defaut de CONFIG_DEFAULTS, rappelees ici pour memoire,
 # pas necessaire de les recopier dans un config.toml reel.
