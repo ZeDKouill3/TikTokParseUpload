@@ -232,18 +232,35 @@ def _init(force: bool) -> int:
 _VERBOSITY_LEVELS = {0: logging.WARNING, 1: logging.INFO}
 
 
+def _process_kind(command: str) -> str:
+    """serve et worker gardent leur propre tag ; toute autre commande (run,
+    render, decide, status, queue, browser) partage « run » (TASK-8067) :
+    le pid, ajoute par journal.install, distingue les instances concurrentes
+    de la meme commande (ex. les sous-processus 'python -m clipper run ...'
+    lances par le worker, ADR-35b7 §1)."""
+    return command if command in ("serve", "worker") else "run"
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    logging.basicConfig(level=_VERBOSITY_LEVELS.get(args.verbose, logging.DEBUG),
-                        format="%(asctime)s %(levelname)s %(message)s")
+    console_level = _VERBOSITY_LEVELS.get(args.verbose, logging.DEBUG)
+    logging.basicConfig(level=console_level, format="%(asctime)s %(levelname)s %(message)s")
+    # Le journal global (TASK-8067) abaisse le niveau du logger racine pour
+    # recevoir ses propres evenements independamment de la verbosite console ;
+    # on fixe donc explicitement le niveau du handler console herite de
+    # basicConfig (NOTSET par defaut) pour qu'il garde son seuil actuel.
+    for handler in logging.getLogger().handlers:
+        if handler.level == logging.NOTSET:
+            handler.setLevel(console_level)
 
     if args.command == "init":
         return _init(args.force)
 
-    from clipper import accounts, browser, download, pipeline
+    from clipper import accounts, browser, download, journal, pipeline
 
     try:
         config = load_config(args.config, base="config.toml") if args.config is not None else load_config()
+        journal.install(_process_kind(args.command), config)
         if args.command == "run":
             video_id = download.extract_video_id(args.url)
             state = _run_with_progress(

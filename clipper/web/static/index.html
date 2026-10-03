@@ -42,6 +42,7 @@
       <a href="#/stats" data-screen="stats"><span data-icon="chart-column"></span><span>Statistiques</span><span class="count" data-count-for="stats" hidden></span></a>
       <a href="#/accounts" data-screen="accounts"><span data-icon="lock"></span><span>Comptes</span><span class="count" data-count-for="accounts" hidden></span></a>
       <a href="#/settings" data-screen="settings"><span data-icon="settings"></span><span>Réglages</span><span class="count" data-count-for="settings" hidden></span></a>
+      <a href="#/journal" data-screen="journal"><span data-icon="activity"></span><span>Journal</span><span class="count" data-count-for="journal" hidden></span></a>
     </nav>
   </aside>
 
@@ -122,6 +123,13 @@
       </div>
       <div class="panel" data-body><div class="skeleton skeleton-line"></div><div class="skeleton skeleton-card"></div></div>
     </section>
+    <section class="screen" id="screen-journal" data-title="Journal" hidden>
+      <div class="page-head reveal">
+        <div class="titles"><div class="eyebrow">Configuration</div><h1>Journal</h1><p class="sub">Toutes les actions de tous les processus, un fichier par jour, purgé au-delà de 2 jours.</p></div>
+        <div class="actions" data-actions></div>
+      </div>
+      <div class="panel" data-body><div class="skeleton skeleton-line"></div><div class="skeleton skeleton-card"></div></div>
+    </section>
     </main>
   </div>
 
@@ -164,6 +172,7 @@
 <script src="/static/screens/settings.js"></script>
 <script src="/static/screens/stats.js"></script>
 <script src="/static/screens/accounts.js"></script>
+<script src="/static/screens/journal.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>

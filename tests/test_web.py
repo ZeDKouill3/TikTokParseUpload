@@ -8,6 +8,7 @@ Aucun test n'utilise le reseau ni un vrai LLM.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -6483,7 +6484,7 @@ def test_every_panel_screen_keeps_its_content_off_the_edges():
     css = "\n".join(p.read_text(encoding="utf-8") for p in [STATIC / "style.css", *sorted((STATIC / "screens").glob("*.css"))])
     own_margin = {"videos"}  # .vadd, .vfilters et .job portent 16-24 px de marge
     screens = re.findall(r'<section class="screen" id="screen-(\w+)".*?<div class="([^"]*)" data-body', page, re.S)
-    assert {name for name, _ in screens} == {"dashboard", "videos", "review", "clips", "publish", "channels", "stats", "accounts", "settings"}
+    assert {name for name, _ in screens} == {"dashboard", "videos", "review", "clips", "publish", "channels", "stats", "accounts", "settings", "journal"}
     for name, classes in screens:
         if "panel" not in classes.split() or name in own_margin:
             continue
@@ -7423,3 +7424,106 @@ def test_series_manual_reorder_moves_a_unit_up_or_down():
     assert out["down"] == ["b", "a", "c"]
     assert out["clampTop"] == ["a", "b", "c"]
     assert out["clampBottom"] == ["a", "b", "c"]
+
+
+# --------------------------------------------------------------------------
+# Journal (TASK-8067) : middleware de journalisation des requetes + GET /api/journal.
+# Le middleware journalise via le logger normal (clipper.web.app) ; c'est le
+# handler de clipper.journal, installe par clipper.__main__ independamment de
+# ce module, qui le persiste dans logs/ (teste dans test_journal.py).
+# --------------------------------------------------------------------------
+
+
+def test_get_request_is_journaled_with_method_path_status_and_duration(tmp_path, isolated_cwd, caplog):
+    with caplog.at_level(logging.INFO, logger="clipper.web.app"):
+        resp = client(tmp_path).get("/api/dashboard")
+
+    assert resp.status_code == 200
+    lines = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+    assert any("GET" in l and "/api/dashboard" in l and "200" in l and "ms" in l for l in lines)
+    assert not any("corps=" in l for l in lines)  # GET n'est jamais une action qui modifie
+
+
+def test_a_request_with_a_query_string_is_journaled_with_it(tmp_path, isolated_cwd, caplog):
+    with caplog.at_level(logging.INFO, logger="clipper.web.app"):
+        client(tmp_path).get("/api/journal", params={"level": "WARNING"})
+
+    lines = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+    assert any("/api/journal?level=WARNING" in l for l in lines), lines
+
+
+def test_excluded_paths_are_never_journaled(tmp_path, isolated_cwd, caplog):
+    with caplog.at_level(logging.INFO, logger="clipper.web.app"):
+        client(tmp_path).get("/static/style.css")
+
+    assert [r for r in caplog.records if r.name == "clipper.web.app"] == []
+
+
+def test_mutating_request_logs_a_body_summary_with_secrets_masked(tmp_path, isolated_cwd, monkeypatch, caplog):
+    from clipper import worker
+
+    monkeypatch.setattr(
+        worker, "enqueue",
+        lambda url, channel, action, force_steps, *, config=None: {
+            "id": "e1", "video_id": VIDEO_ID, "url": url, "channel": channel,
+            "action": action, "force_steps": force_steps or [], "status": "waiting",
+        },
+    )
+
+    with caplog.at_level(logging.INFO, logger="clipper.web.app"):
+        client(tmp_path).post("/api/queue", json={"url": URL, "password": "s3cret"})
+
+    lines = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+    body_lines = [l for l in lines if "corps=" in l]
+    assert body_lines, lines
+    assert "s3cret" not in body_lines[0]
+    assert "***" in body_lines[0]
+
+
+def test_get_journal_endpoint_returns_recent_lines(tmp_path, isolated_cwd):
+    from clipper import journal
+
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    today = journal._today()
+    record_info = logging.LogRecord("clipper.test", logging.INFO, "", 0, "premier evenement", None, None)
+    record_warn = logging.LogRecord("clipper.test", logging.WARNING, "", 0, "deuxieme evenement important", None, None)
+    content = journal.format_line(record_info, "run[1]") + journal.format_line(record_warn, "run[2]")
+    (logs_dir / f"journal-{today.isoformat()}.log").write_text(content, encoding="utf-8")
+
+    resp = client(tmp_path).get("/api/journal")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["available"] is True
+    messages = [l["message"] for l in body["lines"]]
+    assert "premier evenement" in messages and "deuxieme evenement important" in messages
+
+
+def test_get_journal_endpoint_filters_by_level_and_text(tmp_path, isolated_cwd):
+    from clipper import journal
+
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    today = journal._today()
+    record_info = logging.LogRecord("clipper.test", logging.INFO, "", 0, "premier evenement", None, None)
+    record_warn = logging.LogRecord("clipper.test", logging.WARNING, "", 0, "deuxieme evenement important", None, None)
+    content = journal.format_line(record_info, "run[1]") + journal.format_line(record_warn, "run[2]")
+    (logs_dir / f"journal-{today.isoformat()}.log").write_text(content, encoding="utf-8")
+    c = client(tmp_path)
+
+    by_level = c.get("/api/journal", params={"level": "WARNING"}).json()
+    by_text = c.get("/api/journal", params={"q": "premier"}).json()
+
+    assert [l["message"] for l in by_level["lines"]] == ["deuxieme evenement important"]
+    assert [l["message"] for l in by_text["lines"]] == ["premier evenement"]
+
+
+def test_get_journal_endpoint_reports_unavailable_without_a_logs_directory(tmp_path, isolated_cwd):
+    resp = client(tmp_path).get("/api/journal")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["available"] is False
+    assert body["lines"] == []
+    assert body["reason"]

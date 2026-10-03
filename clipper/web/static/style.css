@@ -1603,6 +1603,10 @@ input[type="color"] { width: 36px; height: 36px; padding: 2px; border-radius: va
 #screen-clips [data-body] { padding: 20px 24px 24px; }
 @media (max-width: 900px) { #screen-clips [data-body] { padding: 16px; } }
 
+/* Ecran Journal (TASK-8067) : barre de filtre + tableau, contenu colle au panneau sinon. */
+#screen-journal [data-body] { padding: 20px 24px 24px; }
+@media (max-width: 900px) { #screen-journal [data-body] { padding: 16px; } }
+
 /* Formulaire « Nouvelle publication » (SPEC-1ed3) */
 .pub-form { width: min(720px, calc(100vw - 24px)); }
 .pub-form .modal-body { max-height: min(70vh, 640px); overflow-y: auto; }

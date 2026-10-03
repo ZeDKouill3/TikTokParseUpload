@@ -66,6 +66,32 @@ def test_config_loads_mode_auto_from_toml_file(isolated_cwd):
     assert config.mode == "auto"
 
 
+def test_config_section_journal_has_the_documented_defaults(isolated_cwd):
+    from clipper.config import load_config
+
+    config = load_config()
+
+    assert config.section("journal") == {
+        "enabled": True, "dir": "logs", "retention_days": 2,
+        "level": "INFO", "exclude_paths": ["/static/", "/media/"],
+    }
+
+
+def test_config_journal_section_accepts_toml_overrides(isolated_cwd):
+    from clipper.config import load_config
+
+    (isolated_cwd / "config.toml").write_text(
+        '[journal]\nenabled = false\ndir = "mon_journal"\nretention_days = 7\n', encoding="utf-8"
+    )
+
+    section = load_config(isolated_cwd / "config.toml").section("journal")
+
+    assert section["enabled"] is False
+    assert section["dir"] == "mon_journal"
+    assert section["retention_days"] == 7
+    assert section["level"] == "INFO"  # cle non redefinie : defaut conserve
+
+
 def test_config_rejects_unknown_key(isolated_cwd):
     from clipper.config import ConfigError, load_config
 

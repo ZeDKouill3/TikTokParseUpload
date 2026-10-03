@@ -20,6 +20,7 @@ import re
 import sys
 import tempfile
 import threading
+import time as time_mod
 import tomllib
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
@@ -39,6 +40,7 @@ from clipper import accounts as accounts_mod
 from clipper import browser as browser_mod
 from clipper import channel as channel_mod
 from clipper import gpu as gpu_mod
+from clipper import journal as journal_mod
 from clipper import moments as moments_mod
 from clipper import pipeline
 from clipper import publish as publish_mod
@@ -1972,6 +1974,32 @@ def create_app(config: Config | None = None) -> FastAPI:
             response.headers["Cache-Control"] = "no-cache"  # revalidation par ETag, 304 conserve
         return response
 
+    _journal_exclude_paths = tuple(config.section("journal")["exclude_paths"])
+
+    @app.middleware("http")
+    async def _journal_requests(request: Request, call_next):
+        """Chaque requete HTTP dans le journal global (TASK-8067), sauf les
+        chemins exclus (statique, media) : methode, chemin, statut, duree ;
+        une requete qui modifie (POST/PUT/PATCH/DELETE) ajoute un resume du
+        corps avec mots de passe/cookies/jetons masques (clipper.journal).
+        Ecrit via le logger normal : c'est le handler de journal installe
+        par clipper.__main__ (independant de ce module) qui le persiste."""
+        path = request.url.path
+        excluded = any(path.startswith(prefix) for prefix in _journal_exclude_paths)
+        full_path = f"{path}?{request.url.query}" if request.url.query else path
+        body_summary = None
+        if not excluded and request.method in ("POST", "PUT", "PATCH", "DELETE"):
+            body_summary = journal_mod.summarize_body(await request.body())
+        started = time_mod.monotonic()
+        response = await call_next(request)
+        if not excluded:
+            duration_ms = (time_mod.monotonic() - started) * 1000
+            message = f"{request.method} {full_path} -> {response.status_code} ({duration_ms:.1f} ms)"
+            if body_summary:
+                message += f" corps={body_summary}"
+            logger.info(message)
+        return response
+
     @app.get("/")
     def index(request: Request) -> Response:
         page = STATIC_DIR / "index.html"
@@ -2713,6 +2741,15 @@ def create_app(config: Config | None = None) -> FastAPI:
             raise HTTPException(status_code=422, detail=f"valeur non enregistrable : {exc}") from exc
         app.state.config = config
         return _settings_detail(web_cfg)
+
+    # ----------------------------------------------------------------
+    # Journal (TASK-8067) : lecture seule des fichiers logs/journal-*.log
+    # ----------------------------------------------------------------
+
+    @app.get("/api/journal")
+    def get_journal(lines: int = 200, q: str | None = None, level: str | None = None) -> dict[str, Any]:
+        return journal_mod.tail(config, limit=lines, text=q, level=level)
+
     @app.get("/api/channels/{name}/keyframe")
     def channel_keyframe(name: str, video_id: str | None = None) -> FileResponse:
         _channel_preset_path(name)

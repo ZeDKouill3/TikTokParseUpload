@@ -57,6 +57,13 @@ output_dir = "output"
 # [browser]
 # pilot_wait_s = 300         # un seul compte pilote a la fois : attente du compte en cours avant d'echouer
 
+# [journal]  # journal global de toutes les actions (TASK-8067), un fichier par jour sous logs/
+# enabled = true            # desactive (tests isoles) : aucun handler, aucun dossier logs/
+# dir = "logs"
+# retention_days = 2        # purge au-dela de N jours, au demarrage et a chaque changement de jour
+# level = "INFO"            # independant de la verbosite console (-v/-vv)
+# exclude_paths = ["/static/", "/media/"]  # jamais journalises par le middleware web
+
 # Reglages retenus apres le banc RTX 3050 4 Go (docs/benchmarks/rtx3050.md) :
 # deja les valeurs par defaut de CONFIG_DEFAULTS, rappelees ici pour memoire,
 # pas necessaire de les recopier dans un config.toml reel.
