@@ -665,8 +665,13 @@ function pubSeriesRenderPreview(f, d) {
       <div class="li-main grow"><div class="li-title">${esc(it.screen_title || it.title || it.clip_id)}</div>
         <div class="li-sub muted">${esc(pubSlotLabel(it.publish_at_paris))}</div>
         ${it.refusal ? `<div class="li-sub bad">${esc(it.refusal)}</div>` : ""}</div></div>`).join("");
+  // Pourquoi « Programmer » reste grise : resume visible des dates refusees (sinon seulement en petit sous chaque ligne).
+  const refused = p.items.filter((it) => it.refusal);
+  const summary = refused.length
+    ? `<p class="reason bad" style="margin-top:8px" data-series-refused>${refused.length} date${refused.length > 1 ? "s" : ""} refusée${refused.length > 1 ? "s" : ""} sur ${p.items.length} : ${esc(refused[0].refusal)}. Change l'intervalle, la date de début ou le nombre de vidéos.</p>`
+    : "";
   box.innerHTML = `<div class="panel">${rows || `<p class="muted" style="padding:8px">Aucune publication.</p>`}</div>
-    ${p.insufficient ? `<p class="reason bad" style="margin-top:8px">${esc(p.insufficient_reason)}</p>` : ""}`;
+    ${p.insufficient ? `<p class="reason bad" style="margin-top:8px">${esc(p.insufficient_reason)}</p>` : ""}${summary}`;
   if (submit) submit.disabled = !p.ok;
 }
 
