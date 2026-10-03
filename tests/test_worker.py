@@ -1742,3 +1742,182 @@ def test_starting_the_worker_fails_an_entry_left_in_progress(tmp_path, monkeypat
 
     entry = _entries(tmp_path, NO_CHANNEL)[0]
     assert entry["status"] == "failed" and "interrompue" in entry["error"] and entry["in_progress_since"] is None
+
+
+# --------------------------------------------------------------------------
+# TASK-9776 : le worker publie sur YouTube les entrees d'un compte YouTube (SPEC-5e50 R2-R5)
+# La publication est injectee (fausse) : aucun navigateur, aucun YouTube.
+# --------------------------------------------------------------------------
+
+from clipper import youtube  # noqa: E402
+
+SHORT_URL = "https://youtube.com/shorts/OOOeOwbvu34"
+
+
+class FakeYouTubePublisher:
+    """Remplace youtube.publish : enregistre les appels, rend un resultat ou leve ``error``."""
+
+    def __init__(self, error=None):
+        self.calls, self.error = [], error
+
+    def __call__(self, clip, account, *, mode, schedule_at=None, config=None, on_tick=None, **kwargs):
+        self.calls.append({"clip": clip, "account": account, "mode": mode, "schedule_at": schedule_at,
+                           "on_tick": on_tick, **kwargs})
+        if self.error is not None:
+            raise self.error
+        scheduled = mode == "scheduled"
+        return {"post_url": SHORT_URL, "post_id": "OOOeOwbvu34",
+                "state": "scheduled_on_youtube" if scheduled else "published",
+                "publish_at": (schedule_at if scheduled else datetime.now(timezone.utc)).isoformat(), "note": None}
+
+
+def _youtube_env(tmp_path, monkeypatch, *, youtube_settings=None, tiktok_settings=None):
+    """``_pub_env`` dont le compte ``ACCOUNT`` est un compte YouTube (l'autre reste TikTok)."""
+    config = _pub_env(tmp_path, monkeypatch, tiktok_settings=tiktok_settings)
+    path = tmp_path / "state" / "accounts.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    for account in data["accounts"]:
+        if account["id"] == ACCOUNT:
+            account.update(service="youtube", login={**_CONNECTED, "channel": {"name": "Ma Chaîne", "id": "UCabc"}})
+    path.write_text(json.dumps(data), encoding="utf-8")
+    config._sections["youtube"] = dict(youtube_settings or {})
+    return config
+
+
+def _yt_worker(config, yt_publisher, tt_publisher=None, login=None, fetcher=None):
+    return worker.Worker(config=config, spawner=FakeSpawner(), publisher=tt_publisher or FakePublisher(),
+                         youtube_publisher=yt_publisher, login_checker=login or FakeLogin(),
+                         stats_fetcher=fetcher or (lambda account, **kw: {"account": account}))
+
+
+def test_a_youtube_account_entry_goes_through_clipper_youtube_not_tiktok(tmp_path, monkeypatch):
+    config = _youtube_env(tmp_path, monkeypatch)
+    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1))
+    sidecar_path = tmp_path / "output" / "aaaaaaaaaaa" / "01.json"
+    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    sidecar_path.write_text(json.dumps({**sidecar, "screen_title": "Le titre"}), encoding="utf-8")
+    yt, tt, login = FakeYouTubePublisher(), FakePublisher(), FakeLogin()
+
+    _yt_worker(config, yt, tt, login).tick()
+
+    assert tt.calls == [] and len(yt.calls) == 1
+    call = yt.calls[0]
+    assert (call["account"], call["mode"], call["schedule_at"]) == (ACCOUNT, "immediate", None)
+    assert call["clip"] == {"video_path": tmp_path / "output" / "aaaaaaaaaaa" / "01.mp4", "caption": "legende 01",
+                            "hashtags": ["#a", "#b"], "screen_title": "Le titre"}
+    assert callable(call["on_tick"]) and login.calls == []  # pas de lecture des cookies TikTok pour un compte YouTube
+    entry = _entries(tmp_path)[0]
+    assert entry["status"] == "published" and entry["service"] == "youtube"
+    assert (entry["post_url"], entry["post_id"], entry["tiktok_state"]) == (SHORT_URL, "OOOeOwbvu34", "published")
+    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    assert sidecar["youtube_post"]["url"] == SHORT_URL and sidecar["youtube_post"]["account"] == ACCOUNT
+    assert "tiktok_post" not in sidecar
+    event = tiktok.read_events(config=config)[-1]
+    assert event["level"] == "info" and SHORT_URL in event["reason"]
+
+
+def test_a_tiktok_account_entry_still_goes_through_tiktok_in_the_same_run(tmp_path, monkeypatch):
+    config = _youtube_env(tmp_path, monkeypatch)
+    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1), account="ef34ab")
+    yt, tt = FakeYouTubePublisher(), FakePublisher()
+
+    _yt_worker(config, yt, tt).tick()
+
+    assert yt.calls == [] and len(tt.calls) == 1 and tt.calls[0]["account"] == "ef34ab"
+
+
+def test_a_scheduled_youtube_entry_is_programmed_on_youtube_and_recorded(tmp_path, monkeypatch):
+    config = _youtube_env(tmp_path, monkeypatch)
+    slot = datetime.now(timezone.utc) + timedelta(days=20)  # hors fenetre TikTok (10 j), dans celle de YouTube (30 j)
+    _seed(tmp_path, "ma_chaine", "01", slot, publish_mode="scheduled")
+    yt = FakeYouTubePublisher()
+
+    _yt_worker(config, yt).tick()
+
+    assert len(yt.calls) == 1 and yt.calls[0]["mode"] == "scheduled" and yt.calls[0]["schedule_at"] == slot
+    entry = _entries(tmp_path)[0]
+    assert entry["tiktok_state"] == "scheduled_on_youtube" and entry["status"] == "published"
+    assert datetime.fromisoformat(entry["tiktok_publish_at"]) == slot
+
+
+def test_a_scheduled_youtube_entry_outside_the_youtube_window_waits(tmp_path, monkeypatch):
+    config = _youtube_env(tmp_path, monkeypatch, youtube_settings={"schedule_max_days": 5})
+    _seed(tmp_path, "ma_chaine", "01", datetime.now(timezone.utc) + timedelta(days=6), publish_mode="scheduled")
+    yt = FakeYouTubePublisher()
+
+    _yt_worker(config, yt).tick()
+
+    assert yt.calls == [] and _entries(tmp_path)[0]["status"] == "scheduled"
+
+
+def test_a_youtube_stop_fails_the_entry_with_reason_and_capture_halts_the_account_and_notifies(tmp_path, monkeypatch):
+    config = _youtube_env(tmp_path, monkeypatch)
+    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=2))
+    _seed(tmp_path, "ma_chaine", "02", _ago(minutes=1))
+    capture = tmp_path / "state" / "browser" / ACCOUNT / "captures" / "x-captcha.png"
+    yt = FakeYouTubePublisher(error=youtube.YouTubeStop("captcha", "captcha détecté : arrêt immédiat", capture))
+    w = _yt_worker(config, yt)
+
+    w.tick()
+    w.tick()
+
+    first, second = _entries(tmp_path)
+    assert first["status"] == "failed" and first["error"] == "captcha détecté : arrêt immédiat"
+    assert first["capture"] == str(capture) and first["halted"] is True
+    assert second["status"] == "scheduled" and len(yt.calls) == 1  # compte arrete : rien derriere
+    event = next(e for e in tiktok.read_events(config=config) if e["level"] == "error")
+    assert (event["account"], event["capture"]) == (ACCOUNT, str(capture))
+
+
+def test_a_youtube_setting_error_fails_the_entry_without_halting_the_account(tmp_path, monkeypatch):
+    config = _youtube_env(tmp_path, monkeypatch)
+    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1))
+    yt = FakeYouTubePublisher(error=youtube.YouTubeError("titre manquant"))
+
+    _yt_worker(config, yt).tick()
+
+    entry = _entries(tmp_path)[0]
+    assert entry["status"] == "failed" and entry["error"] == "titre manquant" and not entry["halted"]
+
+
+def test_the_youtube_daily_cap_postpones_and_logs_the_report(tmp_path, monkeypatch, caplog):
+    config = _youtube_env(tmp_path, monkeypatch, youtube_settings={"max_posts_per_day": 1, "min_gap_minutes": 0})
+    now = datetime.now(timezone.utc)
+    _seed(tmp_path, "ma_chaine", "00", _ago(hours=0, seconds=1), status="published",
+          tiktok_publish_at=(now - timedelta(seconds=1)).isoformat(), published_at=now.isoformat())
+    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1))
+    yt = FakeYouTubePublisher()
+
+    with caplog.at_level(logging.WARNING):
+        _yt_worker(config, yt).tick()
+
+    assert yt.calls == []
+    entry = next(e for e in _entries(tmp_path) if e["clip_id"] == "01")
+    assert entry["status"] == "scheduled" and datetime.fromisoformat(entry["slot_at"]) > now
+    assert "plafond de 1 publication(s) par jour" in entry["postponed_reason"]
+    assert "reporté" in caplog.text
+    event = tiktok.read_events(config=config)[-1]
+    assert event["level"] == "warn" and event["account"] == ACCOUNT and "plafond" in event["reason"]
+
+
+def test_the_youtube_min_gap_comes_from_the_youtube_section_not_the_tiktok_one(tmp_path, monkeypatch):
+    # TikTok : 1 par jour / 480 min ; YouTube : 3 par jour / 120 min par defaut -> un post d'il y a 3 h passe
+    config = _youtube_env(tmp_path, monkeypatch)
+    now = datetime.now(timezone.utc)
+    _seed(tmp_path, "ma_chaine", "00", _ago(hours=3), status="published",
+          tiktok_publish_at=(now - timedelta(hours=3)).isoformat(), published_at=now.isoformat())
+    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1))
+    yt = FakeYouTubePublisher()
+
+    _yt_worker(config, yt).tick()
+
+    assert len(yt.calls) == 1
+
+
+def test_the_worker_never_fetches_tiktok_stats_for_a_youtube_account(tmp_path, monkeypatch):
+    config = _youtube_env(tmp_path, monkeypatch)
+    fetcher = FakeStatsFetcher(tmp_path)
+
+    _yt_worker(config, FakeYouTubePublisher(), fetcher=fetcher).tick()
+
+    assert [c["account"] for c in fetcher.calls] == ["ef34ab"]  # le compte TikTok seulement

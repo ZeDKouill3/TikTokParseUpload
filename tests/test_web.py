@@ -5043,8 +5043,9 @@ def test_publish_accounts_lists_every_account_with_its_flag_and_the_channel_defa
     data = client(tmp_path).get("/api/publish/accounts", params={"channel": "ma_chaine"}).json()
 
     assert data["default"] == READY
-    assert data["accounts"] == [{"id": READY, "label": "Compte exemple", "ready_to_publish": True},
-                                {"id": SPARE, "label": "Autre compte", "ready_to_publish": False}]
+    assert data["accounts"] == [
+        {"id": READY, "label": "Compte exemple", "ready_to_publish": True, "service": "tiktok", "service_label": "TikTok"},
+        {"id": SPARE, "label": "Autre compte", "ready_to_publish": False, "service": "tiktok", "service_label": "TikTok"}]
     assert client(tmp_path).get("/api/publish/accounts").json()["default"] is None
     assert client(tmp_path).get("/api/publish/accounts", params={"channel": "inconnue"}).status_code == 404
 
@@ -5057,7 +5058,7 @@ def test_publish_accounts_never_carry_a_secret_and_work_from_a_remote_console(tm
     resp = remote.get("/api/publish/accounts", params={"channel": "ma_chaine"})
 
     assert resp.status_code == 200
-    assert set(resp.json()["accounts"][0]) == {"id", "label", "ready_to_publish"}
+    assert set(resp.json()["accounts"][0]) == {"id", "label", "ready_to_publish", "service", "service_label"}
 
 
 def test_approve_with_a_ready_account_records_it_in_the_publication_entry(tmp_path, isolated_cwd):
@@ -6771,3 +6772,201 @@ def test_a_tiktok_account_without_style_is_listed_and_readable_in_the_stats_scre
 
     assert found["channel"] is None and found["account"] == TT_ACCOUNT        # présent, pas masqué faute de style
     assert overview.status_code == 200 and overview.json()["channel"] is None
+
+
+# --------------------------------------------------------------------------
+# TASK-9776 : l'ecran Publication propose les comptes YouTube et leurs reglages (SPEC-5e50 R2)
+# --------------------------------------------------------------------------
+
+YT_ACCOUNT = "cd56ef"
+
+
+def _youtube_accounts_state(tmp_path, *, yt_ready=True):
+    """READY (TikTok) et YT_ACCOUNT (YouTube) : deux services dans la meme liste de comptes."""
+    rows = [{"id": READY, "label": "Compte exemple", "platform": "TikTok", "ready_to_publish": True},
+            {"id": YT_ACCOUNT, "label": "ma_chaine", "service": "youtube", "ready_to_publish": yt_ready,
+             "login": {"state": "connected", "checked_at": "2026-10-03T10:00:00+00:00", "expires_at": None,
+                       "channel": {"name": "Ma Chaîne", "id": "UCabcdefghijklmnopqrstuv"}}}]
+    (tmp_path / "state").mkdir(exist_ok=True)
+    (tmp_path / "state" / "accounts.json").write_text(json.dumps({"accounts": rows}), encoding="utf-8")
+
+
+def _yt_setup(tmp_path, **kwargs):
+    _publish_setup(tmp_path)
+    _youtube_accounts_state(tmp_path, **kwargs)
+
+
+def test_the_publication_screen_lists_the_accounts_of_both_services_and_the_youtube_settings(tmp_path, isolated_cwd):
+    _yt_setup(tmp_path)
+
+    data = _pub_client(tmp_path).get("/api/publications").json()
+
+    accounts = {a["id"]: a for a in data["accounts"]}
+    assert (accounts[READY]["service"], accounts[READY]["service_label"]) == ("tiktok", "TikTok")
+    assert (accounts[YT_ACCOUNT]["service"], accounts[YT_ACCOUNT]["service_label"]) == ("youtube", "YouTube")
+    assert accounts[YT_ACCOUNT]["ready_to_publish"] is True
+    yt = data["defaults"]["youtube"]
+    assert yt["options"] == {"visibility": "public", "made_for_kids": False}  # publique, pas pour les enfants
+    assert yt["schedule_min_minutes"] >= 0 and yt["schedule_max_days"] >= 1
+    assert data["defaults"]["options"]["visibility"] == "public" and "allow_comments" in data["defaults"]["options"]
+
+
+def test_the_youtube_defaults_follow_the_youtube_section(tmp_path, isolated_cwd):
+    _yt_setup(tmp_path)
+    config = Config(mode="review", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output",
+                    _sections={"youtube": {"visibility": "unlisted", "made_for_kids": True}})
+
+    data = TestClient(create_app(config=config)).get("/api/publications").json()
+
+    assert data["defaults"]["youtube"]["options"] == {"visibility": "unlisted", "made_for_kids": True}
+
+
+def test_an_invalid_youtube_setting_is_an_explicit_422_on_the_publication_screen(tmp_path, isolated_cwd):
+    _yt_setup(tmp_path)
+    config = Config(mode="review", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output",
+                    _sections={"youtube": {"visibility": "secrète"}})
+
+    resp = TestClient(create_app(config=config)).get("/api/publications")
+
+    assert resp.status_code == 422 and "visibility" in resp.json()["detail"]
+
+
+def test_a_youtube_publication_is_created_with_the_youtube_options_and_service(tmp_path, isolated_cwd):
+    _yt_setup(tmp_path)
+    options = {"title": "Mon titre", "visibility": "unlisted", "made_for_kids": False}
+
+    resp = _pub_client(tmp_path).post("/api/publications", json={
+        "video_id": CLIPS_VIDEO, "clip_id": "01", "account": YT_ACCOUNT, "mode": "immediate", "options": options})
+
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["account"] == YT_ACCOUNT and body["service"] == "youtube" and body["post_options"] == options
+    entry = json.loads((tmp_path / "state" / "publish" / "ma_chaine.json").read_text(encoding="utf-8"))[0]
+    assert entry["service"] == "youtube" and entry["post_options"] == options
+
+
+def test_a_scheduled_youtube_publication_keeps_the_date(tmp_path, isolated_cwd):
+    _yt_setup(tmp_path)
+    when = _soon(days=3)
+
+    resp = _pub_client(tmp_path).post("/api/publications", json={
+        "video_id": CLIPS_VIDEO, "clip_id": "01", "account": YT_ACCOUNT, "mode": "scheduled", "publish_at": when})
+
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["slot_at"] == when and resp.json()["publish_mode"] == "scheduled"
+
+
+@pytest.mark.parametrize("options,status,word", [
+    ({"allow_comments": False}, 409, "allow_comments"),   # reglage TikTok sur un compte YouTube
+    ({"visibility": "friends"}, 409, "visibility"),       # visibilite TikTok
+    ({"title": " "}, 409, "title"),
+    ({"made_for_kids": "non"}, 409, "made_for_kids"),
+])
+def test_invalid_youtube_options_are_refused_with_the_reason(tmp_path, isolated_cwd, options, status, word):
+    _yt_setup(tmp_path)
+
+    resp = _pub_client(tmp_path).post("/api/publications", json={
+        "video_id": CLIPS_VIDEO, "clip_id": "01", "account": YT_ACCOUNT, "mode": "immediate", "options": options})
+
+    assert resp.status_code == status and word in resp.json()["detail"]
+    assert _publications(tmp_path) == []
+
+
+def test_a_private_youtube_publication_cannot_be_scheduled(tmp_path, isolated_cwd):
+    _yt_setup(tmp_path)
+
+    resp = _pub_client(tmp_path).post("/api/publications", json={
+        "video_id": CLIPS_VIDEO, "clip_id": "01", "account": YT_ACCOUNT, "mode": "scheduled",
+        "publish_at": _soon(days=2), "options": {"visibility": "private"}})
+
+    assert resp.status_code == 409 and "programm" in resp.json()["detail"]
+
+
+def test_a_youtube_account_not_ready_is_refused_like_a_tiktok_one(tmp_path, isolated_cwd):
+    _yt_setup(tmp_path, yt_ready=False)
+
+    resp = _pub_client(tmp_path).post("/api/publications", json={
+        "video_id": CLIPS_VIDEO, "clip_id": "01", "account": YT_ACCOUNT, "mode": "immediate"})
+
+    assert resp.status_code == 409 and "non prêt à publier" in resp.json()["detail"]
+
+
+def test_a_youtube_publication_uses_the_youtube_caps(tmp_path, isolated_cwd):
+    _yt_setup(tmp_path)
+    c = _pub_client(tmp_path, max_posts_per_day=1, min_gap_minutes=480)  # plafonds TikTok serres : sans effet sur YouTube
+    first = c.post("/api/publications", json={"video_id": CLIPS_VIDEO, "clip_id": "01", "account": YT_ACCOUNT, "mode": "immediate"})
+    later = c.post("/api/publications", json={"video_id": CLIPS_VIDEO, "clip_id": "02", "account": YT_ACCOUNT,
+                                              "mode": "scheduled", "publish_at": _soon(hours=5)})
+    refused = c.post("/api/publications", json={"video_id": CLIPS_VIDEO, "clip_id": "03", "account": YT_ACCOUNT,
+                                                "mode": "scheduled", "publish_at": _soon(hours=1)})
+
+    assert first.status_code == 201 and later.status_code == 201, (first.text, later.text)
+    assert refused.status_code == 409 and "120 minutes" in refused.json()["detail"] and refused.json()["next_at"]
+
+
+def test_editing_a_youtube_publication_keeps_the_youtube_validation(tmp_path, isolated_cwd):
+    _yt_setup(tmp_path)
+    c = _pub_client(tmp_path)
+    c.post("/api/publications", json={"video_id": CLIPS_VIDEO, "clip_id": "01", "account": YT_ACCOUNT, "mode": "immediate"})
+
+    ok = c.patch(f"/api/publications/{CLIPS_VIDEO}/01", json={"options": {"visibility": "private", "title": "T"}})
+    bad = c.patch(f"/api/publications/{CLIPS_VIDEO}/01", json={"options": {"allow_comments": False}})
+
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["post_options"] == {"visibility": "private", "title": "T"} and ok.json()["service"] == "youtube"
+    assert bad.status_code == 409 and "allow_comments" in bad.json()["detail"]
+
+
+def test_a_publication_scheduled_on_youtube_shows_its_status_url_and_service(tmp_path, isolated_cwd):
+    _yt_setup(tmp_path)
+    url = "https://youtube.com/shorts/OOOeOwbvu34"
+    when = _soon(days=2)
+    _write_publish(tmp_path, "ma_chaine", [
+        _entry("01", "published", account=YT_ACCOUNT, service="youtube", tiktok_state="scheduled_on_youtube",
+               tiktok_publish_at=when, post_url=url, post_id="OOOeOwbvu34", published_at=_soon())])
+
+    row = _publications(tmp_path)[0]
+
+    assert row["tiktok_status"] == "scheduled_on_youtube" and row["tiktok_live"] is False
+    assert (row["post_url"], row["post_id"], row["service"]) == (url, "OOOeOwbvu34", "youtube")
+
+
+def test_a_published_youtube_short_is_live_with_its_url(tmp_path, isolated_cwd):
+    _yt_setup(tmp_path)
+    url = "https://youtube.com/shorts/OOOeOwbvu34"
+    _write_publish(tmp_path, "ma_chaine", [
+        _entry("01", "published", account=YT_ACCOUNT, service="youtube", tiktok_state="published",
+               tiktok_publish_at=_soon(minutes=-5), post_url=url, post_id="OOOeOwbvu34", published_at=_soon(minutes=-5))])
+
+    row = _publications(tmp_path)[0]
+
+    assert row["tiktok_status"] == "published" and row["tiktok_live"] is True and row["post_url"] == url
+
+
+def test_the_publication_form_has_the_youtube_settings_and_the_service_in_the_account_label():
+    js = (STATIC / "screens" / "publish.js").read_text(encoding="utf-8")
+
+    for marker in ("pub-form-youtube", "pub-form-yt-title", "pub-form-yt-visibility", "pub-form-yt-kids",
+                   "pub-form-tiktok", "pubFormService", "pubAccountText", "data.defaults.youtube"):
+        assert marker in js, marker
+    for label in ("Titre YouTube", "Non répertoriée", "Conçue pour les enfants", "Programmée sur YouTube", "#Shorts"):
+        assert label in js, label
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node absent du PATH")
+def test_the_account_label_carries_the_service_and_a_youtube_schedule_is_shown_as_such():
+    out = _run_publish("""(() => {
+      const yt = { publish_status: 'published', service: 'youtube', tiktok_status: 'scheduled_on_youtube', tiktok_live: false,
+        tiktok_publish_at: '2026-10-02T10:30:00+00:00', published_at_paris: '2026-10-01T22:55:00+02:00', slot_at_paris: '2026-10-01T22:55:00+02:00' };
+      return {
+        yt: pubAccountText({ id: 'a', label: 'ma_chaine', service: 'youtube', service_label: 'YouTube' }),
+        tt: pubAccountText({ id: 'b', label: 'Compte exemple', service: 'tiktok' }),
+        bare: pubAccountText({ id: 'c', label: 'Sans service' }),
+        chip: pubChip(yt), line: pubDoneLine(yt), live: pubChip({ ...yt, tiktok_live: true }),
+        hintYt: pubWhenHint({ minMinutes: 15, maxDays: 10, ytMinMinutes: 15, ytMaxDays: 30 }, 'youtube'),
+      };
+    })()""")
+    assert out["yt"] == "ma_chaine (YouTube)" and out["tt"] == "Compte exemple (TikTok)" and out["bare"] == "Sans service"
+    assert "Programmée sur YouTube" in out["chip"] and "Publiée" not in out["chip"]
+    assert out["line"].startswith("programmée sur YouTube, en ligne le") and "Publiée" in out["live"]
+    assert "YouTube programme la vidéo" in out["hintYt"] and "30 jours" in out["hintYt"]

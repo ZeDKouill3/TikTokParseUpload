@@ -41,7 +41,15 @@ output_dir = "output"
 # min_gap_minutes = 120      # ecart minimal entre deux publications d'un compte
 # min_action_delay_s = 0.3   # pause humaine entre deux actions sur la page
 # max_action_delay_s = 1
-# action_timeout_s = 30      # attente de l'adresse de chaine apres l'ouverture de YouTube Studio
+# action_timeout_s = 30      # attente d'un element de la page (adresse de chaine, bouton...)
+# poll_interval_s = 1        # pas d'attente entre deux lectures de la page
+# publish_mode = "immediate" # immediate | scheduled (programme cote YouTube, PC eteint ensuite)
+# visibility = "public"      # public | unlisted | private (une video programmee est toujours publique)
+# made_for_kids = false      # « conçue pour les enfants » : non par defaut (reponse obligatoire de Studio)
+# upload_timeout_s = 600     # attente de la fin de l'envoi du mp4 (lien du Short, bouton final actif)
+# publish_confirm_timeout_s = 120  # attente de la fenetre « Vidéo mise en ligne » apres le clic final
+# schedule_max_days = 30     # programmation la plus lointaine acceptee ; au-dela Clipper garde la publication
+# schedule_min_minutes = 15  # avance minimale d'une programmation
 #
 # Toute date ou heure saisie dans une page (TikTok comme YouTube) est en heure de Paris (Europe/Paris),
 # quel que soit le fuseau du PC : le navigateur pilote est lance avec ce fuseau.

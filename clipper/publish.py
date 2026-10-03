@@ -20,7 +20,7 @@ from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from clipper import channel as channel_mod
-from clipper import tiktok
+from clipper import tiktok, youtube
 from clipper.config import ConfigError
 
 _DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
@@ -30,6 +30,9 @@ CONFIG_DEFAULTS: dict[str, object] = {
 }
 
 TIKTOK_STATES = ("published", "scheduled_on_tiktok")
+YOUTUBE_STATES = ("published", "scheduled_on_youtube")
+SERVICE_STATES = {"tiktok": TIKTOK_STATES, "youtube": YOUTUBE_STATES}
+SERVICE_LABELS = {"tiktok": "TikTok", "youtube": "YouTube"}
 PUBLISH_MODES = ("immediate", "scheduled")
 _POSTPONE_FIRST_BATCH = 8
 _POSTPONE_MAX_SLOTS = 512
@@ -397,11 +400,14 @@ def mark_published(
     publish_at: str | None = None,
     post_note: str | None = None,
     account: str | None = None,
+    service: str = "tiktok",
 ) -> dict[str, Any]:
     """Marque un clip publie (SPEC-74e9 4.3). A la main, sans argument de plus ; apres une
     publication TikTok (SPEC-9225 R3), ``tiktok_state`` (``published`` | ``scheduled_on_tiktok``),
     l'URL ou l'id du post et ``publish_at`` (l'instant ou le post est en ligne) sont enregistres
-    dans l'entree ET dans le sidecar du clip (champ ``tiktok_post``)."""
+    dans l'entree ET dans le sidecar du clip (champ ``tiktok_post``). Pour un compte YouTube (SPEC-5e50 R2),
+    ``service="youtube"`` : etat ``published`` | ``scheduled_on_youtube``, URL ``youtube.com/shorts/<id>``,
+    sidecar ``youtube_post`` (les champs ``tiktok_state`` / ``tiktok_publish_at`` de l'entree servent aux deux services)."""
     path = _state_path(channel, state_dir)
     with _locked(path):
         entries = _load_entries(path)
@@ -421,12 +427,16 @@ def mark_published(
         entry["waiting_reason"] = None
         entry["in_progress_since"] = None
         if tiktok_state is not None:
-            if tiktok_state not in TIKTOK_STATES:
-                raise PublishError(f"etat TikTok invalide : {tiktok_state!r} (attendu : {' | '.join(TIKTOK_STATES)})")
+            if service not in SERVICE_STATES:
+                raise PublishError(f"service invalide : {service!r} (attendu : {' | '.join(SERVICE_STATES)})")
+            states = SERVICE_STATES[service]
+            if tiktok_state not in states:
+                raise PublishError(f"etat {SERVICE_LABELS[service]} invalide : {tiktok_state!r} "
+                                   f"(attendu : {' | '.join(states)})")
             entry.update(tiktok_state=tiktok_state, post_url=post_url, post_id=post_id,
-                         tiktok_publish_at=publish_at, post_note=post_note)
+                         tiktok_publish_at=publish_at, post_note=post_note, service=service)
             sidecar = _read_sidecar(output_dir, video_id, clip_id)
-            sidecar["tiktok_post"] = {
+            sidecar["tiktok_post" if service == "tiktok" else "youtube_post"] = {
                 "url": post_url, "id": post_id, "state": tiktok_state, "publish_at": publish_at,
                 "account": account, "note": post_note,
             }
@@ -785,21 +795,36 @@ def _tz(channel_dict: dict[str, Any]) -> ZoneInfo:
     return ZoneInfo(str(channel_dict["timezone"]))
 
 
+def service_settings(service: str, settings: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Reglages du service (plafonds, fenetre de programmation, reglages par defaut d'un post) : ``settings`` s'il est
+    donne, sinon les valeurs par defaut du module du service."""
+    if service not in SERVICE_STATES:
+        raise PublishError(f"service invalide : {service!r} (attendu : {' | '.join(SERVICE_STATES)})")
+    if settings is not None:
+        return dict(settings)
+    return dict(youtube.CONFIG_DEFAULTS if service == "youtube" else tiktok.CONFIG_DEFAULTS)
+
+
 def _check_post_input(
     mode: Any, account: Any, publish_at: datetime | None, options: dict[str, Any] | None,
-    settings: dict[str, Any], now: datetime,
+    settings: dict[str, Any], now: datetime, service: str = "tiktok",
 ) -> dict[str, Any]:
     """Validation commune a la creation et a la modification ; rend les options validees."""
     if mode not in PUBLISH_MODES:
         raise PublishError(f"mode de publication invalide : {mode!r} (attendu : {' | '.join(PUBLISH_MODES)})")
     if not isinstance(account, str) or not account:
         raise PublishError("compte de publication manquant : choisis un compte prêt à publier")
+    label = SERVICE_LABELS.get(service, service)
     try:
-        merged = tiktok.post_settings(settings, options)
-    except tiktok.TikTokError as exc:
+        if service == "youtube":
+            merged = youtube.post_settings(settings, options)
+            youtube.check_mode(mode, merged)
+        else:
+            merged = tiktok.post_settings(settings, options)
+    except (tiktok.TikTokError, youtube.YouTubeError) as exc:
         raise PublishError(str(exc)) from exc
     if mode == "scheduled":
-        if merged["visibility"] == "private":
+        if service == "tiktok" and merged["visibility"] == "private":
             raise PublishError(
                 "publication privée programmée refusée : TikTok ne programme pas une vidéo privée "
                 "(« Les vidéos privées ne peuvent pas être programmées ») : choisis « Maintenant » ou une autre visibilité"
@@ -813,7 +838,7 @@ def _check_post_input(
         minutes = int(settings["schedule_min_minutes"])
         if publish_at < now + timedelta(minutes=minutes):
             raise PublishError(
-                f"publication programmée : la date est à moins de {minutes} minutes (avance minimale de TikTok) : "
+                f"publication programmée : la date est à moins de {minutes} minutes (avance minimale de {label}) : "
                 "choisis « Maintenant » ou une heure plus tardive"
             )
     return dict(options or {})
@@ -839,7 +864,7 @@ def _check_caps(
     account: str, target: datetime, exclude: tuple[str, str], settings: dict[str, Any], tz: ZoneInfo,
     state_dir: str | Path | None, presets_dir: str | Path, base: str | Path,
 ) -> None:
-    """Plafonds par compte (SPEC-1ed3 R4) : un depassement est refuse ici, avec la raison et la prochaine
+    """Plafonds par compte (SPEC-1ed3 R4, SPEC-5e50 R5 : ceux du service du compte, dans ``settings``) : un depassement est refuse ici, avec la raison et la prochaine
     heure possible, jamais reporte en silence."""
     times = planned_times(account, exclude=exclude, state_dir=state_dir, presets_dir=presets_dir, base=base)
     reason = tiktok.check_limits(times, target, settings, tz)
@@ -864,20 +889,23 @@ def create_post(
     state_dir: str | Path | None = None,
     presets_dir: str | Path = "presets",
     base: str | Path = "config.toml",
+    service: str = "tiktok",
 ) -> dict[str, Any]:
     """Cree l'entree de publication d'un clip depuis le formulaire (SPEC-1ed3 R3) : valider = approuver. ``channel``
     est None pour une video sans chaine (file ``NO_CHANNEL``). ``mode`` ``immediate`` : due tout de suite ;
     ``scheduled`` : due a ``publish_at`` (le worker la programme sur TikTok quand la date entre dans la fenetre).
     ``options`` : reglages par post (visibilite, commentaires, reutilisation, contenu IA, verification de contenu).
-    Refuse : clip pas pret, refuse ou deja publie, deja en file, prive + programme, plafond du compte depasse."""
+    Refuse : clip pas pret, refuse ou deja publie, deja en file, prive + programme, plafond du compte depasse.
+    ``service`` (``tiktok`` | ``youtube``, celui du compte) choisit les reglages, options et plafonds valides
+    (``settings`` : ceux de ce service)."""
     sidecar = _read_sidecar(output_dir, video_id, clip_id)
     if not sidecar.get("ready"):
         raise PublishError(f"clip non prêt pour publication : {video_id}/{clip_id}")
     channel = channel or NO_CHANNEL
     channel_dict = channel_settings(channel, presets_dir, base)
-    settings = dict(settings) if settings is not None else dict(tiktok.CONFIG_DEFAULTS)
+    settings = service_settings(service, settings)
     now_dt = _now(now)
-    options = _check_post_input(mode, account, publish_at, options, settings, now_dt)
+    options = _check_post_input(mode, account, publish_at, options, settings, now_dt, service)
     when = publish_at if mode == "scheduled" else now_dt
     tz = _tz(channel_dict)
     _check_caps(account, when, (video_id, clip_id), settings, tz, state_dir, presets_dir, base)
@@ -901,7 +929,7 @@ def create_post(
             "video_id": video_id, "clip_id": clip_id, "series_id": series_id, "part": part,
             "status": "scheduled", "slot_at": _iso(when), "decided_at": _iso(now_dt),
             "published_at": None, "error": None, "account": account,
-            "publish_mode": mode, "post_options": options, "manual": True,
+            "publish_mode": mode, "post_options": options, "manual": True, "service": service,
         }
         _upsert_entry(entries, entry)
         _save_entries(path, entries)
@@ -944,12 +972,14 @@ def update_post(
     state_dir: str | Path | None = None,
     presets_dir: str | Path = "presets",
     base: str | Path = "config.toml",
+    service: str = "tiktok",
 ) -> dict[str, Any]:
     """Modifie une entree de publication (SPEC-1ed3 R5) tant qu'elle n'est ni en cours ni publiee. Les champs
-    omis sont conserves ; l'ensemble est revalide comme a la creation (prive + programme, date, plafonds)."""
+    omis sont conserves ; l'ensemble est revalide comme a la creation (prive + programme, date, plafonds).
+    ``service`` : celui du compte retenu (voir ``create_post``)."""
     channel = channel or NO_CHANNEL
     channel_dict = channel_settings(channel, presets_dir, base)
-    settings = dict(settings) if settings is not None else dict(tiktok.CONFIG_DEFAULTS)
+    settings = service_settings(service, settings)
     now_dt = _now(now)
     path = _state_path(channel, state_dir)
     with _locked(path):
@@ -968,7 +998,7 @@ def update_post(
         else:
             new_at = datetime.fromisoformat(entry["slot_at"]) if entry.get("slot_at") else None
         new_options = _check_post_input(new_mode, new_account, new_at if new_mode == "scheduled" else None,
-                                        new_options, settings, now_dt)
+                                        new_options, settings, now_dt, service)
         when = new_at if new_mode == "scheduled" else now_dt
         _check_caps(new_account, when, (video_id, clip_id), settings, _tz(channel_dict), state_dir, presets_dir, base)
         if caption is not None or hashtags is not None:
@@ -976,7 +1006,7 @@ def update_post(
                            caption, hashtags, now_dt)
         entry = dict(entry)
         entry.update(account=new_account, publish_mode=new_mode, slot_at=_iso(when), post_options=new_options,
-                     waiting_reason=None, postponed_reason=None)
+                     waiting_reason=None, postponed_reason=None, service=service)
         _upsert_entry(entries, entry)
         _save_entries(path, entries)
     return entry
@@ -999,8 +1029,12 @@ def cancel_post(
             raise PublishError(f"clip absent de la file de publication : {video_id}/{clip_id}")
         _refuse_in_progress(entry, "annulation")
         if entry["status"] == "published":
-            where = (" : elle est déjà programmée sur TikTok, annule-la dans TikTok Studio"
-                     if entry.get("tiktok_state") == "scheduled_on_tiktok" else " : le clip est publié")
+            if entry.get("tiktok_state") == "scheduled_on_tiktok":
+                where = " : elle est déjà programmée sur TikTok, annule-la dans TikTok Studio"
+            elif entry.get("tiktok_state") == "scheduled_on_youtube":
+                where = " : elle est déjà programmée sur YouTube, annule-la dans YouTube Studio"
+            else:
+                where = " : le clip est publié"
             raise PublishError(f"annulation refusée pour {video_id}/{clip_id}{where}")
         if entry["status"] not in _CANCELLABLE_STATUSES:
             raise PublishError(f"annulation refusée pour {video_id}/{clip_id} : statut {entry['status']!r}")

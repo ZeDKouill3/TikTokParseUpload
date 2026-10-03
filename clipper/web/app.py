@@ -749,7 +749,7 @@ def _clip_publish_status(sidecar: dict[str, Any], entry: dict[str, Any] | None) 
 
 def _tiktok_fields(entry: dict[str, Any] | None, video_id: str, clip_id: str) -> dict[str, Any]:
     """Statut TikTok d'une publication (SPEC-9225 R3, R4) : ``pending`` (en attente),
-    ``scheduled_on_tiktok`` (programmee cote TikTok), ``published`` (avec lien si connu),
+    ``scheduled_on_tiktok`` / ``scheduled_on_youtube`` (programmee cote service), ``published`` (avec lien si connu),
     ``failed`` (avec capture et raison) ; None sans entree ou refusee."""
     entry = entry or {}
     status = entry.get("status")
@@ -758,14 +758,15 @@ def _tiktok_fields(entry: dict[str, Any] | None, video_id: str, clip_id: str) ->
     elif status in ("approved", "scheduled"):
         tiktok_status = "pending"
     elif status == "published":
-        tiktok_status = "scheduled_on_tiktok" if entry.get("tiktok_state") == "scheduled_on_tiktok" else "published"
+        scheduled = entry.get("tiktok_state") in ("scheduled_on_tiktok", "scheduled_on_youtube")
+        tiktok_status = entry["tiktok_state"] if scheduled else "published"
     elif status == "failed":
         tiktok_status = "failed"
     else:
         tiktok_status = None
     scheduled_at = _publish_entry_instant(entry, "tiktok_publish_at") if status == "published" else None
     # « en ligne » : publie pour de bon, ou programme sur TikTok dont l'heure est passee (une programmee future n'est pas publiee)
-    live = status == "published" and not (tiktok_status == "scheduled_on_tiktok" and scheduled_at is not None
+    live = status == "published" and not (str(tiktok_status).startswith("scheduled_on_") and scheduled_at is not None
                                           and scheduled_at > _now_utc())
     return {
         "tiktok_status": tiktok_status, "tiktok_live": live,
@@ -774,6 +775,7 @@ def _tiktok_fields(entry: dict[str, Any] | None, video_id: str, clip_id: str) ->
         "post_url": entry.get("post_url"), "post_id": entry.get("post_id"), "post_note": entry.get("post_note"),
         "tiktok_publish_at": entry.get("tiktok_publish_at"), "postponed_reason": entry.get("postponed_reason"),
         "account": entry.get("account"), "waiting_reason": entry.get("waiting_reason"),
+        "service": entry.get("service"),
         "publish_mode": entry.get("publish_mode"), "post_options": entry.get("post_options") or {},
         "editable": status in ("approved", "scheduled", "failed") and not entry.get("in_progress_since"),
         "capture_url": f"/api/publish/{video_id}/{clip_id}/capture" if entry.get("capture") else None,
@@ -1855,18 +1857,29 @@ class _LimitRefused(Exception):
         self.detail, self.next_at = detail, next_at
 
 
-def _publication_settings(config: Config) -> dict[str, Any]:
-    """Reglages [tiktok] valides (plafonds, fenetre de programmation, reglages par defaut d'un post)."""
+def _publication_settings(config: Config, service: str = "tiktok") -> dict[str, Any]:
+    """Reglages [tiktok] (ou [youtube], SPEC-5e50 R5) valides : plafonds, fenetre de programmation, reglages par defaut
+    d'un post."""
     try:
-        return tiktok_mod.get_settings(config)
-    except tiktok_mod.TikTokError as exc:
+        return youtube_mod.get_settings(config) if service == "youtube" else tiktok_mod.get_settings(config)
+    except (tiktok_mod.TikTokError, youtube_mod.YouTubeError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 def _publish_accounts(config: Config) -> list[dict[str, Any]]:
-    """Comptes proposes a la publication : id, libelle, pret ou non (aucun secret, lisible hors du PC)."""
-    return [{"id": a["id"], "label": a["label"], "ready_to_publish": a["ready_to_publish"]}
+    """Comptes proposes a la publication, des deux services : id, libelle, service, pret ou non (aucun secret,
+    lisible hors du PC)."""
+    return [{"id": a["id"], "label": a["label"], "ready_to_publish": a["ready_to_publish"],
+             "service": a["service"], "service_label": accounts_mod.SERVICE_LABELS.get(a["service"], a["service"])}
             for a in _accounts_call(accounts_mod.list_accounts, config)]
+
+
+def _account_service(config: Config, account_id: Any) -> str:
+    """Service (``tiktok`` | ``youtube``) d'un compte de publication."""
+    found = next((a for a in _publish_accounts(config) if a["id"] == account_id), None)
+    if found is None:
+        raise HTTPException(status_code=409, detail=f"compte inconnu : {account_id!r} (écran Comptes)")
+    return found["service"]
 
 
 def _require_ready_account(config: Config, account_id: Any) -> str:
@@ -2269,7 +2282,7 @@ def create_app(config: Config | None = None) -> FastAPI:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except channel_mod.ChannelError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
-        except (ConfigError, tiktok_mod.TikTokError) as exc:
+        except (ConfigError, tiktok_mod.TikTokError, youtube_mod.YouTubeError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.exception_handler(_LimitRefused)
@@ -2277,10 +2290,10 @@ def create_app(config: Config | None = None) -> FastAPI:
         # un plafond depasse rend aussi la prochaine heure possible ({"detail": texte, "next_at": date ISO})
         return JSONResponse({"detail": exc.detail, "next_at": exc.next_at}, status_code=409)
 
-    def _publication_scope() -> dict[str, Any]:
+    def _publication_scope(service: str = "tiktok") -> dict[str, Any]:
         return {"output_dir": Path(config.output_dir), "state_dir": _publish_dir(config),
                 "presets_dir": _PRESETS_DIR, "base": _BASE_CONFIG,
-                "settings": _publication_settings(config)}
+                "settings": _publication_settings(config, service), "service": service}
 
     def _publication_view(channel: str, entry: dict[str, Any]) -> dict[str, Any]:
         video_id, clip_id = entry["video_id"], entry["clip_id"]
@@ -2293,6 +2306,7 @@ def create_app(config: Config | None = None) -> FastAPI:
         """Toutes les entrees de publication (chaines et videos sans chaine) avec leur statut, plus ce qu'il faut
         au formulaire : comptes (prets ou non), reglages par defaut, limites de programmation de TikTok."""
         settings = _publication_settings(config)
+        yt_settings = _publication_settings(config, "youtube")
         rows = []
         try:
             found = publish_mod.all_entries(state_dir=_publish_dir(config), presets_dir=_PRESETS_DIR)
@@ -2314,6 +2328,11 @@ def create_app(config: Config | None = None) -> FastAPI:
                                                             "ai_generated", "content_check")},
                 "schedule_max_days": settings["schedule_max_days"],
                 "schedule_min_minutes": settings["schedule_min_minutes"],
+                "youtube": {
+                    "options": {key: yt_settings[key] for key in ("visibility", "made_for_kids")},
+                    "schedule_max_days": yt_settings["schedule_max_days"],
+                    "schedule_min_minutes": yt_settings["schedule_min_minutes"],
+                },
             },
         }
 
@@ -2327,7 +2346,7 @@ def create_app(config: Config | None = None) -> FastAPI:
         entry = _publication_call(
             publish_mod.create_post, body.video_id, body.clip_id, channel, account=account, mode=body.mode,
             publish_at=publish_at, options=body.options, caption=body.description, hashtags=body.hashtags,
-            **_publication_scope())
+            **_publication_scope(_account_service(config, account)))
         return _publication_view(channel or publish_mod.NO_CHANNEL, entry)
 
     @app.patch("/api/publications/{video_id}/{clip_id}")
@@ -2345,9 +2364,19 @@ def create_app(config: Config | None = None) -> FastAPI:
         if "options" in sent and body.options is not None:
             changes["options"] = body.options
         channel = _channel_of(video_id, config)
+        account = changes.get("account")
+        if account is None:  # compte inchange : le service est celui du compte deja retenu par l'entree
+            current = _publish_entries(config, channel or publish_mod.NO_CHANNEL).get((video_id, clip_id))
+            account = current.get("account") if current else None
+        try:
+            service = _account_service(config, account) if account else "tiktok"
+        except HTTPException:
+            if "account" in changes:
+                raise
+            service = "tiktok"  # compte de l'entree disparu de l'ecran Comptes : sans effet sur la validation
         entry = _publication_call(
             publish_mod.update_post, video_id, clip_id, channel, caption=body.description, hashtags=body.hashtags,
-            **changes, **_publication_scope())
+            **changes, **_publication_scope(service))
         return _publication_view(channel or publish_mod.NO_CHANNEL, entry)
 
     @app.delete("/api/publications/{video_id}/{clip_id}", status_code=204)
