@@ -7543,7 +7543,9 @@ def test_series_preview_reports_insufficient_clips_without_creating_anything(tmp
 
 
 def test_series_create_is_all_or_nothing_on_a_cap_violation(tmp_path, isolated_cwd):
-    config = _series_client(tmp_path, max_posts_per_day=1)
+    # écart minimal de 2 h pour une série toutes les heures : violation quelle que soit l'heure du test
+    # (un plafond « par jour » échouait vers minuit, quand les 2 dates tombent sur 2 jours différents).
+    config = _series_client(tmp_path, min_gap_minutes=120)
     c = TestClient(create_app(config=config))
 
     resp = c.post("/api/publications/series", json={
