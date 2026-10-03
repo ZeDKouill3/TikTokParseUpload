@@ -36,6 +36,16 @@ VERSION = _current_version()
 TAG = f"v{VERSION}"
 ESC_VERSION = re.escape(VERSION)
 NOTES = ROOT / "docs" / "releases" / f"{TAG}.md"
+HAS_NOTES = NOTES.exists()
+NO_NOTES_REASON = f"{TAG} n'a pas de fichier de notes séparé : le changelog suffit"
+
+
+def _next_minor(version: str) -> str:
+    major, minor, _patch = version.split(".")
+    return f"{major}.{int(minor) + 1}.0"
+
+
+NEXT_VERSION = _next_minor(VERSION)
 
 
 def _changelog_section(text: str, title_pattern: str) -> str:
@@ -61,7 +71,8 @@ def test_clipper_version_attribute_matches_pyproject():
 def test_readme_version_badge_and_notes_link_follow_the_current_version():
     text = _read(README)
     assert f"version-{VERSION}" in text
-    assert f"docs/releases/{TAG}.md" in text
+    if HAS_NOTES:
+        assert f"docs/releases/{TAG}.md" in text
 
 
 def test_changelog_header_mentions_semantic_versioning():
@@ -89,7 +100,9 @@ def test_changelog_current_version_has_only_non_empty_keep_a_changelog_sections(
     body = _changelog_section(_read(CHANGELOG), rf"\[{ESC_VERSION}\]")
     titles = re.findall(r"^### (.+)$", body, re.M)
     assert titles, f"aucune section ### dans [{VERSION}]"
-    assert set(titles) <= {"Ajouté", "Modifié", "Corrigé", "Sécurité", "Retiré", "Obsolète"}, titles
+    assert set(titles) <= {
+        "Ajouté", "Modifié", "Corrigé", "Sécurité", "Retiré", "Obsolète", "À savoir pour migrer",
+    }, titles
     assert len(titles) == len(set(titles)), titles
     for title in titles:
         block = re.search(rf"^### {title}$(.*?)(?=^### |\Z)", body, re.S | re.M)
@@ -114,6 +127,7 @@ def test_changelog_footer_links_compare_consecutive_tags():
     assert f"[{versions[-1]}]: {REPO_URL}/releases/tag/v{versions[-1]}" in text
 
 
+@pytest.mark.skipif(not HAS_NOTES, reason=NO_NOTES_REASON)
 def test_changelog_current_version_points_to_its_release_notes():
     body = _changelog_section(_read(CHANGELOG), rf"\[{ESC_VERSION}\]")
     assert f"docs/releases/{TAG}.md" in body
@@ -125,6 +139,7 @@ REQUIRED_NOTE_THEMES = [
 ]
 
 
+@pytest.mark.skipif(not HAS_NOTES, reason=NO_NOTES_REASON)
 def test_release_notes_have_the_expected_structure():
     text = _read(NOTES)
     headings = re.findall(r"^#{1,3} (.+)$", text, re.M)
@@ -135,6 +150,7 @@ def test_release_notes_have_the_expected_structure():
     assert text.startswith(f"# clipper {TAG}")
 
 
+@pytest.mark.skipif(not HAS_NOTES, reason=NO_NOTES_REASON)
 def test_release_notes_cover_the_upgrade_steps():
     text = _read(NOTES)
     for needle in ("uv pip install", "config.toml", "[parts]", "rubric_path", "stats_interval_h",
@@ -142,6 +158,7 @@ def test_release_notes_cover_the_upgrade_steps():
         assert needle in text, f"manque dans les notes : {needle}"
 
 
+@pytest.mark.skipif(not HAS_NOTES, reason=NO_NOTES_REASON)
 def test_release_notes_upgrade_section_names_the_removed_parts_key_and_the_stats_default():
     text = _read(NOTES)
     upgrade = re.search(r"^## Mettre à jour depuis la .*?$(.*?)(?=^## )", text, re.S | re.M)
@@ -150,6 +167,7 @@ def test_release_notes_upgrade_section_names_the_removed_parts_key_and_the_stats
     assert "[parts]" in body and "rubric_path" in body and "stats_interval_h" in body
 
 
+@pytest.mark.skipif(not HAS_NOTES, reason=NO_NOTES_REASON)
 def test_release_notes_list_artifacts_of_the_current_version():
     text = _read(NOTES)
     assert f"clipper-{VERSION}-py3-none-any.whl" in text
@@ -157,6 +175,7 @@ def test_release_notes_list_artifacts_of_the_current_version():
     assert f"/blob/{TAG}/" in text
 
 
+@pytest.mark.skipif(not HAS_NOTES, reason=NO_NOTES_REASON)
 def test_release_notes_use_a_neutral_channel_example():
     assert "ma_chaine" in _read(NOTES)
 
@@ -169,7 +188,10 @@ def test_0_2_0_release_notes_are_kept_with_their_themes():
     assert text.startswith("# clipper v0.2.0")
 
 
-@pytest.mark.parametrize("path", [CHANGELOG, NOTES, VERSIONS, README], ids=lambda p: p.name)
+_LEAK_CHECKED_PATHS = [CHANGELOG, VERSIONS, README] + ([NOTES] if HAS_NOTES else [])
+
+
+@pytest.mark.parametrize("path", _LEAK_CHECKED_PATHS, ids=lambda p: p.name)
 def test_release_docs_leak_no_real_identifier(path):
     text = _read(path)
     for token in LEAKED_TOKENS:
@@ -180,7 +202,10 @@ def test_versions_marks_the_current_version_published_with_its_content():
     lines = _read(VERSIONS).splitlines()
     row = next(line for line in lines if line.startswith(f"| {TAG} "))
     assert row.rstrip().endswith("| publiée |")
-    assert f"releases/{TAG}.md" in row
+    if HAS_NOTES:
+        assert f"releases/{TAG}.md" in row
+    else:
+        assert "CHANGELOG.md" in row
     assert "maintenant" not in row
     assert "à définir" not in row.lower()
 
@@ -195,5 +220,5 @@ def test_versions_published_rows_are_never_marked_planned():
 
 def test_versions_keeps_the_next_version_after_real_usage():
     text = _read(VERSIONS)
-    row = next(line for line in text.splitlines() if line.startswith("| v0.4.0 "))
+    row = next(line for line in text.splitlines() if line.startswith(f"| v{NEXT_VERSION} "))
     assert "Mode auto" in row and row.rstrip().endswith("| après une semaine d'usage réel |")

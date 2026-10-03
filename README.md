@@ -6,7 +6,7 @@
   **Une vidéo longue en entrée, des clips verticaux sous-titrés en sortie, publiés sur TikTok depuis une console web locale.**
 
   <p>
-    <img alt="Version" src="https://img.shields.io/badge/version-0.3.0%20pr%C3%A9--version-orange">
+    <img alt="Version" src="https://img.shields.io/badge/version-0.4.0%20pr%C3%A9--version-orange">
     <img alt="Python" src="https://img.shields.io/badge/python-3.11-blue">
     <img alt="Plateforme" src="https://img.shields.io/badge/plateforme-Windows-lightgrey">
     <img alt="GPU" src="https://img.shields.io/badge/GPU-CUDA%20optionnel-76b900">
@@ -17,7 +17,7 @@
 
 > ⚠️ **Pré-version.** Pas encore de garantie de stabilité de la ligne de
 > commande ni du format de configuration. Voir
-> [`docs/releases/v0.3.0.md`](docs/releases/v0.3.0.md) et le plan de versions
+> [`CHANGELOG.md`](CHANGELOG.md) (section `[0.4.0]`) et le plan de versions
 > [`docs/versions.md`](docs/versions.md).
 
 ## Ce que ça fait
@@ -210,8 +210,8 @@ Python 3.11, ffmpeg, `claude`, `ank`, GPU optionnel, Google Chrome pour
 [publier sur TikTok](#publier-sur-tiktok)).
 
 Depuis la release (sans cloner le dépôt) : télécharge le `.whl` de la
-[dernière release](docs/releases/v0.3.0.md), `uv pip install
-clipper-0.3.0-py3-none-any.whl` puis `clipper init` (écrit `config.toml` et
+[dernière release](CHANGELOG.md), `uv pip install
+clipper-0.4.0-py3-none-any.whl` puis `clipper init` (écrit `config.toml` et
 `rubric.toml` — la grille par défaut, embarquée dans la wheel — dans le
 dossier courant). La commande `clipper` s'ajoute à `python -m clipper`.
 

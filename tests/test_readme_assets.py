@@ -306,8 +306,11 @@ def test_readme_version_badge_matches_pyproject():
 
 def test_readme_links_the_documentation_set():
     text = _readme_text()
-    for target in ("docs/GUIDE.md", "docs/versions.md", "docs/tiktok-cadence.md",
-                   f"docs/releases/v{_current_version()}.md", "CHANGELOG.md"):
+    targets = ["docs/GUIDE.md", "docs/versions.md", "docs/tiktok-cadence.md", "CHANGELOG.md"]
+    notes = ROOT / "docs" / "releases" / f"v{_current_version()}.md"
+    if notes.exists():
+        targets.append(f"docs/releases/v{_current_version()}.md")
+    for target in targets:
         assert f"]({target})" in text, f"lien vers {target} absent de README.md"
 
 
