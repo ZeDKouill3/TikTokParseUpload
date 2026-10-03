@@ -639,6 +639,15 @@ function pubSeriesRenderManual(f, d) {
   pubSeriesRenderPreview(f, d);
 }
 
+/* Texte sous la coche « À la suite de la dernière programmation » (TASK-8c4818a974fa) : la date vient de
+   publish.after_last_schedule (reutilise /api/publications/after-last, deja servi pour « Nouvelle
+   publication », TASK-5c00), jamais recalculee en JS ; `f.afterAtParis` est la chaine deja a l'heure de
+   Paris renvoyee par l'API (``publish_at_paris``). */
+function pubSeriesAfterLastHint(f) {
+  if (!f.afterAt) return "Choisis un compte et un intervalle.";
+  return `Programmée à partir de ${pubSlotLabel(f.afterAtParis || f.afterAt)} (dernière programmation du compte + ${f.intervalH} h).`;
+}
+
 function pubSeriesFormHtml(f) {
   const ready = f.accounts.filter((a) => a.ready_to_publish);
   const styles = pubSeriesStyles(f.units);
@@ -661,12 +670,14 @@ function pubSeriesFormHtml(f) {
         <span class="hint">Seuls les comptes « prêts à publier » (écran Comptes) sont proposés.</span></div>
       <div class="row wrap" style="gap:16px">
         <div class="field"><label for="pubs-start">Début (heure de Paris)</label>
-          <input class="input" id="pubs-start" type="datetime-local" value="${esc(f.start)}"></div>
+          <input class="input" id="pubs-start" type="datetime-local" value="${esc(f.afterLast && f.afterAt ? pubLocalInput(f.afterAt) : f.start)}"${f.afterLast ? " disabled" : ""}></div>
         <div class="field"><label for="pubs-interval">Toutes les (heures)</label>
           <input class="input" id="pubs-interval" type="number" min="1" step="1" value="${f.intervalH}" style="width:8ch"></div>
         ${f.mode === "auto" ? `<div class="field"><label for="pubs-count">Nombre de vidéos</label>
           <input class="input" id="pubs-count" type="number" min="1" step="1" value="${f.count}" style="width:8ch"${available != null ? ` max="${available}"` : ""}${available === 0 ? " disabled" : ""}></div>` : ""}
       </div>
+      <div class="field"><label class="row" style="gap:6px"><input type="checkbox" id="pubs-after-last"${f.afterLast ? " checked" : ""}> À la suite de la dernière programmation</label>
+        <span class="hint" id="pubs-after-last-hint"${f.afterLast ? "" : " hidden"}>${esc(pubSeriesAfterLastHint(f))}</span></div>
       ${f.mode === "manual" ? `
         <div class="field"><span class="field-label">Clips disponibles</span>
           <div class="pubf-clips" id="pubs-pool" role="listbox" aria-label="Clips disponibles"></div></div>
@@ -687,11 +698,13 @@ function pubSeriesBody(f, d) {
   const style = $("#pubs-style", d).value;
   const account = $("#pubs-account", d).value;
   const interval_hours = Number($("#pubs-interval", d).value);
+  const afterLast = $("#pubs-after-last", d).checked;
   const startLocal = $("#pubs-start", d).value;
   const parts_together = $("#pubs-together", d).checked;
   const body = {
     mode, style: style || null, account, interval_hours, parts_together,
-    start_at: startLocal ? pubParisInstant(startLocal).toISOString() : "",
+    // Coche cochee (TASK-8c4818a974fa) : la date vient de l'API (f.afterAt), jamais recalculee ici.
+    start_at: afterLast ? (f.afterAt || "") : (startLocal ? pubParisInstant(startLocal).toISOString() : ""),
   };
   if (mode === "auto") body.count = Number($("#pubs-count", d).value);
   else body.selection = f.selected.map((u) => ({ video_id: u.video_id, clip_id: u.clip_ids[0] }));
@@ -807,6 +820,35 @@ async function pubSeriesSubmit(f, d) {
   }
 }
 
+/* Coche « À la suite de la dernière programmation » (TASK-8c4818a974fa) : reutilise l'endpoint deja servi
+   pour « Nouvelle publication » (/api/publications/after-last, TASK-5c00 -> publish.after_last_schedule),
+   met a jour le champ Debut (desactive) et le texte d'aide ; aucun calcul de date ici, seulement l'affichage
+   de ce que l'API a renvoye. */
+async function pubSeriesRefreshAfterLast(f, d) {
+  const account = $("#pubs-account", d).value;
+  const interval = Number($("#pubs-interval", d).value);
+  f.intervalH = interval;
+  const hint = $("#pubs-after-last-hint", d);
+  if (!account || !(interval > 0)) {
+    f.afterAt = null;
+    f.afterAtParis = null;
+    if (hint) hint.textContent = pubSeriesAfterLastHint(f);
+    return;
+  }
+  try {
+    const res = await api(`/api/publications/after-last?account=${pubEnc(account)}&interval_hours=${pubEnc(interval)}`);
+    f.afterAt = res.publish_at;
+    f.afterAtParis = res.publish_at_paris;
+    const input = $("#pubs-start", d);
+    if (input) input.value = pubLocalInput(res.publish_at);
+    if (hint) hint.textContent = pubSeriesAfterLastHint(f);
+  } catch (err) {
+    f.afterAt = null;
+    f.afterAtParis = null;
+    if (hint) hint.textContent = err.message || String(err);
+  }
+}
+
 function pubSeriesWire(f, d) {
   $$("input[name='pubs-mode']", d).forEach((r) => (r.onchange = () => { f.mode = r.value; pubSeriesRerender(f, d); }));
   $("#pubs-style", d).onchange = () => { f.style = $("#pubs-style", d).value; };
@@ -822,15 +864,36 @@ function pubSeriesWire(f, d) {
     clearTimeout(timer);
     if (f.mode === "auto" || f.selected.length) timer = setTimeout(() => pubSeriesPreview(f, d), 500);
   };
+  // Decochee par defaut (TASK-8c4818a974fa) : cochee, desactive Debut et affiche la date calculee cote
+  // Python ; decochee, rend le champ au comportement actuel.
+  const afterLastEl = $("#pubs-after-last", d);
+  if (afterLastEl) {
+    afterLastEl.onchange = () => {
+      f.afterLast = afterLastEl.checked;
+      const input = $("#pubs-start", d), hint = $("#pubs-after-last-hint", d);
+      if (input) input.disabled = f.afterLast;
+      if (hint) hint.hidden = !f.afterLast;
+      if (f.afterLast) pubSeriesRefreshAfterLast(f, d).then(refresh);
+      else refresh();
+    };
+  }
   ["#pubs-start", "#pubs-interval", "#pubs-count"].forEach((sel) => {
     const el = $(sel, d);
-    if (el) el.addEventListener("input", refresh);
+    if (el) el.addEventListener("input", () => {
+      // L'intervalle recalcule la date tant que la coche est active (TASK-8c4818a974fa).
+      if (sel === "#pubs-interval" && f.afterLast) { pubSeriesRefreshAfterLast(f, d).then(refresh); return; }
+      refresh();
+    });
   });
   // Style, compte et coche « Parties ensemble » changent la composition du pool et le max du compte
-  // (TASK-fc561e4dc7e9) : re-interroge le serveur avant de relancer l'apercu.
+  // (TASK-fc561e4dc7e9) : re-interroge le serveur avant de relancer l'apercu. Le compte recalcule aussi
+  // la date « à la suite » tant que la coche est active (TASK-8c4818a974fa).
   ["#pubs-style", "#pubs-account", "#pubs-together"].forEach((sel) => {
     const el = $(sel, d);
-    if (el) el.addEventListener("change", () => pubSeriesFetchClips(f, d).then(refresh));
+    if (el) el.addEventListener("change", () => pubSeriesFetchClips(f, d).then(() => {
+      if (sel === "#pubs-account" && f.afterLast) { pubSeriesRefreshAfterLast(f, d).then(refresh); return; }
+      refresh();
+    }));
   });
   pubSeriesFetchClips(f, d).then(() => {
     if (f.mode === "auto") pubSeriesPreview(f, d);
@@ -852,6 +915,7 @@ async function pubOpenSeriesForm() {
     mode: "auto", style: "", units: clipsData.units, accounts: data.accounts,
     start: pubSeriesDefaultStart(), intervalH: clipsData.default_interval_h || 4,
     count: 1, selected: [], preview: null, together: true, available: null,
+    afterLast: false, afterAt: null, afterAtParis: null,
   };
   return openPanel("modal pub-modal pub-form", pubSeriesFormHtml(f), (d) => pubSeriesWire(f, d));
 }
