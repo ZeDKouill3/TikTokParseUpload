@@ -665,8 +665,10 @@ input[type="color"] { width: 36px; height: 36px; padding: 2px; border-radius: va
 .phone .pbtn { position: absolute; inset: 0; display: grid; place-items: center; }
 .phone .pbtn span { width: 56px; height: 56px; border-radius: 50%; background: rgba(0,0,0,0.5); color: #fff; display: grid; place-items: center; backdrop-filter: blur(6px); transition: opacity 200ms ease, transform 200ms var(--ease-out); }
 .phone.playing .pbtn span { opacity: 0; transform: scale(0.9); }
-.parts { display: flex; gap: 8px; margin-top: 16px; }
-.parts .part { flex: 1; border: 1px solid var(--line-2); border-radius: var(--r); padding: 8px; font-size: 12px; text-align: center; transition: border-color 160ms ease, background-color 160ms ease; }
+.parts-label { font-size: 12px; margin-top: 16px; margin-bottom: 6px; }
+/* Grille qui passe a la ligne : une serie de 8-12 parties ne tient pas sur une ligne de 300 px. */
+.parts { display: grid; grid-template-columns: repeat(auto-fill, minmax(40px, 1fr)); gap: 6px; }
+.parts .part { white-space: nowrap;border: 1px solid var(--line-2); border-radius: var(--r); padding: 8px; font-size: 12px; text-align: center; transition: border-color 160ms ease, background-color 160ms ease; }
 .parts .part.on { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); font-weight: 600; }
 .qa-item { display: flex; gap: 12px; padding: 12px; border-radius: var(--r); background: var(--warn-soft); color: var(--text); font-size: 13px; }
 .qa-item .i { color: var(--warn); margin-top: 1px; }

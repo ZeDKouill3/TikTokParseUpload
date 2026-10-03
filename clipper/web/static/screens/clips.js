@@ -162,7 +162,7 @@ function clipDrawerHtml(c) {
     <div class="drawer-body">
       <div>
         <div class="phone"><video src="${esc(c.video_url)}" controls playsinline preload="metadata"></video></div>
-        ${series.length ? `<div class="parts">${series.map((p) => `<button type="button" class="part ${p.clip_id === c.clip_id ? "on" : ""}" data-part="${esc(clipKey(p))}">Partie ${esc(p.part)}</button>`).join("")}</div>` : ""}
+        ${series.length ? `<div class="parts-label muted">Parties</div><div class="parts">${series.map((p) => `<button type="button" class="part ${p.clip_id === c.clip_id ? "on" : ""}" data-part="${esc(clipKey(p))}" title="Partie ${esc(p.part)}" aria-label="Partie ${esc(p.part)}">${esc(p.part)}</button>`).join("")}</div>` : ""}
         <div class="row" style="justify-content:center;margin-top:16px;gap:16px;font-size:13px">
           ${c.duration != null ? `<span class="mono">${esc(clipSeconds(c.duration))}</span><span class="muted">·</span>` : ""}<span class="mono">1080×1920</span>${c.score != null ? `<span class="muted">·</span><span>score <b class="num" style="font-size:16px">${esc(fr(c.score))}</b></span>` : ""}
         </div>
