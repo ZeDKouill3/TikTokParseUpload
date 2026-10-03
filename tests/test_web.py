@@ -5908,9 +5908,11 @@ def test_a_daily_cap_overrun_is_refused_with_the_reason_and_the_next_possible_ti
     next_at = _dt.fromisoformat(resp.json()["next_at"])
     assert next_at > _dt.now(_tz.utc)
     assert [p["clip_id"] for p in _publications(tmp_path, c)] == ["01"]  # rien n'est ecrit
+    # 2 h apres l'heure possible (meme jour) : juste avant minuit, next_at = 00:00 tombe sous l'avance
+    # minimale de programmation et le test echouait selon l'heure.
     ok = c.post("/api/publications", json={
         "video_id": CLIPS_VIDEO, "clip_id": "03", "account": READY, "mode": "scheduled",
-        "publish_at": next_at.isoformat()})
+        "publish_at": (next_at + timedelta(hours=2)).isoformat()})
     assert ok.status_code == 201, ok.text
 
 
