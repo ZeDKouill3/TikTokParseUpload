@@ -268,6 +268,7 @@ def ask(
     log_path: Path | None = None,
     usage_log_path: Path | None = None,
     cache_prefix: str | None = None,
+    timeout: float | None = None,
 ) -> Any:
     """Ask the model configured for ``usage`` and return its JSON answer,
     validated against ``schema`` then by ``check`` (which raises SchemaError
@@ -286,7 +287,11 @@ def ask(
     block (if any) is used instead; with neither, nothing is written.
     ``cache_prefix``, when given, must be a prefix of ``prompt`` (else
     LLMError, ADR-ad2e) shared with other calls: forwarded to the backend as
-    LLMRequest.cache_prefix, for it to mark as its own cacheable block."""
+    LLMRequest.cache_prefix, for it to mark as its own cacheable block.
+    ``timeout``, when given, overrides this call's timeout (seconds, every
+    attempt including repairs) in place of the backend's own [llm.<backend>]
+    default; other calls, even other calls to the same usage, are
+    unaffected (TASK-db6f)."""
     effective_usage_log_path = usage_log_path if usage_log_path is not None else _usage_log_path
     settings = _settings(config)
     name, model, backend_settings = _resolve(usage, settings)
@@ -303,6 +308,7 @@ def ask(
         images=[Path(p) for p in images],
         schema=schema,
         cache_prefix=cache_prefix,
+        timeout=timeout,
     )
     totals: dict[str, float | int | None] = dict.fromkeys(_USAGE_FIELDS)
     duration_total = 0.0

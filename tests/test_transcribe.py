@@ -1006,6 +1006,114 @@ def test_force_redoes_whisper_even_if_raw_transcript_exists(tmp_path, video_dir,
 
 
 # --------------------------------------------------------------------------
+# TASK-db6f : une tranche de correction bloquee ne fait plus tout
+# recommencer (tranches reussies gardees, delai par tranche, 1 re-essai).
+# --------------------------------------------------------------------------
+
+
+def test_default_fix_timeout_s_is_360(tmp_path):
+    from clipper.transcribe import CONFIG_DEFAULTS
+
+    assert CONFIG_DEFAULTS["fix_timeout_s"] == 360
+
+
+def test_fix_timeout_s_is_forwarded_to_llm_ask_without_changing_other_usages(tmp_path, video_dir, cpu):
+    fake = FakeBackend([VOCAB, NO_FIX])
+    with llm.use_backend(fake):
+        run(tmp_path, ModelFactory(), config=make_config(tmp_path, fix_timeout_s=42))
+
+    vocab_call, fix_call = fake.calls
+    assert vocab_call.usage == "vocab" and vocab_call.timeout is None
+    assert fix_call.usage == "transcript_fix" and fix_call.timeout == 42
+
+
+def test_transient_failure_on_one_chunk_is_retried_once_immediately_and_succeeds(
+    tmp_path, video_dir, cpu
+):
+    segments = _many_word_segments(2)  # fix_chunk_words=1 -> 2 tranches
+    attempts: dict[str, int] = {}
+    lock = threading.Lock()
+
+    def respond(request):
+        line = next(l for l in request.prompt.splitlines() if "\t" in l)
+        _, word_text = line.split("\t", 1)
+        with lock:
+            attempts[word_text] = attempts.get(word_text, 0) + 1
+            n = attempts[word_text]
+        if word_text == "mot0" and n == 1:
+            raise llm.TransientLLMError("surcharge")
+        return {"corrections": [{"i": 0, "old": word_text, "word": word_text.upper()}]}
+
+    fake = FakeBackend([VOCAB, respond])
+    config = make_config(tmp_path, fix_chunk_words=1)
+    with llm.use_backend(fake):
+        run(tmp_path, ModelFactory(segments=segments), config=config)
+
+    assert attempts["mot0"] == 2  # 1er essai transitoire + re-essai immediat, meme tranche
+    assert attempts["mot1"] == 1  # l'autre tranche n'est touchee qu'une fois
+    words = [w["word"] for s in read_transcript(video_dir)["segments"] for w in s["words"]]
+    assert words == [" MOT0", " MOT1"]
+
+
+def test_fix_chunk_result_is_cached_and_a_retried_pass_only_recalls_the_missing_chunk(
+    tmp_path, video_dir, cpu
+):
+    """Une tranche en echec transitoire deux fois de suite (jamais relancee
+    une 2e fois : l'etape echoue explicitement comme avant, ADR-ad2e) laisse
+    les autres tranches, elles reussies, deja ecrites sous workspace/<id>/
+    (preuve : nombre d'appels au fake backend du 2e passage)."""
+    segments = _many_word_segments(4)  # fix_chunk_words=1 -> 4 tranches
+    attempts: dict[str, int] = {}
+    lock = threading.Lock()
+
+    def respond(request):
+        line = next(l for l in request.prompt.splitlines() if "\t" in l)
+        _, word_text = line.split("\t", 1)
+        with lock:
+            attempts[word_text] = attempts.get(word_text, 0) + 1
+        if word_text == "mot2":
+            raise llm.TransientLLMError("quota")  # echoue aux 2 essais (initial + re-essai)
+        return {"corrections": [{"i": 0, "old": word_text, "word": word_text.upper()}]}
+
+    fake = FakeBackend([VOCAB, respond])
+    config = make_config(tmp_path, fix_chunk_words=1)
+    factory1 = ModelFactory(segments=segments)
+    with llm.use_backend(fake):
+        with pytest.raises(llm.TransientLLMError):
+            run(tmp_path, factory1, config=config)
+    assert not (video_dir / "transcript.json").exists()
+    assert attempts == {"mot0": 1, "mot1": 1, "mot2": 2, "mot3": 1}
+
+    # 2e passage : whisper pas relance (raw reutilise), seule la tranche
+    # manquante (mot2) est redemandee au fake -- les 3 autres, deja ecrites
+    # sous workspace/<id>/fix_chunks/, ne generent aucun nouvel appel.
+    fake2 = FakeBackend([lambda request: {"corrections": [{"i": 0, "old": "mot2", "word": "DEUX"}]}])
+    factory2 = ModelFactory(segments=segments)
+    with llm.use_backend(fake2):
+        run(tmp_path, factory2, config=config)
+
+    assert factory2.built == []  # whisper pas relance
+    assert [c.usage for c in fake2.calls] == ["transcript_fix"]  # vocab et 3 tranches pas redemandes
+    words = [w["word"] for s in read_transcript(video_dir)["segments"] for w in s["words"]]
+    assert words == [" MOT0", " MOT1", " DEUX", " MOT3"]
+
+
+def test_force_clears_the_fix_chunk_cache_so_a_full_redo_is_never_reused(tmp_path, video_dir, cpu):
+    """``force`` refait whisper et le vocabulaire : une tranche de meme texte
+    ne doit pas rejouer une correction calculee avant (contexte different),
+    donc le cache de tranches est vide a chaque force (TASK-db6f)."""
+    segments = _many_word_segments(1)
+    config = make_config(tmp_path, fix_chunk_words=1)
+    with llm.use_backend(FakeBackend([VOCAB, {"corrections": [{"i": 0, "old": "mot0", "word": "UN"}]}])):
+        run(tmp_path, ModelFactory(segments=segments), config=config)
+    assert read_transcript(video_dir)["segments"][0]["words"][0]["word"] == " UN"
+
+    with llm.use_backend(FakeBackend([VOCAB, {"corrections": [{"i": 0, "old": "mot0", "word": "DEUX"}]}])):
+        run(tmp_path, ModelFactory(segments=segments), config=config, force=True)
+    assert read_transcript(video_dir)["segments"][0]["words"][0]["word"] == " DEUX"
+
+
+# --------------------------------------------------------------------------
 # C9 : cache par video (ADR-b16b)
 # --------------------------------------------------------------------------
 
