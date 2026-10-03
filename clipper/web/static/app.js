@@ -3,7 +3,7 @@
    de video. Les ecrans eux-memes vivent dans screens.js. */
 "use strict";
 
-const SCREEN_IDS = ["dashboard", "videos", "review", "clips", "channels", "publish", "stats", "accounts", "settings"];
+const SCREEN_IDS = ["dashboard", "videos", "review", "clips", "channels", "publish", "stats", "accounts", "settings", "journal"];
 const POLL_MS = 5000;
 const THEME_KEY = "clipper-theme";
 const NOTIF_KEY = "clipper-notifications";
