@@ -5,7 +5,7 @@ slug: commandes-clipper-doctor-pr-requis-d-un-premier
 title: Commandes « clipper doctor » (prérequis d'un premier clip, sondes injectables) et « clipper models prefetch » (whisper + mediapipe) (SPEC installeur R5, R7)
 created: 2026-10-03T22:51:31Z
 author: plan-portable
-status: open
+status: in_progress
 scope:
   - clipper/doctor.py
   - clipper/models.py
@@ -20,7 +20,7 @@ criteria_by: creator
 verify: [tests]
 method: tdd
 schema: 4
-version: 2
+version: 3
 ---
 
 Tâche 2 de SPEC-38f7761891f6 (ADR-e1dac9ba2284). L'installeur (install.ps1) appelle « clipper models prefetch » puis « clipper doctor » en fin d'installation ; doctor sert aussi à l'utilisateur quand quelque chose ne marche pas. Faits 2026-10-03 : « claude auth status » et « claude auth login » existent (Claude Code 2.1.281) ; le modèle mediapipe est téléchargé par clipper.reframe dans ~/.cache/clipper/blaze_face_short_range.tflite ; faster-whisper télécharge dans le cache Hugging Face à la construction de WhisperModel(name) (clipper.transcribe, fabrique model_factory) ; Chrome est cherché par clipper.browser.find_chrome. ADR-b16b : doctor.py et models.py ne sont pas des étapes et n'en importent aucune ; seul __main__ (comme pipeline) câble les vraies fabriques. Indépendante de la tâche GPU (T1) : doctor lit clipper.gpu tel qu'il est.

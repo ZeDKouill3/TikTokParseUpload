@@ -554,6 +554,37 @@ modèles choisis) :
 Get-Content workspace\<video_id>\llm_usage.jsonl | ConvertFrom-Json | Measure-Object cost_usd -Sum
 ```
 
+## Diagnostic (`clipper doctor`) et modèles (`clipper models prefetch`)
+
+`clipper doctor [--json]` (SPEC-38f7 R7, `clipper/doctor.py`) affiche un
+rapport avant un premier clip, ou quand quelque chose ne marche pas : une
+ligne par point (Python et version de clipper, `ffmpeg`/`ffprobe`, `claude`
+trouvé et connecté ou non, Chrome, GPU, modèle mediapipe et modèle whisper
+configuré présents ou non dans leurs caches, `config.toml` du dossier
+courant, dossiers de données). Avec `--json`, le même rapport sort en JSON.
+Code de sortie 0 si tout ce qui est requis pour un premier clip est là
+(`ffmpeg`, `claude` connecté, `config.toml`, les deux modèles), 1 sinon ;
+Chrome et le GPU ne sont que des avertissements (pas requis pour un premier
+clip CPU).
+
+```powershell
+clipper doctor
+clipper doctor --json
+```
+
+`clipper models prefetch` (`clipper/models.py`) télécharge, s'il n'y est pas
+déjà, le modèle mediapipe de détection de visages et le modèle faster-whisper
+configuré (`[transcribe] model`, `small` par défaut) dans leurs caches
+habituels (`~/.cache/clipper/`, cache Hugging Face) — pour que le premier
+`clipper run` n'attende pas un téléchargement ni n'échoue à mi-pipeline faute
+de réseau. Dit pour chaque modèle s'il était déjà présent ou vient d'être
+téléchargé ; un échec de téléchargement remonte explicitement (jamais de
+repli, ADR-ad2e).
+
+```powershell
+clipper models prefetch
+```
+
 ## Dépannage
 
 **`ModuleNotFoundError` / erreur d'import cv2 après installation** —

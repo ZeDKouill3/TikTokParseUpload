@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 
 from clipper.config import ConfigError, load_config
+from clipper.models import ModelsError
 
 _PROGRESS_POLL_SECONDS = 0.1
 _INIT_FILES = (("config.toml", "config.example.toml"), ("rubric.toml", "rubric.toml"))
@@ -35,6 +36,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("init", help="Ecrit config.toml et rubric.toml (grille embarquee) dans le dossier courant")
     p.add_argument("--force", action="store_true", help="Ecrase config.toml/rubric.toml existants")
+
+    p = sub.add_parser("doctor", help="Diagnostic avant un premier clip (ffmpeg, claude, modeles, GPU...)")
+    p.add_argument("--json", action="store_true", help="Rapport en JSON plutot qu'en texte")
+
+    p = sub.add_parser("models", help="Modeles locaux (mediapipe, whisper)")
+    models_sub = p.add_subparsers(dest="models_command", required=True)
+    models_sub.add_parser(
+        "prefetch", help="Telecharge le modele mediapipe et le modele whisper configure dans leurs caches habituels"
+    )
 
     p = sub.add_parser("run", help="Traite une video : jusqu'a la revue (review) ou jusqu'au bout (auto)")
     p.add_argument("url", help="URL YouTube ou VOD Twitch (twitch.tv/videos/<id>) de la video")
@@ -229,6 +239,61 @@ def _init(force: bool) -> int:
     return 0
 
 
+def _doctor(as_json: bool) -> int:
+    """« clipper doctor » (SPEC-38f7 R7) : rapport de diagnostic dans le
+    dossier courant, avant que config.toml ne soit charge pour les autres
+    commandes (clipper/doctor.py fait sa propre lecture, pour rapporter un
+    config.toml absent ou invalide comme un point du rapport plutot que de
+    planter avant d'avoir pu diagnostiquer le reste)."""
+    from clipper import doctor
+
+    points = doctor.report()
+    print(json.dumps(points, ensure_ascii=False, indent=2) if as_json else doctor.format_text(points))
+    return doctor.exit_code(points)
+
+
+def _whisper_prefetch_factory(name: str, local_files_only: bool) -> object:
+    """Fabrique whisper reelle de « clipper models prefetch ». Sonde locale
+    (local_files_only=True) : faster_whisper.utils.download_model directement,
+    sans charger le modele en memoire (juste verifier le cache). Telechargement
+    reel (local_files_only=False) : la meme fabrique que l'etape transcribe
+    (clipper.transcribe._whisper_model, jamais recopiee), qui declenche le
+    telechargement Hugging Face au chargement si le modele manque."""
+    if local_files_only:
+        from faster_whisper.utils import download_model
+
+        return download_model(name, local_files_only=True)
+    from clipper.gpu import get_device
+    from clipper.transcribe import _whisper_model
+
+    device = get_device()
+    return _whisper_model(name, device.type, device.compute_type)
+
+
+def _mediapipe_prefetch_factory(config, local_files_only: bool) -> object:
+    """Fabrique mediapipe reelle de « clipper models prefetch » : reutilise
+    clipper.reframe.ensure_mediapipe_model (jamais recopiee)."""
+    from clipper import models, reframe
+
+    if local_files_only:
+        path = models.mediapipe_model_path(config)
+        if not path.exists():
+            raise FileNotFoundError(str(path))
+        return path
+    return reframe.ensure_mediapipe_model(config.section("reframe"))
+
+
+def _models_prefetch(config) -> int:
+    from clipper import models
+
+    results = models.prefetch(
+        config, _whisper_prefetch_factory, lambda local_files_only: _mediapipe_prefetch_factory(config, local_files_only)
+    )
+    for result in results:
+        print(f"{result.name} : {'deja present' if result.already_present else 'telecharge'}")
+    return 0
+
+
 _VERBOSITY_LEVELS = {0: logging.WARNING, 1: logging.INFO}
 
 
@@ -255,6 +320,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "init":
         return _init(args.force)
+    if args.command == "doctor":
+        return _doctor(args.json)
 
     from clipper import accounts, browser, download, journal, pipeline
 
@@ -286,6 +353,10 @@ def main(argv: list[str] | None = None) -> int:
 
             worker_mod.Worker(config=config).loop()
             return 0
+        elif args.command == "models":
+            if args.models_command == "prefetch":
+                return _models_prefetch(config)
+            raise AssertionError(f"sous-commande models inconnue : {args.models_command!r}")
         elif args.command == "browser":
             if args.account not in {a["id"] for a in accounts.list_accounts(config)}:
                 raise browser.BrowserError(
@@ -327,7 +398,7 @@ def main(argv: list[str] | None = None) -> int:
                 _report(state)
             return max((_exit_code(s) for s in states), default=0)
     except (pipeline.PipelineError, ConfigError, download.DownloadError, browser.BrowserError,
-            accounts.AccountsError) as exc:
+            accounts.AccountsError, ModelsError) as exc:
         print(f"erreur : {exc}", file=sys.stderr)
         return 1
 
