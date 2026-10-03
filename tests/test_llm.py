@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import threading
@@ -372,6 +373,58 @@ def test_claude_cli_missing_binary_is_a_permanent_error(monkeypatch):
     with pytest.raises(LLMError) as exc:
         llm.ask("qa", "p", [], COLOR_SCHEMA, config=make_config())
     assert not isinstance(exc.value, TransientLLMError)
+
+
+# --------------------------------------------------------------------------
+# TASK-db6f : timeout par appel (ask(timeout=...)), sans toucher au timeout
+# configure du backend pour les autres appels/usages.
+# --------------------------------------------------------------------------
+
+
+def test_ask_timeout_overrides_the_backend_timeout_for_this_call_only(fake_run):
+    run = fake_run(json.dumps(RECORDED_CLAUDE_CLI_OK))
+    llm.ask("transcript_fix", "p", [], COLOR_SCHEMA, config=make_config(), timeout=42)
+    assert run.calls[0]["timeout"] == 42
+
+
+def test_ask_without_timeout_keeps_the_backend_default(fake_run):
+    run = fake_run(json.dumps(RECORDED_CLAUDE_CLI_OK))
+    llm.ask("qa", "p", [], COLOR_SCHEMA, config=make_config())
+    assert run.calls[0]["timeout"] == 900  # claude_cli.timeout par defaut (CONFIG_DEFAULTS)
+
+
+def test_ask_timeout_does_not_leak_into_a_later_call_without_it(fake_run):
+    run = fake_run(json.dumps(RECORDED_CLAUDE_CLI_OK))
+    llm.ask("transcript_fix", "p1", [], COLOR_SCHEMA, config=make_config(), timeout=42)
+    llm.ask("qa", "p2", [], COLOR_SCHEMA, config=make_config())
+    assert run.calls[1]["timeout"] == 900
+
+
+def test_claude_cli_timeout_logs_command_prompt_size_duration_and_output_tail(monkeypatch, caplog):
+    captured: dict = {}
+
+    def boom(cmd, **kwargs):
+        captured["cmd"] = list(cmd)
+        captured["input"] = kwargs["input"]
+        raise subprocess.TimeoutExpired(
+            cmd, kwargs["timeout"],
+            output="O" * 3000 + "QUEUE_TAIL",
+            stderr="E" * 3000 + "ERR_TAIL",
+        )
+
+    monkeypatch.setattr("clipper.llm.claude_cli.subprocess.run", boom)
+    prompt = "Un prompt reel qui ne doit jamais finir dans les logs. " * 5
+    with caplog.at_level(logging.WARNING, logger="clipper.llm.claude_cli"):
+        with pytest.raises(TransientLLMError):
+            llm.ask("transcript_fix", prompt, [], COLOR_SCHEMA, config=make_config())
+
+    messages = " ".join(r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
+    assert messages  # un diagnostic a bien ete journalise
+    assert "Un prompt reel" not in messages  # jamais le texte du prompt (parti par stdin)
+    assert str(len(captured["input"])) in messages  # taille du prompt envoye
+    assert "transcript_fix" in messages  # usage
+    assert "QUEUE_TAIL" in messages and "ERR_TAIL" in messages  # fin de stdout/stderr gardee
+    assert "O" * 3000 not in messages  # pas la sortie entiere, ~2 Ko seulement
 
 
 # --- validation de schema ---------------------------------------------------

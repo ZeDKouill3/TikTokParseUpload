@@ -17,7 +17,12 @@ class LLMRequest:
     that supports Anthropic-style prompt caching should send it as its own
     content block carrying ``cache_control``, since the cache matches whole
     blocks, not an arbitrary prefix inside one block of text (TASK-2cbb) ; a
-    backend that does not support this can ignore the field."""
+    backend that does not support this can ignore the field.
+
+    ``timeout``, when given, overrides this one call's timeout (seconds) in
+    place of the backend's own configured default ([llm.<backend>] timeout) :
+    other calls, including other usages sharing the same backend, are
+    unaffected (TASK-db6f)."""
 
     usage: str
     model: str
@@ -25,6 +30,7 @@ class LLMRequest:
     images: list[Path] = field(default_factory=list)
     schema: dict[str, Any] = field(default_factory=dict)
     cache_prefix: str | None = None
+    timeout: float | None = None
 
 
 @dataclass(frozen=True)

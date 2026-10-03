@@ -43,8 +43,9 @@ class OllamaBackend:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
+        timeout = request.timeout if request.timeout is not None else self.timeout
         try:
-            with urllib.request.urlopen(http_request, timeout=self.timeout) as response:
+            with urllib.request.urlopen(http_request, timeout=timeout) as response:
                 data = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace")[:500]

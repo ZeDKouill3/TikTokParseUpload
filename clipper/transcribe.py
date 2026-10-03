@@ -46,6 +46,20 @@ Deroulement :
    au moins 2), c'est en revanche un echec explicite : la correction semble
    decalee dans son ensemble, pas seulement pour un mot isole.
 
+   Chaque tranche reussie est ecrite tout de suite dans
+   workspace/<id>/fix_chunks/<hash>.json (cle = hash du texte de la tranche
+   et de ``_FIX_CACHE_VERSION``) : un nouveau passage de l'etape (apres
+   l'echec d'une autre tranche) ne redemande que les tranches manquantes, au
+   lieu de tout refaire (TASK-db6f). Le delai d'un appel de correction est
+   ``fix_timeout_s`` (defaut 360 s), propre a cet usage ([llm] timeout global
+   inchange pour les autres usages). Une tranche en echec transitoire
+   (TransientLLMError : quota, reseau, timeout...) est relancee une fois tout
+   de suite, seule ; au second echec l'etape echoue explicitement comme
+   avant, jamais de texte non corrige substitue en silence (ADR-ad2e). Un
+   ``force`` videant transcript_raw.json (whisper et vocabulaire refaits)
+   vide aussi ce cache de tranches, pour ne jamais reutiliser une correction
+   calculee sur un texte ou un vocabulaire differents.
+
 Si transcript_raw.json existe deja (retour apres un echec de la correction),
 il est reutilise et whisper n'est pas relance, sauf ``force``.
 
@@ -57,9 +71,11 @@ appels.
 from __future__ import annotations
 
 import gc
+import hashlib
 import json
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -103,6 +119,12 @@ CONFIG_DEFAULTS: dict[str, object] = {
     # Nombre de tranches de correction traitees en meme temps (appels
     # clipper.llm en sous-processus, pas de cout CPU Python).
     "fix_parallel": 4,
+    # Delai (s) d'un appel clipper.llm pour une seule tranche de correction
+    # (usage transcript_fix) : surcharge le timeout global du backend pour cet
+    # appel precis, les autres usages (vocab, moments...) gardent leur propre
+    # reglage (TASK-db6f : perdre au plus une tranche et le detecter en
+    # quelques minutes, pas tout recommencer apres le timeout global de 900 s).
+    "fix_timeout_s": 360,
 }
 
 log = logging.getLogger(__name__)
@@ -524,18 +546,72 @@ def _fix_prefix(vocab: list[str]) -> str:
     )
 
 
+# Version du gabarit de prompt (_fix_prefix) et du schema (_fix_schema) d'une
+# tranche de correction : entre dans la cle de cache (_fix_cache_path). A
+# augmenter si l'un des deux change de forme, pour qu'un ancien fichier
+# fix_chunks/<hash>.json ne soit jamais relu comme s'il repondait au nouveau
+# gabarit (TASK-db6f).
+_FIX_CACHE_VERSION = 1
+
+
+def _fix_cache_dir(video_dir: Path) -> Path:
+    return video_dir / "fix_chunks"
+
+
+def _fix_cache_path(video_dir: Path, chunk_text: str) -> Path:
+    """Fichier de cache d'une tranche de correction, par le contenu reel
+    envoye (texte de la tranche, independant du vocabulaire) et la version du
+    gabarit/schema : deux tranches de contenu identique partagent le meme
+    fichier (meme correction attendue), et un gabarit different ne retrouve
+    jamais un cache ecrit par l'ancien."""
+    key = hashlib.sha256(f"{_FIX_CACHE_VERSION}\n{chunk_text}".encode("utf-8")).hexdigest()
+    return _fix_cache_dir(video_dir) / f"{key}.json"
+
+
+def _load_cached_fix(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _store_cached_fix(path: Path, answer: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(answer, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _ask_fix(prompt: str, n_words: int, config: Any, log_path: Path, timeout: float) -> dict[str, Any]:
+    """Un appel transcript_fix, relance une fois tout de suite si l'erreur est
+    transitoire (quota, reseau, timeout...) ; au second echec transitoire,
+    comme a tout autre echec, l'exception remonte telle quelle et fait
+    echouer l'etape -- jamais de texte non corrige substitue en silence
+    (ADR-ad2e). ``timeout`` est propre a cet appel ([transcribe]
+    fix_timeout_s), le timeout global du backend pour les autres usages
+    n'est pas touche."""
+    kwargs: dict[str, Any] = dict(
+        config=config, check=_check_correction_shape, log_path=log_path, timeout=timeout,
+    )
+    try:
+        return llm.ask("transcript_fix", prompt, [], _fix_schema(n_words), **kwargs)
+    except llm.TransientLLMError:
+        return llm.ask("transcript_fix", prompt, [], _fix_schema(n_words), **kwargs)
+
+
 def _fix_chunk(
-    chunk: list[dict[str, Any]], vocab: list[str], config: Any, log_path: Path, stats: _FixStats
+    chunk: list[dict[str, Any]], vocab: list[str], config: Any, log_path: Path, stats: _FixStats,
+    video_dir: Path, timeout: float,
 ) -> None:
     words = [w for seg in chunk for w in seg["words"]]
     if not words:
         return
     lines = "\n".join(f"{i}\t{w['word'].strip()}" for i, w in enumerate(words))
-    prompt = _fix_prefix(vocab) + lines
-    answer = llm.ask(
-        "transcript_fix", prompt, [], _fix_schema(len(words)),
-        config=config, check=_check_correction_shape, log_path=log_path,
-    )
+    cache_path = _fix_cache_path(video_dir, lines)
+    answer = _load_cached_fix(cache_path)
+    if answer is None:
+        prompt = _fix_prefix(vocab) + lines
+        answer = _ask_fix(prompt, len(words), config, log_path, timeout)
+        _store_cached_fix(cache_path, answer)
     for correction in answer["corrections"]:
         word = words[correction["i"]]
         old = correction["old"].strip()
@@ -556,7 +632,7 @@ def _fix_chunk(
 
 def _fix_chunks(
     chunks: list[list[dict[str, Any]]], vocab: list[str], config: Any, parallel: int, log_path: Path,
-    stats: _FixStats,
+    stats: _FixStats, video_dir: Path, timeout: float,
 ) -> None:
     """Corrige les tranches en 2 vagues : la premiere seule, pour que le
     fournisseur du modele mette en cache le bloc commun (_fix_prefix) qu'elle
@@ -572,11 +648,14 @@ def _fix_chunks(
     est elle aussi un echec explicite."""
     if not chunks:
         return
-    _fix_chunk(chunks[0], vocab, config, log_path, stats)
+    _fix_chunk(chunks[0], vocab, config, log_path, stats, video_dir, timeout)
     rest = chunks[1:]
     if rest:
         with ThreadPoolExecutor(max_workers=max(1, min(parallel, len(rest)))) as executor:
-            futures = [executor.submit(_fix_chunk, chunk, vocab, config, log_path, stats) for chunk in rest]
+            futures = [
+                executor.submit(_fix_chunk, chunk, vocab, config, log_path, stats, video_dir, timeout)
+                for chunk in rest
+            ]
             for future in futures:
                 future.result()
     _check_refusal_ratio(stats)
@@ -621,6 +700,10 @@ def transcribe(
             raise TranscribeError(f"meta.json absent : {meta_file}")
         meta = json.loads(meta_file.read_text(encoding="utf-8"))
 
+        fix_cache_dir = _fix_cache_dir(video_dir)
+        if fix_cache_dir.exists():
+            shutil.rmtree(fix_cache_dir)
+
         vocab = _ask_vocab(meta, config) if settings["vocab"] else []
 
         audio = video_dir / "transcribe_audio.wav"
@@ -640,7 +723,10 @@ def transcribe(
     if settings["transcript_fix"]:
         chunks = _chunks(segments, int(settings["fix_chunk_words"]))
         log_path = video_dir / "llm_refusals.jsonl"
-        _fix_chunks(chunks, vocab, config, int(settings["fix_parallel"]), log_path, fix_stats)
+        _fix_chunks(
+            chunks, vocab, config, int(settings["fix_parallel"]), log_path, fix_stats,
+            video_dir, float(settings["fix_timeout_s"]),
+        )
 
     transcript = {
         "video_id": video_id,

@@ -51,11 +51,15 @@ class ClaudeAPIBackend:
         ]
         content.append({"type": "text", "text": request.prompt})
         client = make_client(self.settings)
+        extra: dict[str, Any] = {}
+        if request.timeout is not None:
+            extra["timeout"] = request.timeout
         try:
             message = client.messages.create(
                 model=MODEL_ALIASES.get(request.model, request.model),
                 max_tokens=self.max_tokens,
                 messages=[{"role": "user", "content": content}],
+                **extra,
             )
         except anthropic.APIConnectionError as exc:  # includes timeouts
             raise TransientLLMError(f"claude-api : reseau : {exc}") from exc

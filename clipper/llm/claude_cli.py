@@ -111,14 +111,24 @@ true``, le message dans ``result`` et le code HTTP dans
 from __future__ import annotations
 
 import json
+import logging
 import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
 from clipper.llm.backend import LLMRequest, Usage, image_b64, image_media_type
 from clipper.llm.errors import LLMError, TransientLLMError
+
+log = logging.getLogger(__name__)
+
+# Taille (caracteres) de la fin de stdout/stderr gardee dans le diagnostic
+# d'un blocage (TASK-db6f) : assez pour voir le dernier evenement, jamais le
+# prompt entier (qui n'est de toute facon jamais dans cmd, lui passe par
+# stdin).
+_DIAGNOSTIC_TAIL_CHARS = 2000
 
 SYSTEM_PROMPT = (
     "Tu es un composant d'un pipeline automatique. Reponds uniquement avec "
@@ -172,6 +182,14 @@ def resolve_command(command: str) -> str:
         return command
     exe = _npm_shim_exe(Path(found))
     return str(exe) if exe else found
+
+
+def _tail(text: str | None) -> str:
+    """Fin de ``text`` (~2 Ko, _DIAGNOSTIC_TAIL_CHARS) : l'evenement le plus
+    recent, pas le debut deja vu dans les logs precedents."""
+    if not text:
+        return ""
+    return text[-_DIAGNOSTIC_TAIL_CHARS:]
 
 
 def stdin_input(request: LLMRequest) -> str:
@@ -234,22 +252,48 @@ class ClaudeCLIBackend:
                 f"claude -p : ligne de commande de {length} caracteres (limite {MAX_COMMAND_LINE}), "
                 "schema --json-schema trop long pour argv"
             )
+        stdin_text = stdin_input(request)
+        timeout = request.timeout if request.timeout is not None else self.timeout
+        start = time.monotonic()
         try:
             proc = subprocess.run(
                 cmd,
-                input=stdin_input(request),
+                input=stdin_text,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
-                timeout=self.timeout,
+                timeout=timeout,
             )
         except FileNotFoundError as exc:
             raise LLMError(f"commande {self.command!r} introuvable (Claude Code installe ?)") from exc
         except subprocess.TimeoutExpired as exc:
-            raise TransientLLMError(f"claude -p : pas de reponse en {self.timeout} s") from exc
+            self._log_timeout(request, cmd, stdin_text, timeout, time.monotonic() - start, exc)
+            raise TransientLLMError(f"claude -p : pas de reponse en {timeout} s") from exc
         text, usage = parse_output(proc.stdout, proc.returncode, proc.stderr)
         self.last_usage = usage
         return text
+
+    @staticmethod
+    def _log_timeout(
+        request: LLMRequest, cmd: list[str], stdin_text: str, timeout: float, duration: float,
+        exc: subprocess.TimeoutExpired,
+    ) -> None:
+        """Diagnostic journalise (worker.log via le logger du module) quand
+        ``claude -p`` ne repond pas dans le delai : la commande (jamais le
+        prompt, qui part par stdin, pas par argv), la taille du prompt, la
+        duree reelle, et la fin de ce que le sous-processus a deja ecrit sur
+        stdout/stderr avant d'etre tue -- subprocess.run() les capture lui
+        meme sur TimeoutExpired (communicate() apres kill) quand il les a
+        captures via capture_output ; absents si rien n'a ete recu (lecture
+        non bloquante, ADR-ad2e : aucune valeur inventee). Releve reel
+        TASK-db6f : un 2e blocage sans cause connue (claude -p transcript_fix
+        muet alors qu'un appel sonnet "ok" repond en 9 s)."""
+        log.warning(
+            "claude -p : pas de reponse en %.1f s (usage %s, commande %s, prompt %d caracteres) ; "
+            "sortie recue avant arret -- stdout: %r, stderr: %r",
+            duration, request.usage, cmd, len(stdin_text),
+            _tail(exc.stdout), _tail(exc.stderr),
+        )
 
 
 def _usage_from(data: dict[str, Any]) -> Usage:
