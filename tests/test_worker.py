@@ -318,6 +318,60 @@ def test_build_command_run_without_channel_with_force_step_is_accepted(tmp_path)
     assert (args.config, args.command, args.url, args.force_step) == (None, "run", URL_A, ["parts"])
 
 
+def test_launch_head_syncs_the_channel_mode_into_the_preset_before_spawning(tmp_path):
+    """Important 1 (revue r-transcription) : l'enfant lance par --config lit le mode de TETE du
+    preset (clipper.__main__.load_config), jamais [channel].mode directement ; les deux doivent donc
+    etre synchronises avant chaque lancement, sinon l'enfant tourne dans le mode global au lieu de
+    celui de la chaine (et vice versa)."""
+    presets = tmp_path / "presets"
+    presets.mkdir()
+    base = tmp_path / "config.toml"
+    base.write_text('mode = "review"\n', encoding="utf-8")
+    preset_path = presets / "ma_chaine.toml"
+    preset_path.write_text('[channel]\nmode = "auto"\n', encoding="utf-8")
+    config = Config(
+        mode="review", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output",
+        _sections={
+            "worker": {"queue_path": str(tmp_path / "state" / "queue.json")},
+            "watch": {"presets_dir": str(presets), "base_config": str(base)},
+        },
+    )
+    worker.enqueue(URL_A, "ma_chaine", "run", config=config)
+
+    worker.Worker(config=config, spawner=FakeSpawner()).tick()
+
+    from clipper.config import load_config
+
+    assert load_config(preset_path, base=base).mode == "auto"
+
+
+def test_launch_head_removes_a_stale_preset_mode_override_once_the_channel_inherits_the_global_default(tmp_path):
+    """Sens inverse : [channel].mode redevient vide (herite du mode global) alors que le preset garde
+    encore une tete 'mode' laissee par une synchronisation precedente (chaine alors en mode explicite) :
+    cette tete doit disparaitre, sinon la chaine reste figee sur l'ancien mode au lieu de suivre le mode
+    global courant."""
+    presets = tmp_path / "presets"
+    presets.mkdir()
+    base = tmp_path / "config.toml"
+    base.write_text('mode = "review"\n', encoding="utf-8")
+    preset_path = presets / "ma_chaine.toml"
+    preset_path.write_text('mode = "auto"\n\n[channel]\ntimezone = "UTC"\n', encoding="utf-8")
+    config = Config(
+        mode="review", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output",
+        _sections={
+            "worker": {"queue_path": str(tmp_path / "state" / "queue.json")},
+            "watch": {"presets_dir": str(presets), "base_config": str(base)},
+        },
+    )
+    worker.enqueue(URL_A, "ma_chaine", "run", config=config)
+
+    worker.Worker(config=config, spawner=FakeSpawner()).tick()
+
+    from clipper.config import load_config
+
+    assert load_config(preset_path, base=base).mode == "review"
+
+
 class _LoggingSpawner(FakeSpawner):
     """Simule un enfant qui ecrit sa sortie d'erreur dans le journal du worker."""
 
@@ -1082,6 +1136,63 @@ def test_a_browser_error_fails_and_halts_a_tiktok_error_only_fails_the_entry(tmp
     w.tick()
     entry = _entries(tmp_path)[0]
     assert entry["status"] == "failed" and "trop loin" in entry["error"] and entry["halted"] is False
+
+
+def test_a_resolved_account_halt_without_retrying_the_failed_entry_leaves_new_publications_waiting_with_a_reason(
+    tmp_path, monkeypatch,
+):
+    """I1 (revue r-fable-publication) : « J'ai réglé le problème » efface l'arrêt du COMPTE (R4), pas
+    celui de l'entrée restée 'failed'/'halted' (elle ne s'efface que par « Réessayer » ou son
+    annulation) ; tant qu'elle n'est pas retentée, les publications suivantes du compte ne doivent pas
+    rester bloquées en silence (ADR-ad2e) mais en attente avec une raison visible."""
+    config = _pub_env(tmp_path, monkeypatch)
+    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=2))
+    w = _pub_worker(config, FakePublisher(error=tiktok.TikTokStop("captcha", "captcha détecté", None)))
+    w.tick()
+    assert _entries(tmp_path)[0]["status"] == "failed" and _entries(tmp_path)[0]["halted"] is True
+
+    _recheck()  # l'utilisateur resout le captcha, « J'ai regle le probleme » (le compte seul, pas l'entree 01)
+    _seed(tmp_path, "ma_chaine", "02", _ago(minutes=1))
+    w.publisher = FakePublisher()
+    w.tick()
+
+    assert w.publisher.calls == []  # l'entree 01 en echec arrete encore le compte : rien ne part
+    second = _entries(tmp_path)[1]
+    assert second["status"] == "scheduled"
+    assert second["waiting_reason"] and "aaaaaaaaaaa/01" in second["waiting_reason"]
+    events = tiktok.read_events(config=config)
+    assert events[-1]["level"] == "warn" and "aaaaaaaaaaa/01" in events[-1]["reason"]
+
+
+def test_a_corrupt_publish_file_does_not_kill_the_worker_tick(tmp_path, monkeypatch, caplog):
+    """M2 (revue r-fable-publication) : un fichier state/publish/<chaine>.json tronque levait un
+    JSONDecodeError qui traversait _publish_due (jamais rattrapee) et tuait le worker ; desormais elle
+    est journalisee une fois (ADR-ad2e) et ne bloque pas le tick suivant."""
+    config = _pub_env(tmp_path, monkeypatch)
+    path = tmp_path / "state" / "publish" / "ma_chaine.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('[{"not": "closed"', encoding="utf-8")
+
+    with caplog.at_level(logging.ERROR):
+        worker.Worker(config=config, spawner=FakeSpawner()).tick()  # ne leve pas
+
+    assert "publication TikTok impossible" in caplog.text
+
+
+def test_an_invalid_slot_at_in_the_publish_file_does_not_kill_the_worker_tick(tmp_path, monkeypatch, caplog):
+    """M2 (revue r-fable-publication) : un slot_at non ISO (jamais valide par _validate_entry) leve un
+    ValueError dans _publish_next qui traversait _publish_due et tuait le worker."""
+    config = _pub_env(tmp_path, monkeypatch)
+    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1))
+    path = tmp_path / "state" / "publish" / "ma_chaine.json"
+    entries = json.loads(path.read_text(encoding="utf-8"))
+    entries[0]["slot_at"] = "2026-10-05 18:00 Paris"
+    path.write_text(json.dumps(entries), encoding="utf-8")
+
+    with caplog.at_level(logging.ERROR):
+        worker.Worker(config=config, spawner=FakeSpawner()).tick()  # ne leve pas
+
+    assert "publication TikTok impossible" in caplog.text
 
 
 def test_an_unexpected_error_is_logged_and_fails_the_entry_instead_of_killing_the_worker(tmp_path, monkeypatch, caplog):

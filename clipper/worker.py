@@ -26,6 +26,8 @@ from pathlib import Path
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
+import tomllib
+
 from clipper import accounts as accounts_mod
 from clipper import browser
 from clipper import channel as channel_mod
@@ -421,7 +423,11 @@ class Worker:
 
         from clipper import pipeline
 
-        pipeline.process_queue(config=self.config)
+        try:
+            pipeline.process_queue(config=self.config)
+        except Exception:  # noqa: BLE001 - jamais un worker mort (Mineur 1, revue r-transcription) :
+            # la file reste reprise au tick suivant, l'exception est seulement journalisee.
+            log.exception("reprise de la file de pipeline interrompue par une erreur inattendue")
 
     def _watch_channels(self) -> None:
         """Appelle ``watch.check`` pour chaque chaine ``watch = true`` dont
@@ -452,11 +458,13 @@ class Worker:
     def _publish_due(self) -> bool:
         """Une publication TikTok due par iteration (SPEC-9225 R3) ; vrai si une tentative a eu lieu.
         Une file, un preset ou un reglage illisible est journalise une fois (ADR-ad2e) et ne tue
-        pas le worker."""
+        pas le worker. ``OSError``/``ValueError`` (dont ``JSONDecodeError``) couvrent un fichier de
+        publication tronque ou un ``slot_at`` mal forme (M2, revue r-fable-publication) : sans eux,
+        l'exception traversait jusqu'a ``tick``/``loop`` et tuait le worker."""
         try:
             return self._publish_next()
         except (publish_mod.PublishError, channel_mod.ChannelError, ConfigError, tiktok.TikTokError,
-                youtube.YouTubeError, accounts_mod.AccountsError) as exc:
+                youtube.YouTubeError, accounts_mod.AccountsError, OSError, ValueError) as exc:
             message = str(exc)
             if message not in self._logged_publish_errors:
                 self._logged_publish_errors.add(message)
@@ -558,8 +566,15 @@ class Worker:
         account_row = next(a for a in accounts_mod.list_accounts(self.config) if a["id"] == account)
         schedule = accounts_mod.schedule_of(account_row)
         scope = {"state_dir": paths["state_dir"], "presets_dir": paths["presets_dir"], "base": paths["base"]}
-        if publish_mod.halted_account(account, **scope) is not None:
-            return False  # arret sur en cours (R4) : rien ne part avant « Reessayer »
+        halt = publish_mod.halted_account(account, **scope)
+        if halt is not None:
+            # arret sur en cours (R4) : rien ne part avant « Reessayer » (ou l'annulation) de l'entree
+            # en echec qui a arrete le compte ; la raison reste visible plutot qu'un blocage silencieux
+            # (I1, revue r-fable-publication).
+            self._wait(entry, name, account,
+                       f"compte arrêté par l'échec de {halt['video_id']}/{halt['clip_id']} "
+                       f"({halt['error']}) : réessaie-la ou annule-la", paths["state_dir"])
+            return False
 
         times = publish_mod.account_publish_times(account, **scope)
         # Plafonds par compte (SPEC-6076 R6) : le fuseau est celui du COMPTE, pas du style (revue r-comptes 9).
@@ -705,6 +720,43 @@ class Worker:
                            "clip_id": clip_id, "reason": reason, "capture": str(capture) if capture else None},
                           config=self.config)
 
+    def _sync_channel_mode(self, name: str) -> None:
+        """L'enfant lance par ``--config presets/<chaine>.toml`` lit le mode
+        de TETE du preset (``__main__.load_config``), jamais ``[channel].mode``
+        directement : les deux sont donc tenus synchronises avant chaque
+        lancement, sinon l'enfant tourne dans le mode global au lieu de celui
+        de la chaine (Important 1, revue r-transcription). ``[channel].mode``
+        explicite est copie en tete ; vide (herite du mode global), toute
+        tete laissee par une synchronisation precedente est retiree, sinon la
+        chaine resterait figee sur cet ancien mode au lieu de suivre le mode
+        global courant (la tete, si elle restait, masquerait tout changement
+        de ``config.toml``). Un preset ou un reglage illisible est journalise
+        une fois et ne bloque jamais le lancement (ADR-ad2e : visible,
+        jamais silencieux ni fatal)."""
+        watch = self.config.section("watch")
+        presets_dir, base = watch["presets_dir"], watch["base_config"]
+        path = Path(presets_dir) / f"{name}.toml"
+        try:
+            with path.open("rb") as f:
+                raw = tomllib.load(f)
+            channel_mod.load_channel(name, presets_dir=presets_dir, base=base)  # valide le preset
+        except (channel_mod.ChannelError, ConfigError, OSError, tomllib.TOMLDecodeError) as exc:
+            log.error("%s : synchronisation du mode de chaîne impossible : %s", name, exc)
+            return
+        explicit = str((raw.get("channel") or {}).get("mode") or "")
+        if explicit:
+            if raw.get("mode") == explicit:
+                return
+            data = {**raw, "mode": explicit}
+        elif "mode" in raw:
+            data = {k: v for k, v in raw.items() if k != "mode"}
+        else:
+            return
+        try:
+            channel_mod.save_channel(name, data, presets_dir=presets_dir, base=base)
+        except (channel_mod.ChannelError, ConfigError, OSError) as exc:
+            log.error("%s : synchronisation du mode de chaîne impossible : %s", name, exc)
+
     def _launch_head(self) -> bool:
         """Lance la tete de file ``waiting`` ; le cycle relecture-lancement-
         ecriture est sous verrou, la file ayant pu changer (API web) depuis
@@ -714,6 +766,8 @@ class Worker:
             entry = next((e for e in entries if e["status"] == "waiting"), None)
             if entry is None:
                 return False
+            if entry.get("channel"):
+                self._sync_channel_mode(entry["channel"])
             self._launched_at = datetime.now(timezone.utc)
             process = self._spawn(entry, _build_command(entry))
             entry["status"] = "running"

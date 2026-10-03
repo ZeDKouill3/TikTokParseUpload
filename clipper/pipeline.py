@@ -407,10 +407,25 @@ class _Run:
         parts.run(self.video_id, self.ws, config=self.config, force=self._forced("parts"), **self.opts("parts"))
 
     def captions(self) -> None:
-        if self.config.mode == "review":
-            _apply_review(self)
-        captions.run(self.video_id, self.ws, config=self.config, force=self._forced("captions"),
-                     **self.opts("captions"))
+        force = self._forced("captions")
+        changed = self.config.mode == "review" and _apply_review(self)
+        before_ids = {c["id"] for c in self.clips()} if changed and (self.dir / "captions.json").exists() else None
+        if changed:
+            # parts.json a change (moment retire ou borne ajustee) : captions.json, qui liste les clips
+            # lus par reframe/subtitles/render/qa, doit etre refait meme si captions etait deja 'done'
+            # (Important 2, revue r-transcription), sinon le moment refuse est tout de meme rendu et
+            # une borne ajustee est ignoree.
+            force = True
+            self.forced = self.forced | set(STEPS[STEPS.index(_AFTER_REVIEW):])
+        captions.run(self.video_id, self.ws, config=self.config, force=force, **self.opts("captions"))
+        if before_ids is not None:
+            # Un clip qui disparait de captions.json (moment refuse, parts refait) laisse sinon son
+            # ancienne sortie sur disque, proposable a la publication bien qu'absente de l'etat.
+            stale = before_ids - {c["id"] for c in self.clips()}
+            for clip_id in stale:
+                out_dir = self.out / self.video_id
+                (out_dir / f"{clip_id}.mp4").unlink(missing_ok=True)
+                (out_dir / f"{clip_id}.json").unlink(missing_ok=True)
 
     def reframe(self) -> None:
         opts = self.opts("reframe")
@@ -666,9 +681,12 @@ def _undecided(video_dir: Path) -> list[int]:
     return [i for i in ids if str(i) not in decisions]
 
 
-def _apply_review(run: _Run) -> None:
+def _apply_review(run: _Run) -> bool:
     """Applique les decisions humaines avant captions : bornes ajustees dans
-    moments.json (parts refait), moments refuses sortis de parts.json."""
+    moments.json (parts refait), moments refuses sortis de parts.json. Rend
+    True si parts.json a change : l'appelant doit alors refaire captions.json
+    (et les etapes suivantes) meme deja 'done' (Important 2, revue
+    r-transcription)."""
     decisions = _read_review(run.dir)["decisions"]
 
     moments_path = run.dir / "moments.json"
@@ -697,6 +715,7 @@ def _apply_review(run: _Run) -> None:
             for m in refused
         ]
         _write_json(parts_path, parts_data)
+    return adjusted or bool(refused)
 
 
 def _moment_text(video_dir: Path, start: float, end: float) -> str:
@@ -806,17 +825,23 @@ def _fail(run: _Run, name: str, exc: BaseException) -> dict[str, Any]:
     step["progress"] = None
     settings = config.section("pipeline")
     if config.mode == "auto" and is_transient(exc):
-        state["attempts"] += 1
         max_attempts = int(settings["max_attempts"])
-        if state["attempts"] < max_attempts:
-            delays = list(settings["retry_delays"])
-            delay = delays[min(state["attempts"], len(delays)) - 1]
-            state.update(status="queued", reason=f"{name} : {reason}",
-                         retry_at=_iso(_now() + timedelta(seconds=float(delay))))
-            log.warning("%s : %s en echec transitoire, re-essai a %s", run.video_id, name, state["retry_at"])
-            save_state(state, config=config)
-            return state
-        reason = f"{reason} ({state['attempts']} echecs transitoires, max_attempts = {max_attempts})"
+        delays = list(settings["retry_delays"])
+        if delays and max_attempts >= 1:
+            state["attempts"] += 1
+            if state["attempts"] < max_attempts:
+                delay = delays[min(state["attempts"], len(delays)) - 1]
+                state.update(status="queued", reason=f"{name} : {reason}",
+                             retry_at=_iso(_now() + timedelta(seconds=float(delay))))
+                log.warning("%s : %s en echec transitoire, re-essai a %s", run.video_id, name, state["retry_at"])
+                save_state(state, config=config)
+                return state
+            reason = f"{reason} ({state['attempts']} echecs transitoires, max_attempts = {max_attempts})"
+        else:
+            # [pipeline] retry_delays = [] (ou max_attempts < 1) : pas de re-essai plutot qu'un IndexError
+            # qui laissait l'etape 'running' pour toujours, sans raison journalisee (Mineur 2, revue
+            # r-transcription, ADR-ad2e).
+            reason = f"{reason} (aucun re-essai : [pipeline] retry_delays vide ou max_attempts < 1)"
     state.update(status="failed", reason=f"{name} : {reason}", retry_at=None)
     log.error("%s : etape %s en echec : %s", run.video_id, name, reason)
     save_state(state, config=config)
@@ -829,12 +854,19 @@ USAGE_LOG_FILE = "llm_usage.jsonl"
 def _usage_summary(usage_log_path: Path) -> dict[str, dict[str, float | int]]:
     """Totaux par usage (appels, tokens, cout) accumules dans le journal de
     consommation de la video depuis son debut ; vide si aucun appel LLM
-    n'a encore ete journalise."""
+    n'a encore ete journalise. Une ligne tronquee (ecriture coupee) est
+    journalisee et ignoree plutot que de lever (Mineur 1, revue
+    r-transcription) : sinon l'exception sortait du ``finally`` de
+    ``_advance`` et tuait le worker en cours de reprise."""
     totals: dict[str, dict[str, float | int]] = {}
     if not usage_log_path.exists():
         return totals
     for line in usage_log_path.read_text(encoding="utf-8").splitlines():
-        entry = json.loads(line)
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError as exc:
+            log.error("%s : ligne de consommation LLM illisible, ignoree : %s", usage_log_path, exc)
+            continue
         bucket = totals.setdefault(entry["usage"], {
             "calls": 0, "input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "cost_usd": 0.0,
         })
@@ -1148,12 +1180,20 @@ def set_channel(
 
 
 def queued(*, config: Config | None = None) -> list[dict[str, Any]]:
-    """Etats des videos en file d'attente, par retry_at croissant."""
+    """Etats des videos en file d'attente, par retry_at croissant. Un
+    ``pipeline.json`` tronque est journalise et ignore (Mineur 1, revue
+    r-transcription) plutot que de faire lever cette fonction a chaque appel,
+    ce qui bloquait la reprise de toutes les videos tant que le fichier
+    n'etait pas repare a la main."""
     config = config or load_config()
     root = Path(config.workspace_dir)
     states = []
     for path in sorted(root.glob(f"*/{STATE_FILE}")) if root.is_dir() else []:
-        state = json.loads(path.read_text(encoding="utf-8"))
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            log.error("%s : etat illisible, ignore de la reprise de file : %s", path, exc)
+            continue
         if state["status"] == "queued" and not state.get("dismissed_at"):
             states.append(state)
     return sorted(states, key=lambda s: s["retry_at"])
@@ -1176,27 +1216,34 @@ def process_queue(
     proprement en ``awaiting_review`` au lieu de lever (Important 3, revue
     r-transcription) -- une reprise automatique ne doit jamais interrompre
     les videos suivantes de la file. Chaque reprise garde ``attempts`` tel
-    quel (``manual=False``) : ce n'est pas une relance manuelle."""
+    quel (``manual=False``) : ce n'est pas une relance manuelle. Une erreur
+    inattendue d'une video (etat ou journal illisible...) est journalisee et
+    n'empeche jamais la reprise des videos suivantes (Mineur 1, revue
+    r-transcription, ADR-ad2e)."""
     config = config or load_config()
     now = now or _now()
     out = []
     for state in queued(config=config):
         if datetime.fromisoformat(state["retry_at"]) > now:
             continue
-        run_config = config
-        if state.get("channel") is not None:
-            try:
-                run_config = _channel_config(state["channel"])
-            except (channel_mod.ChannelError, ConfigError) as exc:
-                reason = f"chaine {state['channel']!r} inutilisable a la reprise : {exc}"
-                if state.get("reason") != reason:
-                    log.error("%s : %s", state["video_id"], reason)
-                    state["reason"] = reason
-                    save_state(state, config=config)
-                continue
-        out.append(_advance(
-            _start(state, run_config, False, step_options, manual=False), through_review=False,
-        ))
+        video_id = state.get("video_id")
+        try:
+            run_config = config
+            if state.get("channel") is not None:
+                try:
+                    run_config = _channel_config(state["channel"])
+                except (channel_mod.ChannelError, ConfigError) as exc:
+                    reason = f"chaine {state['channel']!r} inutilisable a la reprise : {exc}"
+                    if state.get("reason") != reason:
+                        log.error("%s : %s", video_id, reason)
+                        state["reason"] = reason
+                        save_state(state, config=config)
+                    continue
+            out.append(_advance(
+                _start(state, run_config, False, step_options, manual=False), through_review=False,
+            ))
+        except Exception:  # noqa: BLE001 - une video en echec inattendu ne bloque jamais les suivantes
+            log.exception("%s : reprise en file interrompue par une erreur inattendue", video_id)
     return out
 
 

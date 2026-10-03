@@ -682,6 +682,22 @@ def test_fix_correction_carrying_attached_punctuation_does_not_double_it(tmp_pat
     assert data["transcript_fix_refused"] == 0
 
 
+def test_fix_correction_on_a_punctuation_only_word_is_refused_not_doubled(tmp_path, video_dir, cpu):
+    """Un mot sans aucun caractere alphanumerique (" -", " ...") a un coeur normalise vide : la
+    comparaison tolerante a la ponctuation (faite pour Alstner == Alstner,) declarerait alors
+    n'importe quel ``old`` egal (les deux coeurs sont vides), la correction serait appliquee et son
+    coeur insere apres l'ancienne ponctuation intacte au lieu de la remplacer, doublant la
+    ponctuation (" -" corrige en " --" au lieu de " —", Mineur 3, revue r-transcription)."""
+    segments = [_segment(1, [_word(" -", 0.0, 0.4)])]
+    fake = FakeBackend([VOCAB, {"corrections": [{"i": 0, "old": "-", "word": "—"}]}])
+    with llm.use_backend(fake):
+        run(tmp_path, ModelFactory(segments=segments))
+
+    data = read_transcript(video_dir)
+    assert data["segments"][0]["words"][0]["word"] == " -"  # pas touche, jamais double
+    assert data["transcript_fix_refused"] == 1
+
+
 def test_fix_majority_refused_chunks_are_not_cached_a_relaunch_asks_the_llm_again(
     tmp_path, video_dir, cpu
 ):
