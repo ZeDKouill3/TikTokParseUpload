@@ -851,6 +851,7 @@ async function pubSetAccount(c, account) {
 function pubDetailHtml(c) {
   const account = c.account;
   const status = c.publish_status;
+  const inProgress = c.tiktok_status === "in_progress";  // le worker pilote : pas de « Déclarer publié » (fable-publication I2)
   const hint = status === "approved" ? "Clique « Publier maintenant » (formulaire Nouvelle publication), ou glisse ce clip sur un créneau libre du calendrier pour le planifier."
     : status === "failed" ? "La publication s'est arrêtée : regarde la capture, règle le problème dans le navigateur du compte, puis « Réessayer » (ou repasse le clip en attente pour le replanifier)." : "";
   return `
@@ -865,7 +866,7 @@ function pubDetailHtml(c) {
       ${c.post_note ? `<p class="muted">${esc(c.post_note)}</p>` : ""}
       ${c.postponed_reason ? `<p class="muted">Reportée : ${esc(c.postponed_reason)}</p>` : ""}
       ${hint ? `<p class="muted">${esc(hint)}</p>` : ""}
-      ${status === "scheduled" ? `<p class="muted">« Déclarer publié » sert à un clip que tu as déjà publié toi-même, hors de Clipper : il ne sera pas publié par le worker.</p>` : ""}
+      ${status === "scheduled" && !inProgress ? `<p class="muted">« Déclarer publié » sert à un clip que tu as déjà publié toi-même, hors de Clipper : il ne sera pas publié par le worker.</p>` : ""}
       <div class="field"><span class="field-label">Description</span><div class="pub-caption">${esc(c.description || "")}</div></div>
       <div class="hashtags">${(c.hashtags || []).map((t) => `<span class="tag">${esc(t)}</span>`).join("")}</div>
     </div>
@@ -876,7 +877,7 @@ function pubDetailHtml(c) {
       ${status === "failed" ? `<button type="button" class="btn btn-primary" data-retry>${icon("rotate-ccw")}Réessayer</button>` : ""}
       ${status === "scheduled" || status === "failed" ? `<button type="button" class="btn" data-unschedule>${icon("undo-2")}Repasser en attente</button>` : ""}
       ${status === "approved" ? `<button type="button" class="btn btn-primary" data-publish-now>${icon("send")}Publier maintenant</button>` : ""}
-      ${status === "scheduled" ? `<button type="button" class="btn" data-published title="Pour un clip déjà publié hors de Clipper">${icon("check")}Déclarer publié (hors Clipper)</button>` : ""}
+      ${status === "scheduled" && !inProgress ? `<button type="button" class="btn" data-published title="Pour un clip déjà publié hors de Clipper">${icon("check")}Déclarer publié (hors Clipper)</button>` : ""}
     </div>`;
 }
 

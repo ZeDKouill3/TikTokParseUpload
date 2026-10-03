@@ -1718,3 +1718,48 @@ def test_set_channel_refuses_a_video_with_unfinished_publications_without_a_styl
     ]), encoding="utf-8")
     state = pipeline.set_channel(VIDEO_ID, "ma_chaine", config=config, presets_dir=presets, state_dir=state_dir)
     assert state["channel"] == "ma_chaine"
+
+
+def test_set_channel_moves_the_finished_publications_without_a_style_into_the_style_file(tmp_path):
+    """fable-comptes 1 (CRITIQUE) : apres attribution du style, les entrees publiees/refusees restaient dans
+    _sans_chaine.json ; la console les cherchait sous le style, voyait le clip publie « à valider » et
+    l'approbation le republiait. Elles suivent la video dans state/publish/<style>.json, intactes."""
+    from clipper import pipeline, publish
+
+    presets = _channel_preset(tmp_path)
+    config = _unassigned_state(tmp_path)
+    state_dir = tmp_path / "state" / "publish"
+    state_dir.mkdir(parents=True)
+    published = _sans_chaine_entry("01", "published", published_at="2026-10-01T16:00:04+00:00",
+                                   tiktok_state="published", post_url="https://example.invalid/@x/video/1",
+                                   account="ab12cd", manual=True)
+    rejected = _sans_chaine_entry("02", "rejected", account="ab12cd")
+    other = _sans_chaine_entry("01", "scheduled", video_id="autrevideo1", slot_at="2026-10-05T18:30:00+02:00")
+    (state_dir / f"{publish.NO_CHANNEL}.json").write_text(json.dumps([published, other, rejected]), encoding="utf-8")
+
+    state = pipeline.set_channel(VIDEO_ID, "ma_chaine", config=config, presets_dir=presets, state_dir=state_dir)
+
+    assert state["channel"] == "ma_chaine"
+    assert publish.list_entries("ma_chaine", state_dir=state_dir) == [published, rejected]
+    assert publish.list_entries(publish.NO_CHANNEL, state_dir=state_dir) == [other]  # les autres videos restent
+
+
+def test_set_channel_refuses_when_the_style_file_already_has_an_entry_of_the_video(tmp_path):
+    """fable-comptes 1 : deux entrees pour un meme clip (style et sans style) : refus explicite, rien n'est ecrit."""
+    from clipper import pipeline, publish
+
+    presets = _channel_preset(tmp_path)
+    config = _unassigned_state(tmp_path)
+    state_dir = tmp_path / "state" / "publish"
+    state_dir.mkdir(parents=True)
+    no_style = [_sans_chaine_entry("01", "published", published_at="2026-10-01T16:00:04+00:00")]
+    styled = [_sans_chaine_entry("01", "rejected")]
+    (state_dir / f"{publish.NO_CHANNEL}.json").write_text(json.dumps(no_style), encoding="utf-8")
+    (state_dir / "ma_chaine.json").write_text(json.dumps(styled), encoding="utf-8")
+
+    with pytest.raises(pipeline.PipelineError, match="01"):
+        pipeline.set_channel(VIDEO_ID, "ma_chaine", config=config, presets_dir=presets, state_dir=state_dir)
+
+    assert pipeline.load_state(VIDEO_ID, config=config)["channel"] is None
+    assert publish.list_entries(publish.NO_CHANNEL, state_dir=state_dir) == no_style
+    assert publish.list_entries("ma_chaine", state_dir=state_dir) == styled

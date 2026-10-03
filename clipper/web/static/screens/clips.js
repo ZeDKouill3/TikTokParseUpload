@@ -269,7 +269,7 @@ function clipDrawerHtml(c) {
     </div>
     <div class="drawer-foot">
       ${c.publish_status === "à valider" || c.publish_status === "approved" ? `<button type="button" class="btn btn-primary" data-publish-now>${icon("send")}Publier maintenant</button>` : ""}
-      <button type="button" class="btn btn-ok" data-approve>${icon("check")}Approuver</button>
+      ${c.publish_status === "à valider" || c.publish_status === "approved" ? `<button type="button" class="btn btn-ok" data-approve>${icon("check")}Approuver</button>` : ""}
       <button type="button" class="btn btn-bad" data-reject>${icon("x")}Refuser</button>
       <button type="button" class="btn" data-rerender>${icon("refresh-cw")}Re-rendre</button>
       <span class="grow"></span>
@@ -341,7 +341,8 @@ async function openClipDrawer(key) {
     const now = $("[data-publish-now]", d);
     // « Publier maintenant » ouvre le formulaire de l'ecran Publication, prerempli avec ce clip (SPEC-1ed3 R5)
     if (now) now.onclick = () => { closeLayer(); setTimeout(() => pubOpenForm({ video_id: c.video_id, clip_id: c.clip_id }), 340); };
-    $("[data-approve]", d).onclick = async () => {
+    const approve = $("[data-approve]", d);  // absent hors « à valider » / approved (revue fable-comptes 3)
+    if (approve) approve.onclick = async () => {
       const chosen = $("#clip-account", d).value;
       if (!chosen) { toast({ kind: "warn", title: "Compte manquant", body: "Choisis le compte qui publiera ce clip." }); return; }
       try {

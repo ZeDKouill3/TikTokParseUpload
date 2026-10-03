@@ -2115,6 +2115,8 @@ def test_bulk_approve_applies_the_same_decision_as_the_single_endpoint_for_each_
     from clipper import publish
 
     _clips_setup(tmp_path)
+    # 01 sans entree (planifie, approve le refuserait : la pre-validation aussi, revue fable-comptes 2)
+    _write_publish(tmp_path, "ma_chaine", [_entry("03", "failed", error="quota depasse")])
     _accounts_state(tmp_path)
     calls = []
     monkeypatch.setattr(publish, "approve", lambda *a, **kw: calls.append((a, kw)) or _entry(a[1], "scheduled"))
@@ -2245,6 +2247,210 @@ def test_bulk_approve_selecting_one_part_approves_the_whole_series_in_part_order
     assert all(c["status"] in ("approved", "scheduled") for c in approved)
     entries = json.loads((tmp_path / "state" / "publish" / "ma_chaine.json").read_text(encoding="utf-8"))
     assert {e["clip_id"] for e in entries} == {"01-p1", "01-p2", "01-p3"}
+
+
+# --------------------------------------------------------------------------
+# Revue Fable (TASK-4c3d) : fable-comptes 1 a 9, fable-publication I2, I3, M1, M3, M4
+# --------------------------------------------------------------------------
+
+
+def _fable_setup(tmp_path, channel="ma_chaine", clips=("01", "02", "03")):
+    (tmp_path / "config.toml").write_text('mode = "review"\n', encoding="utf-8")
+    (tmp_path / "presets").mkdir(exist_ok=True)
+    (tmp_path / "presets" / "ma_chaine.toml").write_text("[channel]\n", encoding="utf-8")
+    _write_state(tmp_path, CLIPS_VIDEO, channel=channel, status="done")
+    for clip_id in clips:
+        _write_clip(tmp_path, CLIPS_VIDEO, _clip_sidecar(clip_id))
+    _accounts_state(tmp_path)
+
+
+def _publish_file(tmp_path, channel):
+    path = tmp_path / "state" / "publish" / f"{channel}.json"
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
+
+
+def test_assigning_a_style_never_lets_a_published_clip_be_approved_again(tmp_path, isolated_cwd):
+    """fable-comptes 1 (CRITIQUE) : apres « Attribuer un style », le clip publie sans style s'affichait « à valider »
+    et « Approuver » le remettait en file : second post. Ses publications suivent la video, intactes."""
+    _fable_setup(tmp_path, channel=None, clips=("01", "02"))
+    published = _entry("01", "published", slot_at="2026-10-01T18:00:00+02:00", published_at="2026-10-01T16:00:04+00:00",
+                       tiktok_state="published", post_url="https://example.invalid/@x/video/1", manual=True)
+    _write_publish(tmp_path, "_sans_chaine", [published, _entry("02", "rejected")])
+    c = client(tmp_path)
+
+    assert c.post(f"/api/videos/{CLIPS_VIDEO}/channel", json={"channel": "ma_chaine"}).status_code == 200
+
+    statuses = {x["clip_id"]: x["publish_status"] for x in c.get("/api/clips", params={"video_id": CLIPS_VIDEO}).json()}
+    assert statuses == {"01": "published", "02": "rejected"}
+    assert c.post(f"/api/clips/{CLIPS_VIDEO}/01/approve", json={"account": READY}).status_code == 409
+    assert c.post(f"/api/clips/{CLIPS_VIDEO}/02/approve", json={"account": READY}).status_code == 409
+    assert [(e["clip_id"], e["status"]) for e in _publish_file(tmp_path, "ma_chaine")] == [("01", "published"),
+                                                                                           ("02", "rejected")]
+    assert _publish_file(tmp_path, "ma_chaine")[0] == published
+    pubs = [(p["clip_id"], p["publish_status"]) for p in c.get("/api/publications").json()["publications"]]
+    assert pubs == [("01", "published")]  # un seul ecran, une seule verite
+
+
+@pytest.mark.parametrize("blocking", [
+    {"status": "scheduled", "slot_at": "2026-10-12T18:30:00+02:00"},
+    {"status": "scheduled", "slot_at": "2026-10-12T18:30:00+02:00", "in_progress_since": "2026-10-03T10:00:00+00:00"},
+    {"status": "failed", "manual": True, "publish_mode": "immediate", "post_options": {"visibility": "friends"}},
+])
+def test_bulk_approve_is_all_or_nothing_when_approve_would_refuse_one_clip(tmp_path, isolated_cwd, blocking):
+    """fable-comptes 2 / fable-publication M1 : la pre-validation ne refusait que published/rejected ; 01 etait
+    approuve puis 409 sur 02 (planifie, en cours de pilotage, ou publication du formulaire)."""
+    _fable_setup(tmp_path)
+    _write_publish(tmp_path, "ma_chaine", [_entry("02", **blocking)])
+    state_path = tmp_path / "state" / "publish" / "ma_chaine.json"
+    before = state_path.read_text(encoding="utf-8")
+
+    resp = client(tmp_path).post("/api/clips/approve", json=_bulk_body([(CLIPS_VIDEO, "01"), (CLIPS_VIDEO, "02"),
+                                                                        (CLIPS_VIDEO, "03")]))
+
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == "sélection refusée, rien d'approuvé"
+    assert any(f"{CLIPS_VIDEO}/02" in r for r in resp.json()["refused"])
+    assert state_path.read_text(encoding="utf-8") == before  # 01 n'a pas ete approuve avant le refus
+
+
+def test_bulk_approve_skips_an_already_published_part_pulled_in_by_its_series(tmp_path, isolated_cwd):
+    """fable-comptes 5 : cocher la partie 2 entrainait la partie 1 deja publiee, et tout etait refuse ; la partie
+    publiee entrainee par la serie est laissee telle quelle, les suivantes s'approuvent."""
+    _fable_setup(tmp_path, clips=())
+    for part in (1, 2, 3):
+        _write_clip(tmp_path, CLIPS_VIDEO, _clip_sidecar(f"01-p{part}", part=part, parts_total=3))
+    published = _entry("01-p1", "published", series_id=f"{CLIPS_VIDEO}:01", part=1,
+                       slot_at="2026-10-01T18:30:00+02:00", published_at="2026-10-01T16:30:04+00:00")
+    _write_publish(tmp_path, "ma_chaine", [published])
+
+    resp = client(tmp_path).post("/api/clips/approve", json=_bulk_body([(CLIPS_VIDEO, "01-p2")]))
+
+    assert resp.status_code == 200, resp.text
+    assert [c["clip_id"] for c in resp.json()] == ["01-p2", "01-p3"]
+    entries = {e["clip_id"]: e for e in _publish_file(tmp_path, "ma_chaine")}
+    assert entries["01-p1"] == published
+    assert entries["01-p2"]["status"] in ("approved", "scheduled")
+
+
+def test_clip_drawer_offers_approve_only_to_a_clip_to_validate_or_approved():
+    """fable-comptes 3 / fable-publication I3 : « Approuver » etait affiche quel que soit le statut."""
+    js = (STATIC / "screens" / "clips.js").read_text(encoding="utf-8")
+    line = next(raw for raw in js.splitlines() if "data-approve>" in raw)
+
+    assert 'publish_status === "à valider"' in line and 'publish_status === "approved"' in line
+
+
+def test_deleting_a_style_keeps_its_publications_visible_and_counted(tmp_path, isolated_cwd):
+    """fable-comptes 4 : apres suppression du style, ses publications publiees disparaissaient de l'ecran
+    Publication (et des plafonds du compte, voir test_publish)."""
+    _fable_setup(tmp_path, clips=("01",))
+    _write_publish(tmp_path, "ma_chaine", [_entry("01", "published", slot_at="2026-10-01T18:00:00+02:00",
+                                                  published_at="2026-10-01T16:00:04+00:00")])
+    c = client(tmp_path)
+
+    assert c.delete("/api/channels/ma_chaine", params={"confirm": "true"}).status_code == 200
+
+    pubs = [(p["clip_id"], p["publish_status"]) for p in c.get("/api/publications").json()["publications"]]
+    assert pubs == [("01", "published")]
+
+
+def test_deleting_a_style_with_an_unreadable_publish_file_is_an_explicit_409(tmp_path, isolated_cwd):
+    """fable-comptes 4 : fichier de publication invalide -> 500 ; c'est une erreur explicite qui le nomme."""
+    _fable_setup(tmp_path, clips=())
+    (tmp_path / "state" / "publish").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "state" / "publish" / "ma_chaine.json").write_text("{pas du json", encoding="utf-8")
+
+    resp = TestClient(create_app(config=make_config(tmp_path)), raise_server_exceptions=False).delete(
+        "/api/channels/ma_chaine", params={"confirm": "true"})
+
+    assert resp.status_code == 409 and "ma_chaine.json" in resp.json()["detail"]
+    assert (tmp_path / "presets" / "ma_chaine.toml").exists()
+
+
+def test_approving_a_clip_whose_style_preset_is_gone_is_a_404(tmp_path, isolated_cwd):
+    """fable-comptes 7 : ChannelError non attrapee dans _decide -> 500."""
+    _fable_setup(tmp_path, channel="disparu", clips=("01",))
+
+    resp = TestClient(create_app(config=make_config(tmp_path)), raise_server_exceptions=False).post(
+        f"/api/clips/{CLIPS_VIDEO}/01/approve", json={"account": READY})
+
+    assert resp.status_code == 404 and "disparu" in resp.json()["detail"]
+
+
+def test_accounts_list_shows_a_write_error_on_the_account_instead_of_a_500(tmp_path, isolated_cwd, monkeypatch):
+    """fable-comptes 8 : une AccountsError de record_login faisait tomber tout l'ecran Comptes."""
+    from clipper import accounts, browser
+
+    _browser_setup(tmp_path)
+    monkeypatch.setattr(browser, "login_state", lambda account_id, config=None: {"state": "never"})
+
+    def failing(config, account_id, observed):
+        raise accounts.AccountsError("écriture du fichier des comptes impossible : state/accounts.json")
+
+    monkeypatch.setattr(accounts, "record_login", failing)
+    c = TestClient(create_app(config=make_config(tmp_path)), base_url="http://127.0.0.1:8000",
+                   client=("127.0.0.1", 50000), raise_server_exceptions=False)
+
+    resp = c.get("/api/accounts")
+
+    assert resp.status_code == 200
+    assert "écriture du fichier des comptes impossible" in resp.json()[0]["login_error"]
+
+
+def test_cancel_a_process_that_cannot_be_stopped_is_a_409(tmp_path, isolated_cwd, monkeypatch):
+    """fable-comptes 9 : « processus impossible à arrêter » rendait 404 « aucune video en cours »."""
+    from clipper import worker
+
+    def stuck(video_id, *, config=None):
+        raise worker.WorkerError("processus 4242 impossible à arrêter : [WinError 5] Accès refusé")
+
+    monkeypatch.setattr(worker, "cancel", stuck)
+
+    resp = client(tmp_path).post(f"/api/videos/{VIDEO_ID}/cancel")
+
+    assert resp.status_code == 409 and "impossible à arrêter" in resp.json()["detail"]
+
+
+def test_declare_published_is_refused_while_the_worker_drives_the_entry(tmp_path, isolated_cwd):
+    """fable-publication I2 : la route et le bouton « Déclarer publié » ignoraient le pilotage en cours."""
+    _fable_setup(tmp_path, clips=("01",))
+    driven = _entry("01", "scheduled", slot_at="2026-10-05T18:30:00+02:00",
+                    in_progress_since="2026-10-03T10:00:00+00:00")
+    _write_publish(tmp_path, "ma_chaine", [driven])
+
+    resp = client(tmp_path).post(f"/api/publish/{CLIPS_VIDEO}/01/published")
+
+    assert resp.status_code == 409 and "en cours" in resp.json()["detail"]
+    assert _publish_file(tmp_path, "ma_chaine") == [driven]
+    js = (STATIC / "screens" / "publish.js").read_text(encoding="utf-8")
+    line = next(raw for raw in js.splitlines() if "data-published " in raw)
+    assert "inProgress" in line
+
+
+def test_publications_are_sorted_by_instant_not_by_iso_text(tmp_path, isolated_cwd):
+    """fable-publication M3 : 16:30+00:00 (18:30 Paris) etait classe apres 18:00+02:00."""
+    _fable_setup(tmp_path, clips=("01", "02"))
+    _write_publish(tmp_path, "ma_chaine", [
+        _entry("01", "scheduled", slot_at="2026-10-05T16:30:00+00:00"),  # 18:30 a Paris
+        _entry("02", "scheduled", slot_at="2026-10-05T18:00:00+02:00"),  # 18:00 a Paris
+    ])
+
+    rows = client(tmp_path).get("/api/publications").json()["publications"]
+
+    assert [r["clip_id"] for r in rows] == ["01", "02"]  # le plus tard d'abord
+
+
+def test_set_mode_route_is_refused_while_the_worker_drives_the_entry(tmp_path, isolated_cwd):
+    """fable-publication M4 : POST /mode acceptait une entree en cours de pilotage."""
+    _fable_setup(tmp_path, clips=("01",))
+    driven = _entry("01", "scheduled", slot_at="2026-10-05T18:30:00+02:00",
+                    in_progress_since="2026-10-03T10:00:00+00:00", publish_mode="immediate")
+    _write_publish(tmp_path, "ma_chaine", [driven])
+
+    resp = client(tmp_path).post(f"/api/publish/{CLIPS_VIDEO}/01/mode", json={"mode": "scheduled"})
+
+    assert resp.status_code == 409
+    assert _publish_file(tmp_path, "ma_chaine") == [driven]
 
 
 # --------------------------------------------------------------------------

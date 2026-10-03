@@ -47,6 +47,9 @@ UNFINISHED_STATUSES = ("approved", "scheduled", "failed")
 _NON_EDITABLE_STATUSES = ("scheduled", "published")
 _NON_MOVABLE_STATUSES = ("rejected", "published")
 _PREVIOUS_PART_STATUSES = ("approved", "scheduled", "published")
+# Reglages d'une publication du formulaire (SPEC-1ed3 R2) : approve les jetterait en reconstruisant l'entree
+# (revue fable-comptes 3 / fable-publication I3), elle se reprend par « Reessayer » ou « Modifier ».
+_FORM_FIELDS = ("manual", "publish_mode", "post_options")
 _ENTRY_FIELDS = (
     "video_id", "clip_id", "series_id", "part", "status",
     "slot_at", "decided_at", "published_at", "error",
@@ -236,9 +239,10 @@ def _next_free_slot(schedule: dict[str, Any], taken: set[datetime], after: datet
 def _require_previous_part(
     entries: list[dict[str, Any]], output_dir: str | Path, video_id: str,
     clip_id: str, series_id: str, part: int,
-) -> None:
+) -> dict[str, Any]:
     """La partie N>1 d'une serie ne s'approuve que si la partie N-1 est deja
-    approved ou scheduled : l'ordre des creneaux de la serie est garanti."""
+    approved, scheduled ou published : l'ordre des creneaux de la serie est garanti. Rend l'entree de la
+    partie N-1 (son creneau borne celui de la partie N)."""
     previous = None
     for sibling_id in _sibling_clip_ids(output_dir, video_id, series_id, exclude=clip_id):
         _, sibling_part = _series_info(video_id, sibling_id, _read_sidecar(output_dir, video_id, sibling_id))
@@ -252,8 +256,25 @@ def _require_previous_part(
     if entry is None or status not in _PREVIOUS_PART_STATUSES:
         raise PublishError(
             f"approbation refusee pour {video_id}/{clip_id} (partie {part}) : la partie {part - 1} "
-            f"({previous}) doit etre approved ou scheduled, elle est {status!r}"
+            f"({previous}) doit etre approved, scheduled ou published, elle est {status!r}"
         )
+    return entry
+
+
+def approval_refusal(entry: dict[str, Any] | None) -> str | None:
+    """Pourquoi ``approve`` refuse l'entree existante d'un clip, ou None : la meme regle sert a l'approbation
+    groupee, validee en entier avant la premiere ecriture (revue fable-comptes 2 / fable-publication M1)."""
+    if entry is None:
+        return None
+    if entry.get("in_progress_since"):
+        return "la publication est en cours (le worker pilote TikTok), attends sa fin"
+    if entry["status"] not in ("approved", "failed"):
+        return f"statut {entry['status']!r}"
+    form = [name for name in _FORM_FIELDS if entry.get(name)]
+    if form:
+        return (f"publication du formulaire ({', '.join(form)}) : utilise « Réessayer » ou « Modifier » dans "
+                "l'écran Publication, l'approbation perdrait ses réglages")
+    return None
 
 
 def approve(
@@ -300,18 +321,17 @@ def approve(
     }
     with _locked(path):
         entries = _load_entries(path)
-        existing = _find_entry(entries, video_id, clip_id)
-        if existing is not None:
-            _refuse_in_progress(existing, "approbation")
-            if existing["status"] not in ("approved", "failed"):
-                raise PublishError(
-                    f"approbation refusé pour {video_id}/{clip_id} : statut {existing['status']!r}"
-                )
+        refusal = approval_refusal(_find_entry(entries, video_id, clip_id))
+        if refusal is not None:
+            raise PublishError(f"approbation refusé pour {video_id}/{clip_id} : {refusal}")
+        after = now_dt
         if series_id is not None and part is not None and part > 1:
-            _require_previous_part(entries, output_dir, video_id, clip_id, series_id, part)
+            previous = _require_previous_part(entries, output_dir, video_id, clip_id, series_id, part)
+            if previous.get("slot_at"):  # jamais un creneau avant la partie N-1 (revue fable-comptes 6)
+                after = max(now_dt, datetime.fromisoformat(previous["slot_at"]))
         if schedule and schedule["slots"]:
             taken = _account_taken_slots(account, state_dir, presets_dir, base, exclude=(video_id, clip_id))
-            slot = _next_free_slot(schedule, taken, now_dt)
+            slot = _next_free_slot(schedule, taken, after)
             entry["status"] = "scheduled"
             entry["slot_at"] = _iso(slot)
 
@@ -474,6 +494,8 @@ def mark_published(
                 f"publication manuelle refusee pour {video_id}/{clip_id} : statut {entry['status']!r} "
                 "(attendu : 'scheduled')"
             )
+        if tiktok_state is None:  # declaration a la main : jamais pendant que le worker pilote (fable-publication I2)
+            _refuse_in_progress(entry, "déclaration publiée")
 
         entry = dict(entry)
         entry["status"] = "published"
@@ -574,6 +596,9 @@ def set_mode(
         entry = _find_entry(entries, video_id, clip_id)
         if entry is None:
             raise PublishError(f"clip absent de la file de publication : {video_id}/{clip_id}")
+        _refuse_in_progress(entry, "changement de mode")  # fable-publication M4
+        if entry["status"] in ("published", "rejected"):
+            raise PublishError(f"changement de mode refusé pour {video_id}/{clip_id} : statut {entry['status']!r}")
         entry = dict(entry)
         entry["publish_mode"] = mode
         _upsert_entry(entries, entry)
@@ -586,10 +611,68 @@ def list_entries(channel: str, *, state_dir: str | Path | None = None) -> list[d
     return _load_entries(_state_path(channel, state_dir))
 
 
+def adopt_video_entries(
+    video_id: str, channel: str, *, commit: Callable[[], None], state_dir: str | Path | None = None,
+) -> list[dict[str, Any]]:
+    """Attribution d'un style a une video sans style (revue fable-comptes 1) : toutes ses entrees de
+    ``_sans_chaine.json`` passent, intactes, dans ``<channel>.json`` ; sinon la console les chercherait sous
+    le style, verrait un clip publie « a valider » et l'approbation le republierait. Refuse (``PublishError``,
+    rien n'est ecrit) une entree non terminee (le worker peut la piloter) ou un clip deja present dans la file du
+    style. ``commit`` (l'ecriture de pipeline.json) est appele sous les deux verrous, apres l'ecriture de la file
+    du style et avant le retrait de la file sans style : a aucun moment un clip publie n'est sans entree visible.
+    Rend les entrees deplacees."""
+    source, target = _state_path(NO_CHANNEL, state_dir), _state_path(channel, state_dir)
+    if not source.exists():
+        commit()
+        return []
+    with _locked(source), _locked(target):
+        entries = _load_entries(source)
+        moved = [e for e in entries if e["video_id"] == video_id]
+        pending = [e for e in moved if e["status"] in UNFINISHED_STATUSES]
+        if pending:
+            clips = ", ".join(e["clip_id"] for e in pending)
+            raise PublishError(
+                f"{video_id} a {len(pending)} publication(s) sans style en cours ({clips}) : "
+                "annule-les ou attends leur fin avant de lui attribuer une chaîne"
+            )
+        target_existed = target.exists()
+        styled = _load_entries(target)
+        clash = [e["clip_id"] for e in moved if _find_entry(styled, video_id, e["clip_id"]) is not None]
+        if clash:
+            raise PublishError(
+                f"{video_id} : {', '.join(clash)} déjà dans la file du style « {channel} » et dans celle sans "
+                "style : deux publications pour un même clip, corrige state/publish avant de lui attribuer une chaîne"
+            )
+        if moved:
+            _save_entries(target, styled + moved)
+        try:
+            commit()
+        except BaseException:
+            if moved and target_existed:
+                _save_entries(target, styled)
+            elif moved:
+                target.unlink(missing_ok=True)
+            raise
+        if moved:
+            _save_entries(source, [e for e in entries if e["video_id"] != video_id])
+    return moved
+
+
 def entry_account(entry: dict[str, Any]) -> str | None:
     """Compte qui publie une entree (SPEC-00d1 R4) : celui enregistre dans l'entree, None s'il n'y en a pas
     (SPEC-6076 R2 : un style n'a plus de compte, jamais un autre compte en repli)."""
     return entry.get("account") or None
+
+
+def _queue_names(state_dir: str | Path | None, presets_dir: str | Path) -> list[str]:
+    """Les files de publication a lire : chaque style, la file sans style, et toute file restee sous
+    ``state_dir`` sans preset (style supprime : ses publications comptent toujours pour les plafonds du compte
+    et restent visibles, revue fable-comptes 4)."""
+    names = [*channel_mod.list_channels(presets_dir), NO_CHANNEL]
+    folder = _state_dir(state_dir)
+    if folder.is_dir():
+        names.extend(sorted(p.stem for p in folder.glob("*.json") if p.stem not in names))
+    return names
 
 
 def _account_entries(
@@ -598,7 +681,7 @@ def _account_entries(
     """(chaine, entree) de toutes les entrees publiees par ``account`` (SPEC-00d1 R4), toutes chaines."""
     found: list[tuple[str, dict[str, Any]]] = []
     try:
-        for name in [*channel_mod.list_channels(presets_dir), NO_CHANNEL]:
+        for name in _queue_names(state_dir, presets_dir):
             found.extend((name, e) for e in _load_entries(_state_path(name, state_dir))
                          if entry_account(e) == account)
     except (channel_mod.ChannelError, ConfigError) as exc:
@@ -1221,10 +1304,11 @@ def fail_interrupted(channel: str, *, now: datetime | None = None, state_dir: st
 def all_entries(
     *, state_dir: str | Path | None = None, presets_dir: str | Path = "presets",
 ) -> list[tuple[str, dict[str, Any]]]:
-    """(file, entree) de toutes les entrees de toutes les chaines et de la file des videos sans chaine."""
+    """(file, entree) de toutes les entrees de toutes les chaines (y compris d'un style supprime) et de la file
+    des videos sans chaine."""
     found: list[tuple[str, dict[str, Any]]] = []
     try:
-        for name in [*channel_mod.list_channels(presets_dir), NO_CHANNEL]:
+        for name in _queue_names(state_dir, presets_dir):
             found.extend((name, e) for e in _load_entries(_state_path(name, state_dir)))
     except channel_mod.ChannelError as exc:
         raise PublishError(f"chaînes illisibles : {exc}") from exc
