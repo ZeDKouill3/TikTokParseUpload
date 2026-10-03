@@ -30,7 +30,7 @@ from typing import Any, AsyncIterator, Iterator
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse as _PlainJSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
@@ -2475,10 +2475,14 @@ def create_app(config: Config | None = None) -> FastAPI:
     # ----------------------------------------------------------------
 
     @app.get("/api/publish")
-    def publish_week(account: str | None = None, week: str | None = None) -> dict[str, Any]:
+    def publish_week(
+        account: str | None = None, week: str | None = None,
+        range_: str | None = Query(None, alias="range"),
+    ) -> dict[str, Any]:
         """Calendrier et publications d'un compte TikTok (``account``), ou de tous les comptes sans ``account`` :
-        un post publie via Clipper y figure quel que soit son style (ou l'absence de style)."""
-        return _publish_week_view(config, account or None, week)
+        un post publie via Clipper y figure quel que soit son style (ou l'absence de style). ``range``
+        (day/week/month, defaut week) choisit la plage ; ``week`` ancre la plage (TASK-ad4d)."""
+        return _publish_range_view(config, account or None, range_, week)
 
     def _publish_action(video_id: str, clip_id: str, action: str, *args: Any, **kwargs: Any) -> dict[str, Any]:
         _validate_video_id(video_id)
@@ -3244,15 +3248,38 @@ def _publish_parse_slot(value: str) -> datetime:
     return slot
 
 
-def _publish_week_start(week: str | None, tz: ZoneInfo) -> date:
+_PUBLISH_RANGES = ("day", "week", "month")
+
+
+def _publish_anchor_date(week: str | None, tz: ZoneInfo) -> date:
+    """Jour ancrant la plage demandee : celui du parametre ``week`` (malgre son nom, SPEC-c100 ; il ancre
+    jour et mois aussi), ou aujourd'hui s'il est absent."""
     if not week:
-        day = datetime.now(tz).date()
-    else:
-        try:
-            day = date.fromisoformat(week)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=f"paramètre week invalide : {week!r} (attendu : AAAA-MM-JJ)") from exc
-    return day - timedelta(days=day.weekday())
+        return datetime.now(tz).date()
+    try:
+        return date.fromisoformat(week)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"paramètre week invalide : {week!r} (attendu : AAAA-MM-JJ)") from exc
+
+
+def _publish_range_bounds(range_kind: str, anchor: date) -> tuple[date, date]:
+    """(debut inclus, fin exclue) de la plage, en jours, pour ``range_kind`` (TASK-ad4d)."""
+    if range_kind == "day":
+        return anchor, anchor + timedelta(days=1)
+    if range_kind == "week":
+        start = anchor - timedelta(days=anchor.weekday())
+        return start, start + timedelta(days=7)
+    start = anchor.replace(day=1)
+    next_month = (start + timedelta(days=32)).replace(day=1)
+    return start, next_month
+
+
+def _publish_date_span(start: date, end: date) -> list[date]:
+    days, day = [], start
+    while day < end:
+        days.append(day)
+        day += timedelta(days=1)
+    return days
 
 
 def _publish_entry_instant(entry: dict[str, Any], key: str) -> datetime | None:
@@ -3309,20 +3336,30 @@ def _publish_account_schedule(config: Config, account: str | None) -> tuple[dict
     return schedule, None if schedule["slots"] else "aucun créneau défini pour ce compte (écran Comptes)"
 
 
-def _publish_week_view(config: Config, account: str | None, week: str | None) -> dict[str, Any]:
+def _publish_range_view(config: Config, account: str | None, range_param: str | None, week: str | None) -> dict[str, Any]:
+    range_kind = range_param or "week"
+    if range_kind not in _PUBLISH_RANGES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"paramètre range invalide : {range_kind!r} (attendu : day, week ou month)",
+        )
     if account is not None and not any(a["id"] == account for a in _publish_accounts(config)):
         raise HTTPException(status_code=404, detail=f"compte inconnu : {account!r} (écran Comptes)")
     channel, reason = _publish_account_schedule(config, account)
     tz = ZoneInfo(str(channel["timezone"]) if channel else _PUBLISH_DEFAULT_TZ)
-    monday = _publish_week_start(week, tz)
-    start = datetime.combine(monday, time(0, 0), tzinfo=tz)
-    end = datetime.combine(monday + timedelta(days=7), time(0, 0), tzinfo=tz)
+    anchor = _publish_anchor_date(week, tz)
+    start_date, end_date = _publish_range_bounds(range_kind, anchor)
+    start = datetime.combine(start_date, time(0, 0), tzinfo=tz)
+    end = datetime.combine(end_date, time(0, 0), tzinfo=tz)
+    # Créneaux réguliers = cibles de dépôt seulement en Jour et Semaine (TASK-ad4d) ; la vue Mois n'en a pas besoin.
+    has_slot_grid = range_kind in ("day", "week")
 
     rows = _publish_account_entries(config, account)
     clips = {(c["video_id"], c["clip_id"]): c for c in _list_clip_views(config, None, None, None)}
-    slots_def = channel["slots"] if channel else []
+    slots_def = channel["slots"] if (channel and has_slot_grid) else []
     by_slot: dict[datetime, dict[str, Any]] = {}
     unscheduled, done, off_slot = [], [], []
+    by_day: dict[date, list[tuple[datetime, dict[str, Any]]]] = {d: [] for d in _publish_date_span(start_date, end_date)}
     slot_instants = {s for s in channel_mod.next_slots(channel, start - timedelta(microseconds=1), len(slots_def) + 1)
                      if s < end} if slots_def else set()
     for file_channel, entry in rows:
@@ -3340,6 +3377,19 @@ def _publish_week_view(config: Config, account: str | None, week: str | None) ->
             when = slot or published
             if when is not None and start <= when < end:
                 done.append(_publish_clip_view(clips, file_channel, entry))
+        # Case du jour (TASK-ad4d) : TOUTE publication datée de la plage y figure une fois, créneau occupé,
+        # hors créneau, publiée ou en échec confondus ; une liste (jamais une clé par heure) ne perd aucune
+        # publication quand deux tombent à la même minute.
+        when_for_day = slot if (entry["status"] == "scheduled" and slot is not None) else None
+        if entry["status"] in ("published", "failed"):
+            when_for_day = slot or published
+        if when_for_day is not None and start <= when_for_day < end:
+            by_day[when_for_day.astimezone(tz).date()].append((when_for_day, _publish_clip_view(clips, file_channel, entry)))
+
+    days = []
+    for day in sorted(by_day):
+        posts = [post for _, post in sorted(by_day[day], key=lambda pair: (pair[0], pair[1]["video_id"], pair[1]["clip_id"]))]
+        days.append({"date": day.isoformat(), "count": len(posts), "posts": posts})
 
     slots = []
     if slots_def:
@@ -3355,9 +3405,12 @@ def _publish_week_view(config: Config, account: str | None, week: str | None) ->
                 "clip": _publish_clip_view(clips, by_key[(entry["video_id"], entry["clip_id"])], entry) if entry is not None else None,
                 "free": entry is None,
             })
+    range_start, range_end = start_date.isoformat(), (end_date - timedelta(days=1)).isoformat()
     return {
-        "account": account, "timezone": str(tz.key),
-        "week_start": monday.isoformat(), "week_end": (monday + timedelta(days=6)).isoformat(),
+        "account": account, "timezone": str(tz.key), "range": range_kind,
+        "range_start": range_start, "range_end": range_end,
+        "week_start": range_start, "week_end": range_end,  # alias historique (comportement de week= inchangé)
+        "days": days,
         "slots": slots, "unscheduled": unscheduled, "done": done, "off_slot": sorted(off_slot, key=lambda c: datetime.fromisoformat(c["slot_at"])),
         "accounts": _publish_accounts(config), "reason": reason,
     }

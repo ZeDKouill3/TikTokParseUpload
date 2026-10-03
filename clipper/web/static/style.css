@@ -1694,3 +1694,35 @@ input[type="color"] { width: 36px; height: 36px; padding: 2px; border-radius: va
 .cal .post .mini-clip { display: none; }
 .cal .post .pt { flex: 1 1 100%; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; overflow-wrap: anywhere; hyphens: auto; min-width: 0; }
 .cal .post .pub-acct { flex: 1 1 100%; }
+
+/* ---------- Calendrier : vues Jour / Semaine / Mois (TASK-ad4d) ---------- */
+/* Semaine : une case par jour (toutes ses publications) plutot qu'une case par heure ; reutilise la grille
+   .cal (en-tetes .cal-h) avec une ligne de corps unique. .cal-row-label occupe la colonne d'heure, vide ici. */
+.cal-row-label { border-top: 1px solid var(--line); }
+.cal-day {
+  border-top: 1px solid var(--line); border-left: 1px solid var(--line); padding: 6px; min-height: 92px;
+  max-height: 320px; display: flex; flex-direction: column; gap: 4px; overflow-y: auto;
+}
+.cal-day.today { background: var(--accent-soft); }
+.cal-day.blank { background: var(--surface-2); opacity: 0.4; }
+.cal-day-h { display: flex; align-items: center; justify-content: space-between; gap: 6px; font-family: var(--font-mono); font-size: 11px; color: var(--muted); }
+.cal-day-count { font-family: var(--font-cond); font-weight: 700; font-size: 12px; color: var(--accent); background: var(--accent-soft); border-radius: 999px; padding: 0 6px; min-width: 18px; text-align: center; }
+.pub-day-time { font-family: var(--font-mono); font-size: 10px; color: var(--muted); flex: 0 0 auto; }
+/* Boites mises a l'echelle avec le nombre de publications du jour (TASK-ad4d) : la case defile plutot que de
+   deborder sur la page au-dela du seuil « compact ». */
+.cal-day.dense .post { font-size: 10px; padding: 3px; gap: 4px; }
+.cal-day.dense .post .mini-clip { display: none; }
+.cal-day.compact { gap: 2px; }
+.cal-day.compact .post { font-size: 9px; padding: 2px 3px; gap: 2px; }
+.cal-day.compact .post .pt { -webkit-line-clamp: 1; line-clamp: 1; }
+.cal-day.compact .post .mini-clip, .cal-day.compact .post .pub-service { display: none; }
+/* Mois : grille de 7 colonnes, lundi en tete ; pas de cible de depot (SPEC-c100 : seulement Jour et Semaine). */
+.cal-month { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); border: 1px solid var(--line); border-radius: var(--r-lg); overflow: hidden; background: var(--surface); }
+.cal-month .cal-h { padding: 8px; border-left: 1px solid var(--line); }
+.cal-month .cal-day.small { min-height: 64px; max-height: 160px; }
+/* Jour : liste horaire au lieu d'une grille (heure, compte, service, titre, statut). */
+.pub-day-list { display: flex; flex-direction: column; gap: 6px; }
+.pub-day-list .post { width: 100%; }
+@media (max-width: 900px) {
+  .cal-day { min-height: 72px; max-height: 220px; }
+}

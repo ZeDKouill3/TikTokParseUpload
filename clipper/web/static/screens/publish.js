@@ -24,7 +24,10 @@ const PUB_HOLD_MS = 250;      // appui long avant de saisir un clip au toucher
 const PUB_SLOP_PX = 8;        // mouvement tolere pendant l'appui long (sinon : defilement)
 const pubEnc = encodeURIComponent;
 
-const pubUi = { account: "", week: "", key: "", data: null, error: null, loading: null, dirty: false, at: 0, html: "", dragKey: null, touching: false, landed: null };
+// ``range`` (Jour / Semaine / Mois, TASK-ad4d) : choix retenu pendant la session (pas rechargé depuis le
+// serveur), Semaine par défaut. ``week`` ancre la plage demandée (son nom garde le sens historique de
+// l'appel ``week=`` ; il ancre tout autant un jour ou un mois).
+const pubUi = { account: "", range: "week", week: "", key: "", data: null, error: null, loading: null, dirty: false, at: 0, html: "", dragKey: null, touching: false, landed: null };
 
 // Publications pilotees (SPEC-1ed3) : GET /api/publications, independantes du compte choisi.
 const pubPosts = { data: null, error: null, loading: null, dirty: false, at: 0 };
@@ -62,7 +65,16 @@ const pubTime = (iso) => iso.slice(11, 16);
 const pubUtc = (ymd) => { const [y, m, d] = ymd.split("-").map(Number); return new Date(Date.UTC(y, m - 1, d)); };
 const pubFmt = (ymd, opts) => pubUtc(ymd).toLocaleDateString("fr-FR", Object.assign({ timeZone: "UTC" }, opts));
 const pubShift = (ymd, days) => { const d = pubUtc(ymd); d.setUTCDate(d.getUTCDate() + days); return d.toISOString().slice(0, 10); };
-const pubDayIndex = (ymd, start) => Math.round((pubUtc(ymd) - pubUtc(start)) / 86400000);
+// Décale d'un nombre de mois en se calant au 1er (sinon le 31 janvier + 1 mois déborde sur mars) : seulement
+// pour choisir la plage à demander au serveur (navigation), jamais pour grouper des publications par jour.
+const pubShiftMonth = (ymd, months) => { const d = pubUtc(ymd); d.setUTCMonth(d.getUTCMonth() + months, 1); return d.toISOString().slice(0, 10); };
+// Seuil de densité d'une case jour (TASK-ad4d) : au-delà, les boîtes se compactent pour tenir dans la case
+// plutôt que de déborder sur la page (la case elle-même défile verticalement en dernier recours).
+function pubBoxClass(count) {
+  if (count >= 7) return "compact";
+  if (count >= 4) return "dense";
+  return "";
+}
 const pubSlotLabel = (iso) => `${pubFmt(pubDate(iso), { weekday: "long", day: "numeric", month: "long" })} à ${pubTime(iso)}`;
 const pubWhen = (iso) => new Date(iso).toLocaleString("fr-FR", { weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit", timeZone: PUB_TZ });
 
@@ -88,20 +100,21 @@ function pubParisInstant(local) {
 function pubClips() {
   const d = pubUi.data;
   if (!d) return [];
-  return [...d.unscheduled, ...d.slots.map((s) => s.clip).filter(Boolean), ...(d.off_slot || []), ...d.done];
+  return [...d.unscheduled, ...d.slots.map((s) => s.clip).filter(Boolean), ...(d.off_slot || []), ...d.done,
+    ...(d.days || []).flatMap((day) => day.posts)];
 }
 const pubFind = (key) => pubClips().find((c) => pubKey(c) === key) || null;
 
 /* ---------- Chargement ---------- */
 
-function pubWantedKey() { return `${pubUi.account}|${pubUi.week}`; }
+function pubWantedKey() { return `${pubUi.account}|${pubUi.range}|${pubUi.week}`; }
 
 function pubLoad() {
   if (pubUi.loading) { pubUi.dirty = true; return pubUi.loading; }
   const key = pubWantedKey();
   pubUi.loading = (async () => {
     try {
-      const data = await api(`/api/publish?account=${pubEnc(pubUi.account)}&week=${pubEnc(pubUi.week)}`);
+      const data = await api(`/api/publish?account=${pubEnc(pubUi.account)}&week=${pubEnc(pubUi.week)}&range=${pubEnc(pubUi.range)}`);
       if (key === pubWantedKey()) {
         pubUi.data = data; pubUi.error = null;
         if (!pubUi.week) pubUi.week = data.week_start; // « cette semaine » : on retient le lundi renvoye
@@ -160,39 +173,79 @@ function pubPost(c, extra) {
     ${extra || ""}${icoName ? icon(icoName, "i-xs") : ""}</div>`;
 }
 
-/* Calendrier de la semaine (TASK-5c00) : toujours affiché, les créneaux réguliers (SPEC-6076 R2), les
-   publications programmées hors créneau et les publications terminées (publiées, échecs) de la semaine
-   partagent les mêmes cases, à l'heure de Paris du clip (`slot_at_paris`, jamais réécrit après coup) ; une
-   publication déjà sur un créneau régulier n'y figure qu'une fois (jamais dupliquée avec les terminées). */
-function pubCalendar(d) {
-  const off = d.off_slot || [];
-  const done = d.done || [];
-  const times = Array.from(new Set([
-    ...d.slots.map((s) => pubTime(s.slot_at_paris)), ...off.map((c) => pubTime(c.slot_at_paris)), ...done.map((c) => pubTime(c.slot_at_paris)),
-  ])).sort();
-  const bySlot = {};
-  d.slots.forEach((s) => { bySlot[`${pubDayIndex(pubDate(s.slot_at_paris), d.week_start)}|${pubTime(s.slot_at_paris)}`] = s; });
-  const byOff = {};
-  [...off, ...done].forEach((c) => {
-    const key = `${pubDayIndex(pubDate(c.slot_at_paris), d.week_start)}|${pubTime(c.slot_at_paris)}`;
-    if (!bySlot[key]) byOff[key] = c;
-  });
-  const today = new Date().toLocaleDateString("sv-SE", { timeZone: PUB_TZ });
+/* Calendrier (TASK-ad4d) : Jour / Semaine / Mois. Le serveur regroupe déjà les publications par jour
+   (`d.days`, triées à l'heure de Paris, jamais deux au même instant ne s'écrasent : c'est une liste, pas une
+   case par heure) ; le JS ne fait que choisir le gabarit et poser les créneaux libres restants comme cibles
+   de dépôt (Jour et Semaine seulement, SPEC-c100). Aucune date n'est recalculée ici au-delà de l'affichage. */
+const pubToday = () => new Date().toLocaleDateString("sv-SE", { timeZone: PUB_TZ });
+
+/* Créneau libre d'un jour donné, rendu comme avant (TASK-5c00) : une case vide ciblable au glisser-déposer. */
+function pubFreeSlot(s, inner) {
+  const past = Date.parse(s.slot_at) < Date.now();
+  return `<div class="cal-c slot free${past ? " past" : ""}" data-slot-at="${esc(s.slot_at)}" data-slot="${esc(pubTime(s.slot_at_paris))}" aria-label="Créneau ${esc(pubSlotLabel(s.slot_at_paris))}, libre">${inner || ""}</div>`;
+}
+
+/* Tout ce qui occupe un jour (ymd) : ses publications (`d.days`) et, Jour/Semaine seulement, ses créneaux
+   encore libres (`d.slots`) comme cibles de dépôt ; un créneau déjà occupé n'y figure qu'une fois, via la
+   publication (jamais dupliqué avec le créneau). Trié à l'heure de Paris. */
+function pubDayItems(d, ymd) {
+  const box = (d.days || []).find((x) => x.date === ymd);
+  const posts = box ? box.posts : [];
+  const frees = (d.slots || []).filter((s) => s.free && pubDate(s.slot_at_paris) === ymd);
+  const at = (item) => (item.__free ? item.slot_at_paris : (item.slot_at_paris || item.published_at_paris || ""));
+  return [...posts, ...frees.map((s) => ({ __free: true, ...s }))].sort((a, b) => at(a).localeCompare(at(b)));
+}
+
+function pubDayBoxHtml(d, ymd, extraClass) {
+  const items = pubDayItems(d, ymd);
+  const count = items.filter((it) => !it.__free).length;
+  const body = items.map((it) => (it.__free ? pubFreeSlot(it)
+    : pubPost(it, `<span class="pub-day-time">${esc(pubTime(it.slot_at_paris || it.published_at_paris))}</span>`))).join("");
+  return `<div class="cal-day${pubBoxClass(count) ? ` ${pubBoxClass(count)}` : ""}${ymd === pubToday() ? " today" : ""}${extraClass ? ` ${extraClass}` : ""}" data-date="${esc(ymd)}">
+    <div class="cal-day-h"><span class="n">${esc(pubFmt(ymd, { day: "numeric" }))}</span>${count ? `<span class="cal-day-count">${count}</span>` : ""}</div>
+    <div class="cal-day-body">${body}</div>
+  </div>`;
+}
+
+/* Semaine : une case par jour (toutes ses publications, mises à l'échelle avec leur nombre) plutôt qu'une
+   case par heure (TASK-ad4d, remplace la grille horaire de TASK-5c00). */
+function pubCalendarWeek(d) {
   const days = Array.from({ length: 7 }, (_, i) => pubShift(d.week_start, i));
-  let h = `<div class="cal-h"></div>${days.map((ymd) => `<div class="cal-h${ymd === today ? " today" : ""}"><div class="d">${esc(pubFmt(ymd, { weekday: "short" }))}</div><div class="n">${esc(pubFmt(ymd, { day: "numeric" }))}</div></div>`).join("")}`;
-  times.forEach((time) => {
-    h += `<div class="cal-t">${esc(time)}</div>`;
-    days.forEach((ymd, i) => {
-      const s = bySlot[`${i}|${time}`], manual = byOff[`${i}|${time}`];
-      if (s) {
-        const past = Date.parse(s.slot_at) < Date.now();
-        h += `<div class="cal-c slot${past ? " past" : ""}${s.free ? " free" : ""}" data-slot-at="${esc(s.slot_at)}" data-slot="${esc(time)}" aria-label="Créneau ${esc(pubSlotLabel(s.slot_at_paris))}${s.free ? ", libre" : ""}">${s.clip ? pubPost(s.clip) : ""}</div>`;
-      } else if (manual) {
-        h += `<div class="cal-c manual" aria-label="Publication ${esc(pubSlotLabel(manual.slot_at_paris))}">${pubPost(manual)}</div>`;
-      } else h += `<div class="cal-c off"></div>`;
-    });
-  });
-  return `<div class="cal-wrap"><div class="cal" id="pub-cal">${h}</div></div>`;
+  const head = `<div class="cal-h"></div>${days.map((ymd) => `<div class="cal-h${ymd === pubToday() ? " today" : ""}"><div class="d">${esc(pubFmt(ymd, { weekday: "short" }))}</div><div class="n">${esc(pubFmt(ymd, { day: "numeric" }))}</div></div>`).join("")}`;
+  const body = `<div class="cal-row-label"></div>${days.map((ymd) => pubDayBoxHtml(d, ymd)).join("")}`;
+  return `<div class="cal-wrap"><div class="cal cal-boxes" id="pub-cal">${head}${body}</div></div>`;
+}
+
+/* Mois : grille classique (lundi en tête), pas de cible de dépôt (le serveur ne renvoie aucun créneau pour
+   cette plage, SPEC-c100). Les cases hors mois ne sont que du remplissage visuel, jamais une date calculée
+   pour y ranger une publication. */
+function pubCalendarMonth(d) {
+  const first = d.days[0].date;
+  const lead = (pubUtc(first).getUTCDay() + 6) % 7; // lundi = 0
+  const cells = lead + d.days.length;
+  const trailing = (7 - (cells % 7)) % 7;
+  const weekdays = Array.from({ length: 7 }, (_, i) => pubShift(first, i - lead));
+  const head = weekdays.map((ymd) => `<div class="cal-h"><div class="d">${esc(pubFmt(ymd, { weekday: "short" }))}</div></div>`).join("");
+  const blanks = (n) => Array.from({ length: n }, () => `<div class="cal-day blank"></div>`).join("");
+  const body = `${blanks(lead)}${d.days.map((day) => pubDayBoxHtml(d, day.date, "small")).join("")}${blanks(trailing)}`;
+  return `<div class="cal-wrap"><div class="cal-month" id="pub-cal">${head}${body}</div></div>`;
+}
+
+/* Jour : liste horaire détaillée (heure, compte, service, titre, statut), pas une case. */
+function pubCalendarDay(d) {
+  const ymd = d.range_start;
+  const items = pubDayItems(d, ymd);
+  if (!items.length) return `<p class="reason">Aucune publication ce jour.</p>`;
+  const row = (it) => it.__free
+    ? pubFreeSlot(it, `<span class="pub-day-time">${esc(pubTime(it.slot_at_paris))}</span><span class="muted">Créneau libre</span>`)
+    : pubPost(it, `<span class="pub-day-time">${esc(pubTime(it.slot_at_paris || it.published_at_paris))}</span>${pubChip(it)}`);
+  return `<div class="pub-day-list" id="pub-cal">${items.map(row).join("")}</div>`;
+}
+
+function pubCalendar(d) {
+  if (d.range === "day") return pubCalendarDay(d);
+  if (d.range === "month") return pubCalendarMonth(d);
+  return pubCalendarWeek(d);
 }
 
 /* Ligne de detail d'une publication terminee : « programmee » tant que l'heure n'est pas passee, « publie » ensuite. */
@@ -209,15 +262,33 @@ function pubAccounts(d) {
   return (d && d.accounts) || (pubPosts.data && pubPosts.data.accounts) || [];
 }
 
+// Libellés de navigation par plage (TASK-ad4d) : les trois jeux de textes vivent tous dans la source, quelle
+// que soit la vue active, pour que « Semaine précédente »/« Semaine suivante » restent toujours trouvables.
+const PUB_RANGE_LABELS = {
+  day: { prev: "Jour précédent", next: "Jour suivant", today: "Aujourd'hui" },
+  week: { prev: "Semaine précédente", next: "Semaine suivante", today: "Cette semaine" },
+  month: { prev: "Mois précédent", next: "Mois suivant", today: "Ce mois" },
+};
+const PUB_RANGE_OPTS = [["day", "Jour"], ["week", "Semaine"], ["month", "Mois"]];
+
+/* Libellé de la plage affichée, calculé depuis les bornes renvoyées par le serveur (jamais recalculé ici). */
+function pubRangeLabel(d) {
+  if (!d) return "";
+  if (d.range === "day") return pubFmt(d.range_start, { weekday: "long", day: "numeric", month: "long", year: "numeric" });
+  if (d.range === "month") return pubFmt(d.range_start, { month: "long", year: "numeric" });
+  return `${pubFmt(d.week_start, { day: "numeric", month: "short" })} au ${pubFmt(d.week_end, { day: "numeric", month: "short", year: "numeric" })}`;
+}
+
 function pubToolbar(d) {
-  const weekLabel = d ? `${pubFmt(d.week_start, { day: "numeric", month: "short" })} au ${pubFmt(d.week_end, { day: "numeric", month: "short", year: "numeric" })}` : "";
+  const labels = PUB_RANGE_LABELS[pubUi.range];
   const style = d && d.account ? `<span class="muted">Créneaux du compte (écran Comptes)</span>` : "";
   return `<div class="toolbar pub-toolbar">
     <select class="input" id="pub-account" aria-label="Compte de publication"><option value="">Tous les comptes</option>${pubAccounts(d).map((a) => `<option value="${esc(a.id)}"${a.id === pubUi.account ? " selected" : ""}>${esc(pubAccountText(a))}</option>`).join("")}</select>
-    <div class="row" style="gap:4px"><button type="button" class="icon-btn" data-week="-1" aria-label="Semaine précédente"${d ? "" : " disabled"}>${icon("chevron-left")}</button>
-      <h2 style="font-size:16px;min-width:11ch;text-align:center">${esc(weekLabel)}</h2>
-      <button type="button" class="icon-btn" data-week="1" aria-label="Semaine suivante"${d ? "" : " disabled"}>${icon("chevron-right")}</button>
-      <button type="button" class="btn btn-xs btn-ghost" data-week="0">Cette semaine</button></div>
+    <div class="seg" role="group" aria-label="Vue du calendrier">${PUB_RANGE_OPTS.map(([k, label]) => `<button type="button" class="${k === pubUi.range ? "on" : ""}" data-range="${k}" aria-pressed="${k === pubUi.range}">${label}</button>`).join("")}</div>
+    <div class="row" style="gap:4px"><button type="button" class="icon-btn" data-week="-1" aria-label="${esc(labels.prev)}"${d ? "" : " disabled"}>${icon("chevron-left")}</button>
+      <h2 style="font-size:16px;min-width:11ch;text-align:center">${esc(pubRangeLabel(d))}</h2>
+      <button type="button" class="icon-btn" data-week="1" aria-label="${esc(labels.next)}"${d ? "" : " disabled"}>${icon("chevron-right")}</button>
+      <button type="button" class="btn btn-xs btn-ghost" data-week="0">${esc(labels.today)}</button></div>
     <span class="grow"></span>
     <span class="pub-account-style">${style}</span>
     <div class="legend"><span><i style="background:var(--info)"></i>planifié / programmé</span><span><i style="background:var(--ok)"></i>publié</span><span><i style="background:var(--bad)"></i>échec</span></div>
@@ -1203,7 +1274,19 @@ function pubWire(body) {
   if (sel) sel.onchange = () => { pubUi.account = sel.value; pubUi.week = ""; pubUi.data = null; pubUi.error = null; pubUi.html = ""; renderCurrent(); };
   $$("[data-week]", body).forEach((b) => (b.onclick = () => {
     const step = Number(b.dataset.week);
-    pubUi.week = step === 0 ? "" : pubShift(pubUi.data.week_start, 7 * step);
+    if (step === 0) pubUi.week = "";
+    else if (pubUi.range === "day") pubUi.week = pubShift(pubUi.data.range_start, step);
+    else if (pubUi.range === "month") pubUi.week = pubShiftMonth(pubUi.data.range_start, step);
+    else pubUi.week = pubShift(pubUi.data.week_start, 7 * step);
+    pubUi.data = null; pubUi.html = "";
+    renderCurrent();
+  }));
+  // Vue Jour / Semaine / Mois (TASK-ad4d) : retenue pendant la session, on repart d'aujourd'hui dans la
+  // nouvelle vue plutôt que de traduire l'ancre affichée (plus simple et plus prévisible).
+  $$("[data-range]", body).forEach((b) => (b.onclick = () => {
+    if (pubUi.range === b.dataset.range) return;
+    pubUi.range = b.dataset.range;
+    pubUi.week = "";
     pubUi.data = null; pubUi.html = "";
     renderCurrent();
   }));
