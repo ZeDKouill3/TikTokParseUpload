@@ -10,6 +10,178 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ## [Non publié]
 
+## [0.4.0] - 2026-10-03
+
+YouTube Shorts et publication avancée : publication immédiate ou programmée
+sur YouTube (comme TikTok), séries programmées, approbation groupée, calendrier
+de publication toujours visible, styles détachés du compte de publication,
+éditeur d'agencement letterbox, journal global de toutes les actions, et une
+série de correctifs de fiabilité (revues de code sur la publication, les
+comptes, le worker et la transcription). Pas de fichier de notes séparé pour
+cette version : cette section du changelog suffit.
+
+### Ajouté
+
+**YouTube**
+
+- Comptes YouTube (service `youtube` à côté de `tiktok`), connexion par un
+  Chrome normal sur `studio.youtube.com`, « prêt à publier » vérifié comme
+  pour TikTok (nom de chaîne et identifiant de chaîne enregistrés).
+- Publication sur YouTube Shorts, immédiate ou programmée, par pilotage de
+  YouTube Studio (`clipper/youtube.py`) : titre, description, visibilité,
+  case « conçue pour les enfants », `#Shorts` ajouté si absent, lien
+  `youtube.com/shorts/<id>` enregistré ; plafond de publications par jour et
+  écart minimal entre deux publications (SPEC-5e50) ; toutes les dates
+  saisies (TikTok et YouTube) en heure de Paris, jamais celle du PC.
+
+**Publication et séries**
+
+- « Programmer une série » : choisis un compte, un style (optionnel), un
+  nombre de vidéos et un intervalle en heures ; Clipper choisit les N
+  meilleurs clips validés (score décroissant, parties d'un clip ensemble et
+  dans l'ordre), calcule les dates (passage heure d'été/hiver géré), affiche
+  un aperçu, puis crée les publications d'un coup (SPEC-1ed3).
+- Le mode automatique d'une série (programmée ou non) ne pioche plus que
+  dans les clips déjà validés (approuvés) du compte choisi ; le nombre de
+  vidéos demandé est plafonné au nombre de clips réellement disponibles, et
+  une coche « Parties ensemble » (activée par défaut) impose qu'un clip
+  découpé en plusieurs parties soit toujours programmé ou publié en entier.
+
+**Approbation**
+
+- Écran Clips : sélection multiple et approbation groupée pour un même
+  compte (« Sélectionner », cases à cocher, barre d'action en bas) ; cocher
+  une partie d'un clip découpé sélectionne toute sa série ; tout ou rien
+  (un clip déjà publié ou refusé dans la sélection annule tout).
+
+**Calendrier**
+
+- Écran Publication : le calendrier hebdomadaire est désormais toujours
+  affiché (passé et futur, publications Clipper et déclarées manuellement),
+  même sans compte choisi ni créneaux réguliers ; la liste des clips validés
+  à publier n'apparaît plus deux fois (fusion en une seule liste « En
+  attente ») ; troisième façon de dater une publication : « Après la
+  dernière programmation + N h ».
+
+**Styles et agencement**
+
+- Éditeur d'agencement visuel pour le format letterbox (classique), sur le
+  modèle de celui du format stream `split` : zones réglables par
+  glisser/redimensionner ou valeurs numériques (vidéo nette, titre d'écran,
+  bande des sous-titres, pseudo de chaîne), avec retour au standard du
+  dépôt par un bouton.
+
+**Journal**
+
+- Journal global de toutes les actions, tous processus confondus (`serve`,
+  `worker`, `run`, CLI) : un fichier par jour sous `logs/` (horodatage
+  Europe/Paris), purgé automatiquement au-delà de 2 jours, écran « Journal »
+  dans la console (menu Configuration). Chaque requête web et chaque action
+  qui modifie des données (comptes, publications, styles...) y est
+  consignée, mots de passe et jetons masqués.
+
+**Moments**
+
+- Grille de notation (`rubric.toml`) : plancher `min_moments_cap` (3 par
+  défaut) sous le plafond horaire, pour qu'une courte vidéo avec plusieurs
+  bons moments n'en garde pas qu'un seul (SPEC-4063 règle 4).
+
+**Transcription**
+
+- Chaque tranche de correction réussie est mise en cache séparément : un
+  nouveau passage de l'étape `transcribe` ne redemande que les tranches
+  manquantes au lieu de tout refaire si une seule bloque ; délai par tranche
+  réglable (`[transcribe] fix_timeout_s`) ; une tranche en échec transitoire
+  est relancée une fois seule avant de faire échouer toute l'étape.
+
+### Modifié
+
+**Styles et agencement**
+
+- Un style (preset de chaîne) n'a plus de compte de publication ni de
+  créneaux associés : le compte se choisit par publication, et les créneaux
+  réguliers se règlent désormais sur le compte lui-même, dans l'écran
+  Comptes (SPEC-6076 R2). Un preset existant qui avait encore un
+  compte et des créneaux est migré automatiquement (créneaux reportés sur
+  ce compte s'il n'en a pas déjà, avertissement journalisé une fois).
+
+**Comptes**
+
+- Écran Comptes : créneaux réguliers de publication réglables par compte
+  (ajout/suppression), repris par le worker et affichés dans le calendrier
+  de Publication.
+
+**Worker et fiabilité**
+
+- Un seul compte piloté à la fois, tous services confondus (TikTok et
+  YouTube), par un verrou de pilotage inter-processus ; la prise en main
+  d'une publication programmée est atomique (vérifiée sous verrou avant de
+  piloter le navigateur) ; une série dont les parties sont liées n'avance
+  plus à la partie N tant que la partie N-1 n'est pas publiée.
+- L'annulation d'une vidéo depuis la console passe par la file de traitement
+  (le serveur web ne crée plus de `Worker` lui-même) : plus d'erreur 500 à
+  l'annulation, et aucune publication en cours n'est mise en échec par un
+  arrêt du serveur.
+
+### Corrigé
+
+- **YouTube** : l'envoi d'une vidéo s'ouvre désormais par « Créer » ->
+  « Importer des vidéos » ; l'ancienne URL directe d'envoi redirigeait
+  silencieusement vers le tableau de bord et faisait échouer la publication.
+- **Publication, comptes, styles** (revue de code) : attribuer un style à
+  une vidéo qui n'en avait pas ne fait plus republier un clip déjà publié ni
+  perdre ses publications antérieures ; l'approbation groupée est
+  réellement tout ou rien (tous les clips validés avant toute écriture) ;
+  suppression d'un style avec des publications en cours refusée (liste des
+  publications concernées) ; réglages de publication (visibilité,
+  commentaires...) non perdus à l'approbation ; accès concurrent à
+  `accounts.json` protégé par un verrou inter-processus ; plafonds
+  quotidiens et écart minimal calculés dans le fuseau du compte ; publier un
+  clip d'une vidéo sans style accepté dès que le compte est choisi.
+- **Worker, pipeline, transcription** (revue de code) : une erreur sur une
+  vidéo ou sur un fichier de file d'attente illisible n'arrête plus la
+  boucle du worker (journalisée, vidéo suivante traitée) ; le mode choisi
+  pour un style est bien transmis au sous-processus de traitement ; les
+  décisions de revue humaine sont prises en compte après la génération des
+  sous-titres (captions) et non avant ; `retry_delays` vide ne bloque plus
+  un re-essai ; une correction identique à la précédente n'est plus comptée
+  comme un refus ; une ponctuation déjà présente n'est plus doublée.
+- **Publication** : une entrée déjà publiée, en cours de pilotage ou
+  programmée ne peut plus être approuvée ni refusée par erreur (y compris
+  une partie sœur d'une série) ; une publication programmée ou déjà publiée
+  via Clipper n'est plus annulable par erreur ; une partie ne s'approuve que
+  si la précédente est publiée ; les créneaux déjà pris par un compte
+  comptent pour tous les styles confondus (plus de double réservation d'un
+  même instant) ; l'annulation d'une série en échec partiel liste
+  désormais les publications déjà prises en charge par le worker au lieu
+  d'échouer en silence.
+- **Journal** : le handler du journal global n'est plus fermé par la
+  reconfiguration du logging d'uvicorn (plus jamais d'erreur 500 une fois le
+  serveur monté).
+- **Console** : aperçu d'une série relancé automatiquement à chaque saisie
+  (le bouton « Valider » ne reste plus grisé à tort, le nombre annoncé reste
+  à jour) ; résumé des dates refusées affiché dans l'aperçu d'une série ;
+  service (TikTok ou YouTube) affiché dans le choix du compte de l'écran
+  Clips.
+
+### Retiré
+
+- Clés `[channel] tiktok_account` et `[channel] slots` d'un preset de style :
+  migrées automatiquement vers le compte concerné puis retirées (voir
+  « À savoir pour migrer » ci-dessous). Un style sans publication associée
+  jusqu'ici continue de fonctionner, sans ces clés.
+
+### À savoir pour migrer
+
+- Un preset de style (`presets/<nom>.toml`) qui avait encore `tiktok_account`
+  et `slots` dans sa table `[channel]` est migré tout seul au prochain
+  chargement : ses créneaux passent sur ce compte TikTok (sauf si le compte
+  a déjà des créneaux, auquel cas il n'est pas écrasé) et les deux clés sont
+  retirées du preset à la prochaine sauvegarde. Règle les créneaux de
+  publication depuis l'écran Comptes désormais, pas depuis l'écran Styles.
+- Nouveau dossier `logs/` (journal global, un fichier par jour) : ignoré par
+  git, se purge tout seul au-delà de 2 jours, rien à faire.
+
 ## [0.3.0] - 2026-10-03
 
 Pré-version « prête pour l'usage réel » : corrections et réglages issus du
@@ -339,7 +511,8 @@ verticaux sous-titrés, en local.
 - Aucune publication automatique sur TikTok : le dépôt produit les clips
   et leurs métadonnées, la mise en ligne reste manuelle.
 
-[Non publié]: https://github.com/ZeDKouill3/TikTokParseUpload/compare/v0.3.0...HEAD
+[Non publié]: https://github.com/ZeDKouill3/TikTokParseUpload/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/ZeDKouill3/TikTokParseUpload/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/ZeDKouill3/TikTokParseUpload/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/ZeDKouill3/TikTokParseUpload/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/ZeDKouill3/TikTokParseUpload/releases/tag/v0.1.0
