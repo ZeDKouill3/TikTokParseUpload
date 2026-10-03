@@ -258,7 +258,9 @@ class _Check:
     def channel_name(self) -> tuple[str | None, str | None]:
         """Nom de la chaine : le texte « Votre chaîne <nom> » de la navigation."""
         prefix = str(self.sel["labels"]["channel_prefix"])
-        pattern = re.compile(re.escape(prefix) + r"[ \t ]+([^\n]*)", re.IGNORECASE)
+        # Vraie page (relevé 2026-10-03) : « Votre chaîne » puis le nom sur la ligne suivante ;
+        # le nom sur la même ligne reste accepté.
+        pattern = re.compile(re.escape(prefix) + r"[ \t ]*\n?[ \t ]*([^\n]*)", re.IGNORECASE)
         found = False
         for nav in self.page.query_selector_all(self.sel["selectors"]["navigation"]):
             match = pattern.search(str(nav.inner_text()))

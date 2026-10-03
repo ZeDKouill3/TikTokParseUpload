@@ -68,9 +68,8 @@ final_schedule = "Programmer"
 
 [selectors]
 # Navigation de Studio (ARIA : navigation > img dont le nom est le nom de la chaine) ; son texte porte
-# « Votre chaîne <nom> ». Le role ARIA est celui releve ; le selecteur CSS qui le vise n'a pas ete relu
-# sur la vraie page.
-# NON VÉRIFIÉ
+# « Votre chaîne », puis le nom de la chaine sur la ligne suivante.
+# vérifié 2026-10-03 : 1 élément sur la vraie page, inner_text « Votre chaîne », <nom>, « Tableau de bord »... (une ligne chacun)
 navigation = "[role='navigation']"
 # Champ de fichier de la dialog d'envoi (set_input_files).
 # vérifié 2026-10-03

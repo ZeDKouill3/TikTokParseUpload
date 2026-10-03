@@ -265,8 +265,15 @@ def test_a_channel_page_without_the_channel_label_is_not_ready(tmp_path, monkeyp
     assert result["ready"] is False and "Votre chaîne" in result["reason"]
 
 
+def test_the_channel_name_on_the_next_line_as_on_the_real_page_is_read(tmp_path, monkeypatch):
+    # Relevé réel 2026-10-03 : la navigation affiche « Votre chaîne », puis le nom sur la ligne suivante.
+    page = FakeStudio(nav_text="Votre chaîne\nMa Chaîne\nTableau de bord\nContenus")
+    result, _, _ = verify(tmp_path, monkeypatch, page)
+    assert result["ready"] is True and result["channel"]["name"] == "Ma Chaîne"
+
+
 def test_an_empty_channel_name_is_not_ready(tmp_path, monkeypatch):
-    page = FakeStudio(nav_text="Votre chaîne   \nContenu")
+    page = FakeStudio(nav_text="Votre chaîne   \n\nContenu")
     result, _, _ = verify(tmp_path, monkeypatch, page)
     assert result["ready"] is False and "nom" in result["reason"]
 
