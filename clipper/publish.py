@@ -14,6 +14,7 @@ pipeline / worker).
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -22,6 +23,8 @@ from zoneinfo import ZoneInfo
 from clipper import channel as channel_mod
 from clipper import tiktok, youtube
 from clipper.config import ConfigError
+
+log = logging.getLogger(__name__)
 
 _DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 
@@ -40,7 +43,7 @@ _POSTPONE_MAX_SLOTS = 512
 VALID_STATUSES = ("approved", "scheduled", "published", "failed", "rejected")
 _NON_EDITABLE_STATUSES = ("scheduled", "published")
 _NON_MOVABLE_STATUSES = ("rejected", "published")
-_PREVIOUS_PART_STATUSES = ("approved", "scheduled")
+_PREVIOUS_PART_STATUSES = ("approved", "scheduled", "published")
 _ENTRY_FIELDS = (
     "video_id", "clip_id", "series_id", "part", "status",
     "slot_at", "decided_at", "published_at", "error",
@@ -213,13 +216,14 @@ def series_clip_ids(video_id: str, clip_id: str, output_dir: str | Path = "outpu
     return [cid for _, cid in members]
 
 
-def _next_free_slot(schedule: dict[str, Any], entries: list[dict[str, Any]], after: datetime) -> datetime:
-    taken = {entry["slot_at"] for entry in entries if entry.get("slot_at") is not None}
+def _next_free_slot(schedule: dict[str, Any], taken: set[datetime], after: datetime) -> datetime:
+    """``taken`` : instants (``datetime``) deja occupes par le compte, compares comme des instants (SPEC-6076 R2) :
+    le meme instant en +00:00 ou +02:00 est le meme creneau, jamais deux chaines ISO differentes."""
     n = len(taken) + 1
     while True:
         candidates = channel_mod.next_slots(schedule, after, n)
         for candidate in candidates:
-            if _iso(candidate) not in taken:
+            if candidate not in taken:
                 return candidate
         if len(candidates) < n:
             raise PublishError("aucun creneau disponible pour ce compte")
@@ -293,10 +297,18 @@ def approve(
     }
     with _locked(path):
         entries = _load_entries(path)
+        existing = _find_entry(entries, video_id, clip_id)
+        if existing is not None:
+            _refuse_in_progress(existing, "approbation")
+            if existing["status"] not in ("approved", "failed"):
+                raise PublishError(
+                    f"approbation refusé pour {video_id}/{clip_id} : statut {existing['status']!r}"
+                )
         if series_id is not None and part is not None and part > 1:
             _require_previous_part(entries, output_dir, video_id, clip_id, series_id, part)
         if schedule and schedule["slots"]:
-            slot = _next_free_slot(schedule, entries, now_dt)
+            taken = _account_taken_slots(account, state_dir, presets_dir, base, exclude=(video_id, clip_id))
+            slot = _next_free_slot(schedule, taken, now_dt)
             entry["status"] = "scheduled"
             entry["slot_at"] = _iso(slot)
 
@@ -332,6 +344,25 @@ def _reject_locked(
     entries: list[dict[str, Any]], path: Path, video_id: str, clip_id: str,
     series_id: str | None, part: int | None, now_dt: datetime, output_dir: str | Path,
 ) -> dict[str, Any]:
+    members: list[tuple[str, str | None, int | None]] = [(clip_id, series_id, part)]
+    if series_id is not None:
+        for sibling_id in _sibling_clip_ids(output_dir, video_id, series_id, exclude=clip_id):
+            sibling_sidecar = _read_sidecar(output_dir, video_id, sibling_id)
+            _, sibling_part = _series_info(video_id, sibling_id, sibling_sidecar)
+            members.append((sibling_id, series_id, sibling_part))
+
+    # Verifie TOUS les membres (le clip et ses parties sœurs) avant la moindre ecriture (ADR-ad2e) :
+    # un clip publie, ou en cours de pilotage, ne doit jamais devenir 'rejected', meme via une de ses
+    # parties sœurs.
+    for cid, _sid, _part in members:
+        existing = _find_entry(entries, video_id, cid)
+        if existing is not None:
+            _refuse_in_progress(existing, "refus")
+            if existing["status"] == "published":
+                raise PublishError(
+                    f"refus refusé pour {video_id}/{cid} : statut 'published'"
+                )
+
     def _reject_one(cid: str, series_id: str | None, part: int | None) -> dict[str, Any]:
         existing = _find_entry(entries, video_id, cid)
         entry = dict(existing) if existing is not None else {
@@ -345,15 +376,9 @@ def _reject_locked(
         _upsert_entry(entries, entry)
         return entry
 
-    entry = _reject_one(clip_id, series_id, part)
-    if series_id is not None:
-        for sibling_id in _sibling_clip_ids(output_dir, video_id, series_id, exclude=clip_id):
-            sibling_sidecar = _read_sidecar(output_dir, video_id, sibling_id)
-            _, sibling_part = _series_info(video_id, sibling_id, sibling_sidecar)
-            _reject_one(sibling_id, series_id, sibling_part)
-
+    rejected = [_reject_one(cid, sid, p) for cid, sid, p in members]
     _save_entries(path, entries)
-    return entry
+    return rejected[0]
 
 
 def move(
@@ -374,11 +399,13 @@ def move(
     if not schedule or not schedule["slots"]:
         raise PublishError(f"déplacement impossible pour {video_id}/{clip_id} : le compte n'a aucun créneau (écran Comptes)")
     with _locked(path):
-        return _move_locked(path, video_id, clip_id, slot_at, schedule)
+        return _move_locked(path, video_id, clip_id, slot_at, schedule, state_dir=state_dir,
+                             presets_dir=presets_dir, base=base)
 
 
 def _move_locked(
     path: Path, video_id: str, clip_id: str, slot_at: datetime, schedule: dict[str, Any],
+    *, state_dir: str | Path | None = None, presets_dir: str | Path = "presets", base: str | Path = "config.toml",
 ) -> dict[str, Any]:
     entries = _load_entries(path)
     entry = _find_entry(entries, video_id, clip_id)
@@ -397,15 +424,14 @@ def _move_locked(
     if not any(s["day"] == day and s["time"] == time_str for s in schedule["slots"]):
         raise PublishError(f"creneau hors des creneaux du compte pour {video_id}/{clip_id} : {slot_at}")
 
-    slot_iso = _iso(slot_at)
-    for other in entries:
-        if other is entry:
-            continue
-        if other.get("slot_at") == slot_iso:
-            raise PublishError(f"creneau deja pris pour {video_id}/{clip_id} : {slot_at}")
+    # Creneaux pris = instants de TOUTES les entrees du compte, tous styles confondus (SPEC-6076 R2),
+    # compares comme des instants (le meme instant en +00:00 ou +02:00 est le meme creneau).
+    taken = _account_taken_slots(entry_account(entry), state_dir, presets_dir, base, exclude=(video_id, clip_id))
+    if slot_at in taken:
+        raise PublishError(f"creneau deja pris pour {video_id}/{clip_id} : {slot_at}")
 
     entry = dict(entry)
-    entry["slot_at"] = slot_iso
+    entry["slot_at"] = _iso(slot_at)
     entry["status"] = "scheduled"
     _upsert_entry(entries, entry)
     _save_entries(path, entries)
@@ -577,6 +603,25 @@ def _account_entries(
     return found
 
 
+def _account_taken_slots(
+    account: str | None, state_dir: str | Path | None, presets_dir: str | Path, base: str | Path,
+    *, exclude: tuple[str, str] | None = None,
+) -> set[datetime]:
+    """Instants (``datetime``) deja occupes par ``account``, toutes chaines confondues (SPEC-6076 R2) :
+    compares comme des instants, jamais comme des chaines ISO (le meme instant en +00:00 ou +02:00 est
+    le meme creneau). ``exclude`` ecarte l'entree qu'on deplace/programme elle-meme."""
+    if not account:
+        return set()
+    taken: set[datetime] = set()
+    for _name, entry in _account_entries(account, state_dir, presets_dir, base):
+        if exclude is not None and (entry["video_id"], entry["clip_id"]) == exclude:
+            continue
+        slot_at = entry.get("slot_at")
+        if slot_at:
+            taken.add(datetime.fromisoformat(slot_at))
+    return taken
+
+
 def account_publish_times(
     account: str, *, state_dir: str | Path | None = None, presets_dir: str | Path = "presets",
     base: str | Path = "config.toml",
@@ -697,13 +742,15 @@ def postpone(
             raise PublishError(f"clip absent de la file de publication : {video_id}/{clip_id}")
         if entry["status"] != "scheduled" or not entry["slot_at"]:
             raise PublishError(f"report impossible pour {video_id}/{clip_id} : statut {entry['status']!r} (attendu : 'scheduled')")
-        taken = {e["slot_at"] for e in entries if e is not entry and e.get("slot_at")}
+        # Creneaux pris = instants de TOUTES les entrees du compte, tous styles confondus (SPEC-6076 R2),
+        # compares comme des instants (le meme instant en +00:00 ou +02:00 est le meme creneau).
+        taken = _account_taken_slots(entry_account(entry), state_dir, presets_dir, base, exclude=(video_id, clip_id))
         after = max(datetime.fromisoformat(entry["slot_at"]), _now(now))
         slot = None
         n = _POSTPONE_FIRST_BATCH
         while slot is None and n <= _POSTPONE_MAX_SLOTS:
             slot = next((c for c in channel_mod.next_slots(schedule, after, n)
-                         if _iso(c) not in taken and allowed(c) is None), None)
+                         if c not in taken and allowed(c) is None), None)
             n *= 2
         if slot is None:
             raise PublishError(f"aucun créneau libre et permis pour reporter {video_id}/{clip_id} ({reason})")
@@ -722,7 +769,9 @@ def unschedule(
     *,
     state_dir: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Repasse un clip programme en 'approved', sans creneau."""
+    """Repasse un clip programme en 'approved', sans creneau. Refuse un clip 'rejected', et un clip
+    'published' publie par Clipper (``tiktok_state`` present) : seule l'annulation d'une declaration
+    manuelle (« Marquer publié » sans suivi TikTok/YouTube) reste permise."""
     path = _state_path(channel, state_dir)
     with _locked(path):
         entries = _load_entries(path)
@@ -730,6 +779,13 @@ def unschedule(
         if entry is None:
             raise PublishError(f"clip absent de la file de publication : {video_id}/{clip_id}")
         _refuse_in_progress(entry, "retour en attente")
+        if entry["status"] == "rejected":
+            raise PublishError(f"retour en attente refusé pour {video_id}/{clip_id} : statut 'rejected'")
+        if entry["status"] == "published" and entry.get("tiktok_state"):
+            raise PublishError(
+                f"retour en attente refusé pour {video_id}/{clip_id} : publication déjà faite "
+                f"({entry['tiktok_state']}), annule-la depuis TikTok/YouTube Studio"
+            )
 
         entry = dict(entry)
         entry["status"] = "approved"
@@ -1033,9 +1089,12 @@ def update_post(
         if caption is not None or hashtags is not None:
             _write_caption(output_dir, video_id, clip_id, _read_sidecar(output_dir, video_id, clip_id),
                            caption, hashtags, now_dt)
+        # Une entree 'approved' (compte sans creneau, ou clip approuve a l'ancienne) devient 'scheduled' :
+        # sinon le worker (qui ne prend que 'scheduled') ne la publie jamais (revue r-comptes 6).
+        new_status = "scheduled" if entry["status"] == "approved" else entry["status"]
         entry = dict(entry)
-        entry.update(account=new_account, publish_mode=new_mode, slot_at=_iso(when), post_options=new_options,
-                     waiting_reason=None, postponed_reason=None, service=service)
+        entry.update(status=new_status, account=new_account, publish_mode=new_mode, slot_at=_iso(when),
+                     post_options=new_options, waiting_reason=None, postponed_reason=None, service=service)
         _upsert_entry(entries, entry)
         _save_entries(path, entries)
     return entry
@@ -1361,6 +1420,15 @@ def preview_series(
 
     dates = plan_series_dates(start_at, interval_hours, used) if used else []
 
+    # Refus des reglages du post (visibilite privee/non publique programmee) une seule fois : si la
+    # creation le refuserait pour chaque publication de la serie (meme reglages, seule la date change),
+    # l'apercu doit le dire aussi (revue r-publication M1), jamais "ok" puis refuse a la creation.
+    settings_refusal: str | None = None
+    try:
+        _check_post_input("scheduled", account, start_at, None, settings, now_dt, service)
+    except PublishError as exc:
+        settings_refusal = str(exc)
+
     items: list[dict[str, Any]] = []
     committed: list[datetime] = list(
         planned_times(account, state_dir=state_dir, presets_dir=presets_dir, base=base)
@@ -1372,7 +1440,7 @@ def preview_series(
         for clip_id in unit["clip_ids"]:
             when = dates[i]
             i += 1
-            refusal = _series_item_refusal(when, settings, now_dt, service)
+            refusal = settings_refusal or _series_item_refusal(when, settings, now_dt, service)
             if refusal is None:
                 reason = tiktok.check_limits(committed, when, settings, tz)
                 if reason is not None:
@@ -1444,11 +1512,20 @@ def create_series(
                 presets_dir=presets_dir, base=base, service=service,
             )
             created.append((item["channel"], entry))
-    except (PublishError, channel_mod.ChannelError, ConfigError):
+    except Exception as exc:  # toute exception (ADR-ad2e) : pas seulement PublishError/ChannelError/ConfigError,
+        # un OSError ou un ValueError (sidecar JSON corrompu) doit aussi declencher l'annulation
+        stuck: list[str] = []
         for channel, entry in created:
             try:
                 cancel_post(entry["video_id"], entry["clip_id"], channel, state_dir=state_dir)
-            except PublishError:
-                pass
-        raise
+            except PublishError as cancel_exc:
+                stuck.append(f"{entry['video_id']}/{entry['clip_id']} ({cancel_exc})")
+        if not stuck:
+            raise
+        message = (
+            f"série interrompue ({exc}) : {len(stuck)} publication(s) déjà prise(s) par le worker, "
+            f"non annulée(s) : {'; '.join(stuck)}"
+        )
+        log.error(message)
+        raise PublishError(message) from exc
     return [entry for _, entry in created]
