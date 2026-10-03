@@ -694,7 +694,8 @@ from datetime import timedelta  # noqa: E402
 from zoneinfo import ZoneInfo  # noqa: E402
 
 SHORT_ID = "OOOeOwbvu34"
-UPLOAD_URL = f"{STUDIO}/channel/{UC}/videos/upload?d=ud"
+# Entrees reelles du menu « Créer » (relevé 2026-10-03, Chrome piloté : research/youtube-inspect/yt_probe2.py).
+DEFAULT_MENU_ITEMS = ("Importer des vidéos", "Passer au direct", "Nouvelle playlist", "Nouveau podcast")
 LONDON = ZoneInfo("Europe/London")
 PARIS = ZoneInfo("Europe/Paris")
 
@@ -763,14 +764,17 @@ class FakeUpload:
     « Bienvenue » est presente. ``upload_polls`` : lectures avant que le bouton final soit actif. ``success_polls`` :
     lectures avant la fenetre de succes."""
 
-    def __init__(self, *, welcome=True, studio_redirect=CHANNEL_URL, upload_redirect=UPLOAD_URL, link=True,
+    def __init__(self, *, welcome=True, studio_redirect=CHANNEL_URL, menu_items=DEFAULT_MENU_ITEMS, link=True,
                  upload_polls=0, success_polls=0, success_text=None, drop_tz_paris=False, ignore_date=False,
                  ignore_tz=False, text_boxes=2, captcha=False, final_label=None, screenshot_error=None):
         self.sel = _sel()
         self.S, self.L = self.sel["selectors"], self.sel["labels"]
         self.url = "about:blank"
         self.calls: list[tuple] = []
-        self.studio_redirect, self.upload_redirect = studio_redirect, upload_redirect
+        self.studio_redirect = studio_redirect
+        self.menu_open = False
+        self.menu_items = list(menu_items)
+        self.menu_clicked = None
         self.keyboard = FakeKeyboard(self)
         self.focus = None
         self.typed: dict = {}
@@ -807,7 +811,7 @@ class FakeUpload:
     # -- page
     def goto(self, url, **kwargs):
         self.calls.append(("goto", url))
-        self.url = self.studio_redirect if url == STUDIO else self.upload_redirect
+        self.url = self.studio_redirect
 
     def wait_for_timeout(self, ms):
         self.calls.append(("poll", ms))
@@ -836,6 +840,11 @@ class FakeUpload:
     def _button(self, label, on_click=None):
         return El(self, text=label, on_click=on_click)
 
+    def _pick_menu(self, item):
+        self.calls.append(("menu", item))
+        self.menu_clicked = item
+        self.menu_open = False
+
     def query_selector_all(self, selector):
         S, L = self.S, self.L
         if self.captcha and selector in self.sel["detect"]["captcha"]:
@@ -854,6 +863,12 @@ class FakeUpload:
                 if self.success_text is not None and self.polls_success > self.success_polls:
                     shown.append(El(self, text=self.success_text))
             return shown
+        if selector == S["labeled_button"].format(label=L["create"]):
+            return [self._button(L["create"], on_click=lambda: setattr(self, "menu_open", True))]
+        if selector == S["menu_item"]:
+            if not self.menu_open:
+                return []
+            return [El(self, text=item, on_click=(lambda i=item: self._pick_menu(i))) for item in self.menu_items]
         if self.step == -1:
             return [El(self)] if selector == S["file_input"] else []
         if selector == S["file_input"]:
@@ -973,7 +988,10 @@ def test_an_immediate_public_publication_records_the_shorts_url(tmp_path, monkey
     assert page.kids is False  # « Non, elle n'est pas conçue pour les enfants » par defaut
     assert publish.opened == [("ma_chaine", False)]  # Chrome visible, jamais cache (ADR-58c0)
     urls = [c[1] for c in page.calls if c[0] == "goto"]
-    assert urls == [STUDIO, UPLOAD_URL]  # Studio d'abord (identifiant de chaine), puis la page d'envoi de CETTE chaine
+    assert urls == [STUDIO]  # un seul goto : jamais /videos/upload, qui redirige vers le tableau de bord
+    assert page.clicked("Créer") and page.menu_clicked == "Importer des vidéos"
+    order = [c for c in page.calls if c in (("click", "Créer"), ("menu", "Importer des vidéos"), ("upload", str(tmp_path / "04.mp4")))]
+    assert order == [("click", "Créer"), ("menu", "Importer des vidéos"), ("upload", str(tmp_path / "04.mp4"))]
 
 
 def test_the_title_defaults_to_the_screen_title_and_the_description_to_caption_hashtags_and_shorts(tmp_path, monkeypatch):
@@ -1261,16 +1279,8 @@ def test_a_google_login_page_on_studio_stops_with_the_login_code(tmp_path, monke
     assert Path(stop.capture).is_file() and page.files == []
 
 
-def test_a_google_login_page_on_the_upload_page_stops_with_the_login_code(tmp_path, monkeypatch):
-    page = FakeUpload(upload_redirect=LOGIN_URL)
-
-    stop = stop_of(tmp_path, monkeypatch, page)
-
-    assert stop.code == "login" and page.files == []
-
-
 def test_a_google_verification_page_stops_with_the_verification_code(tmp_path, monkeypatch):
-    page = FakeUpload(upload_redirect="https://accounts.google.com/v3/signin/challenge/pwd")
+    page = FakeUpload(studio_redirect="https://accounts.google.com/v3/signin/challenge/pwd")
 
     stop = stop_of(tmp_path, monkeypatch, page)
 
@@ -1285,12 +1295,13 @@ def test_studio_that_does_not_open_a_channel_is_an_unexpected_page_stop(tmp_path
     assert stop.code == "unexpected_page" and "page inattendue" in stop.reason
 
 
-def test_an_upload_page_that_is_not_the_upload_dialog_is_an_unexpected_page_stop(tmp_path, monkeypatch):
-    page = FakeUpload(upload_redirect=f"{STUDIO}/channel/{UC}/videos/short")
+def test_a_menu_without_the_upload_entry_is_an_unexpected_page_stop(tmp_path, monkeypatch):
+    page = FakeUpload(menu_items=("Passer au direct", "Nouvelle playlist", "Nouveau podcast"))
 
     stop = stop_of(tmp_path, monkeypatch, page)
 
-    assert stop.code == "unexpected_page" and page.files == []
+    assert stop.code == "unexpected_page" and "Importer des vidéos" in stop.reason and "Créer" in stop.reason
+    assert page.files == [] and page.menu_clicked is None
 
 
 def test_an_unknown_dialog_stops_instead_of_clicking_blindly(tmp_path, monkeypatch):
@@ -1404,8 +1415,9 @@ def test_clip_payload_reads_the_sidecar_fields_and_refuses_a_broken_sidecar(tmp_
         youtube.clip_payload({**sidecar, "hashtags": None}, tmp_path)
 
 
-@pytest.mark.parametrize("table,key", [("urls", "upload"), ("urls", "short"), ("expect", "short_id_pattern"),
-                                       ("expect", "upload_url_marker"), ("labels", "next"), ("labels", "final_schedule"),
+@pytest.mark.parametrize("table,key", [("urls", "short"), ("expect", "short_id_pattern"),
+                                       ("labels", "create"), ("labels", "upload_menu"), ("labels", "next"),
+                                       ("labels", "final_schedule"), ("selectors", "menu_item"),
                                        ("selectors", "final_button"), ("selectors", "file_input"),
                                        ("success", "published"), ("detect", "captcha"), ("calendar", "months")])
 def test_a_missing_publication_landmark_is_an_explicit_error_naming_the_key(tmp_path, table, key):

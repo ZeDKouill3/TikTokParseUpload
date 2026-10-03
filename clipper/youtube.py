@@ -60,11 +60,11 @@ MODES = ("immediate", "scheduled")
 VISIBILITIES = ("public", "unlisted", "private")
 POST_OPTIONS = ("title", "visibility", "made_for_kids")
 TITLE_MAX = 100              # limite de YouTube (compteur « n/100 » de l'etape Details)
-REQUIRED_PUBLISH_LABELS = ("next", "kids_yes", "kids_no", "visibility_public", "visibility_unlisted",
-                           "visibility_private", "expand_schedule", "timezone_button", "timezone_wanted",
-                           "timezone_forbidden", "final_publish", "final_save", "final_schedule")
-REQUIRED_PUBLISH_SELECTORS = ("file_input", "text_box", "radio", "labeled_button", "expand", "text_input",
-                              "timezone_option", "final_button", "video_link")
+REQUIRED_PUBLISH_LABELS = ("create", "upload_menu", "next", "kids_yes", "kids_no", "visibility_public",
+                           "visibility_unlisted", "visibility_private", "expand_schedule", "timezone_button",
+                           "timezone_wanted", "timezone_forbidden", "final_publish", "final_save", "final_schedule")
+REQUIRED_PUBLISH_SELECTORS = ("file_input", "menu_item", "text_box", "radio", "labeled_button", "expand",
+                              "text_input", "timezone_option", "final_button", "video_link")
 _SHORTS_TAG = re.compile(r"(?<!\w)#shorts\b", re.IGNORECASE)
 
 SELECTORS_PATH = Path(__file__).parent / "assets" / "youtube_selectors.toml"
@@ -137,9 +137,7 @@ def load_selectors(path: str | Path | None = None) -> dict[str, Any]:
     need("selectors", "navigation", str)
     need("modal", "container", str)
     need("modal", "button", str)
-    need("urls", "upload", str)
     need("urls", "short", str)
-    need("expect", "upload_url_marker", str)
     need("expect", "short_id_pattern", str)
     need("expect", "verification_url_markers", list)
     need("expect", "date_value_pattern", str)
@@ -458,7 +456,21 @@ class _Flow:
             if self.on_tick is not None:
                 self.on_tick()
 
-    # -- ouverture de la page d'envoi
+    # -- ouverture de la dialog d'envoi
+    def open_upload_menu(self) -> None:
+        """Clique « Créer » puis l'entree « Importer des videos » du menu : l'URL /videos/upload redirige vers le
+        tableau de bord et n'ouvre jamais la dialog, elle n'est donc plus utilisee. Menu sans l'entree = arret
+        explicite, jamais un autre clic au hasard."""
+        self.click_labeled("labeled_button", "create")
+        self.wait("menu_item")
+        label = str(self.sel["labels"]["upload_menu"])
+        items = [item for item in self.page.query_selector_all(self.sel["selectors"]["menu_item"])
+                 if self.expect_text(item, label)]
+        if not items:
+            raise self.stop("unexpected_page", f"menu « {self.sel['labels']['create']} » sans l'entrée « {label} »")
+        items[0].click()
+        self.pause()
+
     def channel_id(self) -> str:
         self.page.goto(str(self.sel["urls"]["studio"]))
         self.pause()
@@ -640,13 +652,9 @@ class _Flow:
 
     def run(self, clip: dict[str, Any], title: str, mode: str, schedule_at: datetime | None) -> dict[str, Any]:
         sel, settings = self.sel, self.settings
-        channel_id = self.channel_id()
-        self.page.goto(str(sel["urls"]["upload"]).format(channel_id=channel_id))
-        self.guard()
-        if str(sel["expect"]["upload_url_marker"]) not in str(self.page.url):
-            raise self.stop("unexpected_page", f"page inattendue : {self.page.url}")
-        self.pause()
+        self.channel_id()
         self.close_popups()
+        self.open_upload_menu()
 
         self.wait("file_input", state="attached")
         self.page.set_input_files(sel["selectors"]["file_input"], str(clip["video_path"]))
