@@ -199,7 +199,7 @@ def migrate_slots(config: Config, account_id: str, slots: list[dict[str, str]], 
     """Reprend sur le compte les creneaux d'un ancien style (SPEC-6076 R2), une seule fois : rend False, sans rien
     ecrire, si le compte a deja des creneaux (jamais ecrases) ; ``AccountNotFound`` si le compte n'existe pas."""
     slots = validate_slots(slots)
-    with _lock:
+    with _lock, _file_lock(config):
         accounts = _read(config)
         account = _find(accounts, account_id)
         if account.get("slots") or not slots:
@@ -254,6 +254,14 @@ def _write(config: Config, accounts: list[dict[str, Any]]) -> None:
     except OSError as exc:
         Path(tmp).unlink(missing_ok=True)
         raise AccountsError(f"écriture du fichier des comptes impossible : {path} ({type(exc).__name__})") from None
+
+
+def _file_lock(config: Config):
+    """Verrou inter-processus sur le fichier des comptes, en plus du verrou de thread (ADR-35b7, revue r-comptes
+    3) : import tardif pour eviter le cycle accounts <-> channel (channel importe accounts pour DAYS)."""
+    from clipper import channel as channel_mod
+
+    return channel_mod.file_lock(_path(config))
 
 
 def _now() -> str:
@@ -330,7 +338,7 @@ def _find(accounts: list[dict[str, Any]], account_id: str) -> dict[str, Any]:
 def add_account(config: Config, data: Any) -> dict[str, Any]:
     fields = _clean(data, creating=True)
     password = fields.pop("password", "")
-    with _lock:
+    with _lock, _file_lock(config):
         accounts = _read(config)
         account_id = secrets.token_hex(6)
         if password:
@@ -353,7 +361,7 @@ def update_account(config: Config, account_id: str, data: Any) -> dict[str, Any]
     """Champs absents inchangés ; password absent = inchangé, "" = supprimé du coffre."""
     fields = _clean(data, creating=False)
     password = fields.pop("password", None)
-    with _lock:
+    with _lock, _file_lock(config):
         accounts = _read(config)
         account = _find(accounts, account_id)
         if "service" in fields and fields["service"] != account.get("service"):
@@ -373,7 +381,7 @@ def update_account(config: Config, account_id: str, data: Any) -> dict[str, Any]
 
 def delete_account(config: Config, account_id: str) -> None:
     """Supprime le compte ET son entrée du coffre (le coffre d'abord : pas de secret orphelin)."""
-    with _lock:
+    with _lock, _file_lock(config):
         accounts = _read(config)
         account = _find(accounts, account_id)
         if account.get("has_password"):
@@ -438,6 +446,15 @@ def _sync_ready(account: dict[str, Any], account_id: str) -> str | None:
     return None
 
 
+def _login_changed(previous: dict[str, Any] | None, login: dict[str, Any]) -> bool:
+    """Compare l'etat de connexion observe sans ``checked_at`` : un simple rafraichissement de l'horodatage
+    n'est pas un changement a ecrire (revue r-comptes 3)."""
+    if previous is None:
+        return True
+    keys = (set(previous) | set(login)) - {"checked_at"}
+    return any(previous.get(k) != login.get(k) for k in keys)
+
+
 def record_login(config: Config, account_id: str, observed: dict[str, Any]) -> dict[str, Any]:
     """Enregistre la connexion verifiee (``{"state", "checked_at", "expires_at"}``, R2) et recalcule la case
     « pret a publier » (R3) : cochee quand la connexion est verifiee et qu'aucun arret R4 n'attend, decochee
@@ -451,22 +468,25 @@ def record_login(config: Config, account_id: str, observed: dict[str, Any]) -> d
     if channel is not None and not (isinstance(channel, dict) and all(
             isinstance(channel.get(k), str) and channel[k] for k in ("name", "id"))):
         raise AccountsError("chaîne invalide : {\"name\": nom, \"id\": identifiant} attendu")
-    with _lock:
+    with _lock, _file_lock(config):
         accounts = _read(config)
         account = _find(accounts, account_id)
         if account.get("service") == "youtube" and state == "connected" and channel is None:
             raise AccountsError("connexion YouTube sans chaîne : le nom et l'identifiant de la chaîne sont requis")
-        previous = (account.get("login") or {}).get("state")
+        previous_login = account.get("login")
+        previous = (previous_login or {}).get("state")
         if state == "never" and previous in ("connected", "expired"):
             state = "expired"  # Chrome a purge le cookie expire : le compte etait connecte
         login = {"state": state, "checked_at": observed.get("checked_at") or _now(),
                  "expires_at": observed.get("expires_at")}
         if observed.get("reason"):
             login["reason"] = str(observed["reason"])
-        changed = login != account.get("login")
+        changed = _login_changed(previous_login, login)
         account["login"] = login
         if channel is not None:
+            previous_channel = account.get("channel")
             account["channel"] = {"name": channel["name"], "id": channel["id"]}
+            changed = changed or account["channel"] != previous_channel
         change = _sync_ready(account, account_id)
         if changed or change:
             _write(config, accounts)
@@ -478,7 +498,7 @@ def record_login(config: Config, account_id: str, observed: dict[str, Any]) -> d
 def uncheck_ready(config: Config, account_id: str, reason: str) -> bool:
     """Enregistre un arret R4 (captcha, verification...) : la case se decoche et reste decochee, avec la
     raison affichee, tant que ``clear_halt`` n'a pas ete appele ; rend True si la case etait cochee."""
-    with _lock:
+    with _lock, _file_lock(config):
         accounts = _read(config)
         account = _find(accounts, account_id)
         was_ready = bool(account.get("ready_to_publish"))
@@ -495,7 +515,7 @@ def uncheck_ready(config: Config, account_id: str, reason: str) -> bool:
 def clear_halt(config: Config, account_id: str) -> dict[str, Any]:
     """« J'ai regle le probleme » (R3) : efface l'arret R4 en attente ; la case suit alors la derniere connexion
     verifiee (l'appelant la revérifie juste avant). Journalise l'effacement."""
-    with _lock:
+    with _lock, _file_lock(config):
         accounts = _read(config)
         account = _find(accounts, account_id)
         halt = account.pop("r4_halt", None)

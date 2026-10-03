@@ -1023,6 +1023,24 @@ def test_daily_cap_is_refused_with_the_reason_and_the_next_possible_time(isolate
     assert len(_read_state(isolated_cwd, "ma_chaine")) == 1  # rien n'est ecrit, aucun report silencieux
 
 
+def test_daily_cap_uses_the_given_schedule_timezone_not_the_styles(isolated_cwd):
+    """Revue r-comptes 9 : _check_caps (via create_post) compte le jour dans le fuseau du COMPTE (``schedule``),
+    pas celui du style, quand on le lui donne."""
+    from clipper import publish, tiktok
+
+    _setup(isolated_cwd)
+    _write_sidecar(isolated_cwd, "vid1", "04")
+    settings = {**tiktok.CONFIG_DEFAULTS, "max_posts_per_day": 1, "min_gap_minutes": 0}
+    a = datetime(2026, 10, 1, 20, 0, tzinfo=timezone.utc)   # Europe/Paris : 10-01 ; Asia/Tokyo : 10-02
+    b = datetime(2026, 10, 2, 10, 0, tzinfo=timezone.utc)   # Europe/Paris : 10-02 (jour different de a)
+    _post(isolated_cwd, settings=settings, now=a)  # clip 03, ancre : plafond de 1 pris sur son jour
+
+    # fuseau du compte (schedule) en Asia/Tokyo : meme jour que l'ancre (10-02 aux deux instants) -> refuse,
+    # alors que le fuseau du style (Europe/Paris, par defaut) verrait deux jours differents.
+    with pytest.raises(publish.LimitError, match="plafond de 1 publication"):
+        _post(isolated_cwd, clip="04", settings=settings, now=b, schedule={"slots": [], "timezone": "Asia/Tokyo"})
+
+
 def test_min_gap_is_refused_and_the_next_time_respects_the_gap(isolated_cwd):
     from clipper import publish, tiktok
 

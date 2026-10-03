@@ -208,9 +208,12 @@ def migrate_legacy_presets(
 ) -> list[str]:
     """Migration unique (SPEC-6076 R2) : pour chaque preset dont [channel] porte encore ``tiktok_account`` et/ou
     ``slots``, les creneaux sont repris sur ce compte (jamais ecrases s'il en a deja ; fuseau du style repris avec
-    eux), puis les deux cles sont retirees du fichier. Tout est journalise. Un preset dont le compte est inconnu,
-    ou qui a des creneaux sans compte, est laisse tel quel avec un avertissement : rien n'est perdu en silence.
-    Rend les noms des presets migres."""
+    eux) et ``tiktok_account`` est reporte sur les publications du style qui n'ont encore aucun compte (revue
+    r-comptes 11), puis les deux cles sont retirees du fichier. Tout est journalise. Un preset dont le compte est
+    inconnu, ou qui a des creneaux sans compte, est laisse tel quel avec un avertissement : rien n'est perdu en
+    silence. Rend les noms des presets migres."""
+    from clipper import publish as publish_mod  # import tardif : publish importe channel (ADR-b16b)
+
     migrated = []
     for path in sorted(Path(presets_dir).glob("*.toml")):
         with path.open("rb") as f:
@@ -238,6 +241,11 @@ def migrate_legacy_presets(
             else:
                 logger.info("style %s : le compte %s a déjà des créneaux, ceux du style ne sont pas repris",
                             name, account_id)
+        if account_id:
+            moved = publish_mod.migrate_missing_account(
+                name, account_id, state_dir=config.section("publish")["state_dir"])
+            if moved:
+                logger.info("style %s : compte %s reporté sur %d publication(s) sans compte", name, account_id, moved)
         data["channel"] = {k: v for k, v in table.items() if k not in LEGACY_KEYS}
         write_config(path, data, base=base)
         logger.info("style %s : [channel] %s retiré du preset", name, " et ".join(keys))

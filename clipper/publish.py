@@ -41,6 +41,9 @@ PUBLISH_MODES = ("immediate", "scheduled")
 _POSTPONE_FIRST_BATCH = 8
 _POSTPONE_MAX_SLOTS = 512
 VALID_STATUSES = ("approved", "scheduled", "published", "failed", "rejected")
+# Entrees pas encore closes (ni publiees, ni refusees) : supprimer leur style les abandonnerait en silence
+# (revue r-comptes 7), et set_channel ne doit pas attribuer un style a une video qui en a dans _sans_chaine.
+UNFINISHED_STATUSES = ("approved", "scheduled", "failed")
 _NON_EDITABLE_STATUSES = ("scheduled", "published")
 _NON_MOVABLE_STATUSES = ("rejected", "published")
 _PREVIOUS_PART_STATUSES = ("approved", "scheduled", "published")
@@ -689,6 +692,20 @@ def set_account(
     return entry
 
 
+def migrate_missing_account(channel: str, account_id: str, *, state_dir: str | Path | None = None) -> int:
+    """Reporte ``account_id`` sur les entrees de ``channel`` qui n'en ont encore aucun (migration SPEC-6076 R2,
+    revue r-comptes 11) : jamais une entree qui a deja un compte. Rend le nombre d'entrees modifiees."""
+    path = _state_path(channel, state_dir)
+    with _locked(path):
+        entries = _load_entries(path)
+        changed = [e for e in entries if not e.get("account")]
+        for entry in changed:
+            entry["account"] = account_id
+        if changed:
+            _save_entries(path, entries)
+    return len(changed)
+
+
 def set_waiting_reason(
     video_id: str,
     clip_id: str,
@@ -975,6 +992,7 @@ def create_post(
     presets_dir: str | Path = "presets",
     base: str | Path = "config.toml",
     service: str = "tiktok",
+    schedule: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Cree l'entree de publication d'un clip depuis le formulaire (SPEC-1ed3 R3) : valider = approuver. ``channel``
     est None pour une video sans chaine (file ``NO_CHANNEL``). ``mode`` ``immediate`` : due tout de suite ;
@@ -982,7 +1000,9 @@ def create_post(
     ``options`` : reglages par post (visibilite, commentaires, reutilisation, contenu IA, verification de contenu).
     Refuse : clip pas pret, refuse ou deja publie, deja en file, prive + programme, plafond du compte depasse.
     ``service`` (``tiktok`` | ``youtube``, celui du compte) choisit les reglages, options et plafonds valides
-    (``settings`` : ceux de ce service)."""
+    (``settings`` : ceux de ce service). ``schedule`` (``accounts.schedule_of``) : les plafonds par jour (R6) se
+    comptent dans le fuseau du COMPTE, pas du style (revue r-comptes 9) ; sans ``schedule``, celui du style sert
+    encore (compatibilite)."""
     sidecar = _read_sidecar(output_dir, video_id, clip_id)
     if not sidecar.get("ready"):
         raise PublishError(f"clip non prêt pour publication : {video_id}/{clip_id}")
@@ -992,7 +1012,7 @@ def create_post(
     now_dt = _now(now)
     options = _check_post_input(mode, account, publish_at, options, settings, now_dt, service)
     when = publish_at if mode == "scheduled" else now_dt
-    tz = _tz(channel_dict)
+    tz = _tz(schedule) if schedule else _tz(channel_dict)
     _check_caps(account, when, (video_id, clip_id), settings, tz, state_dir, presets_dir, base)
 
     path = _state_path(channel, state_dir)
@@ -1058,10 +1078,12 @@ def update_post(
     presets_dir: str | Path = "presets",
     base: str | Path = "config.toml",
     service: str = "tiktok",
+    schedule: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Modifie une entree de publication (SPEC-1ed3 R5) tant qu'elle n'est ni en cours ni publiee. Les champs
     omis sont conserves ; l'ensemble est revalide comme a la creation (prive + programme, date, plafonds).
-    ``service`` : celui du compte retenu (voir ``create_post``)."""
+    ``service`` : celui du compte retenu (voir ``create_post``). ``schedule`` : voir ``create_post`` (revue
+    r-comptes 9)."""
     channel = channel or NO_CHANNEL
     channel_dict = channel_settings(channel, presets_dir, base)
     settings = service_settings(service, settings)
@@ -1085,7 +1107,8 @@ def update_post(
         new_options = _check_post_input(new_mode, new_account, new_at if new_mode == "scheduled" else None,
                                         new_options, settings, now_dt, service)
         when = new_at if new_mode == "scheduled" else now_dt
-        _check_caps(new_account, when, (video_id, clip_id), settings, _tz(channel_dict), state_dir, presets_dir, base)
+        tz = _tz(schedule) if schedule else _tz(channel_dict)
+        _check_caps(new_account, when, (video_id, clip_id), settings, tz, state_dir, presets_dir, base)
         if caption is not None or hashtags is not None:
             _write_caption(output_dir, video_id, clip_id, _read_sidecar(output_dir, video_id, clip_id),
                            caption, hashtags, now_dt)
@@ -1391,13 +1414,17 @@ def preview_series(
     state_dir: str | Path | None = None,
     presets_dir: str | Path = "presets",
     base: str | Path = "config.toml",
+    schedule: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Apercu d'une serie programmee (SPEC-1ed3, SPEC-6076 R3/R6), sans rien creer. ``mode`` ``auto`` :
     les meilleurs clips par score jusqu'a ``count`` posts (une partie = un post, une serie incomplete est
     sautee entiere). ``mode`` ``manual`` : ``selection`` (video_id, clip_id) dans l'ordre choisi par
     l'utilisateur ; cocher une partie ajoute toute sa serie. Chaque publication prevue est a
     ``start_at + k x interval_hours`` (duree reelle) ; un refus (date hors fenetre, sous l'avance minimale,
-    plafond du compte) est explicite par publication (ADR-ad2e), jamais un decalage silencieux. Rend
+    plafond du compte) est explicite par publication (ADR-ad2e), jamais un decalage silencieux. ``schedule``
+    (``accounts.schedule_of``) : les plafonds se comptent dans le fuseau du COMPTE, pas du style (revue
+    r-comptes 9) ; sans ``schedule``, celui du style sert encore (compatibilite) ; ``create_series`` doit
+    passer le meme ``schedule`` qu'ici, sous peine d'un apercu « ok » que la creation refuse. Rend
     ``{"items", "available", "requested", "insufficient", "insufficient_reason", "ok"}`` ; ``ok`` est faux
     des qu'un item est refuse ou que la serie est incomplete."""
     if mode not in ("auto", "manual"):
@@ -1436,7 +1463,7 @@ def preview_series(
     i = 0
     for unit in selected_units:
         channel = unit["channel"] or NO_CHANNEL
-        tz = _tz(channel_settings(channel, presets_dir, base))
+        tz = _tz(schedule) if schedule else _tz(channel_settings(channel, presets_dir, base))
         for clip_id in unit["clip_ids"]:
             when = dates[i]
             i += 1
@@ -1483,15 +1510,19 @@ def create_series(
     state_dir: str | Path | None = None,
     presets_dir: str | Path = "presets",
     base: str | Path = "config.toml",
+    schedule: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Cree une serie programmee (SPEC-1ed3, SPEC-6076 R3/R6) : ``preview_series`` d'abord, puis une entree
     ``create_post`` par publication, dans l'ordre. Tout ou rien (ADR-ad2e) : un seul item refuse, ou moins de
     clips que demande, et RIEN n'est cree ; si la creation echoue en cours de route (etat change entre
-    l'apercu et la creation), les entrees deja creees sont annulees avant de relever l'erreur."""
+    l'apercu et la creation), les entrees deja creees sont annulees avant de relever l'erreur. ``schedule`` :
+    le meme que celui passe a ``preview_series`` (revue r-comptes 9), sinon un item accepte a l'apercu
+    pourrait etre refuse ici (fuseaux differents)."""
     preview = preview_series(
         mode=mode, style=style, account=account, service=service, interval_hours=interval_hours,
         start_at=start_at, count=count, selection=selection, settings=settings, now=now,
         workspace_dir=workspace_dir, output_dir=output_dir, state_dir=state_dir, presets_dir=presets_dir, base=base,
+        schedule=schedule,
     )
     if preview["insufficient"]:
         raise PublishError(f"série refusée : {preview['insufficient_reason']}")
@@ -1509,7 +1540,7 @@ def create_series(
             entry = create_post(
                 item["video_id"], item["clip_id"], item["channel"], account=account, mode="scheduled",
                 publish_at=when, settings=settings, now=now, output_dir=output_dir, state_dir=state_dir,
-                presets_dir=presets_dir, base=base, service=service,
+                presets_dir=presets_dir, base=base, service=service, schedule=schedule,
             )
             created.append((item["channel"], entry))
     except Exception as exc:  # toute exception (ADR-ad2e) : pas seulement PublishError/ChannelError/ConfigError,

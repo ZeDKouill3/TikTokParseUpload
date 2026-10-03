@@ -1687,3 +1687,34 @@ def test_set_channel_refuses_an_unknown_channel_a_running_video_or_an_already_as
     config = _unassigned_state(tmp_path, channel="autre")
     with pytest.raises(pipeline.PipelineError, match="déjà la chaîne « autre »"):
         pipeline.set_channel(VIDEO_ID, "ma_chaine", config=config, presets_dir=presets)
+
+
+def _sans_chaine_entry(clip_id, status, video_id=VIDEO_ID, **extra):
+    return {"video_id": video_id, "clip_id": clip_id, "series_id": None, "part": None, "status": status,
+            "slot_at": None, "decided_at": None, "published_at": None, "error": None, **extra}
+
+
+def test_set_channel_refuses_a_video_with_unfinished_publications_without_a_style(tmp_path):
+    """Revue r-comptes 4 : set_channel refuse une video qui a des entrees dans _sans_chaine.json, sinon la
+    console chercherait ensuite la publication sous le nouveau style ou elle n'est pas."""
+    from clipper import pipeline, publish
+
+    presets = _channel_preset(tmp_path)
+    config = _unassigned_state(tmp_path)
+    state_dir = tmp_path / "state" / "publish"
+    state_dir.mkdir(parents=True)
+    (state_dir / f"{publish.NO_CHANNEL}.json").write_text(json.dumps([
+        _sans_chaine_entry("01", "scheduled"),
+        _sans_chaine_entry("02", "published", published_at="2026-10-01T10:00:00+00:00"),
+    ]), encoding="utf-8")
+
+    with pytest.raises(pipeline.PipelineError, match="publication"):
+        pipeline.set_channel(VIDEO_ID, "ma_chaine", config=config, presets_dir=presets, state_dir=state_dir)
+    assert pipeline.load_state(VIDEO_ID, config=config)["channel"] is None
+
+    (state_dir / f"{publish.NO_CHANNEL}.json").write_text(json.dumps([
+        _sans_chaine_entry("01", "rejected"),
+        _sans_chaine_entry("02", "published", published_at="2026-10-01T10:00:00+00:00"),
+    ]), encoding="utf-8")
+    state = pipeline.set_channel(VIDEO_ID, "ma_chaine", config=config, presets_dir=presets, state_dir=state_dir)
+    assert state["channel"] == "ma_chaine"

@@ -518,7 +518,6 @@ class Worker:
         due = []
         # la file des videos sans chaine (SPEC-1ed3 R3) est lue comme celle d'une chaine sans creneau ni compte
         for name in [*channel_mod.list_channels(paths["presets_dir"]), publish_mod.NO_CHANNEL]:
-            channel = publish_mod.channel_settings(name, paths["presets_dir"], paths["base"])
             for entry in publish_mod.list_entries(name, state_dir=paths["state_dir"]):
                 if entry["status"] != "scheduled" or not entry["slot_at"]:
                     continue
@@ -529,14 +528,14 @@ class Worker:
                 mode = entry.get("publish_mode") or str(settings["publish_mode"])
                 window = timedelta(days=float(settings["schedule_max_days"])) if mode == "scheduled" else timedelta(0)
                 if slot - window <= now:  # immediat : creneau atteint ; programme : date dans la fenetre TikTok
-                    due.append((slot, name, channel, entry, mode, service, settings))
-        due.sort(key=lambda d: (d[0], d[1], d[3]["clip_id"]))
-        for slot, name, channel, entry, mode, service, settings in due:
-            if self._publish_one(slot, name, channel, entry, mode, settings, paths, now, service):
+                    due.append((slot, name, entry, mode, service, settings))
+        due.sort(key=lambda d: (d[0], d[1], d[2]["clip_id"]))
+        for slot, name, entry, mode, service, settings in due:
+            if self._publish_one(slot, name, entry, mode, settings, paths, now, service):
                 return True
         return False
 
-    def _publish_one(self, slot: datetime, name: str, channel: dict[str, Any], entry: dict[str, Any], mode: str,
+    def _publish_one(self, slot: datetime, name: str, entry: dict[str, Any], mode: str,
                      settings: dict[str, Any], paths: dict[str, Any], now: datetime, service: str = "tiktok") -> bool:
         """Vrai si la tentative de publication a eu lieu (reussie ou en echec) : fin de l'iteration. ``service`` et
         ``settings`` : ceux du compte de l'entree (SPEC-5e50 : plafonds et module de publication par service)."""
@@ -556,12 +555,15 @@ class Worker:
             return False
         if not self._account_ready(entry, name, account, paths["state_dir"]):
             return False
+        account_row = next(a for a in accounts_mod.list_accounts(self.config) if a["id"] == account)
+        schedule = accounts_mod.schedule_of(account_row)
         scope = {"state_dir": paths["state_dir"], "presets_dir": paths["presets_dir"], "base": paths["base"]}
         if publish_mod.halted_account(account, **scope) is not None:
             return False  # arret sur en cours (R4) : rien ne part avant « Reessayer »
 
         times = publish_mod.account_publish_times(account, **scope)
-        tz = ZoneInfo(str(channel["timezone"]))
+        # Plafonds par compte (SPEC-6076 R6) : le fuseau est celui du COMPTE, pas du style (revue r-comptes 9).
+        tz = ZoneInfo(str(schedule["timezone"]))
         blocked = tiktok.check_limits(times, slot if mode == "scheduled" else now, settings, tz)
         if blocked is not None and entry.get("manual"):
             # publication pilotee depuis l'ecran Publication : le plafond a deja ete verifie au formulaire ; s'il
@@ -570,8 +572,6 @@ class Worker:
                        paths["state_dir"])
             return False
         if blocked is not None:
-            schedule = accounts_mod.schedule_of(
-                next(a for a in accounts_mod.list_accounts(self.config) if a["id"] == account))
             if not schedule["slots"]:  # rien a reporter sans creneau sur le compte (SPEC-6076 R2)
                 self._wait(entry, name, account, f"{blocked} : le compte n'a aucun créneau pour reporter la publication "
                            "(Comptes > Créneaux), modifie son heure ou annule-la", paths["state_dir"])

@@ -1470,6 +1470,37 @@ def test_a_capped_entry_whose_account_has_no_slot_waits_with_an_explicit_reason(
     assert entry["status"] == "scheduled" and "aucun créneau" in entry["waiting_reason"]
 
 
+def test_the_daily_cap_is_counted_in_the_accounts_timezone_not_the_styles(tmp_path, monkeypatch):
+    """Revue r-comptes 9 : check_limits/postpone comptent le jour dans le fuseau du COMPTE, jamais celui du
+    style. Compte en Asia/Tokyo, style en America/Los_Angeles (17 h d'ecart) : deux posts separes de 22 h
+    tombent le meme jour a Tokyo (plafond de 1/jour atteint) mais sur deux jours differents a Los Angeles
+    (le plafond serait loupe si le fuseau du style etait pris a tort)."""
+    config = _pub_env(tmp_path, monkeypatch, tiktok_settings={"max_posts_per_day": 1, "min_gap_minutes": 0},
+                      slots=[{"day": d, "time": "09:00"} for d in ("mon", "tue", "wed", "thu", "fri", "sat", "sun")])
+    accounts_path = tmp_path / "state" / "accounts.json"
+    data = json.loads(accounts_path.read_text(encoding="utf-8"))
+    for account in data["accounts"]:
+        if account["id"] == ACCOUNT:
+            account["timezone"] = "Asia/Tokyo"
+    accounts_path.write_text(json.dumps(data), encoding="utf-8")
+    (tmp_path / "presets" / "ma_chaine.toml").write_text(
+        '[channel]\ntimezone = "America/Los_Angeles"\n', encoding="utf-8")
+
+    published_at = datetime(2026, 1, 1, 16, 0, tzinfo=timezone.utc)   # Tokyo 2026-01-02 01:00, LA 2026-01-01 08:00
+    target_at = datetime(2026, 1, 2, 14, 0, tzinfo=timezone.utc)      # Tokyo 2026-01-02 23:00, LA 2026-01-02 06:00
+    _seed(tmp_path, "ma_chaine", "00", published_at, status="published", video_id="bbbbbbbbbbb",
+          tiktok_publish_at=published_at.isoformat(), published_at=published_at.isoformat())
+    _seed(tmp_path, "ma_chaine", "01", target_at, publish_mode="scheduled")
+    pub = FakePublisher()
+
+    _pub_worker(config, pub).tick()
+
+    assert pub.calls == []  # meme jour a Tokyo (compte) : plafond atteint, publication reportee
+    entry = next(e for e in _entries(tmp_path) if e["clip_id"] == "01")
+    assert entry["status"] == "scheduled" and entry["postponed_reason"]
+    assert "plafond de 1 publication(s) par jour" in entry["postponed_reason"]
+
+
 def test_an_entry_with_an_unknown_account_waits_with_the_reason(tmp_path, monkeypatch):
     config = _pub_env(tmp_path, monkeypatch)
     _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1), account="supprime")
