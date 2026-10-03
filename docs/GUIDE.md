@@ -262,7 +262,7 @@ La navigation (barre latérale, onglets en bas sur téléphone) donne :
    (titre d'écran, description, hashtags, partie N/M, `qa_status`, `issues`),
    édition de la description et des hashtags, du titre d'écran (re-rendu),
    approuver / refuser, re-rendre, télécharger le mp4, copier la description.
-5. **Styles** : liste (nom, source, surveillance, mode, prochains créneaux),
+5. **Styles** : liste (nom, source, surveillance, mode),
    création et édition d'un preset par formulaire, chaque champ montrant sa
    valeur héritée de `config.toml` tant que le preset ne la redéfinit pas ; une
    erreur de validation s'affiche sous le champ. Deux outils : l'**éditeur
@@ -271,7 +271,7 @@ La navigation (barre latérale, onglets en bas sur téléphone) donne :
    enregistrées dans `[reframe]` ; un agencement qui déborde ou se chevauche
    est refusé avec le message de `reframe`) et l'**aperçu du style des
    sous-titres** sur une phrase d'exemple, rendu par le pipeline.
-6. **Publication** : par style, clips `approved` / `scheduled`, calendrier
+6. **Publication** : par compte, clips `approved` / `scheduled`, calendrier
    hebdomadaire des créneaux (glisser-déposer sur un créneau libre),
    télécharger, copier la description, « marquer publié », « repasser en
    attente ». La mise en ligne reste manuelle : le dépôt ne publie rien sur
@@ -306,8 +306,11 @@ clé par clé sur `config.toml`. Seules les clés redéfinies figurent dans le
 fichier ; tout le reste est hérité. La table `[channel]` (validée par
 `CONFIG_DEFAULTS` de `clipper/channel.py`) décrit le style lui-même :
 `display_name`, `source_url`, `watch`, `watch_interval_s`,
-`watch_min_duration_s`, `mode`, `slots`, `timezone`, `tiktok_account`,
-`logo`. Exemple `presets/ma_chaine.toml` :
+`watch_min_duration_s`, `mode`, `timezone`, `logo`. Le compte de publication
+et les créneaux réguliers n'y sont plus : ils appartiennent au compte (écran
+Comptes), chaque publication choisit le sien. Un ancien preset qui porte
+encore `slots` / `tiktok_account` est migré au démarrage (créneaux repris sur
+ce compte s'il n'en a pas déjà, clés retirées du fichier). Exemple `presets/ma_chaine.toml` :
 
 ```toml
 [channel]
@@ -315,7 +318,6 @@ display_name = "ma_chaine"
 source_url = "https://www.twitch.tv/ma_chaine/videos"
 watch = true
 mode = "review"
-slots = [{ day = "mon", time = "18:00" }, { day = "thu", time = "18:00" }]
 
 [reframe]
 format = "stream_auto"

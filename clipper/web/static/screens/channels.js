@@ -16,7 +16,6 @@ const CHAN_SECTIONS = [
   { section: "subtitles", title: "Sous-titres", sub: "Police, couleurs, position" },
   { section: "moments", title: "Grille de notation et moments", sub: "Sélection des moments, grille et jury" },
 ];
-const CHAN_DAYS = [["mon", "Lundi"], ["tue", "Mardi"], ["wed", "Mercredi"], ["thu", "Jeudi"], ["fri", "Vendredi"], ["sat", "Samedi"], ["sun", "Dimanche"]];
 const CHAN_MODES = [["review", "review (tu valides les moments)"], ["auto", "auto (le jury décide)"]];
 // Grilles de notation embarquées (SPEC-9216 R4) : valeur de [moments] rubric_path -> libellé.
 // Toute autre valeur est un chemin de fichier (« Fichier personnalisé »).
@@ -30,13 +29,8 @@ const CHAN_MODELS = [
     preset: { moments: { rubric_path: "builtin:gaming" }, reframe: { layout: "stream_auto", stream_variant: "split" } } },
 ];
 const CHAN_STALE_MS = 4000;
-const CHAN_SLOTS_SHOWN = 3;
 
-// Comptes du carnet (écran Comptes) proposés pour relier un compte TikTok au style ;
-// list = null quand GET /api/accounts est refusé (console ouverte à distance) : le message
-// d'erreur est alors affiché, jamais un champ libre de repli.
-const chAccounts = { list: null, error: "" };
-const chUi = { names: null, details: {}, slots: {}, errors: {}, at: 0, loading: null, edit: null, html: "" };
+const chUi = { names: null, details: {}, errors: {}, at: 0, loading: null, edit: null, html: "" };
 
 const chHash = () => decodeURIComponent((location.hash.replace(/^#\/?/, "").split("/")[1] || "").split("?")[0]);
 const chSame = (a, b) => JSON.stringify(a) === JSON.stringify(b);
@@ -52,7 +46,6 @@ function chLoadList() {
       await Promise.all(chUi.names.map(async (name) => {
         try {
           chUi.details[name] = await api(`/api/channels/${encodeURIComponent(name)}`);
-          chUi.slots[name] = await api(`/api/channels/${encodeURIComponent(name)}/slots`);
           delete chUi.errors[name];
         } catch (err) {
           chUi.errors[name] = err;
@@ -70,10 +63,6 @@ function chLoadList() {
   return chUi.loading;
 }
 
-function chSlotLabel(iso) {
-  return fmtParis(iso, { weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
-}
-
 function chCard(name) {
   const err = chUi.errors[name];
   const detail = chUi.details[name];
@@ -89,10 +78,6 @@ function chCard(name) {
       <div class="ch-foot"><a class="btn btn-sm grow" href="#/styles/${encodeURIComponent(name)}">${icon("sliders-horizontal")}Ouvrir</a></div></div></article>`;
   }
   const c = detail.effective.channel;
-  const info = chUi.slots[name];
-  const slots = info ? info.slots : [];
-  const shown = slots.slice(0, CHAN_SLOTS_SHOWN).map((s) => `<span class="mono">${esc(chSlotLabel(s))}</span>`).join(" ");
-  const more = slots.length > CHAN_SLOTS_SHOWN ? `<span class="faint" title="${esc(slots.map((s) => chSlotLabel(s)).join(" · "))}">+${slots.length - CHAN_SLOTS_SHOWN}</span>` : "";
   const watch = c.watch
     ? `<span class="chip running plain">surveillée</span><span class="muted">toutes les ${esc(fr(Math.round(c.watch_interval_s / 60)))} min · VOD ≥ ${esc(fr(Math.round(c.watch_min_duration_s / 60)))} min</span>`
     : `<span class="chip pending plain">coupée</span>`;
@@ -103,89 +88,19 @@ function chCard(name) {
         <dt>Source</dt><dd>${c.source_url ? `<span class="mono chan-url">${esc(c.source_url)}</span>` : `<span class="faint">aucune source (ajout de vidéos à la main)</span>`}</dd>
         <dt>Surveillance</dt><dd>${watch}</dd>
         <dt>Mode</dt><dd><span class="chip ${c.mode === "auto" ? "running" : "info"} plain">${esc(c.mode)}</span></dd>
-        <dt>Prochains créneaux</dt><dd>${slots.length ? shown + more : `<span class="faint">${esc(info && info.reason ? info.reason : "créneaux indisponibles")}</span>`}</dd>
       </dl>
       <div class="ch-actions">
-        <button type="button" class="btn btn-sm" data-chan-add-slot="${esc(name)}">${icon("calendar-days", "i-xs")}Ajouter un créneau</button>
-        <button type="button" class="btn btn-sm" data-chan-account="${esc(name)}">${icon("user", "i-xs")}Compte TikTok${c.tiktok_account ? ` : ${esc(c.tiktok_account)}` : ""}</button>
         <button type="button" class="btn btn-sm" data-chan-queue="${esc(name)}">${icon("plus", "i-xs")}Mettre une vidéo en file pour ce style</button>
       </div>
       <div class="ch-foot"><a class="btn btn-sm grow" href="#/styles/${encodeURIComponent(name)}">${icon("sliders-horizontal")}Éditer le preset</a></div>
     </div></article>`;
 }
 
-/* ---------- Actions directes sur la carte (sans ouvrir le formulaire du preset) ---------- */
-
-/* Preset du serveur avec une seule clé de [channel] changée ; le reste du preset est renvoyé tel quel. */
-function chPresetWithChannel(detail, key, value) {
-  const preset = JSON.parse(JSON.stringify(detail.raw));
-  preset.channel = Object.assign({}, preset.channel, { [key]: value });
-  return preset;
-}
-
-/* Créneaux du style (ceux du preset, sinon les effectifs) plus le nouveau. */
-function chSlotsWith(detail, day, time) {
-  const current = (detail.raw.channel && detail.raw.channel.slots) || detail.effective.channel.slots || [];
-  return [...current, { day, time }];
-}
-
-async function chSaveChannelKey(name, key, value, doneTitle) {
-  try {
-    await api(`/api/channels/${encodeURIComponent(name)}`, jsonBody("PUT", { preset: chPresetWithChannel(chUi.details[name], key, value) }));
-  } catch (err) {
-    toastError("Enregistrement refusé", err);
-    return false;
-  }
-  toast({ kind: "ok", title: doneTitle, body: name });
-  chUi.at = 0;
-  chLoadList();
-  return true;
-}
-
-function chOpenAddSlot(name) {
-  openPanel("modal", `
-    <div class="modal-head"><h2>Ajouter un créneau</h2><p class="muted" style="margin-top:4px">Créneau hebdomadaire de ${esc(name)} (heure de Paris). Les créneaux sont facultatifs : « Nouvelle publication » publie sans.</p></div>
-    <form id="chan-slot-form"><div class="modal-body">
-      <div class="field"><label for="chan-slot-day">Jour</label><select class="input" id="chan-slot-day">${CHAN_DAYS.map(([k, l]) => `<option value="${k}">${l}</option>`).join("")}</select></div>
-      <div class="field"><label for="chan-slot-time">Heure</label><input class="input mono" id="chan-slot-time" type="time" required value="18:00"></div>
-    </div>
-    <div class="modal-foot"><button type="button" class="btn btn-ghost" data-dismiss>Annuler</button><button type="submit" class="btn btn-primary">Ajouter</button></div></form>`,
-  (el) => {
-    $("#chan-slot-form", el).onsubmit = async (e) => {
-      e.preventDefault();
-      const slots = chSlotsWith(chUi.details[name], $("#chan-slot-day", el).value, $("#chan-slot-time", el).value);
-      closeLayer();
-      await chSaveChannelKey(name, "slots", slots, "Créneau ajouté");
-    };
-  });
-}
-
-async function chOpenAccount(name) {
-  let accounts;
-  try { accounts = await api("/api/accounts"); } catch (err) { toastError("Comptes indisponibles", err); return; }
-  const current = chUi.details[name].effective.channel.tiktok_account || "";
-  openPanel("modal", `
-    <div class="modal-head"><h2>Compte TikTok</h2><p class="muted" style="margin-top:4px">Compte relié à ${esc(name)} : celui de ses publications par défaut. Les comptes se créent dans l'écran Comptes.</p></div>
-    <form id="chan-account-form"><div class="modal-body">
-      <div class="field"><label for="chan-account-pick">Compte</label><select class="input" id="chan-account-pick">
-        <option value=""${current ? "" : " selected"}>Aucun compte</option>${accounts.map((a) => `<option value="${esc(a.id)}"${a.id === current ? " selected" : ""}>${esc(a.label)}${a.platform ? ` (${esc(a.platform)})` : ""}</option>`).join("")}</select></div>
-    </div>
-    <div class="modal-foot"><button type="button" class="btn btn-ghost" data-dismiss>Annuler</button><button type="submit" class="btn btn-primary">Enregistrer</button></div></form>`,
-  (el) => {
-    $("#chan-account-form", el).onsubmit = async (e) => {
-      e.preventDefault();
-      const account = $("#chan-account-pick", el).value;
-      closeLayer();
-      await chSaveChannelKey(name, "tiktok_account", account, "Compte TikTok enregistré");
-    };
-  });
-}
-
 function chListHtml() {
   const names = chUi.names || [];
   const add = `<button type="button" class="btn btn-primary" data-chan-new>${icon("plus")}Nouveau style</button>`;
   if (!names.length) {
-    return emptyState("tv", "Aucun style", "Crée un style, par exemple « ma_chaine », pour lui donner son agencement et ses créneaux.", add);
+    return emptyState("tv", "Aucun style", "Crée un style, par exemple « ma_chaine », pour lui donner son agencement.", add);
   }
   return `<div class="toolbar"><span class="muted">${names.length} style${names.length > 1 ? "s" : ""}</span><span class="grow"></span>${add}</div>
     <div class="channels">${names.map(chCard).join("")}</div>`;
@@ -228,23 +143,12 @@ function chOpenNew() {
 /* ---------- Formulaire d'un preset ---------- */
 
 function chKind(key, section, def) {
-  if (section === "channel" && key === "slots") return "slots";
   if (section === "channel" && key === "mode") return "mode";
-  if (section === "channel" && key === "tiktok_account") return "account";
   if (section === "moments" && key === "rubric_path") return "rubric";
   if (typeof def === "boolean") return "bool";
   if (typeof def === "number") return "number";
   if (typeof def === "string") return "text";
   return "json";
-}
-
-function chSlotsEditor(value, dis) {
-  const rows = (value || []).map((s, i) => `<div class="chan-slot" data-slot="${i}">
-    <select class="input" data-slot-day aria-label="Jour"${dis}>${CHAN_DAYS.map(([k, l]) => `<option value="${k}"${k === s.day ? " selected" : ""}>${l}</option>`).join("")}</select>
-    <input class="input mono" type="time" data-slot-time aria-label="Heure" value="${esc(s.time)}"${dis}>
-    <button type="button" class="icon-btn" data-slot-del="${i}" aria-label="Retirer ce créneau"${dis}>${icon("x", "i-xs")}</button></div>`).join("");
-  return `<div class="chan-slots">${rows || `<span class="muted">Aucun créneau.</span>`}
-    <button type="button" class="btn btn-xs" data-slot-add${dis}>${icon("plus", "i-xs")}Ajouter un créneau</button></div>`;
 }
 
 /* Libellé provisoire de la grille pour une valeur de rubric_path ; le serveur (/api/rubric-label)
@@ -290,25 +194,10 @@ function chRubricEditor(id, value, dis, info) {
     <span class="hint" data-rubric-now>Grille en vigueur : ${esc(shown ? shown.label : chRubricLabel(value))}</span></div>`;
 }
 
-function chAccountEditor(id, value, dis) {
-  if (chAccounts.list === null) {
-    return `<select class="input" id="${id}" aria-label="Compte TikTok relié" disabled><option value="${esc(value)}" selected>${esc(value || "Aucun compte")}</option></select>
-      <span class="hint">Comptes indisponibles : ${esc(chAccounts.error || "chargement impossible")}</span>`;
-  }
-  const known = chAccounts.list.some((a) => a.id === value);
-  const options = [`<option value=""${value ? "" : " selected"}>Aucun compte</option>`]
-    .concat(chAccounts.list.map((a) => `<option value="${esc(a.id)}"${a.id === value ? " selected" : ""}>${esc(a.label)}${a.platform ? ` (${esc(a.platform)})` : ""}</option>`))
-    .concat(value && !known ? [`<option value="${esc(value)}" selected>${esc(value)} (compte inconnu)</option>`] : []);
-  return `<select class="input" id="${id}" aria-label="Compte TikTok relié"${dis}>${options.join("")}</select>
-    <span class="hint">Compte TikTok relié au style, créé dans l'écran Comptes ; « Se connecter dans le navigateur » s'y trouve aussi.</span>`;
-}
-
 function chControl(id, kind, value, locked, rubric) {
   const dis = locked ? " disabled" : "";
   switch (kind) {
-    case "slots": return chSlotsEditor(value, dis);
     case "rubric": return chRubricEditor(id, value, dis, rubric);
-    case "account": return chAccountEditor(id, value, dis);
     case "mode": return `<select class="input" id="${id}"${dis}>${CHAN_MODES.map(([k, l]) => `<option value="${k}"${k === value ? " selected" : ""}>${esc(l)}</option>`).join("")}</select>`;
     case "bool": return `<label class="switch"><input type="checkbox" id="${id}"${value ? " checked" : ""}${dis}><span></span></label>`;
     case "number": return `<input class="input mono" id="${id}" type="number" step="any" value="${esc(value)}"${dis}>`;
@@ -384,9 +273,6 @@ function chPreset(ed) {
 
 function chReadField(field) {
   const kind = field.dataset.kind;
-  if (kind === "slots") {
-    return $$(".chan-slot", field).map((row) => ({ day: $("[data-slot-day]", row).value, time: $("[data-slot-time]", row).value }));
-  }
   if (kind === "rubric") {
     const choice = $("[data-rubric-select]", field).value;
     const pathEl = $("[data-rubric-path]", field);
@@ -488,7 +374,6 @@ async function chDelete(ed) {
   }
   toast({ kind: "ok", title: "Style supprimé", body: ed.name });
   delete chUi.details[ed.name];
-  delete chUi.slots[ed.name];
   chUi.at = 0;
   chUi.edit = null;
   location.hash = "#/styles";
@@ -529,16 +414,6 @@ function chWireEdit(root, ed) {
     } else if (field && t.hasAttribute("data-reset")) {
       const { section, key } = field.dataset;
       delete ed.draft[section][key];
-      chRepaintField(root, ed, section, key);
-    } else if (field && t.hasAttribute("data-slot-add")) {
-      const { section, key } = field.dataset;
-      chEnsureDraft(ed, section, key);
-      ed.draft[section][key] = [...ed.draft[section][key], { day: "mon", time: "18:00" }];
-      chRepaintField(root, ed, section, key);
-    } else if (field && t.hasAttribute("data-slot-del")) {
-      const { section, key } = field.dataset;
-      chEnsureDraft(ed, section, key);
-      ed.draft[section][key] = ed.draft[section][key].filter((_, i) => i !== Number(t.dataset.slotDel));
       chRepaintField(root, ed, section, key);
     } else if (field && t.hasAttribute("data-logo-send")) chSendLogo(root, ed, field);
   };
@@ -585,13 +460,6 @@ async function chOpenEdit(body, name) {
     edit.failed = true;
     return;
   }
-  try {
-    chAccounts.list = await api("/api/accounts");
-    chAccounts.error = "";
-  } catch (err) {
-    chAccounts.list = null;
-    chAccounts.error = String(err.message || err);
-  }
   edit.pending = false;
   edit.draft = chDraft(edit.detail.raw);
   if (chUi.edit !== edit || currentScreen !== "channels") return;
@@ -617,8 +485,6 @@ Screens.channels = {
     const html = chListHtml();
     if (chUi.html !== html || !body.childElementCount) { chUi.html = html; body.innerHTML = html; }
     $$("[data-chan-new]", body).forEach((b) => (b.onclick = chOpenNew));
-    $$("[data-chan-add-slot]", body).forEach((b) => (b.onclick = () => chOpenAddSlot(b.dataset.chanAddSlot)));
-    $$("[data-chan-account]", body).forEach((b) => (b.onclick = () => chOpenAccount(b.dataset.chanAccount)));
     $$("[data-chan-queue]", body).forEach((b) => (b.onclick = () => openAddVideo(b.dataset.chanQueue)));
   },
 };

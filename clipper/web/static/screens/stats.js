@@ -260,9 +260,6 @@ const statsScanButton = (account) => `<button class="btn btn-primary" type="butt
 function statsControls(account) {
   const accounts = statsUi.accounts;
   const options = accounts.map((a) => `<option value="${esc(a.account)}"${a.account === account.account ? " selected" : ""}>${esc(a.label)} · ${esc(a.account)}</option>`).join("");
-  const linked = account.channel
-    ? `<div class="linked">${icon("link", "i-sm")}<span>Style Clipper lié : <b>${esc(account.channel)}</b></span></div>`
-    : `<div class="linked none">${icon("link", "i-sm")}<span>Aucun style Clipper lié</span></div>`;
   const periods = `${STATS_PERIODS.map((n) => `<button type="button" data-stats-period="${n}" class="${n === statsUi.period ? "on" : ""}" aria-pressed="${n === statsUi.period}">${n} jours</button>`).join("")}`;
   const when = account.fetched_at
     ? `Dernier relevé : <b>${esc(statsWhen(account.fetched_at))}</b><br><span class="faint">${esc(fr(account.snapshots))} relevé${account.snapshots > 1 ? "s" : ""} enregistré${account.snapshots > 1 ? "s" : ""}</span>`
@@ -272,7 +269,6 @@ function statsControls(account) {
   const failed = account.error ? `<div class="banner bad" role="alert" data-stats-error>${icon("circle-alert", "i-sm")}<div><b>Dernier relevé arrêté (${esc(account.error.code)}).</b><br><span class="muted">${esc(account.error.reason)}</span></div></div>` : "";
   return `<section class="ctl" aria-label="Compte et période">
       <div class="acct field"><label for="stats-account">Compte TikTok</label><select class="input" id="stats-account" data-stats-account>${options}</select></div>
-      ${linked}
       <div class="field"><span class="field-label" id="stats-lbl-period">Période</span><div class="seg stats-seg" data-stats-periods role="group" aria-labelledby="stats-lbl-period">${periods}</div></div>
       <div class="scan"><div class="scan-when">${when}</div>${statsScanButton(account)}</div>
     </section>${notReady}${running}${failed}`;

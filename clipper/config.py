@@ -50,9 +50,16 @@ def _section_defaults(name: str) -> dict[str, object]:
     return defaults
 
 
+def _section_legacy_keys(name: str) -> tuple[str, ...]:
+    """Cles qu'une section n'a plus mais tolere encore dans un fichier (LEGACY_KEYS du module, optionnel) :
+    ignorees a la lecture, le module qui les declare les signale et les retire."""
+    _section_defaults(name)
+    return tuple(getattr(importlib.import_module(f"clipper.{name}"), "LEGACY_KEYS", ()))
+
+
 def _validate_section(name: str, table: dict[str, object]) -> None:
     defaults = _section_defaults(name)
-    unknown = set(table) - set(defaults)
+    unknown = set(table) - set(defaults) - set(_section_legacy_keys(name))
     if unknown:
         raise ConfigError(
             f"cle(s) inconnue(s) dans la section [{name}]: {', '.join(sorted(unknown))}"
@@ -77,7 +84,8 @@ class Config:
         from config.toml (defaults only if the table is absent). Nested
         values (tables under [name]) are passed through unchanged."""
         defaults = _section_defaults(name)
-        table = self._sections.get(name, {})
+        legacy = _section_legacy_keys(name)
+        table = {k: v for k, v in self._sections.get(name, {}).items() if k not in legacy}
         return {**defaults, **table}
 
 

@@ -294,6 +294,15 @@ class Worker:
         self._last_beat: float | None = None
         self._recover_orphans()
         self._recover_interrupted_publications()
+        self._migrate_legacy_presets()
+
+    def _migrate_legacy_presets(self) -> None:
+        """Au demarrage : creneaux et compte d'un ancien style repris sur le compte (SPEC-6076 R2), journalise."""
+        try:
+            watch = self.config.section("watch")
+            channel_mod.migrate_legacy_presets(self.config, presets_dir=watch["presets_dir"], base=watch["base_config"])
+        except (channel_mod.ChannelError, ConfigError, OSError, ValueError) as exc:
+            log.error("migration des anciens styles impossible : %s", exc)
 
     def _recover_interrupted_publications(self) -> None:
         """Une publication restee « en cours » d'un worker arrete en plein pilotage devient un echec explicite
@@ -461,7 +470,7 @@ class Worker:
                 if entry["status"] != "scheduled" or not entry["slot_at"]:
                     continue
                 slot = datetime.fromisoformat(entry["slot_at"])
-                account = publish_mod.entry_account(entry, channel["tiktok_account"])
+                account = publish_mod.entry_account(entry)
                 service = services.get(account, "tiktok")  # compte inconnu : _publish_one l'explique (R4)
                 settings = self._service_settings(service, cache)
                 mode = entry.get("publish_mode") or str(settings["publish_mode"])
@@ -480,11 +489,10 @@ class Worker:
         ``settings`` : ceux du compte de l'entree (SPEC-5e50 : plafonds et module de publication par service)."""
         video_id, clip_id = entry["video_id"], entry["clip_id"]
         label = publish_mod.SERVICE_LABELS[service]
-        account = publish_mod.entry_account(entry, channel["tiktok_account"])  # jamais un autre compte en repli
+        account = publish_mod.entry_account(entry)  # jamais un autre compte en repli (SPEC-6076 R2)
         where = {"channel": name, "video_id": video_id, "clip_id": clip_id}
         if not account:
-            self._fail(entry, name, f"chaîne {name} sans compte TikTok relié : renseigne [channel] tiktok_account "
-                       "dans son preset" if name != publish_mod.NO_CHANNEL else
+            self._fail(entry, name,
                        "aucun compte de publication choisi : modifie la publication et choisis un compte prêt à publier",
                        halted=False, account=None, state_dir=paths["state_dir"])
             return False
@@ -504,8 +512,14 @@ class Worker:
                        paths["state_dir"])
             return False
         if blocked is not None:
+            schedule = accounts_mod.schedule_of(
+                next(a for a in accounts_mod.list_accounts(self.config) if a["id"] == account))
+            if not schedule["slots"]:  # rien a reporter sans creneau sur le compte (SPEC-6076 R2)
+                self._wait(entry, name, account, f"{blocked} : le compte n'a aucun créneau pour reporter la publication "
+                           "(Comptes > Créneaux), modifie son heure ou annule-la", paths["state_dir"])
+                return False
             moved = publish_mod.postpone(
-                video_id, clip_id, name, blocked, now=now,
+                video_id, clip_id, name, blocked, now=now, schedule=schedule,
                 allowed=lambda candidate: tiktok.check_limits(times, candidate, settings, tz), **scope)
             log.warning("%s/%s : %s", video_id, clip_id, moved["postponed_reason"])
             tiktok.emit_event({"level": "warn", "account": account, **where, "reason": moved["postponed_reason"],

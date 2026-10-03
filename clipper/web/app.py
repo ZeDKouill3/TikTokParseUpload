@@ -1019,6 +1019,8 @@ def _channel_detail(name: str) -> dict[str, Any]:
     path = _channel_preset_path(name)
     try:
         raw = tomllib.loads(path.read_text(encoding="utf-8"))
+        if isinstance(raw.get("channel"), dict):  # SPEC-6076 R2 : ni compte ni creneaux dans un style
+            raw["channel"] = {k: v for k, v in raw["channel"].items() if k not in channel_mod.LEGACY_KEYS}
         effective = {s: channel if s == "channel" else config.section(s) for s in _CHANNEL_FORM_SECTIONS}
         defaults = {s: _defaults_documentation(s) for s in _CHANNEL_FORM_SECTIONS}
     except (OSError, tomllib.TOMLDecodeError, ConfigError) as exc:
@@ -1084,6 +1086,16 @@ def _subspreview_config(name: str, draft: str | None) -> Config:
             return channel_mod.load_channel(name, presets_dir=tmp, base=_BASE_CONFIG)[0]
     except ConfigError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+def _refuse_legacy_keys(preset: dict[str, Any]) -> None:
+    """Un style n'a ni compte de publication ni creneaux (SPEC-6076 R2) : un corps qui en porte est refuse."""
+    found = channel_mod.legacy_keys(preset.get("channel"))
+    if found:
+        raise HTTPException(
+            status_code=422,
+            detail=f"[channel] {' et '.join(found)} : n'existe plus dans un style (le compte de publication se "
+                   "choisit à chaque publication, les créneaux se règlent sur le compte dans l'écran Comptes)")
 
 
 def _save_channel_preset(name: str, preset: dict[str, Any]) -> None:
@@ -1504,7 +1516,7 @@ def _measures(config: Config, since: str | None, until: str | None, channel: str
 
 
 def _stats_account_info(config: Config, account_id: str) -> dict[str, Any]:
-    """Un compte de l'ecran Statistiques : son etat de releve et la chaine Clipper liee ; ``HTTPException`` 404
+    """Un compte de l'ecran Statistiques : son etat de releve ; ``HTTPException`` 404
     si le compte n'existe pas dans l'ecran Comptes. Un compte non pret n'est pas releve (R4) : la raison est dite."""
     found = next((a for a in _accounts_call(accounts_mod.list_accounts, config) if a["id"] == account_id), None)
     if found is None:
@@ -1512,16 +1524,7 @@ def _stats_account_info(config: Config, account_id: str) -> dict[str, Any]:
     ready = bool(found.get("ready_to_publish"))
     reason = None if ready else (accounts_mod.ready_blocked_reason(found) or found.get("ready_note")
                                  or "le compte n'est pas coché « prêt à publier »")
-    linked = None
-    try:
-        for name in channel_mod.list_channels(_PRESETS_DIR):
-            _config, settings = channel_mod.load_channel(name, presets_dir=_PRESETS_DIR, base=_BASE_CONFIG)
-            if settings["tiktok_account"] == account_id:
-                linked = name
-                break
-    except (channel_mod.ChannelError, ConfigError) as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-    return {"account": account_id, "label": found.get("label") or account_id, "channel": linked,
+    return {"account": account_id, "label": found.get("label") or account_id,
             "ready": ready, "not_ready_reason": reason}
 
 
@@ -1795,12 +1798,7 @@ def _account_overview(config: Config, account: dict[str, Any]) -> dict[str, Any]
     try:
         settings_of = youtube_mod.get_settings if out.get("service") == "youtube" else tiktok_mod.get_settings
         out["max_posts_per_day"] = settings_of(config)["max_posts_per_day"]
-        tz = ZoneInfo("UTC")
-        for name in channel_mod.list_channels(_PRESETS_DIR):
-            _config, settings = channel_mod.load_channel(name, presets_dir=_PRESETS_DIR, base=_BASE_CONFIG)
-            if settings["tiktok_account"] == out["id"]:
-                tz = ZoneInfo(str(settings["timezone"]))
-                break
+        tz = ZoneInfo(str(out["timezone"]))
         today = datetime.now(tz).date()
         out["posts_today"] = sum(1 for t in publish_mod.account_publish_times(out["id"], **scope)
                                  if t.astimezone(tz).date() == today)
@@ -1874,6 +1872,14 @@ def _publish_accounts(config: Config) -> list[dict[str, Any]]:
             for a in _accounts_call(accounts_mod.list_accounts, config)]
 
 
+def _account_schedule(config: Config, account_id: str) -> dict[str, Any]:
+    """Creneaux reguliers (et fuseau) d'un compte de l'ecran Comptes (SPEC-6076 R2) : ``{"slots", "timezone"}``."""
+    found = next((a for a in _accounts_call(accounts_mod.list_accounts, config) if a["id"] == account_id), None)
+    if found is None:
+        raise HTTPException(status_code=409, detail=f"compte inconnu : {account_id!r} (écran Comptes)")
+    return accounts_mod.schedule_of(found)
+
+
 def _account_service(config: Config, account_id: Any) -> str:
     """Service (``tiktok`` | ``youtube``) d'un compte de publication."""
     found = next((a for a in _publish_accounts(config) if a["id"] == account_id), None)
@@ -1906,6 +1912,10 @@ def create_app(config: Config | None = None) -> FastAPI:
 
     app = FastAPI(title="Clipper", default_response_class=JSONResponse)
     app.state.config = config
+    try:  # creneaux et compte d'un ancien style repris sur le compte (SPEC-6076 R2), journalise
+        channel_mod.migrate_legacy_presets(config, presets_dir=_PRESETS_DIR, base=_BASE_CONFIG)
+    except (channel_mod.ChannelError, ConfigError, OSError, ValueError) as exc:
+        logger.error("migration des anciens styles impossible : %s", exc)
     stats_refreshes = _StatsRefreshes()
 
     @app.exception_handler(HTTPException)
@@ -2167,10 +2177,16 @@ def create_app(config: Config | None = None) -> FastAPI:
     @app.post("/api/clips/{video_id}/{clip_id}/approve")
     def approve_clip(video_id: str, clip_id: str, body: AccountBody | None = None) -> dict[str, Any]:
         """Valide le clip ; ``{"account": id}`` choisit le compte de publication parmi les comptes prets
-        (SPEC-00d1 R4), sinon c'est celui de la chaine."""
-        if body is not None and body.account is not None:
-            return _decide(video_id, clip_id, "approve", account=_require_ready_account(config, body.account))
-        return _decide(video_id, clip_id, "approve")
+        (SPEC-00d1 R4) ; sans compte, 409 explicite : un style n'en porte plus (SPEC-6076 R2). Les creneaux
+        sont ceux du compte."""
+        _validate_video_id(video_id)
+        _validate_clip_id(clip_id)
+        _require_channel(video_id, clip_id, config)
+        if body is None or body.account is None:
+            raise HTTPException(status_code=409, detail="compte de publication manquant : choisis un compte prêt à publier "
+                                "(un style n'a plus de compte associé)")
+        account = _require_ready_account(config, body.account)
+        return _decide(video_id, clip_id, "approve", account=account, schedule=_account_schedule(config, account))
 
     @app.post("/api/clips/{video_id}/{clip_id}/reject")
     def reject_clip(video_id: str, clip_id: str) -> dict[str, Any]:
@@ -2239,7 +2255,14 @@ def create_app(config: Config | None = None) -> FastAPI:
     @app.post("/api/publish/{video_id}/{clip_id}/move")
     def publish_move(video_id: str, clip_id: str, body: PublishMoveBody) -> dict[str, Any]:
         slot_at = _publish_parse_slot(body.slot_at)
-        return _publish_action(video_id, clip_id, "move", slot_at, presets_dir=_PRESETS_DIR, base=_BASE_CONFIG)
+        _validate_video_id(video_id)
+        _validate_clip_id(clip_id)
+        channel = _require_channel(video_id, clip_id, config, or_no_channel=True)
+        entry = _publish_entries(config, channel).get((video_id, clip_id))
+        account = publish_mod.entry_account(entry) if entry else None
+        schedule = _account_schedule(config, account) if account else None
+        return _publish_action(video_id, clip_id, "move", slot_at, presets_dir=_PRESETS_DIR, base=_BASE_CONFIG,
+                               schedule=schedule)
 
     @app.post("/api/publish/{video_id}/{clip_id}/published")
     def publish_mark_published(video_id: str, clip_id: str) -> dict[str, Any]:
@@ -2254,11 +2277,10 @@ def create_app(config: Config | None = None) -> FastAPI:
         return _publish_action(video_id, clip_id, "retry")
 
     @app.get("/api/publish/accounts")
-    def publish_accounts(channel: str | None = None) -> dict[str, Any]:
+    def publish_accounts() -> dict[str, Any]:
         """Comptes proposes a la validation et a la programmation (SPEC-00d1 R4) : tous, avec leur case « pret a
-        publier », et le compte par defaut de la chaine ([channel] tiktok_account) pour le preremplissage."""
-        default = _load_channel(channel)[1]["tiktok_account"] or None if channel else None
-        return {"accounts": _publish_accounts(config), "default": default}
+        publier ». Aucun compte par defaut : un style n'en porte plus (SPEC-6076 R2), chaque publication choisit."""
+        return {"accounts": _publish_accounts(config)}
 
     @app.post("/api/publish/{video_id}/{clip_id}/account")
     def publish_account(video_id: str, clip_id: str, body: AccountBody) -> dict[str, Any]:
@@ -2449,6 +2471,7 @@ def create_app(config: Config | None = None) -> FastAPI:
         _check_channel_name(body.name)
         if (Path(_PRESETS_DIR) / f"{body.name}.toml").exists():
             raise HTTPException(status_code=409, detail=f"le style {body.name!r} existe déjà")
+        _refuse_legacy_keys(body.preset or {})
         Path(_PRESETS_DIR).mkdir(parents=True, exist_ok=True)
         _save_channel_preset(body.name, body.preset or {"channel": {}})
         return _channel_detail(body.name)
@@ -2464,6 +2487,7 @@ def create_app(config: Config | None = None) -> FastAPI:
     @app.put("/api/channels/{name}")
     def put_channel(name: str, body: ChannelBody) -> dict[str, Any]:
         _channel_preset_path(name)
+        _refuse_legacy_keys(body.preset)
         _save_channel_preset(name, body.preset)
         return _channel_detail(name)
 
@@ -2481,15 +2505,6 @@ def create_app(config: Config | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         Path(_PRESETS_DIR, f"{name}.png").unlink(missing_ok=True)
         return {"name": name, "deleted": True}
-
-    @app.get("/api/channels/{name}/slots")
-    def channel_slots(name: str) -> dict[str, Any]:
-        _config, channel = _load_channel(name)
-        slots = channel_mod.next_slots(channel, datetime.now(timezone.utc), _NEXT_SLOTS)
-        return {
-            "name": name, "timezone": channel["timezone"], "slots": [s.isoformat() for s in slots],
-            "reason": None if channel["slots"] else "aucun créneau défini dans [channel].slots",
-        }
 
     @app.get("/api/channels/{name}/subtitles-preview")
     def channel_subtitles_preview(name: str, text: str = "", draft: str | None = None) -> Response:
@@ -2873,42 +2888,34 @@ def _publish_clip_view(clips: dict[tuple[str, str], dict[str, Any]], channel: st
 
 def _publish_account_entries(config: Config, account: str | None) -> list[tuple[str | None, dict[str, Any]]]:
     """(style du fichier ou None, entree) de toute la file de publication dont le compte est ``account`` (tous
-    les comptes si None). Le compte d'une entree est celui enregistre dedans, a defaut celui de son style : un
-    post d'un compte sans style, ou d'une video sans style, y figure donc aussi."""
+    les comptes si None). Le compte d'une entree est celui enregistre dedans (SPEC-6076 R2) : un post d'une
+    video sans style y figure donc aussi."""
     try:
         found = publish_mod.all_entries(state_dir=_publish_dir(config), presets_dir=_PRESETS_DIR)
     except publish_mod.PublishError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     except (OSError, ValueError) as exc:
         raise HTTPException(status_code=500, detail=f"fichier de publication illisible : {exc}") from exc
-    channel_accounts: dict[str, str | None] = {}
     rows: list[tuple[str | None, dict[str, Any]]] = []
     for name, entry in found:
-        if name not in channel_accounts:
-            channel_accounts[name] = None if name == publish_mod.NO_CHANNEL else _load_channel(name)[1]["tiktok_account"] or None
-        if account is not None and publish_mod.entry_account(entry, channel_accounts[name]) != account:
+        if account is not None and publish_mod.entry_account(entry) != account:
             continue
         rows.append((None if name == publish_mod.NO_CHANNEL else name, entry))
     return rows
 
 
-def _publish_slot_channel(account: str | None) -> tuple[str | None, dict[str, Any] | None, str | None]:
-    """(style, ses reglages, raison sans creneau) : les creneaux viennent du seul style lie au compte."""
+def _publish_account_schedule(config: Config, account: str | None) -> tuple[dict[str, Any] | None, str | None]:
+    """(creneaux du compte, raison sans creneau) : les creneaux appartiennent au compte (SPEC-6076 R2)."""
     if account is None:
-        return None, None, "choisis un compte pour voir les créneaux de son style"
-    linked = [name for name in _channel_names() if _load_channel(name)[1]["tiktok_account"] == account]
-    if not linked:
-        return None, None, "ce compte n'est lié à aucun style : pas de créneaux (publie à la date choisie)"
-    if len(linked) > 1:
-        return None, None, f"plusieurs styles sont liés à ce compte ({', '.join(linked)}) : pas de créneaux"
-    channel = _load_channel(linked[0])[1]
-    return linked[0], channel, None if channel["slots"] else "aucun créneau défini dans [channel].slots"
+        return None, "choisis un compte pour voir ses créneaux"
+    schedule = _account_schedule(config, account)
+    return schedule, None if schedule["slots"] else "aucun créneau défini pour ce compte (écran Comptes)"
 
 
 def _publish_week_view(config: Config, account: str | None, week: str | None) -> dict[str, Any]:
     if account is not None and not any(a["id"] == account for a in _publish_accounts(config)):
         raise HTTPException(status_code=404, detail=f"compte inconnu : {account!r} (écran Comptes)")
-    style, channel, reason = _publish_slot_channel(account)
+    channel, reason = _publish_account_schedule(config, account)
     tz = ZoneInfo(str(channel["timezone"]) if channel else _PUBLISH_DEFAULT_TZ)
     monday = _publish_week_start(week, tz)
     start = datetime.combine(monday, time(0, 0), tzinfo=tz)
@@ -2950,7 +2957,7 @@ def _publish_week_view(config: Config, account: str | None, week: str | None) ->
                 "free": entry is None,
             })
     return {
-        "account": account, "channel": style, "timezone": str(tz.key),
+        "account": account, "timezone": str(tz.key),
         "week_start": monday.isoformat(), "week_end": (monday + timedelta(days=6)).isoformat(),
         "slots": slots, "unscheduled": unscheduled, "done": done, "off_slot": sorted(off_slot, key=lambda c: datetime.fromisoformat(c["slot_at"])),
         "accounts": _publish_accounts(config), "reason": reason,

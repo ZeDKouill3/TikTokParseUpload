@@ -862,3 +862,88 @@ def test_the_accounts_screen_is_wired_for_publication_accounts():
     assert "Se connecter" in js and "/browser/login" in js
     assert "Relever les stats" in js and "/api/stats/tiktok/refresh" in js
     assert "ready_note" in js                                           # décochage automatique affiché
+
+
+# --------------------------------------------------------------------------
+# SPEC-6076 R2 : creneaux de publication reguliers portes par le compte
+# --------------------------------------------------------------------------
+
+SLOTS = [{"day": "mon", "time": "18:30"}, {"day": "fri", "time": "09:00"}]
+
+
+def test_a_new_account_has_no_slots_and_the_default_timezone(config, vault):
+    account = accounts.add_account(config, {"label": "Compte"})
+
+    assert account["slots"] == [] and account["timezone"] == "Europe/Paris"
+    assert accounts.schedule_of(account) == {"slots": [], "timezone": "Europe/Paris"}
+
+
+def test_an_account_of_an_older_file_reads_without_slots_then_with_the_default_timezone(config, vault):
+    Path("state").mkdir()
+    Path("state/accounts.json").write_text(json.dumps({"accounts": [{"id": "ab12cd", "label": "Ancien"}]}), encoding="utf-8")
+
+    listed = accounts.list_accounts(config)[0]
+
+    assert listed["slots"] == [] and listed["timezone"] == "Europe/Paris"
+
+
+def test_slots_and_timezone_are_saved_on_the_account_and_listed(config, vault):
+    account = accounts.add_account(config, {"label": "Compte"})
+
+    updated = accounts.update_account(config, account["id"], {"slots": SLOTS, "timezone": "UTC"})
+
+    assert updated["slots"] == SLOTS and updated["timezone"] == "UTC"
+    on_disk = json.loads(Path("state/accounts.json").read_text(encoding="utf-8"))["accounts"][0]
+    assert on_disk["slots"] == SLOTS and on_disk["timezone"] == "UTC"
+    assert accounts.list_accounts(config)[0]["slots"] == SLOTS
+    # une mise a jour sans slots ne les efface pas, `slots: []` les retire (suppression d'un creneau)
+    assert accounts.update_account(config, account["id"], {"label": "Renommé"})["slots"] == SLOTS
+    assert accounts.update_account(config, account["id"], {"slots": SLOTS[:1]})["slots"] == SLOTS[:1]
+    assert accounts.update_account(config, account["id"], {"slots": []})["slots"] == []
+
+
+def test_slots_are_validated_and_deduplicated_with_explicit_errors(config, vault):
+    account = accounts.add_account(config, {"label": "Compte"})
+
+    for bad in ([{"day": "someday", "time": "18:30"}], [{"day": "mon", "time": "25:99"}], [{"day": "mon"}],
+                ["mon 18:30"], "mon 18:30", [{"day": "mon", "time": "18:30", "extra": 1}]):
+        with pytest.raises(accounts.AccountsError, match="créneau|slots"):
+            accounts.update_account(config, account["id"], {"slots": bad})
+    with pytest.raises(accounts.AccountsError, match="fuseau horaire inconnu"):
+        accounts.update_account(config, account["id"], {"timezone": "Mars/Olympus"})
+    assert accounts.list_accounts(config)[0]["slots"] == []
+    twice = accounts.update_account(config, account["id"], {"slots": SLOTS + SLOTS[:1]})
+    assert twice["slots"] == SLOTS
+
+
+def test_migrate_slots_fills_an_account_once_and_never_overwrites(config, vault):
+    account = accounts.add_account(config, {"label": "Compte"})
+
+    assert accounts.migrate_slots(config, account["id"], SLOTS, "UTC") is True
+    assert accounts.migrate_slots(config, account["id"], [{"day": "tue", "time": "10:00"}], "Asia/Tokyo") is False
+
+    after = accounts.list_accounts(config)[0]
+    assert after["slots"] == SLOTS and after["timezone"] == "UTC"
+    with pytest.raises(accounts.AccountNotFound):
+        accounts.migrate_slots(config, "zz99", SLOTS)
+
+
+def test_slots_over_http_are_saved_by_the_accounts_screen_and_refused_when_invalid(config, vault):
+    client = local_client(config)
+    created = client.post("/api/accounts", json={"label": "Compte exemple", "slots": SLOTS, "timezone": "UTC"})
+    assert created.status_code == 201 and created.json()["slots"] == SLOTS
+    account_id = created.json()["id"]
+
+    saved = client.put(f"/api/accounts/{account_id}", json={"slots": SLOTS[:1]})
+    assert saved.status_code == 200 and saved.json()["slots"] == SLOTS[:1]
+    assert client.get("/api/accounts").json()[0]["slots"] == SLOTS[:1]
+    refused = client.put(f"/api/accounts/{account_id}", json={"slots": [{"day": "xx", "time": "09:00"}]})
+    assert refused.status_code == 422 and "créneau invalide" in refused.json()["detail"]
+
+
+def test_accounts_screen_edits_slots_like_the_old_channel_form():
+    js = (STATIC / "screens" / "accounts.js").read_text(encoding="utf-8")
+
+    for marker in ("accSlotsEditor", "accReadSlots", "data-slot-add", "data-slot-del", "data-acc-slots",
+                   "slots: accReadSlots(slotsBox)", "timezone:", "Créneaux de publication"):
+        assert marker in js

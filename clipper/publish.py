@@ -194,16 +194,16 @@ def _sibling_clip_ids(output_dir: str | Path, video_id: str, series_id: str, *, 
     return siblings
 
 
-def _next_free_slot(channel: dict[str, Any], entries: list[dict[str, Any]], after: datetime) -> datetime:
+def _next_free_slot(schedule: dict[str, Any], entries: list[dict[str, Any]], after: datetime) -> datetime:
     taken = {entry["slot_at"] for entry in entries if entry.get("slot_at") is not None}
     n = len(taken) + 1
     while True:
-        candidates = channel_mod.next_slots(channel, after, n)
+        candidates = channel_mod.next_slots(schedule, after, n)
         for candidate in candidates:
             if _iso(candidate) not in taken:
                 return candidate
         if len(candidates) < n:
-            raise PublishError("aucun creneau disponible pour cette chaine")
+            raise PublishError("aucun creneau disponible pour ce compte")
         n += 1
 
 
@@ -241,17 +241,21 @@ def approve(
     presets_dir: str | Path = "presets",
     base: str | Path = "config.toml",
     account: str | None = None,
+    schedule: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Approuve un clip (SPEC-74e9 4.2) : entree 'approved', puis 'scheduled'
-    au prochain creneau libre si la chaine en a. Leve PublishError si le
-    sidecar dit ready=false. Le compte de publication (SPEC-00d1 R4) est ``account`` s'il est donne,
-    sinon celui de la chaine ([channel] tiktok_account, None s'il n'y en a pas)."""
+    au prochain creneau libre si le compte en a. Leve PublishError si le
+    sidecar dit ready=false ou si ``account`` manque : le compte de publication (SPEC-6076 R2) se choisit a
+    chaque publication, un style n'en porte plus. ``schedule`` : les creneaux du compte
+    (``accounts.schedule_of``) ; sans creneau, l'entree reste 'approved'."""
     sidecar = _read_sidecar(output_dir, video_id, clip_id)
     if not sidecar.get("ready"):
         raise PublishError(f"clip non pret pour publication : {video_id}/{clip_id}")
+    if not account:
+        raise PublishError("compte de publication manquant : choisis un compte prêt à publier")
 
     series_id, part = _series_info(video_id, clip_id, sidecar)
-    channel_dict = channel_settings(channel, presets_dir, base)
+    channel_settings(channel, presets_dir, base)  # style inconnu ou illisible : erreur explicite
 
     path = _state_path(channel, state_dir)
     now_dt = _now(now)
@@ -266,14 +270,14 @@ def approve(
         "decided_at": _iso(now_dt),
         "published_at": None,
         "error": None,
-        "account": account or channel_dict["tiktok_account"] or None,
+        "account": account,
     }
     with _locked(path):
         entries = _load_entries(path)
         if series_id is not None and part is not None and part > 1:
             _require_previous_part(entries, output_dir, video_id, clip_id, series_id, part)
-        if channel_dict["slots"]:
-            slot = _next_free_slot(channel_dict, entries, now_dt)
+        if schedule and schedule["slots"]:
+            slot = _next_free_slot(schedule, entries, now_dt)
             entry["status"] = "scheduled"
             entry["slot_at"] = _iso(slot)
 
@@ -342,17 +346,20 @@ def move(
     state_dir: str | Path | None = None,
     presets_dir: str | Path = "presets",
     base: str | Path = "config.toml",
+    schedule: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Deplace un clip vers un creneau libre de la chaine (SPEC-74e9 4.3) :
-    refuse un creneau deja pris ou hors des slots de la chaine."""
+    """Deplace un clip vers un creneau libre du compte (SPEC-74e9 4.3, SPEC-6076 R2) :
+    refuse un creneau deja pris ou hors des creneaux du compte (``schedule`` : ``accounts.schedule_of``)."""
     path = _state_path(channel, state_dir)
-    channel_dict = channel_settings(channel, presets_dir, base)
+    channel_settings(channel, presets_dir, base)  # style inconnu ou illisible : erreur explicite
+    if not schedule or not schedule["slots"]:
+        raise PublishError(f"déplacement impossible pour {video_id}/{clip_id} : le compte n'a aucun créneau (écran Comptes)")
     with _locked(path):
-        return _move_locked(path, video_id, clip_id, slot_at, channel_dict)
+        return _move_locked(path, video_id, clip_id, slot_at, schedule)
 
 
 def _move_locked(
-    path: Path, video_id: str, clip_id: str, slot_at: datetime, channel_dict: dict[str, Any],
+    path: Path, video_id: str, clip_id: str, slot_at: datetime, schedule: dict[str, Any],
 ) -> dict[str, Any]:
     entries = _load_entries(path)
     entry = _find_entry(entries, video_id, clip_id)
@@ -364,12 +371,12 @@ def _move_locked(
         )
     _refuse_in_progress(entry, "déplacement")
 
-    tz = ZoneInfo(str(channel_dict["timezone"]))
+    tz = ZoneInfo(str(schedule["timezone"]))
     local_slot = slot_at.astimezone(tz)
     day = _DAYS[local_slot.weekday()]
     time_str = local_slot.strftime("%H:%M")
-    if not any(s["day"] == day and s["time"] == time_str for s in channel_dict["slots"]):
-        raise PublishError(f"creneau hors des slots de la chaine pour {video_id}/{clip_id} : {slot_at}")
+    if not any(s["day"] == day and s["time"] == time_str for s in schedule["slots"]):
+        raise PublishError(f"creneau hors des creneaux du compte pour {video_id}/{clip_id} : {slot_at}")
 
     slot_iso = _iso(slot_at)
     for other in entries:
@@ -531,10 +538,10 @@ def list_entries(channel: str, *, state_dir: str | Path | None = None) -> list[d
     return _load_entries(_state_path(channel, state_dir))
 
 
-def entry_account(entry: dict[str, Any], channel_account: str | None) -> str | None:
-    """Compte qui publie une entree (SPEC-00d1 R4) : celui enregistre dans l'entree ; une entree sans ce champ
-    (file d'avant R4) prend le compte de sa chaine. Jamais un autre compte en repli."""
-    return entry["account"] if "account" in entry else (channel_account or None)
+def entry_account(entry: dict[str, Any]) -> str | None:
+    """Compte qui publie une entree (SPEC-00d1 R4) : celui enregistre dans l'entree, None s'il n'y en a pas
+    (SPEC-6076 R2 : un style n'a plus de compte, jamais un autre compte en repli)."""
+    return entry.get("account") or None
 
 
 def _account_entries(
@@ -544,9 +551,8 @@ def _account_entries(
     found: list[tuple[str, dict[str, Any]]] = []
     try:
         for name in [*channel_mod.list_channels(presets_dir), NO_CHANNEL]:
-            settings = channel_settings(name, presets_dir, base)
             found.extend((name, e) for e in _load_entries(_state_path(name, state_dir))
-                         if entry_account(e, settings["tiktok_account"]) == account)
+                         if entry_account(e) == account)
     except (channel_mod.ChannelError, ConfigError) as exc:
         raise PublishError(f"chaines illisibles pour le compte {account} : {exc}") from exc
     return found
@@ -651,15 +657,19 @@ def postpone(
     reason: str,
     *,
     allowed: Callable[[datetime], str | None],
+    schedule: dict[str, Any] | None = None,
     now: datetime | None = None,
     state_dir: str | Path | None = None,
     presets_dir: str | Path = "presets",
     base: str | Path = "config.toml",
 ) -> dict[str, Any]:
-    """Reporte une entree ``scheduled`` au prochain creneau libre que ``allowed`` accepte
-    (``allowed(creneau)`` rend None, ou la raison du refus : plafonds de R6) ; la raison et la
-    nouvelle date sont gardees dans ``postponed_reason``."""
-    channel_dict = channel_settings(channel, presets_dir, base)
+    """Reporte une entree ``scheduled`` au prochain creneau libre du compte (``schedule`` :
+    ``accounts.schedule_of``) que ``allowed`` accepte (``allowed(creneau)`` rend None, ou la raison du refus :
+    plafonds de R6) ; la raison et la nouvelle date sont gardees dans ``postponed_reason``."""
+    channel_settings(channel, presets_dir, base)  # style inconnu ou illisible : erreur explicite
+    if not schedule or not schedule["slots"]:
+        raise PublishError(f"aucun créneau libre et permis pour reporter {video_id}/{clip_id} ({reason}) : "
+                           "le compte n'a aucun créneau (écran Comptes)")
     path = _state_path(channel, state_dir)
     with _locked(path):
         entries = _load_entries(path)
@@ -673,7 +683,7 @@ def postpone(
         slot = None
         n = _POSTPONE_FIRST_BATCH
         while slot is None and n <= _POSTPONE_MAX_SLOTS:
-            slot = next((c for c in channel_mod.next_slots(channel_dict, after, n)
+            slot = next((c for c in channel_mod.next_slots(schedule, after, n)
                          if _iso(c) not in taken and allowed(c) is None), None)
             n *= 2
         if slot is None:

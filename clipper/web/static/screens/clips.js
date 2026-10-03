@@ -179,7 +179,7 @@ function clipDrawerHtml(c) {
         ${lockHint}
         <div class="field" data-clip-account-field><label for="clip-account">Compte de publication</label>
           <select class="input" id="clip-account" data-clip-account><option value="">Chargement…</option></select>
-          <span class="hint" data-clip-account-hint>Prérempli avec le compte du style ; seuls les comptes « prêts à publier » (écran Comptes) sont proposés.</span></div>
+          <span class="hint" data-clip-account-hint>Choisis le compte qui publiera ce clip ; seuls les comptes « prêts à publier » (écran Comptes) sont proposés, avec les créneaux du compte.</span></div>
         <div><button type="button" class="btn btn-xs" data-save-caption${locked ? " disabled" : ""}>${icon("check", "i-xs")}Enregistrer la description et les hashtags</button></div>
         <div class="field"><span class="field-label">Contrôle qualité</span>${clipQaBlock(c)}</div>
         <div class="field"><span class="field-label">Confiance du jury</span><div data-jury-confidence>${juryConfidenceHtml(c.jury_confidence, c.jury_judge_confidences)}</div></div>
@@ -197,21 +197,16 @@ function clipDrawerHtml(c) {
     </div>`;
 }
 
-/* Compte de publication (SPEC-00d1 R4) : les comptes prêts, préremplis avec celui du style. */
+/* Compte de publication (SPEC-00d1 R4, SPEC-6076 R2) : les comptes prêts, à choisir à chaque publication (un style n'a plus de compte). */
 async function clipFillAccounts(c, d) {
   const select = $("#clip-account", d), hint = $("[data-clip-account-hint]", d);
   try {
-    const out = await api(`/api/publish/accounts?channel=${encodeURIComponent(c.channel || "")}`);
+    const out = await api("/api/publish/accounts");
     const ready = out.accounts.filter((a) => a.ready_to_publish);
-    const known = out.accounts.find((a) => a.id === out.default);
     const options = ready.map((a) => `<option value="${esc(a.id)}">${esc(a.label || a.id)}</option>`);
-    if (!known || !known.ready_to_publish) {
-      const name = known ? (known.label || known.id) : "aucun";
-      options.unshift(`<option value="">Compte du style : ${esc(name)} (non prêt à publier)</option>`);
-      hint.textContent = out.default ? "Le compte du style n'est pas prêt à publier : le clip restera en attente tant qu'il ne l'est pas, ou choisis un autre compte." : "Ce style n'a pas de compte (tiktok_account) : choisis un compte prêt.";
-    }
+    options.unshift(`<option value="">Choisis un compte</option>`);
+    if (!ready.length) hint.textContent = "Aucun compte prêt à publier : connecte-en un dans l'écran Comptes.";
     select.innerHTML = options.join("");
-    if (known && known.ready_to_publish) select.value = known.id;
   } catch (err) {
     select.innerHTML = `<option value="">Comptes indisponibles</option>`;
     hint.textContent = String(err.message || err);
@@ -266,9 +261,10 @@ async function openClipDrawer(key) {
     // « Publier maintenant » ouvre le formulaire de l'ecran Publication, prerempli avec ce clip (SPEC-1ed3 R5)
     if (now) now.onclick = () => { closeLayer(); setTimeout(() => pubOpenForm({ video_id: c.video_id, clip_id: c.clip_id }), 340); };
     $("[data-approve]", d).onclick = async () => {
-      const chosen = $("#clip-account", d).value; // vide : le compte du style (peut ne pas être prêt : le clip attend)
+      const chosen = $("#clip-account", d).value;
+      if (!chosen) { toast({ kind: "warn", title: "Compte manquant", body: "Choisis le compte qui publiera ce clip." }); return; }
       try {
-        await api(clipUrl(c, "/approve"), chosen ? jsonBody("POST", { account: chosen }) : { method: "POST" });
+        await api(clipUrl(c, "/approve"), jsonBody("POST", { account: chosen }));
         closeLayer();
         toast({ kind: "ok", title: "Clip approuvé", body: c.screen_title || c.clip_id });
         loadClips();

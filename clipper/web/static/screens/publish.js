@@ -223,7 +223,7 @@ function pubAccounts(d) {
 
 function pubToolbar(d) {
   const weekLabel = d ? `${pubFmt(d.week_start, { day: "numeric", month: "short" })} au ${pubFmt(d.week_end, { day: "numeric", month: "short", year: "numeric" })}` : "";
-  const style = d && d.channel ? `Style : <b>${esc(d.channel)}</b>` : (d && d.account ? `<span class="muted">Compte sans style</span>` : "");
+  const style = d && d.account ? `<span class="muted">Créneaux du compte (écran Comptes)</span>` : "";
   return `<div class="toolbar pub-toolbar">
     <select class="input" id="pub-account" aria-label="Compte de publication"><option value="">Tous les comptes</option>${pubAccounts(d).map((a) => `<option value="${esc(a.id)}"${a.id === pubUi.account ? " selected" : ""}>${esc(pubAccountText(a))}</option>`).join("")}</select>
     <div class="row" style="gap:4px"><button type="button" class="icon-btn" data-week="-1" aria-label="Semaine précédente"${d ? "" : " disabled"}>${icon("chevron-left")}</button>
@@ -417,12 +417,6 @@ async function pubFormSelect(f, d, key) {
   $("#pub-form-tags", d).value = (c.hashtags || []).join(" ");
   $("#pub-form-yt-title", d).value = c.screen_title || "";  // titre YouTube par defaut = titre d'ecran du clip
   pubFormClipCards(f, d);
-  try {
-    const out = await api(`/api/publish/accounts?channel=${pubEnc(c.channel || "")}`);
-    const pick = $("#pub-form-account", d);
-    const known = f.accounts.find((a) => a.id === out.default && a.ready_to_publish);
-    if (known) { pick.value = known.id; pubFormShowService(f, d); }
-  } catch (err) { /* pas de compte par defaut : le choix reste a l'utilisateur */ }
 }
 
 function pubFormBody(f, d) {
@@ -546,7 +540,7 @@ async function pubRestore(c, slotAt, viaUnschedule) {
 }
 
 async function pubMarkPublished(c) {
-  const account = pubUi.data && pubUi.data.tiktok_account;
+  const account = c.account ? pubAccountLabel(c.account) : "";
   const ok = await confirmDialog({
     title: "Déclarer ce clip comme publié ?",
     body: `À utiliser seulement si « ${pubTitle(c)} » a déjà été publié hors de Clipper${account ? ` (sur ${account})` : ""}, par exemple depuis TikTok Studio ou l'appli : Clipper ne le publiera pas et le marque publié. Pour publier depuis Clipper, utilise « Nouvelle publication ».`,
@@ -622,7 +616,7 @@ async function pubSetAccount(c, account) {
 }
 
 function pubDetailHtml(c) {
-  const account = c.account || (pubUi.data && pubUi.data.tiktok_account);
+  const account = c.account;
   const status = c.publish_status;
   const hint = status === "approved" ? "Clique « Publier maintenant » (formulaire Nouvelle publication), ou glisse ce clip sur un créneau libre du calendrier pour le planifier."
     : status === "failed" ? "La publication s'est arrêtée : regarde la capture, règle le problème dans le navigateur du compte, puis « Réessayer » (ou repasse le clip en attente pour le replanifier)." : "";

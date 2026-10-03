@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import secrets
 import string
 import tempfile
@@ -36,6 +37,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import keyring
 from keyring.errors import PasswordDeleteError
@@ -65,6 +67,10 @@ DEFAULT_SERVICE = "tiktok"
 SERVICE_LABELS = {"tiktok": "TikTok", "youtube": "YouTube"}
 _REPLACE_ATTEMPTS = 5
 _REPLACE_DELAY_S = 0.05
+# Creneaux reguliers d'un compte (SPEC-6076 R2) : jour + heure locale, dans le fuseau du compte.
+DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+DEFAULT_TIMEZONE = "Europe/Paris"
+_TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 
 _lock = threading.Lock()
 _backend_override: Any = None
@@ -152,6 +158,61 @@ def _vault_delete(account_id: str) -> None:
         raise AccountsError("le coffre de l'OS a refusé l'opération : suppression du mot de passe") from None
 
 
+# ---------------------------------------------------------------- creneaux
+
+
+def validate_slots(slots: Any) -> list[dict[str, str]]:
+    """Creneaux reguliers ``[{"day": "mon".."sun", "time": "HH:MM"}]`` : liste validee et dedoublonnee, erreur
+    explicite sinon (jamais un creneau ignore)."""
+    if not isinstance(slots, list):
+        raise AccountsError("slots : une liste de créneaux {\"day\", \"time\"} est attendue")
+    out: list[dict[str, str]] = []
+    for slot in slots:
+        day = slot.get("day") if isinstance(slot, dict) else None
+        time_str = slot.get("time") if isinstance(slot, dict) else None
+        if day not in DAYS or not isinstance(time_str, str) or not _TIME_RE.match(time_str):
+            raise AccountsError(
+                f"créneau invalide : {slot!r} (attendu : jour {' | '.join(DAYS)} et heure HH:MM)")
+        if isinstance(slot, dict) and set(slot) - {"day", "time"}:
+            raise AccountsError(f"créneau invalide : {slot!r} (seuls day et time sont admis)")
+        if {"day": day, "time": time_str} not in out:
+            out.append({"day": day, "time": time_str})
+    return out
+
+
+def validate_timezone(name: Any) -> str:
+    if not isinstance(name, str) or not name:
+        raise AccountsError("timezone : un nom de fuseau horaire est attendu (ex. Europe/Paris)")
+    try:
+        ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError):
+        raise AccountsError(f"timezone : fuseau horaire inconnu ({name!r})") from None
+    return name
+
+
+def schedule_of(account: dict[str, Any]) -> dict[str, Any]:
+    """Les creneaux d'un compte sous la forme que lit ``clipper.channel.next_slots`` : ``{"slots", "timezone"}``."""
+    return {"slots": list(account.get("slots") or []), "timezone": account.get("timezone") or DEFAULT_TIMEZONE}
+
+
+def migrate_slots(config: Config, account_id: str, slots: list[dict[str, str]], timezone_name: str | None = None) -> bool:
+    """Reprend sur le compte les creneaux d'un ancien style (SPEC-6076 R2), une seule fois : rend False, sans rien
+    ecrire, si le compte a deja des creneaux (jamais ecrases) ; ``AccountNotFound`` si le compte n'existe pas."""
+    slots = validate_slots(slots)
+    with _lock:
+        accounts = _read(config)
+        account = _find(accounts, account_id)
+        if account.get("slots") or not slots:
+            return False
+        account["slots"] = slots
+        if timezone_name:
+            account["timezone"] = validate_timezone(timezone_name)
+        account["updated_at"] = _now()
+        _write(config, accounts)
+    logger.info("compte %s : %d créneau(x) repris d'un style", account_id, len(slots))
+    return True
+
+
 # ---------------------------------------------------------------- fichier
 
 
@@ -206,14 +267,15 @@ def _public(account: dict[str, Any]) -> dict[str, Any]:
                created_at=account.get("created_at"), updated_at=account.get("updated_at"),
                ready_to_publish=bool(account.get("ready_to_publish")),
                ready_note=account.get("ready_note"), login=account.get("login"),
-               r4_halt=account.get("r4_halt"))
+               r4_halt=account.get("r4_halt"), slots=list(account.get("slots") or []),
+               timezone=account.get("timezone") or DEFAULT_TIMEZONE)
     return out
 
 
 def _clean(data: Any, *, creating: bool) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise AccountsError("corps invalide : un objet JSON est attendu")
-    unknown = set(data) - {*_FIELDS, "password", "service"}
+    unknown = set(data) - {*_FIELDS, "password", "service", "slots", "timezone"}
     if unknown:
         raise AccountsError(f"champ(s) inconnu(s) : {', '.join(sorted(unknown))}")
     out: dict[str, Any] = {}
@@ -235,6 +297,10 @@ def _clean(data: Any, *, creating: bool) -> dict[str, Any]:
         if data["service"] not in SERVICES:
             raise AccountsError(f"service : {data['service']!r} invalide (attendu : {' | '.join(SERVICES)})")
         out["service"] = data["service"]
+    if "slots" in data:
+        out["slots"] = validate_slots(data["slots"])
+    if "timezone" in data:
+        out["timezone"] = validate_timezone(data["timezone"])
     if "password" in data:
         password = data["password"]
         if not isinstance(password, str):
@@ -271,7 +337,8 @@ def add_account(config: Config, data: Any) -> dict[str, Any]:
             _vault_set(account_id, password)
         now = _now()
         account = {"id": account_id, **{k: fields.get(k, "") for k in _FIELDS},
-                   "service": fields.get("service", DEFAULT_SERVICE), "has_password": bool(password), "created_at": now, "updated_at": now}
+                   "service": fields.get("service", DEFAULT_SERVICE), "has_password": bool(password), "created_at": now, "updated_at": now,
+                   "slots": fields.get("slots", []), "timezone": fields.get("timezone", DEFAULT_TIMEZONE)}
         try:
             _write(config, [*accounts, account])
         except AccountsError:

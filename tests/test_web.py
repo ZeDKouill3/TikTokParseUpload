@@ -12,6 +12,7 @@ import os
 import shutil
 import subprocess
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 import pytest
@@ -1782,7 +1783,7 @@ def _write_publish(tmp_path, channel, entries):
 
 def _entry(clip_id, status, video_id=CLIPS_VIDEO, **extra):
     return {"video_id": video_id, "clip_id": clip_id, "series_id": None, "part": None, "status": status,
-            "slot_at": None, "decided_at": None, "published_at": None, "error": None, **extra}
+            "slot_at": None, "decided_at": None, "published_at": None, "error": None, "account": "ab12cd", **extra}
 
 
 def _clips_setup(tmp_path):
@@ -1860,12 +1861,13 @@ def test_approve_and_reject_call_publish(tmp_path, isolated_cwd, monkeypatch):
     from clipper import publish
 
     _clips_setup(tmp_path)
+    _accounts_state(tmp_path)
     calls = []
     monkeypatch.setattr(publish, "approve", lambda *a, **kw: calls.append(("approve", a, kw)) or _entry("01", "scheduled"))
     monkeypatch.setattr(publish, "reject", lambda *a, **kw: calls.append(("reject", a, kw)) or _entry("01", "rejected"))
     c = client(tmp_path)
 
-    ok = c.post(f"/api/clips/{CLIPS_VIDEO}/01/approve")
+    ok = c.post(f"/api/clips/{CLIPS_VIDEO}/01/approve", json={"account": READY})
     no = c.post(f"/api/clips/{CLIPS_VIDEO}/01/reject")
 
     assert ok.status_code == 200 and ok.json()["status"] == "scheduled"
@@ -1873,6 +1875,9 @@ def test_approve_and_reject_call_publish(tmp_path, isolated_cwd, monkeypatch):
     assert [(name, args) for name, args, _ in calls] == [
         ("approve", (CLIPS_VIDEO, "01", "ma_chaine")), ("reject", (CLIPS_VIDEO, "01", "ma_chaine"))]
     assert calls[0][2]["output_dir"] == tmp_path / "output"
+    assert calls[0][2]["account"] == READY  # le compte choisi, pas celui d'un style
+    assert calls[0][2]["schedule"] == {"slots": [{"day": "mon", "time": "18:30"}, {"day": "thu", "time": "12:00"}],
+                                       "timezone": "Europe/Paris"}  # les creneaux du compte
 
 
 @pytest.mark.parametrize("action", ["approve", "reject"])
@@ -1880,13 +1885,14 @@ def test_approve_reject_publish_error_is_409_with_detail(tmp_path, isolated_cwd,
     from clipper import publish
 
     _clips_setup(tmp_path)
+    _accounts_state(tmp_path)
 
     def boom(*a, **kw):
         raise publish.PublishError("clip non pret pour publication : x/02")
 
     monkeypatch.setattr(publish, action, boom)
 
-    resp = client(tmp_path).post(f"/api/clips/{CLIPS_VIDEO}/02/{action}")
+    resp = client(tmp_path).post(f"/api/clips/{CLIPS_VIDEO}/02/{action}", json={"account": READY})
 
     assert resp.status_code == 409
     assert resp.json()["detail"] == "clip non pret pour publication : x/02"
@@ -2078,7 +2084,6 @@ def test_clips_screen_is_wired_with_gallery_sidecar_and_actions():
 CH = "ma_chaine"
 _CH_PRESET = (
     '[channel]\ndisplay_name = "Ma chaîne"\nwatch = true\n'
-    'slots = [{day = "mon", time = "18:30"}, {day = "thu", time = "12:00"}]\n'
     '\n[reframe]\nletterbox_zoom = 1.5\n'
 )
 
@@ -2163,7 +2168,6 @@ def test_put_channel_saves_through_save_channel(tmp_path, isolated_cwd, monkeypa
 @pytest.mark.parametrize("preset, section, key", [
     ({"reframe": {"zzz": 1}}, "reframe", "zzz"),                            # clé inconnue (ConfigError)
     ({"channel": {"mode": "turbo"}}, "channel", "mode"),                    # mode invalide
-    ({"channel": {"slots": [{"day": "xx", "time": "18:30"}]}}, "channel", "slots"),
     ({"channel": {"watch_interval_s": "vite"}}, "channel", "watch_interval_s"),   # mauvais type
     ({"channel": {"timezone": "Mars/Olympus"}}, "channel", "timezone"),
     ({"render": {"crf": True}}, "render", "crf"),                           # bool n'est pas un entier
@@ -2248,24 +2252,51 @@ def test_delete_channel_requires_confirm(tmp_path, isolated_cwd):
     assert c.delete(f"/api/channels/{CH}?confirm=true").status_code == 404
 
 
-def test_channel_slots_returns_the_next_ten_slots(tmp_path, isolated_cwd):
-    from datetime import datetime, timezone
-
+def test_a_style_has_no_slots_route_any_more(tmp_path, isolated_cwd):
     _channels_setup(tmp_path)
-    data = client(tmp_path).get(f"/api/channels/{CH}/slots").json()
 
-    slots = [datetime.fromisoformat(s) for s in data["slots"]]
-    assert len(slots) == 10 and slots == sorted(slots)
-    assert all(s > datetime.now(timezone.utc) for s in slots)
-    assert {(s.weekday(), s.strftime("%H:%M")) for s in slots} == {(0, "18:30"), (3, "12:00")}
-    assert data["timezone"] == "Europe/Paris" and data["reason"] is None
+    assert client(tmp_path).get(f"/api/channels/{CH}/slots").status_code in (404, 405)  # les creneaux sont ceux du compte
 
 
-def test_channel_slots_without_slots_says_why(tmp_path, isolated_cwd):
-    _channels_setup(tmp_path, preset="[channel]\n")
-    data = client(tmp_path).get(f"/api/channels/{CH}/slots").json()
-    assert data["slots"] == [] and "créneau" in data["reason"]
-    assert client(tmp_path).get("/api/channels/autre/slots").status_code == 404
+_LEGACY_PRESET = (
+    '[channel]\ndisplay_name = "Ma chaîne"\ntiktok_account = "ab12cd"\n'
+    '[[channel.slots]]\nday = "mon"\ntime = "18:30"\n\n[reframe]\nletterbox_zoom = 1.5\n'
+)
+
+
+def _legacy_setup(tmp_path):
+    (tmp_path / "state").mkdir(exist_ok=True)
+    (tmp_path / "state" / "accounts.json").write_text(
+        json.dumps({"accounts": [{"id": "ab12cd", "label": "Compte exemple"}]}), encoding="utf-8")
+    _channels_setup(tmp_path, _LEGACY_PRESET)
+
+
+def test_the_style_api_neither_returns_nor_accepts_an_account_or_slots(tmp_path, isolated_cwd):
+    _legacy_setup(tmp_path)
+    c = client(tmp_path)  # create_app migre le preset d'avant : creneaux sur le compte, cles retirees du fichier
+
+    detail = c.get(f"/api/channels/{CH}").json()
+    assert "tiktok_account" not in detail["raw"]["channel"] and "slots" not in detail["raw"]["channel"]
+    assert "tiktok_account" not in detail["effective"]["channel"] and "slots" not in detail["effective"]["channel"]
+    assert "tiktok_account" not in detail["defaults"]["channel"] and "slots" not in detail["defaults"]["channel"]
+
+    for legacy in ({"tiktok_account": "ab12cd"}, {"slots": [{"day": "mon", "time": "18:30"}]}):
+        preset = {"channel": {"display_name": "Ma chaîne", **legacy}}
+        put = c.put(f"/api/channels/{CH}", json={"preset": preset})
+        assert put.status_code == 422 and "n'existe plus dans un style" in put.json()["detail"]
+        post = c.post("/api/channels", json={"name": "autre", "preset": preset})
+        assert post.status_code == 422 and not (tmp_path / "presets" / "autre.toml").exists()
+
+
+def test_starting_the_console_migrates_a_legacy_preset_onto_its_account(tmp_path, isolated_cwd):
+    _legacy_setup(tmp_path)
+
+    client(tmp_path)
+
+    account = json.loads((tmp_path / "state" / "accounts.json").read_text(encoding="utf-8"))["accounts"][0]
+    assert account["slots"] == [{"day": "mon", "time": "18:30"}]
+    text = (tmp_path / "presets" / f"{CH}.toml").read_text(encoding="utf-8")
+    assert "tiktok_account" not in text and "slots" not in text and 'display_name = "Ma chaîne"' in text
 
 
 def _multipart(filename: str, content: bytes, field: str = "file") -> tuple[bytes, str]:
@@ -2313,8 +2344,10 @@ def test_channels_screen_is_wired_with_list_form_inheritance_and_toast():
     assert page.index("/static/screens.js") < page.index("/static/screens/channels.js")
     assert "Screens.channels" in js
     # liste : nom, source, surveillance, mode, prochains créneaux
-    for label in ("source_url", "Surveillance", "Mode", "Prochains créneaux", "/slots"):
+    for label in ("source_url", "Surveillance", "Mode"):
         assert label in js, label
+    for gone in ("Prochains créneaux", "/slots", "tiktok_account", "Compte TikTok", "data-chan-add-slot"):
+        assert gone not in js, gone                    # ni compte ni créneaux dans un style (SPEC-6076 R2)
     # formulaire par sections
     for section in ("channel", "reframe", "render", "subtitles", "moments"):
         assert f'"{section}"' in js, section
@@ -2439,11 +2472,12 @@ PUB_NEXT_MON = "2026-10-12T18:30:00+02:00"
 
 def _publish_setup(tmp_path, entries=None, *, slots=True):
     (tmp_path / "state").mkdir(exist_ok=True)
-    (tmp_path / "state" / "accounts.json").write_text(
-        '{"accounts": [{"id": "ab12cd", "label": "Compte exemple", "platform": "TikTok"}]}', encoding="utf-8")
-    preset = ('[channel]\ndisplay_name = "Ma chaîne"\ntiktok_account = "ab12cd"\n'
-              + ('slots = [{day = "mon", time = "18:30"}, {day = "thu", time = "12:00"}]\n' if slots else ""))
-    _channels_setup(tmp_path, preset)
+    # les creneaux sont ceux du compte (SPEC-6076 R2) ; le style n'a ni compte ni creneaux
+    account = {"id": "ab12cd", "label": "Compte exemple", "platform": "TikTok",
+               "slots": [{"day": "mon", "time": "18:30"}, {"day": "thu", "time": "12:00"}] if slots else [],
+               "timezone": "Europe/Paris"}
+    (tmp_path / "state" / "accounts.json").write_text(json.dumps({"accounts": [account]}), encoding="utf-8")
+    _channels_setup(tmp_path, '[channel]\ndisplay_name = "Ma chaîne"\n')
     _write_state(tmp_path, CLIPS_VIDEO, channel="ma_chaine")
     for clip_id in ("01", "02", "03", "04", "05", "06"):
         _write_clip(tmp_path, CLIPS_VIDEO, _clip_sidecar(clip_id))
@@ -2462,7 +2496,7 @@ def test_get_publish_returns_week_slots_with_clip_or_free(tmp_path, isolated_cwd
 
     assert resp.status_code == 200
     data = resp.json()
-    assert data["account"] == "ab12cd" and data["channel"] == "ma_chaine"   # le style lié au compte porte les créneaux
+    assert data["account"] == "ab12cd" and "channel" not in data           # les créneaux sont ceux du compte, plus d'un style
     assert data["timezone"] == "Europe/Paris"
     assert data["week_start"] == "2026-10-05" and data["week_end"] == "2026-10-11"
     assert [s["slot_at"] for s in data["slots"]] == [PUB_MON, PUB_THU]
@@ -2648,13 +2682,14 @@ PUB_NOCHAN_VIDEO = "nochannel001"
 
 
 def _two_accounts_setup(tmp_path):
-    """Compte ab12cd lié au style ma_chaine ; compte ef34gh sans style ; une vidéo sans style publiée sur ef34gh."""
+    """Compte ab12cd avec des créneaux ; compte ef34gh sans créneau ; une vidéo sans style publiée sur ef34gh."""
     _publish_setup(tmp_path, [
         _entry("01", "published", slot_at=PUB_MON, published_at="2026-10-05T18:40:00+02:00", account="ab12cd"),
         _entry("02", "failed", slot_at=PUB_THU, error="quota depasse", account="ab12cd"),
     ])
     (tmp_path / "state" / "accounts.json").write_text(json.dumps({"accounts": [
-        {"id": "ab12cd", "label": "Compte exemple", "platform": "TikTok"},
+        {"id": "ab12cd", "label": "Compte exemple", "platform": "TikTok",
+         "slots": [{"day": "mon", "time": "18:30"}, {"day": "thu", "time": "12:00"}], "timezone": "Europe/Paris"},
         {"id": SECOND, "label": "second_compte", "platform": "TikTok"}]}), encoding="utf-8")
     _write_state(tmp_path, PUB_NOCHAN_VIDEO)                                  # aucune chaîne
     _write_clip(tmp_path, PUB_NOCHAN_VIDEO, {**_clip_sidecar("01"), "video_id": PUB_NOCHAN_VIDEO})
@@ -2678,8 +2713,8 @@ def test_a_post_published_on_an_account_without_style_shows_in_that_account_and_
 
     assert _ids(second["done"]) == [(PUB_NOCHAN_VIDEO, "01")]
     assert _ids(second["off_slot"]) == [(PUB_NOCHAN_VIDEO, "02")]             # programmé, sans créneau de style
-    assert second["account"] == SECOND and second["channel"] is None and second["slots"] == []
-    assert "style" in second["reason"] and "chaîne" not in second["reason"]  # le texte dit « style », plus « chaîne »
+    assert second["account"] == SECOND and second["slots"] == []
+    assert "créneau" in second["reason"] and "Comptes" in second["reason"]   # le compte n'a pas de créneau : l'écran Comptes en règle
     assert _ids(everyone["done"]) == [(CLIPS_VIDEO, "01"), (CLIPS_VIDEO, "02"), (PUB_NOCHAN_VIDEO, "01")]
     assert everyone["account"] is None
     assert {c["account"] for c in everyone["done"]} == {"ab12cd", SECOND}
@@ -4380,30 +4415,6 @@ def test_browser_routes_keep_the_local_only_protections(tmp_path, isolated_cwd, 
     assert local_client(tmp_path).post(path, content="{}", headers={"content-type": "text/plain"}).status_code == 415
 
 
-def test_channel_save_with_unknown_tiktok_account_is_refused(tmp_path, isolated_cwd):
-    _channels_setup(tmp_path)
-    detail = client(tmp_path).get(f"/api/channels/{CH}").json()
-    preset = detail["raw"]
-    preset["channel"]["tiktok_account"] = "zz99"
-
-    resp = client(tmp_path).put(f"/api/channels/{CH}", json={"preset": preset})
-
-    assert resp.status_code == 422
-    assert "compte inconnu" in resp.json()["detail"]
-
-
-def test_channel_save_with_known_tiktok_account_is_accepted(tmp_path, isolated_cwd):
-    _browser_setup(tmp_path)
-    _channels_setup(tmp_path)
-    preset = client(tmp_path).get(f"/api/channels/{CH}").json()["raw"]
-    preset["channel"]["tiktok_account"] = BROWSER_ACCOUNT
-
-    resp = client(tmp_path).put(f"/api/channels/{CH}", json={"preset": preset})
-
-    assert resp.status_code == 200
-    assert resp.json()["effective"]["channel"]["tiktok_account"] == BROWSER_ACCOUNT
-
-
 def test_accounts_screen_has_the_browser_login_button_and_profile_state():
     js = (STATIC / "screens" / "accounts.js").read_text(encoding="utf-8")
 
@@ -4413,14 +4424,11 @@ def test_accounts_screen_has_the_browser_login_button_and_profile_state():
     assert "modified_at" in js  # date du profil
 
 
-def test_channel_form_picks_the_linked_tiktok_account_from_the_accounts():
+def test_channel_form_has_no_account_and_no_slots_field():
     js = (STATIC / "screens" / "channels.js").read_text(encoding="utf-8")
 
-    assert '"tiktok_account"' in js and "/api/accounts" in js
-    assert "Compte TikTok" in js
-    assert "Aucun compte" in js  # option vide = aucun compte relie
-# TASK-4bfc : console v2, cinquième tour
-# --------------------------------------------------------------------------
+    for gone in ("tiktok_account", "chAccountEditor", "chSlotsEditor", "data-slot-add", "Aucun compte"):
+        assert gone not in js, gone
 
 
 
@@ -4803,11 +4811,11 @@ def test_the_stats_accounts_list_says_which_account_is_ready_and_what_the_last_f
     accounts = {a["account"]: a for a in resp.json()["accounts"]}
     ready, other = accounts[TT_ACCOUNT], accounts[TT_OTHER]
     assert ready["ready"] is True and ready["not_ready_reason"] is None and ready["label"] == "Compte exemple"
-    assert ready["channel"] == "ma_chaine"  # rappel de la chaine liee
+    assert "channel" not in ready  # plus de style lié à un compte (SPEC-6076 R2)
     assert ready["snapshots"] == 2 and ready["fetched_at"] == "2026-10-02T09:00:00+00:00"
     assert ready["last_full_at"] == "2026-10-01T12:00:00+00:00" and ready["error"] is None
     assert other["ready"] is False and "expirée" in other["not_ready_reason"]  # le compte non pret dit pourquoi
-    assert other["channel"] is None and other["snapshots"] == 0 and other["fetched_at"] is None
+    assert other["snapshots"] == 0 and other["fetched_at"] is None
 
 
 def test_the_stats_accounts_list_carries_the_last_safe_stop(tmp_path, isolated_cwd):
@@ -4828,7 +4836,7 @@ def test_the_overview_gives_five_tiles_with_evolution_and_the_daily_curves(tmp_p
 
     data = _tt_get(tmp_path, f"/{TT_ACCOUNT}", period=7).json()
 
-    assert data["account"] == TT_ACCOUNT and data["channel"] == "ma_chaine" and data["ready"] is True
+    assert data["account"] == TT_ACCOUNT and "channel" not in data and data["ready"] is True
     assert data["period"] == 7 and data["last_full_at"] == "2026-10-08T12:00:00+00:00"
     assert list(data["tiles"]) == list(_TT_TILES)
     assert data["tiles"]["views"] == {"value": 130, "change_pct": 4.5, "history_change_pct": 30.0}
@@ -4879,7 +4887,7 @@ def test_the_video_list_comes_from_the_report_sorted_searched_and_linked_to_clip
     assert by_id[TT_ID_A]["clip"] == {"video_id": "aaaaaaaaaaa", "clip_id": "01"} and by_id[TT_ID_A]["outside_clipper"] is False
     assert by_id[TT_ID_B]["clip"] is None and by_id[TT_ID_B]["outside_clipper"] is True  # « publié hors Clipper »
     assert by_id[TT_ID_C]["views"] is None and by_id[TT_ID_C]["processing"] is True
-    assert data["account"] == TT_ACCOUNT and data["channel"] == "ma_chaine"
+    assert data["account"] == TT_ACCOUNT and "channel" not in data
     ids = lambda **params: [v["post_id"] for v in _tt_get(tmp_path, f"/{TT_ACCOUNT}/videos", **params).json()["videos"]]
     assert ids(sort="views", dir="desc") == [TT_ID_B, TT_ID_A, TT_ID_C]  # sans valeur : en dernier
     assert ids(sort="views", dir="asc") == [TT_ID_A, TT_ID_B, TT_ID_C]
@@ -5032,22 +5040,22 @@ def _accounts_state(tmp_path, *, ready=(READY,)):
             {"id": SPARE, "label": "Autre compte", "platform": "TikTok"}]
     for row in rows:
         row["ready_to_publish"] = row["id"] in ready
+        row["slots"] = [{"day": "mon", "time": "18:30"}, {"day": "thu", "time": "12:00"}]  # creneaux du compte (SPEC-6076 R2)
+        row["timezone"] = "Europe/Paris"
     (tmp_path / "state").mkdir(exist_ok=True)
     (tmp_path / "state" / "accounts.json").write_text(json.dumps({"accounts": rows}), encoding="utf-8")
 
 
-def test_publish_accounts_lists_every_account_with_its_flag_and_the_channel_default(tmp_path, isolated_cwd):
+def test_publish_accounts_lists_every_account_with_its_flag_and_no_default(tmp_path, isolated_cwd):
     _publish_setup(tmp_path)
     _accounts_state(tmp_path, ready=(READY,))
 
-    data = client(tmp_path).get("/api/publish/accounts", params={"channel": "ma_chaine"}).json()
+    data = client(tmp_path).get("/api/publish/accounts").json()
 
-    assert data["default"] == READY
+    assert "default" not in data  # un style n'a plus de compte par defaut (SPEC-6076 R2) : chaque publication choisit
     assert data["accounts"] == [
         {"id": READY, "label": "Compte exemple", "ready_to_publish": True, "service": "tiktok", "service_label": "TikTok"},
         {"id": SPARE, "label": "Autre compte", "ready_to_publish": False, "service": "tiktok", "service_label": "TikTok"}]
-    assert client(tmp_path).get("/api/publish/accounts").json()["default"] is None
-    assert client(tmp_path).get("/api/publish/accounts", params={"channel": "inconnue"}).status_code == 404
 
 
 def test_publish_accounts_never_carry_a_secret_and_work_from_a_remote_console(tmp_path, isolated_cwd):
@@ -5072,13 +5080,28 @@ def test_approve_with_a_ready_account_records_it_in_the_publication_entry(tmp_pa
     assert entry["account"] == SPARE
 
 
-def test_approve_without_a_choice_prefills_the_channel_account(tmp_path, isolated_cwd):
+def test_approve_without_an_account_is_a_409_and_approves_nothing(tmp_path, isolated_cwd):
     _publish_setup(tmp_path)
-    _accounts_state(tmp_path, ready=())
+    _accounts_state(tmp_path, ready=(READY,))
 
-    for body in ({}, None):
-        resp = client(tmp_path).post(f"/api/clips/{CLIPS_VIDEO}/01/approve", **({} if body is None else {"json": body}))
-        assert resp.status_code == 200 and resp.json()["account"] == READY  # prérempli, même s'il n'est pas prêt
+    for kwargs in ({}, {"json": {}}, {"json": {"account": None}}):
+        resp = client(tmp_path).post(f"/api/clips/{CLIPS_VIDEO}/01/approve", **kwargs)
+        assert resp.status_code == 409 and "compte de publication manquant" in resp.json()["detail"]
+    assert json.loads((tmp_path / "state" / "publish" / "ma_chaine.json").read_text(encoding="utf-8")) == []
+
+
+def test_approve_schedules_on_the_next_slot_of_the_chosen_account(tmp_path, isolated_cwd):
+    _publish_setup(tmp_path)
+    _accounts_state(tmp_path, ready=(READY, SPARE))
+    rows = json.loads((tmp_path / "state" / "accounts.json").read_text(encoding="utf-8"))
+    rows["accounts"][1]["slots"] = [{"day": "wed", "time": "07:00"}]  # SPARE : un seul creneau, le mercredi
+    (tmp_path / "state" / "accounts.json").write_text(json.dumps(rows), encoding="utf-8")
+
+    resp = client(tmp_path).post(f"/api/clips/{CLIPS_VIDEO}/01/approve", json={"account": SPARE})
+
+    assert resp.status_code == 200 and resp.json()["account"] == SPARE
+    slot = datetime.fromisoformat(resp.json()["slot_at"]).astimezone(ZoneInfo("Europe/Paris"))
+    assert (slot.strftime("%a %H:%M")) == "Wed 07:00"
 
 
 def test_approve_refuses_an_account_that_is_not_ready_or_unknown(tmp_path, isolated_cwd):
@@ -5103,7 +5126,8 @@ def test_publish_account_route_changes_the_account_among_the_ready_ones(tmp_path
 
     assert resp.status_code == 200 and resp.json()["account"] == SPARE
     moved = _get_publish(tmp_path, account=SPARE).json()                     # le post suit son nouveau compte
-    assert [c["account"] for c in moved["off_slot"]] == [SPARE]
+    assert [s["clip"]["account"] for s in moved["slots"] if s["clip"]] == [SPARE]  # sur un creneau du nouveau compte
+    assert moved["off_slot"] == []
     assert _get_publish(tmp_path).json()["slots"][1]["clip"] is None
 
 
@@ -5135,9 +5159,9 @@ def test_the_publication_calendar_shows_the_account_of_each_post_and_why_it_wait
     spare = _get_publish(tmp_path, account=SPARE).json()
 
     assert data["unscheduled"][0]["account"] == READY and data["unscheduled"][0]["waiting_reason"] is None
-    assert data["account"] == READY and data["channel"] == "ma_chaine"  # le style lié au compte reste affiché
+    assert data["account"] == READY and "channel" not in data
     assert [a["id"] for a in data["accounts"]] == [READY, SPARE]  # libellés et état, pour l'affichage
-    waiting = spare["off_slot"][0]                                  # le compte SPARE n'a pas de style : pas de créneau
+    waiting = next(s["clip"] for s in spare["slots"] if s["clip"])  # le post est sur un créneau du compte SPARE
     assert waiting["account"] == SPARE and "non prêt à publier" in waiting["waiting_reason"]
 
 
@@ -5154,8 +5178,9 @@ def test_clips_drawer_picks_the_publication_account_among_the_ready_ones():
     js = (STATIC / "screens" / "clips.js").read_text(encoding="utf-8")
 
     assert "/api/publish/accounts" in js and "clip-account" in js and "Compte de publication" in js
-    assert "ready_to_publish" in js and "default" in js                 # prérempli avec le compte de la chaîne
-    assert "non prêt à publier" in js                                    # compte de la chaîne pas prêt : dit
+    assert "ready_to_publish" in js                                      # seuls les comptes prêts sont proposés
+    assert "out.default" not in js and "Compte du style" not in js       # aucun compte de style (SPEC-6076 R2)
+    assert "Choisis un compte" in js                                     # choix obligatoire, jamais prérempli
     assert 'jsonBody("POST", { account: chosen })' in js                  # le choix part avec l'approbation
 
 
@@ -6057,29 +6082,12 @@ def test_video_page_offers_assign_channel_and_the_approval_error_offers_it_too()
     assert "failure.body = payload" in (STATIC / "app.js").read_text(encoding="utf-8")
 
 
-_CHAN_DETAIL = {"raw": {"channel": {"display_name": "Ma chaîne"}, "reframe": {"letterbox_zoom": 1.5}},
-                "effective": {"channel": {"slots": [{"day": "mon", "time": "18:30"}], "tiktok_account": ""}}}
-
-
-@_NODE
-def test_channel_card_actions_build_the_preset_to_save_without_touching_the_rest():
-    out = _run_js([("screens/channels.js", ["chPresetWithChannel", "chSlotsWith"])], f"""(() => {{
-      const detail = {json.dumps(_CHAN_DETAIL)};
-      const withRawSlots = {json.dumps({**_CHAN_DETAIL, "raw": {"channel": {"slots": [{"day": "tue", "time": "09:00"}]}}})};
-      return {{ account: chPresetWithChannel(detail, 'tiktok_account', 'ab12cd'), fromEffective: chSlotsWith(detail, 'fri', '20:00'),
-        fromRaw: chSlotsWith(withRawSlots, 'fri', '20:00'), untouched: JSON.stringify(detail.raw) }};
-    }})()""")
-    assert out["account"] == {"channel": {"display_name": "Ma chaîne", "tiktok_account": "ab12cd"}, "reframe": {"letterbox_zoom": 1.5}}
-    assert out["fromEffective"] == [{"day": "mon", "time": "18:30"}, {"day": "fri", "time": "20:00"}]
-    assert out["fromRaw"] == [{"day": "tue", "time": "09:00"}, {"day": "fri", "time": "20:00"}]
-    assert json.loads(out["untouched"]) == _CHAN_DETAIL["raw"]        # la copie n'a pas modifié le détail du serveur
-
-
 def test_channel_card_has_direct_actions_and_channel_fields_are_editable_without_redefine():
     js = (STATIC / "screens" / "channels.js").read_text(encoding="utf-8")
-    for marker in ("data-chan-add-slot", "data-chan-account", "data-chan-queue", "Ajouter un créneau", "Compte TikTok",
-                   "Mettre une vidéo en file pour ce style", "openAddVideo(b.dataset.chanQueue)"):
+    for marker in ("data-chan-queue", "Mettre une vidéo en file pour ce style", "openAddVideo(b.dataset.chanQueue)"):
         assert marker in js
+    for gone in ("data-chan-add-slot", "data-chan-account", "chSaveChannelKey", "chPresetWithChannel", "chSlotsWith"):
+        assert gone not in js, gone
     # [channel] : jamais « redéfinir » ni champ grisé (disabled) ; les autres sections gardent l'héritage
     assert "const chIsDirect = (section) => section === \"channel\"" in js
     assert "const redefined = direct || key in raw" in js and "const state = direct ? \"\"" in js
@@ -6091,11 +6099,11 @@ def test_channel_card_has_direct_actions_and_channel_fields_are_editable_without
 @_NODE
 def test_a_channel_field_is_rendered_enabled_without_redefine_while_other_sections_stay_inherited():
     detail = {"raw": {}, "effective": {"channel": {"mode": "review", "display_name": "x"}, "render": {"crf": 18}}}
-    out = _run_js([("screens/channels.js", ["chIsDirect", "chSame", "chKind", "chField", "chControl", "chSlotsEditor", "chRubricEditor",
-                                           "chAccountEditor", "chRubricLabel"])], f"""(() => {{
+    out = _run_js([("screens/channels.js", ["chIsDirect", "chSame", "chKind", "chField", "chControl", "chRubricEditor",
+                                           "chRubricLabel"])], f"""(() => {{
       const ed = {{ draft: {{ channel: {{}}, render: {{}} }}, detail: {json.dumps(detail)} }};
       globalThis.CHAN_DAYS = []; globalThis.CHAN_MODES = [['review', 'review'], ['auto', 'auto']]; globalThis.CHAN_RUBRICS = [];
-      globalThis.CHAN_RUBRIC_CUSTOM = 'custom'; globalThis.chAccounts = {{ list: null, error: '' }};
+      globalThis.CHAN_RUBRIC_CUSTOM = 'custom';
       return {{ mode: chField('channel', 'mode', {{ default: 'review' }}, ed), crf: chField('render', 'crf', {{ default: 23 }}, ed) }};
     }})()""")
     assert "data-redefine" not in out["mode"] and " disabled" not in out["mode"] and "direct" in out["mode"]
@@ -6288,7 +6296,7 @@ def test_the_stats_screen_follows_the_mockup_account_period_scan_tabs_and_video_
     assert "Screens.stats" in js
     for route in ("/api/stats/tiktok", "/videos", "/api/stats/tiktok/refresh", "?period="):
         assert route in js
-    for text in ("Compte TikTok", "Style Clipper lié", "Période", "Dernier relevé", "Relever maintenant",
+    for text in ("Compte TikTok", "Période", "Dernier relevé", "Relever maintenant",
                  "Vue d'ensemble", "Vidéos", "Spectateurs", "Engagement", "Ouvrir sur TikTok", "Voir le clip dans Clipper",
                  "Vidéo source", "publié hors Clipper", "Publié hors Clipper", "Compte non prêt à publier",
                  "Filtrer par légende", "Taux de rétention", "dès 100 vues", "Mots les plus utilisés dans les commentaires",
@@ -6770,8 +6778,8 @@ def test_a_tiktok_account_without_style_is_listed_and_readable_in_the_stats_scre
     found = _tt_account_state(web)
     overview = web.get(f"/api/stats/tiktok/{TT_ACCOUNT}")
 
-    assert found["channel"] is None and found["account"] == TT_ACCOUNT        # présent, pas masqué faute de style
-    assert overview.status_code == 200 and overview.json()["channel"] is None
+    assert "channel" not in found and found["account"] == TT_ACCOUNT        # présent, pas masqué faute de style
+    assert overview.status_code == 200 and "channel" not in overview.json()
 
 
 # --------------------------------------------------------------------------
@@ -6970,3 +6978,25 @@ def test_the_account_label_carries_the_service_and_a_youtube_schedule_is_shown_a
     assert "Programmée sur YouTube" in out["chip"] and "Publiée" not in out["chip"]
     assert out["line"].startswith("programmée sur YouTube, en ligne le") and "Publiée" in out["live"]
     assert "YouTube programme la vidéo" in out["hintYt"] and "30 jours" in out["hintYt"]
+
+
+# --- SPEC-6076 R2 : l'écran Comptes porte les créneaux (éditeur ajout / suppression, relu pour l'enregistrement) -----
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node absent du PATH")
+def test_the_accounts_screen_renders_reads_and_summarises_the_slots_of_an_account():
+    names = ["accDayLabel", "accSlots", "accSlotsEditor", "accReadSlots"]
+    out = _run_js([("screens/accounts.js", names)], """(() => {
+      globalThis.ACC_DAYS = [['mon', 'Lundi'], ['fri', 'Vendredi']]; globalThis.ACC_DEFAULT_TZ = 'Europe/Paris';
+      const slots = [{ day: 'mon', time: '18:30' }, { day: 'fri', time: '09:00' }];
+      const rows = slots.map((s) => ({ querySelector: (q) => ({ value: q.includes('day') ? s.day : s.time }) }));
+      globalThis.$$ = () => rows; globalThis.$ = (q, row) => row.querySelector(q);
+      return { editor: accSlotsEditor(slots), empty: accSlotsEditor([]), read: accReadSlots({}),
+        summary: accSlots({ slots, timezone: 'UTC' }), none: accSlots({ slots: [] }) };
+    })()""")
+    assert out["editor"].count('data-slot-del') == 2 and out["editor"].count("data-slot-day") == 2
+    assert 'value="18:30"' in out["editor"] and 'value="09:00"' in out["editor"] and "data-slot-add" in out["editor"]
+    assert "Aucun créneau" in out["empty"] and "data-slot-add" in out["empty"]
+    assert out["read"] == [{"day": "mon", "time": "18:30"}, {"day": "fri", "time": "09:00"}]
+    assert "Lundi 18:30" in out["summary"] and "Vendredi 09:00" in out["summary"] and "(UTC)" in out["summary"]
+    assert "aucun" in out["none"]

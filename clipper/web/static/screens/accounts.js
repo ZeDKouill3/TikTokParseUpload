@@ -14,6 +14,10 @@ const ACC_LOCAL_HOSTS = ["127.0.0.1", "localhost"];
 const ACC_PLATFORMS = ["TikTok", "YouTube", "Twitch", "E-mail"];
 // Service de publication d'un compte (SPEC-5e50 R1) : choisi à la création, ne change plus ensuite.
 const ACC_SERVICES = { tiktok: "TikTok", youtube: "YouTube" };
+// Créneaux de publication réguliers d'un compte (SPEC-6076 R2) : jour + heure locale, dans le fuseau du compte.
+const ACC_DAYS = [["mon", "Lundi"], ["tue", "Mardi"], ["wed", "Mercredi"], ["thu", "Jeudi"], ["fri", "Vendredi"], ["sat", "Samedi"], ["sun", "Dimanche"]];
+const ACC_DEFAULT_TZ = "Europe/Paris";
+const accDayLabel = (k) => (ACC_DAYS.find(([d]) => d === k) || [k, k])[1];
 const accService = (a) => ACC_SERVICES[a.service] ? a.service : "tiktok";
 
 // revealed : id -> { value, timer } ; gen : état du générateur autonome.
@@ -208,6 +212,27 @@ function accReadyBox(a) {
     ${a.r4_halt ? `<button type="button" class="btn btn-xs" data-acc-resolve="${esc(a.id)}">${icon("check", "i-xs")}J'ai réglé le problème</button>` : ""}</div>`;
 }
 
+function accSlots(a) {
+  const slots = a.slots || [];
+  const text = slots.length
+    ? slots.map((s) => `<span class="mono">${esc(accDayLabel(s.day))} ${esc(s.time)}</span>`).join(" · ") + ` <span class="faint">(${esc(a.timezone || ACC_DEFAULT_TZ)})</span>`
+    : `<span class="faint">aucun (« Nouvelle publication » publie à la date choisie)</span>`;
+  return `<div class="li-sub muted" data-acc-slots>Créneaux : ${text}</div>`;
+}
+
+function accSlotsEditor(slots) {
+  const rows = (slots || []).map((s, i) => `<div class="chan-slot" data-slot="${i}">
+    <select class="input" data-slot-day aria-label="Jour">${ACC_DAYS.map(([k, l]) => `<option value="${k}"${k === s.day ? " selected" : ""}>${l}</option>`).join("")}</select>
+    <input class="input mono" type="time" data-slot-time aria-label="Heure" value="${esc(s.time)}" required>
+    <button type="button" class="icon-btn" data-slot-del="${i}" aria-label="Retirer ce créneau">${icon("x", "i-xs")}</button></div>`).join("");
+  return `<div class="chan-slots" data-acc-slots-editor>${rows || `<span class="muted">Aucun créneau.</span>`}
+    <button type="button" class="btn btn-xs" data-slot-add>${icon("plus", "i-xs")}Ajouter un créneau</button></div>`;
+}
+
+function accReadSlots(root) {
+  return $$(".chan-slot", root).map((row) => ({ day: $("[data-slot-day]", row).value, time: $("[data-slot-time]", row).value }));
+}
+
 function accPosts(a) {
   if (a.publish_error) return `<div class="li-sub bad">Publications illisibles : ${esc(a.publish_error)}</div>`;
   const today = a.posts_today === null || a.posts_today === undefined ? "—" : fr(a.posts_today);
@@ -281,6 +306,7 @@ function accRow(a) {
       ${accBrowserState(a)}
       ${accLoginState(a)}
       ${accReadyBox(a)}
+      ${accSlots(a)}
       ${accPosts(a)}
       ${accLastFailure(a)}
     </div>
@@ -347,7 +373,8 @@ function accWireList(body) {
 
 function accOpenForm(account) {
   const editing = Boolean(account);
-  const a = account || { label: "", platform: "", username: "", notes: "", has_password: false, service: "tiktok" };
+  const a = account || { label: "", platform: "", username: "", notes: "", has_password: false, service: "tiktok", slots: [], timezone: ACC_DEFAULT_TZ };
+  let slots = (a.slots || []).map((s) => ({ ...s }));
   openPanel("modal acc-modal", `
     <div class="modal-head"><h2>${editing ? "Modifier le compte" : "Ajouter un compte"}</h2>
       <p class="muted" style="margin-top:4px">Le mot de passe est rangé dans le coffre de l'OS, jamais dans un fichier du projet.</p></div>
@@ -365,11 +392,26 @@ function accOpenForm(account) {
       <div class="acc-gen-inline">${accGenControls({ length: "", symbols: false, ambiguous: false })}
         <div class="acc-gen-out"><button type="button" class="btn btn-sm" data-gen-fill>${icon("wand-sparkles")}Générer et remplir</button>
           <button type="button" class="btn btn-sm" data-gen-copy-only>${icon("copy")}Générer et copier</button></div></div>
+      <div class="field"><label>Créneaux de publication</label>
+        <div data-acc-slots-box>${accSlotsEditor(slots)}</div>
+        <span class="muted">Créneaux hebdomadaires de ce compte : le calendrier de Publication les propose. Facultatifs.</span></div>
+      <div class="field"><label for="acc-timezone">Fuseau horaire des créneaux</label><input class="input mono" id="acc-timezone" name="timezone" maxlength="60" value="${esc(a.timezone || ACC_DEFAULT_TZ)}" placeholder="${ACC_DEFAULT_TZ}"></div>
       <div class="field"><label for="acc-notes">Notes</label><textarea class="input" id="acc-notes" name="notes" rows="2" maxlength="2000" placeholder="ma_chaine, usage, rappel...">${esc(a.notes)}</textarea></div>
     </div>
     <div class="modal-foot"><button type="button" class="btn btn-ghost" data-dismiss>Annuler</button><button type="submit" class="btn btn-primary">${editing ? "Enregistrer" : "Ajouter"}</button></div></form>`,
   (el) => {
     setTimeout(() => $("#acc-label", el).focus(), 60);
+    const slotsBox = $("[data-acc-slots-box]", el);
+    const repaintSlots = () => { slotsBox.innerHTML = accSlotsEditor(slots); };
+    slotsBox.onclick = (e) => {
+      const t = e.target.closest("button");
+      if (!t) return;
+      slots = accReadSlots(slotsBox);
+      if (t.hasAttribute("data-slot-add")) slots.push({ day: "mon", time: "18:00" });
+      else if (t.hasAttribute("data-slot-del")) slots = slots.filter((_, i) => i !== Number(t.dataset.slotDel));
+      else return;
+      repaintSlots();
+    };
     const box = $(".acc-gen-inline", el);
     $("[data-gen-fill]", el).onclick = async () => {
       const value = await accGenerate(box);
@@ -386,7 +428,8 @@ function accOpenForm(account) {
     };
     $("#acc-form", el).onsubmit = async (e) => {
       e.preventDefault();
-      const payload = { service: $("#acc-service", el).value, label: $("#acc-label", el).value, platform: $("#acc-platform", el).value, username: $("#acc-username", el).value, notes: $("#acc-notes", el).value };
+      const payload = { service: $("#acc-service", el).value, label: $("#acc-label", el).value, platform: $("#acc-platform", el).value, username: $("#acc-username", el).value, notes: $("#acc-notes", el).value,
+        slots: accReadSlots(slotsBox), timezone: $("#acc-timezone", el).value.trim() };
       const password = $("#acc-password", el).value;
       const clear = $("#acc-clear", el);
       if (password) payload.password = password;
