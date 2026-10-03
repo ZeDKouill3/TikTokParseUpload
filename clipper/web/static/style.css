@@ -612,6 +612,24 @@ input[type="color"] { width: 36px; height: 36px; padding: 2px; border-radius: va
 }
 .clip:active .clip-poster { transform: scale(0.98); }
 
+/* Selection groupee de l'ecran Clips (TASK-e99b) : case a cocher sur la carte, barre en bas. */
+.clip-check {
+  width: 22px; height: 22px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+  background: rgba(0,0,0,0.55); border: 2px solid rgba(255,255,255,0.85); color: #fff; backdrop-filter: blur(6px);
+}
+.clip-check.on { background: var(--accent); border-color: var(--accent); }
+.clip.checked .clip-poster { outline: 2px solid var(--accent); outline-offset: 2px; }
+.sel-bar {
+  position: sticky; bottom: 16px; z-index: 10; margin-top: 24px; display: flex; align-items: center; gap: 12px;
+  padding: 12px 16px; border: 1px solid var(--line); border-radius: var(--r); background: var(--surface);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+}
+.sel-bar #clips-sel-account { max-width: 240px; }
+@media (max-width: 900px) {
+  .sel-bar { flex-wrap: wrap; }
+  .sel-bar .btn, .sel-bar #clips-sel-account { min-height: 44px; }
+}
+
 /* Vignette 16:9 generee (pas d'image reelle) : plateau de debat / podcast */
 .plateau { position: absolute; inset: 0; background: radial-gradient(90% 120% at 50% 0%, var(--pc), transparent 70%), #121214; display: flex; align-items: flex-end; justify-content: center; gap: 6%; padding: 0 8%; overflow: hidden; }
 .plateau i { flex: 1; max-width: 22%; aspect-ratio: 3 / 4; position: relative; }
