@@ -1251,6 +1251,148 @@ def test_a_forced_step_is_timed_again(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------
+# Important 3 (revue r-transcription) : process_queue ne tue plus le worker
+# quand une video reprise atterrit en revue humaine sans decision.
+# --------------------------------------------------------------------------
+
+
+def test_process_queue_stops_a_video_at_awaiting_review_instead_of_raising_and_still_processes_the_rest(
+    tmp_path, monkeypatch,
+):
+    """Si le mode global est devenu ``review`` entre la mise en file (mode
+    ``auto``) et la reprise, ``_advance_steps`` atteint ``captions`` sans
+    aucune decision humaine : avant le correctif, ``through_review=True``
+    faisait lever ``PipelineError``, qui traversait ``process_queue`` (donc
+    ``Worker.tick``) sans etre rattrapee, empechant les videos suivantes de
+    la file d'etre reprises."""
+    from clipper import pipeline
+
+    config = Config(mode="review", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output")
+    calls: list[str] = []
+    _all_steps_stubbed(monkeypatch, calls)
+
+    def queue_video(video_id: str, *, already_reviewed: bool) -> None:
+        url = f"https://www.youtube.com/watch?v={video_id}"
+        state = pipeline.new_state(video_id, url, "auto")
+        past = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
+        if already_reviewed:
+            # b est deja passee par la revue (captions deja "done") et
+            # reprend d'un echec transitoire plus tardif (ex. render) : elle
+            # doit continuer jusqu'au bout, pas s'arreter en revue a nouveau.
+            for name in ("download", "transcribe", "scenes", "audio", "moments", "vision", "parts", "captions"):
+                state["steps"][name].update(status="done", started_at=past, finished_at=past)
+        state.update(status="queued", attempts=1, retry_at=past)
+        pipeline.save_state(state, config=config)
+        video_dir = tmp_path / "workspace" / video_id
+        (video_dir / "parts.json").write_text(json.dumps({"moments": [{"id": 0}]}), encoding="utf-8")
+        if already_reviewed:
+            (video_dir / pipeline.REVIEW_FILE).write_text(
+                json.dumps({"decisions": {"0": {"decision": "accepted", "start": 0.0, "end": 1.0,
+                                                 "comment": None, "at": past}}}),
+                encoding="utf-8",
+            )
+
+    queue_video("aaaaaaaaaaa", already_reviewed=False)  # 1re fois en revue, aucune decision
+    queue_video("bbbbbbbbbbb", already_reviewed=True)   # deja revue : doit etre traitee jusqu'au bout
+
+    results = pipeline.process_queue(config=config)
+
+    by_id = {r["video_id"]: r for r in results}
+    assert by_id["aaaaaaaaaaa"]["status"] == "awaiting_review"
+    assert by_id["bbbbbbbbbbb"]["status"] == "done"
+    assert calls.count("captions") == 1  # seule b atteint les etapes apres la revue
+
+
+# --------------------------------------------------------------------------
+# Important 4 (revue r-transcription) : attempts (echecs transitoires
+# consecutifs) remis a 0 apres chaque etape reussie et a une relance
+# manuelle, jamais au fil d'une reprise process_queue.
+# --------------------------------------------------------------------------
+
+
+def test_attempts_resets_to_zero_right_after_a_step_completes(tmp_path, monkeypatch):
+    """La doc parle d'echecs transitoires *consecutifs* : une etape qui
+    reussit doit remettre le compteur a 0, pas seulement le run entier qui
+    termine ``done`` (sinon 3 echecs sur transcribe + 2 sur moments font
+    echouer la video pour de bon, alors qu'aucune etape n'a jamais echoue
+    2 fois de suite)."""
+    from clipper import pipeline
+
+    config = Config(mode="auto", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output")
+    state = pipeline.new_state(VIDEO_ID, URL, "auto")
+    state["attempts"] = 3  # echecs transitoires accumules par des etapes precedentes
+    pipeline.save_state(state, config=config)
+
+    monkeypatch.setattr(pipeline._Run, "download", lambda self: None)
+    monkeypatch.setattr(pipeline._Run, "transcribe", lambda self: None)  # reussit
+
+    def boom(self):
+        raise llm.TransientLLMError("surcharge")
+
+    monkeypatch.setattr(pipeline._Run, "scenes", boom)
+
+    run_ = pipeline._Run(state, config, False, None)
+    result = pipeline._advance_steps(run_, through_review=False)
+
+    assert result["attempts"] == 1  # transcribe (reussie) a remis le compteur a 0 avant l'echec de scenes
+    assert result["status"] == "queued"
+
+
+def test_manual_relaunch_resets_attempts_to_zero_before_running(tmp_path, monkeypatch):
+    """Une video ``failed`` apres ``max_attempts`` echecs transitoires (ex.
+    une panne de quota la nuit), relancee a la main le lendemain, doit
+    repartir d'une ardoise propre : sinon elle repasse ``failed`` au premier
+    echec transitoire, sans jamais revenir en file d'attente."""
+    from clipper import pipeline
+
+    config = Config(mode="auto", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output")
+    state = pipeline.new_state(VIDEO_ID, URL, "auto")
+    state["steps"]["download"].update(status="done", started_at="2026-01-01T10:00:00+00:00",
+                                      finished_at="2026-01-01T10:00:01+00:00")
+    state.update(status="failed", attempts=4, reason="transcribe : TransientLLMError: quota")
+    pipeline.save_state(state, config=config)
+
+    monkeypatch.setattr(pipeline._Run, "download", lambda self: None)  # execute meme si "done" (saute l'ecriture, pas l'appel)
+
+    def boom(self):
+        raise llm.TransientLLMError("surcharge")
+
+    monkeypatch.setattr(pipeline._Run, "transcribe", boom)
+
+    result = pipeline.run(URL, config=config)
+
+    assert result["attempts"] == 1  # reparti de 0, pas de 4
+    assert result["status"] == "queued"
+
+
+def test_process_queue_resume_does_not_apply_the_manual_attempts_reset(tmp_path, monkeypatch):
+    """``process_queue`` n'est pas une relance manuelle : elle ne doit pas
+    bénéficier de la remise à 0 de ``_start`` (seule la réussite réelle d'une
+    étape, pas la reprise elle-même, remet le compteur à 0)."""
+    from clipper import pipeline
+
+    config = Config(mode="auto", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output")
+    state = pipeline.new_state(VIDEO_ID, URL, "auto")
+    state["steps"]["download"].update(status="done", started_at="2026-01-01T10:00:00+00:00",
+                                      finished_at="2026-01-01T10:00:01+00:00")
+    past = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
+    state.update(status="queued", attempts=4, retry_at=past)
+    pipeline.save_state(state, config=config)
+
+    monkeypatch.setattr(pipeline._Run, "download", lambda self: None)
+
+    def boom(self):
+        raise llm.TransientLLMError("surcharge")
+
+    monkeypatch.setattr(pipeline._Run, "transcribe", boom)
+
+    [result] = pipeline.process_queue(config=config)
+
+    assert result["attempts"] == 5  # pas remis a 0 : download etait deja "done" (saute), transcribe echoue direct
+    assert result["status"] == "failed"  # 5 >= max_attempts (5 par defaut)
+
+
+# --------------------------------------------------------------------------
 # Miniatures de clips (TASK-dc9d) : seul point d'entree du web (ADR-09ad)
 # --------------------------------------------------------------------------
 

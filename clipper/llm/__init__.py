@@ -278,12 +278,16 @@ def ask(
     JSON line to it (timestamp, usage, model, attempt number, raw refused
     text, exact error), and an answer accepted after repair adds a final
     ``accepted: true`` line; an answer accepted on the first try is never
-    logged. When ``usage_log_path`` is given, this call (successful or
-    finally refused) appends one JSON line to it once it is done: usage,
-    model, input_tokens, output_tokens, cache_read_tokens, cost_usd (summed
-    over every backend call this ask() made, including repairs ; null for a
-    field no call reported), duration_s (wall time summed over those calls).
-    Without ``usage_log_path``, the default set by an enclosing ``usage_log()``
+    logged. When ``usage_log_path`` is given, this call (successful, finally
+    refused, or ending in any other error raised by the backend -- quota,
+    network, LLMError -- once at least one backend call was made) appends one
+    JSON line to it once it is done: usage, model, input_tokens,
+    output_tokens, cache_read_tokens, cost_usd (summed over every backend
+    call this ask() made, including repairs ; null for a field no call
+    reported), duration_s (wall time summed over those calls); an ``error``
+    field (exception type and message) is added when this call ends in such
+    an error rather than a successful or finally-refused answer. Without
+    ``usage_log_path``, the default set by an enclosing ``usage_log()``
     block (if any) is used instead; with neither, nothing is written.
     ``cache_prefix``, when given, must be a prefix of ``prompt`` (else
     LLMError, ADR-ad2e) shared with other calls: forwarded to the backend as
@@ -312,47 +316,66 @@ def ask(
     )
     totals: dict[str, float | int | None] = dict.fromkeys(_USAGE_FIELDS)
     duration_total = 0.0
-    text, duration, call_usage = _call_backend(backend, request)
-    duration_total += duration
-    _accumulate(totals, call_usage)
-    for attempt in range(attempts + 1):
-        try:
-            value = _accept(text, schema, check)
-        except SchemaError as error:
-            if log_path is not None:
+    logged = False
+
+    def _write_usage_log(*, error: str | None = None) -> None:
+        nonlocal logged
+        if effective_usage_log_path is not None:
+            entry = _usage_entry(usage, model, totals, duration_total)
+            if error is not None:
+                entry["error"] = error
+            _log_line(effective_usage_log_path, entry)
+        logged = True
+
+    try:
+        text, duration, call_usage = _call_backend(backend, request)
+        duration_total += duration
+        _accumulate(totals, call_usage)
+        for attempt in range(attempts + 1):
+            try:
+                value = _accept(text, schema, check)
+            except SchemaError as error:
+                if log_path is not None:
+                    _log_line(log_path, {
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "usage": usage,
+                        "model": model,
+                        "attempt": attempt,
+                        "response": text,
+                        "error": str(error),
+                    })
+                if attempt == attempts:
+                    _log_call(usage, model, "echec", call_usage, duration)
+                    _write_usage_log()
+                    raise
+                _log_call(usage, model, "reessai", call_usage, duration)
+                text, duration, call_usage = _call_backend(
+                    backend, replace(request, prompt=_with_repair_instruction(request.prompt, text, error))
+                )
+                duration_total += duration
+                _accumulate(totals, call_usage)
+                continue
+            _log_call(usage, model, "reussi", call_usage, duration)
+            if log_path is not None and attempt > 0:
                 _log_line(log_path, {
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                     "usage": usage,
                     "model": model,
                     "attempt": attempt,
-                    "response": text,
-                    "error": str(error),
+                    "accepted": True,
+                    "response": value,
                 })
-            if attempt == attempts:
-                _log_call(usage, model, "echec", call_usage, duration)
-                if effective_usage_log_path is not None:
-                    _log_line(effective_usage_log_path, _usage_entry(usage, model, totals, duration_total))
-                raise
-            _log_call(usage, model, "reessai", call_usage, duration)
-            text, duration, call_usage = _call_backend(
-                backend, replace(request, prompt=_with_repair_instruction(request.prompt, text, error))
-            )
-            duration_total += duration
-            _accumulate(totals, call_usage)
-            continue
-        _log_call(usage, model, "reussi", call_usage, duration)
-        if log_path is not None and attempt > 0:
-            _log_line(log_path, {
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "usage": usage,
-                "model": model,
-                "attempt": attempt,
-                "accepted": True,
-                "response": value,
-            })
-        if effective_usage_log_path is not None:
-            _log_line(effective_usage_log_path, _usage_entry(usage, model, totals, duration_total))
-        return value
+            _write_usage_log()
+            return value
+    except BaseException as exc:
+        # Un appel qui sort en erreur (quota, reseau, LLMError...) hors
+        # SchemaError (deja journalisee ci-dessus) perdait silencieusement
+        # les tokens/cout deja consommes par les appels precedents de ce
+        # meme ask() (reponse refusee puis timeout de la reparation, par
+        # exemple) : Mineur 3, revue r-transcription.
+        if not logged:
+            _write_usage_log(error=f"{type(exc).__name__}: {exc}")
+        raise
 
 
 @contextlib.contextmanager

@@ -979,6 +979,12 @@ def _advance_steps(run: _Run, *, through_review: bool) -> dict[str, Any]:
         if not skipped:
             step.update(status="done", finished_at=_iso(_now()))
             step["progress"] = None
+            # Une etape qui vient reellement de reussir remet le compteur
+            # d'echecs transitoires a 0 : ce sont des echecs *consecutifs*
+            # (Important 4, revue r-transcription), pas un cumul sur toute la
+            # video. Une etape sautee (deja ``done`` avant ce passage) ne
+            # prouve rien de nouveau, elle ne remet rien a 0.
+            state["attempts"] = 0
             save_state(state, config=config)
         log.info("%s : etape %s terminee en %.1fs", run.video_id, name, elapsed)
         run.current_step = None
@@ -995,13 +1001,19 @@ def _advance_steps(run: _Run, *, through_review: bool) -> dict[str, Any]:
 def _start(
     state: dict[str, Any], config: Config, force: bool,
     step_options: dict[str, dict[str, Any]] | None,
-    *, force_steps: list[str] | None = None, clips: list[str] | None = None,
+    *, force_steps: list[str] | None = None, clips: list[str] | None = None, manual: bool = True,
 ) -> _Run:
     """``force`` remet toutes les etapes a pending et les force toutes.
     ``force_steps`` (sans ``force``) ne remet a pending, et ne force, que
     l'etape nommee la plus en amont et toutes celles qui la suivent dans
-    STEPS (SPEC-74e9 §3.3) : les precedentes restent ``done``."""
+    STEPS (SPEC-74e9 §3.3) : les precedentes restent ``done``. ``manual``
+    (une relance ``run``/``render``, jamais ``process_queue``) remet
+    ``attempts`` a 0 : une relance a la main part d'une ardoise propre, les
+    echecs transitoires d'avant (quota de la nuit...) ne comptent plus pour
+    ``max_attempts`` (Important 4, revue r-transcription)."""
     state.pop("dismissed_at", None)  # une relance reprend la video : elle n'est plus « retiree »
+    if manual:
+        state["attempts"] = 0
     if force:
         forced = set(STEPS)
         for step in state["steps"].values():
@@ -1145,7 +1157,13 @@ def process_queue(
     preset de cette chaine, son mode compris (SPEC-74e9 §1.3), pas avec la
     config globale : si la chaine a disparu ou son preset est invalide,
     l'erreur est journalisee, gardee dans ``reason`` et la video reste en
-    attente (ADR-ad2e, aucun repli sur la config globale)."""
+    attente (ADR-ad2e, aucun repli sur la config globale). Reprise sans
+    decision humaine requise (``through_review=False``) : si le mode est
+    devenu ``review`` entre la mise en file et la reprise, la video s'arrete
+    proprement en ``awaiting_review`` au lieu de lever (Important 3, revue
+    r-transcription) -- une reprise automatique ne doit jamais interrompre
+    les videos suivantes de la file. Chaque reprise garde ``attempts`` tel
+    quel (``manual=False``) : ce n'est pas une relance manuelle."""
     config = config or load_config()
     now = now or _now()
     out = []
@@ -1163,7 +1181,9 @@ def process_queue(
                     state["reason"] = reason
                     save_state(state, config=config)
                 continue
-        out.append(_advance(_start(state, run_config, False, step_options), through_review=True))
+        out.append(_advance(
+            _start(state, run_config, False, step_options, manual=False), through_review=False,
+        ))
     return out
 
 

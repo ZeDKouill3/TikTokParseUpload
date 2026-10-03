@@ -431,7 +431,12 @@ def _check_correction_shape(answer: dict[str, Any]) -> None:
     controlee apres coup, tolerante a la ponctuation (_normalized_core,
     appelee depuis _fix_chunk) : ce n'est pas une raison de redemander au
     modele, une correction qui ne correspond toujours pas est ignoree et
-    journalisee (ADR-ad2e)."""
+    journalisee (ADR-ad2e). Deux corrections visant le meme index ({old,
+    word} identiques) sont une repetition du modele, pas une erreur : la
+    seconde est ignoree en silence par _fix_chunk (ADR-ad2e, ce n'est pas un
+    refus). Si elles different (meme index, old ou word different), c'est
+    contradictoire : reponse hors schema, renvoyee au modele pour reparation."""
+    seen: dict[int, tuple[str, str]] = {}
     for correction in answer["corrections"]:
         new = correction["word"].strip()
         if not new or any(c.isspace() for c in new):
@@ -439,6 +444,14 @@ def _check_correction_shape(answer: dict[str, Any]) -> None:
                 f"correction refusee pour le mot {correction['i']} : {correction['word']!r} "
                 "(un mot doit rester un seul mot)"
             )
+        key = (correction["old"], correction["word"])
+        prior = seen.get(correction["i"])
+        if prior is not None and prior != key:
+            raise llm.SchemaError(
+                f"corrections contradictoires pour le mot {correction['i']} : "
+                f"{prior!r} puis {key!r}"
+            )
+        seen[correction["i"]] = key
 
 
 def _word_core_bounds(word: str) -> tuple[int, int]:
@@ -612,7 +625,11 @@ def _fix_chunk(
         prompt = _fix_prefix(vocab) + lines
         answer = _ask_fix(prompt, len(words), config, log_path, timeout)
         _store_cached_fix(cache_path, answer)
+    seen_indexes: set[int] = set()
     for correction in answer["corrections"]:
+        if correction["i"] in seen_indexes:
+            continue  # doublon identique (_check_correction_shape) : deja applique, pas un refus
+        seen_indexes.add(correction["i"])
         word = words[correction["i"]]
         old = correction["old"].strip()
         actual = word["word"].strip()
@@ -624,7 +641,9 @@ def _fix_chunk(
             continue
         stats.record(applied=True)
         new = correction["word"].strip()
-        word["word"] = _apply_word_correction(word["word"], new)
+        core_start, core_end = _word_core_bounds(new)
+        new_core = new[core_start:core_end] or new
+        word["word"] = _apply_word_correction(word["word"], new_core)
     for seg in chunk:
         if seg["words"]:
             seg["text"] = "".join(w["word"] for w in seg["words"])
@@ -651,14 +670,31 @@ def _fix_chunks(
     _fix_chunk(chunks[0], vocab, config, log_path, stats, video_dir, timeout)
     rest = chunks[1:]
     if rest:
-        with ThreadPoolExecutor(max_workers=max(1, min(parallel, len(rest)))) as executor:
+        executor = ThreadPoolExecutor(max_workers=max(1, min(parallel, len(rest))))
+        try:
             futures = [
                 executor.submit(_fix_chunk, chunk, vocab, config, log_path, stats, video_dir, timeout)
                 for chunk in rest
             ]
             for future in futures:
                 future.result()
-    _check_refusal_ratio(stats)
+        except BaseException:
+            # Premier echec definitif : les tranches pas encore lancees sont
+            # annulees plutot que toutes demandees avant que l'erreur ne
+            # remonte (Mineur 1, revue r-transcription).
+            executor.shutdown(wait=True, cancel_futures=True)
+            raise
+        else:
+            executor.shutdown(wait=True)
+    try:
+        _check_refusal_ratio(stats)
+    except TranscribeError:
+        # Une majorite de corrections refusees indique une correction
+        # decalee dans son ensemble : garder les tranches en cache les
+        # rejouerait a l'identique sans jamais redemander au LLM (Important
+        # 1, revue r-transcription).
+        shutil.rmtree(_fix_cache_dir(video_dir), ignore_errors=True)
+        raise
 
 
 def transcribe(
