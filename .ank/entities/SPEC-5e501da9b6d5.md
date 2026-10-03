@@ -5,7 +5,7 @@ slug: youtube-shorts-par-navigateur-comptes-youtube-pu
 title: "YouTube Shorts par navigateur : comptes YouTube, publication immédiate ou programmée, statistiques à l'usage, heure de Paris partout"
 created: 2026-10-03T09:08:22Z
 author: nicoc@zedk_ordi
-status: proposed
+status: accepted
 scope:
   - clipper/youtube.py
   - clipper/browser.py
@@ -17,8 +17,12 @@ scope:
   - clipper/assets/youtube_selectors.toml
   - config.example.toml
 supersedes: SPEC-3872d5411c8c
+ratified: f08f69301f16
+verified:
+  - by: nicoc@zedk_ordi
+    at: 2026-10-03T09:14:38Z
 schema: 4
-version: 1
+version: 2
 ---
 
 ## Objet
