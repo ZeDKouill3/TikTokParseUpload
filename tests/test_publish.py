@@ -809,6 +809,51 @@ def test_entry_account_never_falls_back_to_another_account(isolated_cwd):
     assert publish.entry_account({}) is None  # file d'avant R4 : plus de compte de style en repli (SPEC-6076 R2)
 
 
+# --------------------------------------------------------------------------
+# TASK-5c00d0c09c98 : « Après la dernière programmation + N h » (SPEC-1ed3)
+# --------------------------------------------------------------------------
+
+
+def test_after_last_schedule_adds_the_interval_to_the_last_future_publication(isolated_cwd):
+    publish = _tiktok_env(isolated_cwd, ("01", "02"))  # 01 : lun 09:00, 02 : lun 18:00
+    noon = datetime(2026, 9, 28, 12, 0, tzinfo=timezone.utc)  # entre les deux : 09:00 est passé, 18:00 à venir
+
+    when = publish.after_last_schedule(_ACCOUNT, 2, now=noon)
+
+    assert when == datetime(2026, 9, 28, 20, 0, tzinfo=timezone.utc)  # 18:00 (à venir) + 2 h ; 09:00 (passé) ignoré
+
+
+def test_after_last_schedule_falls_back_to_now_without_any_future_publication(isolated_cwd):
+    publish = _tiktok_env(isolated_cwd, ())
+    now = datetime(2026, 9, 28, 6, 0, tzinfo=timezone.utc)
+
+    when = publish.after_last_schedule(_ACCOUNT, 3, now=now)
+
+    assert when == now + timedelta(hours=3)
+
+
+def test_after_last_schedule_counts_a_post_scheduled_on_the_service_not_yet_live(isolated_cwd):
+    publish = _tiktok_env(isolated_cwd, ("01",))
+    at = datetime(2026, 9, 28, 9, 0, tzinfo=timezone.utc)
+    later = datetime(2026, 10, 5, 9, 0, tzinfo=timezone.utc)
+    publish.mark_published("vid1", "01", "ma_chaine", now=at, tiktok_state="scheduled_on_tiktok",
+                           publish_at=later.isoformat(), account=_ACCOUNT)
+
+    when = publish.after_last_schedule(_ACCOUNT, 1, now=at)
+
+    assert when == later + timedelta(hours=1)
+
+
+def test_after_last_schedule_ignores_entries_moved_to_another_account(isolated_cwd):
+    publish = _tiktok_env(isolated_cwd, ("01",))  # 01 : lun 09:00
+    now = datetime(2026, 9, 28, 6, 0, tzinfo=timezone.utc)
+    publish.set_account("vid1", "01", "ma_chaine", _OTHER_ACCOUNT)
+
+    when = publish.after_last_schedule(_ACCOUNT, 2, now=now)
+
+    assert when == now + timedelta(hours=2)
+
+
 def test_the_posts_and_halt_of_an_account_follow_the_entry_account_across_channels(isolated_cwd):
     publish = _tiktok_env(isolated_cwd, ("01", "02"))
     _write_preset(isolated_cwd, "autre", _TWO_SLOTS.replace(_ACCOUNT, _OTHER))

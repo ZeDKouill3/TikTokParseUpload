@@ -2519,6 +2519,18 @@ def create_app(config: Config | None = None) -> FastAPI:
             schedule=_account_schedule(config, account), **_publication_scope(_account_service(config, account)))
         return _publication_view(channel or publish_mod.NO_CHANNEL, entry)
 
+    @app.get("/api/publications/after-last")
+    def publication_after_last(account: str, interval_hours: float) -> dict[str, Any]:
+        """« Après la dernière programmation » (SPEC-1ed3) : la date proposee par « Nouvelle publication »,
+        affichee avant validation ; les refus habituels (fenetre, avance minimale, plafonds) se verifient a
+        la creation, comme toute publication programmee."""
+        account = _require_ready_account(config, account)
+        if not interval_hours > 0:
+            raise HTTPException(status_code=422, detail=f"intervalle invalide : {interval_hours!r} (attendu : un nombre d'heures positif)")
+        when = publish_mod.after_last_schedule(
+            account, interval_hours, state_dir=_publish_dir(config), presets_dir=_PRESETS_DIR, base=_BASE_CONFIG)
+        return {"publish_at": when.isoformat(), "publish_at_paris": _paris(when.isoformat())}
+
     @app.patch("/api/publications/{video_id}/{clip_id}")
     def update_publication(video_id: str, clip_id: str, body: PublicationPatchBody) -> dict[str, Any]:
         _validate_video_id(video_id)
@@ -3202,7 +3214,9 @@ def _publish_week_view(config: Config, account: str | None, week: str | None) ->
         if entry["status"] == "approved" and slot is None:
             unscheduled.append(_publish_clip_view(clips, file_channel, entry))
         elif entry["status"] in ("published", "failed"):
-            when = published or slot
+            # le créneau (jamais réécrit après coup, SPEC-1ed3) place la case : un post programmé sur le service
+            # (scheduled_on_tiktok / youtube) reste à sa date de direct, même décidé (published_at) une autre semaine.
+            when = slot or published
             if when is not None and start <= when < end:
                 done.append(_publish_clip_view(clips, file_channel, entry))
 

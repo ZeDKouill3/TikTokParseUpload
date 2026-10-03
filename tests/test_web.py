@@ -2930,6 +2930,22 @@ def test_get_publish_lists_approved_without_slot_and_published_failed_of_the_wee
     assert next(c for c in data["done"] if c["clip_id"] == "03")["publish_error"] == "quota depasse"
 
 
+def test_get_publish_places_a_service_scheduled_post_in_the_week_of_its_slot_not_its_decision(tmp_path, isolated_cwd):
+    # programme vendredi (PUB_MON de la semaine courante) un post dont le créneau choisi est la semaine suivante
+    # (PUB_NEXT_MON) : la décision (published_at) et le direct (slot_at / tiktok_publish_at) sont dans des
+    # semaines différentes, la case doit suivre le direct, pas la décision.
+    _publish_setup(tmp_path, [
+        _entry("01", "published", slot_at=PUB_NEXT_MON, published_at=PUB_MON,
+               tiktok_state="scheduled_on_tiktok", tiktok_publish_at=PUB_NEXT_MON),
+    ])
+
+    this_week = _get_publish(tmp_path).json()
+    next_week = _get_publish(tmp_path, week="2026-10-14").json()
+
+    assert this_week["done"] == []
+    assert [c["clip_id"] for c in next_week["done"]] == ["01"]
+
+
 def test_get_publish_week_is_taken_from_the_requested_week_and_defaults_to_this_one(tmp_path, isolated_cwd):
     _publish_setup(tmp_path, [_entry("01", "scheduled", slot_at=PUB_NEXT_MON)])
 
@@ -3218,7 +3234,7 @@ def test_publish_screen_is_wired_with_calendar_queue_and_actions():
     assert "publish?channel=" not in js                                    # plus aucun filtre par style
     assert "week" in js and "Semaine précédente" in js and "Semaine suivante" in js
     assert "cal-c" in js and "data-slot-at" in js and "slot_at" in js      # calendrier hebdomadaire des créneaux
-    assert "unscheduled" in js and "À publier" in js                       # file des approuvés sans créneau
+    assert "unscheduled" in js and "En attente" in js                       # liste unique (validés sans date + en cours/échecs)
     for ev in ("dragstart", "dragover", "drop"):                            # glisser-déposer à la souris
         assert ev in js, ev
     for ev in ("touchstart", "touchmove", "touchend"):                      # et au toucher
@@ -3231,8 +3247,8 @@ def test_publish_screen_is_wired_with_calendar_queue_and_actions():
     assert "Repasser en attente" in js
     assert "undo" in js                                                    # toast « Annuler »
     assert "toastError" in js                                              # un conflit 409 s'affiche
-    assert "Rien à publier" in js                                          # état vide
-    for sel in (".cal", ".cal-c", ".post", ".queue", "TASK-503d"):
+    assert "Aucune publication en attente" in js                           # état vide
+    for sel in (".cal", ".cal-c", ".post", "TASK-503d"):
         assert sel in css, sel
 # Ecran Reglages (SPEC-c100 E8, ADR-4f6e §2 et §5) : config.toml en formulaire
 # --------------------------------------------------------------------------
@@ -5756,6 +5772,51 @@ def test_an_account_not_ready_or_unknown_is_refused(tmp_path, isolated_cwd):
     assert _publications(tmp_path) == []
 
 
+# --------------------------------------------------------------------------
+# TASK-5c00d0c09c98 : « Après la dernière programmation + N h » (SPEC-1ed3)
+# --------------------------------------------------------------------------
+
+
+def test_publication_after_last_adds_the_interval_to_the_accounts_last_future_publication(tmp_path, isolated_cwd):
+    _publications_setup(tmp_path)
+    when = _soon(days=2)
+    c = _pub_client(tmp_path)
+    created = c.post("/api/publications", json={
+        "video_id": CLIPS_VIDEO, "clip_id": "01", "account": READY, "mode": "scheduled", "publish_at": when})
+    assert created.status_code == 201, created.text
+
+    resp = c.get("/api/publications/after-last", params={"account": READY, "interval_hours": 3})
+
+    assert resp.status_code == 200, resp.text
+    expected = (_dt.fromisoformat(when) + _td(hours=3)).isoformat()
+    assert resp.json()["publish_at"] == expected
+
+
+def test_publication_after_last_falls_back_to_now_without_any_future_publication(tmp_path, isolated_cwd):
+    _publications_setup(tmp_path)
+
+    resp = _pub_client(tmp_path).get("/api/publications/after-last", params={"account": READY, "interval_hours": 4})
+
+    assert resp.status_code == 200, resp.text
+    at = _dt.fromisoformat(resp.json()["publish_at"])
+    now = _dt.now(_tz.utc)
+    assert now + _td(hours=3, minutes=55) < at < now + _td(hours=4, minutes=5)
+
+
+def test_publication_after_last_refuses_an_unknown_account_or_a_non_positive_interval(tmp_path, isolated_cwd):
+    _publications_setup(tmp_path, ready=(READY,))
+    c = _pub_client(tmp_path)
+
+    unready = c.get("/api/publications/after-last", params={"account": SPARE, "interval_hours": 2})
+    unknown = c.get("/api/publications/after-last", params={"account": "zzzzzz", "interval_hours": 2})
+    zero = c.get("/api/publications/after-last", params={"account": READY, "interval_hours": 0})
+    negative = c.get("/api/publications/after-last", params={"account": READY, "interval_hours": -1})
+
+    assert unready.status_code == 409 and unknown.status_code == 409
+    assert zero.status_code == 422 and "intervalle" in zero.json()["detail"]
+    assert negative.status_code == 422
+
+
 @pytest.mark.parametrize("body, status", [
     ({"clip_id": "01", "account": READY, "mode": "immediate"}, 422),
     ({"video_id": CLIPS_VIDEO, "clip_id": "../x", "account": READY, "mode": "immediate"}, 400),
@@ -6624,15 +6685,19 @@ def test_finished_posts_leave_the_ongoing_list_and_an_approved_one_without_momen
 
 
 @_NODE
-def test_publication_layout_puts_the_calendar_in_the_main_column_next_to_the_list_with_one_no_slot_message():
+def test_publication_layout_always_shows_the_calendar_with_a_single_pending_list():
     week = {"account": "ab12cd", "channel": "ma_chaine", "timezone": "Europe/Paris", "week_start": "2026-10-05", "week_end": "2026-10-11",
             "slots": [{"slot_at": "2026-10-05T18:30:00+02:00", "slot_at_paris": "2026-10-05T18:30:00+02:00", "clip": None, "free": True}],
             "unscheduled": [{"video_id": "v", "clip_id": "01", "publish_status": "approved", "screen_title": "T", "video_url": "/m", "thumbnail_url": "/t"}],
-            "done": [], "off_slot": [{"video_id": "v", "clip_id": "02", "publish_status": "scheduled", "screen_title": "Manuel", "slot_at": "2026-10-07T12:15:00+00:00",
-                                      "slot_at_paris": "2026-10-07T14:15:00+02:00", "video_url": "/m", "thumbnail_url": "/t"}],
+            "done": [{"video_id": "v", "clip_id": "03", "publish_status": "published", "screen_title": "Publié", "service": "tiktok",
+                      "slot_at": "2026-10-06T09:00:00+00:00", "slot_at_paris": "2026-10-06T11:00:00+02:00",
+                      "published_at_paris": "2026-10-06T11:00:00+02:00", "video_url": "/m", "thumbnail_url": "/t"}],
+            "off_slot": [{"video_id": "v", "clip_id": "02", "publish_status": "scheduled", "screen_title": "Manuel", "service": "tiktok",
+                          "slot_at": "2026-10-07T12:15:00+00:00", "slot_at_paris": "2026-10-07T14:15:00+02:00",
+                          "video_url": "/m", "thumbnail_url": "/t"}],
             "accounts": [{"id": "ab12cd", "label": "Compte exemple", "ready_to_publish": True},
                          {"id": "ef34ab", "label": "second_compte", "ready_to_publish": True}], "reason": None}
-    empty = {**week, "slots": [], "off_slot": [], "unscheduled": [{**week["unscheduled"][0]}], "reason": "aucun créneau défini dans [channel].slots"}
+    empty = {**week, "slots": [], "off_slot": [], "done": [], "reason": "aucun créneau défini dans [channel].slots"}
     out = _run_publish(f"""(() => {{
       pubUi.account = 'ab12cd';
       const withSlots = pubLayoutHtml({json.dumps(week)}, pubPostsSection());
@@ -6642,12 +6707,13 @@ def test_publication_layout_puts_the_calendar_in_the_main_column_next_to_the_lis
     }})()""")
     html = out["withSlots"]
     grid = html[html.index('class="grid g-side pub-grid"'):]
-    assert grid.index("data-pub-new") < grid.index('id="pub-cal"')                  # Nouvelle publication et liste à gauche, calendrier à droite, dans la même grille
-    assert 'id="pub-queue"' in grid and "data-publish-now" in grid                   # clips à publier : Publier maintenant
+    assert grid.index("data-pub-new") < grid.index('id="pub-cal"')                  # Nouvelle publication à gauche, calendrier à droite, dans la même grille
+    assert "À publier" not in html and "En attente" in html                         # une seule liste (plus de section « À publier » en double)
     assert "14:15" in grid and "Manuel" in grid                                      # une publication manuelle entre les créneaux est au calendrier, à l'heure de Paris
-    assert out["noSlots"].lower().count("aucun créneau") == 1                        # le message n'apparaît qu'une fois
-    assert 'id="pub-cal"' not in out["noSlots"] and "data-pub-new" in out["noSlots"]
-    assert "data-pub-new" in out["loading"]                                          # « Nouvelle publication » sans calendrier chargé
+    assert "11:00" in grid and "Publié" in grid and "TikTok" in grid                 # un publié/échec de la semaine est aussi au calendrier (heure, service), pas dans une liste à part
+    assert 'id="pub-cal"' in out["noSlots"]                                          # le calendrier reste affiché même sans compte ni créneau régulier
+    assert out["noSlots"].lower().count("aucun créneau") == 1                        # le message d'indication n'apparaît qu'une fois
+    assert "data-pub-new" in out["noSlots"] and "data-pub-new" in out["loading"]     # « Nouvelle publication » même sans créneau ni calendrier chargé
     assert 'id="pub-account"' in html and "Tous les comptes" in html                 # sélecteur : tous les comptes + un par compte
     assert '<option value="ab12cd" selected>Compte exemple</option>' in html and "second_compte" in html
 
@@ -6659,6 +6725,45 @@ def test_publication_help_texts_describe_optional_slots_and_the_new_publication_
     for stale in ("télécharge, copie", "Marquer publié", "créneaux obligatoires", "télécharger + copier"):
         assert stale not in js, stale
     assert "Glisse un clip sur un créneau libre du calendrier pour le planifier" not in js
+
+
+# --------------------------------------------------------------------------
+# TASK-5c00d0c09c98 : « Après la dernière programmation + N h » dans « Nouvelle publication »
+# --------------------------------------------------------------------------
+
+
+@_NODE
+def test_new_publication_form_offers_after_last_schedule_with_the_computed_date():
+    base = {
+        "clips": [], "accounts": [{"id": "ab12cd", "label": "Compte", "service": "tiktok", "ready_to_publish": True}],
+        "options": {}, "ytOptions": {}, "minMinutes": 10, "maxDays": 10, "ytMinMinutes": 10, "ytMaxDays": 10,
+        "caption": "", "tags": "", "edit": None, "selected": "",
+    }
+    out = _run_publish(f"""(() => {{
+      const idle = pubFormHtml({json.dumps({**base, "mode": "immediate", "intervalH": 4})});
+      const chosen = pubFormHtml({json.dumps({**base, "mode": "after_last", "intervalH": 3, "afterAt": None})});
+      const computed = pubFormHtml({json.dumps(
+        {**base, "mode": "after_last", "intervalH": 3,
+         "afterAt": "2026-10-08T14:00:00+02:00"})});
+      return {{ idle, chosen, computed }};
+    }})()""")
+    interval_tag = lambda html: re.search(r'<input[^>]*id="pub-form-interval"[^>]*>', html).group(0)
+    assert 'value="after_last"' in out["idle"] and "Après la dernière programmation" in out["idle"]
+    assert 'value="3"' in interval_tag(out["chosen"])
+    assert "hidden" not in interval_tag(out["chosen"])
+    assert "hidden" in interval_tag(out["idle"])
+    assert "jeudi" in out["computed"] and "14:00" in out["computed"]              # date calculée affichée avant validation
+
+
+def test_publish_js_computes_the_after_last_date_server_side_and_submits_it_as_a_scheduled_post():
+    js = (STATIC / "screens" / "publish.js").read_text(encoding="utf-8")
+    assert "/api/publications/after-last" in js and "interval_hours" in js
+    assert '"after_last"' in js
+    body = js[js.index("function pubFormBody"):js.index("async function pubFormSubmit")]
+    assert 'mode: mode === "after_last" ? "scheduled" : mode' in body
+    assert "f.afterAt" in body
+    submit = js[js.index("async function pubFormSubmit"):js.index("async function pubOpenForm")]
+    assert "afterAt" in submit                                                  # refus explicite si la date n'est pas encore calculée
 
 
 @_NODE
