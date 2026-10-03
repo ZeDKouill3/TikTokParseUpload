@@ -250,10 +250,15 @@ function chSectionHtml(spec, ed) {
 
 function chEditHtml(ed) {
   const c = ed.detail.effective.channel;
+  // L'editeur d'agencement ne regle que le format stream split (webcam, jeu, badge) : inutile, et trompeur,
+  // pour un style en letterbox (format par defaut, SPEC-6a47).
+  const rf = (ed.detail.effective && ed.detail.effective.reframe) || {};
+  const isSplit = String(rf.layout || "").startsWith("stream") && rf.stream_variant === "split";
   return `<div class="chan-edit">
     <div class="toolbar"><a class="btn btn-sm btn-ghost" href="#/styles">${icon("chevron-left", "i-xs")}Tous les styles</a>
       <h2 class="chan-title">${esc(c.display_name)} <span class="mono muted">${esc(ed.name)}</span></h2><span class="grow"></span>
-      <a class="btn btn-sm" href="#/styles/${encodeURIComponent(ed.name)}/layout">${icon("layers", "i-xs")}Éditeur d'agencement</a>
+      ${isSplit ? `<a class="btn btn-sm" href="#/styles/${encodeURIComponent(ed.name)}/layout">${icon("layers", "i-xs")}Éditeur d'agencement</a>`
+        : `<span class="muted" style="font-size:12px" title="L'éditeur d'agencement ne concerne que le format stream « split » (webcam en haut, jeu en bas).">Format ${esc(rf.layout || "letterbox")}</span>`}
       <button type="button" class="btn btn-sm btn-bad" data-chan-delete>${icon("trash-2", "i-xs")}Supprimer</button>
       <button type="button" class="btn btn-primary" data-chan-save>Enregistrer</button></div>
     <p class="reason bad" data-form-error role="alert" hidden></p>
