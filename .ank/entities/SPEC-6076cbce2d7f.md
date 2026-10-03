@@ -5,7 +5,7 @@ slug: tiktok-par-navigateur-v2-aucun-compte-dans-un-st
 title: "TikTok par navigateur v2 : aucun compte dans un style, compte choisi par publication, créneaux sur le compte"
 created: 2026-10-03T10:01:15Z
 author: nicoc@zedk_ordi
-status: proposed
+status: accepted
 scope:
   - clipper/browser.py
   - clipper/tiktok.py
@@ -17,8 +17,12 @@ scope:
   - clipper/web/**
   - pyproject.toml
 supersedes: SPEC-922573c1e68f
+ratified: 37d6bef53918
+verified:
+  - by: nicoc@zedk_ordi
+    at: 2026-10-03T10:03:41Z
 schema: 4
-version: 1
+version: 2
 ---
 
 ## Objet
