@@ -292,10 +292,11 @@ function pubPostRow(p) {
 
 function pubPostsSection() {
   const rows = pubPosts.data ? pubPosts.data.publications.filter((p) => pubIsOngoing(p) && (!pubUi.account || p.account === pubUi.account)) : [];
-  const head = `<div class="section-title">${icon("send")}Publications <span class="more">${rows.length || ""}</span>
-    <span class="grow"></span>
-    <button type="button" class="btn btn-ghost btn-xs" data-pub-series>${icon("calendar-days", "i-xs")}Programmer une série</button>
-    <button type="button" class="btn btn-primary btn-xs" data-pub-new>${icon("plus", "i-xs")}Nouvelle publication</button></div>`;
+  // Boutons sur leur propre ligne : dans le titre, ils debordaient sur la colonne de droite (colonne etroite).
+  const head = `<div class="section-title">${icon("send")}Publications <span class="more">${rows.length || ""}</span></div>
+    <div class="row wrap" style="gap:8px;margin-bottom:10px">
+    <button type="button" class="btn btn-primary btn-xs grow" data-pub-new>${icon("plus", "i-xs")}Nouvelle publication</button>
+    <button type="button" class="btn btn-xs grow" data-pub-series>${icon("calendar-days", "i-xs")}Programmer une série</button></div>`;
   if (pubPosts.error) return `<section>${head}<p class="reason bad">Chargement impossible : ${esc(pubPosts.error.message || pubPosts.error)}</p></section>`;
   if (!pubPosts.data) return `<section>${head}<div class="skeleton skeleton-line"></div></section>`;
   return `<section>${head}${rows.length ? `<div class="panel" id="pub-posts">${rows.map(pubPostRow).join("")}</div>`
