@@ -5,7 +5,7 @@ slug: scripts-installer-installer-bat-install-ps1-11-t
 title: "Scripts installer/ : Installer.bat + install.ps1 (11 étapes, --dry-run testable), Desinstaller.bat, lanceur Clipper.bat généré, PREMIER-CLIP.txt (SPEC installeur R2, R3, R6, R8)"
 created: 2026-10-03T22:51:31Z
 author: plan-portable
-status: open
+status: done
 scope:
   - installer/**
   - tests/test_installer.py
@@ -15,8 +15,15 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/fc3e6bce6e46@4519648
+    tree: scope/211534248396
+    criteria: 706de8e6f467
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 3
+version: 5
 ---
 
 Tâche 3 de SPEC-38f7761891f6 (ADR-e1dac9ba2284), cœur de l'installeur. Lire d'abord tools/setup.ps1 (style PowerShell 5.1, vérifications de prérequis, candidats Chrome) et Clipper.bat (logique netstat / start / timeout à reprendre dans le gabarit). Le mode --dry-run est la preuve : il doit passer par le même code de décision que le vrai run (une seule fonction par étape, qui reçoit un drapeau DryRun), sinon les tests ne prouvent rien. Les étapes réseau (uv python install, uv pip install, ffmpeg, installeur claude, prefetch) ne sont jamais exercées par les tests par défaut ; le test réel unique est une autre tâche. Épingler l'URL et le sha256 de l'archive ffmpeg dans install.ps1 avec un commentaire disant comment les renouveler. Mise à jour : .venv supprimé puis recréé, python/ et ffmpeg/ gardés. Aucun nom de personne ni de chaîne réelle dans les fichiers (dépôt public).

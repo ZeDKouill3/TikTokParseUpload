@@ -1,0 +1,24 @@
+@echo off
+setlocal
+rem Lanceur genere par install.ps1 (Invoke-Step9-Launcher) : les deux lignes
+rem ci-dessous sont remplies avec les chemins absolus choisis a l'installation.
+rem Reprend la logique netstat / start / timeout de Clipper.bat du depot.
+set APP=__APP__
+set DATA=__DATA__
+set PATH=%APP%\ffmpeg\bin;%APP%\.venv\Scripts;%PATH%
+set URL=http://127.0.0.1:8000
+
+cd /d "%DATA%"
+
+netstat -ano | findstr /R /C:"127.0.0.1:8000 .*LISTENING" >nul
+if errorlevel 1 (
+  echo Demarrage de la console Clipper sur %URL%...
+  start "Clipper serve" /min /d "%DATA%" "%APP%\.venv\Scripts\clipper.exe" serve
+  rem Attend que le serveur ecoute (20 s max).
+  for /l %%i in (1,1,20) do (
+    netstat -ano | findstr /R /C:"127.0.0.1:8000 .*LISTENING" >nul && goto :open
+    timeout /t 1 /nobreak >nul
+  )
+)
+:open
+start "" "%URL%"

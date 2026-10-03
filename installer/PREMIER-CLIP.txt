@@ -1,0 +1,24 @@
+Clipper est installe. Voici comment faire ton premier clip.
+
+1. Ouvre la console Clipper (double-clic sur le raccourci "Clipper" du
+   Bureau, ou relance Installer.bat qui l'ouvre a la fin). Une page
+   s'ouvre dans ton navigateur a l'adresse http://127.0.0.1:8000.
+
+2. Dans la console, va sur l'ecran "Videos" et colle l'URL d'une video
+   YouTube ou d'un VOD Twitch que tu veux decouper en clips.
+
+3. Lance le traitement. Il passe par plusieurs etapes (telechargement,
+   transcription, decoupage, notation des moments, sous-titres, rendu) :
+   tu peux suivre la progression dans la console.
+
+4. En mode "revue" (par defaut), tu valides toi-meme les moments retenus
+   avant le rendu final, dans l'ecran "Revue". En mode "auto", le jury
+   decide seul : les clips arrivent directement dans l'ecran "Clips".
+
+5. Les clips finis sont dans l'ecran "Clips" (et sur disque, dans ton
+   dossier de donnees Clipper, sous output\<id-de-la-video>\). Depuis
+   la console, tu peux aussi les publier (ecran "Publication").
+
+En cas de probleme : lance "clipper doctor" depuis la console Clipper
+(menu "Reglages", ou dans un terminal ouvert dans ton dossier de donnees
+Clipper) pour un diagnostic qui dit precisement quoi corriger.
