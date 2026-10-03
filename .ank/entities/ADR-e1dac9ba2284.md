@@ -18,10 +18,12 @@ scope:
   - clipper/models.py
   - tests/test_doctor.py
   - tests/test_models.py
+  - installer/**
+  - tests/test_installer.py
 constraint: |
   L'installation pour un utilisateur sans outils de développement passe par un seul zip d'amorçage (uv.exe, la wheel clipper, les scripts installer/, l'icône ; jamais Python ni site-packages dedans) dont Installer.bat installe tout le programme sous un dossier app (par défaut %LOCALAPPDATA%\Clipper\app : Python 3.11 et dépendances via uv, ffmpeg, lanceur) et toutes les données sous un dossier distinct (par défaut %USERPROFILE%\Documents\Clipper : config.toml, rubric.toml, workspace/, output/, state/, logs/) que ni une mise à jour (relance d'un zip plus récent, qui remplace app) ni la désinstallation par défaut ne touchent ; CUDA (extra clipper[cuda]) n'est installé que si un GPU NVIDIA est détecté ; Chrome et le CLI claude restent externes (claude installé par l'installeur officiel natif et connecté par l'utilisateur lui-même, Chrome seulement vérifié) ; tout prérequis manquant ou étape échouée est un arrêt explicite en français avec le remède, jamais un repli silencieux (ADR-ad2e) ; aucun test par défaut ne télécharge quoi que ce soit.
 schema: 4
-version: 3
+version: 4
 ---
 
 ## Contexte
