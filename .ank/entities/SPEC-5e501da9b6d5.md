@@ -1,0 +1,35 @@
+---
+id: SPEC-5e501da9b6d5
+type: spec
+slug: youtube-shorts-par-navigateur-comptes-youtube-pu
+title: "YouTube Shorts par navigateur : comptes YouTube, publication immédiate ou programmée, statistiques à l'usage, heure de Paris partout"
+created: 2026-10-03T09:08:22Z
+author: nicoc@zedk_ordi
+status: proposed
+scope:
+  - clipper/youtube.py
+  - clipper/browser.py
+  - clipper/accounts.py
+  - clipper/tiktok.py
+  - clipper/publish.py
+  - clipper/worker.py
+  - clipper/web/**
+  - clipper/assets/youtube_selectors.toml
+  - config.example.toml
+supersedes: SPEC-3872d5411c8c
+schema: 4
+version: 1
+---
+
+## Objet
+Publier les clips sur YouTube (Shorts) et relever leurs statistiques, par YouTube Studio dans un vrai Chrome, sur le modèle de TikTok (ADR-58c0, ADR-1a58, SPEC-9225, SPEC-e500, SPEC-1ed3, SPEC-47e2). Ce qui n'est pas dit ici suit les règles TikTok correspondantes.
+
+## Règles
+R1. Comptes. Un compte de publication porte un service : `tiktok` ou `youtube` ; les comptes existants sont `tiktok` (migration automatique, sans action de l'utilisateur). L'écran Comptes permet d'ajouter un compte YouTube ; « Se connecter » ouvre un Chrome normal sur le profil state/browser/<compte>/ et la page de connexion de YouTube Studio ; l'utilisateur se connecte à la main. « Prêt à publier » est automatique dès qu'une vérification voit YouTube Studio ouvert sur une chaîne (nom et identifiant de la chaîne affichés), comme SPEC-e500.
+R2. Publication. L'écran Publication propose les comptes des deux services (libellé avec le service). Réglages d'une publication YouTube : titre (100 caractères max, défaut = titre d'écran du clip), description (défaut = légende et hashtags du sidecar SPEC-6a47, avec #Shorts ajouté s'il manque), visibilité (publique, non répertoriée, privée ; défaut publique), « conçue pour les enfants » (non par défaut, réglable par compte), maintenant ou programmée à une date (programmation côté YouTube, pour publier PC éteint). Succès : l'URL de la vidéo (youtube.com/shorts/<id>) est enregistrée dans la publication et le sidecar. Un même clip peut être publié sur plusieurs comptes, une publication par compte.
+R3. Arrêt sûr. Captcha, vérification Google, connexion expirée, élément attendu absent après délai, fenêtre ou page inattendue : arrêt immédiat, publication en échec avec raison et réessayable, capture sous state/browser/<compte>/captures/, notification. Jamais de contournement ni de clic au hasard.
+R4. Repères. Toutes les URL et tous les repères de YouTube Studio dans clipper/assets/youtube_selectors.toml, relevés sur la vraie page (méthode des repères TikTok : Chrome normal du profil avec port de débogage, l'utilisateur montre la page) ; aucun repère écrit à l'aveugle n'est livré comme vérifié.
+R5. Rythme et plafonds. Table [youtube] : min/max_action_delay_s, max_posts_per_day (défaut 3) et min_gap_minutes (défaut 120) par compte ; un seul compte piloté à la fois, tous services confondus.
+R6. Statistiques. Mêmes règles de déclenchement que SPEC-47e2 (seulement quand l'utilisateur se sert de Clipper : ouverture de Statistiques si le dernier relevé est périmé, au passage d'une publication, bouton ; pas de relevé de fond par défaut). Relevé de la liste des Shorts de la chaîne dans YouTube Studio (Contenu) : par vidéo titre, date, visibilité, vues, likes, commentaires, et ce que la page de la vidéo affiche en plus (durée moyenne regardée, part vue en entier) ; valeur absente = null, jamais 0 inventé ; historique horodaté sous state/stats/youtube/<compte>/ ; vidéo supprimée retirée de l'affichage. L'écran Statistiques propose les comptes des deux services ; un compte YouTube montre les tuiles et colonnes disponibles pour YouTube.
+R7. Tests sans navigateur, réseau ni YouTube : fausses pages pour connexion vérifiée, publication immédiate, programmée, chaque cas d'arrêt sûr, relevé de stats ; migration des comptes existants en `tiktok` ; verrou d'un seul compte piloté. Test réel optionnel (skipif, CLIPPER_YOUTUBE_REAL=1) qui envoie en privé sur un compte de test.
+R8. Heure de Paris, toujours. Toute date ou heure choisie, affichée ou saisie par Clipper est en heure de Paris (Europe/Paris, heure d'été comprise), quel que soit le fuseau du PC (constaté : PC réglé sur Londres). Le navigateur piloté (TikTok comme YouTube) est lancé avec le fuseau Europe/Paris, et les dates saisies dans les pages y sont converties ; dans YouTube Studio, le fuseau de la programmation est choisi explicitement (option « Paris »), jamais « Heure locale » ; après saisie, la date et l'heure relues sur la page doivent correspondre à l'heure de Paris attendue, sinon arrêt sûr (R3).
