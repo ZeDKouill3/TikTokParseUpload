@@ -76,7 +76,8 @@ tout le reste est fait ici, de facon verifiable :
    chevauche, meme mieux note (le contenu du single y figure deja) ; entre
    deux candidats du meme format, le mieux note reste. Puis plafond souple
    (``max_moments_per_hour``, regle 4) : au plus ``ceil(max_moments_per_hour
-   x duree de la video en heures)`` moments (au moins 1 ; duree lue dans
+   x duree de la video en heures)`` moments, jamais moins que
+   ``min_moments_cap`` (plancher pour les videos courtes ; duree lue dans
    meta.json, jamais de valeur par defaut silencieuse), pris par score
    decroissant ; un moment a ``always_keep_score`` ou plus est retenu meme
    au-dela du plafond, et compte dedans. Chaque moment ecarte par le plafond
@@ -222,6 +223,9 @@ def load_rubric(path: str | Path) -> dict[str, Any]:
         value = rubric.get(key)
         if not _number(value) or value <= 0:
             raise MomentsError(f"{path} : {key} manquant ou invalide (attendu : nombre > 0)")
+    cap_floor = rubric.get("min_moments_cap")
+    if not isinstance(cap_floor, int) or isinstance(cap_floor, bool) or cap_floor < 1:
+        raise MomentsError(f"{path} : min_moments_cap manquant ou invalide (attendu : entier >= 1)")
     keywords = rubric.get("trend_keywords")
     if not isinstance(keywords, list) or not all(isinstance(k, str) for k in keywords):
         raise MomentsError(f"{path} : trend_keywords doit etre une liste de chaines")
@@ -744,15 +748,17 @@ def _overlaps(c: dict[str, Any], others: list[dict[str, Any]]) -> dict[str, Any]
 
 
 def _cap(rubric: dict[str, Any], meta: dict[str, Any]) -> int:
-    """Plafond souple (SPEC-0eec regle 4) : au plus ``max_moments_per_hour``
-    moments par heure de video source, arrondi superieur, au moins 1. La
-    duree est lue dans meta.json ; absente ou invalide, une MomentsError
-    (jamais de valeur par defaut silencieuse, ADR-ad2e)."""
+    """Plafond souple (SPEC-4063 regle 4) : au plus ``max_moments_per_hour``
+    moments par heure de video source, arrondi superieur, jamais moins que
+    ``min_moments_cap`` (plancher pour les videos courtes ; 1 = ancien
+    comportement, SPEC-0eec). La duree est lue dans meta.json ; absente ou
+    invalide, une MomentsError (jamais de valeur par defaut silencieuse,
+    ADR-ad2e)."""
     duration = meta.get("duration")
     if not _number(duration) or duration <= 0:
         raise MomentsError("meta.json : duration manquante ou invalide (necessaire au plafond de moments par heure)")
     hours = duration / 3600
-    return max(1, math.ceil(rubric["max_moments_per_hour"] * hours - 1e-9))
+    return max(rubric["min_moments_cap"], math.ceil(rubric["max_moments_per_hour"] * hours - 1e-9))
 
 
 def _select(
@@ -794,7 +800,8 @@ def _select(
             rejected.append((
                 c,
                 f"ecarte par le plafond de {cap} moments par heure de video "
-                f"(max_moments_per_hour {rubric['max_moments_per_hour']})",
+                f"(max_moments_per_hour {rubric['max_moments_per_hour']}, "
+                f"min_moments_cap {rubric['min_moments_cap']})",
             ))
     kept = [c for c in kept if id(c) in within_cap]
 

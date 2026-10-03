@@ -72,6 +72,7 @@ _SMOKE_RUBRIC = """
 min_score = 60
 max_moments_per_hour = 1000
 always_keep_score = 1000
+min_moments_cap = 1
 trend_keywords = ["record"]
 
 [criteria.hook]

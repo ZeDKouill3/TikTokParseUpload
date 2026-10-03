@@ -14,14 +14,15 @@
 # signaux mesures plafonne a [bonus] max_total.
 # Retenus : les moments dont le score final >= min_score, avec un plafond
 # souple : au plus max_moments_per_hour moments par heure de video source
-# (plafond = arrondi superieur de max_moments_per_hour x duree en heures, au
-# moins 1), pris par score decroissant ; un moment dont le score atteint
+# (plafond = arrondi superieur de max_moments_per_hour x duree en heures),
+# jamais moins que min_moments_cap ; un moment dont le score atteint
 # always_keep_score est toujours retenu, meme au-dela du plafond, et compte
 # dans le plafond.
 
 min_score = 45
 max_moments_per_hour = 6
 always_keep_score = 70
+min_moments_cap = 3
 
 # Mots-cles tendance (critere trend) : aucun pour le gaming, trend est a poids 0.
 trend_keywords = []

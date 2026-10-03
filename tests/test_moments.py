@@ -24,6 +24,7 @@ TEST_RUBRIC = """
 min_score = 60
 max_moments_per_hour = 1000
 always_keep_score = 1000
+min_moments_cap = 1
 trend_keywords = ["GTA 6", "Vice City"]
 
 [criteria.hook]
@@ -203,6 +204,7 @@ def test_repo_rubric_matches_the_spec():
     assert rubric["min_score"] == 60
     assert rubric["max_moments_per_hour"] == 6
     assert rubric["always_keep_score"] == 70
+    assert rubric["min_moments_cap"] == 3
     d = rubric["durations"]
     assert (
         d["single_min"], d["single_max"], d["part_min"], d["part_max"], d["min_parts"], d["max_parts"], d["tolerance"]
@@ -222,7 +224,7 @@ def test_rubric_without_max_parts_is_refused(tmp_path):
         load_rubric(p)
 
 
-@pytest.mark.parametrize("key", ["max_moments_per_hour", "always_keep_score"])
+@pytest.mark.parametrize("key", ["max_moments_per_hour", "always_keep_score", "min_moments_cap"])
 def test_rubric_without_a_cap_setting_is_refused(tmp_path, key):
     from clipper.moments import MomentsError, load_rubric
 
@@ -232,7 +234,7 @@ def test_rubric_without_a_cap_setting_is_refused(tmp_path, key):
         load_rubric(p)
 
 
-@pytest.mark.parametrize("key", ["max_moments_per_hour", "always_keep_score"])
+@pytest.mark.parametrize("key", ["max_moments_per_hour", "always_keep_score", "min_moments_cap"])
 @pytest.mark.parametrize("value", ["0", "-1"])
 def test_rubric_with_a_non_positive_cap_setting_is_refused(tmp_path, key, value):
     from clipper.moments import MomentsError, load_rubric
@@ -240,6 +242,19 @@ def test_rubric_with_a_non_positive_cap_setting_is_refused(tmp_path, key, value)
     p = tmp_path / "rubric.toml"
     p.write_text(re.sub(rf"^{key} = .*$", f"{key} = {value}", TEST_RUBRIC, flags=re.MULTILINE), encoding="utf-8")
     with pytest.raises(MomentsError, match=key):
+        load_rubric(p)
+
+
+@pytest.mark.parametrize("value", ["1.5", "true", '"3"'])
+def test_min_moments_cap_must_be_a_positive_integer(tmp_path, value):
+    from clipper.moments import MomentsError, load_rubric
+
+    p = tmp_path / "rubric.toml"
+    p.write_text(
+        re.sub(r"^min_moments_cap = .*$", f"min_moments_cap = {value}", TEST_RUBRIC, flags=re.MULTILINE),
+        encoding="utf-8",
+    )
+    with pytest.raises(MomentsError, match="min_moments_cap"):
         load_rubric(p)
 
 
@@ -1882,6 +1897,61 @@ def test_rescore_reapplies_the_plafond_after_a_score_change(tmp_path, video_dir,
     assert lowest["start"] in [m["start"] for m in after["moments"]]
     newly_capped = [r for r in after["rejected"] if "plafond" in r["reason"]]
     assert len(newly_capped) == 1 and newly_capped[0]["start"] != lowest["start"]
+
+
+FLOOR_RUBRIC = re.sub(r"min_moments_cap = \d+", "min_moments_cap = 3", CAP_RUBRIC)
+
+
+@pytest.fixture
+def floor_rubric(tmp_path):
+    p = tmp_path / "floor_rubric.toml"
+    p.write_text(FLOOR_RUBRIC, encoding="utf-8")
+    return p
+
+
+def test_short_video_keeps_at_least_min_moments_cap_moments(tmp_path, video_dir, floor_rubric):
+    # video de 7,5 min (450 s) : ceil(6 x 0.125) = 1, mais min_moments_cap = 3
+    # l'emporte ; 4 candidats au-dessus de min_score, non chevauchants -> les
+    # 3 mieux notes retenus, le 4e (le moins bon) ecarte pour le plafond, qui
+    # cite min_moments_cap dans sa raison.
+    write_flat_signals(video_dir, 450.0)
+    scores = [cap_score(9, t) for t in range(4)]
+    run(tmp_path, floor_rubric, [{"moments": spaced_candidates(4, scores)}])
+
+    data = read_moments(video_dir)
+    assert len(data["moments"]) == 3
+    kept_scores = sorted(m["final_score"] for m in data["moments"])
+    [capped] = [r for r in data["rejected"] if "plafond" in r["reason"]]
+    assert capped["final_score"] < kept_scores[0]
+    assert "min_moments_cap" in capped["reason"]
+
+
+def test_min_moments_cap_of_1_restores_the_former_behaviour(tmp_path, video_dir, cap_rubric):
+    # meme scenario que ci-dessus, mais avec min_moments_cap = 1 (cap_rubric) :
+    # le plafond redevient ceil(6 x 0.125) = 1, un seul moment retenu.
+    write_flat_signals(video_dir, 450.0)
+    scores = [cap_score(9, t) for t in range(4)]
+    run(tmp_path, cap_rubric, [{"moments": spaced_candidates(4, scores)}])
+
+    data = read_moments(video_dir)
+    assert len(data["moments"]) == 1
+    assert len([r for r in data["rejected"] if "plafond" in r["reason"]]) == 3
+
+
+def test_floor_does_not_change_the_cap_for_a_long_video(tmp_path, video_dir, floor_rubric):
+    # video de 2 h (7200 s) : ceil(6 x 2) = 12 > min_moments_cap (3), donc le
+    # plafond reste 12, inchange par le plancher. 13 scores distincts, tous
+    # sous always_keep_score (70), pour isoler l'effet du seul plafond ;
+    # espaces de 30 s (au lieu de 40 s) pour tenir sur les 100 phrases de
+    # video_dir malgre les 13 candidats.
+    write_flat_signals(video_dir, 7200.0)
+    scores = [cap_score(9, t) for t in range(11)] + [cap_score(9, 9, emotion=1), cap_score(9, 10, payoff=1)]
+    candidates = [moment(sentence_start(6 * i), sentence_end(6 * i + 4), scores=s) for i, s in enumerate(scores)]
+    run(tmp_path, floor_rubric, [{"moments": candidates}])
+
+    data = read_moments(video_dir)
+    assert len(data["moments"]) == 12
+    assert len([r for r in data["rejected"] if "plafond" in r["reason"]]) == 1
 
 
 def test_exploration_can_pick_a_moment_rejected_for_the_plafond(tmp_path, video_dir, cap_rubric):
