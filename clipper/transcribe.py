@@ -633,7 +633,12 @@ def _fix_chunk(
         word = words[correction["i"]]
         old = correction["old"].strip()
         actual = word["word"].strip()
-        if _normalized_core(old) != _normalized_core(actual):
+        # Un mot sans coeur alphanumerique (ponctuation seule : "-", "...") a un coeur normalise
+        # vide ; la comparaison tolerante (faite pour Alstner == Alstner,) declarerait alors
+        # n'importe quel 'old' egal (les deux coeurs sont vides), la correction serait appliquee
+        # et son coeur insere apres l'ancienne ponctuation intacte ("--"/"...") au lieu de la
+        # remplacer (Mineur 3, revue r-transcription) : refusee d'office, ce n'est pas un mot.
+        if not _normalized_core(actual) or _normalized_core(old) != _normalized_core(actual):
             stats.record(applied=False)
             _log_ignored_correction(
                 log_path, index=correction["i"], old=old, actual=actual, attempted=correction["word"]

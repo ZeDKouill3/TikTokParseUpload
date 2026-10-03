@@ -464,6 +464,74 @@ def test_review_rejected_moment_is_never_rendered(tmp_path, isolated_cwd, source
     assert fake.calls == []
 
 
+# --------------------------------------------------------------------------
+# Important 2 (revue r-transcription) : une decision changee APRES un premier
+# rendu (captions deja 'done') doit refaire captions.json, pas seulement
+# parts.json/moments.json -- sinon le moment refuse est tout de meme rendu et
+# une borne ajustee est ignoree.
+# --------------------------------------------------------------------------
+
+
+def _review_run_then_first_render(tmp_path, source_video):
+    from clipper import pipeline
+
+    config = make_fast_config(tmp_path, mode="review")
+    opts = step_options(source_video)
+    with llm.use_backend(backend(("moments", fast_moments_response))):
+        state = pipeline.run(URL, config=config, step_options=opts)
+    assert state["status"] == "awaiting_review" and state["awaiting"] == [0]
+    pipeline.decide(VIDEO_ID, 0, "accepted", config=config)
+    with llm.use_backend(backend()):
+        state = pipeline.render(VIDEO_ID, config=config, step_options=opts)
+    assert state["status"] == "done" and len(state["clips"]) == 1
+    return config, opts, state
+
+
+@no_ffmpeg
+def test_rejecting_a_moment_after_a_first_render_is_not_rendered_again(tmp_path, isolated_cwd, source_video):
+    from clipper import pipeline
+
+    config, opts, _before = _review_run_then_first_render(tmp_path, source_video)
+    assert len(clip_files(tmp_path)[0]) == 1
+
+    # L'humain change d'avis apres le premier rendu, puis « Rendre » (web :
+    # action render sans force_steps, comme POST /api/videos/{id}/render).
+    pipeline.decide(VIDEO_ID, 0, "rejected", config=config)
+    with llm.use_backend(backend()):
+        after = pipeline.render(VIDEO_ID, config=config, step_options=opts)
+
+    ws = tmp_path / "workspace" / VIDEO_ID
+    parts = json.loads((ws / "parts.json").read_text(encoding="utf-8"))
+    captions = json.loads((ws / "captions.json").read_text(encoding="utf-8"))
+    assert [m["id"] for m in parts["moments"]] == []  # deja vrai avant le correctif
+    assert [c["id"] for c in captions["clips"]] == []  # captions.json suit desormais parts.json
+    assert after["clips"] == []
+    assert clip_files(tmp_path) == ([], [])
+
+
+@no_ffmpeg
+def test_adjusting_bounds_after_a_first_render_uses_the_new_bounds(tmp_path, isolated_cwd, source_video):
+    from clipper import pipeline
+
+    config, opts, _before = _review_run_then_first_render(tmp_path, source_video)
+    mp4s_before, jsons_before = clip_files(tmp_path)
+    clip_before = json.loads(jsons_before[0].read_text(encoding="utf-8"))
+    assert (clip_before["start"], clip_before["end"]) == (FAST_MOMENT["start"], FAST_MOMENT["end"])
+
+    pipeline.decide(VIDEO_ID, 0, "adjusted", start=4.0, end=6.0, config=config)
+    with llm.use_backend(backend()):
+        after = pipeline.render(VIDEO_ID, config=config, step_options=opts)
+
+    ws = tmp_path / "workspace" / VIDEO_ID
+    captions_clip = json.loads((ws / "captions.json").read_text(encoding="utf-8"))["clips"][0]
+    _, jsons_after = clip_files(tmp_path)
+    clip_after = json.loads(jsons_after[0].read_text(encoding="utf-8"))
+    assert (captions_clip["start"], captions_clip["end"]) == (4.0, 6.0)
+    assert clip_after["start"] == pytest.approx(4.0, abs=0.2)
+    assert clip_after["end"] == pytest.approx(6.0, abs=0.2)
+    assert after["status"] == "done" and len(after["clips"]) == 1
+
+
 @no_ffmpeg
 def test_zero_kept_moments_ends_done_with_an_explicit_reason(tmp_path, isolated_cwd, source_video, capsys):
     """TASK-b2c1 : moments ne retient aucun candidat (score < min_score) ->
@@ -1301,6 +1369,102 @@ def test_process_queue_stops_a_video_at_awaiting_review_instead_of_raising_and_s
     assert by_id["aaaaaaaaaaa"]["status"] == "awaiting_review"
     assert by_id["bbbbbbbbbbb"]["status"] == "done"
     assert calls.count("captions") == 1  # seule b atteint les etapes apres la revue
+
+
+# --------------------------------------------------------------------------
+# Mineur 1 (revue r-transcription) : une video en erreur inattendue (etat ou
+# journal illisible) ne doit jamais interrompre la reprise des suivantes.
+# --------------------------------------------------------------------------
+
+
+def test_queued_ignores_an_unreadable_pipeline_json(tmp_path, caplog):
+    """Un pipeline.json tronque faisait lever queued() a chaque appel : la reprise de TOUTES les
+    videos en file restait bloquee tant que le fichier n'etait pas repare a la main."""
+    from clipper import pipeline
+
+    config = Config(mode="auto", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output")
+    good = pipeline.new_state("bbbbbbbbbbb", URL, "auto")
+    good.update(status="queued", retry_at=datetime.now(timezone.utc).isoformat())
+    pipeline.save_state(good, config=config)
+    bad_dir = tmp_path / "workspace" / "aaaaaaaaaaa"
+    bad_dir.mkdir(parents=True)
+    (bad_dir / pipeline.STATE_FILE).write_text('{"not": "closed"', encoding="utf-8")
+
+    with caplog.at_level(logging.ERROR):
+        states = pipeline.queued(config=config)  # ne leve pas
+
+    assert [s["video_id"] for s in states] == ["bbbbbbbbbbb"]
+    assert "illisible" in caplog.text
+
+
+def test_process_queue_continues_past_a_video_that_raises_unexpectedly(tmp_path, monkeypatch, caplog):
+    """Toute autre erreur qu'une ChannelError/ConfigError (journal LLM tronque, pipeline.json
+    illisible malgre tout...) sortait de process_queue sans etre rattrapee, empechant les videos
+    suivantes de la file d'etre reprises (meme defaut que Important 3, plus general)."""
+    from clipper import pipeline
+
+    config = Config(mode="auto", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output")
+    past = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
+    for video_id in ("aaaaaaaaaaa", "bbbbbbbbbbb"):
+        state = pipeline.new_state(video_id, URL, "auto")
+        state.update(status="queued", retry_at=past)
+        pipeline.save_state(state, config=config)
+    _all_steps_stubbed(monkeypatch, [])
+    original_advance = pipeline._advance
+
+    def flaky(run, **kwargs):
+        if run.video_id == "aaaaaaaaaaa":
+            raise OSError("disque plein (llm_usage.jsonl)")
+        return original_advance(run, **kwargs)
+
+    monkeypatch.setattr(pipeline, "_advance", flaky)
+
+    with caplog.at_level(logging.ERROR):
+        results = pipeline.process_queue(config=config)  # ne leve pas
+
+    assert [r["video_id"] for r in results] == ["bbbbbbbbbbb"]
+    assert "aaaaaaaaaaa" in caplog.text
+
+
+def test_usage_summary_ignores_a_truncated_line(tmp_path, caplog):
+    """Une ligne tronquee de llm_usage.jsonl (ecriture coupee) faisait lever _usage_summary dans le
+    finally de _advance, apres l'ecriture de l'etat : l'exception traversait process_queue/tick."""
+    from clipper.pipeline import _usage_summary
+
+    path = tmp_path / "llm_usage.jsonl"
+    path.write_text(
+        '{"usage": "moments", "input_tokens": 10, "output_tokens": 5, "cache_read_tokens": 0, "cost_usd": 0.01}\n'
+        '{"usage": "captions", "input_tok\n',
+        encoding="utf-8",
+    )
+
+    with caplog.at_level(logging.ERROR):
+        totals = _usage_summary(path)  # ne leve pas
+
+    assert list(totals) == ["moments"]
+    assert "illisible" in caplog.text
+
+
+# --------------------------------------------------------------------------
+# Mineur 2 (revue r-transcription) : [pipeline] retry_delays = [] passait la
+# validation de config puis levait IndexError dans _fail (delays[-1] sur une
+# liste vide), laissant l'etape 'running' pour toujours sans raison.
+# --------------------------------------------------------------------------
+
+
+def test_fail_with_empty_retry_delays_fails_explicitly_instead_of_raising(tmp_path):
+    from clipper import pipeline
+
+    config = Config(mode="auto", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output",
+                    _sections={"pipeline": {"retry_delays": []}})
+    state = pipeline.new_state(VIDEO_ID, URL, "auto")
+    run = pipeline._start(state, config, False, None)
+
+    result = pipeline._fail(run, "download", llm.TransientLLMError("quota atteint"))  # ne leve pas
+
+    assert result["status"] == "failed"
+    assert result["steps"]["download"]["status"] == "failed"
+    assert "aucun re-essai" in result["reason"]
 
 
 # --------------------------------------------------------------------------
