@@ -607,7 +607,7 @@ def _dashboard_llm_cost(config: Config) -> dict[str, Any]:
     ``week`` = les 7 derniers jours locaux (aujourd'hui compris), ``by_usage`` =
     cout de la semaine par usage ; les appels sans cout rapporte sont comptes
     a part (``unreported_calls``), jamais pour 0."""
-    now = datetime.now().astimezone()
+    now = datetime.now(_PARIS)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     week_start = today_start - timedelta(days=_COST_WEEK_DAYS - 1)
     cost: dict[str, Any] = {"today": 0.0, "week": 0.0, "by_usage": {}, "unreported_calls": 0}
@@ -619,7 +619,7 @@ def _dashboard_llm_cost(config: Config) -> dict[str, Any]:
             try:
                 entry = json.loads(raw)
                 # clipper.llm date chaque appel de "timestamp" ; "recorded_at" est la forme du contrat
-                recorded = datetime.fromisoformat(entry.get("recorded_at") or entry["timestamp"]).astimezone()
+                recorded = datetime.fromisoformat(entry.get("recorded_at") or entry["timestamp"]).astimezone(_PARIS)
                 usage = entry["usage"]
             except (ValueError, KeyError, TypeError) as exc:
                 raise ValueError(f"{path.parent.name}/{path.name} ligne {number} : {exc}") from exc
@@ -2115,7 +2115,8 @@ def create_app(config: Config | None = None) -> FastAPI:
         _validate_video_id(video_id)
         _validate_channel_name(body.channel)
         try:
-            return _enrich(pipeline.set_channel(video_id, body.channel, config=config, presets_dir=_PRESETS_DIR), config)
+            return _enrich(pipeline.set_channel(video_id, body.channel, config=config, presets_dir=_PRESETS_DIR,
+                                                 state_dir=_publish_dir(config)), config)
         except pipeline.PipelineError as exc:
             raise HTTPException(status_code=404 if "aucun etat" in str(exc) else 409, detail=str(exc)) from exc
 
@@ -2325,7 +2326,9 @@ def create_app(config: Config | None = None) -> FastAPI:
     def _publish_action(video_id: str, clip_id: str, action: str, *args: Any, **kwargs: Any) -> dict[str, Any]:
         _validate_video_id(video_id)
         _validate_clip_id(clip_id)
-        channel = _require_channel(video_id, clip_id, config, or_no_channel=action == "retry")
+        # Toutes ces actions portent sur une entree DEJA DANS la file (y compris _sans_chaine) : le style n'est
+        # jamais exige ici (revue r-comptes 4), contrairement a la creation (create_post/approve).
+        channel = _require_channel(video_id, clip_id, config, or_no_channel=True)
         try:
             return getattr(publish_mod, action)(video_id, clip_id, channel, *args, state_dir=_publish_dir(config), **kwargs)
         except publish_mod.PublishError as exc:
@@ -2455,7 +2458,7 @@ def create_app(config: Config | None = None) -> FastAPI:
         entry = _publication_call(
             publish_mod.create_post, body.video_id, body.clip_id, channel, account=account, mode=body.mode,
             publish_at=publish_at, options=body.options, caption=body.description, hashtags=body.hashtags,
-            **_publication_scope(_account_service(config, account)))
+            schedule=_account_schedule(config, account), **_publication_scope(_account_service(config, account)))
         return _publication_view(channel or publish_mod.NO_CHANNEL, entry)
 
     @app.patch("/api/publications/{video_id}/{clip_id}")
@@ -2479,13 +2482,14 @@ def create_app(config: Config | None = None) -> FastAPI:
             account = current.get("account") if current else None
         try:
             service = _account_service(config, account) if account else "tiktok"
+            schedule = _account_schedule(config, account) if account else None
         except HTTPException:
             if "account" in changes:
                 raise
-            service = "tiktok"  # compte de l'entree disparu de l'ecran Comptes : sans effet sur la validation
+            service, schedule = "tiktok", None  # compte de l'entree disparu de l'ecran Comptes : sans effet sur la validation
         entry = _publication_call(
             publish_mod.update_post, video_id, clip_id, channel, caption=body.description, hashtags=body.hashtags,
-            **changes, **_publication_scope(service))
+            schedule=schedule, **changes, **_publication_scope(service))
         return _publication_view(channel or publish_mod.NO_CHANNEL, entry)
 
     @app.delete("/api/publications/{video_id}/{clip_id}", status_code=204)
@@ -2545,7 +2549,8 @@ def create_app(config: Config | None = None) -> FastAPI:
         return dict(
             mode=body.mode, style=body.style or None, account=account, service=service,
             interval_hours=body.interval_hours, start_at=_publish_parse_slot(body.start_at),
-            count=body.count, selection=selection, **_series_scope(service),
+            count=body.count, selection=selection, schedule=_account_schedule(config, account),
+            **_series_scope(service),
         )
 
     @app.post("/api/publications/series/preview")
@@ -2649,6 +2654,15 @@ def create_app(config: Config | None = None) -> FastAPI:
             raise HTTPException(
                 status_code=409,
                 detail=f"confirmation requise (confirm=true) : supprimer le style {name!r} efface son preset",
+            )
+        pending = [e for e in publish_mod.list_entries(name, state_dir=_publish_dir(config))
+                   if e["status"] in publish_mod.UNFINISHED_STATUSES]
+        if pending:
+            clips = ", ".join(f"{e['video_id']}/{e['clip_id']}" for e in pending)
+            raise HTTPException(
+                status_code=409,
+                detail=(f"le style {name!r} a {len(pending)} publication(s) non terminée(s) ({clips}) : "
+                        "annule-les ou attends leur fin avant de le supprimer"),
             )
         try:
             channel_mod.delete_channel(name, presets_dir=_PRESETS_DIR)

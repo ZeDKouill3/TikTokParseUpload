@@ -10,6 +10,9 @@ import json
 import logging
 import re
 import string
+import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -106,7 +109,8 @@ def test_accounts_section_is_a_valid_config_table():
 def test_write_is_atomic_and_leaves_no_temp_file(config, vault):
     accounts.add_account(config, NEW)
     accounts.add_account(config, {"label": "Autre"})
-    assert [p.name for p in Path("state").iterdir()] == ["accounts.json"]
+    # accounts.json.lock : le verrou inter-processus (ADR-35b7), jamais un fichier temporaire de l'ecriture.
+    assert {p.name for p in Path("state").iterdir()} == {"accounts.json", "accounts.json.lock"}
     assert len(accounts.list_accounts(config)) == 2
 
 
@@ -124,7 +128,7 @@ def test_write_failure_keeps_the_previous_file_and_cleans_up(config, vault, monk
     monkeypatch.setattr(accounts.os, "replace", real_replace)
 
     assert Path("state/accounts.json").read_bytes() == before
-    assert [p.name for p in Path("state").iterdir()] == ["accounts.json"]
+    assert {p.name for p in Path("state").iterdir()} == {"accounts.json", "accounts.json.lock"}
     assert vault.store == {}  # pas de secret orphelin dans le coffre
 
 
@@ -226,6 +230,49 @@ def test_corrupt_accounts_file_is_an_explicit_error(config, vault):
     Path("state/accounts.json").write_text("{pas du json", encoding="utf-8")
     with pytest.raises(accounts.AccountsError, match="illisible"):
         accounts.list_accounts(config)
+
+
+def test_accounts_read_write_cycle_is_locked_across_processes(config, vault):
+    """Revue r-comptes 3 : preuve a deux processus (comme research/reviews/scratch-comptes/accounts_race.py)
+    que le cycle lecture-ecriture d'accounts.py est protege par un verrou de FICHIER inter-processus, pas
+    seulement le threading.Lock de ce processus : un vrai second processus (le worker), lance exactement entre
+    la lecture et l'ecriture du web, n'efface pas l'arret R4 qu'il vient d'ecrire."""
+    account = accounts.add_account(config, {"label": "Compte"})
+    accounts.record_login(config, account["id"], CONNECTED)
+
+    root = Path(accounts.__file__).resolve().parents[1]
+    cwd = Path.cwd()
+    worker_code = (
+        "import sys\n"
+        f"sys.path.insert(0, {str(root)!r})\n"
+        "from clipper import accounts\n"
+        "from clipper.config import Config\n"
+        "from pathlib import Path\n"
+        "cfg = Config(mode='review', workspace_dir=Path('w'), output_dir=Path('o'))\n"
+        f"accounts.uncheck_ready(cfg, {account['id']!r}, 'arret de publication : captcha')\n"
+    )
+    real_write = accounts._write
+    spawned: list[subprocess.Popen] = []
+
+    def write_after_spawning_worker(cfg, accs):
+        # Le worker est lance alors que ce process tient encore le verrou (il est dans son cycle
+        # lecture-ecriture) : sans verrou de FICHIER, le worker ecrit avant nous et sa R4 est effacee par
+        # notre propre ecriture, batie sur une lecture plus ancienne que la sienne.
+        spawned.append(subprocess.Popen([sys.executable, "-c", worker_code], cwd=cwd))
+        time.sleep(0.3)
+        return real_write(cfg, accs)
+
+    accounts._write = write_after_spawning_worker
+    try:
+        accounts.update_account(config, account["id"], {"slots": [{"day": "mon", "time": "18:00"}]})
+    finally:
+        accounts._write = real_write
+
+    assert spawned[0].wait(timeout=10) == 0
+    stored = accounts.list_accounts(config)[0]
+    assert stored["slots"] == [{"day": "mon", "time": "18:00"}]  # l'ecriture du web n'est pas perdue
+    assert stored["r4_halt"] is not None                          # l'arret R4 du worker non plus
+    assert stored["ready_to_publish"] is False
 
 
 # --------------------------------------------------------------------------
@@ -578,6 +625,25 @@ def test_a_still_connected_check_keeps_ready_and_unchecking_is_not_repeated(conf
     accounts.record_login(config, account["id"], _login("expired"))
     second = accounts.record_login(config, account["id"], _login("expired"))
     assert second["auto_unchecked"] is False  # deja decoche : pas de nouveau decochage
+
+
+def test_record_login_does_not_write_the_file_for_a_checked_at_only_refresh(config, vault, monkeypatch):
+    """Revue r-comptes 3 : l'ouverture de l'ecran Comptes revverifie la connexion a chaque fois, mais rien ne
+    doit etre ecrit sur disque quand seul checked_at change (sinon course avec le worker a chaque ouverture)."""
+    account = accounts.add_account(config, {"label": "Compte"})
+    accounts.record_login(config, account["id"], CONNECTED)
+
+    calls = []
+    real_write = accounts._write
+    monkeypatch.setattr(accounts, "_write", lambda cfg, accs: (calls.append(1), real_write(cfg, accs))[-1])
+
+    again = accounts.record_login(config, account["id"], _login("connected", "2026-10-01T12:00:00+00:00"))
+    assert again["login"]["checked_at"] == "2026-10-01T12:00:00+00:00"  # rendu a l'appelant malgre tout
+    assert calls == []
+
+    changed = accounts.record_login(config, account["id"], _login("expired", "2026-10-01T13:00:00+00:00"))
+    assert changed["login"]["state"] == "expired"
+    assert calls == [1]  # l'etat a change : ecriture
 
 
 def test_an_r4_stop_unchecks_ready_until_the_user_says_the_problem_is_fixed(config, vault, caplog):

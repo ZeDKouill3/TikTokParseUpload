@@ -387,6 +387,28 @@ def test_migration_removes_an_account_key_without_slots_and_touches_no_account(i
     assert "slots" not in _account(isolated_cwd)
 
 
+def test_migration_reports_the_accounts_tiktok_account_onto_entries_without_one(isolated_cwd):
+    from clipper.channel import migrate_legacy_presets
+
+    config, _path = _legacy_env(isolated_cwd, preset='[channel]\ntiktok_account = "ab12cd"\n')
+    publish_dir = isolated_cwd / "state" / "publish"
+    publish_dir.mkdir(parents=True)
+    entries = [
+        {"video_id": "vid1", "clip_id": "01", "series_id": None, "part": None, "status": "scheduled",
+         "slot_at": "2026-01-01T18:00:00+00:00", "decided_at": None, "published_at": None, "error": None},
+        {"video_id": "vid1", "clip_id": "02", "series_id": None, "part": None, "status": "scheduled",
+         "slot_at": "2026-01-02T18:00:00+00:00", "decided_at": None, "published_at": None, "error": None,
+         "account": "compte2"},
+    ]
+    (publish_dir / "ma_chaine.json").write_text(json.dumps(entries), encoding="utf-8")
+
+    assert migrate_legacy_presets(config) == ["ma_chaine"]
+
+    stored = json.loads((publish_dir / "ma_chaine.json").read_text(encoding="utf-8"))
+    assert stored[0]["account"] == "ab12cd"    # sans compte : reporte avant de retirer tiktok_account
+    assert stored[1]["account"] == "compte2"   # avait deja un compte : jamais ecrase
+
+
 def test_migration_does_nothing_on_a_preset_without_legacy_keys(isolated_cwd):
     from clipper.channel import migrate_legacy_presets
 

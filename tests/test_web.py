@@ -1513,11 +1513,15 @@ def test_dashboard_llm_cost_sums_usage_journals_by_window_and_usage(tmp_path, is
     assert cost["by_usage"] == {"moments": pytest.approx(0.90), "vision": pytest.approx(0.10)}
 
 
-def test_dashboard_llm_cost_window_uses_the_local_timezone(tmp_path, isolated_cwd):
-    local_midnight = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+def test_dashboard_llm_cost_window_uses_the_paris_timezone(tmp_path, isolated_cwd):
+    """Revue r-comptes 10 : « aujourd'hui »/« 7 jours » suivent Europe/Paris (regle du projet), jamais
+    l'heure du PC — ici une machine en UK (GMT/BST, une heure derriere Paris en hiver comme en ete)."""
+    from zoneinfo import ZoneInfo
+
+    paris_midnight = datetime.now(ZoneInfo("Europe/Paris")).replace(hour=0, minute=0, second=0, microsecond=0)
     _write_usage(tmp_path, "aaaaaaaaaaa", [
-        _usage_line("moments", 1.0, local_midnight + timedelta(seconds=1)),
-        _usage_line("moments", 2.0, local_midnight - timedelta(seconds=1)),  # veille locale
+        _usage_line("moments", 1.0, paris_midnight + timedelta(seconds=1)),
+        _usage_line("moments", 2.0, paris_midnight - timedelta(seconds=1)),  # veille a Paris
     ])
 
     cost = _dashboard(tmp_path)["llm_cost"]
@@ -2418,6 +2422,34 @@ def test_delete_channel_requires_confirm(tmp_path, isolated_cwd):
     assert c.delete(f"/api/channels/{CH}?confirm=true").status_code == 404
 
 
+def test_delete_channel_refuses_when_unfinished_publications_exist(tmp_path, isolated_cwd):
+    """Revue r-comptes 7 : supprimer un style dont la file a des entrees non terminees -> 409 qui les liste
+    (jamais abandonnees en silence) ; une entree terminee (published/rejected) ne bloque pas."""
+    _channels_setup(tmp_path)
+    _write_publish(tmp_path, CH, [
+        _entry("01", "scheduled", slot_at="2026-10-05T18:30:00+02:00"),
+        _entry("02", "published", published_at="2026-10-01T10:00:00+00:00"),
+    ])
+    c = client(tmp_path)
+    path = tmp_path / "presets" / f"{CH}.toml"
+
+    refused = c.delete(f"/api/channels/{CH}?confirm=true")
+
+    assert refused.status_code == 409
+    detail = refused.json()["detail"]
+    assert "non terminée" in detail and f"{CLIPS_VIDEO}/01" in detail
+    assert f"{CLIPS_VIDEO}/02" not in detail  # publie : termine, ne bloque pas, pas liste
+    assert path.exists()
+
+    # une fois la seule entree non terminee refusee/annulee, la suppression passe
+    _write_publish(tmp_path, CH, [
+        _entry("01", "rejected"),
+        _entry("02", "published", published_at="2026-10-01T10:00:00+00:00"),
+    ])
+    ok = c.delete(f"/api/channels/{CH}?confirm=true")
+    assert ok.status_code == 200 and not path.exists()
+
+
 def test_a_style_has_no_slots_route_any_more(tmp_path, isolated_cwd):
     _channels_setup(tmp_path)
 
@@ -2775,12 +2807,20 @@ def test_publish_move_validates_input(tmp_path, isolated_cwd, monkeypatch):
     naive = c.post(f"/api/publish/{CLIPS_VIDEO}/01/move", json={"slot_at": "2026-10-08T12:00:00"})
     junk = c.post(f"/api/publish/{CLIPS_VIDEO}/01/move", json={"slot_at": "jeudi midi"})
     unsafe = c.post(f"/api/publish/{CLIPS_VIDEO}/..%2Fx/move", json={"slot_at": PUB_THU})
-    nochan = client(tmp_path).post("/api/publish/othervideo01/01/move", json={"slot_at": PUB_THU})
 
     assert naive.status_code == 422 and "fuseau" in naive.json()["detail"]
     assert junk.status_code == 422 and "slot_at" in junk.json()["detail"]
     assert unsafe.status_code in (400, 404)
-    assert nochan.status_code == 409 and "style" in nochan.json()["detail"]
+
+
+def test_publish_move_on_a_video_with_no_entry_anywhere_is_refused(tmp_path, isolated_cwd):
+    # "othervideo01" n'a ni style ni entree dans _sans_chaine, donc aucun compte a retrouver : plus refusee
+    # pour « pas de style » (revue r-comptes 4), mais pour son vrai motif (aucun compte, donc aucun creneau).
+    _publish_setup(tmp_path)
+
+    resp = client(tmp_path).post("/api/publish/othervideo01/01/move", json={"slot_at": PUB_THU})
+
+    assert resp.status_code == 409 and "aucun créneau" in resp.json()["detail"]
 
 
 def test_publish_move_end_to_end_on_a_temporary_state(tmp_path, isolated_cwd):
@@ -2916,6 +2956,36 @@ def test_a_post_created_through_the_form_on_a_second_account_appears_in_its_publ
         assert (PUB_NOCHAN_VIDEO, "01") in _ids(rows), account
     other = c.get("/api/publish", params={"account": READY, "week": monday}).json()
     assert (PUB_NOCHAN_VIDEO, "01") not in _ids([*other["done"], *other["off_slot"], *other["unscheduled"]])
+
+
+def test_publish_actions_work_on_a_video_without_a_style(tmp_path, isolated_cwd):
+    """Revue r-comptes 4 : move, unschedule, published, mode et compte marchent sur une publication d'une
+    video sans style (entree localisee dans _sans_chaine.json, son vrai fichier) : aucune de ces actions
+    n'exige de style, seule la creation en exige un (ou un compte, SPEC-1ed3 R3)."""
+    _publications_setup(tmp_path)
+    _write_state(tmp_path, PUB_NOCHAN_VIDEO)
+    for clip_id in ("01", "02", "03", "04", "05"):
+        _write_clip(tmp_path, PUB_NOCHAN_VIDEO, _clip_sidecar(clip_id, video_id=PUB_NOCHAN_VIDEO))
+    _write_publish(tmp_path, "_sans_chaine", [
+        _entry("01", "scheduled", video_id=PUB_NOCHAN_VIDEO, slot_at=PUB_MON, account=READY),
+        _entry("02", "scheduled", video_id=PUB_NOCHAN_VIDEO, slot_at=PUB_THU, account=READY),
+        _entry("03", "scheduled", video_id=PUB_NOCHAN_VIDEO, slot_at=PUB_NEXT_MON, account=READY),
+        _entry("04", "scheduled", video_id=PUB_NOCHAN_VIDEO, slot_at="2026-10-15T12:00:00+02:00", account=READY),
+        _entry("05", "scheduled", video_id=PUB_NOCHAN_VIDEO, slot_at="2026-10-19T18:30:00+02:00", account=READY),
+    ])
+    c = client(tmp_path)
+
+    moved = c.post(f"/api/publish/{PUB_NOCHAN_VIDEO}/01/move", json={"slot_at": "2026-10-01T12:00:00+02:00"})
+    unscheduled = c.post(f"/api/publish/{PUB_NOCHAN_VIDEO}/02/unschedule")
+    published = c.post(f"/api/publish/{PUB_NOCHAN_VIDEO}/03/published")
+    mode = c.post(f"/api/publish/{PUB_NOCHAN_VIDEO}/04/mode", json={"mode": "immediate"})
+    account = c.post(f"/api/publish/{PUB_NOCHAN_VIDEO}/05/account", json={"account": SPARE})
+
+    assert moved.status_code == 200, moved.text
+    assert unscheduled.status_code == 200 and unscheduled.json()["status"] == "approved", unscheduled.text
+    assert published.status_code == 200 and published.json()["status"] == "published", published.text
+    assert mode.status_code == 200 and mode.json()["publish_mode"] == "immediate", mode.text
+    assert account.status_code == 200 and account.json()["account"] == SPARE, account.text
 
 
 def test_get_publish_corrupt_file_of_a_styleless_video_is_a_500(tmp_path, isolated_cwd):

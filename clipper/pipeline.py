@@ -1115,10 +1115,15 @@ def restore_video(video_id: str, *, config: Config | None = None) -> dict[str, A
 
 def set_channel(
     video_id: str, channel: str, *, config: Config | None = None, presets_dir: str | Path = "presets",
+    state_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     """Attribue ``channel`` a une video qui n'en a pas (console, fiche video) : ecrit ``channel`` dans son
     pipeline.json et le journalise. Refuse une chaine sans preset, une video en cours de traitement (le worker
-    reecrit son etat) et une video qui a deja une chaine (ses publications sont rangees par chaine)."""
+    reecrit son etat), une video qui a deja une chaine (ses publications sont rangees par chaine) et une video
+    qui a encore des publications non terminees dans la file « sans chaine » (revue r-comptes 4 : elles
+    resteraient dans ``_sans_chaine.json`` alors que la console les chercherait sous le nouveau style)."""
+    from clipper import publish as publish_mod  # import tardif : publish n'est pas une etape du pipeline
+
     config = config or load_config()
     state = load_state(video_id, config=config)
     if channel not in channel_mod.list_channels(presets_dir):
@@ -1128,6 +1133,14 @@ def set_channel(
     current = state.get("channel")
     if current is not None:
         raise PipelineError(f"{video_id} a déjà la chaîne « {current} » : elle ne se change pas ici")
+    pending = [e for e in publish_mod.list_entries(publish_mod.NO_CHANNEL, state_dir=state_dir)
+               if e["video_id"] == video_id and e["status"] in publish_mod.UNFINISHED_STATUSES]
+    if pending:
+        clips = ", ".join(e["clip_id"] for e in pending)
+        raise PipelineError(
+            f"{video_id} a {len(pending)} publication(s) sans style en cours ({clips}) : "
+            "annule-les ou attends leur fin avant de lui attribuer une chaîne"
+        )
     state["channel"] = channel
     save_state(state, config=config)
     log.info("%s : chaîne « %s » attribuée depuis la console", video_id, channel)
