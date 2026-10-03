@@ -7635,6 +7635,75 @@ def test_series_clips_endpoint_marks_validated_clips_and_still_lists_unvalidated
     assert validated["02"] is False
 
 
+# ---------- TASK-fc561e4dc7e9 : max du champ « Nombre de vidéos » + coche « Parties ensemble » ----------
+
+
+def test_series_clips_endpoint_returns_available_posts_for_the_given_account(tmp_path, isolated_cwd):
+    config = _series_client(tmp_path)  # 6 clips approuves pour READY (_series_client : approved_account=READY)
+    c = TestClient(create_app(config=config))
+
+    with_account = c.get("/api/publications/series/clips", params={"account": READY})
+    without_account = c.get("/api/publications/series/clips")
+
+    assert with_account.status_code == 200
+    assert with_account.json()["available"] == 6
+    assert without_account.json()["available"] is None  # pas de compte : le max ne se calcule pas
+
+
+def test_series_clips_endpoint_available_is_zero_without_any_validated_clip(tmp_path, isolated_cwd):
+    config = _series_client(tmp_path, approved_account=None)  # tous prets, aucun valide
+    c = TestClient(create_app(config=config))
+
+    resp = c.get("/api/publications/series/clips", params={"account": READY})
+
+    assert resp.json()["available"] == 0
+
+
+def test_series_clips_endpoint_together_false_lists_each_part_separately(tmp_path, isolated_cwd):
+    config = _series_client(tmp_path)
+    _write_clip(tmp_path, CLIPS_VIDEO, _clip_sidecar("multi-p1", part=1, parts_total=2))
+    _write_clip(tmp_path, CLIPS_VIDEO, _clip_sidecar("multi-p2", part=2, parts_total=2))
+    c = TestClient(create_app(config=config))
+
+    grouped = c.get("/api/publications/series/clips").json()["units"]
+    apart = c.get("/api/publications/series/clips", params={"together": False}).json()["units"]
+
+    assert ["multi-p1", "multi-p2"] in [u["clip_ids"] for u in grouped]
+    assert ["multi-p1"] in [u["clip_ids"] for u in apart]
+    assert ["multi-p2"] in [u["clip_ids"] for u in apart]
+
+
+def test_series_preview_and_create_pass_parts_together_false_through_to_entries(tmp_path, isolated_cwd):
+    config = _series_client(tmp_path)
+    c = TestClient(create_app(config=config))
+    start = _soon(hours=1)
+    body = {"mode": "auto", "account": READY, "interval_hours": 1, "start_at": start, "count": 2,
+            "parts_together": False}
+
+    preview = c.post("/api/publications/series/preview", json=body)
+    assert preview.status_code == 200, preview.text
+    assert preview.json()["ok"] is True
+
+    created = c.post("/api/publications/series", json=body)
+    assert created.status_code == 201, created.text
+    entries = json.loads((tmp_path / "state" / "publish" / "ma_chaine.json").read_text(encoding="utf-8"))
+    scheduled = [e for e in entries if e["status"] == "scheduled"]
+    assert len(scheduled) == 2 and all(e["parts_together"] is False for e in scheduled)
+
+
+def test_series_create_default_tags_entries_parts_together_true(tmp_path, isolated_cwd):
+    config = _series_client(tmp_path)
+    c = TestClient(create_app(config=config))
+
+    resp = c.post("/api/publications/series", json={
+        "mode": "auto", "account": READY, "interval_hours": 1, "start_at": _soon(hours=1), "count": 1})
+
+    assert resp.status_code == 201, resp.text
+    entries = json.loads((tmp_path / "state" / "publish" / "ma_chaine.json").read_text(encoding="utf-8"))
+    scheduled = [e for e in entries if e["status"] == "scheduled"]
+    assert len(scheduled) == 1 and scheduled[0]["parts_together"] is True
+
+
 @pytest.mark.skipif(shutil.which("node") is None, reason="node absent du PATH")
 def test_every_static_javascript_file_parses_including_the_series_form():
     # couvert aussi par test_every_static_javascript_file_parses (toute l'arborescence) ; conserve ici pour
@@ -7674,6 +7743,37 @@ def test_series_manual_toggle_adds_or_removes_a_whole_unit_in_selection_order():
     assert out["withBoth"] == [["a-p1", "a-p2"], ["b"]]
     assert out["afterUncheckA"] == [["b"]]
     assert out["countBoth"] == 3
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node absent du PATH")
+def test_series_count_clamps_to_the_available_max():
+    out = _run_publish("""(() => ({
+      over: pubSeriesClampCount(10, 3),
+      ok: pubSeriesClampCount(2, 3),
+      zero: pubSeriesClampCount(5, 0),
+      unknown: pubSeriesClampCount(5, null),
+      belowOne: pubSeriesClampCount(0, 5),
+    }))()""")
+    assert out == {"over": 3, "ok": 2, "zero": 0, "unknown": 5, "belowOne": 1}
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node absent du PATH")
+def test_series_count_note_explains_the_max_or_the_disabled_field():
+    out = _run_publish("""(() => ({
+      disabled: pubSeriesCountNote(3, 0),
+      clamped: pubSeriesCountNote(3, 3),
+      normal: pubSeriesCountNote(2, 5),
+      unknownMax: pubSeriesCountNote(2, null),
+    }))()""")
+    assert "valide d'abord des clips" in out["disabled"]
+    assert "Maximum disponible" in out["clamped"]
+    assert "seront choisies" in out["normal"] and "seront choisies" in out["unknownMax"]
+
+
+def test_series_form_has_a_parts_together_checkbox_on_by_default():
+    js = (STATIC / "screens" / "publish.js").read_text(encoding="utf-8")
+    assert 'id="pubs-together"' in js and "Parties ensemble" in js
+    assert "parts_together" in js
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node absent du PATH")

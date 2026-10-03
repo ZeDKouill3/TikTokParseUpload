@@ -2334,3 +2334,33 @@ def test_part_two_goes_when_part_one_is_scheduled_on_the_service_before_it(tmp_p
     _pub_worker(config, pub).tick()
 
     assert [(c["mode"], c["schedule_at"]) for c in pub.calls] == [("scheduled", when)]
+
+
+# ---------- TASK-fc561e4dc7e9 : parts_together=False leve l'attente « partie N-1 non publiée » ----------
+
+
+def test_part_two_with_parts_together_false_does_not_wait_for_part_one(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    _series_part(tmp_path, "c01-p1", 1, _ago(hours=2), status="failed", error="mp4 introuvable")
+    _series_part(tmp_path, "c01-p2", 2, _ago(minutes=1), parts_together=False)
+    pub = FakePublisher()
+
+    _pub_worker(config, pub).tick()
+
+    assert len(pub.calls) == 1
+    entry = next(e for e in _entries(tmp_path) if e["clip_id"] == "c01-p2")
+    assert entry["status"] == "published"
+
+
+def test_part_two_with_parts_together_true_still_waits_for_part_one(tmp_path, monkeypatch):
+    """ON explicite (pas seulement le champ absent) : l'attente reste."""
+    config = _pub_env(tmp_path, monkeypatch)
+    _series_part(tmp_path, "c01-p1", 1, _ago(hours=2), status="failed", error="mp4 introuvable")
+    _series_part(tmp_path, "c01-p2", 2, _ago(minutes=1), parts_together=True)
+    pub = FakePublisher()
+
+    _pub_worker(config, pub).tick()
+
+    assert pub.calls == []
+    entry = next(e for e in _entries(tmp_path) if e["clip_id"] == "c01-p2")
+    assert "partie 1 non publiée" in entry["waiting_reason"]

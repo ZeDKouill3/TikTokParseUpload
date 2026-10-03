@@ -645,9 +645,13 @@ class Worker:
                                state_dir: str | Path) -> str | None:
         """Une serie part entiere et dans l'ordre : la partie N>1 attend que la partie N-1 soit publiee, ou
         programmee sur le service a une date qui ne passe pas apres ``target`` (date visee de la partie N).
-        Rend la raison de l'attente, None si la partie peut partir."""
+        Rend la raison de l'attente, None si la partie peut partir. ``parts_together`` explicitement False
+        (coche « Parties ensemble » decochee, TASK-fc561e4dc7e9) leve cette attente : la partie est
+        independante de ses soeurs."""
         series_id, part = entry.get("series_id"), entry.get("part")
         if not series_id or not isinstance(part, int) or part <= 1:
+            return None
+        if entry.get("parts_together") is False:
             return None
         previous = next((e for e in publish_mod.list_entries(channel, state_dir=state_dir)
                          if e["video_id"] == entry["video_id"] and e.get("series_id") == series_id
