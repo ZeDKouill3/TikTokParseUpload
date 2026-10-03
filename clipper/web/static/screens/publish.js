@@ -563,6 +563,7 @@ function pubSeriesPoolCards(f, d) {
     return `<button type="button" class="pubf-clip${on ? " on" : ""}" role="option" aria-selected="${on}" data-pubs-pick="${esc(key)}">
       <span class="mini-clip">${u.thumbnail_url ? `<img loading="lazy" decoding="async" width="36" height="64" src="${esc(u.thumbnail_url)}" alt="">` : ""}</span>
       <span class="pubf-clip-main"><b>${esc(pubSeriesUnitLabel(u))}</b><span class="muted">${esc(u.video_id)} · ${u.channel ? esc(u.channel) : "sans style"}</span></span>
+      ${u.validated ? `<span class="chip ok">Validé</span>` : ""}
       <span class="num" title="Score">${u.score != null ? esc(fr(u.score)) : ""}</span></button>`;
   }).join("") : `<p class="muted" style="padding:8px">Aucun clip disponible pour ce style.</p>`;
   $$("[data-pubs-pick]", box).forEach((b) => (b.onclick = () => {
@@ -629,7 +630,7 @@ function pubSeriesFormHtml(f) {
           <div class="pubf-clips" id="pubs-pool" role="listbox" aria-label="Clips disponibles"></div></div>
         <div class="field"><span class="field-label">Sélection (<span id="pubs-sel-count">${count}</span> vidéo(s), ordre de publication)</span>
           <div class="panel" id="pubs-selected"></div></div>`
-        : `<p class="muted" style="font-size:13px" data-pubs-count-note>${count} vidéo${count > 1 ? "s" : ""} seront choisies automatiquement, par score décroissant.</p>`}
+        : `<p class="muted" style="font-size:13px" data-pubs-count-note>${count} vidéo${count > 1 ? "s" : ""} validée${count > 1 ? "s" : ""} seront choisies, par score décroissant.</p>`}
       <p class="hint">${PUBS_WHEN_HINT}</p>
       <p class="reason bad" id="pubs-error" hidden role="alert"></p>
       <div id="pubs-preview"></div>
@@ -729,7 +730,7 @@ function pubSeriesWire(f, d) {
     if (countEl && note) {
       const n = Number(countEl.value) || 0;
       f.count = n;
-      note.textContent = `${n} vidéo${n > 1 ? "s" : ""} seront choisies automatiquement, par score décroissant.`;
+      note.textContent = `${n} vidéo${n > 1 ? "s" : ""} validée${n > 1 ? "s" : ""} seront choisies, par score décroissant.`;
     }
     clearTimeout(timer);
     if (f.mode === "auto" || f.selected.length) timer = setTimeout(() => pubSeriesPreview(f, d), 500);

@@ -583,6 +583,7 @@ def test_sibling_clip_ids_raises_publish_error_on_corrupt_json(isolated_cwd):
 # --------------------------------------------------------------------------
 
 _ACCOUNT = "ab12cd"
+_OTHER_ACCOUNT = "ef34ab"  # TASK-16eeaccfaf09 : compte autre que _ACCOUNT, pour les clips valides ailleurs
 _TWO_SLOTS = '[channel]\ntimezone = "UTC"\n'
 _TWO_SCHED = _sched(("mon", "09:00"), ("mon", "18:00"))
 _MON = datetime(2026, 9, 28, 6, 0, tzinfo=timezone.utc)
@@ -1386,7 +1387,7 @@ def test_plan_series_dates_refuses_invalid_interval_count_or_naive_start(isolate
 # ---------- available_series_clips ----------
 
 
-def test_available_series_clips_excludes_not_ready_queued_or_published(isolated_cwd):
+def test_available_series_clips_excludes_not_ready_or_already_queued(isolated_cwd):
     from clipper import publish
 
     _series_env(isolated_cwd)
@@ -1394,11 +1395,62 @@ def test_available_series_clips_excludes_not_ready_queued_or_published(isolated_
     _write_sidecar(isolated_cwd, "vid1", "a", score=90)
     _write_sidecar(isolated_cwd, "vid1", "b", score=80, ready=False)  # pas pret
     _write_sidecar(isolated_cwd, "vid1", "c", score=70)
-    publish.approve("vid1", "c", "ma_chaine", now=SERIES_NOW, account=_ACCOUNT)  # deja en file
+    publish.create_post("vid1", "c", "ma_chaine", account=_ACCOUNT, mode="immediate", now=SERIES_NOW)  # deja en file
 
     units = publish.available_series_clips("ma_chaine")
 
     assert [u["clip_ids"] for u in units] == [["a"]]
+    assert units[0]["validated"] is False
+
+
+def test_available_series_clips_includes_validated_clips_marked_validated(isolated_cwd):
+    """TASK-16eeaccfaf09 : un clip approuve (statut 'approved', sans creneau) apparait dans le pool,
+    marque ``validated``, a cote des clips prets jamais entres en file (mode manuel : les deux sont
+    proposes)."""
+    from clipper import publish
+
+    _series_env(isolated_cwd)
+    _write_video_channel(isolated_cwd, "vid1", "ma_chaine")
+    _write_sidecar(isolated_cwd, "vid1", "a", score=90)  # pret, pas encore valide
+    _write_sidecar(isolated_cwd, "vid1", "c", score=70)
+    publish.approve("vid1", "c", "ma_chaine", now=SERIES_NOW, account=_ACCOUNT)  # valide, sans creneau
+
+    units = {tuple(u["clip_ids"]): u for u in publish.available_series_clips("ma_chaine")}
+
+    assert units[("a",)]["validated"] is False
+    assert units[("c",)]["validated"] is True
+    assert units[("c",)]["score"] == 70
+
+
+def test_available_series_clips_excludes_a_validated_clip_once_it_has_a_slot(isolated_cwd):
+    """Une entree 'approved' qui recoit un creneau devient 'scheduled' : plus 'validee sans creneau' (TASK-16eeaccfaf09)."""
+    from clipper import publish
+
+    _series_env(isolated_cwd)
+    _write_video_channel(isolated_cwd, "vid1", "ma_chaine")
+    _write_sidecar(isolated_cwd, "vid1", "a", score=90)
+    publish.approve("vid1", "a", "ma_chaine", now=SERIES_NOW, account=_ACCOUNT, schedule=_sched(("mon", "09:00")))
+
+    assert publish.available_series_clips("ma_chaine") == []
+
+
+def test_available_series_clips_excludes_a_validated_clip_in_progress(isolated_cwd):
+    """Cas defensif (inatteignable via approve/create_post) : une entree 'approved' sans creneau mais 'en
+    cours' n'est pas non plus prise (TASK-16eeaccfaf09, clause 'pas en cours')."""
+    from clipper import publish
+
+    _series_env(isolated_cwd)
+    _write_video_channel(isolated_cwd, "vid1", "ma_chaine")
+    _write_sidecar(isolated_cwd, "vid1", "b", score=80)
+    state = _state_file(isolated_cwd, "ma_chaine")
+    state.parent.mkdir(parents=True, exist_ok=True)
+    state.write_text(json.dumps([{
+        "video_id": "vid1", "clip_id": "b", "series_id": None, "part": None, "status": "approved",
+        "slot_at": None, "decided_at": SERIES_NOW.isoformat(), "published_at": None, "error": None,
+        "account": _ACCOUNT, "in_progress_since": SERIES_NOW.isoformat(),
+    }]), encoding="utf-8")
+
+    assert publish.available_series_clips("ma_chaine") == []
 
 
 def test_available_series_clips_groups_the_parts_of_a_clip_together_in_order(isolated_cwd):
@@ -1462,12 +1514,22 @@ def _auto_preview(cwd, **kwargs):
     return publish.preview_series(**kwargs)
 
 
+def _approve_all(cwd, video_id, clip_ids, channel="ma_chaine", account=_ACCOUNT):
+    """Approuve chaque clip (dans l'ordre : requis pour les parties > 1 d'une serie), compte ``account``,
+    sans creneau (TASK-16eeaccfaf09 : le mode auto ne prend que des clips valides)."""
+    from clipper import publish
+
+    for clip_id in clip_ids:
+        publish.approve(video_id, clip_id, channel, now=SERIES_NOW, account=account)
+
+
 def test_preview_series_auto_picks_the_n_best_clips_by_score(isolated_cwd):
     _series_env(isolated_cwd)
     _write_video_channel(isolated_cwd, "vid1", "ma_chaine")
     _write_sidecar(isolated_cwd, "vid1", "a", score=90)
     _write_sidecar(isolated_cwd, "vid1", "b", score=70)
     _write_sidecar(isolated_cwd, "vid1", "c", score=50)
+    _approve_all(isolated_cwd, "vid1", ["a", "b", "c"])
 
     preview = _auto_preview(isolated_cwd, count=2)
 
@@ -1475,11 +1537,53 @@ def test_preview_series_auto_picks_the_n_best_clips_by_score(isolated_cwd):
     assert preview["ok"] is True and preview["available"] == 2 and preview["insufficient"] is False
 
 
+def test_preview_series_auto_never_takes_a_ready_but_unvalidated_clip(isolated_cwd):
+    """Clause TASK-16eeaccfaf09 : un clip pret mais non valide n'est jamais pris en auto, meme s'il a le
+    meilleur score ; le message est clair."""
+    _series_env(isolated_cwd)
+    _write_video_channel(isolated_cwd, "vid1", "ma_chaine")
+    _write_sidecar(isolated_cwd, "vid1", "a", score=99)  # jamais approuve
+    _write_sidecar(isolated_cwd, "vid1", "b", score=50)
+    _approve_all(isolated_cwd, "vid1", ["b"])
+
+    preview = _auto_preview(isolated_cwd, count=2)
+
+    assert [it["clip_id"] for it in preview["items"]] == ["b"]
+    assert preview["available"] == 1 and preview["insufficient"] is True
+    assert "1" in preview["insufficient_reason"] and "2" in preview["insufficient_reason"]
+
+
+def test_preview_series_auto_reports_a_clear_message_when_nothing_is_validated(isolated_cwd):
+    """Clause TASK-16eeaccfaf09 : « valide d'abord des clips dans l'écran Clips » quand aucun clip n'est valide."""
+    _series_env(isolated_cwd)
+    _write_video_channel(isolated_cwd, "vid1", "ma_chaine")
+    _write_sidecar(isolated_cwd, "vid1", "a", score=90)  # pret, jamais approuve
+
+    preview = _auto_preview(isolated_cwd, count=1)
+
+    assert preview["items"] == [] and preview["available"] == 0 and preview["insufficient"] is True
+    assert "valide d'abord des clips dans l'écran Clips" in preview["insufficient_reason"]
+
+
+def test_preview_series_auto_never_takes_a_clip_validated_for_another_account(isolated_cwd):
+    """Clause TASK-16eeaccfaf09 : un clip valide pour un autre compte n'est jamais pris en auto."""
+    _series_env(isolated_cwd)
+    _write_video_channel(isolated_cwd, "vid1", "ma_chaine")
+    _write_sidecar(isolated_cwd, "vid1", "a", score=90)
+    _approve_all(isolated_cwd, "vid1", ["a"], account=_OTHER_ACCOUNT)  # valide, mais pour un autre compte
+
+    preview = _auto_preview(isolated_cwd, count=1)  # _auto_preview : account=_ACCOUNT par defaut
+
+    assert preview["items"] == [] and preview["available"] == 0
+    assert "valide d'abord des clips dans l'écran Clips" in preview["insufficient_reason"]
+
+
 def test_preview_series_auto_dates_are_start_plus_k_times_interval_per_post(isolated_cwd):
     _series_env(isolated_cwd)
     _write_video_channel(isolated_cwd, "vid1", "ma_chaine")
     _write_sidecar(isolated_cwd, "vid1", "a", score=90)
     _write_sidecar(isolated_cwd, "vid1", "b", score=70)
+    _approve_all(isolated_cwd, "vid1", ["a", "b"])
     start = SERIES_NOW + timedelta(hours=1)
 
     preview = _auto_preview(isolated_cwd, count=2, start_at=start, interval_hours=3)
@@ -1495,6 +1599,7 @@ def test_preview_series_auto_counts_posts_not_clips_a_multipart_clip_takes_sever
     _write_sidecar(isolated_cwd, "vid1", "x-p2", score=95, part=2, parts_total=2)
     _write_sidecar(isolated_cwd, "vid1", "y", score=90)
     _write_sidecar(isolated_cwd, "vid1", "z", score=80)
+    _approve_all(isolated_cwd, "vid1", ["x-p1", "x-p2", "y", "z"])
 
     preview = _auto_preview(isolated_cwd, count=3)
 
@@ -1509,6 +1614,7 @@ def test_preview_series_auto_skips_a_series_that_does_not_fit_and_takes_the_next
     _write_sidecar(isolated_cwd, "vid1", "a-p3", score=95, part=3, parts_total=3)
     _write_sidecar(isolated_cwd, "vid1", "b", score=90)
     _write_sidecar(isolated_cwd, "vid1", "c", score=85)
+    _approve_all(isolated_cwd, "vid1", ["a-p1", "a-p2", "a-p3", "b", "c"])
 
     preview = _auto_preview(isolated_cwd, count=2)
 
@@ -1522,6 +1628,7 @@ def test_preview_series_auto_reports_when_not_enough_clips_are_available(isolate
     _write_video_channel(isolated_cwd, "vid1", "ma_chaine")
     _write_sidecar(isolated_cwd, "vid1", "a", score=90)
     _write_sidecar(isolated_cwd, "vid1", "b", score=80)
+    _approve_all(isolated_cwd, "vid1", ["a", "b"])
 
     preview = _auto_preview(isolated_cwd, count=5)
 
@@ -1536,6 +1643,8 @@ def test_preview_series_auto_filters_by_style(isolated_cwd):
     _write_video_channel(isolated_cwd, "vid2", "style_b")
     _write_sidecar(isolated_cwd, "vid1", "a", score=90)
     _write_sidecar(isolated_cwd, "vid2", "b", score=99)
+    _approve_all(isolated_cwd, "vid1", ["a"], channel="style_a")
+    _approve_all(isolated_cwd, "vid2", ["b"], channel="style_b")
 
     preview = _auto_preview(isolated_cwd, count=5, style="style_a")
 
@@ -1547,6 +1656,7 @@ def test_preview_series_refuses_a_date_under_the_minimum_advance(isolated_cwd):
     _series_env(isolated_cwd)
     _write_video_channel(isolated_cwd, "vid1", "ma_chaine")
     _write_sidecar(isolated_cwd, "vid1", "a", score=90)
+    _approve_all(isolated_cwd, "vid1", ["a"])
 
     preview = _auto_preview(isolated_cwd, count=1, start_at=SERIES_NOW + timedelta(minutes=5))
 
@@ -1559,6 +1669,7 @@ def test_preview_series_refuses_a_date_beyond_the_scheduling_window(isolated_cwd
     _write_video_channel(isolated_cwd, "vid1", "ma_chaine")
     _write_sidecar(isolated_cwd, "vid1", "a", score=90)
     _write_sidecar(isolated_cwd, "vid1", "b", score=80)
+    _approve_all(isolated_cwd, "vid1", ["a", "b"])
 
     preview = _auto_preview(isolated_cwd, count=2, interval_hours=24 * 10)  # 2e post a plus de 10 j : hors fenetre
 
@@ -1572,6 +1683,7 @@ def test_preview_series_refuses_a_series_that_violates_the_account_caps(isolated
     _write_video_channel(isolated_cwd, "vid1", "ma_chaine")
     _write_sidecar(isolated_cwd, "vid1", "a", score=90)
     _write_sidecar(isolated_cwd, "vid1", "b", score=80)
+    _approve_all(isolated_cwd, "vid1", ["a", "b"])
 
     preview = _auto_preview(isolated_cwd, count=2, interval_hours=1, settings=_series_settings(max_posts_per_day=1))
 
@@ -1624,10 +1736,36 @@ def test_preview_series_manual_refuses_an_unavailable_selection(isolated_cwd):
     _series_env(isolated_cwd)
     _write_video_channel(isolated_cwd, "vid1", "ma_chaine")
     _write_sidecar(isolated_cwd, "vid1", "a", score=50)
-    publish.approve("vid1", "a", "ma_chaine", now=SERIES_NOW, account=_ACCOUNT)
+    publish.create_post("vid1", "a", "ma_chaine", account=_ACCOUNT, mode="immediate", now=SERIES_NOW)  # deja en file
 
     with pytest.raises(publish.PublishError, match="vid1/a"):
         _auto_preview(isolated_cwd, mode="manual", selection=[("vid1", "a")])
+
+
+def test_preview_series_manual_can_select_a_validated_clip(isolated_cwd):
+    """Clause TASK-16eeaccfaf09 : le mode manuel propose aussi les clips deja valides, marque « validé »."""
+    _series_env(isolated_cwd)
+    _write_video_channel(isolated_cwd, "vid1", "ma_chaine")
+    _write_sidecar(isolated_cwd, "vid1", "a", score=50)
+    _approve_all(isolated_cwd, "vid1", ["a"])
+
+    preview = _auto_preview(isolated_cwd, mode="manual", selection=[("vid1", "a")])
+
+    assert [it["clip_id"] for it in preview["items"]] == ["a"]
+    assert preview["ok"] is True
+
+
+def test_preview_series_manual_can_select_a_clip_validated_for_another_account(isolated_cwd):
+    """Contrairement au mode auto, le mode manuel n'a pas de restriction de compte sur les clips valides."""
+    _series_env(isolated_cwd)
+    _write_video_channel(isolated_cwd, "vid1", "ma_chaine")
+    _write_sidecar(isolated_cwd, "vid1", "a", score=50)
+    _approve_all(isolated_cwd, "vid1", ["a"], account=_OTHER_ACCOUNT)
+
+    preview = _auto_preview(isolated_cwd, mode="manual", selection=[("vid1", "a")])  # compte de la serie = _ACCOUNT
+
+    assert [it["clip_id"] for it in preview["items"]] == ["a"]
+    assert preview["ok"] is True
 
 
 # ---------- create_series ----------
@@ -1640,6 +1778,7 @@ def test_create_series_creates_the_scheduled_entries_at_the_computed_dates(isola
     _write_video_channel(isolated_cwd, "vid1", "ma_chaine")
     _write_sidecar(isolated_cwd, "vid1", "a", score=90)
     _write_sidecar(isolated_cwd, "vid1", "b", score=80)
+    _approve_all(isolated_cwd, "vid1", ["a", "b"])
     start = SERIES_NOW + timedelta(hours=1)
 
     created = publish.create_series(
@@ -1658,6 +1797,7 @@ def test_create_series_is_all_or_nothing_when_a_date_is_refused(isolated_cwd):
     _write_video_channel(isolated_cwd, "vid1", "ma_chaine")
     _write_sidecar(isolated_cwd, "vid1", "a", score=90)
     _write_sidecar(isolated_cwd, "vid1", "b", score=80)
+    _approve_all(isolated_cwd, "vid1", ["a", "b"])
 
     with pytest.raises(publish.PublishError):
         publish.create_series(
@@ -1665,7 +1805,9 @@ def test_create_series_is_all_or_nothing_when_a_date_is_refused(isolated_cwd):
             start_at=SERIES_NOW + timedelta(hours=1), count=2, now=SERIES_NOW,
             settings=_series_settings(max_posts_per_day=1))
 
-    assert _read_state(isolated_cwd, "ma_chaine") == []  # aucune publication creee
+    # tout ou rien : les deux restent 'approved' (deja valides avant l'appel), rien n'est passe en 'scheduled'
+    assert {e["clip_id"]: e["status"] for e in _read_state(isolated_cwd, "ma_chaine")} == {
+        "a": "approved", "b": "approved"}
 
 
 def test_create_series_manual_respects_the_chosen_order(isolated_cwd):
@@ -2007,6 +2149,7 @@ def test_preview_series_refuses_every_item_when_the_default_visibility_would_be_
     _write_video_channel(isolated_cwd, "vid1", "ma_chaine")
     _write_sidecar(isolated_cwd, "vid1", "a", score=90)
     _write_sidecar(isolated_cwd, "vid1", "b", score=80)
+    _approve_all(isolated_cwd, "vid1", ["a", "b"])
 
     preview = _auto_preview(isolated_cwd, count=2, settings=_series_settings(visibility="private"))
 
@@ -2026,6 +2169,7 @@ def test_create_series_lists_and_logs_the_entries_the_worker_already_took_and_co
     _write_video_channel(isolated_cwd, "vid1", "ma_chaine")
     _write_sidecar(isolated_cwd, "vid1", "a", score=90)
     _write_sidecar(isolated_cwd, "vid1", "b", score=80)
+    _approve_all(isolated_cwd, "vid1", ["a", "b"])
     start = SERIES_NOW + timedelta(hours=1)
 
     real_create_post = publish.create_post

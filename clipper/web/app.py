@@ -2573,8 +2573,10 @@ def create_app(config: Config | None = None) -> FastAPI:
 
     @app.get("/api/publications/series/clips")
     def series_clips(style: str | None = None) -> dict[str, Any]:
-        """Clips disponibles pour une serie (memes exclusions que le choix automatique) : une unite par
-        serie (parties regroupees et triees), pour le mode manuel du formulaire."""
+        """Clips disponibles pour le mode manuel du formulaire : une unite par serie (parties regroupees et
+        triees), les clips deja valides (approuves, sans creneau) ET les clips prets jamais entres en file
+        (``validated`` les distingue) ; aucune restriction de compte ici (TASK-16eeaccfaf09 : la restriction de
+        compte ne vaut que pour le choix automatique, voir ``preview_series_endpoint``)."""
         units = publish_mod.available_series_clips(
             style or None, workspace_dir=Path(config.workspace_dir), output_dir=Path(config.output_dir),
             state_dir=_publish_dir(config))
@@ -2586,6 +2588,7 @@ def create_app(config: Config | None = None) -> FastAPI:
                 "channel": unit["channel"], "score": unit["score"], "parts_total": len(unit["clip_ids"]),
                 "screen_title": lead.get("screen_title"), "title": lead.get("title"),
                 "thumbnail_url": f"/media/clip/{unit['video_id']}/{unit['clip_ids'][0]}/thumbnail",
+                "validated": unit["validated"],
             })
         return {"units": out, "default_interval_h": config.section("publish")["series_default_interval_h"]}
 

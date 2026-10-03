@@ -1360,7 +1360,8 @@ def _eligible_units(
     output_dir: str | Path, video_id: str, channel: str | None, entries: dict[tuple[str, str], dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """Unites (une serie entiere) de ce ``video_id`` pretes a publier (``ready``) et absentes de
-    ``entries`` (jamais publiees, en file ni programmees) ; une partie indisponible exclut toute la serie."""
+    ``entries`` (jamais publiees, en file ni programmees) ; une partie indisponible exclut toute la serie.
+    Jamais validees (``validated`` : False) : un clip pret n'est pas encore approuve (TASK-16eeaccfaf09)."""
     out_dir = Path(output_dir) / video_id
     seen: set[str] = set()
     units: list[dict[str, Any]] = []
@@ -1376,17 +1377,60 @@ def _eligible_units(
             continue
         if any((video_id, m) in entries for m in members):
             continue
-        units.append({"video_id": video_id, "channel": channel, "clip_ids": members, "score": sidecar.get("score")})
+        units.append({
+            "video_id": video_id, "channel": channel, "clip_ids": members, "score": sidecar.get("score"),
+            "validated": False,
+        })
+    return units
+
+
+def _entry_matches_account(entry: dict[str, Any], account: str | None) -> bool:
+    return account is None or entry.get("account") in (None, account)
+
+
+def _validated_units(
+    output_dir: str | Path, video_id: str, channel: str | None, entries: dict[tuple[str, str], dict[str, Any]],
+    account: str | None,
+) -> list[dict[str, Any]]:
+    """Unites (une serie entiere) de ce ``video_id`` DEJA validees : toutes leurs parties ont une entree de
+    publication 'approved', sans creneau (``slot_at`` None) et pas en cours (TASK-16eeaccfaf09). Si ``account``
+    est donne, chaque entree doit avoir ce compte ou aucun ; jamais un clip valide pour un autre compte. Une
+    partie non validee exclut toute la serie, comme pour ``_eligible_units``."""
+    out_dir = Path(output_dir) / video_id
+    seen: set[str] = set()
+    units: list[dict[str, Any]] = []
+    for path in sorted(out_dir.glob("*.json")):
+        clip_id = path.stem
+        if clip_id in seen:
+            continue
+        sidecar = _read_sidecar(output_dir, video_id, clip_id)
+        members = _unit_members(output_dir, video_id, clip_id, sidecar)
+        seen.update(members)
+        member_entries = [entries.get((video_id, m)) for m in members]
+        if any(
+            e is None or e["status"] != "approved" or e.get("slot_at") is not None or e.get("in_progress_since")
+            for e in member_entries
+        ):
+            continue
+        if any(not _entry_matches_account(e, account) for e in member_entries):
+            continue
+        units.append({
+            "video_id": video_id, "channel": channel, "clip_ids": members, "score": sidecar.get("score"),
+            "validated": True,
+        })
     return units
 
 
 def available_series_clips(
-    style: str | None, *, workspace_dir: str | Path = "workspace", output_dir: str | Path = "output",
-    state_dir: str | Path | None = None,
+    style: str | None, *, account: str | None = None, workspace_dir: str | Path = "workspace",
+    output_dir: str | Path = "output", state_dir: str | Path | None = None,
 ) -> list[dict[str, Any]]:
-    """Unites de clips (chacune une serie entiere, parties triees) pretes a publier et absentes de toute
-    file de publication, optionnellement filtrees par ``style`` (``None`` = tous les styles, y compris les
-    videos sans style). L'ordre rendu n'est PAS trie par score (voir ``preview_series``)."""
+    """Unites de clips (chacune une serie entiere, parties triees), optionnellement filtrees par ``style``
+    (``None`` = tous les styles, y compris les videos sans style). Chaque unite porte ``validated`` : False pour
+    un clip pret jamais entre en file (comme avant), True pour un clip deja approuve sans creneau
+    (TASK-16eeaccfaf09 : mode manuel = les deux). Avec ``account`` donne, une unite validee pour un AUTRE compte
+    est exclue (les unites non validees n'ont pas encore de compte, jamais filtrees). L'ordre rendu n'est PAS
+    trie par score (voir ``preview_series``)."""
     workspace_root = Path(workspace_dir)
     if not workspace_root.is_dir():
         return []
@@ -1408,7 +1452,9 @@ def available_series_clips(
         out_dir = Path(output_dir) / video_dir.name
         if not out_dir.is_dir():
             continue
-        units.extend(_eligible_units(output_dir, video_dir.name, channel, entries_cache[file_channel]))
+        entries = entries_cache[file_channel]
+        units.extend(_eligible_units(output_dir, video_dir.name, channel, entries))
+        units.extend(_validated_units(output_dir, video_dir.name, channel, entries, account))
     return units
 
 
@@ -1501,9 +1547,12 @@ def preview_series(
     schedule: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Apercu d'une serie programmee (SPEC-1ed3, SPEC-6076 R3/R6), sans rien creer. ``mode`` ``auto`` :
-    les meilleurs clips par score jusqu'a ``count`` posts (une partie = un post, une serie incomplete est
-    sautee entiere). ``mode`` ``manual`` : ``selection`` (video_id, clip_id) dans l'ordre choisi par
-    l'utilisateur ; cocher une partie ajoute toute sa serie. Chaque publication prevue est a
+    uniquement des clips DEJA VALIDES (approuves, sans creneau) pour ``account`` (ou aucun compte) -- jamais un
+    clip pret mais non valide, ni valide pour un autre compte (TASK-16eeaccfaf09) -- les meilleurs par score
+    jusqu'a ``count`` posts (une partie = un post, une serie incomplete est sautee entiere) ; si aucun clip
+    n'est valide, le refus le dit explicitement. ``mode`` ``manual`` : ``selection`` (video_id, clip_id) dans
+    l'ordre choisi par l'utilisateur, parmi les clips valides ET les clips prets non valides (aucune
+    restriction de compte) ; cocher une partie ajoute toute sa serie. Chaque publication prevue est a
     ``start_at + k x interval_hours`` (duree reelle) ; un refus (date hors fenetre, sous l'avance minimale,
     plafond du compte) est explicite par publication (ADR-ad2e), jamais un decalage silencieux. ``schedule``
     (``accounts.schedule_of``) : les plafonds se comptent dans le fuseau du COMPTE, pas du style (revue
@@ -1518,11 +1567,17 @@ def preview_series(
 
     settings = service_settings(service, settings)
     now_dt = _now(now)
-    pool = available_series_clips(style, workspace_dir=workspace_dir, output_dir=output_dir, state_dir=state_dir)
+    # Mode auto : seules les unites deja validees (approuvees, sans creneau) pour CE compte (ou aucun) sont
+    # eligibles (TASK-16eeaccfaf09) ; mode manuel : aucune restriction de compte, ready et validees proposees.
+    pool = available_series_clips(
+        style, account=(account if mode == "auto" else None),
+        workspace_dir=workspace_dir, output_dir=output_dir, state_dir=state_dir,
+    )
 
     if mode == "auto":
         if not isinstance(count, int) or isinstance(count, bool) or count < 1:
             raise PublishError("nombre de vidéos invalide : un entier >= 1 est attendu")
+        pool = [u for u in pool if u["validated"]]  # jamais un clip pret mais non valide
         selected_units, used = _auto_series_units(pool, count)
         requested = count
     else:
@@ -1567,8 +1622,12 @@ def preview_series(
     insufficient = mode == "auto" and used < count
     insufficient_reason = None
     if insufficient:
-        plural = "s" if used > 1 else ""
-        insufficient_reason = f"seulement {used} vidéo{plural} disponible{plural} (demandé : {count})"
+        if used == 0:
+            # Message clair (TASK-16eeaccfaf09) : distingue « rien n'est validé » d'un simple manque de clips.
+            insufficient_reason = "aucun clip validé disponible : valide d'abord des clips dans l'écran Clips"
+        else:
+            plural = "s" if used > 1 else ""
+            insufficient_reason = f"seulement {used} vidéo{plural} disponible{plural} (demandé : {count})"
     ok = not insufficient and bool(items) and all(it["refusal"] is None for it in items)
     return {
         "mode": mode, "requested": requested, "available": used,
