@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -1160,3 +1160,110 @@ def test_all_entries_lists_every_channel_and_the_no_channel_file(isolated_cwd):
     found = publish.all_entries()
 
     assert sorted((c, e["clip_id"]) for c, e in found) == [(publish.NO_CHANNEL, "04"), ("ma_chaine", "03")]
+
+
+# --------------------------------------------------------------------------
+# TASK-9776 : publications YouTube (SPEC-5e50 R2, R5)
+# --------------------------------------------------------------------------
+
+
+def test_mark_published_with_a_youtube_post_records_it_in_the_entry_and_the_sidecar(isolated_cwd):
+    publish = _tiktok_env(isolated_cwd, ("01",))
+    at = datetime(2026, 10, 3, 9, 0, tzinfo=timezone.utc)
+    url = "https://youtube.com/shorts/OOOeOwbvu34"
+
+    entry = publish.mark_published(
+        "vid1", "01", "ma_chaine", now=at, post_url=url, post_id="OOOeOwbvu34", tiktok_state="published",
+        publish_at=at.isoformat(), account=_ACCOUNT, service="youtube")
+
+    assert entry["status"] == "published" and entry["service"] == "youtube"
+    assert (entry["post_url"], entry["post_id"]) == (url, "OOOeOwbvu34")
+    sidecar = _read_sidecar(isolated_cwd, "vid1", "01")
+    assert sidecar["youtube_post"] == {"url": url, "id": "OOOeOwbvu34", "state": "published",
+                                       "publish_at": at.isoformat(), "account": _ACCOUNT, "note": None}
+    assert "tiktok_post" not in sidecar
+
+
+def test_a_youtube_publication_accepts_scheduled_on_youtube_and_only_that_scheduled_state(isolated_cwd):
+    from clipper import publish
+
+    publish = _tiktok_env(isolated_cwd, ("01", "02", "03"))
+    at = datetime(2026, 10, 3, 9, 0, tzinfo=timezone.utc)
+    entry = publish.mark_published("vid1", "01", "ma_chaine", now=at, post_url=None, post_id=None,
+                                   tiktok_state="scheduled_on_youtube", publish_at=at.isoformat(), service="youtube")
+    assert entry["tiktok_state"] == "scheduled_on_youtube"
+    with pytest.raises(publish.PublishError, match="YouTube"):
+        publish.mark_published("vid1", "02", "ma_chaine", tiktok_state="scheduled_on_tiktok", service="youtube")
+    with pytest.raises(publish.PublishError, match="TikTok"):
+        publish.mark_published("vid1", "03", "ma_chaine", tiktok_state="scheduled_on_youtube")
+    with pytest.raises(publish.PublishError, match="service invalide"):
+        publish.mark_published("vid1", "03", "ma_chaine", tiktok_state="published", service="autre")
+
+
+def test_a_youtube_post_is_validated_with_the_youtube_options_and_remembers_its_service(isolated_cwd):
+    _setup(isolated_cwd)
+    options = {"title": "Mon titre", "visibility": "unlisted", "made_for_kids": False}
+
+    entry = _post(isolated_cwd, options=options, service="youtube")
+
+    assert entry["service"] == "youtube" and entry["post_options"] == options
+
+
+def test_a_tiktok_only_option_is_refused_on_a_youtube_post_and_the_reverse(isolated_cwd):
+    from clipper import publish
+
+    _setup(isolated_cwd)
+    with pytest.raises(publish.PublishError, match="allow_comments"):
+        _post(isolated_cwd, options={"allow_comments": False}, service="youtube")
+    with pytest.raises(publish.PublishError, match="made_for_kids"):
+        _post(isolated_cwd, options={"made_for_kids": True})
+
+
+def test_a_scheduled_youtube_post_must_be_public(isolated_cwd):
+    from clipper import publish
+
+    _setup(isolated_cwd)
+    with pytest.raises(publish.PublishError, match="programm"):
+        _post(isolated_cwd, mode="scheduled", publish_at=NOW + timedelta(days=1), service="youtube",
+              options={"visibility": "private"})
+
+
+def test_a_youtube_post_uses_the_youtube_caps_not_the_tiktok_ones(isolated_cwd):
+    from clipper import publish
+
+    _setup(isolated_cwd)
+    first = _post(isolated_cwd, service="youtube")  # YouTube : 3 par jour, 120 min d'ecart
+    _write_sidecar(isolated_cwd, "vid1", "04")
+    _write_sidecar(isolated_cwd, "vid1", "05")
+    later = _post(isolated_cwd, clip="04", mode="scheduled", publish_at=NOW + timedelta(hours=3), service="youtube")
+
+    assert first["service"] == later["service"] == "youtube"
+    with pytest.raises(publish.LimitError, match="120 minutes"):
+        _post(isolated_cwd, clip="05", mode="scheduled", publish_at=NOW + timedelta(minutes=30), service="youtube")
+    # le meme 2e post, sous les plafonds TikTok (1 par jour) serait refuse
+    with pytest.raises(publish.LimitError, match="plafond de 1 publication"):
+        _post(isolated_cwd, clip="05", mode="scheduled", publish_at=NOW + timedelta(hours=9))
+
+
+def test_update_post_revalidates_with_the_youtube_service(isolated_cwd):
+    from clipper import publish
+
+    _setup(isolated_cwd)
+    _post(isolated_cwd, service="youtube")
+
+    entry = publish.update_post("vid1", "03", "ma_chaine", options={"visibility": "private"}, now=NOW,
+                                service="youtube")
+    assert entry["post_options"] == {"visibility": "private"} and entry["service"] == "youtube"
+    with pytest.raises(publish.PublishError, match="programm"):
+        publish.update_post("vid1", "03", "ma_chaine", mode="scheduled", publish_at=NOW + timedelta(days=1), now=NOW,
+                            service="youtube")
+
+
+def test_cancelling_a_publication_scheduled_on_youtube_points_to_youtube_studio(isolated_cwd):
+    from clipper import publish
+
+    publish_mod = _tiktok_env(isolated_cwd, ("01",))
+    publish_mod.mark_published("vid1", "01", "ma_chaine", now=NOW, tiktok_state="scheduled_on_youtube",
+                               publish_at=NOW.isoformat(), service="youtube")
+    with pytest.raises(publish.PublishError, match="YouTube Studio"):
+        publish.cancel_post("vid1", "01", "ma_chaine")

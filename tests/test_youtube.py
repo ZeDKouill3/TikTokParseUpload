@@ -676,3 +676,743 @@ def test_the_accounts_screen_offers_the_service_choice_and_shows_it_on_each_acco
     assert 'name="service"' in js and "YouTube" in js
     assert "a.service" in js
     assert "/verify" in js
+
+
+# ================================================================ publication (TASK-9776, SPEC-5e50 R2-R5, R8)
+#
+# Fausse dialog d'envoi de YouTube Studio : aucune vraie page, aucun navigateur. Les selecteurs viennent du toml
+# (le test les lit comme le code), les actions de la page modifient l'etat visible.
+
+from datetime import timedelta  # noqa: E402
+from zoneinfo import ZoneInfo  # noqa: E402
+
+SHORT_ID = "OOOeOwbvu34"
+UPLOAD_URL = f"{STUDIO}/channel/{UC}/videos/upload?d=ud"
+LONDON = ZoneInfo("Europe/London")
+PARIS = ZoneInfo("Europe/Paris")
+
+
+class FakeTimeoutError(Exception):
+    """Nom contenant « Timeout » comme celui de Playwright."""
+
+
+class El:
+    def __init__(self, page, text="", on_click=None, attrs=None, value=None, enabled=True):
+        self.page, self.text, self.on_click = page, text, on_click
+        self.attrs, self.value, self.enabled, self.visible = dict(attrs or {}), value, enabled, True
+        self.children: dict[str, "El"] = {}
+
+    def click(self, **kwargs):
+        self.page.calls.append(("click", self.text or self.value))
+        if self.on_click is not None:
+            self.on_click()
+
+    def fill(self, text, **kwargs):
+        self.page.calls.append(("fill", text))
+        self.value = text
+
+    def press(self, key, **kwargs):
+        self.page.calls.append(("press", key))
+        if key == "Enter":
+            self.page.committed(self)
+
+    def inner_text(self):
+        return self.text
+
+    def input_value(self):
+        return self.value
+
+    def get_attribute(self, name):
+        return self.attrs.get(name)
+
+    def is_visible(self):
+        return self.visible
+
+    def is_enabled(self):
+        return self.enabled
+
+    def query_selector(self, selector):
+        return self.children.get(selector)
+
+
+class FakeKeyboard:
+    def __init__(self, page):
+        self.page = page
+
+    def press(self, key):
+        self.page.calls.append(("key", key))
+        if key == "Backspace" and self.page.focus is not None:
+            self.page.typed[self.page.focus] = ""
+
+    def insert_text(self, text):
+        self.page.calls.append(("insert", text))
+        self.page.typed[self.page.focus] = self.page.typed.get(self.page.focus, "") + text
+
+
+class FakeUpload:
+    """Dialog d'envoi de YouTube Studio : etapes Details -> Elements video -> Verifications -> Visibilite.
+
+    ``tz_default`` : fuseau propose par defaut (PC simule a Londres : « Heure locale »). ``welcome`` : la dialog
+    « Bienvenue » est presente. ``upload_polls`` : lectures avant que le bouton final soit actif. ``success_polls`` :
+    lectures avant la fenetre de succes."""
+
+    def __init__(self, *, welcome=True, studio_redirect=CHANNEL_URL, upload_redirect=UPLOAD_URL, link=True,
+                 upload_polls=0, success_polls=0, success_text=None, drop_tz_paris=False, ignore_date=False,
+                 ignore_tz=False, text_boxes=2, captcha=False, final_label=None, screenshot_error=None):
+        self.sel = _sel()
+        self.S, self.L = self.sel["selectors"], self.sel["labels"]
+        self.url = "about:blank"
+        self.calls: list[tuple] = []
+        self.studio_redirect, self.upload_redirect = studio_redirect, upload_redirect
+        self.keyboard = FakeKeyboard(self)
+        self.focus = None
+        self.typed: dict = {}
+        self.step = -1                      # -1 : pas de fichier ; 0..3 : etapes
+        self.files: list[str] = []
+        self.kids = None
+        self.visibility = None
+        self.expanded = False
+        self.tz_open = False
+        self.tz_choice = "(GMT+0100) Heure locale"
+        self.date_text, self.time_text = "4 oct. 2026", "00:00"
+        self.link, self.drop_tz_paris, self.ignore_date, self.ignore_tz = link, drop_tz_paris, ignore_date, ignore_tz
+        self.text_boxes_count, self.captcha, self.screenshot_error = text_boxes, captcha, screenshot_error
+        self.upload_polls, self.success_polls, self.final_label = upload_polls, success_polls, final_label
+        self.final_clicked = False
+        self.success_text = success_text
+        self.polls_final = 0
+        self.polls_success = 0
+        self.welcome = welcome
+        self.clicks_log: list[str] = []
+        self.upload_dialog = El(self, text="Importer des vidéos")
+        self.upload_dialog.children[self.S["file_input"]] = El(self)
+
+    # -- helpers pour les tests
+    def clicked(self, label):
+        return any(c == ("click", label) for c in self.calls)
+
+    def title_typed(self):
+        return self.typed.get("title")
+
+    def description_typed(self):
+        return self.typed.get("description")
+
+    # -- page
+    def goto(self, url, **kwargs):
+        self.calls.append(("goto", url))
+        self.url = self.studio_redirect if url == STUDIO else self.upload_redirect
+
+    def wait_for_timeout(self, ms):
+        self.calls.append(("poll", ms))
+
+    def screenshot(self, path=None, **kwargs):
+        if self.screenshot_error:
+            raise RuntimeError(self.screenshot_error)
+        Path(path).write_bytes(b"\x89PNG fake")
+
+    def set_input_files(self, selector, path, **kwargs):
+        assert selector == self.S["file_input"]
+        self.calls.append(("upload", path))
+        self.files.append(path)
+        self.step = 0
+
+    def wait_for_selector(self, selector, timeout=None, state=None):
+        found = self.query_selector(selector)
+        if found is None:
+            raise FakeTimeoutError(f"Timeout {timeout} ms : {selector}")
+        return found
+
+    def query_selector(self, selector):
+        found = self.query_selector_all(selector)
+        return found[0] if found else None
+
+    def _button(self, label, on_click=None):
+        return El(self, text=label, on_click=on_click)
+
+    def query_selector_all(self, selector):
+        S, L = self.S, self.L
+        if self.captcha and selector in self.sel["detect"]["captcha"]:
+            return [El(self, text="captcha")]
+        if selector == self.sel["modal"]["container"]:
+            shown = []
+            if self.welcome:
+                dialog = El(self, text="Bienvenue dans YouTube Studio\nContinuer")
+                dialog.children[self.sel["modal"]["button"].format(label="Continuer")] = El(
+                    self, text="Continuer", on_click=lambda: setattr(self, "welcome", False))
+                shown.append(dialog)
+            if self.step == -1:
+                shown.append(self.upload_dialog)
+            if self.final_clicked:
+                self.polls_success += 1
+                if self.success_text is not None and self.polls_success > self.success_polls:
+                    shown.append(El(self, text=self.success_text))
+            return shown
+        if self.step == -1:
+            return [El(self)] if selector == S["file_input"] else []
+        if selector == S["file_input"]:
+            return [El(self)]
+        if selector == S["text_box"] and self.step == 0:
+            boxes = []
+            for index, name in enumerate(("title", "description")[: self.text_boxes_count]):
+                box = El(self, text="04.mp4" if name == "title" else "")
+                box.on_click = (lambda n=name: setattr(self, "focus", n))
+                boxes.append(box)
+            return boxes
+        if selector == S["video_link"] and self.link:
+            return [El(self, text=f"youtube.com/shorts/{SHORT_ID}",
+                       attrs={"href": f"https://youtube.com/shorts/{SHORT_ID}"})]
+        for label, value in ((L["kids_yes"], True), (L["kids_no"], False)):
+            if selector == S["radio"].format(label=label) and self.step == 0:
+                return [El(self, text=label, on_click=lambda v=value: setattr(self, "kids", v))]
+        if selector == S["labeled_button"].format(label=L["next"]) and self.step in (0, 1, 2):
+            return [self._button(L["next"], on_click=lambda: setattr(self, "step", self.step + 1))]
+        if self.step == 3:
+            return self._visibility_step(selector)
+        return []
+
+    def _visibility_step(self, selector):
+        S, L = self.S, self.L
+        for key in ("public", "unlisted", "private"):
+            if selector == S["radio"].format(label=L["visibility_" + key]):
+                return [El(self, text=L["visibility_" + key], on_click=lambda k=key: self._choose(k))]
+        if selector == S["expand"].format(label=L["expand_schedule"]):
+            return [El(self, text=L["expand_schedule"], on_click=lambda: setattr(self, "expanded", True))]
+        if selector == S["text_input"] and self.expanded:
+            return [El(self, value=self.date_text), El(self, value=self.time_text)]
+        if selector == S["labeled_button"].format(label=L["timezone_button"]) and self.expanded:
+            return [El(self, text=f"{L['timezone_button']}\n{self.tz_choice}",
+                       on_click=lambda: setattr(self, "tz_open", True))]
+        if selector == S["timezone_option"] and self.tz_open:
+            options = [("(GMT+0100) Heure locale"), "(UTC+01:00) Londres", "(UTC+02:00) Paris", "(UTC+02:00) Berlin"]
+            if self.drop_tz_paris:
+                options = [o for o in options if "Paris" not in o]
+            return [El(self, text=o, on_click=lambda o=o: self._pick_tz(o)) for o in options]
+        if selector == S["final_button"]:
+            self.polls_final += 1
+            label = self.final_label or self._final_label()
+            return [El(self, text=label, enabled=self.polls_final > self.upload_polls,
+                       on_click=lambda: setattr(self, "final_clicked", True))]
+        return []
+
+    def _final_label(self):
+        if self.expanded:
+            return self.L["final_schedule"]
+        return self.L["final_save"] if self.visibility in (None, "private") else self.L["final_publish"]
+
+    def _choose(self, key):
+        self.visibility = key
+        self.expanded = False
+
+    def _pick_tz(self, option):
+        if not self.ignore_tz:
+            self.tz_choice = option
+        self.tz_open = False
+
+    def committed(self, element):
+        """Entree dans un champ de la section Programmer."""
+        if element.value is None or self.ignore_date:
+            return
+        if re.match(r"^\d{1,2}:\d{2}$", element.value):
+            self.time_text = element.value
+        else:
+            self.date_text = element.value
+
+
+def _clip(tmp_path, **extra):
+    mp4 = tmp_path / "04.mp4"
+    mp4.write_bytes(b"mp4")
+    return {"video_path": mp4, "caption": "Une légende", "hashtags": ["#jeu", "#fun"],
+            "screen_title": "Le titre d'écran", **extra}
+
+
+def publish(tmp_path, monkeypatch, page, *, mode="immediate", schedule_at=None, options=None, clip=None, **settings):
+    monkeypatch.chdir(tmp_path)
+    opened, sleeps = [], []
+
+    @contextmanager
+    def opener(account, *, headless):
+        opened.append((account, headless))
+        yield FakeContext(page)
+
+    config = Config(mode="review", workspace_dir=tmp_path / "w", output_dir=tmp_path / "o",
+                    _sections={"youtube": {"upload_timeout_s": 3, "publish_confirm_timeout_s": 3, "poll_interval_s": 1,
+                                           "action_timeout_s": 2, **settings}})
+    result = youtube.publish(clip or _clip(tmp_path), "ma_chaine", mode=mode, schedule_at=schedule_at,
+                             options=options, config=config, now=NOW, opener=opener, sleep=sleeps.append,
+                             rng=random.Random(1))
+    publish.opened, publish.sleeps = opened, sleeps
+    return result
+
+
+def stop_of(tmp_path, monkeypatch, page, **kwargs) -> youtube.YouTubeStop:
+    with pytest.raises(youtube.YouTubeStop) as caught:
+        publish(tmp_path, monkeypatch, page, **kwargs)
+    return caught.value
+
+
+# -- publication immediate
+
+
+def test_an_immediate_public_publication_records_the_shorts_url(tmp_path, monkeypatch):
+    page = FakeUpload(success_text="Vidéo mise en ligne")
+
+    result = publish(tmp_path, monkeypatch, page)
+
+    assert result["post_url"] == f"https://youtube.com/shorts/{SHORT_ID}"
+    assert (result["post_id"], result["state"]) == (SHORT_ID, "published")
+    assert datetime.fromisoformat(result["publish_at"]) == NOW
+    assert page.files == [str(tmp_path / "04.mp4")]
+    assert page.clicked("Publique") and page.clicked("Publier")
+    assert page.kids is False  # « Non, elle n'est pas conçue pour les enfants » par defaut
+    assert publish.opened == [("ma_chaine", False)]  # Chrome visible, jamais cache (ADR-58c0)
+    urls = [c[1] for c in page.calls if c[0] == "goto"]
+    assert urls == [STUDIO, UPLOAD_URL]  # Studio d'abord (identifiant de chaine), puis la page d'envoi de CETTE chaine
+
+
+def test_the_title_defaults_to_the_screen_title_and_the_description_to_caption_hashtags_and_shorts(tmp_path, monkeypatch):
+    page = FakeUpload(success_text="Vidéo mise en ligne")
+
+    publish(tmp_path, monkeypatch, page)
+
+    assert page.title_typed() == "Le titre d'écran"
+    assert page.description_typed() == "Une légende\n\n#jeu #fun #Shorts"
+
+
+def test_the_title_option_overrides_the_screen_title(tmp_path, monkeypatch):
+    page = FakeUpload(success_text="Vidéo mise en ligne")
+
+    publish(tmp_path, monkeypatch, page, options={"title": "Mon titre"})
+
+    assert page.title_typed() == "Mon titre"
+
+
+def test_the_prefilled_title_is_emptied_before_typing(tmp_path, monkeypatch):
+    page = FakeUpload(success_text="Vidéo mise en ligne")
+
+    publish(tmp_path, monkeypatch, page)
+
+    keys = [c[1] for c in page.calls if c[0] == "key"]
+    assert keys[:2] == ["Control+A", "Backspace"]  # le champ est prerempli du nom du fichier : vider puis taper
+
+
+def test_a_title_longer_than_100_characters_is_truncated(tmp_path, monkeypatch):
+    page = FakeUpload(success_text="Vidéo mise en ligne")
+
+    publish(tmp_path, monkeypatch, page, clip=_clip(tmp_path, screen_title="x" * 150))
+
+    assert page.title_typed() == "x" * 100
+
+
+def test_shorts_is_not_added_twice_whatever_its_case(tmp_path, monkeypatch):
+    page = FakeUpload(success_text="Vidéo mise en ligne")
+
+    publish(tmp_path, monkeypatch, page, clip=_clip(tmp_path, hashtags=["#jeu", "#shorts"]))
+
+    assert page.description_typed().lower().count("#shorts") == 1
+
+
+def test_shorts_is_added_when_there_is_no_hashtag(tmp_path, monkeypatch):
+    page = FakeUpload(success_text="Vidéo mise en ligne")
+
+    publish(tmp_path, monkeypatch, page, clip=_clip(tmp_path, hashtags=[]))
+
+    assert page.description_typed() == "Une légende\n\n#Shorts"
+
+
+def test_made_for_kids_yes_clicks_the_yes_radio(tmp_path, monkeypatch):
+    page = FakeUpload(success_text="Vidéo mise en ligne")
+
+    publish(tmp_path, monkeypatch, page, options={"made_for_kids": True})
+
+    assert page.kids is True
+
+
+def test_a_private_publication_saves_instead_of_publishing(tmp_path, monkeypatch):
+    page = FakeUpload(success_text="Vidéo enregistrée")
+
+    result = publish(tmp_path, monkeypatch, page, options={"visibility": "private"})
+
+    assert page.clicked("Privée") and page.clicked("Enregistrer") and not page.clicked("Publier")
+    assert result["state"] == "published" and "en privé" in result["note"]
+
+
+def test_an_unlisted_publication_picks_the_unlisted_radio_and_publishes(tmp_path, monkeypatch):
+    page = FakeUpload(success_text="Vidéo mise en ligne")
+
+    result = publish(tmp_path, monkeypatch, page, options={"visibility": "unlisted"})
+
+    assert page.clicked("Non répertoriée") and page.clicked("Publier")
+    assert "non répertoriée" in result["note"]
+
+
+def test_the_welcome_dialog_is_closed_with_continuer_before_the_upload(tmp_path, monkeypatch):
+    page = FakeUpload(welcome=True, success_text="Vidéo mise en ligne")
+
+    publish(tmp_path, monkeypatch, page)
+
+    assert page.welcome is False and page.clicked("Continuer")
+    order = [c[0] for c in page.calls]
+    assert order.index("upload") > [i for i, c in enumerate(page.calls) if c == ("click", "Continuer")][0]
+
+
+def test_the_publication_pauses_like_a_human_between_actions(tmp_path, monkeypatch):
+    page = FakeUpload(success_text="Vidéo mise en ligne")
+
+    publish(tmp_path, monkeypatch, page, min_action_delay_s=0.5, max_action_delay_s=0.9)
+
+    assert publish.sleeps and all(0.5 <= s <= 0.9 for s in publish.sleeps)
+
+
+def test_the_worker_beat_is_called_while_driving(tmp_path, monkeypatch):
+    ticks = []
+    page = FakeUpload(success_text="Vidéo mise en ligne")
+    monkeypatch.chdir(tmp_path)
+
+    @contextmanager
+    def opener(account, *, headless):
+        yield FakeContext(page)
+
+    config = Config(mode="review", workspace_dir=tmp_path / "w", output_dir=tmp_path / "o")
+    youtube.publish(_clip(tmp_path), "ma_chaine", mode="immediate", config=config, now=NOW, opener=opener,
+                    sleep=lambda s: None, rng=random.Random(1), on_tick=lambda: ticks.append(1))
+    assert ticks
+
+
+def test_the_final_button_is_awaited_while_the_upload_is_still_running(tmp_path, monkeypatch):
+    page = FakeUpload(upload_polls=3, success_text="Vidéo mise en ligne")
+
+    result = publish(tmp_path, monkeypatch, page, upload_timeout_s=30)
+
+    assert result["state"] == "published"
+    assert [c for c in page.calls if c == ("click", "Publier")] == [("click", "Publier")]  # un seul clic, une fois actif
+
+
+def test_a_final_button_that_stays_disabled_is_a_stop(tmp_path, monkeypatch):
+    page = FakeUpload(upload_polls=999)
+
+    stop = stop_of(tmp_path, monkeypatch, page, upload_timeout_s=2)
+
+    assert stop.code == "element_missing" and "envoi" in stop.reason
+    assert not page.clicked("Publier")
+
+
+def test_the_success_window_is_awaited_after_the_final_click(tmp_path, monkeypatch):
+    page = FakeUpload(success_polls=2, success_text="Vidéo mise en ligne")
+
+    result = publish(tmp_path, monkeypatch, page, publish_confirm_timeout_s=30)
+
+    assert result["state"] == "published"
+
+
+def test_no_success_window_is_an_explicit_stop_never_a_supposed_success(tmp_path, monkeypatch):
+    page = FakeUpload(success_text=None)
+
+    stop = stop_of(tmp_path, monkeypatch, page, publish_confirm_timeout_s=2)
+
+    assert stop.code == "publish_unconfirmed" and "à vérifier à la main" in stop.reason
+    assert stop.capture is not None and Path(stop.capture).is_file()
+
+
+def test_the_final_button_label_must_match_the_mode(tmp_path, monkeypatch):
+    page = FakeUpload(final_label="Enregistrer", success_text="Vidéo mise en ligne")
+
+    stop = stop_of(tmp_path, monkeypatch, page)
+
+    assert stop.code == "unexpected_page" and "« Enregistrer » au lieu de « Publier »" in stop.reason
+    assert not page.final_clicked
+
+
+# -- publication programmee, heure de Paris (R8)
+
+
+def test_a_scheduled_publication_types_paris_time_when_the_pc_is_on_london_time(tmp_path, monkeypatch):
+    page = FakeUpload(success_text="Vidéo programmée")
+    at = datetime(2026, 10, 4, 20, 30, tzinfo=LONDON)  # le PC (Londres) pense 20:30 : Paris = 21:30
+
+    result = publish(tmp_path, monkeypatch, page, mode="scheduled", schedule_at=at)
+
+    assert (page.date_text, page.time_text) == ("4 oct. 2026", "21:30")
+    assert page.tz_choice == "(UTC+02:00) Paris"  # fuseau choisi explicitement
+    assert not page.clicked("(GMT+0100) Heure locale")
+    assert result["state"] == "scheduled_on_youtube" and result["post_id"] == SHORT_ID
+    assert datetime.fromisoformat(result["publish_at"]) == at
+    assert ("press", "Enter") in page.calls
+
+
+def test_the_scheduled_date_is_the_paris_date_not_the_pc_date(tmp_path, monkeypatch):
+    page = FakeUpload(success_text="Vidéo programmée")
+    at = datetime(2026, 10, 4, 23, 30, tzinfo=LONDON)  # 00:30 le lendemain a Paris
+
+    publish(tmp_path, monkeypatch, page, mode="scheduled", schedule_at=at)
+
+    assert (page.date_text, page.time_text) == ("5 oct. 2026", "00:30")
+
+
+def test_the_scheduled_time_in_utc_is_converted_to_paris(tmp_path, monkeypatch):
+    page = FakeUpload(success_text="Vidéo programmée")
+    at = datetime(2026, 12, 25, 8, 5, tzinfo=timezone.utc)  # hiver : Paris = UTC+1
+
+    monkeypatch.chdir(tmp_path)
+    publish_now = datetime(2026, 12, 1, tzinfo=timezone.utc)
+
+    @contextmanager
+    def opener(account, *, headless):
+        yield FakeContext(page)
+
+    config = Config(mode="review", workspace_dir=tmp_path / "w", output_dir=tmp_path / "o",
+                    _sections={"youtube": {"schedule_max_days": 60, "publish_confirm_timeout_s": 3}})
+    youtube.publish(_clip(tmp_path), "ma_chaine", mode="scheduled", schedule_at=at, config=config, now=publish_now,
+                    opener=opener, sleep=lambda s: None, rng=random.Random(1))
+
+    assert (page.date_text, page.time_text) == ("25 déc. 2026", "09:05")
+
+
+def test_the_scheduled_final_button_is_programmer(tmp_path, monkeypatch):
+    page = FakeUpload(success_text="Vidéo programmée")
+
+    publish(tmp_path, monkeypatch, page, mode="scheduled", schedule_at=NOW + timedelta(days=1))
+
+    assert [c for c in page.calls if c == ("click", "Programmer")]
+    assert not page.clicked("Publier") and not page.clicked("Publique")
+
+
+def test_a_scheduled_date_that_the_page_did_not_take_is_a_stop_with_capture(tmp_path, monkeypatch):
+    page = FakeUpload(ignore_date=True, success_text="Vidéo programmée")
+
+    stop = stop_of(tmp_path, monkeypatch, page, mode="scheduled", schedule_at=NOW + timedelta(days=1))
+
+    assert stop.code == "unexpected_page" and "programmation non prise en compte" in stop.reason
+    assert stop.capture is not None and Path(stop.capture).is_file()
+    assert not page.final_clicked  # jamais de clic final sur une relecture fausse
+
+
+def test_a_timezone_that_the_page_did_not_take_is_a_stop(tmp_path, monkeypatch):
+    page = FakeUpload(ignore_tz=True, success_text="Vidéo programmée")
+
+    stop = stop_of(tmp_path, monkeypatch, page, mode="scheduled", schedule_at=NOW + timedelta(days=1))
+
+    assert stop.code == "unexpected_page" and "fuseau" in stop.reason and "Paris" in stop.reason
+    assert not page.final_clicked
+
+
+def test_a_missing_paris_timezone_option_is_a_stop_never_the_local_time(tmp_path, monkeypatch):
+    page = FakeUpload(drop_tz_paris=True, success_text="Vidéo programmée")
+
+    stop = stop_of(tmp_path, monkeypatch, page, mode="scheduled", schedule_at=NOW + timedelta(days=1))
+
+    assert stop.code == "element_missing" and "Paris" in stop.reason
+    assert not page.clicked("(GMT+0100) Heure locale") and not page.final_clicked
+
+
+def test_an_unknown_scheduled_success_title_is_a_stop_to_verify_in_real(tmp_path, monkeypatch):
+    page = FakeUpload(success_text="Quelque chose d'autre")
+
+    stop = stop_of(tmp_path, monkeypatch, page, mode="scheduled", schedule_at=NOW + timedelta(days=1),
+                   publish_confirm_timeout_s=2)
+
+    assert stop.code == "publish_unconfirmed"
+
+
+@pytest.mark.parametrize("visibility", ["private", "unlisted"])
+def test_a_scheduled_publication_is_public_only(tmp_path, monkeypatch, visibility):
+    page = FakeUpload()
+    with pytest.raises(youtube.YouTubeError, match="programm"):
+        publish(tmp_path, monkeypatch, page, mode="scheduled", schedule_at=NOW + timedelta(days=1),
+                options={"visibility": visibility})
+    assert page.calls == []  # refuse avant tout navigateur
+
+
+@pytest.mark.parametrize("at,match", [(None, "date avec fuseau"), (datetime(2026, 10, 5, 9, 0), "date avec fuseau"),
+                                      (NOW + timedelta(minutes=2), "avance minimale"),
+                                      (NOW + timedelta(days=4000), "limite")])
+def test_a_bad_schedule_date_is_refused_before_any_browser(tmp_path, monkeypatch, at, match):
+    page = FakeUpload()
+    with pytest.raises(youtube.YouTubeError, match=match):
+        publish(tmp_path, monkeypatch, page, mode="scheduled", schedule_at=at)
+    assert page.calls == []
+
+
+# -- arret sur (R3)
+
+
+def test_a_captcha_stops_immediately_with_a_capture_and_the_reason(tmp_path, monkeypatch):
+    page = FakeUpload(captcha=True)
+
+    stop = stop_of(tmp_path, monkeypatch, page)
+
+    assert stop.code == "captcha" and "captcha" in stop.reason
+    assert Path(stop.capture).parent == browser.profile_dir("ma_chaine") / "captures" and Path(stop.capture).is_file()
+    assert page.files == []  # rien n'est envoye
+
+
+def test_a_google_login_page_on_studio_stops_with_the_login_code(tmp_path, monkeypatch):
+    page = FakeUpload(studio_redirect=LOGIN_URL)
+
+    stop = stop_of(tmp_path, monkeypatch, page)
+
+    assert stop.code == "login" and "ma_chaine" in stop.reason
+    assert Path(stop.capture).is_file() and page.files == []
+
+
+def test_a_google_login_page_on_the_upload_page_stops_with_the_login_code(tmp_path, monkeypatch):
+    page = FakeUpload(upload_redirect=LOGIN_URL)
+
+    stop = stop_of(tmp_path, monkeypatch, page)
+
+    assert stop.code == "login" and page.files == []
+
+
+def test_a_google_verification_page_stops_with_the_verification_code(tmp_path, monkeypatch):
+    page = FakeUpload(upload_redirect="https://accounts.google.com/v3/signin/challenge/pwd")
+
+    stop = stop_of(tmp_path, monkeypatch, page)
+
+    assert stop.code == "verification" and "vérification" in stop.reason
+
+
+def test_studio_that_does_not_open_a_channel_is_an_unexpected_page_stop(tmp_path, monkeypatch):
+    page = FakeUpload(studio_redirect=f"{STUDIO}/")
+
+    stop = stop_of(tmp_path, monkeypatch, page)
+
+    assert stop.code == "unexpected_page" and "page inattendue" in stop.reason
+
+
+def test_an_upload_page_that_is_not_the_upload_dialog_is_an_unexpected_page_stop(tmp_path, monkeypatch):
+    page = FakeUpload(upload_redirect=f"{STUDIO}/channel/{UC}/videos/short")
+
+    stop = stop_of(tmp_path, monkeypatch, page)
+
+    assert stop.code == "unexpected_page" and page.files == []
+
+
+def test_an_unknown_dialog_stops_instead_of_clicking_blindly(tmp_path, monkeypatch):
+    page = FakeUpload(welcome=False)
+    unknown = El(page, text="Une fenêtre qu'on ne connaît pas")
+    original = page.query_selector_all
+
+    def with_unknown(selector):
+        found = original(selector)
+        return [*found, unknown] if selector == _sel()["modal"]["container"] else found
+
+    page.query_selector_all = with_unknown
+
+    stop = stop_of(tmp_path, monkeypatch, page)
+
+    assert stop.code == "unexpected_page" and "fenêtre inattendue" in stop.reason
+    assert page.files == [] and not any(c[0] == "click" for c in page.calls)
+
+
+def test_a_missing_shorts_link_is_a_stop_naming_the_element(tmp_path, monkeypatch):
+    page = FakeUpload(link=False)
+
+    stop = stop_of(tmp_path, monkeypatch, page, upload_timeout_s=2)
+
+    assert stop.code == "element_missing" and "video_link" in stop.reason
+    assert Path(stop.capture).is_file() and not page.final_clicked
+
+
+def test_a_missing_description_box_is_a_stop(tmp_path, monkeypatch):
+    page = FakeUpload(text_boxes=1)
+
+    stop = stop_of(tmp_path, monkeypatch, page)
+
+    assert stop.code == "element_missing" and not page.final_clicked
+
+
+def test_an_unexpected_page_error_becomes_a_stop_with_capture(tmp_path, monkeypatch):
+    page = FakeUpload()
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("la page a planté")
+
+    page.set_input_files = boom
+
+    stop = stop_of(tmp_path, monkeypatch, page)
+
+    assert stop.code == "unexpected_page" and "RuntimeError" in stop.reason and Path(stop.capture).is_file()
+
+
+def test_a_failed_capture_is_said_in_the_stop_reason(tmp_path, monkeypatch):
+    page = FakeUpload(captcha=True, screenshot_error="écran verrouillé")
+
+    stop = stop_of(tmp_path, monkeypatch, page)
+
+    assert stop.capture is None and "capture d'écran impossible : écran verrouillé" in stop.reason
+
+
+# -- refus avant navigateur, reglages
+
+
+def test_a_missing_account_mp4_or_title_is_an_explicit_error(tmp_path, monkeypatch):
+    page = FakeUpload()
+    monkeypatch.chdir(tmp_path)
+    config = Config(mode="review", workspace_dir=tmp_path / "w", output_dir=tmp_path / "o")
+    ok = _clip(tmp_path)
+    with pytest.raises(youtube.YouTubeError, match="compte YouTube manquant"):
+        youtube.publish(ok, "", mode="immediate", config=config, now=NOW)
+    with pytest.raises(youtube.YouTubeError, match="mp4 introuvable"):
+        youtube.publish({**ok, "video_path": tmp_path / "nope.mp4"}, "ma_chaine", mode="immediate", config=config, now=NOW)
+    with pytest.raises(youtube.YouTubeError, match="titre"):
+        youtube.publish({**ok, "screen_title": ""}, "ma_chaine", mode="immediate", config=config, now=NOW)
+    with pytest.raises(youtube.YouTubeError, match="mode de publication invalide"):
+        youtube.publish(ok, "ma_chaine", mode="demain", config=config, now=NOW)
+    assert page.calls == []
+
+
+def test_post_options_are_validated_with_explicit_errors():
+    base = youtube.get_settings(None)
+    assert youtube.post_settings(base, {"visibility": "private", "made_for_kids": True, "title": "t"})["visibility"] == "private"
+    with pytest.raises(youtube.YouTubeError, match="inconnu"):
+        youtube.post_settings(base, {"couleur": "rouge"})
+    with pytest.raises(youtube.YouTubeError, match="visibility"):
+        youtube.post_settings(base, {"visibility": "secrète"})
+    with pytest.raises(youtube.YouTubeError, match="made_for_kids"):
+        youtube.post_settings(base, {"made_for_kids": "non"})
+    with pytest.raises(youtube.YouTubeError, match="title"):
+        youtube.post_settings(base, {"title": "   "})
+
+
+def test_the_publication_settings_have_defaults_and_validation():
+    d = youtube.CONFIG_DEFAULTS
+    assert (d["visibility"], d["made_for_kids"], d["publish_mode"]) == ("public", False, "immediate")
+    for key in ("upload_timeout_s", "publish_confirm_timeout_s", "schedule_max_days", "schedule_min_minutes"):
+        assert key in d
+    config = Config(mode="review", workspace_dir=Path("w"), output_dir=Path("o"), _sections={"youtube": {"visibility": "x"}})
+    with pytest.raises(youtube.YouTubeError, match="visibility"):
+        youtube.get_settings(config)
+    config = Config(mode="review", workspace_dir=Path("w"), output_dir=Path("o"), _sections={"youtube": {"made_for_kids": "x"}})
+    with pytest.raises(youtube.YouTubeError, match="made_for_kids"):
+        youtube.get_settings(config)
+
+
+def test_clip_payload_reads_the_sidecar_fields_and_refuses_a_broken_sidecar(tmp_path):
+    sidecar = {"video_id": "aaaaaaaaaaa", "clip_id": "01", "caption": "c", "hashtags": ["#a"], "screen_title": "T"}
+    payload = youtube.clip_payload(sidecar, tmp_path)
+    assert payload == {"video_path": tmp_path / "aaaaaaaaaaa" / "01.mp4", "caption": "c", "hashtags": ["#a"],
+                       "screen_title": "T"}
+    with pytest.raises(youtube.YouTubeError, match="caption"):
+        youtube.clip_payload({**sidecar, "caption": " "}, tmp_path)
+    with pytest.raises(youtube.YouTubeError, match="hashtags"):
+        youtube.clip_payload({**sidecar, "hashtags": None}, tmp_path)
+
+
+@pytest.mark.parametrize("table,key", [("urls", "upload"), ("urls", "short"), ("expect", "short_id_pattern"),
+                                       ("expect", "upload_url_marker"), ("labels", "next"), ("labels", "final_schedule"),
+                                       ("selectors", "final_button"), ("selectors", "file_input"),
+                                       ("success", "published"), ("detect", "captcha"), ("calendar", "months")])
+def test_a_missing_publication_landmark_is_an_explicit_error_naming_the_key(tmp_path, table, key):
+    text = SELECTORS.read_text(encoding="utf-8")
+    broken = re.sub(rf"(?m)^{key} = ", f"{key}_absent = ", text, count=1)
+    assert broken != text
+    bad = tmp_path / "s.toml"
+    bad.write_text(broken, encoding="utf-8")
+    with pytest.raises(youtube.YouTubeError, match=rf"\[{table}\] {key}"):
+        youtube.load_selectors(bad)
+
+
+def test_the_unverified_landmarks_are_flagged_in_the_toml():
+    text = SELECTORS.read_text(encoding="utf-8")
+    # le repere du bouton final est ecrit sans releve reel : signale ; le lien du Short est releve
+    assert "NON VÉRIFIÉ" in text[text.index("# Bouton final de la dialog"):text.index("final_button =")]
+    assert "vérifié 2026-10-03" in text[text.index("# Lien youtube.com/shorts/<id> affiche"):text.index("video_link =")]

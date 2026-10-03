@@ -29,7 +29,7 @@ from clipper import accounts as accounts_mod
 from clipper import browser
 from clipper import channel as channel_mod
 from clipper import publish as publish_mod
-from clipper import tiktok
+from clipper import tiktok, youtube
 from clipper.config import Config, ConfigError, load_config
 
 log = logging.getLogger(__name__)
@@ -268,6 +268,7 @@ class Worker:
         publisher: Callable[..., dict[str, Any]] | None = None,
         stats_fetcher: Callable[..., dict[str, Any]] | None = None,
         login_checker: Callable[..., dict[str, Any]] | None = None,
+        youtube_publisher: Callable[..., dict[str, Any]] | None = None,
     ) -> None:
         self._popen = None
         if spawner is None:
@@ -281,6 +282,7 @@ class Worker:
         self.watch_lister = watch_lister
         self._logged_watch_errors: set[str] = set()
         self.publisher = publisher or tiktok.publish
+        self.youtube_publisher = youtube_publisher or youtube.publish  # compte YouTube (SPEC-5e50 R2)
         self._logged_publish_errors: set[str] = set()
         self.stats_fetcher = stats_fetcher or tiktok.fetch_stats
         self.login_checker = login_checker or browser.login_state  # connexion verifiee avant chaque publication
@@ -391,7 +393,8 @@ class Worker:
         pas le worker."""
         try:
             return self._publish_next()
-        except (publish_mod.PublishError, channel_mod.ChannelError, ConfigError, tiktok.TikTokError) as exc:
+        except (publish_mod.PublishError, channel_mod.ChannelError, ConfigError, tiktok.TikTokError,
+                youtube.YouTubeError, accounts_mod.AccountsError) as exc:
             message = str(exc)
             if message not in self._logged_publish_errors:
                 self._logged_publish_errors.add(message)
@@ -416,8 +419,8 @@ class Worker:
             wait = timedelta(hours=float(settings["stats_interval_h"]))
             for found in accounts_mod.list_accounts(self.config):
                 account = found["id"]
-                if not found["ready_to_publish"]:
-                    continue
+                if not found["ready_to_publish"] or found.get("service") == "youtube":
+                    continue  # les statistiques YouTube viennent d'une autre tache : jamais releves par la page TikTok
                 tried = self._stats_attempts.get(account)
                 if tried is not None and now - tried < wait:
                     continue
@@ -437,9 +440,16 @@ class Worker:
                 self._logged_stats_errors.add(message)
                 log.error("relevé des statistiques TikTok impossible : %s", message)
 
+    def _service_settings(self, service: str, cache: dict[str, dict[str, Any]]) -> dict[str, Any]:
+        """Reglages [tiktok] ou [youtube] du service d'un compte, lus (et valides) une fois par passage."""
+        if service not in cache:
+            cache[service] = youtube.get_settings(self.config) if service == "youtube" else tiktok.get_settings(self.config)
+        return cache[service]
+
     def _publish_next(self) -> bool:
         now = datetime.now(timezone.utc)
-        settings = tiktok.get_settings(self.config)
+        services = {a["id"]: a.get("service") or "tiktok" for a in accounts_mod.list_accounts(self.config)}
+        cache: dict[str, dict[str, Any]] = {}
         watch = self.config.section("watch")
         paths = {"state_dir": self.config.section("publish")["state_dir"],
                  "presets_dir": watch["presets_dir"], "base": watch["base_config"]}
@@ -451,20 +461,25 @@ class Worker:
                 if entry["status"] != "scheduled" or not entry["slot_at"]:
                     continue
                 slot = datetime.fromisoformat(entry["slot_at"])
+                account = publish_mod.entry_account(entry, channel["tiktok_account"])
+                service = services.get(account, "tiktok")  # compte inconnu : _publish_one l'explique (R4)
+                settings = self._service_settings(service, cache)
                 mode = entry.get("publish_mode") or str(settings["publish_mode"])
                 window = timedelta(days=float(settings["schedule_max_days"])) if mode == "scheduled" else timedelta(0)
                 if slot - window <= now:  # immediat : creneau atteint ; programme : date dans la fenetre TikTok
-                    due.append((slot, name, channel, entry, mode))
+                    due.append((slot, name, channel, entry, mode, service, settings))
         due.sort(key=lambda d: (d[0], d[1], d[3]["clip_id"]))
-        for slot, name, channel, entry, mode in due:
-            if self._publish_one(slot, name, channel, entry, mode, settings, paths, now):
+        for slot, name, channel, entry, mode, service, settings in due:
+            if self._publish_one(slot, name, channel, entry, mode, settings, paths, now, service):
                 return True
         return False
 
     def _publish_one(self, slot: datetime, name: str, channel: dict[str, Any], entry: dict[str, Any], mode: str,
-                     settings: dict[str, Any], paths: dict[str, Any], now: datetime) -> bool:
-        """Vrai si la tentative de publication a eu lieu (reussie ou en echec) : fin de l'iteration."""
+                     settings: dict[str, Any], paths: dict[str, Any], now: datetime, service: str = "tiktok") -> bool:
+        """Vrai si la tentative de publication a eu lieu (reussie ou en echec) : fin de l'iteration. ``service`` et
+        ``settings`` : ceux du compte de l'entree (SPEC-5e50 : plafonds et module de publication par service)."""
         video_id, clip_id = entry["video_id"], entry["clip_id"]
+        label = publish_mod.SERVICE_LABELS[service]
         account = publish_mod.entry_account(entry, channel["tiktok_account"])  # jamais un autre compte en repli
         where = {"channel": name, "video_id": video_id, "clip_id": clip_id}
         if not account:
@@ -497,23 +512,24 @@ class Worker:
                                "capture": None}, config=self.config)
             return False
 
-        if not self._connected(entry, name, account, paths["state_dir"]):
-            return False
+        if service == "tiktok" and not self._connected(entry, name, account, paths["state_dir"]):
+            return False  # YouTube : la connexion est « prete a publier » (derniere verification) ; Studio arrete sur Google
         if entry.get("waiting_reason"):
             publish_mod.set_waiting_reason(video_id, clip_id, name, None, state_dir=paths["state_dir"])
         try:
-            clip = tiktok.clip_payload(publish_mod.read_sidecar(self.config.output_dir, video_id, clip_id),
-                                       self.config.output_dir)
+            payload = youtube.clip_payload if service == "youtube" else tiktok.clip_payload
+            clip = payload(publish_mod.read_sidecar(self.config.output_dir, video_id, clip_id), self.config.output_dir)
             extra = {"options": entry["post_options"]} if entry.get("post_options") else {}
             publish_mod.mark_in_progress(video_id, clip_id, name, state_dir=paths["state_dir"])
-            result = self.publisher(clip, account, mode=mode, schedule_at=slot if mode == "scheduled" else None,
-                                    config=self.config, on_tick=self._beat, **extra)
-        except tiktok.TikTokStop as stop:
+            publisher = self.youtube_publisher if service == "youtube" else self.publisher
+            result = publisher(clip, account, mode=mode, schedule_at=slot if mode == "scheduled" else None,
+                               config=self.config, on_tick=self._beat, **extra)
+        except (tiktok.TikTokStop, youtube.YouTubeStop) as stop:
             self._fail(entry, name, stop.reason, halted=True, account=account, capture=stop.capture,
                        state_dir=paths["state_dir"])
         except browser.BrowserError as exc:
             self._fail(entry, name, str(exc), halted=True, account=account, state_dir=paths["state_dir"])
-        except (tiktok.TikTokError, publish_mod.PublishError) as exc:
+        except (tiktok.TikTokError, youtube.YouTubeError, publish_mod.PublishError) as exc:
             self._fail(entry, name, str(exc), halted=False, account=account, state_dir=paths["state_dir"])
         except Exception as exc:  # noqa: BLE001 - jamais un worker mort : l'entree echoue, avec la raison
             log.exception("%s/%s : erreur inattendue pendant la publication", video_id, clip_id)
@@ -523,11 +539,11 @@ class Worker:
             publish_mod.mark_published(
                 video_id, clip_id, name, state_dir=paths["state_dir"], output_dir=self.config.output_dir,
                 tiktok_state=result["state"], post_url=result["post_url"], post_id=result["post_id"],
-                publish_at=result["publish_at"], post_note=result["note"], account=account)
-            label = "programmée sur TikTok" if result["state"] == "scheduled_on_tiktok" else "publiée"
-            log.info("%s/%s : %s (%s)", video_id, clip_id, label, result["post_url"] or result["note"])
+                publish_at=result["publish_at"], post_note=result["note"], account=account, service=service)
+            done = f"programmée sur {label}" if result["state"].startswith("scheduled_on_") else "publiée"
+            log.info("%s/%s : %s (%s)", video_id, clip_id, done, result["post_url"] or result["note"])
             tiktok.emit_event({"level": "info", "account": account, **where,
-                               "reason": f"{label} : {result['post_url'] or result['note']}", "capture": None},
+                               "reason": f"{done} : {result['post_url'] or result['note']}", "capture": None},
                               config=self.config)
         return True
 
@@ -577,7 +593,7 @@ class Worker:
         """Entree ``failed`` (reessayable), journal et evenement console (SPEC-9225 R4). Un arret R4 decoche
         aussi « pret a publier » du compte, jusqu'a ce que l'utilisateur le recoche (SPEC-00d1 R3)."""
         video_id, clip_id = entry["video_id"], entry["clip_id"]
-        log.error("%s/%s : publication TikTok en échec : %s", video_id, clip_id, reason)
+        log.error("%s/%s : publication en échec : %s", video_id, clip_id, reason)
         publish_mod.mark_failed(video_id, clip_id, channel, reason, capture=capture, halted=halted, state_dir=state_dir)
         if halted and account:
             try:

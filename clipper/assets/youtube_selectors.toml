@@ -15,6 +15,12 @@ version = 1
 # Page ouverte pour la connexion a la main et pour la verification « pret a publier ».
 # vérifié 2026-10-03
 studio = "https://studio.youtube.com"
+# Page d'envoi d'une chaine ({channel_id} = identifiant UC lu dans l'adresse de Studio) : ouvre la dialog d'envoi.
+# vérifié 2026-10-03
+upload = "https://studio.youtube.com/channel/{channel_id}/videos/upload?d=ud"
+# Adresse publique d'un Short ({id} = identifiant lu dans le lien affiche des l'etape Details).
+# vérifié 2026-10-03
+short = "https://youtube.com/shorts/{id}"
 
 [expect]
 # Connecte : l'adresse devient studio.youtube.com/channel/<UC...>/... ; le groupe capture l'identifiant de la chaine.
@@ -23,11 +29,42 @@ channel_url_pattern = 'studio\.youtube\.com/channel/(UC[\w-]+)'
 # Fragments d'adresse de la connexion Google (aussi ses pages de verification) : non connecte = pas pret.
 # vérifié 2026-10-03
 login_url_markers = ["accounts.google.com"]
+# Fragments d'adresse des verifications Google (« confirmez votre identite ») : arret « verification », pas « login ».
+# NON VÉRIFIÉ
+verification_url_markers = ["/signin/challenge", "/speedbump", "/v3/signin/challenge"]
+# La dialog d'envoi est ouverte (adresse de la page d'envoi).
+# NON VÉRIFIÉ
+upload_url_marker = "/videos/upload"
+# Lien du Short affiche des l'etape Details : le groupe capture l'identifiant de la video.
+# vérifié 2026-10-03
+short_id_pattern = 'youtube\.com/shorts/([\w-]+)'
+# Valeur d'un champ de date (« 4 oct. 2026 ») et d'un champ d'heure (« 00:00 ») de la section Programmer,
+# reperes par leur valeur (les ids input-N sont instables).
+# vérifié 2026-10-03
+date_value_pattern = '^\d{1,2}\s+\S+\s+\d{4}$'
+# vérifié 2026-10-03
+time_value_pattern = '^\d{1,2}:\d{2}$'
 
 [labels]
 # La navigation affiche « Votre chaîne <nom de la chaine> ».
 # vérifié 2026-10-03
 channel_prefix = "Votre chaîne"
+# Libelles des boutons, radios et sections de la dialog d'envoi (YouTube Studio en francais, vérifié 2026-10-03).
+next = "Suivant"
+kids_yes = "Oui, elle est conçue pour les enfants"
+kids_no = "Non, elle n'est pas conçue pour les enfants"
+visibility_public = "Publique"
+visibility_unlisted = "Non répertoriée"
+visibility_private = "Privée"
+expand_schedule = "Click to expand"
+timezone_button = "Fuseau horaire"
+# Fuseau a choisir (texte de l'option contenant « Paris ») ; « Heure locale » = fuseau du PC : jamais (SPEC-5e50 R8).
+timezone_wanted = "Paris"
+timezone_forbidden = "Heure locale"
+# Libelle du bouton final selon le mode : immediat public/non repertorie, immediat prive, programme.
+final_publish = "Publier"
+final_save = "Enregistrer"
+final_schedule = "Programmer"
 
 [selectors]
 # Navigation de Studio (ARIA : navigation > img dont le nom est le nom de la chaine) ; son texte porte
@@ -35,6 +72,33 @@ channel_prefix = "Votre chaîne"
 # sur la vraie page.
 # NON VÉRIFIÉ
 navigation = "[role='navigation']"
+# Champ de fichier de la dialog d'envoi (set_input_files).
+# vérifié 2026-10-03
+file_input = "input[type='file']"
+# Zones de texte de l'etape Details : 1re = titre, 2e = description (div#textbox role=textbox).
+# vérifié 2026-10-03
+text_box = "div#textbox[role='textbox']"
+# Radio de la dialog, vise par libelle ({label}).
+# NON VÉRIFIÉ
+radio = "tp-yt-paper-radio-button:has-text(\"{label}\")"
+# Bouton vise par libelle ({label}) : Suivant, Fuseau horaire.
+# NON VÉRIFIÉ
+labeled_button = "button:has-text(\"{label}\")"
+# Section « Programmer » repliee : controle dont le nom accessible est « Click to expand ».
+# NON VÉRIFIÉ
+expand = "[aria-label=\"{label}\"]"
+# Champs texte de la section Programmer (date et heure) : input.tp-yt-paper-input, reperes par leur valeur.
+# vérifié 2026-10-03
+text_input = "input.tp-yt-paper-input"
+# Options de la liste des fuseaux horaires : « (UTC+02:00) Paris ».
+# NON VÉRIFIÉ
+timezone_option = "[role='option']"
+# Bouton final de la dialog (Enregistrer, Publier ou Programmer selon le choix) ; son libelle est relu avant le clic.
+# NON VÉRIFIÉ
+final_button = "#done-button"
+# Lien youtube.com/shorts/<id> affiche des l'etape Details.
+# vérifié 2026-10-03
+video_link = "a[href*='youtube.com/shorts/']"
 
 [modal]
 # Fenetre surgissante (role ARIA dialog) et son bouton, vise par libelle ({label}, sans guillemet double).
@@ -47,3 +111,24 @@ button = "button:has-text(\"{label}\")"
 # Fenetres connues : fragment de leur texte -> libelle du bouton qui les ferme. Toute autre fenetre = arret.
 # Dialog « Bienvenue dans YouTube Studio » de la 1re visite, bouton « Continuer » (textes : vérifié 2026-10-03).
 "Bienvenue dans YouTube Studio" = "Continuer"
+
+[calendar]
+# Mois abreges tels que YouTube Studio (en francais) les affiche dans la date : « 4 oct. 2026 ».
+# « oct. » est releve ; les 11 autres suivent l'usage francais, NON VÉRIFIÉ (un mois illisible arrete la publication).
+months = ["janv.", "févr.", "mars", "avr.", "mai", "juin", "juil.", "août", "sept.", "oct.", "nov.", "déc."]
+
+
+[success]
+# Titres de la fenetre affichee une fois la video envoyee : toute valeur de la liste du mode vaut preuve.
+# « Vidéo mise en ligne » : vérifié 2026-10-03 (publique immediate).
+published = ["Vidéo mise en ligne"]
+# NON VÉRIFIÉ : programmation et privee non relevees ; sans l'un de ces titres, arret « publish_unconfirmed » a verifier en reel.
+scheduled = ["Vidéo programmée", "Vidéo planifiée"]
+# NON VÉRIFIÉ
+saved = ["Vidéo enregistrée"]
+
+[detect]
+# Presence d'un de ces elements = arret immediat (captcha, verification de compte). NON VÉRIFIÉ : jamais rencontres
+# pendant le releve ; la connexion Google (adresse accounts.google.com) est deja couverte par [expect].
+captcha = ["iframe[src*='recaptcha']", "#captcha-form"]
+verification = ["#challenge", "[data-challengetype]"]

@@ -16,6 +16,7 @@ const PUB_STATUS = {
 // Statut TikTok d'une publication (SPEC-9225 R3, R4), calcule par l'API : prime sur le statut de la file.
 const PUB_TIKTOK = {
   pending: { label: "En attente", cls: "pending" }, in_progress: { label: "En cours", cls: "info" }, scheduled_on_tiktok: { label: "Programmée sur TikTok", cls: "info" },
+  scheduled_on_youtube: { label: "Programmée sur YouTube", cls: "info" },
   published: { label: "Publiée", cls: "ok" }, failed: { label: "Échec", cls: "bad" },
 };
 const PUB_STALE_MS = 4000;
@@ -28,6 +29,11 @@ const pubUi = { account: "", week: "", key: "", data: null, error: null, loading
 // Publications pilotees (SPEC-1ed3) : GET /api/publications, independantes du compte choisi.
 const pubPosts = { data: null, error: null, loading: null, dirty: false, at: 0 };
 
+/* Libelle d'un compte avec son service (« Ma chaîne (YouTube) ») : les comptes des deux services sont proposes (SPEC-5e50 R2). */
+const pubAccountText = (a) => {
+  const service = a.service_label || (a.service === "youtube" ? "YouTube" : a.service === "tiktok" ? "TikTok" : "");
+  return `${a.label || a.id}${service ? ` (${service})` : ""}`;
+};
 const pubAccountLabel = (id) => {
   const accounts = [...((pubUi.data && pubUi.data.accounts) || []), ...((pubPosts.data && pubPosts.data.accounts) || [])];
   const found = accounts.find((a) => a.id === id);
@@ -40,10 +46,12 @@ const pubTitle = (c) => c.screen_title || c.title || c.clip_id;
    une fois l'heure passee (`tiktok_live`, calcule par le serveur). */
 function pubStatusOf(c) {
   if (c.waiting_reason) return { label: "En attente du compte", cls: "warn" };
-  if (c.tiktok_status === "scheduled_on_tiktok" && c.tiktok_live) return PUB_TIKTOK.published;
+  if (pubIsScheduledOnService(c) && c.tiktok_live) return PUB_TIKTOK.published;
   return PUB_TIKTOK[c.tiktok_status] || pubStatus(c);
 }
 const pubChip = (c) => { const s = pubStatusOf(c); return `<span class="chip ${s.cls}">${esc(s.label)}</span>`; };
+const pubIsScheduledOnService = (c) => c.tiktok_status === "scheduled_on_tiktok" || c.tiktok_status === "scheduled_on_youtube";
+const pubServiceName = (c) => (c.service === "youtube" || c.tiktok_status === "scheduled_on_youtube" ? "YouTube" : "TikTok");
 const pubCaptionText = (c) => [c.description || "", (c.hashtags || []).join(" ")].filter(Boolean).join("\n\n");
 // Toutes les heures affichees sont celles de Paris (Europe/Paris, ete +02:00 / hiver +01:00), jamais un
 // decalage fixe : le serveur donne les champs *_paris (zoneinfo) que l'on lit tels quels, et tout autre
@@ -189,9 +197,9 @@ function pubQueue(d) {
 
 /* Ligne de detail d'une publication terminee : « programmee » tant que l'heure n'est pas passee, « publie » ensuite. */
 function pubDoneLine(c) {
-  const live = c.publish_status !== "published" || c.tiktok_status !== "scheduled_on_tiktok" || c.tiktok_live;
+  const live = c.publish_status !== "published" || !pubIsScheduledOnService(c) || c.tiktok_live;
   const state = c.publish_status === "failed" ? "échec"
-    : live ? "publié" : `programmée sur TikTok${c.tiktok_publish_at ? `, en ligne le ${pubWhen(c.tiktok_publish_at)}` : ""}`;
+    : live ? "publié" : `programmée sur ${pubServiceName(c)}${c.tiktok_publish_at ? `, en ligne le ${pubWhen(c.tiktok_publish_at)}` : ""}`;
   const at = c.publish_status === "published" && !live ? "" : (c.publish_status === "published" ? (c.published_at_paris || c.slot_at_paris) : c.slot_at_paris);
   return `${state}${at ? ` · ${pubSlotLabel(at)}` : ""}`;
 }
@@ -203,7 +211,7 @@ function pubDone(d) {
     <div class="panel">${d.done.map((c) => `<div class="list-item pub-done" data-post="${esc(pubKey(c))}" tabindex="0" role="button">
       <div class="mini-clip">${c.video_url ? `<img loading="lazy" decoding="async" width="36" height="64" src="${esc(c.thumbnail_url)}" alt="">` : ""}</div>
       <div class="li-main grow"><div class="li-title">${esc(pubTitle(c))}</div>
-        <div class="li-sub muted">${esc(pubDoneLine(c))}${c.account ? ` · ${esc(pubAccountLabel(c.account))}` : ""}${c.publish_error ? ` · ${esc(c.publish_error)}` : ""}${c.post_url ? ` · <a href="${esc(c.post_url)}" target="_blank" rel="noopener">voir sur TikTok</a>` : ""}</div></div>
+        <div class="li-sub muted">${esc(pubDoneLine(c))}${c.account ? ` · ${esc(pubAccountLabel(c.account))}` : ""}${c.publish_error ? ` · ${esc(c.publish_error)}` : ""}${c.post_url ? ` · <a href="${esc(c.post_url)}" target="_blank" rel="noopener">voir sur ${pubServiceName(c)}</a>` : ""}</div></div>
       ${pubChip(c)}</div>`).join("")}</div>
   </section>`;
 }
@@ -217,7 +225,7 @@ function pubToolbar(d) {
   const weekLabel = d ? `${pubFmt(d.week_start, { day: "numeric", month: "short" })} au ${pubFmt(d.week_end, { day: "numeric", month: "short", year: "numeric" })}` : "";
   const style = d && d.channel ? `Style : <b>${esc(d.channel)}</b>` : (d && d.account ? `<span class="muted">Compte sans style</span>` : "");
   return `<div class="toolbar pub-toolbar">
-    <select class="input" id="pub-account" aria-label="Compte TikTok"><option value="">Tous les comptes</option>${pubAccounts(d).map((a) => `<option value="${esc(a.id)}"${a.id === pubUi.account ? " selected" : ""}>${esc(a.label || a.id)}</option>`).join("")}</select>
+    <select class="input" id="pub-account" aria-label="Compte de publication"><option value="">Tous les comptes</option>${pubAccounts(d).map((a) => `<option value="${esc(a.id)}"${a.id === pubUi.account ? " selected" : ""}>${esc(pubAccountText(a))}</option>`).join("")}</select>
     <div class="row" style="gap:4px"><button type="button" class="icon-btn" data-week="-1" aria-label="Semaine précédente"${d ? "" : " disabled"}>${icon("chevron-left")}</button>
       <h2 style="font-size:16px;min-width:11ch;text-align:center">${esc(weekLabel)}</h2>
       <button type="button" class="icon-btn" data-week="1" aria-label="Semaine suivante"${d ? "" : " disabled"}>${icon("chevron-right")}</button>
@@ -306,6 +314,7 @@ async function pubPostCancel(p) {
 /* ---------- Formulaire « Nouvelle publication » (SPEC-1ed3 R1, R2) ---------- */
 
 const PUB_VISIBILITIES = [["public", "Tout le monde"], ["friends", "Ami(e)s"], ["private", "Toi uniquement"]];
+const PUB_YT_VISIBILITIES = [["public", "Publique"], ["unlisted", "Non répertoriée"], ["private", "Privée"]];
 const PUB_CHECKS = [["off", "Désactivée (rapide)"], ["wait", "Attendre le résultat (~10 min)"]];
 
 function pubFormClips(clips) {
@@ -313,11 +322,29 @@ function pubFormClips(clips) {
     .sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")) || pubKey(b).localeCompare(pubKey(a)));
 }
 
+const pubWhenHint = (f, service) => (service === "youtube"
+  ? `Programmer : YouTube programme la vidéo (heure de Paris, publiée comme publique) si la date est entre ${f.ytMinMinutes} min et ${f.ytMaxDays} jours ; au-delà, Clipper la garde et la programme le moment venu.`
+  : `Programmer : TikTok programme la vidéo si la date est entre ${f.minMinutes} min et ${f.maxDays} jours ; au-delà, Clipper la garde et la programme le moment venu.`);
+
+/* Service (tiktok | youtube) du compte choisi dans le formulaire : les reglages affiches sont ceux de ce service. */
+function pubFormService(d) {
+  const pick = $("#pub-form-account", d);
+  const chosen = pick && pick.selectedOptions && pick.selectedOptions[0];
+  return (chosen && chosen.dataset.service) || "tiktok";
+}
+
+function pubFormShowService(f, d) {
+  const youtube = pubFormService(d) === "youtube";
+  $("#pub-form-tiktok", d).hidden = youtube;
+  $("#pub-form-youtube", d).hidden = !youtube;
+  $("#pub-form-when-hint", d).textContent = pubWhenHint(f, youtube ? "youtube" : "tiktok");
+}
+
 function pubFormHtml(f) {
   const videos = Array.from(new Set(f.clips.map((c) => c.video_id)));
   const channels = Array.from(new Set(f.clips.map((c) => c.channel || ""))).sort();
   const ready = f.accounts.filter((a) => a.ready_to_publish);
-  const o = f.options;
+  const o = f.options, y = f.ytOptions;
   const editing = Boolean(f.edit);
   return `
     <div class="modal-head"><h2>${editing ? "Modifier la publication" : "Nouvelle publication"}</h2>
@@ -330,25 +357,38 @@ function pubFormHtml(f) {
           <select class="input" id="pub-form-channel" aria-label="Filtrer par style"><option value="">Tous les styles</option>${channels.map((ch) => `<option value="${esc(ch)}">${esc(ch || "sans style")}</option>`).join("")}</select></div>
         <div class="pubf-clips" id="pub-form-clips" role="listbox" aria-label="Clips à publier"></div></div>`}
       <div class="field"><label for="pub-form-account">Compte</label>
-        <select class="input" id="pub-form-account">${ready.length ? ready.map((a) => `<option value="${esc(a.id)}">${esc(a.label || a.id)}</option>`).join("") : `<option value="">Aucun compte prêt à publier</option>`}</select>
+        <select class="input" id="pub-form-account">${ready.length ? ready.map((a) => `<option value="${esc(a.id)}" data-service="${esc(a.service || "tiktok")}">${esc(pubAccountText(a))}</option>`).join("") : `<option value="">Aucun compte prêt à publier</option>`}</select>
         <span class="hint">Seuls les comptes « prêts à publier » (écran Comptes) sont proposés ; prérempli avec le compte du style.</span></div>
       <div class="field"><span class="field-label">Quand</span>
         <div class="row wrap" style="gap:16px">
           <label class="row" style="gap:6px"><input type="radio" name="pub-form-when" value="immediate" id="pub-form-now"${f.mode === "immediate" ? " checked" : ""}> Maintenant</label>
           <label class="row" style="gap:6px"><input type="radio" name="pub-form-when" value="scheduled" id="pub-form-later"${f.mode === "scheduled" ? " checked" : ""}> Programmer</label>
           <input class="input" id="pub-form-at" type="datetime-local" aria-label="Date et heure"${f.mode === "scheduled" ? "" : " hidden"} value="${esc(f.at || "")}"></div>
-        <span class="hint">Programmer : TikTok programme la vidéo si la date est entre ${esc(f.minMinutes)} min et ${esc(f.maxDays)} jours ; au-delà, Clipper la garde et la programme le moment venu.</span></div>
+        <span class="hint" id="pub-form-when-hint">${esc(pubWhenHint(f, "tiktok"))}</span></div>
       <div class="field"><label for="pub-form-caption">Légende</label><textarea class="input" id="pub-form-caption" rows="3">${esc(f.caption)}</textarea></div>
       <div class="field"><label for="pub-form-tags">Hashtags</label><input class="input" id="pub-form-tags" value="${esc(f.tags)}"><span class="hint">Séparés par des espaces.</span></div>
-      <div class="field"><label for="pub-form-visibility">Visibilité</label>
-        <select class="input" id="pub-form-visibility">${PUB_VISIBILITIES.map(([k, l]) => `<option value="${k}"${o.visibility === k ? " selected" : ""}>${esc(l)}</option>`).join("")}</select>
-        <span class="hint">Une vidéo « Toi uniquement » ne peut pas être programmée (règle de TikTok).</span></div>
-      <div class="field"><span class="field-label">Autoriser</span>
-        <label class="row" style="gap:6px"><input type="checkbox" id="pub-form-comments"${o.allow_comments ? " checked" : ""}> Les commentaires</label>
-        <label class="row" style="gap:6px"><input type="checkbox" id="pub-form-reuse"${o.allow_reuse ? " checked" : ""}> La réutilisation du contenu (duo, collage)</label>
-        <label class="row" style="gap:6px"><input type="checkbox" id="pub-form-ai"${o.ai_generated ? " checked" : ""}> Contenu généré par IA (étiquette)</label></div>
-      <div class="field"><label for="pub-form-check">Vérification de contenu</label>
-        <select class="input" id="pub-form-check">${PUB_CHECKS.map(([k, l]) => `<option value="${k}"${o.content_check === k ? " selected" : ""}>${esc(l)}</option>`).join("")}</select></div>
+      <div class="stack" id="pub-form-tiktok" style="gap:16px">
+        <div class="field"><label for="pub-form-visibility">Visibilité</label>
+          <select class="input" id="pub-form-visibility">${PUB_VISIBILITIES.map(([k, l]) => `<option value="${k}"${o.visibility === k ? " selected" : ""}>${esc(l)}</option>`).join("")}</select>
+          <span class="hint">Une vidéo « Toi uniquement » ne peut pas être programmée (règle de TikTok).</span></div>
+        <div class="field"><span class="field-label">Autoriser</span>
+          <label class="row" style="gap:6px"><input type="checkbox" id="pub-form-comments"${o.allow_comments ? " checked" : ""}> Les commentaires</label>
+          <label class="row" style="gap:6px"><input type="checkbox" id="pub-form-reuse"${o.allow_reuse ? " checked" : ""}> La réutilisation du contenu (duo, collage)</label>
+          <label class="row" style="gap:6px"><input type="checkbox" id="pub-form-ai"${o.ai_generated ? " checked" : ""}> Contenu généré par IA (étiquette)</label></div>
+        <div class="field"><label for="pub-form-check">Vérification de contenu</label>
+          <select class="input" id="pub-form-check">${PUB_CHECKS.map(([k, l]) => `<option value="${k}"${o.content_check === k ? " selected" : ""}>${esc(l)}</option>`).join("")}</select></div>
+      </div>
+      <div class="stack" id="pub-form-youtube" style="gap:16px" hidden>
+        <div class="field"><label for="pub-form-yt-title">Titre YouTube</label>
+          <input class="input" id="pub-form-yt-title" maxlength="100" value="${esc(f.ytTitle || "")}">
+          <span class="hint">100 caractères au plus ; par défaut le titre d'écran du clip. La description est la légende et les hashtags ci-dessus : #Shorts y est ajouté s'il manque.</span></div>
+        <div class="field"><label for="pub-form-yt-visibility">Visibilité</label>
+          <select class="input" id="pub-form-yt-visibility">${PUB_YT_VISIBILITIES.map(([k, l]) => `<option value="${k}"${y.visibility === k ? " selected" : ""}>${esc(l)}</option>`).join("")}</select>
+          <span class="hint">Une vidéo programmée est publiée « comme publique » : « Publique » est exigée pour programmer.</span></div>
+        <div class="field"><span class="field-label">Public</span>
+          <label class="row" style="gap:6px"><input type="checkbox" id="pub-form-yt-kids"${y.made_for_kids ? " checked" : ""}> Conçue pour les enfants</label>
+          <span class="hint">Non par défaut (réponse obligatoire de YouTube Studio).</span></div>
+      </div>
       <p class="reason bad" id="pub-form-error" hidden role="alert"></p>
     </div>
     <div class="modal-foot"><button type="button" class="btn btn-ghost" data-dismiss>Fermer</button><span class="grow"></span>
@@ -375,25 +415,31 @@ async function pubFormSelect(f, d, key) {
   if (!c) return;
   $("#pub-form-caption", d).value = c.description || "";
   $("#pub-form-tags", d).value = (c.hashtags || []).join(" ");
+  $("#pub-form-yt-title", d).value = c.screen_title || "";  // titre YouTube par defaut = titre d'ecran du clip
   pubFormClipCards(f, d);
   try {
     const out = await api(`/api/publish/accounts?channel=${pubEnc(c.channel || "")}`);
     const pick = $("#pub-form-account", d);
     const known = f.accounts.find((a) => a.id === out.default && a.ready_to_publish);
-    if (known) pick.value = known.id;
+    if (known) { pick.value = known.id; pubFormShowService(f, d); }
   } catch (err) { /* pas de compte par defaut : le choix reste a l'utilisateur */ }
 }
 
 function pubFormBody(f, d) {
   const now = $("#pub-form-now", d).checked;
-  const body = {
-    account: $("#pub-form-account", d).value, mode: now ? "immediate" : "scheduled",
-    description: $("#pub-form-caption", d).value, hashtags: parseHashtags($("#pub-form-tags", d).value),
-    options: {
+  const youtube = pubFormService(d) === "youtube";
+  const title = $("#pub-form-yt-title", d).value.trim();
+  const options = youtube
+    ? Object.assign({ visibility: $("#pub-form-yt-visibility", d).value, made_for_kids: $("#pub-form-yt-kids", d).checked }, title ? { title } : {})
+    : {
       visibility: $("#pub-form-visibility", d).value, allow_comments: $("#pub-form-comments", d).checked,
       allow_reuse: $("#pub-form-reuse", d).checked, ai_generated: $("#pub-form-ai", d).checked,
       content_check: $("#pub-form-check", d).value,
-    },
+    };
+  const body = {
+    account: $("#pub-form-account", d).value, mode: now ? "immediate" : "scheduled",
+    description: $("#pub-form-caption", d).value, hashtags: parseHashtags($("#pub-form-tags", d).value),
+    options,
   };
   if (!now) {
     const at = $("#pub-form-at", d).value;
@@ -438,7 +484,10 @@ async function pubOpenForm(preset, edit) {
   const base = edit || (preset && clips.find((c) => c.video_id === preset.video_id && c.clip_id === preset.clip_id)) || null;
   const f = {
     clips: pubFormClips(clips), accounts: data.accounts, edit: edit || null, selected: base && !edit ? pubKey(base) : "",
-    options: Object.assign({}, data.defaults.options, edit ? edit.post_options : {}),
+    options: Object.assign({}, data.defaults.options, edit && edit.service !== "youtube" ? edit.post_options : {}),
+    ytOptions: Object.assign({}, data.defaults.youtube.options, edit && edit.service === "youtube" ? edit.post_options : {}),
+    ytTitle: edit && edit.service === "youtube" && edit.post_options && edit.post_options.title ? edit.post_options.title : (base ? (base.screen_title || "") : ""),
+    ytMinMinutes: data.defaults.youtube.schedule_min_minutes, ytMaxDays: data.defaults.youtube.schedule_max_days,
     mode: edit && edit.publish_mode === "scheduled" ? "scheduled" : "immediate",
     at: edit && edit.publish_mode === "scheduled" && edit.slot_at ? pubLocalInput(edit.slot_at) : "",
     caption: base ? (base.description || "") : "", tags: base ? (base.hashtags || []).join(" ") : "",
@@ -456,6 +505,8 @@ async function pubOpenForm(preset, edit) {
       if (f.selected) pubFormSelect(f, d, f.selected);
     }
     if (edit && edit.account) $("#pub-form-account", d).value = edit.account;
+    $("#pub-form-account", d).onchange = () => pubFormShowService(f, d);
+    pubFormShowService(f, d);
     $$("input[name='pub-form-when']", d).forEach((r) => (r.onchange = () => { $("#pub-form-at", d).hidden = !$("#pub-form-later", d).checked; }));
     $("#pub-form-submit", d).onclick = () => pubFormSubmit(f, d);
   });
@@ -551,7 +602,7 @@ function pubAccountField(c) {
   const accounts = (pubUi.data && pubUi.data.accounts) || [];
   const locked = c.publish_status === "published" || c.missing;
   const options = accounts.filter((a) => a.ready_to_publish || a.id === c.account)
-    .map((a) => `<option value="${esc(a.id)}"${a.id === c.account ? " selected" : ""}${a.ready_to_publish ? "" : " disabled"}>${esc(a.label || a.id)}${a.ready_to_publish ? "" : " (non prêt à publier)"}</option>`);
+    .map((a) => `<option value="${esc(a.id)}"${a.id === c.account ? " selected" : ""}${a.ready_to_publish ? "" : " disabled"}>${esc(pubAccountText(a))}${a.ready_to_publish ? "" : " (non prêt à publier)"}</option>`);
   if (!c.account) options.unshift(`<option value="" selected>Aucun compte</option>`);
   return `<div class="field"><label for="pub-account">Compte de publication</label>
     <select class="input" id="pub-account" data-pub-account${locked ? " disabled" : ""}>${options.join("")}</select>
