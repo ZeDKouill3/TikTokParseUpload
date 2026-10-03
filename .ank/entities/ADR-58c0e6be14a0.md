@@ -5,7 +5,7 @@ slug: publication-et-statistiques-youtube-shorts-par-p
 title: Publication et statistiques YouTube (Shorts) par pilotage d'un vrai navigateur sur YouTube Studio, comme TikTok
 created: 2026-10-03T08:47:11Z
 author: nicoc@zedk_ordi
-status: proposed
+status: accepted
 scope:
   - clipper/youtube.py
   - clipper/browser.py
@@ -15,8 +15,12 @@ scope:
   - clipper/assets/youtube_selectors.toml
 constraint: |
   Toute action sur YouTube en tant que compte de publication (publication immédiate ou programmée, lecture des statistiques) passe par clipper.youtube ; aucun autre module ne publie sur YouTube (le téléchargement des vidéos sources reste dans clipper.download). Backend browser : Playwright sur un vrai Chrome visible, profil persistant par compte sous state/browser/<compte>/ (clipper.browser) ; connexion faite à la main par l'utilisateur, jamais de saisie d'identifiant ni de mot de passe ; profil jamais versionné ni copié hors de state/. Captcha, vérification Google, page ou élément inattendu = arrêt immédiat, publication remise en attente avec capture et raison journalisées ; aucun contournement. Rythme humain, plafonds par compte en config, un seul compte piloté à la fois tous services confondus. Aucun test par défaut ne touche YouTube, le réseau ni un vrai navigateur.
+ratified: 2bc7d5329f7d
+verified:
+  - by: nicoc@zedk_ordi
+    at: 2026-10-03T09:13:57Z
 schema: 4
-version: 1
+version: 2
 ---
 
 ## Contexte
