@@ -149,6 +149,14 @@ def test_wheel_contains_rubric_and_config_example_assets(tmp_path):
     assert "clipper/assets/config.example.toml" in names
 
 
+def test_cuda_extra_declares_cublas_and_cudnn():
+    """TASK-f6c495f901c0 (SPEC-38f7 R4) : l'installeur doit pouvoir installer
+    'clipper[cuda]' plutot que de deposer les paquets nvidia a la main."""
+    extra = _load_pyproject()["project"]["optional-dependencies"]["cuda"]
+    assert any(dep.startswith("nvidia-cublas-cu12") for dep in extra)
+    assert any(dep.startswith("nvidia-cudnn-cu12") for dep in extra)
+
+
 def _venv_python(venv_dir: Path) -> Path:
     if sys.platform.startswith("win"):
         return venv_dir / "Scripts" / "python.exe"

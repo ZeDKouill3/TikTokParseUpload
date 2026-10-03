@@ -101,10 +101,12 @@ jamais lancé en CI ni par défaut en local.
   incompatibles (mediapipe veut `opencv-contrib-python`, scenedetect veut
   `opencv-python`, même module `cv2`).
 - **faster-whisper en CUDA** a besoin des paquets `nvidia-cublas-cu12` et
-  `nvidia-cudnn-cu12` (CTranslate2 ne les installe pas lui-même), et leurs
-  dossiers `bin` doivent être dans le PATH au lancement — sinon CTranslate2
-  ne voit pas le GPU et `clipper.gpu` retombe sur CPU en silence (ce n'est
-  pas un bug, juste l'absence de CUDA détectée).
+  `nvidia-cudnn-cu12` (CTranslate2 ne les installe pas lui-même) : installer
+  l'extra `clipper[cuda]` (pas de manipulation manuelle du PATH). Leurs
+  dossiers `bin` sont ajoutés au PATH du processus par
+  `clipper.gpu.ensure_cuda_dlls_on_path()`, appelée par `get_device()` —
+  sinon CTranslate2 ne voit pas le GPU et `clipper.gpu` retombe sur CPU en
+  silence (ce n'est pas un bug, juste l'absence de CUDA détectée).
 - Le modèle mediapipe (`blaze_face_short_range.tflite`) est **téléchargé au
   premier lancement** dans le cache utilisateur
   (`~/.cache/clipper/`, donc `%USERPROFILE%\.cache\clipper\` sous Windows) :
