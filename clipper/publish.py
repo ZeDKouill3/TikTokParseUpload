@@ -27,6 +27,7 @@ _DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 
 CONFIG_DEFAULTS: dict[str, object] = {
     "state_dir": "state/publish",
+    "series_default_interval_h": 4,  # intervalle propose par defaut dans le formulaire « Programmer une serie »
 }
 
 TIKTOK_STATES = ("published", "scheduled_on_tiktok")
@@ -1105,3 +1106,308 @@ def all_entries(
     except channel_mod.ChannelError as exc:
         raise PublishError(f"chaînes illisibles : {exc}") from exc
     return found
+
+
+# --------------------------------------------------------------------------
+# Série programmée (TASK-5bbf, SPEC-1ed3, SPEC-6076 R3/R6) : choix automatique
+# (N meilleurs clips par score) ou manuel (ordre de selection choisi par
+# l'utilisateur) de clips a publier a cadence reguliere (debut + k x X h, en
+# duree reelle). Une serie en plusieurs parties est prise entiere, dans
+# l'ordre, ou pas du tout ; N compte des posts (une partie = un post).
+# Aucun repli silencieux (ADR-ad2e) : l'apercu (preview_series) dit chaque
+# refus, la creation (create_series) est tout ou rien.
+# --------------------------------------------------------------------------
+
+
+def plan_series_dates(start_at: datetime, interval_hours: int, count: int) -> list[datetime]:
+    """Dates d'une serie (debut + k x intervalle, k=0..count-1), en duree reelle : conversion
+    en UTC puis arithmetique sur des ``timedelta`` (jamais d'arithmetique murale) : un changement
+    d'heure d'ete/hiver ne decale jamais l'ecart entre deux publications."""
+    if start_at.tzinfo is None:
+        raise PublishError("série : la date de début doit avoir un fuseau horaire")
+    if not isinstance(interval_hours, int) or isinstance(interval_hours, bool) or interval_hours < 1:
+        raise PublishError("intervalle invalide : un nombre entier d'heures >= 1 est attendu (pas de demi-heure)")
+    if not isinstance(count, int) or isinstance(count, bool) or count < 1:
+        raise PublishError("nombre de publications invalide : un entier >= 1 est attendu")
+    start_utc = start_at.astimezone(timezone.utc)
+    step = timedelta(hours=interval_hours)
+    return [start_utc + i * step for i in range(count)]
+
+
+def _unit_members(output_dir: str | Path, video_id: str, clip_id: str, sidecar: dict[str, Any]) -> list[str]:
+    """Les clip_id d'une serie (celle de ``clip_id`` incluse), tries par numero de partie ; ``[clip_id]``
+    si ce n'est pas une serie en plusieurs parties."""
+    series_id, part = _series_info(video_id, clip_id, sidecar)
+    if series_id is None:
+        return [clip_id]
+    ordered = [(part or 1, clip_id)]
+    for sibling_id in _sibling_clip_ids(output_dir, video_id, series_id, exclude=clip_id):
+        sibling_sidecar = _read_sidecar(output_dir, video_id, sibling_id)
+        _, sibling_part = _series_info(video_id, sibling_id, sibling_sidecar)
+        ordered.append((sibling_part or 1, sibling_id))
+    ordered.sort(key=lambda pair: pair[0])
+    return [cid for _, cid in ordered]
+
+
+def _eligible_units(
+    output_dir: str | Path, video_id: str, channel: str | None, entries: dict[tuple[str, str], dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Unites (une serie entiere) de ce ``video_id`` pretes a publier (``ready``) et absentes de
+    ``entries`` (jamais publiees, en file ni programmees) ; une partie indisponible exclut toute la serie."""
+    out_dir = Path(output_dir) / video_id
+    seen: set[str] = set()
+    units: list[dict[str, Any]] = []
+    for path in sorted(out_dir.glob("*.json")):
+        clip_id = path.stem
+        if clip_id in seen:
+            continue
+        sidecar = _read_sidecar(output_dir, video_id, clip_id)
+        members = _unit_members(output_dir, video_id, clip_id, sidecar)
+        seen.update(members)
+        member_sidecars = [sidecar if m == clip_id else _read_sidecar(output_dir, video_id, m) for m in members]
+        if not all(s.get("ready") is True for s in member_sidecars):
+            continue
+        if any((video_id, m) in entries for m in members):
+            continue
+        units.append({"video_id": video_id, "channel": channel, "clip_ids": members, "score": sidecar.get("score")})
+    return units
+
+
+def available_series_clips(
+    style: str | None, *, workspace_dir: str | Path = "workspace", output_dir: str | Path = "output",
+    state_dir: str | Path | None = None,
+) -> list[dict[str, Any]]:
+    """Unites de clips (chacune une serie entiere, parties triees) pretes a publier et absentes de toute
+    file de publication, optionnellement filtrees par ``style`` (``None`` = tous les styles, y compris les
+    videos sans style). L'ordre rendu n'est PAS trie par score (voir ``preview_series``)."""
+    workspace_root = Path(workspace_dir)
+    if not workspace_root.is_dir():
+        return []
+    units: list[dict[str, Any]] = []
+    entries_cache: dict[str, dict[tuple[str, str], dict[str, Any]]] = {}
+    for video_dir in sorted(p for p in workspace_root.iterdir() if p.is_dir()):
+        pipeline_path = video_dir / "pipeline.json"
+        if not pipeline_path.exists():
+            continue
+        state = json.loads(pipeline_path.read_text(encoding="utf-8"))
+        channel = state.get("channel")
+        if style is not None and channel != style:
+            continue
+        file_channel = channel or NO_CHANNEL
+        if file_channel not in entries_cache:
+            entries_cache[file_channel] = {
+                (e["video_id"], e["clip_id"]): e for e in _load_entries(_state_path(file_channel, state_dir))
+            }
+        out_dir = Path(output_dir) / video_dir.name
+        if not out_dir.is_dir():
+            continue
+        units.extend(_eligible_units(output_dir, video_dir.name, channel, entries_cache[file_channel]))
+    return units
+
+
+def _series_item_refusal(when: datetime, settings: dict[str, Any], now_dt: datetime, service: str) -> str | None:
+    """Refus explicite (ADR-ad2e) d'une date de serie, ou None : date deja passee, sous l'avance minimale, ou
+    au-dela de la fenetre de programmation du service (contrairement a ``create_post`` seul, une serie refuse
+    une date hors fenetre plutot que de la garder en attente : trop de publications a surveiller a la main)."""
+    label = SERVICE_LABELS.get(service, service)
+    if when <= now_dt:
+        return f"date déjà passée : {when.isoformat()}"
+    minutes = int(settings["schedule_min_minutes"])
+    if when < now_dt + timedelta(minutes=minutes):
+        return (f"date à moins de {minutes} minutes (avance minimale de {label}) : "
+                "choisis un début plus tardif ou un intervalle plus grand")
+    days = int(settings["schedule_max_days"])
+    if when > now_dt + timedelta(days=days):
+        return (f"date hors fenêtre de programmation de {label} (plus de {days} jours à l'avance) : "
+                "réduis le nombre de vidéos, l'intervalle, ou avance le début")
+    return None
+
+
+def _auto_series_units(pool: list[dict[str, Any]], count: int) -> tuple[list[dict[str, Any]], int]:
+    """Les meilleures unites (score decroissant) qui tiennent dans ``count`` posts : une unite trop grande
+    pour les places restantes est sautee (jamais coupee), la suivante (par score) est tentee (complement
+    utilisateur du 2026-10-03)."""
+    ordered = sorted(
+        pool, key=lambda u: (-(u["score"] if u["score"] is not None else float("-inf")), u["video_id"], u["clip_ids"][0])
+    )
+    selected: list[dict[str, Any]] = []
+    used = 0
+    for unit in ordered:
+        if used >= count:
+            break
+        size = len(unit["clip_ids"])
+        if used + size > count:
+            continue
+        selected.append(unit)
+        used += size
+    return selected, used
+
+
+def _manual_series_units(
+    pool: list[dict[str, Any]], selection: list[tuple[str, str]],
+) -> tuple[list[dict[str, Any]], int]:
+    """Les unites choisies a la main, dans l'ordre de selection : cocher n'importe quelle partie d'une serie
+    selectionne la serie entiere ; une serie deja selectionnee (par une autre de ses parties) n'est pas
+    comptee deux fois. Leve ``PublishError`` si une selection ne correspond a aucune unite disponible."""
+    if not selection:
+        raise PublishError("série manuelle : choisis au moins un clip")
+    by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    for unit in pool:
+        for clip_id in unit["clip_ids"]:
+            by_key[(unit["video_id"], clip_id)] = unit
+
+    selected: list[dict[str, Any]] = []
+    seen: set[tuple[str, tuple[str, ...]]] = set()
+    used = 0
+    for video_id, clip_id in selection:
+        unit = by_key.get((video_id, clip_id))
+        if unit is None:
+            raise PublishError(
+                f"clip indisponible pour la série : {video_id}/{clip_id} (déjà en file, publié ou pas prêt)"
+            )
+        unit_key = (unit["video_id"], tuple(unit["clip_ids"]))
+        if unit_key in seen:
+            continue
+        seen.add(unit_key)
+        selected.append(unit)
+        used += len(unit["clip_ids"])
+    return selected, used
+
+
+def preview_series(
+    *,
+    mode: str,
+    style: str | None,
+    account: str,
+    service: str = "tiktok",
+    interval_hours: int,
+    start_at: datetime,
+    count: int | None = None,
+    selection: list[tuple[str, str]] | None = None,
+    settings: dict[str, Any] | None = None,
+    now: datetime | None = None,
+    workspace_dir: str | Path = "workspace",
+    output_dir: str | Path = "output",
+    state_dir: str | Path | None = None,
+    presets_dir: str | Path = "presets",
+    base: str | Path = "config.toml",
+) -> dict[str, Any]:
+    """Apercu d'une serie programmee (SPEC-1ed3, SPEC-6076 R3/R6), sans rien creer. ``mode`` ``auto`` :
+    les meilleurs clips par score jusqu'a ``count`` posts (une partie = un post, une serie incomplete est
+    sautee entiere). ``mode`` ``manual`` : ``selection`` (video_id, clip_id) dans l'ordre choisi par
+    l'utilisateur ; cocher une partie ajoute toute sa serie. Chaque publication prevue est a
+    ``start_at + k x interval_hours`` (duree reelle) ; un refus (date hors fenetre, sous l'avance minimale,
+    plafond du compte) est explicite par publication (ADR-ad2e), jamais un decalage silencieux. Rend
+    ``{"items", "available", "requested", "insufficient", "insufficient_reason", "ok"}`` ; ``ok`` est faux
+    des qu'un item est refuse ou que la serie est incomplete."""
+    if mode not in ("auto", "manual"):
+        raise PublishError(f"mode de série invalide : {mode!r} (attendu : auto | manual)")
+    if not account:
+        raise PublishError("compte de publication manquant : choisis un compte prêt à publier")
+
+    settings = service_settings(service, settings)
+    now_dt = _now(now)
+    pool = available_series_clips(style, workspace_dir=workspace_dir, output_dir=output_dir, state_dir=state_dir)
+
+    if mode == "auto":
+        if not isinstance(count, int) or isinstance(count, bool) or count < 1:
+            raise PublishError("nombre de vidéos invalide : un entier >= 1 est attendu")
+        selected_units, used = _auto_series_units(pool, count)
+        requested = count
+    else:
+        selected_units, used = _manual_series_units(pool, selection or [])
+        requested = used
+
+    dates = plan_series_dates(start_at, interval_hours, used) if used else []
+
+    items: list[dict[str, Any]] = []
+    committed: list[datetime] = list(
+        planned_times(account, state_dir=state_dir, presets_dir=presets_dir, base=base)
+    )
+    i = 0
+    for unit in selected_units:
+        channel = unit["channel"] or NO_CHANNEL
+        tz = _tz(channel_settings(channel, presets_dir, base))
+        for clip_id in unit["clip_ids"]:
+            when = dates[i]
+            i += 1
+            refusal = _series_item_refusal(when, settings, now_dt, service)
+            if refusal is None:
+                reason = tiktok.check_limits(committed, when, settings, tz)
+                if reason is not None:
+                    next_at = tiktok.next_allowed(committed, when, settings, tz)
+                    refusal = str(LimitError(reason, next_at, tz))
+                else:
+                    committed.append(when)
+            items.append({
+                "video_id": unit["video_id"], "clip_id": clip_id, "channel": unit["channel"],
+                "score": unit["score"], "publish_at": _iso(when), "refusal": refusal,
+            })
+
+    insufficient = mode == "auto" and used < count
+    insufficient_reason = None
+    if insufficient:
+        plural = "s" if used > 1 else ""
+        insufficient_reason = f"seulement {used} vidéo{plural} disponible{plural} (demandé : {count})"
+    ok = not insufficient and bool(items) and all(it["refusal"] is None for it in items)
+    return {
+        "mode": mode, "requested": requested, "available": used,
+        "insufficient": insufficient, "insufficient_reason": insufficient_reason,
+        "items": items, "ok": ok,
+    }
+
+
+def create_series(
+    *,
+    mode: str,
+    style: str | None,
+    account: str,
+    service: str = "tiktok",
+    interval_hours: int,
+    start_at: datetime,
+    count: int | None = None,
+    selection: list[tuple[str, str]] | None = None,
+    settings: dict[str, Any] | None = None,
+    now: datetime | None = None,
+    workspace_dir: str | Path = "workspace",
+    output_dir: str | Path = "output",
+    state_dir: str | Path | None = None,
+    presets_dir: str | Path = "presets",
+    base: str | Path = "config.toml",
+) -> list[dict[str, Any]]:
+    """Cree une serie programmee (SPEC-1ed3, SPEC-6076 R3/R6) : ``preview_series`` d'abord, puis une entree
+    ``create_post`` par publication, dans l'ordre. Tout ou rien (ADR-ad2e) : un seul item refuse, ou moins de
+    clips que demande, et RIEN n'est cree ; si la creation echoue en cours de route (etat change entre
+    l'apercu et la creation), les entrees deja creees sont annulees avant de relever l'erreur."""
+    preview = preview_series(
+        mode=mode, style=style, account=account, service=service, interval_hours=interval_hours,
+        start_at=start_at, count=count, selection=selection, settings=settings, now=now,
+        workspace_dir=workspace_dir, output_dir=output_dir, state_dir=state_dir, presets_dir=presets_dir, base=base,
+    )
+    if preview["insufficient"]:
+        raise PublishError(f"série refusée : {preview['insufficient_reason']}")
+    if not preview["items"]:
+        raise PublishError("série refusée : aucun clip disponible")
+    bad = [it for it in preview["items"] if it["refusal"]]
+    if bad:
+        reasons = "; ".join(f"{it['video_id']}/{it['clip_id']} : {it['refusal']}" for it in bad)
+        raise PublishError(f"série refusée (aucune publication créée) : {reasons}")
+
+    created: list[tuple[str | None, dict[str, Any]]] = []
+    try:
+        for item in preview["items"]:
+            when = datetime.fromisoformat(item["publish_at"])
+            entry = create_post(
+                item["video_id"], item["clip_id"], item["channel"], account=account, mode="scheduled",
+                publish_at=when, settings=settings, now=now, output_dir=output_dir, state_dir=state_dir,
+                presets_dir=presets_dir, base=base, service=service,
+            )
+            created.append((item["channel"], entry))
+    except (PublishError, channel_mod.ChannelError, ConfigError):
+        for channel, entry in created:
+            try:
+                cancel_post(entry["video_id"], entry["clip_id"], channel, state_dir=state_dir)
+            except PublishError:
+                pass
+        raise
+    return [entry for _, entry in created]

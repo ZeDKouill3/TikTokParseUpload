@@ -2409,6 +2409,70 @@ def create_app(config: Config | None = None) -> FastAPI:
                           state_dir=_publish_dir(config))
         return Response(status_code=204)
 
+    # ----------------------------------------------------------------
+    # Série programmée (TASK-5bbf, SPEC-1ed3, SPEC-6076 R3/R6) : choix auto
+    # (N meilleurs clips) ou manuel (ordre choisi), apercu obligatoire puis
+    # création tout ou rien. Tout le calcul (dates, choix des clips, refus)
+    # passe par clipper.publish ; aucune logique ici au-dela de la mise en
+    # forme de la reponse.
+    # ----------------------------------------------------------------
+
+    def _series_scope(service: str) -> dict[str, Any]:
+        return {"workspace_dir": Path(config.workspace_dir), "output_dir": Path(config.output_dir),
+                "state_dir": _publish_dir(config), "presets_dir": _PRESETS_DIR, "base": _BASE_CONFIG,
+                "settings": _publication_settings(config, service)}
+
+    @app.get("/api/publications/series/clips")
+    def series_clips(style: str | None = None) -> dict[str, Any]:
+        """Clips disponibles pour une serie (memes exclusions que le choix automatique) : une unite par
+        serie (parties regroupees et triees), pour le mode manuel du formulaire."""
+        units = publish_mod.available_series_clips(
+            style or None, workspace_dir=Path(config.workspace_dir), output_dir=Path(config.output_dir),
+            state_dir=_publish_dir(config))
+        out = []
+        for unit in units:
+            lead = _read_clip_sidecar(config, unit["video_id"], unit["clip_ids"][0])
+            out.append({
+                "video_id": unit["video_id"], "clip_id": unit["clip_ids"][0], "clip_ids": unit["clip_ids"],
+                "channel": unit["channel"], "score": unit["score"], "parts_total": len(unit["clip_ids"]),
+                "screen_title": lead.get("screen_title"), "title": lead.get("title"),
+                "thumbnail_url": f"/media/clip/{unit['video_id']}/{unit['clip_ids'][0]}/thumbnail",
+            })
+        return {"units": out, "default_interval_h": config.section("publish")["series_default_interval_h"]}
+
+    def _series_view(item: dict[str, Any]) -> dict[str, Any]:
+        sidecar = _read_clip_sidecar(config, item["video_id"], item["clip_id"])
+        return {
+            "video_id": item["video_id"], "clip_id": item["clip_id"], "channel": item["channel"],
+            "score": item["score"], "screen_title": sidecar.get("screen_title"), "title": sidecar.get("title"),
+            "thumbnail_url": f"/media/clip/{item['video_id']}/{item['clip_id']}/thumbnail",
+            "part": sidecar.get("part"), "parts_total": sidecar.get("parts_total"),
+            "publish_at": item["publish_at"], "publish_at_paris": _paris(item["publish_at"]),
+            "refusal": item["refusal"],
+        }
+
+    def _series_kwargs(body: SeriesBody) -> dict[str, Any]:
+        account = _require_ready_account(config, body.account)
+        service = _account_service(config, account)
+        selection = [(s.video_id, s.clip_id) for s in (body.selection or [])] if body.mode == "manual" else None
+        return dict(
+            mode=body.mode, style=body.style or None, account=account, service=service,
+            interval_hours=body.interval_hours, start_at=_publish_parse_slot(body.start_at),
+            count=body.count, selection=selection, **_series_scope(service),
+        )
+
+    @app.post("/api/publications/series/preview")
+    def preview_series_endpoint(body: SeriesBody) -> dict[str, Any]:
+        kwargs = _series_kwargs(body)
+        preview = _publication_call(publish_mod.preview_series, **kwargs)
+        return {**preview, "items": [_series_view(it) for it in preview["items"]]}
+
+    @app.post("/api/publications/series", status_code=201)
+    def create_series_endpoint(body: SeriesBody) -> dict[str, Any]:
+        kwargs = _series_kwargs(body)
+        created = _publication_call(publish_mod.create_series, **kwargs)
+        return {"created": len(created)}
+
     @app.get("/api/publish/{video_id}/{clip_id}/capture")
     def publish_capture(video_id: str, clip_id: str) -> FileResponse:
         """Capture d'ecran d'un arret sur (SPEC-9225 R4) : seulement un .png sous
@@ -2826,6 +2890,22 @@ class PublicationBody(BaseModel):
     options: dict[str, Any] | None = None
     description: str | None = None
     hashtags: list[str] | None = None
+
+
+class SeriesSelectionItem(BaseModel):
+    video_id: str
+    clip_id: str
+
+
+class SeriesBody(BaseModel):
+    """Formulaire « Programmer une série » (TASK-5bbf, SPEC-1ed3, SPEC-6076 R3/R6)."""
+    mode: str                                   # auto | manual
+    style: str | None = None                    # None = tous les styles
+    account: str
+    interval_hours: int
+    start_at: str
+    count: int | None = None                    # requis en mode auto
+    selection: list[SeriesSelectionItem] | None = None  # requis en mode manuel, dans l'ordre choisi
 
 
 class PublicationPatchBody(BaseModel):
