@@ -1186,13 +1186,19 @@ def test_fix_chunk_result_is_cached_and_a_retried_pass_only_recalls_the_missing_
     segments = _many_word_segments(4)  # fix_chunk_words=1 -> 4 tranches
     attempts: dict[str, int] = {}
     lock = threading.Lock()
+    mot3_started = threading.Event()
 
     def respond(request):
         line = next(l for l in request.prompt.splitlines() if "\t" in l)
         _, word_text = line.split("\t", 1)
         with lock:
             attempts[word_text] = attempts.get(word_text, 0) + 1
+        if word_text == "mot3":
+            mot3_started.set()
         if word_text == "mot2":
+            # attend que mot3 soit parti : sinon l'annulation des tranches en attente (cancel_futures)
+            # peut l'annuler avant son demarrage, selon l'ordonnancement des threads (test instable).
+            mot3_started.wait(timeout=5)
             raise llm.TransientLLMError("quota")  # echoue aux 2 essais (initial + re-essai)
         return {"corrections": [{"i": 0, "old": word_text, "word": word_text.upper()}]}
 
