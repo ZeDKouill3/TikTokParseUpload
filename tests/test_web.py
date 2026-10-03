@@ -2989,6 +2989,85 @@ def test_get_publish_corrupt_publish_file_is_a_500_not_an_empty_week(tmp_path, i
     assert resp.status_code == 500 and "publication" in resp.json()["detail"]
 
 
+# --------------------------------------------------------------------------
+# Calendrier : vues Jour / Semaine / Mois (TASK-ad4d) : parametre ``range``
+# explicite (day/week/month, 422 sinon), bornes calculees en Europe/Paris
+# cote Python, regroupement par jour (``days``) sans jamais perdre une
+# publication meme a la meme minute.
+# --------------------------------------------------------------------------
+
+
+def test_get_publish_rejects_invalid_range(tmp_path, isolated_cwd):
+    _publish_setup(tmp_path)
+
+    resp = _get_publish(tmp_path, range="annee")
+
+    assert resp.status_code == 422 and "range" in resp.json()["detail"]
+
+
+def test_get_publish_defaults_to_week_range_with_bounds_unchanged(tmp_path, isolated_cwd):
+    _publish_setup(tmp_path, [_entry("01", "scheduled", slot_at=PUB_THU)])
+
+    data = _get_publish(tmp_path).json()
+
+    assert data["range"] == "week"
+    assert data["range_start"] == data["week_start"] == "2026-10-05"
+    assert data["range_end"] == data["week_end"] == "2026-10-11"
+    assert len(data["days"]) == 7
+    thu_box = data["days"][3]
+    assert thu_box["date"] == "2026-10-08" and thu_box["count"] == 1
+    assert thu_box["posts"][0]["clip_id"] == "01"
+
+
+def test_get_publish_day_range_bounds_and_keeps_slot_grid(tmp_path, isolated_cwd):
+    _publish_setup(tmp_path, [_entry("01", "scheduled", slot_at=PUB_THU)])
+
+    data = _get_publish(tmp_path, range="day", week="2026-10-08").json()
+
+    assert data["range"] == "day"
+    assert data["range_start"] == data["range_end"] == "2026-10-08"
+    assert len(data["days"]) == 1
+    assert data["days"][0]["date"] == "2026-10-08" and data["days"][0]["count"] == 1
+    assert [s["slot_at"] for s in data["slots"]] == [PUB_THU]     # cible de depot : creneau du jour conserve
+    assert data["slots"][0]["free"] is False
+
+
+def test_get_publish_month_range_has_every_day_and_no_slot_grid(tmp_path, isolated_cwd):
+    _publish_setup(tmp_path, [_entry("01", "scheduled", slot_at=PUB_THU)])
+
+    data = _get_publish(tmp_path, range="month", week="2026-10-15").json()
+
+    assert data["range"] == "month"
+    assert data["range_start"] == "2026-10-01" and data["range_end"] == "2026-10-31"
+    assert len(data["days"]) == 31
+    assert data["slots"] == []                                    # pas de cible de depot en vue Mois
+    thu_box = next(d for d in data["days"] if d["date"] == "2026-10-08")
+    assert thu_box["count"] == 1
+
+
+def test_get_publish_day_groups_every_publication_without_losing_same_minute_duplicates(tmp_path, isolated_cwd):
+    extra = [
+        _entry("07", "scheduled", slot_at="2026-10-08T20:00:00+02:00"),
+        _entry("08", "scheduled", slot_at="2026-10-08T20:00:00+02:00"),      # meme minute que 07
+    ] + [
+        _entry(str(10 + i), "published" if i % 2 == 0 else "scheduled",
+               slot_at=f"2026-10-08T{6 + i:02d}:00:00+02:00",
+               published_at=f"2026-10-08T{6 + i:02d}:05:00+02:00" if i % 2 == 0 else None)
+        for i in range(10)
+    ]
+    _publish_setup(tmp_path, extra)
+
+    data = _get_publish(tmp_path, range="day", week="2026-10-08").json()
+
+    day = data["days"][0]
+    assert day["date"] == "2026-10-08" and day["count"] == 12
+    ids = [p["clip_id"] for p in day["posts"]]
+    assert len(ids) == 12 and len(set(ids)) == 12                # aucune ecrasee, meme a la meme minute
+    assert ids.count("07") == 1 and ids.count("08") == 1
+    times = [p["slot_at_paris"] or p["published_at_paris"] for p in day["posts"]]
+    assert times == sorted(times)                                 # triees par heure de Paris
+
+
 def test_publish_move_calls_publish_move_with_the_slot(tmp_path, isolated_cwd, monkeypatch):
     from clipper import publish
 
@@ -3250,6 +3329,18 @@ def test_publish_screen_is_wired_with_calendar_queue_and_actions():
     assert "Aucune publication en attente" in js                           # état vide
     for sel in (".cal", ".cal-c", ".post", "TASK-503d"):
         assert sel in css, sel
+
+
+def test_publish_calendar_css_scales_day_boxes_and_never_overflows_the_page():
+    css = (STATIC / "style.css").read_text(encoding="utf-8")
+
+    for sel in (".cal-day", ".cal-day.dense", ".cal-day.compact", ".cal-month", ".pub-day-list"):
+        assert sel in css, sel
+    body = css[css.index(".cal-day {"):css.index(".cal-day {") + css[css.index(".cal-day {"):].index("}")]
+    assert "overflow-y: auto" in body and "max-height" in body          # defile plutot que deborder sur la page
+
+
+# --------------------------------------------------------------------------
 # Ecran Reglages (SPEC-c100 E8, ADR-4f6e §2 et §5) : config.toml en formulaire
 # --------------------------------------------------------------------------
 
@@ -6839,20 +6930,35 @@ def test_finished_posts_leave_the_ongoing_list_and_an_approved_one_without_momen
     assert "choisis Maintenant ou une date (Modifier)" in out["row"]
 
 
+def _week_days(posts_by_date):
+    """``days`` d'une semaine 2026-10-05..2026-10-11 (TASK-ad4d) : une entree par date, vide sauf override."""
+    out = []
+    for i in range(7):
+        from datetime import date, timedelta
+        ymd = (date(2026, 10, 5) + timedelta(days=i)).isoformat()
+        posts = posts_by_date.get(ymd, [])
+        out.append({"date": ymd, "count": len(posts), "posts": posts})
+    return out
+
+
 @_NODE
 def test_publication_layout_always_shows_the_calendar_with_a_single_pending_list():
-    week = {"account": "ab12cd", "channel": "ma_chaine", "timezone": "Europe/Paris", "week_start": "2026-10-05", "week_end": "2026-10-11",
+    done_clip = {"video_id": "v", "clip_id": "03", "publish_status": "published", "screen_title": "Publié", "service": "tiktok",
+                 "slot_at": "2026-10-06T09:00:00+00:00", "slot_at_paris": "2026-10-06T11:00:00+02:00",
+                 "published_at_paris": "2026-10-06T11:00:00+02:00", "video_url": "/m", "thumbnail_url": "/t"}
+    manual_clip = {"video_id": "v", "clip_id": "02", "publish_status": "scheduled", "screen_title": "Manuel", "service": "tiktok",
+                   "slot_at": "2026-10-07T12:15:00+00:00", "slot_at_paris": "2026-10-07T14:15:00+02:00",
+                   "video_url": "/m", "thumbnail_url": "/t"}
+    week = {"account": "ab12cd", "channel": "ma_chaine", "timezone": "Europe/Paris", "range": "week",
+            "range_start": "2026-10-05", "range_end": "2026-10-11", "week_start": "2026-10-05", "week_end": "2026-10-11",
             "slots": [{"slot_at": "2026-10-05T18:30:00+02:00", "slot_at_paris": "2026-10-05T18:30:00+02:00", "clip": None, "free": True}],
             "unscheduled": [{"video_id": "v", "clip_id": "01", "publish_status": "approved", "screen_title": "T", "video_url": "/m", "thumbnail_url": "/t"}],
-            "done": [{"video_id": "v", "clip_id": "03", "publish_status": "published", "screen_title": "Publié", "service": "tiktok",
-                      "slot_at": "2026-10-06T09:00:00+00:00", "slot_at_paris": "2026-10-06T11:00:00+02:00",
-                      "published_at_paris": "2026-10-06T11:00:00+02:00", "video_url": "/m", "thumbnail_url": "/t"}],
-            "off_slot": [{"video_id": "v", "clip_id": "02", "publish_status": "scheduled", "screen_title": "Manuel", "service": "tiktok",
-                          "slot_at": "2026-10-07T12:15:00+00:00", "slot_at_paris": "2026-10-07T14:15:00+02:00",
-                          "video_url": "/m", "thumbnail_url": "/t"}],
+            "done": [done_clip],
+            "off_slot": [manual_clip],
+            "days": _week_days({"2026-10-06": [done_clip], "2026-10-07": [manual_clip]}),
             "accounts": [{"id": "ab12cd", "label": "Compte exemple", "ready_to_publish": True},
                          {"id": "ef34ab", "label": "second_compte", "ready_to_publish": True}], "reason": None}
-    empty = {**week, "slots": [], "off_slot": [], "done": [], "reason": "aucun créneau défini dans [channel].slots"}
+    empty = {**week, "slots": [], "off_slot": [], "done": [], "days": _week_days({}), "reason": "aucun créneau défini dans [channel].slots"}
     out = _run_publish(f"""(() => {{
       pubUi.account = 'ab12cd';
       const withSlots = pubLayoutHtml({json.dumps(week)}, pubPostsSection());
@@ -6871,6 +6977,80 @@ def test_publication_layout_always_shows_the_calendar_with_a_single_pending_list
     assert "data-pub-new" in out["noSlots"] and "data-pub-new" in out["loading"]     # « Nouvelle publication » même sans créneau ni calendrier chargé
     assert 'id="pub-account"' in html and "Tous les comptes" in html                 # sélecteur : tous les comptes + un par compte
     assert '<option value="ab12cd" selected>Compte exemple</option>' in html and "second_compte" in html
+
+
+# --------------------------------------------------------------------------
+# Calendrier : vues Jour / Semaine / Mois côté JS (TASK-ad4d)
+# --------------------------------------------------------------------------
+
+
+def test_publish_calendar_has_a_day_week_month_switch_defaulting_to_week():
+    js = (STATIC / "screens" / "publish.js").read_text(encoding="utf-8")
+
+    assert 'range: "week"' in js                                       # Semaine par défaut, retenue dans pubUi (session)
+    assert "data-range" in js and "pubUi.range" in js
+    for label in ('"Jour"', '"Semaine"', '"Mois"'):
+        assert label in js, label
+
+
+@_NODE
+def test_publish_box_density_class_scales_with_post_count():
+    out = _run_publish("[0, 1, 3, 4, 6, 7, 15].map(pubBoxClass)")
+    assert out == ["", "", "", "dense", "dense", "compact", "compact"]
+
+
+@_NODE
+def test_publish_shift_month_stays_on_the_first_and_rolls_over_the_year():
+    out = _run_publish("""({
+      next: pubShiftMonth('2026-01-31', 1),
+      prev: pubShiftMonth('2026-01-15', -1),
+      rollover: pubShiftMonth('2026-12-05', 1),
+    })""")
+    assert out["next"] == "2026-02-01"      # jamais le 31 janvier + 1 mois ne deborde sur mars
+    assert out["prev"] == "2025-12-01"
+    assert out["rollover"] == "2027-01-01"  # franchit l'annee
+
+
+@_NODE
+def test_publish_range_label_reads_server_bounds_without_recomputing_dates():
+    out = _run_publish("""({
+      day: pubRangeLabel({ range: 'day', range_start: '2026-10-08' }),
+      week: pubRangeLabel({ range: 'week', week_start: '2026-10-05', week_end: '2026-10-11' }),
+      month: pubRangeLabel({ range: 'month', range_start: '2026-10-01' }),
+      none: pubRangeLabel(null),
+    })""")
+    assert "8" in out["day"] and "octobre" in out["day"] and "2026" in out["day"]
+    assert "2026" in out["week"] and "oct" in out["week"].lower()
+    assert "octobre" in out["month"] and "2026" in out["month"] and "8" not in out["month"]
+    assert out["none"] == ""
+
+
+@_NODE
+def test_publish_day_view_lists_time_account_service_title_and_status():
+    clip = {"video_id": "v", "clip_id": "01", "publish_status": "scheduled", "screen_title": "Titre", "service": "tiktok",
+            "account": "ab12cd", "slot_at": "2026-10-08T10:00:00+00:00", "slot_at_paris": "2026-10-08T12:00:00+02:00",
+            "video_url": "/m", "thumbnail_url": "/t"}
+    day = {"range": "day", "range_start": "2026-10-08", "range_end": "2026-10-08",
+           "slots": [{"slot_at": "2026-10-08T16:00:00+02:00", "slot_at_paris": "2026-10-08T16:00:00+02:00", "clip": None, "free": True}],
+           "days": [{"date": "2026-10-08", "count": 1, "posts": [clip]}]}
+
+    out = _run_publish(f"pubCalendarDay({json.dumps(day)})")
+
+    assert "12:00" in out and "Titre" in out and "Planifié" in out          # heure, titre, statut
+    assert "data-post-account" in out                                      # compte
+    assert "data-slot-at" in out and "16:00" in out                        # créneau libre : toujours une cible de dépôt en Jour
+
+
+@_NODE
+def test_publish_month_view_has_no_drop_targets_and_pads_leading_and_trailing_days():
+    days = [{"date": f"2026-10-{d:02d}", "count": 0, "posts": []} for d in range(1, 32)]
+    month = {"range": "month", "range_start": "2026-10-01", "range_end": "2026-10-31", "slots": [], "days": days}
+
+    out = _run_publish(f"pubCalendarMonth({json.dumps(month)})")
+
+    assert "data-slot-at" not in out                                       # pas de cible de dépôt en vue Mois (SPEC-c100)
+    assert out.count('class="cal-day blank"') == 4                         # 1er octobre 2026 = jeudi : 3 avant, 1 après (31 jours)
+    assert out.count('data-date="2026-10-') == 31
 
 
 def test_publication_help_texts_describe_optional_slots_and_the_new_publication_flow():
