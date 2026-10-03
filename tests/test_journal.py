@@ -498,3 +498,19 @@ def test_main_keeps_the_console_handler_at_its_own_level_while_lowering_root_for
     console_handlers = [h for h in root.handlers if not isinstance(h, journal.JournalHandler)]
     assert console_handlers and all(h.level == logging.WARNING for h in console_handlers)
     assert root.level <= logging.INFO
+
+
+def test_handler_closed_by_a_logging_reconfiguration_reopens_and_never_raises(tmp_path):
+    # Constat réel 2026-10-03 : uvicorn reconfigure le logging au démarrage (dictConfig), ce qui ferme
+    # TOUS les handlers existants sans les retirer du logger racine ; le handler fermé faisait planter
+    # chaque requête web (AssertionError dans _append). Il doit se rouvrir tout seul.
+    handler = journal.JournalHandler(tmp_path / "logs", "serve[1]", retention_days=2)
+    record = logging.LogRecord("x", logging.INFO, __file__, 1, "avant", None, None)
+    handler.emit(record)
+    handler.close()
+
+    handler.emit(logging.LogRecord("x", logging.INFO, __file__, 1, "apres fermeture", None, None))
+
+    text = "".join(p.read_text(encoding="utf-8") for p in (tmp_path / "logs").glob("journal-*.log"))
+    assert "avant" in text and "apres fermeture" in text
+    handler.close()

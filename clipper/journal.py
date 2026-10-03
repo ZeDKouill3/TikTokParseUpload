@@ -187,15 +187,17 @@ class JournalHandler(logging.Handler):
     def emit(self, record: logging.LogRecord) -> None:
         try:
             today = _today()
-            if today != self._day:
+            # fd ferme : une reconfiguration du logging (uvicorn, dictConfig) ferme tous les handlers
+            # existants sans les retirer du logger racine -> on rouvre au lieu de planter la requete.
+            if today != self._day or self._fd is None:
                 if self._fd is not None:
                     os.close(self._fd)
                 self._open_for(today)
             self._append(format_line(record, self._process_tag).encode("utf-8"))
-        except OSError as exc:
+        except Exception as exc:  # noqa: BLE001 - le journal ne doit jamais casser l'action journalisee
             if not self._warned:
                 self._warned = True
-                print(f"journal : ecriture impossible ({exc})", file=sys.stderr)
+                print(f"journal : ecriture impossible ({type(exc).__name__}: {exc})", file=sys.stderr)
 
     def close(self) -> None:
         if self._fd is not None:
