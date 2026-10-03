@@ -1662,3 +1662,71 @@ def test_create_series_manual_respects_the_chosen_order(isolated_cwd):
 
     assert [e["clip_id"] for e in created] == ["a", "b"]
     assert [e["slot_at"] for e in created] == [start.isoformat(), (start + timedelta(hours=2)).isoformat()]
+
+
+# --------------------------------------------------------------------------
+# TASK-2456 (revue r-publication I4) : mark_in_progress = prise en main atomique sous verrou
+# --------------------------------------------------------------------------
+
+
+def test_taking_an_entry_returns_the_entry_read_under_the_lock(isolated_cwd):
+    from clipper import publish
+
+    _setup(isolated_cwd)
+    snapshot = _post(isolated_cwd)
+
+    taken = publish.mark_in_progress("vid1", "03", "ma_chaine", now=NOW, expected=snapshot)
+
+    assert taken["in_progress_since"] == NOW.isoformat() and taken["account"] == "compte1"
+    assert _read_state(isolated_cwd, "ma_chaine")[0]["in_progress_since"] == NOW.isoformat()
+
+
+@pytest.mark.parametrize("field, value", [
+    ("account", "compte2"),
+    ("slot_at", "2026-10-01T18:00:00+00:00"),
+    ("publish_mode", "scheduled"),
+    ("post_options", {"visibility": "friends"}),
+])
+def test_an_entry_changed_since_the_snapshot_is_not_taken(isolated_cwd, field, value):
+    from clipper import publish
+
+    _setup(isolated_cwd)
+    snapshot = _post(isolated_cwd)
+    stale = {**snapshot, field: value}  # l'instantane du worker ne correspond plus a l'entree relue
+
+    with pytest.raises(publish.PublishError, match="modifiée"):
+        publish.mark_in_progress("vid1", "03", "ma_chaine", now=NOW, expected=stale)
+
+    assert not _read_state(isolated_cwd, "ma_chaine")[0].get("in_progress_since")
+
+
+@pytest.mark.parametrize("status", ["approved", "published", "failed", "rejected"])
+def test_only_a_scheduled_entry_is_taken(isolated_cwd, status):
+    from clipper import publish
+
+    _setup(isolated_cwd)
+    snapshot = _post(isolated_cwd)
+    path = isolated_cwd / "state" / "publish" / "ma_chaine.json"
+    entries = json.loads(path.read_text(encoding="utf-8"))
+    entries[0]["status"] = status
+    path.write_text(json.dumps(entries), encoding="utf-8")
+
+    with pytest.raises(publish.PublishError, match=status):
+        publish.mark_in_progress("vid1", "03", "ma_chaine", now=NOW, expected=snapshot)
+
+    assert _read_state(isolated_cwd, "ma_chaine")[0]["status"] == status
+    assert not _read_state(isolated_cwd, "ma_chaine")[0].get("in_progress_since")
+
+
+def test_an_entry_already_in_progress_is_not_taken_twice(isolated_cwd):
+    from clipper import publish
+
+    _setup(isolated_cwd)
+    snapshot = _post(isolated_cwd)
+    publish.mark_in_progress("vid1", "03", "ma_chaine", now=NOW, expected=snapshot)
+    later = NOW + timedelta(minutes=5)
+
+    with pytest.raises(publish.PublishError, match="en cours"):
+        publish.mark_in_progress("vid1", "03", "ma_chaine", now=later, expected=snapshot)
+
+    assert _read_state(isolated_cwd, "ma_chaine")[0]["in_progress_since"] == NOW.isoformat()

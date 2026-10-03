@@ -17,14 +17,17 @@ est importe a la demande ; les tests branchent un faux avec ``use_playwright``.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
 import shutil
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import threading
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -69,8 +72,8 @@ _cookie_reader: Callable[[str], list[dict[str, Any]]] | None = None  # remplace 
 _popen: Callable[..., Any] = subprocess.Popen  # remplace par les tests : aucun vrai Chrome
 _lock = threading.Lock()
 _active: dict[str, Any] = {}  # comptes dont la fenetre de connexion est ouverte
-_pilot = threading.Lock()  # un seul compte piloté par Playwright à la fois, TikTok comme YouTube
-_pilot_account: str | None = None
+_pilot = threading.Lock()  # fils d'un meme processus ; entre processus : state/pilot.lock (_pilot_lock)
+_PILOT_POLL_S = 0.05
 
 
 class BrowserError(Exception):
@@ -214,20 +217,103 @@ def _is_missing_chrome(message: str) -> bool:
     return "distribution" in low and "not found" in low or "playwright install" in low or "executable doesn't exist" in low
 
 
+def _pilot_paths() -> tuple[Path, Path]:
+    """Verrou de pilotage partage par tous les processus (worker, serveur web, CLI) : ``state/pilot.lock``, et
+    ``state/pilot.json`` qui nomme le compte pilote (message d'attente)."""
+    root = STATE_DIR.parent
+    return root / "pilot.lock", root / "pilot.json"
+
+
+def _try_lock(handle: Any) -> bool:
+    if sys.platform == "win32":
+        import msvcrt
+
+        handle.seek(0)
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
+            return False
+        return True
+    import fcntl
+
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    return True
+
+
+def _unlock(handle: Any) -> None:
+    if sys.platform == "win32":
+        import msvcrt
+
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _pilot_holder() -> str:
+    """Compte pilote par le detenteur du verrou, d'apres ``state/pilot.json`` ; sinon dit pourquoi on l'ignore."""
+    _, holder_path = _pilot_paths()
+    try:
+        holder = json.loads(holder_path.read_text(encoding="utf-8"))
+        return f"{holder['account']} (processus {holder['pid']})"
+    except FileNotFoundError:
+        return "(compte non encore inscrit par l'autre processus)"
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        return f"(compte illisible dans {holder_path} : {type(exc).__name__})"
+
+
+@contextmanager
+def _pilot_lock(account: str, wait: float) -> Iterator[None]:
+    """Un seul compte piloté à la fois, tous services et tous processus confondus (ADR-58c0) : verrou de fil
+    (fils d'un même processus) puis verrou de fichier ``state/pilot.lock`` (worker et serveur web), le tout
+    en ``wait`` secondes au plus ; au-delà, ``BrowserError`` qui nomme le compte piloté."""
+    deadline = time.monotonic() + wait
+
+    def refuse(holder: str) -> BrowserError:
+        return BrowserError(
+            f"le compte {holder} est déjà piloté (un seul compte à la fois, tous services confondus) : "
+            f"attente de {wait:g} s dépassée pour {account}, réessaie quand il a fini"
+        )
+
+    if not _pilot.acquire(timeout=wait):
+        raise refuse(_pilot_holder())
+    try:
+        lock_path, holder_path = _pilot_paths()
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+b") as handle:
+            while not _try_lock(handle):
+                if time.monotonic() >= deadline:
+                    raise refuse(_pilot_holder())
+                time.sleep(_PILOT_POLL_S)
+            try:
+                tmp = holder_path.with_name(f"{holder_path.name}.{os.getpid()}.tmp")
+                tmp.write_text(json.dumps({"account": account, "pid": os.getpid(),
+                                           "since": datetime.now(timezone.utc).isoformat()}), encoding="utf-8")
+                os.replace(tmp, holder_path)
+                yield
+            finally:
+                try:
+                    holder_path.unlink()
+                except OSError as exc:
+                    logger.warning("%s non effacé : %s", holder_path, exc)
+                _unlock(handle)
+    finally:
+        _pilot.release()
+
+
 @contextmanager
 def _open_context(account: str, *, headless: bool, config: Config | None = None) -> Iterator[Any]:
     """Contexte Playwright du profil, en heure de Paris (R8). Un seul compte est piloté à la fois, tous
-    services confondus : un second appel attend ``[browser] pilot_wait_s`` puis échoue explicitement."""
-    global _pilot_account
+    services et tous processus confondus : un second appel attend ``[browser] pilot_wait_s`` puis échoue
+    explicitement."""
     directory = profile_dir(account)
     wait = float(_settings(config)["pilot_wait_s"])
-    if not _pilot.acquire(timeout=wait):
-        raise BrowserError(
-            f"le compte {_pilot_account} est déjà piloté (un seul compte à la fois, tous services confondus) : "
-            f"attente de {wait:g} s dépassée pour {account}, réessaie quand il a fini"
-        )
-    _pilot_account = account
-    try:
+    with _pilot_lock(account, wait):
         manager = _playwright_factory()()
         pw = manager.start()
         try:
@@ -251,9 +337,6 @@ def _open_context(account: str, *, headless: bool, config: Config | None = None)
                     logger.debug("fermeture du contexte : %s", type(exc).__name__)
         finally:
             pw.stop()
-    finally:
-        _pilot_account = None
-        _pilot.release()
 
 
 def _login_url(url: str | None, config: Config | None) -> str:
@@ -409,7 +492,7 @@ def export_cookies(account: str, *, config: Config | None = None) -> Path:
             f"« clipper browser login {account} --url https://www.youtube.com »"
         )
     suffixes = [str(d).lower() for d in _settings(config)["cookie_domains"]]
-    with _open_context(account, headless=True) as context:
+    with _open_context(account, headless=True, config=config) as context:
         cookies = [c for c in context.cookies() if _in_domains(str(c.get("domain", "")), suffixes)]
     if not cookies:
         raise BrowserError(

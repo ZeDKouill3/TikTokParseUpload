@@ -699,26 +699,45 @@ def test_queue_delete_unknown_entry_is_404(tmp_path, isolated_cwd, monkeypatch):
 # --------------------------------------------------------------------------
 
 
-def test_cancel_calls_worker_cancel(tmp_path, isolated_cwd, monkeypatch):
-    from clipper import worker
+def test_cancel_kills_the_running_child_without_failing_the_publication_being_driven(tmp_path, isolated_cwd,
+                                                                                      monkeypatch):
+    """Revues r-publication I1 / r-comptes 1 : l'API ne construit jamais de Worker (ses reprises de demarrage
+    passaient en echec la publication pilotee par le vrai worker) ; l'enfant est arrete par son pid."""
+    import sys
 
-    calls = []
-    monkeypatch.setattr(worker.Worker, "cancel", lambda self, video_id: calls.append(video_id))
+    from clipper import pipeline, worker
 
-    resp = client(tmp_path).post(f"/api/videos/{VIDEO_ID}/cancel")
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        _write_json(tmp_path / "state" / "queue.json", [{
+            "id": "q1", "video_id": VIDEO_ID, "url": URL, "channel": None, "action": "run", "force_steps": [],
+            "enqueued_at": "2026-10-03T10:00:00+00:00", "status": "running", "pid": child.pid}])
+        pipeline.save_state({**pipeline.new_state(VIDEO_ID, URL, "review"), "status": "running"},
+                            config=make_config(tmp_path))
+        driven = {**_publish_entry("autrevideo1", "01", "scheduled", "2026-10-03T10:00:00+00:00"),
+                  "account": "ab12cd", "in_progress_since": "2026-10-03T10:00:00+00:00"}
+        _write_json(tmp_path / "state" / "publish" / "_sans_chaine.json", [driven])
 
-    assert resp.status_code == 200
-    assert calls == [VIDEO_ID]
+        def refuse(self, *args, **kwargs):
+            raise AssertionError("l'API web a construit un Worker")
+
+        monkeypatch.setattr(worker.Worker, "__init__", refuse)
+
+        resp = client(tmp_path).post(f"/api/videos/{VIDEO_ID}/cancel")
+
+        assert resp.status_code == 200, resp.text
+        assert child.wait(timeout=10) is not None
+    finally:
+        if child.poll() is None:
+            child.kill()
+    publications = json.loads((tmp_path / "state" / "publish" / "_sans_chaine.json").read_text(encoding="utf-8"))
+    assert publications == [driven]  # la publication en cours n'est pas passee en echec
+    assert json.loads((tmp_path / "state" / "queue.json").read_text(encoding="utf-8")) == []
+    state = pipeline.load_state(VIDEO_ID, config=make_config(tmp_path))
+    assert (state["status"], state["reason"]) == ("failed", "annulée par l'utilisateur")
 
 
-def test_cancel_not_running_is_404(tmp_path, isolated_cwd, monkeypatch):
-    from clipper import worker
-
-    def fake_cancel(self, video_id):
-        raise worker.WorkerError(f"aucune video en cours pour {video_id!r}")
-
-    monkeypatch.setattr(worker.Worker, "cancel", fake_cancel)
-
+def test_cancel_not_running_is_404(tmp_path, isolated_cwd):
     resp = client(tmp_path).post(f"/api/videos/{VIDEO_ID}/cancel")
 
     assert resp.status_code == 404

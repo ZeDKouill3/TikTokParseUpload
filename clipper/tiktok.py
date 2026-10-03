@@ -24,6 +24,7 @@ file et le worker l'appellent.
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import random
@@ -1202,6 +1203,11 @@ _BACKENDS = {"browser": BrowserBackend, "api": ApiBackend}
 # ---------------------------------------------------------------- interface
 
 
+def _default_opener(config: Config | None) -> Opener:
+    """Profil ouvert par clipper.browser avec les reglages [browser] du config (pilot_wait_s), jamais les defauts."""
+    return functools.partial(browser._open_context, config=config)
+
+
 def publish(
     clip: dict[str, Any], account: str, *, mode: str | None = None, schedule_at: datetime | None = None,
     config: Config | None = None, now: datetime | None = None, selectors: dict[str, Any] | None = None,
@@ -1233,7 +1239,7 @@ def publish(
         return backend.publish()
     return backend.publish(
         clip, browser.validate_account(account), mode=mode, schedule_at=schedule_at, settings=settings,
-        selectors=selectors or load_selectors(), now=now, opener=opener, sleep=sleep,
+        selectors=selectors or load_selectors(), now=now, opener=opener or _default_opener(config), sleep=sleep,
         rng=rng or random.Random(), on_tick=on_tick,
     )
 
@@ -1444,7 +1450,8 @@ def fetch_stats(
     previous = merged_posts(read_history(account, config=config))
     try:
         data = backend.fetch_stats(
-            account, previous, settings=settings, selectors=selectors or load_selectors(), now=now, opener=opener,
+            account, previous, settings=settings, selectors=selectors or load_selectors(), now=now,
+            opener=opener or _default_opener(config),
             sleep=sleep, rng=rng or random.Random(), on_tick=on_tick)
     except (TikTokStop, browser.BrowserError) as exc:
         _record_stats_failure(account, exc, config, settings, now)

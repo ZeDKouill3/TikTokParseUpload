@@ -6,6 +6,8 @@ simules) remplace ``sync_playwright``. Aucun reseau, aucun navigateur.
 
 from __future__ import annotations
 
+import json
+import os
 import subprocess
 import sys
 import threading
@@ -674,3 +676,102 @@ def test_start_login_calls_on_close_once_the_chrome_window_is_closed(cwd, monkey
     assert not closed.is_set()  # la fenetre est encore ouverte
     release.set()
     assert closed.wait(5) and seen == [False]
+
+
+# ------------------------------------------------------------------ verrou de pilotage inter-processus
+# (TASK-2456, revue r-publication I2) : le worker et le serveur web sont deux processus ; deux vrais
+# processus Python, faux Playwright, aucun navigateur.
+
+_PILOT_SCRIPT = r'''
+import json, sys, time
+from pathlib import Path
+from clipper import browser
+
+class Context:
+    pages = []
+    def close(self):
+        pass
+
+class Chromium:
+    def launch_persistent_context(self, user_data_dir, **kwargs):
+        return Context()
+
+class Playwright:
+    chromium = Chromium()
+    def stop(self):
+        pass
+
+class Manager:
+    def start(self):
+        return Playwright()
+
+browser.use_playwright(lambda: Manager())
+account, out, hold = sys.argv[1], Path(sys.argv[2]), float(sys.argv[3])
+try:
+    with browser._open_context(account, headless=True):
+        start = time.time()
+        Path(str(out) + ".inside").write_text("1", encoding="utf-8")
+        time.sleep(hold)
+        end = time.time()
+    out.write_text(json.dumps({"start": start, "end": end}), encoding="utf-8")
+except browser.BrowserError as exc:
+    out.write_text(json.dumps({"error": str(exc)}), encoding="utf-8")
+'''
+
+
+def _pilot_process(cwd, account, out, hold):
+    script = cwd / "pilot_script.py"
+    script.write_text(_PILOT_SCRIPT, encoding="utf-8")
+    env = {**os.environ, "PYTHONPATH": str(ROOT)}
+    return subprocess.Popen([sys.executable, str(script), account, str(out), str(hold)], cwd=cwd, env=env)
+
+
+def _wait_for(path, timeout=30):
+    import time
+
+    deadline = time.monotonic() + timeout
+    while not path.exists():
+        assert time.monotonic() < deadline, f"{path} jamais écrit"
+        time.sleep(0.05)
+
+
+def test_two_processes_never_drive_at_the_same_time(cwd):
+    first = _pilot_process(cwd, "compte_a", cwd / "a.json", 1.5)
+    _wait_for(cwd / "a.json.inside")
+    second = _pilot_process(cwd, "compte_b", cwd / "b.json", 0.2)
+    assert first.wait(60) == 0 and second.wait(60) == 0
+
+    a = json.loads((cwd / "a.json").read_text(encoding="utf-8"))
+    b = json.loads((cwd / "b.json").read_text(encoding="utf-8"))
+    assert b["start"] >= a["end"]  # le second processus a attendu la fin du premier pilotage
+
+
+def test_a_process_gives_up_after_pilot_wait_and_names_the_account_driven_by_another_process(cwd):
+    import time
+
+    holder = _pilot_process(cwd, "compte_worker", cwd / "w.json", 3)
+    try:
+        _wait_for(cwd / "w.json.inside")
+        config = Config(mode="review", workspace_dir=cwd / "workspace", output_dir=cwd / "output",
+                        _sections={"browser": {"pilot_wait_s": 0.3}})
+        fake_playwright_ctx = FakeContext()
+        browser.use_playwright(lambda: FakeManager(FakePlaywright(FakeChromium(fake_playwright_ctx))))
+        started = time.monotonic()
+        with pytest.raises(browser.BrowserError, match="compte_worker") as caught:
+            with browser._open_context("compte_web", headless=True, config=config):
+                pytest.fail("deux processus pilotent en même temps")
+        assert time.monotonic() - started < 2.5  # attente bornee par pilot_wait_s, pas jusqu'a la fin du pilotage
+        assert "compte_web" in str(caught.value)
+    finally:
+        assert holder.wait(60) == 0
+    assert (cwd / "state").is_dir() and any(p.name.startswith("pilot") for p in (cwd / "state").iterdir())
+
+
+def test_the_pilot_lock_is_free_again_once_the_other_process_has_finished(cwd, monkeypatch):
+    holder = _pilot_process(cwd, "compte_worker", cwd / "w.json", 0.1)
+    assert holder.wait(60) == 0
+    fake_playwright(monkeypatch)
+    config = Config(mode="review", workspace_dir=cwd / "workspace", output_dir=cwd / "output",
+                    _sections={"browser": {"pilot_wait_s": 0.3}})
+    with browser._open_context("compte_web", headless=True, config=config):
+        pass

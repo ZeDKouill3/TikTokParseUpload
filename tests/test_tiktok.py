@@ -2548,3 +2548,22 @@ def test_viewers_and_engagement_are_skipped_below_the_audience_threshold(tmp_pat
     post = tiktok.video_detail("ma_chaine", ID_A, config=env.config)
     assert post["viewers"] is None and post["engagement"] is None
     assert tiktok.CONFIG_DEFAULTS["stats_audience_min_views"] == 100
+
+
+# ---------------------------------------------------------------- [browser] pilot_wait_s (TASK-2456, revue M5)
+
+
+def test_the_pilot_wait_of_the_config_reaches_the_browser_for_publishing_and_stats(env, monkeypatch):
+    monkeypatch.setitem(browser.CONFIG_DEFAULTS, "pilot_wait_s", 5)  # le defaut ne doit pas s'appliquer
+    config = Config(mode="review", workspace_dir=env.config.workspace_dir, output_dir=env.config.output_dir,
+                    _sections={"tiktok": {"content_check": "wait"}, "browser": {"pilot_wait_s": 0.2}})
+    calls = {
+        "publish": lambda: tiktok.publish(env.clip, "ma_chaine", mode="immediate", config=config, now=NOW),
+        "fetch_stats": lambda: tiktok.fetch_stats("ma_chaine", config=config, now=NOW),
+    }
+    with browser._pilot_lock("compte_occupe", 1):  # un autre compte est en cours de pilotage
+        for name, call in calls.items():
+            started = time.monotonic()
+            with pytest.raises(browser.BrowserError, match="compte_occupe"):
+                call()
+            assert time.monotonic() - started < 2, f"{name} : pilot_wait_s de config.toml ignoré"
