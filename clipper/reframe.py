@@ -227,6 +227,18 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "letterbox_zoom": 1.3,
     # Ordonnée (sortie) où commence le panneau vidéo du format letterbox.
     "letterbox_top": 440,
+    # Zone du titre d'écran en letterbox, {x, y, w, h} en pixels du canevas ; vide = au-dessus de la vidéo.
+    # Zones de texte du format letterbox réglables par style (éditeur
+    # d'agencement, TASK-3be3), en pixels du canevas 1080x1920. {} (défaut) =
+    # zone déduite comme avant : titre de safe_top jusqu'à text_gap au-dessus
+    # de la vidéo, sous-titres de text_gap sous la vidéo jusqu'à la bande
+    # « Partie N », toutes deux de safe_left à safe_right. Un rectangle doit
+    # tenir dans la zone sûre TikTok, sans chevaucher l'autre zone de texte
+    # ni la bande « Partie N » (erreur explicite au chargement), ni la vidéo
+    # nette (erreur explicite au recadrage).
+    "letterbox_title_dest": {},
+    # Zone des sous-titres en letterbox, {x, y, w, h} en pixels du canevas ; vide = sous la vidéo.
+    "letterbox_subtitle_dest": {},
     # Zone sûre TikTok (sortie 1080x1920) : aucun texte hors de ces bornes.
     "safe_top": 160,
     "safe_bottom": 1520,
@@ -1108,6 +1120,11 @@ def _letterbox_geometry(source_w: int, source_h: int, settings: dict[str, Any]) 
         h -= 1
 
     main_rect = (0, letterbox_top, out_w, letterbox_top + h)
+    if main_rect[3] > out_h:
+        raise ReframeError(
+            f"[reframe] la video nette (letterbox_top {letterbox_top}, letterbox_zoom {zoom}) sort du cadre "
+            f"{out_w}x{out_h} pour une source {source_w}x{source_h} : bas a y={main_rect[3]}"
+        )
 
     safe_left = int(settings["safe_left"])
     safe_right = int(settings["safe_right"])
@@ -1121,6 +1138,10 @@ def _letterbox_geometry(source_w: int, source_h: int, settings: dict[str, Any]) 
         "subtitles": (safe_left, letterbox_top + h + text_gap, safe_right, safe_bottom - part_height - text_gap),
         "part": (safe_left, safe_bottom - part_height, safe_right, safe_bottom),
     }
+    # Zones reglees par style (TASK-3be3) : {} garde la zone deduite.
+    for name, key in (("title", "letterbox_title_dest"), ("subtitles", "letterbox_subtitle_dest")):
+        if settings[key]:
+            zones[name] = _dest_box(key, settings[key])
     for name, (x0, y0, x1, y1) in zones.items():
         if x1 <= x0 or y1 <= y0:
             raise ReframeError(
@@ -2077,6 +2098,7 @@ def _settings(config: Any) -> dict[str, Any]:
         )
     if settings["stream_variant"] == "split":
         _validate_split_geometry(settings)
+    _validate_letterbox_geometry(settings)
     return settings
 
 
@@ -2126,6 +2148,44 @@ def _validate_split_geometry(settings: dict[str, Any]) -> None:
         raise ReframeError(
             f"[reframe] badge_dest {settings['badge_dest']!r} et split_subtitle_dest "
             f"{settings['split_subtitle_dest']!r} se chevauchent"
+        )
+
+
+def _validate_letterbox_geometry(settings: dict[str, Any]) -> None:
+    """Reglages letterbox de l'editeur d'agencement (TASK-3be3) verifies des
+    le chargement de la config, sans la source : letterbox_top dans le
+    canevas ; zones titre/sous-titres explicites dans le canevas et la zone
+    sure TikTok, sans chevaucher la bande « Partie N » ni l'une l'autre. Le
+    chevauchement avec la video nette depend de la source :
+    _letterbox_geometry le refuse au recadrage."""
+    out_w, out_h = int(settings["output_width"]), int(settings["output_height"])
+    top = settings["letterbox_top"]
+    if not isinstance(top, int) or isinstance(top, bool) or not 0 <= top < out_h:
+        raise ReframeError(f"[reframe] letterbox_top invalide {top!r} (attendu un entier dans [0, {out_h}[)")
+    safe_left, safe_right = int(settings["safe_left"]), int(settings["safe_right"])
+    safe_top, safe_bottom = int(settings["safe_top"]), int(settings["safe_bottom"])
+    part = (safe_left, safe_bottom - int(settings["part_height"]), safe_right, safe_bottom)
+    boxes = {}
+    for key in ("letterbox_title_dest", "letterbox_subtitle_dest"):
+        if not settings[key]:
+            continue
+        x0, y0, x1, y1 = box = _dest_box(key, settings[key])
+        if x0 < 0 or y0 < 0 or x1 > out_w or y1 > out_h:
+            raise ReframeError(f"[reframe] {key} deborde du canevas {out_w}x{out_h} : ({x0},{y0})-({x1},{y1})")
+        if x0 < safe_left or y0 < safe_top or x1 > safe_right or y1 > safe_bottom:
+            raise ReframeError(
+                f"[reframe] {key} hors de la zone sure TikTok "
+                f"(x {safe_left}-{safe_right}, y {safe_top}-{safe_bottom}) : ({x0},{y0})-({x1},{y1})"
+            )
+        if _rects_overlap(box, part):
+            raise ReframeError(
+                f"[reframe] {key} chevauche la bande « Partie N » (y {part[1]}-{part[3]}) : ({x0},{y0})-({x1},{y1})"
+            )
+        boxes[key] = box
+    if len(boxes) == 2 and _rects_overlap(*boxes.values()):
+        raise ReframeError(
+            f"[reframe] letterbox_title_dest {settings['letterbox_title_dest']!r} et letterbox_subtitle_dest "
+            f"{settings['letterbox_subtitle_dest']!r} se chevauchent"
         )
 
 

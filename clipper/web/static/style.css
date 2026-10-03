@@ -1419,6 +1419,18 @@ input[type="color"] { width: 36px; height: 36px; padding: 2px; border-radius: va
 .ly-coords label { display: flex; flex-direction: column; gap: 4px; font: 11px var(--font-mono); text-transform: uppercase; color: var(--muted); }
 .ly-coords .input { height: 36px; padding: 0 4px; text-align: center; width: 100%; font-family: var(--font-mono); font-size: 13px; }
 .ly-dirty { font-size: 13px; }
+/* Éditeur letterbox (layout-letterbox.js, TASK-3be3) */
+.lb-z-video { overflow: hidden; z-index: 1; }
+.lb-z-title, .lb-z-subs { z-index: 3; }
+.lb-z-pseudo { z-index: 4; cursor: pointer; outline-style: dotted; }
+.lb-net { position: absolute; top: 0; height: 100%; max-width: none; pointer-events: none; }
+.lb-title { position: absolute; inset: 0; display: flex; align-items: flex-end; justify-content: center; pointer-events: none; }
+.lb-title-box { padding: 16px 28px; border-radius: 22px; background: #fff; color: #000; font: 800 64px/1.25 var(--font); white-space: nowrap; }
+.lb-pseudo-txt { position: absolute; inset: 0; display: grid; place-items: center; color: #fff; font: 800 32px/1 var(--font); text-shadow: 0 0 3px #000, 2px 2px 0 #000, -2px -2px 0 #000; pointer-events: none; }
+.lb-part { position: absolute; z-index: 2; display: grid; place-items: center; color: rgba(255, 255, 255, 0.7); font: 800 40px var(--font); outline: 2px dotted rgba(255, 255, 255, 0.3); outline-offset: -2px; pointer-events: none; }
+.lb-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.lb-wide { text-transform: none; }
+.lb-hint { margin: 0; font-size: 12px; }
 @media (max-width: 900px) {
   .ly-grid { grid-template-columns: minmax(0, 1fr); }
   .ly-side { position: static; }

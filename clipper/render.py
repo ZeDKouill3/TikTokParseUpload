@@ -846,6 +846,15 @@ def badge_png(logo_path: Path, name: str, zone: dict[str, Any], settings: dict[s
     img.save(path, format="PNG")
 
 
+def check_cta_handle_gap(settings: dict[str, Any]) -> None:
+    """Ecart titre/pseudo (reglable par style depuis l'editeur d'agencement,
+    TASK-3be3) : entier >= 0, sinon RenderError (jamais un pseudo colle
+    dans l'encadre du titre en silence)."""
+    gap = settings["cta_handle_gap"]
+    if not isinstance(gap, int) or isinstance(gap, bool) or gap < 0:
+        raise RenderError(f"[render] cta_handle_gap doit etre un entier >= 0, recu {gap!r}")
+
+
 def _draw_pseudo(
     png_path: Path, zone: dict[str, Any], title_layout: TitleLayout, text: str,
     pseudo: PseudoLayout, settings: dict[str, Any],
@@ -1253,6 +1262,7 @@ def render(
             raise RenderError(
                 f"[render] cta_seconds doit etre > 0, recu {cta_seconds_setting}"
             )
+        check_cta_handle_gap(settings)
     if badge_enabled:
         # ADR-ad2e : jamais de badge a moitie active.
         if not str(settings["badge_logo"]).strip():

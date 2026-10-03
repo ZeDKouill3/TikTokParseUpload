@@ -5,7 +5,8 @@
    dans [reframe] du preset. Aucune validation ici : c'est reframe qui refuse un
    agencement qui déborde, se chevauche ou sort de la zone sûre, et le serveur
    renvoie son message tel quel (422), affiché sous la barre d'outils.
-   Charge après channels.js, dont il enveloppe Screens.channels. */
+   Charge après channels.js, dont il enveloppe Screens.channels. Un style en
+   letterbox ouvre à la place l'éditeur de layout-letterbox.js (lbOpen). */
 "use strict";
 
 const LY_CANVAS = { w: 1080, h: 1920 };
@@ -242,6 +243,8 @@ async function lyOpen(body, name) {
   try {
     const [data] = await Promise.all([api(lyUrl(name, "layout")), lyLoadFrame(name)]);
     if (lyUi.name !== name) return;
+    // Style en letterbox : éditeur letterbox (layout-letterbox.js), même route et même image clé.
+    if (data.mode === "letterbox") { await lbOpen(body, name); return; }
     lyUi.data = data;
     lyUi.draft = Object.fromEntries(LY_ZONES.map((z) => [z.key, lyCopy(data[z.key])]));
     lyUi.saved = lyCopy(lyUi.draft);

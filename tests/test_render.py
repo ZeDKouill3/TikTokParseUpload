@@ -1679,6 +1679,88 @@ def test_render_draws_the_pseudo_handle_under_the_title_box(tmp_path, letterbox_
     _assert_box_inside(title_layout.box, TITLE_ZONE)  # le titre remonte reste dans la zone
 
 
+# --- Éditeur d'agencement letterbox (TASK-3be3) : réglages par style --------
+
+
+def _render_title_png(tmp_path, letterbox_dir, monkeypatch, config, reframe=None):
+    from PIL import Image
+
+    from clipper.render import render
+
+    if reframe is not None:
+        (letterbox_dir / "reframe" / f"{CLIP_ID}.json").write_text(json.dumps(reframe), encoding="utf-8")
+    (letterbox_dir / f"{VIDEO_ID}.mp4").write_bytes(b"")
+    seen = {}
+
+    def run(cmd, cwd, out_path):
+        seen["png"] = Image.open(Path(cwd) / "title.png").convert("RGBA").copy()
+        seen["cmd"] = list(cmd)
+        Path(out_path).write_bytes(b"mp4")
+
+    monkeypatch.setattr("clipper.render._exec_ffmpeg", run)
+    render(VIDEO_ID, CLIP_ID, workspace_dir=letterbox_dir.parent, output_dir=tmp_path / "output",
+           config=config, force=True)
+    return seen
+
+
+def _lowest_white_row(img):
+    """Bas de l'encadre blanc du titre : derniere ligne largement blanche
+    (le pseudo, blanc lui aussi, est bien plus etroit)."""
+    white = (255, 255, 255, 255)
+    rows = [y for y in range(img.height) if sum(img.getpixel((x, y)) == white for x in range(img.width)) > 400]
+    return max(rows)
+
+
+def test_default_letterbox_settings_keep_the_same_zones_and_ffmpeg_filters(tmp_path, video_dir):
+    """Sans réglage de style ({} pour les zones de texte), reframe calcule les
+    mêmes zones qu'avant l'éditeur, donc le même filtergraph."""
+    from clipper import reframe
+    from clipper.config import Config
+
+    settings = reframe._settings(Config(mode="review", workspace_dir="w", output_dir="o", _sections={}))
+    zones = reframe._letterbox_geometry(1920, 1080, settings)["zones"]
+    assert zones == {"title": (150, 160, 930, 424), "subtitles": (150, 1246, 930, 1448), "part": (150, 1464, 930, 1520)}
+
+    part_path = tmp_path / "part.txt"
+    part_path.write_text("Partie 2", encoding="utf-8")
+    filt, _label = _letterbox_filter(tmp_path, video_dir, part_path=part_path)
+    assert "[vsub][1:v]overlay=x=150:y=160:eof_action=repeat[vtitle]" in filt
+    assert "x=150+(780-text_w)/2" in filt
+
+
+def test_render_places_the_title_in_the_title_zone_chosen_by_the_style(
+    tmp_path, letterbox_dir, monkeypatch, cpu_device
+):
+    reframe = _reframe_json_letterbox()
+    reframe["text_zones"]["title"] = {"x0": 200, "y0": 240, "x1": 880, "y1": 400}
+
+    seen = _render_title_png(tmp_path, letterbox_dir, monkeypatch, make_config(), reframe)
+
+    assert seen["png"].size == (680, 160)
+    graph = seen["cmd"][seen["cmd"].index("-filter_complex") + 1]
+    assert "[1:v]overlay=x=200:y=240:" in graph
+    # encadre colle en bas de la zone, a title_lift (40) du bas
+    assert _lowest_white_row(seen["png"]) == 160 - 40 - 1
+
+
+def test_render_cta_handle_gap_of_the_style_moves_the_title_box_up(
+    tmp_path, letterbox_dir, monkeypatch, cpu_device
+):
+    default = _render_title_png(tmp_path, letterbox_dir, monkeypatch, _cta_config())
+    wider = _render_title_png(tmp_path, letterbox_dir, monkeypatch, _cta_config(cta_handle_gap=30))
+
+    assert _lowest_white_row(default["png"]) - _lowest_white_row(wider["png"]) == 22
+
+
+def test_negative_cta_handle_gap_is_an_explicit_error(tmp_path, letterbox_dir, fake_ffmpeg, cpu_device):
+    from clipper.render import RenderError, render
+
+    (letterbox_dir / f"{VIDEO_ID}.mp4").write_bytes(b"")
+    with pytest.raises(RenderError, match="cta_handle_gap"):
+        render(VIDEO_ID, CLIP_ID, workspace_dir=letterbox_dir.parent, output_dir=tmp_path / "output",
+               config=_cta_config(cta_handle_gap=-4))
+
+
 # --- (5) carte de fin : encadre centre, mesure avec la vraie police --------
 
 
