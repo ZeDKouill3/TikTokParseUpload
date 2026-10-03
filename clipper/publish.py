@@ -195,6 +195,24 @@ def _sibling_clip_ids(output_dir: str | Path, video_id: str, series_id: str, *, 
     return siblings
 
 
+def series_clip_ids(video_id: str, clip_id: str, output_dir: str | Path = "output") -> list[str]:
+    """Tous les clip_id de la serie de ``clip_id`` (lui compris), tries par numero de partie ;
+    ``[clip_id]`` si le clip n'appartient a aucune serie (TASK-e99b : cocher une partie entraine
+    toute sa serie). Leve ``PublishError`` si le sidecar de ``clip_id`` est introuvable ou
+    illisible (ADR-ad2e : pas de repli silencieux sur un clip absent)."""
+    sidecar = _read_sidecar(output_dir, video_id, clip_id)
+    series_id, part = _series_info(video_id, clip_id, sidecar)
+    if series_id is None:
+        return [clip_id]
+    members = [(part, clip_id)]
+    for sibling_id in _sibling_clip_ids(output_dir, video_id, series_id, exclude=clip_id):
+        sibling_sidecar = _read_sidecar(output_dir, video_id, sibling_id)
+        _, sibling_part = _series_info(video_id, sibling_id, sibling_sidecar)
+        members.append((sibling_part, sibling_id))
+    members.sort(key=lambda m: (m[0] if m[0] is not None else 0))
+    return [cid for _, cid in members]
+
+
 def _next_free_slot(schedule: dict[str, Any], entries: list[dict[str, Any]], after: datetime) -> datetime:
     taken = {entry["slot_at"] for entry in entries if entry.get("slot_at") is not None}
     n = len(taken) + 1

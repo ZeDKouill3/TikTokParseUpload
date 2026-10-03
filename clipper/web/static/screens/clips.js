@@ -20,7 +20,7 @@ const CLIP_LOCKED = ["scheduled", "published"];
 const CLIPS_STALE_MS = 4000;
 const CLIPS_PAGE_SIZE = 24; // la galerie n'affiche que 24 clips a la fois (« Afficher plus »)
 
-const clipsUi = { data: null, error: null, loading: null, dirty: false, at: 0, filter: "à valider", channel: "", video: "", hashVideo: null, html: "", shown: CLIPS_PAGE_SIZE };
+const clipsUi = { data: null, error: null, loading: null, dirty: false, at: 0, filter: "à valider", channel: "", video: "", hashVideo: null, html: "", shown: CLIPS_PAGE_SIZE, selecting: false, selected: new Set() };
 
 /* Vidéo visée par l'adresse : #/clips/<video_id> (lien « Voir les N clips » de la fiche vidéo), sinon "". */
 const clipsHashVideo = () => decodeURIComponent((location.hash.replace(/^#\/?/, "").split("?")[0].split("/")[1] || ""));
@@ -66,15 +66,32 @@ function clipCaptionText(c) {
 function clipCard(c) {
   const s = clipStatus(c);
   const warn = c.qa_status === "rejected" ? "bad" : (c.issues && c.issues.length ? "warn" : "");
-  return `<div class="clip" data-clip="${esc(clipKey(c))}" tabindex="0" role="button" aria-label="Ouvrir le clip ${esc(c.screen_title || c.clip_id)}">
+  const sel = clipsUi.selecting;
+  const checked = sel && clipsUi.selected.has(clipKey(c));
+  const label = sel
+    ? `${checked ? "Désélectionner" : "Sélectionner"} ${esc(c.screen_title || c.clip_id)}`
+    : `Ouvrir le clip ${esc(c.screen_title || c.clip_id)}`;
+  return `<div class="clip${sel ? " selecting" : ""}${checked ? " checked" : ""}" data-clip="${esc(clipKey(c))}" tabindex="0" role="${sel ? "checkbox" : "button"}"${sel ? ` aria-checked="${checked}"` : ""} aria-label="${label}">
     <div class="clip-poster"><img loading="lazy" decoding="async" width="270" height="480" src="${esc(c.thumbnail_url)}" alt="" tabindex="-1"><div class="shade"></div>
-      <div class="top"><span class="pill-dark ${s.cls}">${esc(s.label)}</span>${c.parts_total > 1 ? `<span class="pill-dark">${esc(c.part)}/${esc(c.parts_total)}</span>` : ""}</div>
+      <div class="top">${sel ? `<span class="clip-check${checked ? " on" : ""}">${checked ? icon("check", "i-xs") : ""}</span>` : `<span class="pill-dark ${s.cls}">${esc(s.label)}</span>`}${c.parts_total > 1 ? `<span class="pill-dark">${esc(c.part)}/${esc(c.parts_total)}</span>` : ""}</div>
       <span class="play">${icon("play")}</span>
       <div class="bottom"><span class="num">${c.duration != null ? esc(clipSeconds(c.duration)) : ""}</span><span class="grow"></span>
         ${warn ? `<span class="pill-dark ${warn}">${icon("triangle-alert", "i-xs")}QA</span>` : ""}${c.score != null ? `<span class="pill-dark">${esc(fr(c.score))}</span>` : ""}</div>
     </div>
     <div class="clip-title">${esc(c.screen_title || c.title || c.clip_id)}</div>
     <div class="clip-sub"><span class="mono">${esc(c.video_id)}</span>${c.channel ? `<span class="tag">${esc(c.channel)}</span>` : ""}</div>
+  </div>`;
+}
+
+/* Barre de selection groupee (TASK-e99b) : nombre selectionne, compte (prets seulement), approuver / annuler. */
+function clipsSelectionBarHtml() {
+  const n = clipsUi.selected.size;
+  return `<div class="sel-bar" id="clips-selbar">
+    <span>${n} clip${n === 1 ? "" : "s"} sélectionné${n === 1 ? "" : "s"}</span>
+    <select class="input" id="clips-sel-account" aria-label="Compte de publication"><option value="">Chargement…</option></select>
+    <span class="grow"></span>
+    <button type="button" class="btn btn-ghost" data-clips-sel-cancel>Annuler</button>
+    <button type="button" class="btn btn-ok" data-clips-sel-approve${n ? "" : " disabled"}>${icon("check", "i-xs")}Approuver la sélection</button>
   </div>`;
 }
 
@@ -101,8 +118,10 @@ function clipsView(body) {
       <select class="input" id="clips-video" aria-label="Vidéo"><option value="">Toutes les vidéos</option>${videos.map((v) => `<option value="${esc(v)}"${v === clipsUi.video ? " selected" : ""}>${esc(v)}</option>`).join("")}</select>
       ${clipsUi.video ? `<button type="button" class="btn btn-xs" data-clear-video aria-label="Retirer le filtre vidéo">${icon("x", "i-xs")}Vidéo : ${esc(clipsUi.video)}</button>` : ""}
       <select class="input" id="clips-channel" aria-label="Style"><option value="">Tous les styles</option>${channels.map((n) => `<option value="${esc(n)}"${n === clipsUi.channel ? " selected" : ""}>${esc(n)}</option>`).join("")}</select>
+      ${!clipsUi.selecting ? `<button type="button" class="btn btn-xs" data-clips-select>${icon("list-checks", "i-xs")}Sélectionner</button>` : ""}
     </div>
-    ${filtered.length ? `<div class="clips">${filtered.slice(0, clipsUi.shown).map(clipCard).join("")}</div>${more}` : clipsEmpty(all)}`;
+    ${filtered.length ? `<div class="clips">${filtered.slice(0, clipsUi.shown).map(clipCard).join("")}</div>${more}` : clipsEmpty(all)}
+    ${clipsUi.selecting ? clipsSelectionBarHtml() : ""}`;
   if (clipsUi.html === html && body.childElementCount) return; // rien de change : on garde les vignettes en place
   clipsUi.html = html;
   body.innerHTML = html;
@@ -124,10 +143,67 @@ function clipsWire(body) {
   const more = $("[data-clips-more]", body);
   if (more) more.onclick = () => { clipsUi.shown += CLIPS_PAGE_SIZE; renderCurrent(); };
   $$("[data-clip]", body).forEach((el) => {
-    const open = () => openClipDrawer(el.dataset.clip);
-    el.onclick = open;
-    el.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); } };
+    const act = () => (clipsUi.selecting ? clipsToggleSelect(el.dataset.clip) : openClipDrawer(el.dataset.clip));
+    el.onclick = act;
+    el.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); act(); } };
   });
+  const selectBtn = $("[data-clips-select]", body);
+  if (selectBtn) selectBtn.onclick = () => { clipsUi.selecting = true; clipsUi.selected = new Set(); renderCurrent(); };
+  const selBar = $("#clips-selbar", body);
+  if (selBar) {
+    clipsFillSelAccounts($("#clips-sel-account", selBar));
+    $("[data-clips-sel-cancel]", selBar).onclick = () => { clipsUi.selecting = false; clipsUi.selected = new Set(); renderCurrent(); };
+    const approveBtn = $("[data-clips-sel-approve]", selBar);
+    if (approveBtn) approveBtn.onclick = () => clipsApproveSelection($("#clips-sel-account", selBar).value);
+  }
+}
+
+/* Cocher une partie coche toute sa serie (TASK-e99b) : meme decision groupee que l'approbation groupee cote serveur. */
+function clipsToggleSelect(key) {
+  const c = clipsUi.data.find((o) => clipKey(o) === key);
+  if (!c) return;
+  const series = clipSeries(c);
+  const group = series.length ? series.map(clipKey) : [key];
+  const adding = !clipsUi.selected.has(key);
+  group.forEach((k) => (adding ? clipsUi.selected.add(k) : clipsUi.selected.delete(k)));
+  if (adding && group.length > 1) {
+    toast({ kind: "info", title: "Série ajoutée", body: `${group.length} parties sélectionnées ensemble : cocher une partie coche toute sa série.`, ms: 3200 });
+  }
+  renderCurrent();
+}
+
+/* Compte de publication de la barre de selection : comptes prets seulement (SPEC-00d1 R4). */
+async function clipsFillSelAccounts(select) {
+  try {
+    const out = await api("/api/publish/accounts");
+    const ready = out.accounts.filter((a) => a.ready_to_publish);
+    const options = ready.map((a) => `<option value="${esc(a.id)}">${esc(a.label || a.id)}</option>`);
+    options.unshift(`<option value="">${ready.length ? "Choisis un compte" : "Aucun compte prêt à publier"}</option>`);
+    select.innerHTML = options.join("");
+  } catch (err) {
+    select.innerHTML = `<option value="">Comptes indisponibles</option>`;
+  }
+}
+
+/* Approbation groupee (TASK-e99b) : meme decision que /approve pour chaque clip, tout ou rien cote serveur. */
+async function clipsApproveSelection(account) {
+  if (!account) { toast({ kind: "warn", title: "Compte manquant", body: "Choisis le compte qui publiera la sélection." }); return; }
+  const clips = Array.from(clipsUi.selected).map((key) => {
+    const [video_id, clip_id] = key.split("/");
+    return { video_id, clip_id };
+  });
+  if (!clips.length) return;
+  try {
+    const approved = await api("/api/clips/approve", jsonBody("POST", { clips, account }));
+    clipsUi.selecting = false;
+    clipsUi.selected = new Set();
+    renderCurrent();
+    toast({ kind: "ok", title: "Clips approuvés", body: `${approved.length} clip${approved.length === 1 ? "" : "s"} approuvé${approved.length === 1 ? "" : "s"}.` });
+    loadClips();
+  } catch (err) {
+    const refused = err.body && Array.isArray(err.body.refused) ? err.body.refused : null;
+    toastError("Approbation impossible", refused ? Object.assign(new Error(`${err.message} : ${refused.join(" ; ")}`), { body: err.body }) : err);
+  }
 }
 
 /* ---------- Fiche d'un clip ---------- */

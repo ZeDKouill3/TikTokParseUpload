@@ -1757,6 +1757,8 @@ def test_review_screen_render_button_is_blocked_while_moments_await_a_decision()
 # --------------------------------------------------------------------------
 
 CLIPS_VIDEO = "clipsvideo01"
+READY = "ab12cd"   # compte pret (SPEC-00d1 R4) ; defini ici (avant _bulk_body) pour servir de defaut
+SPARE = "ef34ab"   # second compte, pas forcement pret selon le test
 
 
 def _clip_sidecar(clip_id, *, part=1, parts_total=1, ready=True, qa_status="passed", issues=None, **extra):
@@ -2075,6 +2077,151 @@ def test_clips_screen_is_wired_with_gallery_sidecar_and_actions():
     assert "undo" in js                                  # toast « Annuler »
     assert "confirm: true" in js                         # re-rendu confirmé
     assert "Aucun clip" in js                            # etat vide
+
+
+# --------------------------------------------------------------------------
+# Approbation groupee (TASK-e99b) : POST /api/clips/approve
+# --------------------------------------------------------------------------
+
+
+def _bulk_body(clips, account=READY):
+    return {"clips": [{"video_id": v, "clip_id": c} for v, c in clips], "account": account}
+
+
+def test_bulk_approve_applies_the_same_decision_as_the_single_endpoint_for_each_clip(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import publish
+
+    _clips_setup(tmp_path)
+    _accounts_state(tmp_path)
+    calls = []
+    monkeypatch.setattr(publish, "approve", lambda *a, **kw: calls.append((a, kw)) or _entry(a[1], "scheduled"))
+
+    resp = client(tmp_path).post("/api/clips/approve", json=_bulk_body([(CLIPS_VIDEO, "01"), (CLIPS_VIDEO, "03")]))
+
+    assert resp.status_code == 200
+    assert [c["clip_id"] for c in resp.json()] == ["01", "03"]
+    assert [a for a, _ in calls] == [(CLIPS_VIDEO, "01", "ma_chaine"), (CLIPS_VIDEO, "03", "ma_chaine")]
+    for _, kw in calls:
+        assert kw["account"] == READY                    # le compte choisi, le meme pour chaque clip
+        assert kw["output_dir"] == tmp_path / "output"
+        assert kw["schedule"] == {"slots": [{"day": "mon", "time": "18:30"}, {"day": "thu", "time": "12:00"}],
+                                   "timezone": "Europe/Paris"}  # les creneaux du compte, les memes pour chaque clip
+
+
+def test_bulk_approve_without_a_ready_account_refuses_and_approves_nothing(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import publish
+
+    _clips_setup(tmp_path)
+    _accounts_state(tmp_path)
+    monkeypatch.setattr(publish, "approve", lambda *a, **kw: pytest.fail("publish.approve ne doit pas etre appele"))
+    c = client(tmp_path)
+
+    missing = c.post("/api/clips/approve", json=_bulk_body([(CLIPS_VIDEO, "01")], account=None))
+    not_ready = c.post("/api/clips/approve", json=_bulk_body([(CLIPS_VIDEO, "01")], account=SPARE))
+    unknown = c.post("/api/clips/approve", json=_bulk_body([(CLIPS_VIDEO, "01")], account="fantome"))
+
+    assert missing.status_code == 409 and "compte de publication manquant" in missing.json()["detail"]
+    assert not_ready.status_code == 409 and "non prêt à publier" in not_ready.json()["detail"]
+    assert unknown.status_code == 409 and "compte inconnu" in unknown.json()["detail"]
+
+
+def test_bulk_approve_an_unknown_clip_refuses_the_whole_batch(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import publish
+
+    _clips_setup(tmp_path)
+    _accounts_state(tmp_path)
+    monkeypatch.setattr(publish, "approve", lambda *a, **kw: pytest.fail("publish.approve ne doit pas etre appele"))
+    state_path = tmp_path / "state" / "publish" / "ma_chaine.json"
+    before = state_path.read_text(encoding="utf-8")
+
+    resp = client(tmp_path).post("/api/clips/approve", json=_bulk_body([(CLIPS_VIDEO, "01"), (CLIPS_VIDEO, "no-such")]))
+
+    assert resp.status_code == 409
+    assert any("no-such" in r for r in resp.json()["refused"])
+    assert state_path.read_text(encoding="utf-8") == before  # tout ou rien : rien approuve
+
+
+def test_bulk_approve_an_already_published_clip_refuses_the_whole_batch(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import publish
+
+    _write_state(tmp_path, CLIPS_VIDEO, channel="ma_chaine")
+    _write_clip(tmp_path, CLIPS_VIDEO, _clip_sidecar("01"))
+    _write_clip(tmp_path, CLIPS_VIDEO, _clip_sidecar("04"))
+    _write_publish(tmp_path, "ma_chaine", [_entry("04", "published")])
+    _accounts_state(tmp_path)
+    monkeypatch.setattr(publish, "approve", lambda *a, **kw: pytest.fail("publish.approve ne doit pas etre appele"))
+    state_path = tmp_path / "state" / "publish" / "ma_chaine.json"
+    before = state_path.read_text(encoding="utf-8")
+
+    resp = client(tmp_path).post("/api/clips/approve", json=_bulk_body([(CLIPS_VIDEO, "01"), (CLIPS_VIDEO, "04")]))
+
+    assert resp.status_code == 409
+    assert any("04" in r and "published" in r for r in resp.json()["refused"])
+    assert state_path.read_text(encoding="utf-8") == before
+
+
+def test_bulk_approve_an_already_rejected_clip_refuses_the_whole_batch(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import publish
+
+    _write_state(tmp_path, CLIPS_VIDEO, channel="ma_chaine")
+    _write_clip(tmp_path, CLIPS_VIDEO, _clip_sidecar("01"))
+    _write_clip(tmp_path, CLIPS_VIDEO, _clip_sidecar("04"))
+    _write_publish(tmp_path, "ma_chaine", [_entry("04", "rejected")])
+    _accounts_state(tmp_path)
+    monkeypatch.setattr(publish, "approve", lambda *a, **kw: pytest.fail("publish.approve ne doit pas etre appele"))
+    state_path = tmp_path / "state" / "publish" / "ma_chaine.json"
+    before = state_path.read_text(encoding="utf-8")
+
+    resp = client(tmp_path).post("/api/clips/approve", json=_bulk_body([(CLIPS_VIDEO, "01"), (CLIPS_VIDEO, "04")]))
+
+    assert resp.status_code == 409
+    assert any("04" in r and "rejected" in r for r in resp.json()["refused"])
+    assert state_path.read_text(encoding="utf-8") == before
+
+
+def test_bulk_approve_a_not_ready_clip_refuses_the_whole_batch(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import publish
+
+    _write_state(tmp_path, CLIPS_VIDEO, channel="ma_chaine")
+    _write_clip(tmp_path, CLIPS_VIDEO, _clip_sidecar("01"))
+    _write_clip(tmp_path, CLIPS_VIDEO, _clip_sidecar("04", ready=False))
+    _accounts_state(tmp_path)
+    monkeypatch.setattr(publish, "approve", lambda *a, **kw: pytest.fail("publish.approve ne doit pas etre appele"))
+
+    resp = client(tmp_path).post("/api/clips/approve", json=_bulk_body([(CLIPS_VIDEO, "01"), (CLIPS_VIDEO, "04")]))
+
+    assert resp.status_code == 409
+    assert any("04" in r for r in resp.json()["refused"])
+
+
+def test_clips_screen_has_a_multi_select_bulk_approve_bar():
+    js = (STATIC / "screens" / "clips.js").read_text(encoding="utf-8")
+
+    assert "Sélectionner" in js
+    assert "/api/clips/approve" in js
+    assert "Approuver la sélection" in js
+    assert "Annuler" in js
+    assert "toute sa série" in js or "toute la série" in js  # message : cocher une partie coche la serie
+
+
+def test_bulk_approve_selecting_one_part_approves_the_whole_series_in_part_order(tmp_path, isolated_cwd):
+    (tmp_path / "config.toml").write_text('mode = "review"\n', encoding="utf-8")
+    (tmp_path / "presets").mkdir(exist_ok=True)
+    (tmp_path / "presets" / "ma_chaine.toml").write_text('[channel]\n', encoding="utf-8")
+    _write_state(tmp_path, CLIPS_VIDEO, channel="ma_chaine")
+    _write_clip(tmp_path, CLIPS_VIDEO, _clip_sidecar("01-p1", part=1, parts_total=3))
+    _write_clip(tmp_path, CLIPS_VIDEO, _clip_sidecar("01-p2", part=2, parts_total=3))
+    _write_clip(tmp_path, CLIPS_VIDEO, _clip_sidecar("01-p3", part=3, parts_total=3))
+    _accounts_state(tmp_path)
+
+    resp = client(tmp_path).post("/api/clips/approve", json=_bulk_body([(CLIPS_VIDEO, "01-p2")]))  # une seule partie choisie
+
+    assert resp.status_code == 200
+    approved = resp.json()
+    assert [c["clip_id"] for c in approved] == ["01-p1", "01-p2", "01-p3"]  # toute la serie, dans l'ordre
+    assert all(c["status"] in ("approved", "scheduled") for c in approved)
+    entries = json.loads((tmp_path / "state" / "publish" / "ma_chaine.json").read_text(encoding="utf-8"))
+    assert {e["clip_id"] for e in entries} == {"01-p1", "01-p2", "01-p3"}
 
 
 # --------------------------------------------------------------------------
@@ -5030,9 +5177,6 @@ def test_refresh_route_refuses_an_invalid_body_or_account(tmp_path, isolated_cwd
 # --------------------------------------------------------------------------
 # SPEC-00d1 R4, R5 : compte choisi par publication, calendrier, validation
 # --------------------------------------------------------------------------
-
-READY = "ab12cd"
-SPARE = "ef34ab"
 
 
 def _accounts_state(tmp_path, *, ready=(READY,)):

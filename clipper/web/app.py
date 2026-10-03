@@ -864,6 +864,26 @@ class _NoChannel(HTTPException):
         self.video_id, self.channels = video_id, channels
 
 
+class BulkApproveClip(BaseModel):
+    video_id: str
+    clip_id: str
+
+
+class BulkApproveBody(BaseModel):
+    clips: list[BulkApproveClip]
+    account: str | None = None
+
+
+class _BulkApproveRefused(Exception):
+    """Approbation groupee refusee en bloc (TASK-e99b, ADR-ad2e) : au moins un clip de la selection
+    (parties de serie comprises) est introuvable, deja publie ou deja refuse, ou pas pret ; aucun
+    n'est approuve (``refused`` : un message par clip en cause)."""
+
+    def __init__(self, refused: list[str]) -> None:
+        super().__init__("sélection refusée, rien d'approuvé")
+        self.refused = refused
+
+
 def _require_channel(video_id: str, clip_id: str, config: Config, *, or_no_channel: bool = False) -> str:
     """La chaîne d'une vidéo (409 sans chaîne). ``or_no_channel`` : une vidéo sans chaîne rend la file
     ``_sans_chaine`` de ses publications pilotées (SPEC-1ed3 R3 : le compte suffit) — réessayer, capture."""
@@ -2192,6 +2212,69 @@ def create_app(config: Config | None = None) -> FastAPI:
     def reject_clip(video_id: str, clip_id: str) -> dict[str, Any]:
         return _decide(video_id, clip_id, "reject")
 
+    @app.post("/api/clips/approve")
+    def approve_clips_bulk(body: BulkApproveBody) -> list[dict[str, Any]]:
+        """Approuve plusieurs clips d'un coup pour un meme compte (bouton « Sélectionner » de
+        l'écran Clips, TASK-e99b) : exactement la même décision que POST /api/clips/{v}/{c}/approve
+        pour chacun (même compte, mêmes créneaux du compte). Cocher une partie de série entraîne
+        toute la série (ordre des parties respecté, _require_previous_part de publish.approve).
+        Validation de tous les clips (séries comprises) avant la première approbation : tout ou
+        rien, aucune valeur de secours (ADR-ad2e)."""
+        if not body.clips:
+            raise HTTPException(status_code=400, detail="sélection vide : choisis au moins un clip")
+        if not body.account:
+            raise HTTPException(status_code=409, detail="compte de publication manquant : choisis un compte prêt à publier "
+                                "(un style n'a plus de compte associé)")
+        account = _require_ready_account(config, body.account)
+        schedule = _account_schedule(config, account)
+
+        seen: set[tuple[str, str]] = set()
+        expanded: list[tuple[str, str]] = []
+        refused: list[str] = []
+        for item in body.clips:
+            _validate_video_id(item.video_id)
+            _validate_clip_id(item.clip_id)
+            if (item.video_id, item.clip_id) in seen:
+                continue
+            try:
+                series = publish_mod.series_clip_ids(item.video_id, item.clip_id, output_dir=config.output_dir)
+            except publish_mod.PublishError as exc:
+                refused.append(f"{item.video_id}/{item.clip_id} : {exc}")
+                seen.add((item.video_id, item.clip_id))
+                continue
+            for clip_id in series:
+                key = (item.video_id, clip_id)
+                if key not in seen:
+                    seen.add(key)
+                    expanded.append(key)
+
+        channel_of_video: dict[str, str | None] = {}
+        entries_by_channel: dict[str, dict[tuple[str, str], dict[str, Any]]] = {}
+        for video_id, clip_id in expanded:
+            if video_id not in channel_of_video:
+                try:
+                    channel_of_video[video_id] = _require_channel(video_id, clip_id, config)
+                except HTTPException as exc:
+                    channel_of_video[video_id] = None
+                    refused.append(f"{video_id}/{clip_id} : {exc.detail}")
+            channel = channel_of_video[video_id]
+            if channel is None:
+                continue
+            if channel not in entries_by_channel:
+                entries_by_channel[channel] = _publish_entries(config, channel)
+            entry = entries_by_channel[channel].get((video_id, clip_id))
+            if entry and entry["status"] in ("published", "rejected"):
+                refused.append(f"{video_id}/{clip_id} : déjà {entry['status']}")
+                continue
+            sidecar = publish_mod.read_sidecar(config.output_dir, video_id, clip_id)
+            if not sidecar.get("ready"):
+                refused.append(f"{video_id}/{clip_id} : pas prêt pour publication")
+
+        if refused:
+            raise _BulkApproveRefused(refused)
+
+        return [_decide(video_id, clip_id, "approve", account=account, schedule=schedule) for video_id, clip_id in expanded]
+
     @app.post("/api/clips/{video_id}/{clip_id}/rerender", status_code=202)
     def rerender_clip(video_id: str, clip_id: str) -> JSONResponse:
         _validate_video_id(video_id)
@@ -2311,6 +2394,10 @@ def create_app(config: Config | None = None) -> FastAPI:
     async def _publication_limit_handler(request: Request, exc: _LimitRefused) -> JSONResponse:
         # un plafond depasse rend aussi la prochaine heure possible ({"detail": texte, "next_at": date ISO})
         return JSONResponse({"detail": exc.detail, "next_at": exc.next_at}, status_code=409)
+
+    @app.exception_handler(_BulkApproveRefused)
+    async def _bulk_approve_refused_handler(request: Request, exc: _BulkApproveRefused) -> JSONResponse:
+        return JSONResponse({"detail": "sélection refusée, rien d'approuvé", "refused": exc.refused}, status_code=409)
 
     def _publication_scope(service: str = "tiktok") -> dict[str, Any]:
         return {"output_dir": Path(config.output_dir), "state_dir": _publish_dir(config),
