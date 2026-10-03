@@ -1217,7 +1217,7 @@ def publish(
     backend = _BACKENDS[settings["backend"]]()
     mode = mode if mode is not None else str(settings["publish_mode"])
     if not account:
-        raise TikTokError("compte TikTok manquant : la chaîne n'a pas de tiktok_account")
+        raise TikTokError("compte TikTok manquant : aucun compte n'a été choisi pour cette publication")
     if mode not in MODES:
         raise TikTokError(f"mode de publication invalide : {mode!r} (attendu : {' | '.join(MODES)})")
     if not Path(clip["video_path"]).is_file():

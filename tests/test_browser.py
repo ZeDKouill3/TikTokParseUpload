@@ -475,7 +475,8 @@ def test_readme_documents_tiktok_publishing_and_youtube_cookies():
     tiktok = readme.split("## Publier sur TikTok", 1)[1].split("\n## ", 1)[0]
     cookies = readme.split("## Cookies YouTube", 1)[1].split("\n## ", 1)[0]
 
-    assert "tiktok_account" in tiktok and "browser login" in tiktok
+    assert "browser login" in tiktok
+    assert "tiktok_account" not in tiktok and "créneaux" in tiktok   # le compte se choisit par publication (SPEC-6076 R2)
     assert "à la main" in tiktok and "jamais" in tiktok          # connexion manuelle, aucun identifiant saisi
     assert "Risques" in tiktok and "captcha" in tiktok.lower() and "arrêt" in tiktok
     assert "cookies_profile" in cookies and "cookies_from_browser" in cookies

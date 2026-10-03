@@ -65,6 +65,10 @@ class DemoError(Exception):
     """Dossier de démonstration refusé, ffmpeg absent ou en échec."""
 
 
+# Creneaux reguliers du compte de demonstration (jour, heure locale).
+DEMO_SLOTS = [{"day": "mon", "time": "18:00"}, {"day": "wed", "time": "18:00"}, {"day": "fri", "time": "12:30"},
+              {"day": "sun", "time": "10:00"}]
+
 def _inside(root: Path, path: Path) -> Path:
     """``path`` si elle est sous ``root`` ; sinon une erreur explicite (le script ne touche qu'au dossier temporaire)."""
     resolved = path.resolve()
@@ -255,15 +259,14 @@ def build_demo(root: Path, *, now: datetime | None = None, settings: dict[str, o
         "notes": "Compte fictif pour les captures.", "has_password": True,
         "created_at": _iso(now - timedelta(days=40)), "updated_at": _iso(now - timedelta(days=2)),
         "ready_to_publish": True, "ready_note": None, "r4_halt": None,
+        "slots": DEMO_SLOTS, "timezone": "Europe/Paris",  # les creneaux appartiennent au compte (SPEC-6076 R2)
         "login": {"state": "connected", "checked_at": _iso(now - timedelta(hours=3)),
                   "expires_at": _iso(now + timedelta(days=60))}}]})
     _fake_profile(root, state / "browser" / account, now)
     presets = _inside(root, root / "presets")
     presets.mkdir()
     (presets / f"{channel}.toml").write_text(
-        f'[channel]\ndisplay_name = "{channel}"\ntimezone = "Europe/Paris"\ntiktok_account = "{account}"\n'
-        'slots = [{ day = "mon", time = "18:00" }, { day = "wed", time = "18:00" }, { day = "fri", time = "12:30" }, '
-        '{ day = "sun", time = "10:00" }]\n', encoding="utf-8")
+        f'[channel]\ndisplay_name = "{channel}"\ntimezone = "Europe/Paris"\n', encoding="utf-8")
 
     scratch = _inside(root, root / "_synthese")
     scratch.mkdir()
@@ -369,8 +372,8 @@ def _working_in(folder: Path):
 
 def _publication_state(root: Path, state: Path, clips_dir: Path, video_id: str, channel: str, account: str,
                        now: datetime) -> list[dict[str, Any]]:
-    """Publications de démonstration : une publiée (liée aux statistiques), deux programmées sur des créneaux de la
-    chaîne, une en échec (arrêt sur captcha), une approuvée sans créneau ; le dernier clip reste « à valider »."""
+    """Publications de démonstration : une publiée (liée aux statistiques), deux programmées sur des créneaux du
+    compte, une en échec (arrêt sur captcha), une approuvée sans créneau ; le dernier clip reste « à valider »."""
     from clipper import publish as publish_mod
 
     kwargs = {"output_dir": root / "output", "state_dir": state / "publish", "presets_dir": root / "presets",
@@ -393,7 +396,8 @@ def _publication_state(root: Path, state: Path, clips_dir: Path, video_id: str, 
                     "error": "captcha détecté sur TikTok Studio : arrêt immédiat, rien n'a été publié"})
     _write_json(root, state / "publish" / f"{channel}.json", entries)
     for clip_id in ("02-p1", "02-p2", "03"):
-        publish_mod.approve(video_id, clip_id, channel, now=now, account=account, **kwargs)
+        publish_mod.approve(video_id, clip_id, channel, now=now, account=account,
+                            schedule={"slots": DEMO_SLOTS, "timezone": "Europe/Paris"}, **kwargs)
     return [{"post_id": post_id, "clip_id": "01"}]
 
 

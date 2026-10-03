@@ -128,11 +128,11 @@ hashtags et titre d'écran, d'approuver, de refuser ou de relancer le rendu.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/publication-dark.webp">
-  <img src="docs/assets/readme/publication-light.webp" alt="Publication : liste des publications en cours et calendrier hebdomadaire des créneaux du style" width="100%">
+  <img src="docs/assets/readme/publication-light.webp" alt="Publication : liste des publications en cours et calendrier hebdomadaire des créneaux du compte" width="100%">
 </picture>
 
 À gauche, « Nouvelle publication » et les publications en cours ; à droite, le
-calendrier de la semaine avec les créneaux du style (clips planifiés,
+calendrier de la semaine avec les créneaux du compte choisi (clips planifiés,
 publiés, en échec). Un clip se publie maintenant ou à une date, sans créneau
 obligatoire.
 
@@ -261,15 +261,17 @@ Contrat de sortie complet (zones sûres TikTok, style des sous-titres...) :
 Un fichier de config par style (`presets/<nom>.toml`) active des réglages
 spécifiques sans toucher `config.toml` ; il se crée aussi dans l'écran
 **Styles** de la console (formulaire, éditeur d'agencement, aperçu des
-sous-titres). Exemple avec le style neutre `ma_chaine` :
+sous-titres). Un style n'a ni compte de publication ni créneaux : le compte se
+choisit à chaque publication, et les créneaux réguliers se règlent sur le
+compte (écran **Comptes**). Un ancien preset qui porte encore `slots` et
+`tiktok_account` est migré au démarrage (créneaux repris sur ce compte, clés
+retirées du fichier, journalisé). Exemple avec le style neutre `ma_chaine` :
 
 ```toml
 [channel]
 display_name = "ma_chaine"
 source_url = "https://www.twitch.tv/ma_chaine/videos"
 watch = true                      # nouvelles VOD : en file (auto) ou « à confirmer » (review)
-slots = [{ day = "mon", time = "18:00" }, { day = "thu", time = "18:00" }]
-tiktok_account = "mon_compte"     # identifiant d'un compte de l'écran Comptes
 
 [reframe]
 layout = "stream_auto"            # facecam détectée : agencement stream
@@ -338,10 +340,11 @@ jamais copié hors de `state/`). Le programme ne saisit **jamais** ton
 identifiant ni ton mot de passe : tu te connectes à la main, une fois, dans un
 **Chrome normal** (voir ci-dessous).
 
-1. **Relier un compte** — dans la console, écran **Comptes**, ajoute le compte
-   TikTok (libellé, plateforme) ; dans l'écran **Styles**, ouvre le style et
-   choisis ce compte dans `tiktok_account` (ou écris `tiktok_account = "<id>"`
-   dans la table `[channel]` du preset). Un identifiant inconnu est refusé.
+1. **Ajouter un compte** — dans la console, écran **Comptes**, ajoute le compte
+   TikTok (libellé, plateforme) ; ses **créneaux** réguliers (jour + heure,
+   fuseau du compte) se règlent dans le même formulaire. Aucun compte n'est
+   rattaché à un style : chaque publication (écran **Publication**) choisit son
+   compte, et une publication sans compte échoue avec un message explicite.
 2. **Se connecter une fois** — bouton **Se connecter dans le navigateur** du
    compte (console ouverte sur `127.0.0.1`/`localhost` seulement), ou
    `python -m clipper browser login <compte>` (`--url` pour une autre page,

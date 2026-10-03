@@ -20,7 +20,16 @@ def _write_preset(cwd: Path, name: str, body: str = "[channel]\n") -> Path:
     return path
 
 
-_SLOT_PRESET = '[channel]\ntimezone = "UTC"\n[[channel.slots]]\nday = "mon"\ntime = "09:00"\n'
+_SLOT_PRESET = '[channel]\ntimezone = "UTC"\n'  # un style n'a ni compte ni creneaux (SPEC-6076 R2)
+
+
+def _sched(*slots):
+    """Creneaux d'un compte (accounts.schedule_of) : couples (jour, heure), fuseau UTC."""
+    return {"slots": [{"day": d, "time": t} for d, t in slots], "timezone": "UTC"}
+
+
+_MON9 = _sched(("mon", "09:00"))
+_MON9_WED9 = _sched(("mon", "09:00"), ("wed", "09:00"))
 
 
 def _write_sidecar(
@@ -96,7 +105,7 @@ def test_approve_without_slots_sets_status_approved(isolated_cwd):
     _write_preset(isolated_cwd, "ma_chaine")
     _write_sidecar(isolated_cwd, "vid1", "03")
 
-    entry = publish.approve("vid1", "03", "ma_chaine")
+    entry = publish.approve("vid1", "03", "ma_chaine", account=_ACCOUNT)
 
     assert entry["video_id"] == "vid1"
     assert entry["clip_id"] == "03"
@@ -118,12 +127,12 @@ def test_approve_with_slots_schedules_next_free_slot_after_now(isolated_cwd):
     _write_config(isolated_cwd)
     _write_preset(
         isolated_cwd, "ma_chaine",
-        '[channel]\ntimezone = "UTC"\n[[channel.slots]]\nday = "mon"\ntime = "09:00"\n',
+        '[channel]\ntimezone = "UTC"\n',
     )
     _write_sidecar(isolated_cwd, "vid1", "03")
     now = datetime(2026, 9, 28, 12, 0, tzinfo=timezone.utc)  # monday, past 09:00
 
-    entry = publish.approve("vid1", "03", "ma_chaine", now=now)
+    entry = publish.approve("vid1", "03", "ma_chaine", now=now, account=_ACCOUNT, schedule=_sched(("mon", "09:00")))
 
     assert entry["status"] == "scheduled"
     assert entry["slot_at"] == datetime(2026, 10, 5, 9, 0, tzinfo=ZoneInfo("UTC")).isoformat()
@@ -136,15 +145,13 @@ def test_approve_series_parts_get_consecutive_slots_in_part_order(isolated_cwd):
     _write_preset(
         isolated_cwd, "ma_chaine",
         '[channel]\ntimezone = "UTC"\n'
-        '[[channel.slots]]\nday = "mon"\ntime = "09:00"\n'
-        '[[channel.slots]]\nday = "wed"\ntime = "09:00"\n',
     )
     _write_sidecar(isolated_cwd, "vid1", "03-p1", part=1, parts_total=2)
     _write_sidecar(isolated_cwd, "vid1", "03-p2", part=2, parts_total=2)
     now = datetime(2026, 9, 28, 12, 0, tzinfo=timezone.utc)  # monday, past 09:00
 
-    part1 = publish.approve("vid1", "03-p1", "ma_chaine", now=now)
-    part2 = publish.approve("vid1", "03-p2", "ma_chaine", now=now)
+    part1 = publish.approve("vid1", "03-p1", "ma_chaine", now=now, account=_ACCOUNT, schedule=_sched(("mon", "09:00"), ("wed", "09:00")))
+    part2 = publish.approve("vid1", "03-p2", "ma_chaine", now=now, account=_ACCOUNT, schedule=_sched(("mon", "09:00"), ("wed", "09:00")))
 
     assert part1["series_id"] == part2["series_id"]
     assert part1["series_id"] is not None
@@ -167,7 +174,7 @@ def test_approve_refuses_clip_not_ready(isolated_cwd):
     _write_sidecar(isolated_cwd, "vid1", "03", ready=False)
 
     with pytest.raises(publish.PublishError, match="vid1/03"):
-        publish.approve("vid1", "03", "ma_chaine")
+        publish.approve("vid1", "03", "ma_chaine", account=_ACCOUNT)
 
     assert _read_state(isolated_cwd, "ma_chaine") == []
 
@@ -184,7 +191,7 @@ def test_reject_a_series_part_rejects_the_whole_series(isolated_cwd):
     _write_preset(isolated_cwd, "ma_chaine")
     _write_sidecar(isolated_cwd, "vid1", "03-p1", part=1, parts_total=2)
     _write_sidecar(isolated_cwd, "vid1", "03-p2", part=2, parts_total=2)
-    publish.approve("vid1", "03-p1", "ma_chaine")
+    publish.approve("vid1", "03-p1", "ma_chaine", account=_ACCOUNT)
 
     rejected = publish.reject("vid1", "03-p2", "ma_chaine")
 
@@ -202,7 +209,7 @@ def test_reject_a_clip_without_a_series_only_rejects_that_clip(isolated_cwd):
     _write_preset(isolated_cwd, "ma_chaine")
     _write_sidecar(isolated_cwd, "vid1", "03")
     _write_sidecar(isolated_cwd, "vid1", "04")
-    publish.approve("vid1", "04", "ma_chaine")
+    publish.approve("vid1", "04", "ma_chaine", account=_ACCOUNT)
 
     publish.reject("vid1", "03", "ma_chaine")
 
@@ -223,35 +230,33 @@ def test_move_refuses_a_slot_already_taken(isolated_cwd):
     _write_preset(
         isolated_cwd, "ma_chaine",
         '[channel]\ntimezone = "UTC"\n'
-        '[[channel.slots]]\nday = "mon"\ntime = "09:00"\n'
-        '[[channel.slots]]\nday = "wed"\ntime = "09:00"\n',
     )
     _write_sidecar(isolated_cwd, "vid1", "03")
     _write_sidecar(isolated_cwd, "vid1", "04")
     now = datetime(2026, 9, 28, 12, 0, tzinfo=timezone.utc)
-    publish.approve("vid1", "03", "ma_chaine", now=now)  # -> wed 2026-09-30 09:00
-    publish.approve("vid1", "04", "ma_chaine", now=now)  # -> mon 2026-10-05 09:00
+    publish.approve("vid1", "03", "ma_chaine", now=now, account=_ACCOUNT, schedule=_sched(("mon", "09:00"), ("wed", "09:00")))  # -> wed 2026-09-30 09:00
+    publish.approve("vid1", "04", "ma_chaine", now=now, account=_ACCOUNT, schedule=_sched(("mon", "09:00"), ("wed", "09:00")))  # -> mon 2026-10-05 09:00
     taken_slot = datetime(2026, 9, 30, 9, 0, tzinfo=ZoneInfo("UTC"))
 
     with pytest.raises(publish.PublishError, match="vid1/04"):
-        publish.move("vid1", "04", "ma_chaine", taken_slot)
+        publish.move("vid1", "04", "ma_chaine", taken_slot, schedule=_MON9_WED9)
 
 
-def test_move_refuses_a_slot_outside_the_channel_slots(isolated_cwd):
+def test_move_refuses_a_slot_outside_the_account_slots(isolated_cwd):
     from clipper import publish
 
     _write_config(isolated_cwd)
     _write_preset(
         isolated_cwd, "ma_chaine",
-        '[channel]\ntimezone = "UTC"\n[[channel.slots]]\nday = "mon"\ntime = "09:00"\n',
+        '[channel]\ntimezone = "UTC"\n',
     )
     _write_sidecar(isolated_cwd, "vid1", "03")
     now = datetime(2026, 9, 28, 12, 0, tzinfo=timezone.utc)
-    publish.approve("vid1", "03", "ma_chaine", now=now)
+    publish.approve("vid1", "03", "ma_chaine", now=now, account=_ACCOUNT, schedule=_sched(("mon", "09:00")))
     out_of_slots = datetime(2026, 10, 1, 9, 0, tzinfo=ZoneInfo("UTC"))  # tuesday
 
     with pytest.raises(publish.PublishError, match="vid1/03"):
-        publish.move("vid1", "03", "ma_chaine", out_of_slots)
+        publish.move("vid1", "03", "ma_chaine", out_of_slots, schedule=_MON9)
 
 
 def test_move_to_a_free_slot_updates_slot_at(isolated_cwd):
@@ -261,15 +266,13 @@ def test_move_to_a_free_slot_updates_slot_at(isolated_cwd):
     _write_preset(
         isolated_cwd, "ma_chaine",
         '[channel]\ntimezone = "UTC"\n'
-        '[[channel.slots]]\nday = "mon"\ntime = "09:00"\n'
-        '[[channel.slots]]\nday = "wed"\ntime = "09:00"\n',
     )
     _write_sidecar(isolated_cwd, "vid1", "03")
     now = datetime(2026, 9, 28, 12, 0, tzinfo=timezone.utc)
-    publish.approve("vid1", "03", "ma_chaine", now=now)  # -> wed 2026-09-30 09:00
+    publish.approve("vid1", "03", "ma_chaine", now=now, account=_ACCOUNT, schedule=_sched(("mon", "09:00"), ("wed", "09:00")))  # -> wed 2026-09-30 09:00
     new_slot = datetime(2026, 10, 5, 9, 0, tzinfo=ZoneInfo("UTC"))  # mon, free
 
-    moved = publish.move("vid1", "03", "ma_chaine", new_slot)
+    moved = publish.move("vid1", "03", "ma_chaine", new_slot, schedule=_MON9_WED9)
 
     assert moved["slot_at"] == new_slot.isoformat()
     assert moved["status"] == "scheduled"
@@ -286,7 +289,7 @@ def test_mark_published_sets_status_and_published_at(isolated_cwd):
     _write_config(isolated_cwd)
     _write_preset(isolated_cwd, "ma_chaine", _SLOT_PRESET)  # avec creneau : scheduled
     _write_sidecar(isolated_cwd, "vid1", "03")
-    publish.approve("vid1", "03", "ma_chaine")
+    publish.approve("vid1", "03", "ma_chaine", account=_ACCOUNT, schedule=_MON9)
     now = datetime(2026, 9, 28, 12, 0, tzinfo=timezone.utc)
 
     entry = publish.mark_published("vid1", "03", "ma_chaine", now=now)
@@ -301,11 +304,11 @@ def test_unschedule_returns_a_scheduled_clip_to_approved(isolated_cwd):
     _write_config(isolated_cwd)
     _write_preset(
         isolated_cwd, "ma_chaine",
-        '[channel]\ntimezone = "UTC"\n[[channel.slots]]\nday = "mon"\ntime = "09:00"\n',
+        '[channel]\ntimezone = "UTC"\n',
     )
     _write_sidecar(isolated_cwd, "vid1", "03")
     now = datetime(2026, 9, 28, 12, 0, tzinfo=timezone.utc)
-    publish.approve("vid1", "03", "ma_chaine", now=now)
+    publish.approve("vid1", "03", "ma_chaine", now=now, account=_ACCOUNT, schedule=_sched(("mon", "09:00")))
 
     entry = publish.unschedule("vid1", "03", "ma_chaine")
 
@@ -340,10 +343,10 @@ def test_edit_caption_refuses_on_a_scheduled_entry(isolated_cwd):
     _write_config(isolated_cwd)
     _write_preset(
         isolated_cwd, "ma_chaine",
-        '[channel]\ntimezone = "UTC"\n[[channel.slots]]\nday = "mon"\ntime = "09:00"\n',
+        '[channel]\ntimezone = "UTC"\n',
     )
     _write_sidecar(isolated_cwd, "vid1", "03")
-    publish.approve("vid1", "03", "ma_chaine")
+    publish.approve("vid1", "03", "ma_chaine", account=_ACCOUNT, schedule=_sched(("mon", "09:00")))
 
     with pytest.raises(publish.PublishError, match="vid1/03"):
         publish.edit_caption("vid1", "03", "ma_chaine", "x", [])
@@ -355,7 +358,7 @@ def test_edit_caption_refuses_on_a_published_entry(isolated_cwd):
     _write_config(isolated_cwd)
     _write_preset(isolated_cwd, "ma_chaine", _SLOT_PRESET)  # avec creneau : scheduled
     _write_sidecar(isolated_cwd, "vid1", "03")
-    publish.approve("vid1", "03", "ma_chaine")
+    publish.approve("vid1", "03", "ma_chaine", account=_ACCOUNT, schedule=_MON9)
     publish.mark_published("vid1", "03", "ma_chaine")
 
     with pytest.raises(publish.PublishError, match="vid1/03"):
@@ -380,7 +383,7 @@ def test_list_pending_returns_ready_clips_absent_from_the_publish_file(isolated_
     (workspace_dir / "pipeline.json").write_text(
         json.dumps({"channel": "ma_chaine"}), encoding="utf-8"
     )
-    publish.approve("vid1", "04", "ma_chaine")
+    publish.approve("vid1", "04", "ma_chaine", account=_ACCOUNT)
 
     pending = publish.list_pending("ma_chaine")
 
@@ -454,7 +457,7 @@ def _approve_many(cwd, prefix, n):
 
     os.chdir(cwd)
     for i in range(n):
-        publish.approve(f"{prefix}vid", f"{i:02d}", "ma_chaine")
+        publish.approve(f"{prefix}vid", f"{i:02d}", "ma_chaine", account=_ACCOUNT)
 
 
 def test_approve_from_two_processes_loses_no_entry(isolated_cwd):
@@ -482,7 +485,7 @@ def _seed_entry(cwd, status, clip_id="03"):
     _write_config(cwd)
     _write_preset(
         cwd, "ma_chaine",
-        '[channel]\ntimezone = "UTC"\n[[channel.slots]]\nday = "mon"\ntime = "09:00"\n',
+        '[channel]\ntimezone = "UTC"\n',
     )
     _write_sidecar(cwd, "vid1", clip_id)
     state = _state_file(cwd, "ma_chaine")
@@ -502,7 +505,7 @@ def test_move_refuses_a_rejected_or_published_entry(isolated_cwd, status):
     slot = datetime(2026, 10, 5, 9, 0, tzinfo=timezone.utc)
 
     with pytest.raises(publish.PublishError, match=status):
-        publish.move("vid1", "03", "ma_chaine", slot)
+        publish.move("vid1", "03", "ma_chaine", slot, schedule=_MON9)
 
 
 @pytest.mark.parametrize("status", ["approved", "rejected", "published", "failed"])
@@ -537,7 +540,7 @@ def test_approve_part_n_refuses_when_previous_part_was_never_approved(isolated_c
     _series(isolated_cwd)
 
     with pytest.raises(publish.PublishError, match="03-p1"):
-        publish.approve("vid1", "03-p2", "ma_chaine")
+        publish.approve("vid1", "03-p2", "ma_chaine", account=_ACCOUNT)
     assert _read_state(isolated_cwd, "ma_chaine") == []
 
 
@@ -545,24 +548,24 @@ def test_approve_part_n_refuses_when_previous_part_is_rejected(isolated_cwd):
     from clipper import publish
 
     _series(isolated_cwd)
-    publish.approve("vid1", "03-p1", "ma_chaine")
+    publish.approve("vid1", "03-p1", "ma_chaine", account=_ACCOUNT)
     state = _state_file(isolated_cwd, "ma_chaine")
     entries = json.loads(state.read_text(encoding="utf-8"))
     entries[0]["status"] = "rejected"
     state.write_text(json.dumps(entries), encoding="utf-8")
 
     with pytest.raises(publish.PublishError, match="03-p1"):
-        publish.approve("vid1", "03-p2", "ma_chaine")
+        publish.approve("vid1", "03-p2", "ma_chaine", account=_ACCOUNT)
 
 
 def test_approve_part_n_accepts_when_previous_part_is_approved(isolated_cwd):
     from clipper import publish
 
     _series(isolated_cwd)
-    publish.approve("vid1", "03-p1", "ma_chaine")
-    publish.approve("vid1", "03-p2", "ma_chaine")
+    publish.approve("vid1", "03-p1", "ma_chaine", account=_ACCOUNT)
+    publish.approve("vid1", "03-p2", "ma_chaine", account=_ACCOUNT)
 
-    assert publish.approve("vid1", "03-p3", "ma_chaine")["part"] == 3
+    assert publish.approve("vid1", "03-p3", "ma_chaine", account=_ACCOUNT)["part"] == 3
 
 
 def test_sibling_clip_ids_raises_publish_error_on_corrupt_json(isolated_cwd):
@@ -580,10 +583,8 @@ def test_sibling_clip_ids_raises_publish_error_on_corrupt_json(isolated_cwd):
 # --------------------------------------------------------------------------
 
 _ACCOUNT = "ab12cd"
-_TWO_SLOTS = (
-    f'[channel]\ntimezone = "UTC"\ntiktok_account = "{_ACCOUNT}"\n'
-    '[[channel.slots]]\nday = "mon"\ntime = "09:00"\n[[channel.slots]]\nday = "mon"\ntime = "18:00"\n'
-)
+_TWO_SLOTS = '[channel]\ntimezone = "UTC"\n'
+_TWO_SCHED = _sched(("mon", "09:00"), ("mon", "18:00"))
 _MON = datetime(2026, 9, 28, 6, 0, tzinfo=timezone.utc)
 
 
@@ -597,7 +598,7 @@ def _tiktok_env(cwd, clips=("01", "02", "03"), preset=_TWO_SLOTS):
 
     for clip in clips:
         _write_sidecar(cwd, "vid1", clip)
-        publish.approve("vid1", clip, "ma_chaine", now=_MON)
+        publish.approve("vid1", clip, "ma_chaine", now=_MON, account=_ACCOUNT, schedule=_TWO_SCHED)
     return publish
 
 
@@ -709,7 +710,7 @@ def test_postpone_moves_to_the_next_free_allowed_slot_and_records_why(isolated_c
 
     entry = publish.postpone(
         "vid1", "01", "ma_chaine", "plafond atteint",
-        allowed=lambda slot: "trop tot" if slot < blocked_until else None, now=_MON)
+        allowed=lambda slot: "trop tot" if slot < blocked_until else None, now=_MON, schedule=_TWO_SCHED)
 
     assert first["slot_at"] == "2026-09-28T09:00:00+00:00"
     assert entry["slot_at"] == "2026-10-05T09:00:00+00:00"  # le 18:00 du 28 est pris par 02 ; le 05 09:00 est libre
@@ -721,7 +722,7 @@ def test_postpone_moves_to_the_next_free_allowed_slot_and_records_why(isolated_c
 def test_postpone_without_any_allowed_slot_is_an_explicit_error(isolated_cwd):
     publish = _tiktok_env(isolated_cwd, ("01",))
     with pytest.raises(publish.PublishError, match="créneau"):
-        publish.postpone("vid1", "01", "ma_chaine", "plafond", allowed=lambda slot: "jamais", now=_MON)
+        publish.postpone("vid1", "01", "ma_chaine", "plafond", allowed=lambda slot: "jamais", now=_MON, schedule=_TWO_SCHED)
 
 
 def test_set_mode_overrides_the_publish_mode_of_one_entry(isolated_cwd):
@@ -739,24 +740,48 @@ def test_set_mode_overrides_the_publish_mode_of_one_entry(isolated_cwd):
 _OTHER = "ef34ab"
 
 
-def test_approve_prefills_the_account_with_the_channel_account(isolated_cwd):
+def test_approve_records_the_account_it_was_given(isolated_cwd):
     publish = _tiktok_env(isolated_cwd, ("01",))
 
     assert publish.list_entries("ma_chaine")[0]["account"] == _ACCOUNT
 
 
-def test_approve_can_pick_another_account_and_a_channel_without_account_leaves_it_empty(isolated_cwd):
+def test_approve_without_an_account_is_an_explicit_failure_and_writes_nothing(isolated_cwd):
+    from clipper import publish
+
     _write_config(isolated_cwd)
-    _write_preset(isolated_cwd, "ma_chaine", _SLOT_PRESET)  # aucun tiktok_account
+    _write_preset(isolated_cwd, "ma_chaine", _SLOT_PRESET)
+    _write_sidecar(isolated_cwd, "vid1", "01")
+
+    for missing in (None, ""):
+        with pytest.raises(publish.PublishError, match="compte de publication manquant"):
+            publish.approve("vid1", "01", "ma_chaine", now=_MON, account=missing, schedule=_MON9)
+    assert _read_state(isolated_cwd, "ma_chaine") == []
+
+
+def test_approve_takes_the_chosen_account_and_its_own_slots(isolated_cwd):
+    _write_config(isolated_cwd)
+    _write_preset(isolated_cwd, "ma_chaine", _SLOT_PRESET)
     from clipper import publish
 
     _write_sidecar(isolated_cwd, "vid1", "01")
     _write_sidecar(isolated_cwd, "vid1", "02")
-    publish.approve("vid1", "01", "ma_chaine", now=_MON)
-    publish.approve("vid1", "02", "ma_chaine", now=_MON, account=_OTHER)
+    publish.approve("vid1", "01", "ma_chaine", now=_MON, account=_ACCOUNT, schedule=_MON9)
+    publish.approve("vid1", "02", "ma_chaine", now=_MON, account=_OTHER, schedule=_sched(("tue", "10:00")))
 
     first, second = publish.list_entries("ma_chaine")
-    assert first["account"] is None and second["account"] == _OTHER
+    assert (first["account"], first["slot_at"]) == (_ACCOUNT, "2026-09-28T09:00:00+00:00")
+    assert (second["account"], second["slot_at"]) == (_OTHER, "2026-09-29T10:00:00+00:00")
+
+
+def test_move_and_postpone_without_account_slots_are_explicit_errors(isolated_cwd):
+    publish = _tiktok_env(isolated_cwd, ("01",))
+    slot = datetime(2026, 10, 5, 9, 0, tzinfo=timezone.utc)
+
+    with pytest.raises(publish.PublishError, match="aucun créneau"):
+        publish.move("vid1", "01", "ma_chaine", slot, schedule=_sched())
+    with pytest.raises(publish.PublishError, match="aucun créneau"):
+        publish.postpone("vid1", "01", "ma_chaine", "plafond", allowed=lambda s: None, now=_MON, schedule=None)
 
 
 def test_set_account_changes_the_account_of_an_entry_until_it_is_published(isolated_cwd):
@@ -778,10 +803,9 @@ def test_set_account_changes_the_account_of_an_entry_until_it_is_published(isola
 def test_entry_account_never_falls_back_to_another_account(isolated_cwd):
     from clipper import publish
 
-    assert publish.entry_account({"account": _OTHER}, _ACCOUNT) == _OTHER
-    assert publish.entry_account({"account": None}, _ACCOUNT) is None      # aucun compte choisi : pas le defaut
-    assert publish.entry_account({}, _ACCOUNT) == _ACCOUNT                  # file d'avant R4 : compte de la chaine
-    assert publish.entry_account({}, "") is None
+    assert publish.entry_account({"account": _OTHER}) == _OTHER
+    assert publish.entry_account({"account": None}) is None  # aucun compte choisi : jamais un autre
+    assert publish.entry_account({}) is None  # file d'avant R4 : plus de compte de style en repli (SPEC-6076 R2)
 
 
 def test_the_posts_and_halt_of_an_account_follow_the_entry_account_across_channels(isolated_cwd):
@@ -913,7 +937,7 @@ def test_create_post_refuses_rejected_and_published_clips(isolated_cwd, status):
     from clipper import publish
 
     _setup(isolated_cwd)
-    publish.approve("vid1", "03", "ma_chaine")
+    publish.approve("vid1", "03", "ma_chaine", account=_ACCOUNT)
     path = _state_file(isolated_cwd, "ma_chaine")
     entries = json.loads(path.read_text(encoding="utf-8"))
     entries[0]["status"] = status
@@ -927,7 +951,7 @@ def test_create_post_accepts_a_clip_approved_the_old_way(isolated_cwd):
     from clipper import publish
 
     _setup(isolated_cwd)
-    publish.approve("vid1", "03", "ma_chaine")
+    publish.approve("vid1", "03", "ma_chaine", account=_ACCOUNT)
 
     entry = _post(isolated_cwd)
 

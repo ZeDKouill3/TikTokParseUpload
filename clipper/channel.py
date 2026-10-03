@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import sys
@@ -15,9 +16,10 @@ from zoneinfo import ZoneInfo
 from clipper import accounts
 from clipper.config import Config, ConfigError, VALID_MODES, load_config, write_config
 
+logger = logging.getLogger(__name__)
+
 NAME_RE = re.compile(r"^[a-z0-9_-]{1,40}$")
-_TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
-_DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+_DAYS = accounts.DAYS
 
 CONFIG_DEFAULTS: dict[str, object] = {
     "display_name": "",
@@ -26,11 +28,15 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "watch_interval_s": 1800,
     "watch_min_duration_s": 600,
     "mode": "",
-    "slots": [],
     "timezone": "Europe/Paris",
-    "tiktok_account": "",
     "logo": "",
 }
+
+# Cles d'un [channel] d'avant SPEC-6076 R2 : le compte de publication et les creneaux appartiennent au compte
+# (clipper.accounts), plus au style. Presentes dans un preset = ignorees (clipper.config les retire de la table),
+# avertissement journalise une fois, migration par migrate_legacy_presets, retirees a la sauvegarde du style.
+LEGACY_KEYS = ("slots", "tiktok_account")
+_warned_legacy: set[str] = set()
 
 
 class ChannelError(Exception):
@@ -128,31 +134,17 @@ def list_channels(presets_dir: str | Path) -> list[str]:
     return sorted(names)
 
 
-def _validate_slots(slots: list[object]) -> None:
-    for slot in slots:
-        day = slot.get("day") if isinstance(slot, dict) else None
-        time_str = slot.get("time") if isinstance(slot, dict) else None
-        if day not in _DAYS or not isinstance(time_str, str) or not _TIME_RE.match(time_str):
-            raise ConfigError(f"creneau invalide dans [channel].slots : {slot!r}")
+def legacy_keys(table: Any) -> list[str]:
+    """Les cles d'avant SPEC-6076 R2 presentes dans une table [channel] brute."""
+    return [k for k in LEGACY_KEYS if isinstance(table, dict) and k in table]
 
 
-def _validate_tiktok_account(channel: dict[str, object], config: Config) -> None:
-    """[channel] tiktok_account : vide (aucun compte relie) ou l'id d'un compte du
-    carnet clipper.accounts ; un id inconnu est une erreur, jamais ignore (SPEC-9225 R2)."""
-    account = channel["tiktok_account"]
-    if not isinstance(account, str):
-        raise ConfigError(f"[channel] tiktok_account : une chaine est attendue, recu {account!r}")
-    if not account:
-        return
-    try:
-        known = {a["id"] for a in accounts.list_accounts(config)}
-    except accounts.AccountsError as exc:
-        raise ConfigError(f"[channel] tiktok_account {account!r} : carnet des comptes illisible ({exc})") from exc
-    if account not in known:
-        raise ConfigError(
-            f"[channel] tiktok_account {account!r} : compte inconnu "
-            "(cree-le dans l'ecran Comptes, puis choisis-le dans la chaine)"
-        )
+def _warn_legacy(name: str, keys: list[str]) -> None:
+    if keys and name not in _warned_legacy:
+        _warned_legacy.add(name)
+        logger.warning(
+            "style %s : [channel] %s ignoré (le compte de publication et les créneaux sont réglés par compte, "
+            "écran Comptes) ; retiré à la prochaine sauvegarde du style", name, " et ".join(keys))
 
 
 def load_channel(
@@ -171,12 +163,11 @@ def load_channel(
 
     config = load_config(path, base=base)
     channel = dict(config.section("channel"))
+    with path.open("rb") as f:
+        _warn_legacy(name, legacy_keys(tomllib.load(f).get("channel")))
 
     if not channel["display_name"]:
         channel["display_name"] = name
-
-    _validate_slots(channel["slots"])
-    _validate_tiktok_account(channel, config)
 
     if not channel["mode"]:
         channel["mode"] = config.mode
@@ -198,9 +189,60 @@ def save_channel(
 ) -> None:
     """Serialize data (the full preset, e.g. {"channel": {...}}) and replace
     the preset file, via config.write_config: reread and validated against
-    base first, an invalid file is left intact (SPEC-74e9 1.5)."""
+    base first, an invalid file is left intact (SPEC-74e9 1.5). The legacy
+    [channel] keys (SPEC-6076 R2) are dropped here, with a log."""
     _validate_name(name)
+    table = data.get("channel")
+    dropped = legacy_keys(table)
+    if dropped:
+        data = {**data, "channel": {k: v for k, v in table.items() if k not in LEGACY_KEYS}}
+        logger.info("style %s : [channel] %s retiré à la sauvegarde", name, " et ".join(dropped))
     write_config(_preset_path(presets_dir, name), data, base=base)
+
+
+def migrate_legacy_presets(
+    config: Config,
+    *,
+    presets_dir: str | Path = "presets",
+    base: str | Path = "config.toml",
+) -> list[str]:
+    """Migration unique (SPEC-6076 R2) : pour chaque preset dont [channel] porte encore ``tiktok_account`` et/ou
+    ``slots``, les creneaux sont repris sur ce compte (jamais ecrases s'il en a deja ; fuseau du style repris avec
+    eux), puis les deux cles sont retirees du fichier. Tout est journalise. Un preset dont le compte est inconnu,
+    ou qui a des creneaux sans compte, est laisse tel quel avec un avertissement : rien n'est perdu en silence.
+    Rend les noms des presets migres."""
+    migrated = []
+    for path in sorted(Path(presets_dir).glob("*.toml")):
+        with path.open("rb") as f:
+            data = tomllib.load(f)
+        table = data.get("channel")
+        keys = legacy_keys(table)
+        if not keys:
+            continue
+        name = path.stem
+        account_id = table.get("tiktok_account") or ""
+        slots = table.get("slots") or []
+        if slots:
+            if not account_id:
+                logger.warning("style %s : créneaux sans compte relié, laissés dans le preset (recopie-les sur un "
+                               "compte dans l'écran Comptes, puis sauvegarde le style)", name)
+                continue
+            try:
+                copied = accounts.migrate_slots(config, account_id, slots, table.get("timezone"))
+            except accounts.AccountsError as exc:
+                logger.warning("style %s : créneaux non migrés vers le compte %s (%s), laissés dans le preset",
+                               name, account_id, exc)
+                continue
+            if copied:
+                logger.info("style %s : %d créneau(x) migré(s) sur le compte %s", name, len(slots), account_id)
+            else:
+                logger.info("style %s : le compte %s a déjà des créneaux, ceux du style ne sont pas repris",
+                            name, account_id)
+        data["channel"] = {k: v for k, v in table.items() if k not in LEGACY_KEYS}
+        write_config(path, data, base=base)
+        logger.info("style %s : [channel] %s retiré du preset", name, " et ".join(keys))
+        migrated.append(name)
+    return migrated
 
 
 def delete_channel(name: str, *, presets_dir: str | Path = "presets") -> None:
@@ -212,8 +254,9 @@ def delete_channel(name: str, *, presets_dir: str | Path = "presets") -> None:
 
 
 def next_slots(channel: dict[str, object], after: datetime, n: int) -> list[datetime]:
-    """The n next slot datetimes strictly after `after`, in the channel's
-    timezone, chronologically sorted."""
+    """The n next slot datetimes strictly after `after`, in the schedule's
+    timezone, chronologically sorted. `channel` is any {"slots", "timezone"}
+    dict, in practice accounts.schedule_of(account) (SPEC-6076 R2)."""
     slots = channel["slots"]
     if n <= 0 or not slots:
         return []

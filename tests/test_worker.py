@@ -859,7 +859,8 @@ from clipper import accounts as accounts_mod, browser, publish, tiktok  # noqa: 
 
 ACCOUNT = "ab12cd"
 LINK = "https://example.invalid/@ma_chaine/video/7300000000000000001"
-_WEEK = "".join(f'[[channel.slots]]\nday = "{d}"\ntime = "09:00"\n' for d in ("mon", "tue", "wed", "thu", "fri", "sat", "sun"))
+# creneaux reguliers d'un compte (SPEC-6076 R2) : tous les jours a 09:00, fuseau UTC
+_WEEK = [{"day": d, "time": "09:00"} for d in ("mon", "tue", "wed", "thu", "fri", "sat", "sun")]
 
 
 _CONNECTED = {"state": "connected", "checked_at": "2026-10-01T10:00:00+00:00", "expires_at": None}
@@ -898,19 +899,19 @@ class FakePublisher:
                 "publish_at": (schedule_at if scheduled else datetime.now(timezone.utc)).isoformat(), "note": None}
 
 
-def _pub_env(tmp_path, monkeypatch, *, tiktok_settings=None, account=ACCOUNT, channels=("ma_chaine",)):
+def _pub_env(tmp_path, monkeypatch, *, tiktok_settings=None, channels=("ma_chaine",), slots=_WEEK):
     monkeypatch.chdir(tmp_path)
     (tmp_path / "config.toml").write_text('mode = "review"\n', encoding="utf-8")
     (tmp_path / "state").mkdir(exist_ok=True)
     (tmp_path / "state" / "accounts.json").write_text(
-        json.dumps({"accounts": [{"id": ACCOUNT, "label": "A", "ready_to_publish": True, "login": _CONNECTED},
-                                 {"id": "ef34ab", "label": "B", "ready_to_publish": True, "login": _CONNECTED}]}),
+        json.dumps({"accounts": [
+            {"id": ACCOUNT, "label": "A", "ready_to_publish": True, "login": _CONNECTED, "slots": slots, "timezone": "UTC"},
+            {"id": "ef34ab", "label": "B", "ready_to_publish": True, "login": _CONNECTED, "slots": slots, "timezone": "UTC"}]}),
         encoding="utf-8")
     presets = tmp_path / "presets"
     presets.mkdir(exist_ok=True)
-    for i, name in enumerate(channels):
-        acc = f'tiktok_account = "{["ab12cd", "ef34ab"][i]}"\n' if account else ""
-        (presets / f"{name}.toml").write_text(f'[channel]\ntimezone = "UTC"\n{acc}{_WEEK}', encoding="utf-8")
+    for name in channels:  # un style n'a ni compte ni creneaux (SPEC-6076 R2)
+        (presets / f"{name}.toml").write_text('[channel]\ntimezone = "UTC"\n', encoding="utf-8")
     return Config(
         mode="review", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output",
         _sections={
@@ -922,6 +923,7 @@ def _pub_env(tmp_path, monkeypatch, *, tiktok_settings=None, account=ACCOUNT, ch
 
 
 def _seed(tmp_path, channel, clip_id, slot_at, *, status="scheduled", video_id="aaaaaaaaaaa", **extra):
+    extra.setdefault("account", ACCOUNT)  # le compte est celui de la publication ; account=None : aucun compte choisi
     out = tmp_path / "output" / video_id
     out.mkdir(parents=True, exist_ok=True)
     (out / f"{clip_id}.mp4").write_bytes(b"mp4")
@@ -1031,7 +1033,7 @@ def test_the_worker_publishes_one_entry_per_tick_one_account_at_a_time(tmp_path,
                       tiktok_settings={"max_posts_per_day": 5, "min_gap_minutes": 0})
     _seed(tmp_path, "ma_chaine", "01", _ago(minutes=3))
     _seed(tmp_path, "ma_chaine", "02", _ago(minutes=2))
-    _seed(tmp_path, "autre", "03", _ago(minutes=1), video_id="bbbbbbbbbbb")
+    _seed(tmp_path, "autre", "03", _ago(minutes=1), video_id="bbbbbbbbbbb", account="ef34ab")
     pub = FakePublisher()
     w = _pub_worker(config, pub)
 
@@ -1043,9 +1045,9 @@ def test_the_worker_publishes_one_entry_per_tick_one_account_at_a_time(tmp_path,
     assert [c["account"] for c in pub.calls] == [ACCOUNT, ACCOUNT, "ef34ab"]
 
 
-def test_a_channel_without_a_tiktok_account_fails_explicitly_and_does_not_publish(tmp_path, monkeypatch):
-    config = _pub_env(tmp_path, monkeypatch, account=None)
-    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1))
+def test_an_entry_without_an_account_fails_explicitly_and_does_not_publish(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1), account=None)
     pub = FakePublisher()
 
     _pub_worker(config, pub).tick()
@@ -1053,9 +1055,9 @@ def test_a_channel_without_a_tiktok_account_fails_explicitly_and_does_not_publis
     assert pub.calls == []
     entry = _entries(tmp_path)[0]
     assert entry["status"] == "failed"
-    assert "tiktok_account" in entry["error"] and "ma_chaine" in entry["error"]
+    assert "aucun compte de publication choisi" in entry["error"]
     events = tiktok.read_events(config=config)
-    assert events[-1]["level"] == "error" and "tiktok_account" in events[-1]["reason"]
+    assert events[-1]["level"] == "error" and "aucun compte de publication choisi" in events[-1]["reason"]
 
 
 @pytest.mark.parametrize("code, reason", [
@@ -1160,7 +1162,7 @@ def test_r6_min_gap_postpones_even_when_the_daily_cap_is_not_reached(tmp_path, m
 def test_r6_a_published_post_counts_for_the_account_across_channels(tmp_path, monkeypatch):
     config = _pub_env(tmp_path, monkeypatch)
     (tmp_path / "presets" / "autre.toml").write_text(
-        f'[channel]\ntimezone = "UTC"\ntiktok_account = "{ACCOUNT}"\n{_WEEK}', encoding="utf-8")
+        '[channel]\ntimezone = "UTC"\n', encoding="utf-8")
     now = datetime.now(timezone.utc)
     _seed(tmp_path, "autre", "00", _ago(minutes=5), status="published", video_id="bbbbbbbbbbb",
           tiktok_publish_at=(now - timedelta(seconds=5)).isoformat(), published_at=now.isoformat())
@@ -1447,14 +1449,52 @@ def test_the_account_chosen_for_the_publication_is_the_one_the_worker_uses(tmp_p
     assert sidecar["tiktok_post"]["account"] == OTHER
 
 
-def test_an_entry_without_account_field_keeps_using_the_channel_account(tmp_path, monkeypatch):
+def test_an_entry_without_account_field_never_falls_back_to_a_style_account(tmp_path, monkeypatch):
     config = _pub_env(tmp_path, monkeypatch)
-    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1))  # file d'avant R4 : aucun champ account
+    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1))
+    path = tmp_path / "state" / "publish" / "ma_chaine.json"
+    entries = json.loads(path.read_text(encoding="utf-8"))
+    del entries[0]["account"]  # file d'avant R4 : aucun champ account
+    path.write_text(json.dumps(entries), encoding="utf-8")
     pub = FakePublisher()
 
     _pub_worker(config, pub).tick()
 
-    assert [c["account"] for c in pub.calls] == [ACCOUNT]
+    assert pub.calls == []
+    assert _entries(tmp_path)[0]["status"] == "failed"
+
+
+def test_a_capped_entry_is_postponed_to_a_slot_of_its_account_not_of_a_style(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch, tiktok_settings={"max_posts_per_day": 1, "min_gap_minutes": 0},
+                      slots=[{"day": d, "time": "09:00"} for d in ("mon", "tue", "wed", "thu", "fri", "sat", "sun")])
+    now = datetime.now(timezone.utc)
+    _seed(tmp_path, "ma_chaine", "00", _ago(minutes=5), status="published", video_id="bbbbbbbbbbb",
+          tiktok_publish_at=(now - timedelta(seconds=5)).isoformat(), published_at=now.isoformat())
+    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1))  # plafond du jour atteint par 00
+    pub = FakePublisher()
+
+    _pub_worker(config, pub).tick()
+
+    assert pub.calls == []
+    entry = next(e for e in _entries(tmp_path) if e["clip_id"] == "01")
+    moved = datetime.fromisoformat(entry["slot_at"])
+    assert moved > now and (moved.hour, moved.minute) == (9, 0)  # un creneau 09:00 du compte
+    assert entry["postponed_reason"]
+
+
+def test_a_capped_entry_whose_account_has_no_slot_waits_with_an_explicit_reason(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch, tiktok_settings={"max_posts_per_day": 1, "min_gap_minutes": 0}, slots=[])
+    now = datetime.now(timezone.utc)
+    _seed(tmp_path, "ma_chaine", "00", _ago(minutes=5), status="published", video_id="bbbbbbbbbbb",
+          tiktok_publish_at=(now - timedelta(seconds=5)).isoformat(), published_at=now.isoformat())
+    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1))
+    pub = FakePublisher()
+
+    _pub_worker(config, pub).tick()
+
+    assert pub.calls == []
+    entry = next(e for e in _entries(tmp_path) if e["clip_id"] == "01")
+    assert entry["status"] == "scheduled" and "aucun créneau" in entry["waiting_reason"]
 
 
 def test_an_entry_with_an_unknown_account_waits_with_the_reason(tmp_path, monkeypatch):

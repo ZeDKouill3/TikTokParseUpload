@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -17,9 +19,7 @@ def test_config_defaults_has_exactly_the_spec_keys_and_defaults():
         "watch_interval_s": 1800,
         "watch_min_duration_s": 600,
         "mode": "",
-        "slots": [],
         "timezone": "Europe/Paris",
-        "tiktok_account": "",
         "logo": "",
     }
 
@@ -114,51 +114,6 @@ def test_load_channel_rejects_invalid_mode(isolated_cwd):
     (presets_dir / "ma_chaine.toml").write_text('[channel]\nmode = "bogus"\n')
 
     with pytest.raises(ConfigError, match="bogus"):
-        load_channel("ma_chaine")
-
-
-def test_load_channel_accepts_valid_slots(isolated_cwd):
-    from clipper.channel import load_channel
-
-    (isolated_cwd / "config.toml").write_text('mode = "review"\n')
-    presets_dir = isolated_cwd / "presets"
-    presets_dir.mkdir()
-    (presets_dir / "ma_chaine.toml").write_text(
-        '[channel]\n[[channel.slots]]\nday = "mon"\ntime = "18:30"\n'
-    )
-
-    _, channel = load_channel("ma_chaine")
-
-    assert channel["slots"] == [{"day": "mon", "time": "18:30"}]
-
-
-def test_load_channel_rejects_slot_with_invalid_day(isolated_cwd):
-    from clipper.config import ConfigError
-    from clipper.channel import load_channel
-
-    (isolated_cwd / "config.toml").write_text('mode = "review"\n')
-    presets_dir = isolated_cwd / "presets"
-    presets_dir.mkdir()
-    (presets_dir / "ma_chaine.toml").write_text(
-        '[channel]\n[[channel.slots]]\nday = "someday"\ntime = "18:30"\n'
-    )
-
-    with pytest.raises(ConfigError, match="someday"):
-        load_channel("ma_chaine")
-
-
-def test_load_channel_rejects_slot_with_invalid_time(isolated_cwd):
-    from clipper.config import ConfigError
-    from clipper.channel import load_channel
-
-    (isolated_cwd / "config.toml").write_text('mode = "review"\n')
-    presets_dir = isolated_cwd / "presets"
-    presets_dir.mkdir()
-    (presets_dir / "ma_chaine.toml").write_text(
-        '[channel]\n[[channel.slots]]\nday = "mon"\ntime = "25:99"\n'
-    )
-
-    with pytest.raises(ConfigError, match="25:99"):
         load_channel("ma_chaine")
 
 
@@ -289,78 +244,169 @@ def test_list_channels_raises_channel_error_naming_a_malformed_preset(isolated_c
         list_channels(presets_dir)
 
 
-# --- TASK-e522 : [channel] tiktok_account valide contre clipper.accounts (SPEC-9225 R2) ---
+# --- TASK-31d5 : ni compte ni creneaux dans un style (SPEC-6076 R2) ---
+
+_LEGACY = (
+    '[channel]\ndisplay_name = "Ma chaine"\ntimezone = "UTC"\ntiktok_account = "ab12cd"\n'
+    '[[channel.slots]]\nday = "mon"\ntime = "18:30"\n[[channel.slots]]\nday = "fri"\ntime = "09:00"\n'
+)
 
 
-def _channel_with_account(isolated_cwd, account, accounts_json='{"accounts": [{"id": "ab12cd", "label": "Compte"}]}'):
+def _legacy_env(isolated_cwd, preset=_LEGACY, accounts=None):
+    from clipper.config import load_config
+
     (isolated_cwd / "config.toml").write_text('mode = "review"\n')
-    if accounts_json is not None:
-        (isolated_cwd / "state").mkdir(exist_ok=True)
-        (isolated_cwd / "state" / "accounts.json").write_text(accounts_json, encoding="utf-8")
+    (isolated_cwd / "state").mkdir(exist_ok=True)
+    rows = [{"id": "ab12cd", "label": "Compte"}] if accounts is None else accounts
+    (isolated_cwd / "state" / "accounts.json").write_text(json.dumps({"accounts": rows}), encoding="utf-8")
     presets = isolated_cwd / "presets"
     presets.mkdir(exist_ok=True)
-    line = f'tiktok_account = "{account}"\n' if account is not None else ""
-    (presets / "ma_chaine.toml").write_text(f"[channel]\n{line}")
+    path = presets / "ma_chaine.toml"
+    path.write_text(preset, encoding="utf-8")
+    return load_config("config.toml"), path
 
 
-def test_tiktok_account_empty_by_default_needs_no_accounts_file(isolated_cwd):
+def _account(isolated_cwd, account_id="ab12cd"):
+    rows = json.loads((isolated_cwd / "state" / "accounts.json").read_text(encoding="utf-8"))["accounts"]
+    return next(a for a in rows if a["id"] == account_id)
+
+
+def _channel_keys(path):
+    import tomllib
+
+    return tomllib.loads(path.read_text(encoding="utf-8"))["channel"]
+
+
+@pytest.fixture(autouse=True)
+def _forget_legacy_warnings():
+    from clipper import channel
+
+    channel._warned_legacy.clear()
+
+
+def test_a_style_has_no_account_and_no_slots_keys():
+    from clipper.channel import CONFIG_DEFAULTS
+
+    assert "tiktok_account" not in CONFIG_DEFAULTS and "slots" not in CONFIG_DEFAULTS
+
+
+def test_a_legacy_preset_still_loads_never_uses_its_account_and_warns_once(isolated_cwd, caplog):
     from clipper.channel import load_channel
 
-    _channel_with_account(isolated_cwd, None, accounts_json=None)
+    _legacy_env(isolated_cwd)
 
-    _config, channel = load_channel("ma_chaine")
-
-    assert channel["tiktok_account"] == ""
-
-
-def test_tiktok_account_known_account_is_accepted(isolated_cwd):
-    from clipper.channel import load_channel
-
-    _channel_with_account(isolated_cwd, "ab12cd")
-
-    _config, channel = load_channel("ma_chaine")
-
-    assert channel["tiktok_account"] == "ab12cd"
-
-
-def test_tiktok_account_unknown_account_is_a_config_error(isolated_cwd):
-    from clipper.channel import load_channel
-    from clipper.config import ConfigError
-
-    _channel_with_account(isolated_cwd, "zz99")
-
-    with pytest.raises(ConfigError, match=r"tiktok_account.*zz99.*compte inconnu"):
+    with caplog.at_level(logging.WARNING, logger="clipper.channel"):
+        _config, channel = load_channel("ma_chaine")
         load_channel("ma_chaine")
 
-
-def test_tiktok_account_without_accounts_file_is_an_unknown_account(isolated_cwd):
-    from clipper.channel import load_channel
-    from clipper.config import ConfigError
-
-    _channel_with_account(isolated_cwd, "ab12cd", accounts_json=None)
-
-    with pytest.raises(ConfigError, match="compte inconnu"):
-        load_channel("ma_chaine")
+    assert "slots" not in channel and "tiktok_account" not in channel
+    warnings = [r.getMessage() for r in caplog.records if "ma_chaine" in r.getMessage()]
+    assert len(warnings) == 1 and "slots" in warnings[0] and "tiktok_account" in warnings[0]
 
 
-def test_tiktok_account_must_be_a_string(isolated_cwd):
-    from clipper.channel import load_channel
-    from clipper.config import ConfigError
+def test_migration_copies_the_slots_on_the_account_and_removes_both_keys(isolated_cwd, caplog):
+    from clipper.channel import load_channel, migrate_legacy_presets
 
-    (isolated_cwd / "config.toml").write_text('mode = "review"\n')
-    presets = isolated_cwd / "presets"
-    presets.mkdir()
-    (presets / "ma_chaine.toml").write_text("[channel]\ntiktok_account = 12\n")
+    config, path = _legacy_env(isolated_cwd)
 
-    with pytest.raises(ConfigError, match="tiktok_account"):
-        load_channel("ma_chaine")
+    with caplog.at_level(logging.INFO, logger="clipper.channel"):
+        migrated = migrate_legacy_presets(config)
+
+    assert migrated == ["ma_chaine"]
+    account = _account(isolated_cwd)
+    assert account["slots"] == [{"day": "mon", "time": "18:30"}, {"day": "fri", "time": "09:00"}]
+    assert account["timezone"] == "UTC"
+    keys = _channel_keys(path)
+    assert "slots" not in keys and "tiktok_account" not in keys
+    assert keys["display_name"] == "Ma chaine"  # le reste du preset est conserve
+    assert "migré" in caplog.text and "ab12cd" in caplog.text
+    caplog.clear()
+    load_channel("ma_chaine")
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]  # plus d'avertissement ensuite
 
 
-def test_tiktok_account_unreadable_accounts_file_is_a_config_error(isolated_cwd):
-    from clipper.channel import load_channel
-    from clipper.config import ConfigError
+def test_migration_never_overwrites_the_slots_an_account_already_has(isolated_cwd):
+    from clipper.channel import migrate_legacy_presets
 
-    _channel_with_account(isolated_cwd, "ab12cd", accounts_json="pas du json")
+    existing = [{"day": "wed", "time": "12:00"}]
+    config, path = _legacy_env(isolated_cwd, accounts=[{"id": "ab12cd", "label": "C", "slots": existing, "timezone": "Europe/Paris"}])
 
-    with pytest.raises(ConfigError, match="tiktok_account"):
-        load_channel("ma_chaine")
+    assert migrate_legacy_presets(config) == ["ma_chaine"]
+
+    account = _account(isolated_cwd)
+    assert account["slots"] == existing and account["timezone"] == "Europe/Paris"
+    assert "slots" not in _channel_keys(path) and "tiktok_account" not in _channel_keys(path)
+
+
+def test_migration_leaves_a_preset_whose_account_is_unknown_untouched_and_says_so(isolated_cwd, caplog):
+    from clipper.channel import migrate_legacy_presets
+
+    config, path = _legacy_env(isolated_cwd, accounts=[])
+    before = path.read_text(encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="clipper.channel"):
+        assert migrate_legacy_presets(config) == []
+
+    assert path.read_text(encoding="utf-8") == before
+    assert "ma_chaine" in caplog.text and "ab12cd" in caplog.text
+
+
+def test_migration_leaves_slots_without_an_account_untouched_and_says_so(isolated_cwd, caplog):
+    from clipper.channel import migrate_legacy_presets
+
+    config, path = _legacy_env(isolated_cwd, preset='[channel]\n[[channel.slots]]\nday = "mon"\ntime = "18:30"\n')
+    before = path.read_text(encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="clipper.channel"):
+        assert migrate_legacy_presets(config) == []
+
+    assert path.read_text(encoding="utf-8") == before and "sans compte" in caplog.text
+
+
+def test_migration_refuses_to_copy_an_invalid_slot_and_keeps_the_preset(isolated_cwd, caplog):
+    from clipper.channel import migrate_legacy_presets
+
+    config, path = _legacy_env(
+        isolated_cwd, preset='[channel]\ntiktok_account = "ab12cd"\n[[channel.slots]]\nday = "someday"\ntime = "25:99"\n')
+
+    with caplog.at_level(logging.WARNING, logger="clipper.channel"):
+        assert migrate_legacy_presets(config) == []
+
+    assert "someday" in caplog.text and "slots" in _channel_keys(path)
+    assert "slots" not in _account(isolated_cwd)
+
+
+def test_migration_removes_an_account_key_without_slots_and_touches_no_account(isolated_cwd):
+    from clipper.channel import migrate_legacy_presets
+
+    config, path = _legacy_env(isolated_cwd, preset='[channel]\ntiktok_account = "ab12cd"\n')
+
+    assert migrate_legacy_presets(config) == ["ma_chaine"]
+
+    assert "tiktok_account" not in _channel_keys(path)
+    assert "slots" not in _account(isolated_cwd)
+
+
+def test_migration_does_nothing_on_a_preset_without_legacy_keys(isolated_cwd):
+    from clipper.channel import migrate_legacy_presets
+
+    config, path = _legacy_env(isolated_cwd, preset='[channel]\ndisplay_name = "X"\n')
+    before = path.read_text(encoding="utf-8")
+
+    assert migrate_legacy_presets(config) == []
+    assert path.read_text(encoding="utf-8") == before
+
+
+def test_saving_a_style_drops_the_legacy_keys(isolated_cwd, caplog):
+    from clipper.channel import load_channel, save_channel
+
+    _legacy_env(isolated_cwd)
+
+    with caplog.at_level(logging.INFO, logger="clipper.channel"):
+        save_channel("ma_chaine", {"channel": {"display_name": "Nouveau", "tiktok_account": "ab12cd",
+                                               "slots": [{"day": "mon", "time": "18:30"}]}})
+
+    keys = _channel_keys(isolated_cwd / "presets" / "ma_chaine.toml")
+    assert keys == {"display_name": "Nouveau"}
+    assert "retiré" in caplog.text
+    load_channel("ma_chaine")
