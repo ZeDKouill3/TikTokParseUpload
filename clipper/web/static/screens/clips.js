@@ -31,6 +31,11 @@ function clipsFiltered(all, ui) {
 }
 
 const clipKey = (c) => `${c.video_id}/${c.clip_id}`;
+/* Libelle d'un compte avec son service (« ClipManiaq3 (YouTube) ») : un meme nom peut exister sur TikTok et YouTube. */
+const clipsAccountText = (a) => {
+  const service = a.service_label || (a.service === "youtube" ? "YouTube" : a.service === "tiktok" ? "TikTok" : "");
+  return `${a.label || a.id}${service ? ` (${service})` : ""}`;
+};
 const clipUrl = (c, tail) => `/api/clips/${encodeURIComponent(c.video_id)}/${encodeURIComponent(c.clip_id)}${tail || ""}`;
 const clipStatus = (c) => CLIP_STATUS[c.publish_status] || { label: c.publish_status, cls: "pending" };
 const clipSeconds = (s) => `${fr(s, 1)} s`;
@@ -177,7 +182,7 @@ async function clipsFillSelAccounts(select) {
   try {
     const out = await api("/api/publish/accounts");
     const ready = out.accounts.filter((a) => a.ready_to_publish);
-    const options = ready.map((a) => `<option value="${esc(a.id)}">${esc(a.label || a.id)}</option>`);
+    const options = ready.map((a) => `<option value="${esc(a.id)}">${esc(clipsAccountText(a))}</option>`);
     options.unshift(`<option value="">${ready.length ? "Choisis un compte" : "Aucun compte prêt à publier"}</option>`);
     select.innerHTML = options.join("");
   } catch (err) {
@@ -279,7 +284,7 @@ async function clipFillAccounts(c, d) {
   try {
     const out = await api("/api/publish/accounts");
     const ready = out.accounts.filter((a) => a.ready_to_publish);
-    const options = ready.map((a) => `<option value="${esc(a.id)}">${esc(a.label || a.id)}</option>`);
+    const options = ready.map((a) => `<option value="${esc(a.id)}">${esc(clipsAccountText(a))}</option>`);
     options.unshift(`<option value="">Choisis un compte</option>`);
     if (!ready.length) hint.textContent = "Aucun compte prêt à publier : connecte-en un dans l'écran Comptes.";
     select.innerHTML = options.join("");
