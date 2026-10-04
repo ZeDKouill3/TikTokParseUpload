@@ -41,6 +41,13 @@ def _node_run(script: str, *args: str) -> str:
     finally:
         Path(path).unlink(missing_ok=True)
 
+def _busy_worker(tmp_path) -> None:
+    """Un worker vivant qui traite des videos (battement « busy », pid de ce processus) : leurs etapes « running »
+    sans entree dans la file ne sont pas orphelines (TASK-bdd5)."""
+    _write_json(tmp_path / "state" / "worker.json",
+                {"pid": os.getpid(), "at": datetime.now(timezone.utc).isoformat(), "busy": True})
+
+
 def make_config(tmp_path) -> Config:
     return Config(mode="review", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output")
 
@@ -131,6 +138,7 @@ def test_list_videos_empty_workspace_is_an_empty_list(tmp_path, isolated_cwd):
 
 
 def test_get_video_detail_uses_pipeline_load_state(tmp_path, isolated_cwd, monkeypatch):
+    _busy_worker(tmp_path)
     from clipper import pipeline
 
     state = {"video_id": VIDEO_ID, "status": "running", "steps": {}}
@@ -1206,6 +1214,7 @@ def _seed_videos(tmp_path):
 
 
 def test_list_videos_enriches_each_video_with_title_duration_and_current_step(tmp_path, isolated_cwd):
+    _busy_worker(tmp_path)
     _seed_videos(tmp_path)
 
     by_id = {v["video_id"]: v for v in client(tmp_path).get("/api/videos").json()}
@@ -1387,6 +1396,7 @@ def test_dashboard_empty_workspace_has_explicit_empty_sections(tmp_path, isolate
 
 
 def test_dashboard_running_videos_expose_current_step_and_progress(tmp_path, isolated_cwd):
+    _busy_worker(tmp_path)
     progress = {"fraction": 0.4, "eta_s": 90.0, "message": "segment 3/8"}
     state = _write_state(tmp_path, "aaaaaaaaaaa", status="running", channel="ma_chaine")
     state["steps"]["download"]["status"] = "done"
@@ -6583,6 +6593,7 @@ def test_a_twitch_video_without_any_recorded_thumbnail_has_none_not_a_made_up_on
 
 
 def test_queue_entries_and_dashboard_rows_carry_the_platform_thumbnail(tmp_path, isolated_cwd):
+    _busy_worker(tmp_path)
     entries = [{"id": "e1", "video_id": VIDEO_ID, "url": URL, "channel": None, "action": "run", "force_steps": [],
                 "enqueued_at": "2026-01-01T00:00:00+00:00", "status": "waiting", "pid": None},
                {"id": "e2", "video_id": TWITCH_ID, "url": TWITCH_URL, "channel": None, "action": "run", "force_steps": [],
@@ -6603,6 +6614,7 @@ def test_queue_entries_and_dashboard_rows_carry_the_platform_thumbnail(tmp_path,
 
 
 def test_dashboard_running_card_carries_the_title_of_the_video(tmp_path, isolated_cwd):
+    _busy_worker(tmp_path)
     _write_state(tmp_path, "aaaaaaaaaaa", status="running")
     _write_state(tmp_path, "bbbbbbbbbbb", status="running")
     _write_json(tmp_path / "workspace" / "aaaaaaaaaaa" / "meta.json", {"title": "Mon titre de vidéo"})
@@ -8545,3 +8557,98 @@ def test_get_journal_endpoint_reports_unavailable_without_a_logs_directory(tmp_p
     assert body["available"] is False
     assert body["lines"] == []
     assert body["reason"]
+
+
+# --------------------------------------------------------------------------
+# TASK-bdd5 : vidéo interrompue (étape running sans processus)
+# --------------------------------------------------------------------------
+
+ORPHAN_ID = "Zk_wshsmq5w"
+
+
+def _write_orphan(tmp_path, video_id=ORPHAN_ID):
+    """Cas réel 2026-10-04 : download done, transcribe running, file vide."""
+    from clipper import pipeline
+
+    state = pipeline.new_state(video_id, f"https://youtu.be/{video_id}", "review")
+    state["status"] = "running"
+    state["steps"]["download"].update(status="done")
+    state["steps"]["transcribe"].update(status="running", started_at="2026-10-04T10:02:00+00:00")
+    pipeline.save_state(state, config=make_config(tmp_path))
+    return state
+
+
+def _orphan_statuses(tmp_path) -> dict:
+    from clipper import pipeline
+
+    return {n: s["status"] for n, s in pipeline.load_state(ORPHAN_ID, config=make_config(tmp_path))["steps"].items()}
+
+
+def test_a_running_step_without_a_process_is_reported_interrupted_never_running(tmp_path, isolated_cwd):
+    _write_orphan(tmp_path)
+
+    listed = client(tmp_path).get("/api/videos").json()
+    detail = client(tmp_path).get(f"/api/videos/{ORPHAN_ID}").json()
+
+    assert [(v["video_id"], v["status"], v["interrupted"]) for v in listed] == [(ORPHAN_ID, "interrupted", True)]
+    assert detail["status"] == "interrupted" and "transcribe" in detail["reason"]
+    assert [v["video_id"] for v in client(tmp_path).get("/api/videos?status=interrupted").json()] == [ORPHAN_ID]
+    assert client(tmp_path).get("/api/videos?status=running").json() == []
+    assert client(tmp_path).get("/api/dashboard").json()["running"] == []
+
+
+def test_a_running_step_with_a_live_process_stays_running(tmp_path, isolated_cwd):
+    state = _write_orphan(tmp_path)
+    _write_json(tmp_path / "state" / "queue.json", [{
+        "id": "q1", "video_id": ORPHAN_ID, "url": state["source_url"], "channel": None, "action": "run",
+        "force_steps": [], "enqueued_at": "2026-10-04T10:00:00+00:00", "status": "running", "pid": os.getpid()}])
+
+    video = client(tmp_path).get(f"/api/videos/{ORPHAN_ID}").json()
+
+    assert (video["status"], video["interrupted"]) == ("running", False)
+
+
+def test_cancelling_an_interrupted_video_works_and_keeps_the_finished_steps(tmp_path, isolated_cwd):
+    _write_orphan(tmp_path)
+
+    resp = client(tmp_path).post(f"/api/videos/{ORPHAN_ID}/cancel")
+
+    assert resp.status_code == 200, resp.text
+    assert _orphan_statuses(tmp_path)["download"] == "done"
+    assert _orphan_statuses(tmp_path)["transcribe"] == "pending"
+    assert client(tmp_path).get(f"/api/videos/{ORPHAN_ID}").json()["status"] == "failed"
+
+
+def test_resuming_an_interrupted_video_requeues_it_without_redoing_done_steps(tmp_path, isolated_cwd):
+    _write_orphan(tmp_path)
+
+    resp = client(tmp_path).post(f"/api/videos/{ORPHAN_ID}/resume")
+
+    assert resp.status_code == 202, resp.text
+    queue = json.loads((tmp_path / "state" / "queue.json").read_text(encoding="utf-8"))
+    assert [(e["video_id"], e["action"], e["status"], e["force_steps"]) for e in queue] == [
+        (ORPHAN_ID, "run", "waiting", [])]
+    assert _orphan_statuses(tmp_path)["download"] == "done"
+
+
+def test_resuming_a_video_that_really_runs_is_a_409(tmp_path, isolated_cwd):
+    state = _write_orphan(tmp_path)
+    _write_json(tmp_path / "state" / "queue.json", [{
+        "id": "q1", "video_id": ORPHAN_ID, "url": state["source_url"], "channel": None, "action": "run",
+        "force_steps": [], "enqueued_at": "2026-10-04T10:00:00+00:00", "status": "running", "pid": os.getpid()}])
+
+    assert client(tmp_path).post(f"/api/videos/{ORPHAN_ID}/resume").status_code == 409
+
+
+def test_resuming_an_unknown_video_is_a_404(tmp_path, isolated_cwd):
+    assert client(tmp_path).post(f"/api/videos/{ORPHAN_ID}/resume").status_code == 404
+
+
+def test_videos_screen_offers_resume_and_cancel_on_an_interrupted_video(tmp_path, isolated_cwd):
+    js = _videos_js(tmp_path)
+
+    assert 'video.status === "interrupted"' in js
+    assert "/resume" in js and "data-resume-video" in js
+    assert "/cancel" in js
+    idx = js.index("/resume")
+    assert "confirmDialog(" in js[max(0, idx - 800):idx]

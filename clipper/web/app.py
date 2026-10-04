@@ -191,6 +191,9 @@ def _moment_transcript(video_dir: Path, start: float, end: float) -> tuple[str |
 # Statuts valides d'une video (contrat pipeline.json) : un filtre hors de cette
 # liste est une erreur, jamais une liste vide silencieuse (ADR-ad2e).
 _VIDEO_STATUSES = ("pending", "running", "awaiting_review", "queued", "done", "failed")
+# « interrompue » (TASK-bdd5) n'est jamais ecrit dans pipeline.json : l'API le deduit d'un statut « running »
+# sans processus (worker.is_interrupted). Seul le filtre de la liste l'accepte en plus.
+_VIDEO_FILTER_STATUSES = (*_VIDEO_STATUSES, "interrupted")
 
 
 def _parse_ts(video_id: str, step: str, key: str, value: str) -> datetime:
@@ -253,9 +256,17 @@ def _added_at(state: dict[str, Any], config: Config) -> tuple[str, str]:
 
 def _enrich(state: dict[str, Any], config: Config) -> dict[str, Any]:
     """Etat pipeline.json + titre (meta.json de download, sinon l'identifiant
-    avec la raison), etape courante et duree par etape."""
+    avec la raison), etape courante et duree par etape. Une video « running » sans processus (serveur ou PC
+    arrete en plein traitement) est rapportee ``interrupted``, jamais « en cours » (TASK-bdd5)."""
     video_id = state["video_id"]
     out = dict(state)
+    out["interrupted"] = False
+    try:
+        if worker_mod.is_interrupted(state, config):
+            out.update(status="interrupted", interrupted=True,
+                       reason=f"interrompue à l'étape {_current_step(state)} : plus aucun processus ne travaille dessus")
+    except worker_mod.WorkerError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
     meta_path = Path(config.workspace_dir) / video_id / "meta.json"
     title = None
     if meta_path.exists():
@@ -533,8 +544,10 @@ def _dashboard_videos(config: Config) -> dict[str, Any]:
     for state in states:
         if state.get("status") != "running":
             continue
-        step = _current_step(state)
         enriched = _enrich(state, config)
+        if enriched["interrupted"]:
+            continue  # jamais « en cours » : l'ecran Videos propose Reprendre / Annuler
+        step = _current_step(state)
         running.append({
             "video_id": state["video_id"], "title": enriched["title"], "channel": state.get("channel"),
             "source_url": state.get("source_url"), "platform_thumbnail": enriched["platform_thumbnail"],
@@ -2171,10 +2184,10 @@ def create_app(config: Config | None = None) -> FastAPI:
         """Liste filtrable (chaine exacte, statut, texte sur video_id / titre /
         source_url), chaque video enrichie de son titre, de son etape courante
         et de la duree de chaque etape (SPEC-c100 E2)."""
-        if status is not None and status not in _VIDEO_STATUSES:
+        if status is not None and status not in _VIDEO_FILTER_STATUSES:
             raise HTTPException(
                 status_code=400,
-                detail=f"statut inconnu : {status!r} (attendu : {', '.join(_VIDEO_STATUSES)})",
+                detail=f"statut inconnu : {status!r} (attendu : {', '.join(_VIDEO_FILTER_STATUSES)})",
             )
         videos = []
         for state in _list_states(config):
@@ -2231,6 +2244,18 @@ def create_app(config: Config | None = None) -> FastAPI:
             raise HTTPException(status_code=404 if "aucune video en cours" in str(exc) else 409,
                                 detail=str(exc)) from exc
         return {"video_id": video_id, "cancelled": True}
+
+    @app.post("/api/videos/{video_id}/resume", status_code=202)
+    def resume_video(video_id: str) -> JSONResponse:
+        """Remet une video interrompue dans la file ; elle repart de son etape interrompue (TASK-bdd5)."""
+        _validate_video_id(video_id)
+        try:
+            entry = worker_mod.resume(video_id, config=config)
+        except pipeline.PipelineError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except worker_mod.WorkerError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return JSONResponse(entry, status_code=202)
 
     @app.post("/api/videos/{video_id}/retry", status_code=202)
     def retry_video(video_id: str, body: RetryBody) -> JSONResponse:

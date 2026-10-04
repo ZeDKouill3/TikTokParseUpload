@@ -61,7 +61,7 @@
             <label class="input-ico">${icon("search")}<input class="input" name="q" type="search" placeholder="Titre, identifiant ou adresse" aria-label="Filtrer par texte"></label>
             <select class="input" name="filter-channel" aria-label="Filtrer par style"><option value="">Tous les styles</option></select>
             <select class="input" name="filter-status" aria-label="Filtrer par statut"><option value="">Tous les statuts</option>
-              ${Object.keys(STATUS_LABELS).map((k) => `<option value="${k}">${esc(STATUS_LABELS[k])}</option>`).join("")}</select>
+              ${Object.keys(STATUS_LABELS).map((k) => `<option value="${k}">${esc(STATUS_LABELS[k])}</option>`).join("")}<option value="interrupted">interrompue</option></select>
             <span class="grow"></span><span class="muted" data-vcount></span>
           </div>
           <div class="jobs" data-vlist></div>
@@ -168,7 +168,7 @@
         <div style="margin-top:10px">${segs(video)}</div>
         ${video.reason ? `<p class="reason ${video.status === "failed" ? "bad" : ""}">${esc(video.reason)}</p>` : ""}
       </div>
-      <div class="job-side">${statusChip(video.status)}${video.dismissed_at ? `<span class="chip pending plain">retirée</span>` : ""}</div>
+      <div class="job-side">${videoChip(video.status)}${video.dismissed_at ? `<span class="chip pending plain">retirée</span>` : ""}</div>
     </a>`;
   }
 
@@ -269,7 +269,7 @@
     const st = stepStatusOf(video, name);
     const progress = step.progress;
     const dur = fmtDur((video.durations || {})[name]);
-    const canRetry = (st === "done" || st === "failed") && video.status !== "running";
+    const canRetry = (st === "done" || st === "failed") && video.status !== "running" && video.status !== "interrupted";
     return `<div class="panel-head"><h2>${esc(STEP_LABELS[name])}</h2><div class="right">${statusChip(st)}</div></div>
       <div class="vstep">
         <dl class="kv">
@@ -309,13 +309,14 @@
         <div style="min-width:0">
           <h2 class="vtitle">${esc(video.title)}</h2>
           ${video.title_reason ? `<p class="muted vsub">${esc(video.title_reason)}</p>` : ""}
-          <div class="job-meta"><span class="mono">${esc(video.video_id)}</span>${video.channel ? `<span class="tag">${esc(video.channel)}</span>` : `<span class="muted">sans style</span>`}${video.source_url ? `<span class="mono">${esc(video.source_url)}</span>` : ""}${statusChip(video.status)}${video.rubric ? `<span class="muted">Grille : <span class="mono">${esc(video.rubric)}</span></span>` : ""}</div>
+          <div class="job-meta"><span class="mono">${esc(video.video_id)}</span>${video.channel ? `<span class="tag">${esc(video.channel)}</span>` : `<span class="muted">sans style</span>`}${video.source_url ? `<span class="mono">${esc(video.source_url)}</span>` : ""}${videoChip(video.status)}${video.rubric ? `<span class="muted">Grille : <span class="mono">${esc(video.rubric)}</span></span>` : ""}</div>
         </div>
         <div class="vactions">
           ${review ? `<a class="btn btn-primary" href="#/review/${enc}">${icon("sparkles")}Revoir les moments${(video.awaiting || []).length ? ` (${video.awaiting.length})` : ""}</a>` : ""}
           ${(video.clips || []).length ? `<a class="btn" href="#/clips/${enc}">${icon("clapperboard")}Voir les ${video.clips.length} clips</a>` : ""}
-          ${!video.channel && video.status !== "running" ? `<button type="button" class="btn" data-assign-channel="${esc(video.video_id)}">${icon("tv")}Attribuer un style</button>` : ""}
-          ${video.status === "running" ? `<button type="button" class="btn btn-bad" data-cancel-video>${icon("ban")}Annuler le traitement</button>` : ""}
+          ${!video.channel && video.status !== "running" && video.status !== "interrupted" ? `<button type="button" class="btn" data-assign-channel="${esc(video.video_id)}">${icon("tv")}Attribuer un style</button>` : ""}
+          ${video.status === "interrupted" ? `<button type="button" class="btn btn-primary" data-resume-video>${icon("play")}Reprendre</button>` : ""}
+          ${video.status === "running" || video.status === "interrupted" ? `<button type="button" class="btn btn-bad" data-cancel-video>${icon("ban")}Annuler le traitement</button>` : ""}
           ${(video.status === "failed" || video.status === "queued") && !video.dismissed_at ? `<button type="button" class="btn" data-retry-video="${esc(video.video_id)}" data-from-step="${esc(video.current_step || "")}">${icon("rotate-ccw")}Relancer</button>
             <button type="button" class="btn btn-ghost" data-dismiss-video="${esc(video.video_id)}">Retirer</button>` : ""}
           ${video.dismissed_at ? `<span class="chip pending plain">retirée des échecs</span> <button type="button" class="btn" data-restore-video="${esc(video.video_id)}">Rétablir</button>` : ""}
@@ -349,6 +350,8 @@
     if (retry) retry.onclick = () => retryFrom(video, retry.dataset.retry);
     const cancel = $("[data-cancel-video]", view);
     if (cancel) cancel.onclick = () => cancelVideo(video);
+    const resume = $("[data-resume-video]", view);
+    if (resume) resume.onclick = () => resumeVideo(video);
     const assign = $("[data-assign-channel]", view);
     if (assign) assign.onclick = () => openAssignChannel(video.video_id);
     $("[data-log-copy]", view).onclick = () => copyText(state.events.map((e) => `${e.at} ${e.level} ${e.step || ""} ${e.message}`).join("\n"), "Journal");
@@ -369,6 +372,26 @@
       await Promise.all([loadVideos(), loadQueue()]);
       refreshDetail();
     } catch (err) { toastError("Relance impossible", err); }
+  }
+
+  /* « interrompue » (serveur ou PC arrete en plein traitement) n'est pas un statut de pipeline.json : l'API le
+     deduit d'une etape « running » sans processus. Ni « en cours » ni « en echec » : un chip a part. */
+  const videoChip = (status) => status === "interrupted" ? `<span class="chip failed">interrompue</span>` : statusChip(status);
+
+  /* Reprendre : remet la video interrompue en file, elle repart de l'etape interrompue (les etapes finies restent). */
+  async function resumeVideo(video) {
+    const ok = await confirmDialog({
+      title: "Reprendre le traitement ?",
+      body: `${video.video_id} repart de l'étape « ${STEP_LABELS[video.current_step] || video.current_step} » ; les étapes déjà terminées ne sont pas refaites.`,
+      confirmLabel: "Reprendre", danger: false,
+    });
+    if (!ok) return;
+    try {
+      await api(`/api/videos/${encodeURIComponent(video.video_id)}/resume`, { method: "POST" });
+      toast({ kind: "ok", title: "Reprise mise en file", body: video.video_id });
+      await Promise.all([loadVideos(), loadQueue()]);
+      refreshDetail();
+    } catch (err) { toastError("Reprise impossible", err); }
   }
 
   async function cancelVideo(video) {

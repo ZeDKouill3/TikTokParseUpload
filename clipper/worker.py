@@ -220,6 +220,80 @@ def remove(video_id: str, *, config: Config | None = None) -> None:
         _write_queue(path, remaining)
 
 
+_INTERRUPTED_REASON = "interrompue"
+
+
+def _live_in_queue(video_id: str, config: Config) -> bool:
+    """Vrai si la file a une entrée ``running`` pour ``video_id`` dont le processus existe encore."""
+    entries = _read_queue(_queue_path(config))  # lecture seule : l'ecriture de la file est atomique
+    return any(e["video_id"] == video_id and e["status"] == "running" and _pid_alive(e.get("pid")) for e in entries)
+
+
+def _worker_busy_inline(config: Config) -> bool:
+    """Vrai si le worker est vivant et reprend lui-même des vidéos en file (battement ``busy``) : leur étape
+    ``running`` n'a alors pas d'entrée dans la file sans être orpheline."""
+    path = heartbeat_path(config)
+    try:
+        beat = json.loads(path.read_text(encoding="utf-8"))
+        return bool(beat.get("busy")) and _pid_alive(int(beat["pid"]))
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise WorkerError(f"battement du worker illisible ({path}) : {exc}") from exc
+
+
+def is_interrupted(state: dict[str, Any], config: Config) -> bool:
+    """Une vidéo ``running`` dont aucun processus ne travaille (pas d'entrée ``running`` vivante dans la file, et
+    le worker n'est pas en train de la reprendre lui-même) est interrompue : serveur ou PC arrêté en plein
+    traitement (TASK-bdd5)."""
+    if state.get("status") != "running":
+        return False
+    return not _live_in_queue(state["video_id"], config) and not _worker_busy_inline(config)
+
+
+def mark_interrupted(video_id: str, config: Config, *, cancelled: bool = False) -> str | None:
+    """Étape orpheline ``running`` -> ``pending`` (les étapes terminées restent ``done``), vidéo ``failed`` avec
+    ``reason``, journalisé. Renvoie l'étape interrompue (None si aucune)."""
+    from clipper import pipeline
+
+    state = pipeline.load_state(video_id, config=config)
+    orphan = next((n for n, st in state["steps"].items() if st.get("status") == "running"), None)
+    if orphan is not None:
+        state["steps"][orphan].update(status="pending", reason=None, started_at=None, finished_at=None, progress=None)
+    detail = f"{_INTERRUPTED_REASON} à l'étape {orphan}" if orphan else _INTERRUPTED_REASON
+    state.update(status="failed", reason=f"{_CANCEL_REASON} ({detail})" if cancelled else detail, retry_at=None)
+    pipeline.save_state(state, config=config)
+    log.warning("%s : traitement interrompu (%s), plus aucun processus ne travaille dessus", video_id, detail)
+    return orphan
+
+
+def resume(video_id: str, *, config: Config | None = None) -> dict[str, Any]:
+    """Remet une vidéo interrompue dans la file ; elle repart de sa première étape non terminée (les étapes
+    ``done`` ne sont pas refaites, ADR-b16b). Avant la revue : ``run`` sur l'URL source ; à partir de la revue :
+    ``render``."""
+    from clipper import pipeline
+
+    config = config or load_config()
+    state = pipeline.load_state(video_id, config=config)
+    if state.get("status") == "running" and not is_interrupted(state, config):
+        raise WorkerError(f"{video_id} est en cours de traitement : rien à reprendre")
+    first = next((n for n in pipeline.STEPS if state["steps"][n]["status"] != "done"), None)
+    if first is None:
+        raise WorkerError(f"{video_id} : toutes les étapes sont terminées, rien à reprendre")
+    if pipeline.STEPS.index(first) >= pipeline.STEPS.index(pipeline._AFTER_REVIEW):
+        action, target = "render", video_id
+    else:
+        if not state.get("source_url"):
+            raise WorkerError(f"{video_id} : pipeline.json sans source_url, impossible de reprendre à l'étape {first}")
+        action, target = "run", state["source_url"]
+    if state.get("status") == "running":
+        mark_interrupted(video_id, config)
+    state = pipeline.load_state(video_id, config=config)
+    state.pop("dismissed_at", None)
+    pipeline.save_state(state, config=config)
+    return enqueue(target, state.get("channel"), action, config=config)
+
+
 def cancel(video_id: str, *, config: Config | None = None) -> None:
     """Annule la video en cours (SPEC-74e9 §2.3) depuis n'importe quel processus (API web), sans construire de
     ``Worker`` : l'enfant est arrete par le pid lu dans la file (``cancel_grace_s`` puis kill), l'entree quitte
@@ -230,7 +304,8 @@ def cancel(video_id: str, *, config: Config | None = None) -> None:
     with _locked(path):
         entry = next((e for e in _read_queue(path) if e["video_id"] == video_id and e["status"] == "running"), None)
     if entry is None:
-        raise WorkerError(f"aucune video en cours pour {video_id!r}")
+        _cancel_interrupted(video_id, config)
+        return
 
     _terminate_pid(entry["pid"], float(config.section("worker")["cancel_grace_s"]))
     with _locked(path):
@@ -245,6 +320,20 @@ def cancel(video_id: str, *, config: Config | None = None) -> None:
     state.pop("dismissed_at", None)
     state.update(status="failed", reason=_CANCEL_REASON, retry_at=None)
     pipeline.save_state(state, config=config)
+
+
+def _cancel_interrupted(video_id: str, config: Config) -> None:
+    """Annuler une vidéo interrompue (``running`` sans processus) : l'étape orpheline repasse ``pending``, la vidéo
+    ``failed`` « annulée », journalisé ; les étapes terminées sont conservées."""
+    from clipper import pipeline
+
+    try:
+        state = pipeline.load_state(video_id, config=config)
+    except pipeline.PipelineError:
+        state = None
+    if state is None or not is_interrupted(state, config):
+        raise WorkerError(f"aucune video en cours pour {video_id!r}")
+    mark_interrupted(video_id, config, cancelled=True)
 
 
 def _terminate_pid(pid: int | None, grace: float) -> None:
@@ -348,6 +437,7 @@ class Worker:
         de la file, publications interrompues, migration des anciens styles. Jamais dans le constructeur : un
         autre processus qui construirait un Worker passerait en echec la publication que le worker pilote."""
         self._recover_orphans()
+        self._recover_interrupted_videos()
         self._recover_interrupted_publications()
         self._migrate_legacy_presets()
 
@@ -358,6 +448,20 @@ class Worker:
             channel_mod.migrate_legacy_presets(self.config, presets_dir=watch["presets_dir"], base=watch["base_config"])
         except (channel_mod.ChannelError, ConfigError, OSError, ValueError) as exc:
             log.error("migration des anciens styles impossible : %s", exc)
+
+    def _recover_interrupted_videos(self) -> None:
+        """Au démarrage, une étape restée ``running`` sans entrée vivante dans la file (serveur ou PC arrêté
+        pendant le traitement) est marquée interrompue et journalisée (TASK-bdd5) : jamais laissée « en cours »."""
+        from clipper import pipeline
+
+        root = Path(self.config.workspace_dir)
+        for path in sorted(root.glob(f"*/{pipeline.STATE_FILE}")) if root.is_dir() else []:
+            try:
+                state = json.loads(path.read_text(encoding="utf-8"))
+                if state.get("status") == "running" and not _live_in_queue(state["video_id"], self.config):
+                    mark_interrupted(state["video_id"], self.config)
+            except (OSError, ValueError, KeyError, pipeline.PipelineError) as exc:
+                log.error("reprise des vidéos interrompues : %s illisible : %s", path, exc)
 
     def _recover_interrupted_publications(self) -> None:
         """Une publication restee « en cours » d'un worker arrete en plein pilotage devient un echec explicite
@@ -371,17 +475,19 @@ class Worker:
         except (publish_mod.PublishError, channel_mod.ChannelError, ConfigError, OSError, ValueError) as exc:
             log.error("reprise des publications interrompues impossible : %s", exc)
 
-    def _beat(self) -> None:
-        """Écrit ``{pid, at}`` dans ``heartbeat_path`` si ``heartbeat_interval_s``
-        s'est écoulé depuis le dernier battement (écriture atomique)."""
+    def _beat(self, *, busy: bool = False, force: bool = False) -> None:
+        """Écrit ``{pid, at, busy}`` dans ``heartbeat_path`` si ``heartbeat_interval_s``
+        s'est écoulé depuis le dernier battement (écriture atomique). ``busy`` : le worker reprend lui-même des
+        vidéos en file (pas d'entrée ``running`` pour elles) ; ``force`` écrit sans attendre l'intervalle."""
         section = self.config.section("worker")
         now = time.monotonic()
-        if self._last_beat is not None and now - self._last_beat < float(section["heartbeat_interval_s"]):
+        if not force and self._last_beat is not None and now - self._last_beat < float(section["heartbeat_interval_s"]):
             return
         path = heartbeat_path(self.config)
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-        tmp.write_text(json.dumps({"pid": os.getpid(), "at": datetime.now(timezone.utc).isoformat()}), encoding="utf-8")
+        tmp.write_text(json.dumps({"pid": os.getpid(), "at": datetime.now(timezone.utc).isoformat(), "busy": busy}),
+                       encoding="utf-8")
         os.replace(tmp, path)
         self._last_beat = now
 
@@ -423,11 +529,17 @@ class Worker:
 
         from clipper import pipeline
 
+        busy = bool(pipeline.queued(config=self.config))
+        if busy:
+            self._beat(busy=True, force=True)  # les reprises tournent dans ce processus : pas « interrompues »
         try:
             pipeline.process_queue(config=self.config)
         except Exception:  # noqa: BLE001 - jamais un worker mort (Mineur 1, revue r-transcription) :
             # la file reste reprise au tick suivant, l'exception est seulement journalisee.
             log.exception("reprise de la file de pipeline interrompue par une erreur inattendue")
+        finally:
+            if busy:
+                self._beat(force=True)
 
     def _watch_channels(self) -> None:
         """Appelle ``watch.check`` pour chaque chaine ``watch = true`` dont
