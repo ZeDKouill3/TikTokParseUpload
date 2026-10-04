@@ -19,7 +19,7 @@ Numérotation : versionnage sémantique, `MAJEUR.MINEUR.CORRECTIF`.
 
 ## Critères de la v1.0.0
 
-1. **Installation propre** : sur un PC neuf, suivre le README (`tools/setup.ps1`) mène à un premier clip publié, sans aide.
+1. **Installation propre** : sur un PC neuf, le zip portable de la Release mène à un premier clip sans aide.
 2. **Une semaine d'usage réel sans retouche du code** : vidéos traitées et clips publiés ; aucune perte silencieuse ni blocage sans raison affichée.
 3. **Formats figés et documentés** : `config.toml`, presets de chaîne, fichiers d'état (`state/`, `workspace/<id>/pipeline.json`) et sidecars de clip ; tout changement ultérieur passe par une migration automatique.
 4. **Tests** : suite complète verte, test de fumée réel (`CLIPPER_CLAUDE_INTEGRATION=1`) et test réel TikTok (`CLIPPER_TIKTOK_REAL=1`) verts sur la version publiée.

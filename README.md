@@ -193,7 +193,17 @@ toute seule.
 - **Étapes indépendantes et reprises depuis le cache** — une étape déjà
   faite ne se relance pas sauf `--force`.
 
-## Installation
+## Installation sans outils de développement
+
+Pas envie de cloner le dépôt, d'installer Python ou `uv` ? Télécharge le zip
+portable d'une [Release](https://github.com/ZeDKouill3/TikTokParseUpload/releases)
+(`Clipper-portable-<version>.zip`), dézippe-le et double-clique sur
+`Installer.bat` : il installe Python, ffmpeg, `claude` et les modèles dans son
+propre dossier, sans rien toucher d'autre sur ta machine. Parcours complet
+(prérequis, connexion à Claude, premier clip, mise à jour, désinstallation,
+dépannage) : [`docs/INSTALLATION.md`](docs/INSTALLATION.md).
+
+## Installation développeur
 
 ```powershell
 uv venv

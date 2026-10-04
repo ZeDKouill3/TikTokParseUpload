@@ -1,0 +1,131 @@
+"""TASK-1b5a73188dba : documentation de l'installeur portable (SPEC-38f7761891f6
+R10). Verifie mecaniquement ce qui peut l'etre : sections de docs/INSTALLATION.md
+dans l'ordre du critere, chemins par defaut cites, section README et entree
+CHANGELOG. Le contenu redactionnel fin se lit a l'oeil."""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+INSTALLATION = ROOT / "docs" / "INSTALLATION.md"
+README = ROOT / "README.md"
+VERSIONS = ROOT / "docs" / "versions.md"
+CHANGELOG = ROOT / "CHANGELOG.md"
+
+REQUIRED_SECTIONS_IN_ORDER = [
+    "## Prérequis",
+    "## Télécharger",
+    "## Installer.bat",
+    "## Connexion à Claude",
+    "## Où sont le programme et les données",
+    "## Premier clip",
+    "## GPU",
+    "## Mise à jour",
+    "## Désinstallation",
+    "## Diagnostic",
+    "## Problèmes fréquents",
+]
+
+REQUIRED_TROUBLESHOOTING_ITEMS = [
+    "claude",
+    "Chrome",
+    "8000",
+    "SmartScreen",
+]
+
+DEFAULT_APP_PATH = r"%LOCALAPPDATA%\Clipper\app"
+DEFAULT_DATA_PATH = r"Documents\Clipper"
+
+
+def _text(path: Path) -> str:
+    return path.read_text(encoding="utf-8")
+
+
+def test_installation_doc_exists():
+    assert INSTALLATION.is_file()
+
+
+def test_installation_doc_has_all_sections_in_order():
+    text = _text(INSTALLATION)
+    positions = []
+    for needle in REQUIRED_SECTIONS_IN_ORDER:
+        index = text.find(needle)
+        assert index != -1, f"section manquante dans docs/INSTALLATION.md : {needle!r}"
+        positions.append(index)
+    assert positions == sorted(positions), "sections de docs/INSTALLATION.md pas dans l'ordre attendu"
+
+
+def test_installation_doc_mentions_both_default_paths():
+    text = _text(INSTALLATION)
+    assert DEFAULT_APP_PATH in text, "chemin par defaut du programme absent de docs/INSTALLATION.md"
+    assert DEFAULT_DATA_PATH in text, "chemin par defaut des donnees absent de docs/INSTALLATION.md"
+
+
+def test_installation_doc_prerequisites_mention_windows_claude_and_chrome():
+    text = _text(INSTALLATION)
+    start = text.index("Prérequis")
+    end = text.index("Télécharger")
+    section = text[start:end]
+    for needle in ("Windows 10", "64 bits", "Claude", "Chrome"):
+        assert needle in section, f"prerequis manquant : {needle!r}"
+
+
+def test_installation_doc_troubleshooting_section_covers_required_cases():
+    text = _text(INSTALLATION)
+    start = text.index("Problèmes fréquents")
+    section = text[start:]
+    for needle in REQUIRED_TROUBLESHOOTING_ITEMS:
+        assert needle in section, f"cas manquant dans Problemes frequents : {needle!r}"
+
+
+def test_installation_doc_has_no_real_person_or_channel_name():
+    text = _text(INSTALLATION).lower()
+    for name in ("madajel", "nicoc"):
+        assert name not in text, f"nom interdit dans docs/INSTALLATION.md : {name!r}"
+
+
+def test_readme_has_no_dev_tools_installation_section_before_developer_one():
+    text = _text(README)
+    no_dev_index = text.index("Installation sans outils de développement")
+    dev_index = text.index("Installation développeur")
+    assert no_dev_index < dev_index
+
+
+def test_readme_no_dev_tools_section_links_to_installation_doc():
+    text = _text(README)
+    start = text.index("Installation sans outils de développement")
+    end = text.index("Installation développeur")
+    section = text[start:end]
+    assert "docs/INSTALLATION.md" in section
+
+
+def test_readme_developer_installation_content_is_unchanged():
+    text = _text(README)
+    start = text.index("## Installation développeur")
+    end = text.index("## Démarrage rapide")
+    section = text[start:end]
+    for needle in ("uv venv", 'uv pip install -e ".[test]"', "tools/setup.ps1"):
+        assert needle in section
+
+
+def test_versions_doc_criterion_one_is_about_the_portable_zip():
+    text = _text(VERSIONS)
+    match = re.search(r"1\. \*\*[^*]+\*\* ?:? ?(.+)", text)
+    assert match, "critere n1 de la v1.0.0 introuvable"
+    criterion = match.group(1)
+    assert "zip portable" in criterion
+    assert "Release" in criterion
+    assert "premier clip" in criterion
+    assert "sans aide" in criterion
+
+
+def test_changelog_has_an_unreleased_entry_about_the_installer():
+    text = _text(CHANGELOG)
+    start = text.index("## [Non publié]")
+    end = text.index("## [0.4.0]")
+    section = text[start:end]
+    assert section.strip() != "", "section [Non publié] vide"
+    for needle in ("Installer.bat", "portable"):
+        assert needle in section, f"{needle!r} absent de l'entree [Non publie] du CHANGELOG"
