@@ -10,6 +10,24 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ## [Non publié]
 
+### Ajouté
+
+- **Installeur portable Windows** (SPEC-38f7761891f6, ADR-e1dac9ba2284) :
+  un zip d'amorçage léger (`Clipper-portable-<version>.zip`, < 150 Mo,
+  `uv.exe` + wheel + scripts, jamais de Python ni de site-packages dedans)
+  construit par `tools/build_portable.py` et attaché à chaque Release.
+  `Installer.bat` installe Python 3.11, l'environnement, ffmpeg (version
+  figée) et `claude` dans un dossier programme jetable
+  (`%LOCALAPPDATA%\Clipper\app` par défaut), prépare un dossier de données
+  séparé (`Documents\Clipper` par défaut), détecte automatiquement le GPU
+  (CUDA si `nvidia-smi` répond, CPU sinon), précharge les modèles et termine
+  par un `clipper doctor`. `Desinstaller.bat` supprime le dossier programme
+  et conserve les données par défaut (`--donnees` pour tout supprimer).
+  Mise à jour par simple relance d'un zip plus récent, refus explicite d'une
+  version plus ancienne. Documentation complète du parcours dans
+  [`docs/INSTALLATION.md`](docs/INSTALLATION.md), nouvelle section
+  « Installation sans outils de développement » dans le README.
+
 ## [0.4.0] - 2026-10-03
 
 YouTube Shorts et publication avancée : publication immédiate ou programmée

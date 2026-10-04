@@ -18,7 +18,7 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 schema: 4
-version: 3
+version: 5
 ---
 
 Tâche 5 de SPEC-38f7761891f6 (ADR-e1dac9ba2284). À écrire une fois les scripts (tâche 3) et le builder (tâche 4) faits, pour documenter ce qui existe et non ce qui était prévu : relire installer/install.ps1 et PREMIER-CLIP.txt avant d'écrire. Ton du README existant (français, direct). Le nom du zip et les options de Installer.bat viennent du code, pas de mémoire.
