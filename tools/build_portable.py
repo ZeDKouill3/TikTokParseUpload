@@ -42,12 +42,17 @@ ICON_SRC = REPO_ROOT / "tools" / "clipper.ico"
 # Desinstaller.bat y vivent deja a plat dans le depot.
 ROOT_INSTALLER_FILES = ["Installer.bat", "Desinstaller.bat"]
 
-# Fichiers d'installer/ places sous installer/ dans le zip (R1).
+# Fichiers d'installer/ places sous installer/ dans le zip (R1). overrides.txt
+# (I1, TASK-4f1d7d1ee341) : passe explicitement a 'uv pip install --override'
+# a l'etape 3, sinon [tool.uv] override-dependencies de pyproject.toml n'est
+# honore que si un pyproject.toml est trouve en remontant depuis le dossier
+# courant -- jamais le cas chez l'utilisateur (Telechargements).
 SUBDIR_INSTALLER_FILES = [
     "install.ps1",
     "desinstaller.ps1",
     "Clipper.bat.template",
     "PREMIER-CLIP.txt",
+    "overrides.txt",
 ]
 
 # uv 0.12.19, releve le 2026-10-03 (AGENTS.md) : asset Windows x86_64 et son

@@ -62,6 +62,16 @@ if (Test-ConsolePortListening -Port $Port) {
     Fail "la console Clipper tourne (le port $Port ecoute)" "ferme la console (fenetre 'Clipper serve') puis relance Desinstaller.bat"
 }
 
+# I6 : refuse si $App ne ressemble pas a une installation Clipper (aucun
+# install.json ni version.txt), sinon un --app absent ou une faute de frappe
+# affichait "Desinstallation terminee." en vert (succes silencieux, ADR-ad2e)
+# sans rien supprimer, ou a l'inverse supprimait n'importe quel dossier passe
+# en --app sans aucune verification.
+$hasInstallMarker = (Test-Path (Join-Path $App "install.json")) -or (Test-Path (Join-Path $App "version.txt"))
+if (-not $hasInstallMarker) {
+    Fail "aucune installation Clipper sous $App (install.json absent)" "passe --app <dossier app> ou verifie l'installation"
+}
+
 $desktop = [Environment]::GetFolderPath("Desktop")
 $shortcut = Join-Path $desktop "Clipper.lnk"
 

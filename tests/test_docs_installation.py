@@ -121,6 +121,17 @@ def test_versions_doc_criterion_one_is_about_the_portable_zip():
     assert "sans aide" in criterion
 
 
+def test_m6_installation_doc_diagnostic_section_has_no_phantom_menu():
+    """M6 (TASK-4f1d7d1ee341) : la section Diagnostic ne renvoie plus vers un
+    bouton "menu Reglages" de la console, qui n'existe pas (clipper/web/
+    n'a aucun appel a doctor)."""
+    text = _text(INSTALLATION)
+    start = text.index("## Diagnostic")
+    end = text.index("## Problèmes fréquents")
+    section = text[start:end]
+    assert "menu" not in section.lower()
+
+
 def test_changelog_has_an_unreleased_entry_about_the_installer():
     text = _text(CHANGELOG)
     start = text.index("## [Non publié]")

@@ -5,4 +5,9 @@ rem Toutes les options sont transmises telles quelles a
 rem installer\desinstaller.ps1.
 setlocal
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0installer\desinstaller.ps1" %*
-exit /b %errorlevel%
+set EXIT_CODE=%errorlevel%
+rem I4 : en double-clic, cmd fermerait la fenetre (donc le message rouge)
+rem moins d'une seconde apres un echec ; cette pause ne gene jamais un appel
+rem depuis un terminal ou des tests (toujours en succes dans ce cas).
+if not %EXIT_CODE%==0 pause
+exit /b %EXIT_CODE%

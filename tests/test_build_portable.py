@@ -31,6 +31,7 @@ EXPECTED_ENTRIES = {
     "installer/desinstaller.ps1",
     "installer/Clipper.bat.template",
     "installer/PREMIER-CLIP.txt",
+    "installer/overrides.txt",
     "installer/clipper.ico",
     "uv.exe",
     "version.txt",

@@ -10,7 +10,11 @@ dossier temporaire sous ``research/installer-real/`` (jamais
 ``%LOCALAPPDATA%\\Clipper``, jamais le Bureau reel : ``--sans-raccourci``),
 en CPU ; verifie le contenu de app/ et data/, puis ``clipper doctor``, puis
 une mise a jour sur le meme ``app`` (data inchange), puis la desinstallation
-complete.
+complete. Les .bat et ``clipper doctor`` tournent avec un PATH reduit a
+System32 + PowerShell (TASK-4f1d7d1ee341, ``_reduced_path_env``) : ni uv, ni
+clipper, ni ``.venv`` du depot n'y sont reperables, pour ne jamais masquer un
+appel a nu comme l'avait fait TASK-a093 (uv/.venv du PC de dev en tete du
+PATH, cwd sous le depot pour l'override OpenCV).
 
 Compte plusieurs minutes et environ 700 Mo telecharges (Python, ffmpeg,
 modeles) : ne jamais lancer en parallele d'un autre travail reseau/CPU lourd
@@ -61,12 +65,43 @@ DOCTOR_TIMEOUT = 120
 UNINSTALL_TIMEOUT = 60
 
 
+# TASK-4f1d7d1ee341 (research/reviews/installeur.md, intro) : le test reel
+# de TASK-a093 tournait avec le PATH complet du PC de dev (uv global,
+# .venv\Scripts du depot en tete), ce qui masquait C1/C2 (uv/clipper
+# appeles a nu, resolus par accident sur le mauvais binaire au lieu
+# d'echouer). Reduit ici a System32 + PowerShell (ni uv, ni clipper, ni
+# .venv du depot) dans les sous-processus qui executent les .bat et
+# 'clipper doctor' : seul uv.exe du zip et le clipper.exe installe doivent
+# fonctionner.
+REDUCED_PATH = r"C:\Windows\System32;C:\Windows;C:\Windows\System32\WindowsPowerShell\v1.0"
+
+
+def _reduced_path_env() -> dict[str, str]:
+    env = dict(os.environ)
+    env["PATH"] = REDUCED_PATH
+    return env
+
+
 def _run_bat(bat_path: Path, args: list[str], *, cwd: Path, timeout: int) -> subprocess.CompletedProcess:
     # cmd.exe /c explicite (jamais shell=True) : CreateProcess seul
     # (shell=False, sans passer par cmd) ne sait pas lancer un .bat, qui
     # n'est pas un executable Win32 mais depend de l'association de fichier.
     cmd = ["cmd", "/c", str(bat_path), *args]
-    return subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True, timeout=timeout)
+    # encoding/errors explicites (TASK-4f1d7d1ee341) : la sortie de 'claude'
+    # (install officiel, jamais exerce avant un PATH reduit qui le force a
+    # s'installer ici) contient des octets hors de la page de code par
+    # defaut (cp1252 sur ce PC), qui faisaient planter le thread lecteur de
+    # subprocess (UnicodeDecodeError) et laissaient stdout/stderr a None.
+    return subprocess.run(
+        cmd,
+        cwd=str(cwd),
+        env=_reduced_path_env(),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+    )
 
 
 def test_installer_real_full_cycle() -> None:
@@ -87,6 +122,8 @@ def test_installer_real_full_cycle() -> None:
             cwd=str(REPO_ROOT),
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=INSTALL_TIMEOUT,
         )
         assert built.returncode == 0, built.stdout + built.stderr
@@ -142,16 +179,28 @@ def test_installer_real_full_cycle() -> None:
         # ordre que Clipper.bat.template, ffmpeg\bin puis .venv\Scripts).
         # Un seul paquet OpenCV dans le venv (override-dependencies honore).
         # ------------------------------------------------------------------
+        # Base = l'environnement reel (pas le PATH reduit des .bat ci-dessus) :
+        # ce controle verifie la composition du PATH du lanceur (R10), pas
+        # l'absence de uv/clipper/.venv du depot -- un Clipper.bat reel, lui,
+        # tourne dans un process frais qui a bien le PATH utilisateur a jour
+        # (claude y compris, poste par son installeur officiel au registre).
         doctor_env = dict(os.environ)
         doctor_env["PATH"] = os.pathsep.join(
             [str(app_dir / "ffmpeg" / "bin"), str(app_dir / ".venv" / "Scripts"), doctor_env.get("PATH", "")]
         )
+        # Chemin complet (jamais 'clipper' a nu, meme esprit que C1/C2) :
+        # CreateProcess resout un nom non qualifie via le PATH du PROCESS
+        # PARENT (celui du test), pas celui du dict env= passe au sous-
+        # processus, donc un PATH reduit uniquement dans env= ne suffit pas
+        # a le retrouver (FileNotFoundError observe sur un run reel).
         doctor_result = subprocess.run(
-            ["clipper", "doctor"],
+            [str(app_dir / ".venv" / "Scripts" / "clipper.exe"), "doctor"],
             cwd=str(data_dir),
             env=doctor_env,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=DOCTOR_TIMEOUT,
         )
         assert doctor_result.returncode == 0, doctor_result.stdout + doctor_result.stderr
