@@ -2255,6 +2255,28 @@ def test_badge_enabled_draws_the_logo_and_name_and_is_included_as_an_ffmpeg_inpu
     assert f"overlay=x={SPLIT_BADGE_ZONE['x0']}:y={SPLIT_BADGE_ZONE['y0']}" in filt
 
 
+def test_badge_disabled_draws_no_badge_even_with_a_logo_and_name_configured(
+    tmp_path, stream_split_dir, fake_ffmpeg, cpu_device, monkeypatch
+):
+    from clipper import render as render_mod
+
+    drawn = []
+    monkeypatch.setattr(render_mod, "badge_png", lambda *a, **k: drawn.append(a))
+    logo = tmp_path / "logo.png"
+    _write_logo(logo)
+    (stream_split_dir / f"{VIDEO_ID}.mp4").write_bytes(b"")
+    render_mod.render(VIDEO_ID, CLIP_ID, workspace_dir=stream_split_dir.parent, output_dir=tmp_path / "output",
+                      config=make_config(title_enabled=False, badge_enabled=False, badge_logo=str(logo),
+                                         badge_name="ma_chaine"))
+
+    assert drawn == []
+    cmd = fake_ffmpeg[0]["cmd"]
+    inputs = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-i"]
+    assert not any(i.endswith("badge.png") for i in inputs)
+    filt = cmd[cmd.index("-filter_complex") + 1]
+    assert f"overlay=x={SPLIT_BADGE_ZONE['x0']}:y={SPLIT_BADGE_ZONE['y0']}" not in filt
+
+
 def test_badge_png_draws_the_filled_square_logo_and_the_measured_name(tmp_path):
     from PIL import Image
 
