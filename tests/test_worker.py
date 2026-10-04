@@ -2407,3 +2407,161 @@ def test_part_two_with_parts_together_true_still_waits_for_part_one(tmp_path, mo
     assert pub.calls == []
     entry = next(e for e in _entries(tmp_path) if e["clip_id"] == "c01-p2")
     assert "partie 1 non publiée" in entry["waiting_reason"]
+
+
+# --------------------------------------------------------------------------
+# TASK-bdd5 : vidéo interrompue (étape running sans processus)
+# --------------------------------------------------------------------------
+
+ORPHAN_ID = "Zk_wshsmq5w"  # cas réel : transcribe = running, file vide
+
+
+def _orphan_state(config: Config, video_id: str = ORPHAN_ID, running: str = "transcribe") -> dict:
+    """download done, ``running`` en cours, le reste pending, status running ; la file est vide."""
+    state = pipeline.new_state(video_id, f"https://youtu.be/{video_id}", config.mode)
+    state["status"] = "running"
+    for name in pipeline.STEPS[:pipeline.STEPS.index(running)]:
+        state["steps"][name].update(status="done", started_at="2026-10-04T10:00:00+00:00",
+                                    finished_at="2026-10-04T10:01:00+00:00")
+    state["steps"][running].update(status="running", started_at="2026-10-04T10:02:00+00:00")
+    pipeline.save_state(state, config=config)
+    return state
+
+
+def _statuses(config: Config, video_id: str = ORPHAN_ID) -> dict[str, str]:
+    return {n: s["status"] for n, s in pipeline.load_state(video_id, config=config)["steps"].items()}
+
+
+def _write_busy_heartbeat(config: Config) -> None:
+    path = worker.heartbeat_path(config)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"pid": os.getpid(), "at": datetime.now(timezone.utc).isoformat(), "busy": True}),
+                    encoding="utf-8")
+
+
+def test_a_running_video_without_a_running_queue_entry_is_interrupted(tmp_path):
+    config = _config(tmp_path)
+    state = _orphan_state(config)
+
+    assert worker.is_interrupted(state, config) is True
+
+
+def test_a_running_video_with_a_live_queue_entry_is_not_interrupted(tmp_path):
+    config = _config(tmp_path)
+    state = _orphan_state(config)
+    _write_queue(config, [_entry(ORPHAN_ID, state["source_url"], status="running", pid=os.getpid())])
+
+    assert worker.is_interrupted(state, config) is False
+
+
+def test_a_running_entry_whose_process_is_dead_is_interrupted(tmp_path):
+    config = _config(tmp_path)
+    state = _orphan_state(config)
+    dead = subprocess.Popen(_SLEEPER)
+    dead.kill()
+    dead.wait()
+    _write_queue(config, [_entry(ORPHAN_ID, state["source_url"], status="running", pid=dead.pid)])
+
+    assert worker.is_interrupted(state, config) is True
+
+
+def test_a_video_the_live_worker_resumes_itself_is_not_interrupted(tmp_path):
+    config = _config(tmp_path)
+    state = _orphan_state(config)
+    _write_busy_heartbeat(config)
+
+    assert worker.is_interrupted(state, config) is False
+
+
+def test_only_running_videos_can_be_interrupted(tmp_path):
+    config = _config(tmp_path)
+    state = _orphan_state(config)
+    state["status"] = "failed"
+
+    assert worker.is_interrupted(state, config) is False
+
+
+def test_cancelling_an_interrupted_video_succeeds_and_keeps_the_finished_steps(tmp_path, caplog):
+    config = _config(tmp_path)
+    _orphan_state(config)
+
+    with caplog.at_level("WARNING", logger="clipper.worker"):
+        worker.cancel(ORPHAN_ID, config=config)
+
+    state = pipeline.load_state(ORPHAN_ID, config=config)
+    assert state["status"] == "failed" and "annulée par l'utilisateur" in state["reason"]
+    assert "transcribe" in state["reason"]
+    statuses = _statuses(config)
+    assert statuses["download"] == "done" and statuses["transcribe"] == "pending"
+    assert "running" not in statuses.values()
+    assert any(ORPHAN_ID in r.getMessage() and "interrompu" in r.getMessage() for r in caplog.records)
+
+
+def test_cancelling_a_video_that_really_runs_still_needs_a_process(tmp_path):
+    config = _config(tmp_path)
+    state = _orphan_state(config)
+    _write_queue(config, [_entry(ORPHAN_ID, state["source_url"], status="waiting")])  # pas running : rien à tuer
+    _write_busy_heartbeat(config)
+
+    with pytest.raises(worker.WorkerError, match="aucune video en cours"):
+        worker.cancel(ORPHAN_ID, config=config)
+
+    assert pipeline.load_state(ORPHAN_ID, config=config)["status"] == "running"
+
+
+def test_resume_requeues_the_interrupted_video_from_its_interrupted_step(tmp_path):
+    config = _config(tmp_path)
+    _orphan_state(config)
+
+    entry = worker.resume(ORPHAN_ID, config=config)
+
+    assert (entry["video_id"], entry["action"], entry["status"]) == (ORPHAN_ID, "run", "waiting")
+    assert entry["url"] == f"https://youtu.be/{ORPHAN_ID}"
+    assert [e["video_id"] for e in _queue(config)] == [ORPHAN_ID]
+    statuses = _statuses(config)
+    assert statuses["download"] == "done" and statuses["transcribe"] == "pending"  # download n'est pas refait
+    assert entry["force_steps"] == []  # aucune étape terminée n'est forcée
+
+
+def test_resume_after_the_review_gate_renders(tmp_path):
+    config = _config(tmp_path)
+    _orphan_state(config, running="reframe")
+
+    entry = worker.resume(ORPHAN_ID, config=config)
+
+    assert (entry["action"], entry["url"]) == ("render", ORPHAN_ID)
+
+
+def test_resume_of_a_video_that_really_runs_is_refused(tmp_path):
+    config = _config(tmp_path)
+    state = _orphan_state(config)
+    _write_queue(config, [_entry(ORPHAN_ID, state["source_url"], status="running", pid=os.getpid())])
+
+    with pytest.raises(worker.WorkerError, match="en cours de traitement"):
+        worker.resume(ORPHAN_ID, config=config)
+
+
+def test_startup_marks_orphan_running_steps_interrupted_and_journals_it(tmp_path, caplog):
+    config = _config(tmp_path)
+    _orphan_state(config)
+    _orphan_state(config, video_id=VIDEO_A)
+    _write_queue(config, [_entry(VIDEO_A, URL_A, status="running", pid=os.getpid())])  # celle-ci vit vraiment
+    w = worker.Worker(config=config, spawner=FakeSpawner())
+
+    with caplog.at_level("WARNING", logger="clipper.worker"):
+        w._recover_interrupted_videos()
+
+    state = pipeline.load_state(ORPHAN_ID, config=config)
+    assert state["status"] == "failed" and state["reason"] == "interrompue à l'étape transcribe"
+    assert _statuses(config)["transcribe"] == "pending" and _statuses(config)["download"] == "done"
+    assert pipeline.load_state(VIDEO_A, config=config)["status"] == "running"
+    assert any(ORPHAN_ID in r.getMessage() and "interrompu" in r.getMessage() for r in caplog.records)
+
+
+def test_startup_runs_the_interrupted_video_recovery(tmp_path):
+    config = _config(tmp_path)
+    _orphan_state(config)
+
+    worker.Worker(config=config, spawner=FakeSpawner()).startup()
+
+    assert pipeline.load_state(ORPHAN_ID, config=config)["status"] == "failed"
