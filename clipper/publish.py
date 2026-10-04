@@ -1678,7 +1678,19 @@ def preview_series(
     insufficient = mode == "auto" and used < count
     insufficient_reason = None
     if insufficient:
-        if used == 0:
+        if used == 0 and pool:
+            # Des clips valides existent mais aucun ne tient dans count : jamais « aucun clip validé » (faux).
+            parts = sum(len(u["clip_ids"]) for u in pool)
+            smallest = min(len(u["clip_ids"]) for u in pool)
+            n = len(pool)
+            clips = f"{n} clip{'s' if n > 1 else ''} validé{'s' if n > 1 else ''}"
+            parts_label = f"{parts} partie{'s' if parts > 1 else ''}"
+            verb = "tiennent" if n > 1 else "tient"
+            insufficient_reason = (
+                f"{clips} en {parts_label} ne {verb} pas dans {count} place{'s' if count > 1 else ''} : "
+                f"passe à {smallest} vidéo{'s' if smallest > 1 else ''} ou décoche « Parties ensemble »"
+            )
+        elif used == 0:
             # Message clair (TASK-16eeaccfaf09) : distingue « rien n'est validé » d'un simple manque de clips.
             insufficient_reason = "aucun clip validé disponible : valide d'abord des clips dans l'écran Clips"
         else:
