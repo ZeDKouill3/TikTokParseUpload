@@ -74,6 +74,13 @@ python -m pytest -q tests/test_installer_real.py
   carte de fin « Abonne-toi ! »), désactivé par défaut. Remplace SPEC-6127
   (elle-même remplaçait SPEC-350f). Successeur proposé (non ratifié) :
   **SPEC-6a86** — titre d'écran sobre, sans emoji ni superlatif par défaut.
+- **ADR-e1da** / **SPEC-38f7** — installeur portable Windows : zip
+  d'amorçage (`uv.exe` + wheel + `installer/`) construit par
+  `tools/build_portable.py` ; programme sous `%LOCALAPPDATA%\Clipper\app`
+  (jetable, refait à chaque mise à jour), données sous `Documents\Clipper`
+  (jamais touchées par une mise à jour) ; CUDA seulement si un GPU NVIDIA
+  est détecté ; `claude` installé par son installeur officiel ; `clipper
+  doctor` vérifie l'installation ; aucun repli silencieux.
 - **SPEC-53f3** — grille de notation des moments (`rubric.toml`), critères et
   règles de sélection.
 - **SPEC-8257** *(proposée, pas encore `ank accept`)* — succède à SPEC-3a88
