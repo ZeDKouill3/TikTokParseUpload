@@ -3718,6 +3718,76 @@ def test_put_layout_without_any_key_or_with_bad_rect_is_422(tmp_path, isolated_c
     assert c.put("/api/channels/inconnue/layout", json={"badge_dest": _LAYOUT_DEFAULTS["badge_dest"]}).status_code == 404
 
 
+# --- Badge de style retirable (TASK-818c7566591f) ---------------------------------
+
+_BADGE_PRESET = _CH_PRESET + '\n[render]\nbadge_enabled = true\nbadge_logo = "logo.png"\nbadge_name = "ma_chaine"\ncrf = 20\n'
+
+
+def test_get_layout_reports_badge_enabled_effective_value(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path)
+    assert client(tmp_path).get(f"/api/channels/{CH}/layout").json()["badge_enabled"] is False
+    _channels_setup(tmp_path, _BADGE_PRESET)
+    assert client(tmp_path).get(f"/api/channels/{CH}/layout").json()["badge_enabled"] is True
+
+
+def test_put_layout_badge_enabled_false_writes_only_that_render_key(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path, _BADGE_PRESET)
+    before = tomllib.loads((tmp_path / "presets" / f"{CH}.toml").read_text(encoding="utf-8"))
+
+    resp = client(tmp_path).put(f"/api/channels/{CH}/layout", json={"badge_enabled": False})
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["badge_enabled"] is False
+    saved = tomllib.loads((tmp_path / "presets" / f"{CH}.toml").read_text(encoding="utf-8"))
+    assert saved["render"]["badge_enabled"] is False
+    expected = {**before, "render": {**before["render"], "badge_enabled": False}}
+    assert saved == expected                                            # aucun autre réglage modifié
+
+
+def test_put_layout_badge_enabled_back_to_true_keeps_badge_dest(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path)
+    c = client(tmp_path)
+    badge = {"x": 330, "y": 640, "w": 420, "h": 100}
+    resp = c.put(f"/api/channels/{CH}/layout", json={
+        "split_webcam_dest": {"x": 0, "y": 0, "w": 1080, "h": 700},
+        "split_gameplay_dest": {"x": 0, "y": 700, "w": 1080, "h": 1220},
+        "badge_dest": badge, "split_subtitle_dest": {"x": 150, "y": 760, "w": 780, "h": 150},
+        "badge_enabled": False})
+    assert resp.status_code == 200, resp.text
+    assert c.put(f"/api/channels/{CH}/layout", json={"badge_enabled": True}).status_code == 200
+    saved = tomllib.loads((tmp_path / "presets" / f"{CH}.toml").read_text(encoding="utf-8"))
+    assert saved["render"]["badge_enabled"] is True
+    assert saved["reframe"]["badge_dest"] == badge                      # position enregistrée conservée
+    assert c.get(f"/api/channels/{CH}/layout").json()["badge_dest"] == badge
+
+
+def test_put_layout_badge_enabled_must_be_a_boolean(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path)
+    resp = client(tmp_path).put(f"/api/channels/{CH}/layout", json={"badge_enabled": "peut-être"})
+    assert resp.status_code == 422
+
+
+def test_layout_js_has_a_badge_toggle_that_hides_the_zone_and_saves_badge_enabled():
+    js = (STATIC / "screens" / "layout.js").read_text(encoding="utf-8")
+    css = (STATIC / "style.css").read_text(encoding="utf-8")
+    assert "Afficher le badge" in js and "data-ly-badge" in js and "badge_enabled" in js
+    assert ".ly-zone.off" in css
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node absent du PATH")
+def test_layout_js_badge_zone_is_hidden_from_the_stage_when_disabled():
+    out = _run_js([("screens/layout.js", ["LY_ZONES", "LY_SAMPLE", "lyZoneInner", "lyBadgeOn", "lyStageHtml"])], """(() => {
+      const mk = (on) => { globalThis.lyUi = { name: 'ma_chaine', frame: null, selected: 'badge_dest', safe: false,
+        data: { safe: { left: 150, top: 160, right: 930, bottom: 1520 } }, draft: { badge_enabled: on } };
+        return lyStageHtml(); };
+      const off = mk(false), on = mk(true);
+      const cls = (h) => (h.match(/class="ly-zone ly-z-badge[^"]*"/) || [''])[0];
+      return { off: cls(off), on: cls(on), offCount: (off.match(/ly-zone /g) || []).length };
+    })()""")
+    assert " off" in out["off"] and " off" not in out["on"]
+    assert out["offCount"] == 4                                          # la zone reste dans le DOM : rien n'est perdu
+
+
 # --- Éditeur d'agencement letterbox (TASK-3be3) -----------------------------
 
 _LB_KEYS = ("letterbox_top", "letterbox_zoom", "letterbox_title_dest", "letterbox_subtitle_dest", "cta_handle_gap")

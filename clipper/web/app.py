@@ -34,7 +34,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse as _PlainJSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
-from pydantic import BaseModel
+from pydantic import BaseModel, StrictBool
 
 from clipper import accounts as accounts_mod
 from clipper import browser as browser_mod
@@ -1350,6 +1350,7 @@ def _layout_view(name: str) -> dict[str, Any]:
         # editeur a ouvrir : split (ci-dessous), letterbox (/layout/letterbox) ; crop n'en a pas
         "mode": "split" if split else "letterbox" if reframe["format"] == "letterbox" else "crop",
         **{key: reframe[key] for key in _LAYOUT_KEYS},
+        "badge_enabled": bool(config.section("render")["badge_enabled"]),
         "defaults": {key: defaults[key] for key in _LAYOUT_KEYS},
         "canvas": {"w": reframe["output_width"], "h": reframe["output_height"]},
         "safe": {"left": reframe["safe_left"], "top": reframe["safe_top"],
@@ -1378,14 +1379,21 @@ def _layout_save(name: str, body: dict[str, Any]) -> None:
     avoir verifie la geometrie comme reframe la verifiera au rendu : l'editeur
     ne laisse jamais passer un agencement que reframe refuserait."""
     given = {key: body[key] for key in _LAYOUT_KEYS if body.get(key) is not None}
-    if not given:
-        raise HTTPException(status_code=422, detail=f"aucun rectangle à enregistrer (attendu : {', '.join(_LAYOUT_KEYS)})")
+    badge_enabled = body.get("badge_enabled")
+    if not given and badge_enabled is None:
+        raise HTTPException(
+            status_code=422,
+            detail=f"aucun rectangle à enregistrer (attendu : {', '.join(_LAYOUT_KEYS)}, ou badge_enabled)",
+        )
     path = _channel_preset_path(name)
     try:
         preset = tomllib.loads(path.read_text(encoding="utf-8"))
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise HTTPException(status_code=422, detail=f"preset illisible ({path.name}) : {exc}") from exc
     preset["reframe"] = {**preset.get("reframe", {}), **given}
+    if badge_enabled is not None:
+        # seul [render] badge_enabled change : badge_dest et le reste du preset restent tels quels
+        preset["render"] = {**preset.get("render", {}), "badge_enabled": badge_enabled}
     try:
         _layout_check_geometry(name, preset)
     except ConfigError as exc:
@@ -1761,6 +1769,7 @@ class LayoutBody(BaseModel):
     split_gameplay_dest: dict[str, Any] | None = None
     badge_dest: dict[str, Any] | None = None
     split_subtitle_dest: dict[str, Any] | None = None
+    badge_enabled: StrictBool | None = None
 
 
 class LetterboxLayoutBody(BaseModel):

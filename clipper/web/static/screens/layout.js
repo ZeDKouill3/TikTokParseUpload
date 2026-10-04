@@ -2,7 +2,8 @@
    #/styles/<chaine>/layout : canevas 1080x1920 mis à l'échelle, quatre zones
    (webcam, jeu, badge, sous-titres) à glisser et redimensionner sur une image
    clé d'une vidéo du style, valeurs {x, y, w, h} éditables, enregistrées
-   dans [reframe] du preset. Aucune validation ici : c'est reframe qui refuse un
+   dans [reframe] du preset ; la case « Afficher le badge » écrit
+   [render] badge_enabled (décoché : la zone disparaît, badge_dest reste). Aucune validation ici : c'est reframe qui refuse un
    agencement qui déborde, se chevauche ou sort de la zone sûre, et le serveur
    renvoie son message tel quel (422), affiché sous la barre d'outils.
    Charge après channels.js, dont il enveloppe Screens.channels. Un style en
@@ -21,6 +22,7 @@ const LY_SAMPLE = "EXEMPLE DE SOUS-TITRE";
 
 const lyUi = { name: null, data: null, draft: null, saved: null, selected: LY_ZONES[0].key, frame: null, frameError: null, error: null, scale: 0.3, safe: false, snap: true, busy: false };
 
+const lyBadgeOn = () => lyUi.draft.badge_enabled !== false;
 const lyName = () => {
   const parts = location.hash.replace(/^#\/?/, "").split("?")[0].split("/");
   return parts[0] === "styles" && parts[2] === "layout" ? decodeURIComponent(parts[1] || "") : "";
@@ -39,7 +41,7 @@ function lyZoneInner(z) {
 
 function lyStageHtml() {
   const s = lyUi.data.safe;
-  const zones = LY_ZONES.map((z) => `<div class="ly-zone ly-z-${z.kind}${z.key === lyUi.selected ? " sel" : ""}" data-zone="${z.key}" tabindex="0" role="group" aria-label="${esc(z.label)}">
+  const zones = LY_ZONES.map((z) => `<div class="ly-zone ly-z-${z.kind}${z.key === lyUi.selected ? " sel" : ""}${z.kind === "badge" && !lyBadgeOn() ? " off" : ""}" data-zone="${z.key}" tabindex="0" role="group" aria-label="${esc(z.label)}">
       ${lyZoneInner(z)}<span class="ly-tag">${esc(z.label)}</span>
       ${["nw", "ne", "sw", "se"].map((h) => `<span class="ly-hdl ${h}" data-h="${h}"></span>`).join("")}</div>`).join("");
   return `<img class="ly-bg" src="${esc(lyUi.frame || "")}" alt="" ${lyUi.frame ? "" : "hidden"}>${zones}
@@ -50,7 +52,7 @@ function lyStageHtml() {
 function lyValuesHtml() {
   return LY_ZONES.map((z) => {
     const r = lyUi.draft[z.key];
-    return `<div class="ly-values${z.key === lyUi.selected ? " sel" : ""}" data-values="${z.key}">
+    return `<div class="ly-values${z.key === lyUi.selected ? " sel" : ""}${z.kind === "badge" && !lyBadgeOn() ? " off" : ""}" data-values="${z.key}">
       <button type="button" class="ly-values-head" data-select="${z.key}">${icon(z.icon, "i-sm")}<b>${esc(z.label)}</b><span class="mono muted">${esc(z.key)}</span></button>
       <div class="ly-coords">${["x", "y", "w", "h"].map((k) => `<label>${k}<input class="input" type="number" inputmode="numeric" step="1" data-k="${k}" value="${esc(r[k])}"></label>`).join("")}</div></div>`;
   }).join("");
@@ -71,6 +73,7 @@ function lyHtml() {
       <div class="ly-main">
         <div class="ly-tools">
           <label class="ly-check"><input type="checkbox" data-ly-safe ${lyUi.safe ? "checked" : ""}> Zone sûre TikTok</label>
+          <label class="ly-check"><input type="checkbox" data-ly-badge ${lyBadgeOn() ? "checked" : ""}> Afficher le badge</label>
           <label class="ly-check"><input type="checkbox" data-ly-snap ${lyUi.snap ? "checked" : ""}> Magnétisme (axe central)</label></div>
         <div class="ly-outer" data-ly-outer><div class="ly-stage" data-ly-stage>${lyStageHtml()}</div></div>
         ${frameNote}
@@ -184,12 +187,22 @@ async function lySave(root) {
   }
 }
 
+/* Case « Afficher le badge » : masque ou remet la zone, sans toucher à badge_dest. */
+function lyApplyBadge(root) {
+  const on = lyBadgeOn();
+  $$('[data-zone="badge_dest"], [data-values="badge_dest"]', root).forEach((el) => el.classList.toggle("off", !on));
+  const box = $("[data-ly-badge]", root);
+  if (box) box.checked = on;
+  lyRefreshDirty(root);
+}
+
 function lyReset(root) {
   const before = lyCopy(lyUi.draft);
-  lyUi.draft = lyCopy(lyUi.data.defaults);
+  // Les défauts ne portent que les rectangles : l'état du badge est conservé.
+  lyUi.draft = Object.assign(lyCopy(lyUi.data.defaults), { badge_enabled: before.badge_enabled });
   lyShowError(root, null);
   lyPlaceAll(root);
-  toast({ kind: "info", title: "Défauts rétablis", body: "Pas encore enregistrés.", undo: () => { lyUi.draft = before; lyPlaceAll(root); } });
+  toast({ kind: "info", title: "Défauts rétablis", body: "Pas encore enregistrés.", undo: () => { lyUi.draft = before; lyPlaceAll(root); lyApplyBadge(root); } });
 }
 
 function lyWire(root) {
@@ -204,6 +217,7 @@ function lyWire(root) {
   root.onchange = (e) => {
     if (e.target.matches("[data-ly-safe]")) { lyUi.safe = e.target.checked; $(".ly-safe", root).classList.toggle("show", lyUi.safe); }
     else if (e.target.matches("[data-ly-snap]")) lyUi.snap = e.target.checked;
+    else if (e.target.matches("[data-ly-badge]")) { lyUi.draft.badge_enabled = e.target.checked; lyApplyBadge(root); }
   };
   root.oninput = (e) => {
     const input = e.target.closest("[data-values] input");
@@ -247,6 +261,7 @@ async function lyOpen(body, name) {
     if (data.mode === "letterbox") { await lbOpen(body, name); return; }
     lyUi.data = data;
     lyUi.draft = Object.fromEntries(LY_ZONES.map((z) => [z.key, lyCopy(data[z.key])]));
+    lyUi.draft.badge_enabled = data.badge_enabled === true;
     lyUi.saved = lyCopy(lyUi.draft);
   } catch (err) {
     if (lyUi.name === name) { lyUi.name = null; body.innerHTML = emptyState("circle-alert", "Agencement illisible", err.message); }
