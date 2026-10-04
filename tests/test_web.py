@@ -3358,8 +3358,9 @@ def test_publish_screen_is_wired_with_calendar_queue_and_actions():
 def test_publish_calendar_css_scales_day_boxes_and_never_overflows_the_page():
     css = (STATIC / "style.css").read_text(encoding="utf-8")
 
-    for sel in (".cal-day", ".cal-day.dense", ".cal-day.compact", ".cal-month", ".pub-day-list"):
+    for sel in (".cal-day", ".cal-day.compact", ".cal-day.mini", ".cal-month", ".pub-day-list", ".cal-mini-row", ".cal-more"):
         assert sel in css, sel
+    assert ".cal-day.dense" not in css                                  # palier retire (TASK-460904227d2f)
     body = css[css.index(".cal-day {"):css.index(".cal-day {") + css[css.index(".cal-day {"):].index("}")]
     assert "overflow-y: auto" in body and "max-height" in body          # defile plutot que deborder sur la page
 
@@ -7019,8 +7020,103 @@ def test_publish_calendar_has_a_day_week_month_switch_defaulting_to_week():
 
 @_NODE
 def test_publish_box_density_class_scales_with_post_count():
-    out = _run_publish("[0, 1, 3, 4, 6, 7, 15].map(pubBoxClass)")
-    assert out == ["", "", "", "dense", "dense", "compact", "compact"]
+    # Paliers (TASK-460904227d2f) : normal <= 4, compact <= 10, mini au-dela.
+    out = _run_publish("[0, 1, 4, 5, 10, 12, 20].map(pubBoxClass)")
+    assert out == ["", "", "", "compact", "compact", "mini", "mini"]
+
+
+@_NODE
+def test_publish_week_box_truncates_a_busy_day_to_mini_rows_with_a_counted_link_to_day_view():
+    # Relevé réel (2026-10-04, 17 posts le dimanche) : la case coupait sans l'indiquer (TASK-460904227d2f).
+    ymd = "2026-10-11"
+    posts = [{"video_id": "v", "clip_id": f"{i:02d}", "publish_status": "scheduled", "screen_title": f"Clip {i}",
+              "service": "tiktok", "slot_at": f"2026-10-11T{i:02d}:00:00+00:00", "slot_at_paris": f"2026-10-11T{i:02d}:00:00+02:00",
+              "video_url": "/m", "thumbnail_url": "/t"} for i in range(17)]
+    week = {"week_start": "2026-10-05", "week_end": "2026-10-11", "slots": [], "days": _week_days({ymd: posts})}
+
+    out = _run_publish(f"pubCalendarWeek({json.dumps(week)})")
+
+    assert "cal-day mini" in out                               # palier mini (17 > 10)
+    assert out.count("cal-mini-row") == 10                     # cap visible (PUB_WEEK_MINI_CAP)
+    assert "+7 autres" in out                                  # 17 - 10 caches, jamais sans indication
+    assert f'data-pub-more="{ymd}"' in out                     # cible : vue Jour de ce jour
+
+
+@_NODE
+def test_publish_week_box_mini_tier_keeps_free_slots_as_full_drop_targets():
+    # Un creneau libre dans un jour charge reste une cible de depot normale (.cal-c[data-slot-at]) : seules
+    # les publications se tronquent en lignes minuscules, jamais les creneaux libres (TASK-460904227d2f).
+    ymd = "2026-10-11"
+    posts = [{"video_id": "v", "clip_id": f"{i:02d}", "publish_status": "scheduled", "screen_title": f"Clip {i}",
+              "service": "tiktok", "slot_at": f"2026-10-11T{i:02d}:00:00+00:00", "slot_at_paris": f"2026-10-11T{i:02d}:00:00+02:00",
+              "video_url": "/m", "thumbnail_url": "/t"} for i in range(12)]
+    free = {"slot_at": "2026-10-11T22:00:00+02:00", "slot_at_paris": "2026-10-11T22:00:00+02:00", "clip": None, "free": True}
+    week = {"week_start": "2026-10-05", "week_end": "2026-10-11", "slots": [free], "days": _week_days({ymd: posts})}
+
+    out = _run_publish(f"pubCalendarWeek({json.dumps(week)})")
+
+    assert 'class="cal-c slot free' in out and 'data-slot-at="2026-10-11T22:00:00+02:00"' in out
+    assert out.count("cal-mini-row") == 10                     # le creneau libre ne consomme pas le cap des posts
+
+
+@_NODE
+def test_publish_week_box_compact_tier_keeps_full_post_cards_without_truncation():
+    ymd = "2026-10-08"
+    posts = [{"video_id": "v", "clip_id": f"{i:02d}", "publish_status": "scheduled", "screen_title": f"Clip {i}",
+              "service": "tiktok", "slot_at": f"2026-10-08T{i:02d}:00:00+00:00", "slot_at_paris": f"2026-10-08T{i:02d}:00:00+02:00",
+              "video_url": "/m", "thumbnail_url": "/t"} for i in range(6)]
+    week = {"week_start": "2026-10-05", "week_end": "2026-10-11", "slots": [], "days": _week_days({ymd: posts})}
+
+    out = _run_publish(f"pubCalendarWeek({json.dumps(week)})")
+
+    assert "cal-day compact" in out and "cal-mini-row" not in out
+    assert out.count('data-post="v/0') == 6                    # les 6 posts rendus, aucun tronque
+    assert "autres" not in out
+
+
+@_NODE
+def test_publish_month_box_shows_first_posts_then_a_counted_link_to_day_view():
+    ymd = "2026-10-11"
+    posts = [{"video_id": "v", "clip_id": f"{i:02d}", "publish_status": "scheduled", "screen_title": f"Clip {i}",
+              "service": "tiktok", "slot_at": f"2026-10-11T{i:02d}:00:00+00:00", "slot_at_paris": f"2026-10-11T{i:02d}:00:00+02:00",
+              "video_url": "/m", "thumbnail_url": "/t"} for i in range(6)]
+    days = [{"date": f"2026-10-{d:02d}", "count": (6 if f"2026-10-{d:02d}" == ymd else 0),
+             "posts": (posts if f"2026-10-{d:02d}" == ymd else [])} for d in range(1, 32)]
+    month = {"range": "month", "range_start": "2026-10-01", "range_end": "2026-10-31", "slots": [], "days": days}
+
+    out = _run_publish(f"pubCalendarMonth({json.dumps(month)})")
+
+    assert out.count("cal-mini-row") == 4                      # cap visible (PUB_MONTH_CAP)
+    assert "+2 autres" in out                                  # 6 - 4 caches, jamais sans indication
+    assert f'data-pub-more="{ymd}"' in out                     # cible : vue Jour de ce jour
+
+
+def test_publish_week_calendar_has_no_leading_empty_hour_column():
+    js = (STATIC / "screens" / "publish.js").read_text(encoding="utf-8")
+    css = (STATIC / "style.css").read_text(encoding="utf-8")
+    assert "cal-row-label" not in js and "cal-row-label" not in css        # reste de l'ancienne grille horaire
+
+
+@_NODE
+def test_publish_week_view_renders_exactly_seven_day_headers_and_boxes():
+    week = {"week_start": "2026-10-05", "week_end": "2026-10-11", "slots": [], "days": _week_days({})}
+
+    out = _run_publish(f"pubCalendarWeek({json.dumps(week)})")
+
+    assert out.count('class="cal-h') == 7                      # pas de 8e cellule d'en-tete vide (colonne d'heure)
+    assert out.count("data-date=") == 7
+
+
+def test_publish_legend_dots_use_three_distinct_colors_reused_from_the_calendar_boxes():
+    js = (STATIC / "screens" / "publish.js").read_text(encoding="utf-8")
+    toolbar = js[js.index("function pubToolbar"):js.index("const PUB_HELP")]
+    assert '<i class="pub-leg info">' in toolbar
+    assert '<i class="pub-leg ok">' in toolbar
+    assert '<i class="pub-leg bad">' in toolbar
+    css = (STATIC / "style.css").read_text(encoding="utf-8")
+    assert ".pub-leg.info { background: var(--info)" in css
+    assert ".pub-leg.ok { background: var(--ok)" in css
+    assert ".pub-leg.bad { background: var(--bad)" in css
 
 
 @_NODE

@@ -947,7 +947,7 @@ input[type="color"] { width: 36px; height: 36px; padding: 2px; border-radius: va
 .review-progress .bar { width: 160px; }
 
 /* ---------- Publication ---------- */
-.cal { display: grid; grid-template-columns: 64px repeat(7, minmax(0, 1fr)); border: 1px solid var(--line); border-radius: var(--r-lg); overflow: hidden; background: var(--surface); }
+.cal { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); border: 1px solid var(--line); border-radius: var(--r-lg); overflow: hidden; background: var(--surface); }
 .cal-h { padding: 12px 8px; border-bottom: 1px solid var(--line); border-left: 1px solid var(--line); text-align: center; }
 .cal-h:first-child { border-left: 0; }
 .cal-h .d { font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); font-weight: 600; }
@@ -1088,7 +1088,7 @@ input[type="color"] { width: 36px; height: 36px; padding: 2px; border-radius: va
   .kpis-4 .kpi:nth-child(4) { border-left: 1px solid var(--line); }
   .kpis-4 .kpi:last-child { grid-column: auto; }
   .choice-grid { grid-template-columns: minmax(0, 1fr); }
-  .cal { grid-template-columns: 48px repeat(7, minmax(84px, 1fr)); overflow-x: auto; }
+  .cal { grid-template-columns: repeat(7, minmax(84px, 1fr)); overflow-x: auto; }
   .cal-wrap { overflow-x: auto; margin: 0 -16px; padding: 0 16px; }
   .cal-wrap .cal { min-width: 680px; }
   .toasts { right: 16px; left: 16px; width: auto; bottom: calc(80px + env(safe-area-inset-bottom)); }
@@ -1296,10 +1296,16 @@ input[type="color"] { width: 36px; height: 36px; padding: 2px; border-radius: va
 .pub-pad { padding: 0; }
 .pub-toolbar { gap: 12px 16px; }
 .pub-toolbar .legend { flex: 0 1 auto; }
+/* Pastilles (pas les traits de .legend i plus bas, pour un autre graphique) : trois couleurs distinctes
+   reprises des boites (.post.scheduled/.published/.failed), TASK-460904227d2f. */
+.legend i.pub-leg { display: inline-block; width: 10px; height: 10px; border: 0; border-radius: 3px; margin-right: 6px; }
+.legend i.pub-leg.info { background: var(--info); }
+.legend i.pub-leg.ok { background: var(--ok); }
+.legend i.pub-leg.bad { background: var(--bad); }
 .pub-account { font-size: 13px; }
 .pub-grid { grid-template-columns: 360px minmax(0, 1fr); }
 .pub-side, .pub-main { min-width: 0; }
-.cal { display: grid; grid-template-columns: 64px repeat(7, minmax(0, 1fr)); border: 1px solid var(--line); border-radius: var(--r-lg); overflow: hidden; background: var(--surface); }
+.cal { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); border: 1px solid var(--line); border-radius: var(--r-lg); overflow: hidden; background: var(--surface); }
 .cal-h { padding: 12px 8px; border-bottom: 1px solid var(--line); border-left: 1px solid var(--line); text-align: center; }
 .cal-h:first-child { border-left: 0; }
 .cal-h .d { font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); font-weight: 600; }
@@ -1331,7 +1337,7 @@ input[type="color"] { width: 36px; height: 36px; padding: 2px; border-radius: va
 .pub-caption { white-space: pre-wrap; font-size: 14px; color: var(--text-2); padding: 12px; border: 1px solid var(--line); border-radius: var(--r-md, 8px); background: var(--surface-2); max-height: 40vh; overflow: auto; }
 @media (max-width: 900px) {
   .pub-grid { grid-template-columns: minmax(0, 1fr); }
-  .cal { grid-template-columns: 48px repeat(7, minmax(84px, 1fr)); }
+  .cal { grid-template-columns: repeat(7, minmax(84px, 1fr)); }
   .cal-wrap { overflow-x: auto; margin: 0 -16px; padding: 0 16px; }
   .cal-wrap .cal { min-width: 680px; }
   .pub-modal .modal-foot .btn { min-height: 44px; }
@@ -1695,10 +1701,9 @@ input[type="color"] { width: 36px; height: 36px; padding: 2px; border-radius: va
 .cal .post .pt { flex: 1 1 100%; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; overflow-wrap: anywhere; hyphens: auto; min-width: 0; }
 .cal .post .pub-acct { flex: 1 1 100%; }
 
-/* ---------- Calendrier : vues Jour / Semaine / Mois (TASK-ad4d) ---------- */
+/* ---------- Calendrier : vues Jour / Semaine / Mois (TASK-ad4d, paliers TASK-460904227d2f) ---------- */
 /* Semaine : une case par jour (toutes ses publications) plutot qu'une case par heure ; reutilise la grille
-   .cal (en-tetes .cal-h) avec une ligne de corps unique. .cal-row-label occupe la colonne d'heure, vide ici. */
-.cal-row-label { border-top: 1px solid var(--line); }
+   .cal (en-tetes .cal-h), sept colonnes, aucune colonne d'heure. */
 .cal-day {
   border-top: 1px solid var(--line); border-left: 1px solid var(--line); padding: 6px; min-height: 92px;
   max-height: 320px; display: flex; flex-direction: column; gap: 4px; overflow-y: auto;
@@ -1708,14 +1713,27 @@ input[type="color"] { width: 36px; height: 36px; padding: 2px; border-radius: va
 .cal-day-h { display: flex; align-items: center; justify-content: space-between; gap: 6px; font-family: var(--font-mono); font-size: 11px; color: var(--muted); }
 .cal-day-count { font-family: var(--font-cond); font-weight: 700; font-size: 12px; color: var(--accent); background: var(--accent-soft); border-radius: 999px; padding: 0 6px; min-width: 18px; text-align: center; }
 .pub-day-time { font-family: var(--font-mono); font-size: 10px; color: var(--muted); flex: 0 0 auto; }
-/* Boites mises a l'echelle avec le nombre de publications du jour (TASK-ad4d) : la case defile plutot que de
-   deborder sur la page au-dela du seuil « compact ». */
-.cal-day.dense .post { font-size: 10px; padding: 3px; gap: 4px; }
-.cal-day.dense .post .mini-clip { display: none; }
+/* Palier compact (5 a 10 publications du jour) : boites reduites, encore des cartes. */
 .cal-day.compact { gap: 2px; }
 .cal-day.compact .post { font-size: 9px; padding: 2px 3px; gap: 2px; }
 .cal-day.compact .post .pt { -webkit-line-clamp: 1; line-clamp: 1; }
 .cal-day.compact .post .mini-clip, .cal-day.compact .post .pub-service { display: none; }
+/* Palier mini (plus de 10 en Semaine, toujours en Mois) : une ligne heure + titre tronque + pastille de statut
+   (TASK-460904227d2f). Au-dela de PUB_WEEK_MINI_CAP / PUB_MONTH_CAP (publish.js), un lien .cal-more indique
+   le reste plutot que de le cacher sans le dire. */
+.cal-day.mini { gap: 1px; }
+.cal-mini-row { display: flex; align-items: center; gap: 6px; padding: 1px 2px; border-radius: 4px; font-size: 10px; line-height: 1.35; cursor: pointer; }
+.cal-mini-row:hover, .cal-mini-row:focus-visible { background: var(--surface-2); outline: none; }
+.cal-mini-time { font-family: var(--font-mono); font-size: 9px; color: var(--muted); flex: 0 0 auto; }
+.cal-mini-title { flex: 1 1 auto; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.cal-mini-dot { flex: 0 0 auto; width: 6px; height: 6px; border-radius: 50%; background: var(--info); }
+.cal-mini-dot.published { background: var(--ok); }
+.cal-mini-dot.failed { background: var(--bad); }
+.cal-more {
+  margin-top: 2px; padding: 3px 6px; border-radius: 6px; border: 1px dashed var(--line-2); background: var(--surface-2);
+  color: var(--muted); font-size: 10px; font-family: var(--font-mono); cursor: pointer; text-align: center;
+}
+.cal-more:hover, .cal-more:focus-visible { background: var(--surface-3); color: var(--text); outline: none; }
 /* Mois : grille de 7 colonnes, lundi en tete ; pas de cible de depot (SPEC-c100 : seulement Jour et Semaine). */
 .cal-month { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); border: 1px solid var(--line); border-radius: var(--r-lg); overflow: hidden; background: var(--surface); }
 .cal-month .cal-h { padding: 8px; border-left: 1px solid var(--line); }
