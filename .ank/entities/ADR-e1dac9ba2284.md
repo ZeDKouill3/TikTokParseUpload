@@ -5,7 +5,7 @@ slug: installeur-portable-windows-zip-d-amor-age-uv-ex
 title: "Installeur portable Windows : zip d'amorçage (uv.exe + wheel), programme sous %LOCALAPPDATA%\\Clipper\\app, données sous Documents\\Clipper"
 created: 2026-10-03T22:47:34Z
 author: plan-portable
-status: proposed
+status: accepted
 scope:
   - pyproject.toml
   - clipper/gpu.py
@@ -25,8 +25,12 @@ scope:
   - docs/INSTALLATION.md
 constraint: |
   L'installation pour un utilisateur sans outils de développement passe par un seul zip d'amorçage (uv.exe, la wheel clipper, les scripts installer/, l'icône ; jamais Python ni site-packages dedans) dont Installer.bat installe tout le programme sous un dossier app (par défaut %LOCALAPPDATA%\Clipper\app : Python 3.11 et dépendances via uv, ffmpeg, lanceur) et toutes les données sous un dossier distinct (par défaut %USERPROFILE%\Documents\Clipper : config.toml, rubric.toml, workspace/, output/, state/, logs/) que ni une mise à jour (relance d'un zip plus récent, qui remplace app) ni la désinstallation par défaut ne touchent ; CUDA (extra clipper[cuda]) n'est installé que si un GPU NVIDIA est détecté ; Chrome et le CLI claude restent externes (claude installé par l'installeur officiel natif et connecté par l'utilisateur lui-même, Chrome seulement vérifié) ; tout prérequis manquant ou étape échouée est un arrêt explicite en français avec le remède, jamais un repli silencieux (ADR-ad2e) ; aucun test par défaut ne télécharge quoi que ce soit.
+ratified: 99c3ba0afd34
+verified:
+  - by: nicoc@zedk_ordi
+    at: 2026-10-04T10:09:53Z
 schema: 4
-version: 6
+version: 7
 ---
 
 ## Contexte
