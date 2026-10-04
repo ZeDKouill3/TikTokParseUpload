@@ -1668,6 +1668,23 @@ def test_preview_series_auto_skips_a_series_that_does_not_fit_and_takes_the_next
     assert preview["ok"] is True
 
 
+def test_preview_series_auto_says_a_validated_series_does_not_fit_instead_of_none_validated(isolated_cwd):
+    _series_env(isolated_cwd)
+    _write_video_channel(isolated_cwd, "vid1", "ma_chaine")
+    ids = [f"a-p{n}" for n in range(1, 9)]
+    for n, clip_id in enumerate(ids, start=1):
+        _write_sidecar(isolated_cwd, "vid1", clip_id, score=95, part=n, parts_total=8)
+    _approve_all(isolated_cwd, "vid1", ids)
+
+    preview = _auto_preview(isolated_cwd, count=2)
+
+    reason = preview["insufficient_reason"]
+    assert preview["ok"] is False and preview["insufficient"] is True and preview["available"] == 0
+    assert "aucun clip validé" not in reason
+    assert "1 clip validé en 8 parties ne tient pas dans 2 places" in reason
+    assert "passe à 8 vidéos" in reason and "Parties ensemble" in reason
+
+
 def test_preview_series_auto_reports_when_not_enough_clips_are_available(isolated_cwd):
     _series_env(isolated_cwd)
     _write_video_channel(isolated_cwd, "vid1", "ma_chaine")
