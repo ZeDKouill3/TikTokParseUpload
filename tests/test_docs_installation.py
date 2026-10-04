@@ -132,11 +132,11 @@ def test_m6_installation_doc_diagnostic_section_has_no_phantom_menu():
     assert "menu" not in section.lower()
 
 
-def test_changelog_has_an_unreleased_entry_about_the_installer():
+def test_changelog_current_version_has_an_entry_about_the_installer():
     text = _text(CHANGELOG)
-    start = text.index("## [Non publié]")
+    start = text.index("## [0.4.1]")
     end = text.index("## [0.4.0]")
     section = text[start:end]
-    assert section.strip() != "", "section [Non publié] vide"
+    assert section.strip() != "", "section [0.4.1] vide"
     for needle in ("Installer.bat", "portable"):
-        assert needle in section, f"{needle!r} absent de l'entree [Non publie] du CHANGELOG"
+        assert needle in section, f"{needle!r} absent de l'entree [0.4.1] du CHANGELOG"
