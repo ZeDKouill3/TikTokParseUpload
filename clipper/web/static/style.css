@@ -1706,7 +1706,7 @@ input[type="color"] { width: 36px; height: 36px; padding: 2px; border-radius: va
    .cal (en-tetes .cal-h), sept colonnes, aucune colonne d'heure. */
 .cal-day {
   border-top: 1px solid var(--line); border-left: 1px solid var(--line); padding: 6px; min-height: 92px;
-  max-height: 320px; display: flex; flex-direction: column; gap: 4px; overflow-y: auto;
+  display: flex; flex-direction: column; gap: 4px;
 }
 .cal-day.today { background: var(--accent-soft); }
 .cal-day.blank { background: var(--surface-2); opacity: 0.4; }
@@ -1718,9 +1718,8 @@ input[type="color"] { width: 36px; height: 36px; padding: 2px; border-radius: va
 .cal-day.compact .post { font-size: 9px; padding: 2px 3px; gap: 2px; }
 .cal-day.compact .post .pt { -webkit-line-clamp: 1; line-clamp: 1; }
 .cal-day.compact .post .mini-clip, .cal-day.compact .post .pub-service { display: none; }
-/* Palier mini (plus de 10 en Semaine, toujours en Mois) : une ligne heure + titre tronque + pastille de statut
-   (TASK-460904227d2f). Au-dela de PUB_WEEK_MINI_CAP / PUB_MONTH_CAP (publish.js), un lien .cal-more indique
-   le reste plutot que de le cacher sans le dire. */
+/* Palier mini (plus de 10 en Semaine) : une ligne heure + titre tronque + pastille de statut. La case
+   s'agrandit en hauteur autant qu'il faut : toutes les publications restent visibles (TASK-39bbe20b3284). */
 .cal-day.mini { gap: 1px; }
 .cal-mini-row { display: flex; align-items: center; gap: 6px; padding: 1px 2px; border-radius: 4px; font-size: 10px; line-height: 1.35; cursor: pointer; }
 .cal-mini-row:hover, .cal-mini-row:focus-visible { background: var(--surface-2); outline: none; }
@@ -1729,18 +1728,16 @@ input[type="color"] { width: 36px; height: 36px; padding: 2px; border-radius: va
 .cal-mini-dot { flex: 0 0 auto; width: 6px; height: 6px; border-radius: 50%; background: var(--info); }
 .cal-mini-dot.published { background: var(--ok); }
 .cal-mini-dot.failed { background: var(--bad); }
-.cal-more {
-  margin-top: 2px; padding: 3px 6px; border-radius: 6px; border: 1px dashed var(--line-2); background: var(--surface-2);
-  color: var(--muted); font-size: 10px; font-family: var(--font-mono); cursor: pointer; text-align: center;
-}
-.cal-more:hover, .cal-more:focus-visible { background: var(--surface-3); color: var(--text); outline: none; }
 /* Mois : grille de 7 colonnes, lundi en tete ; pas de cible de depot (SPEC-c100 : seulement Jour et Semaine). */
 .cal-month { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); border: 1px solid var(--line); border-radius: var(--r-lg); overflow: hidden; background: var(--surface); }
 .cal-month .cal-h { padding: 8px; border-left: 1px solid var(--line); }
-.cal-month .cal-day.small { min-height: 64px; max-height: 160px; }
+.cal-month .cal-day.small { min-height: 64px; cursor: pointer; }
+.cal-month .cal-day.small:hover, .cal-month .cal-day.small:focus-visible { background: var(--surface-2); outline: none; }
+.cal-month .cal-day.small.today { background: var(--accent-soft); }
+.cal-month-count { font-family: var(--font-cond); font-weight: 700; font-size: 13px; color: var(--accent); }
 /* Jour : liste horaire au lieu d'une grille (heure, compte, service, titre, statut). */
 .pub-day-list { display: flex; flex-direction: column; gap: 6px; }
 .pub-day-list .post { width: 100%; }
 @media (max-width: 900px) {
-  .cal-day { min-height: 72px; max-height: 220px; }
+  .cal-day { min-height: 72px; }
 }
