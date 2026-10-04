@@ -12,6 +12,8 @@ plan affiche, pas une implementation separee."""
 
 from __future__ import annotations
 
+import ctypes
+import json
 import os
 import re
 import shutil
@@ -49,6 +51,7 @@ def installer_dir(tmp_path: Path) -> Path:
         "desinstaller.ps1",
         "Clipper.bat.template",
         "PREMIER-CLIP.txt",
+        "overrides.txt",
         "Installer.bat",
         "Desinstaller.bat",
     ):
@@ -69,8 +72,11 @@ def zip_layout_dir(tmp_path: Path) -> Path:
     sub.mkdir(parents=True)
     for name in ("Installer.bat", "Desinstaller.bat"):
         shutil.copy(INSTALLER_SRC / name, root / name)
-    for name in ("install.ps1", "desinstaller.ps1", "Clipper.bat.template", "PREMIER-CLIP.txt"):
+    for name in ("install.ps1", "desinstaller.ps1", "Clipper.bat.template", "PREMIER-CLIP.txt", "overrides.txt"):
         shutil.copy(INSTALLER_SRC / name, sub / name)
+    # Icone factice (contenu sans importance ici) : meme disposition que le
+    # vrai zip (tools/build_portable.py copie clipper.ico sous installer/).
+    (sub / "clipper.ico").write_bytes(b"\x00\x01\x02\x03")
     (root / "version.txt").write_text(NEW_VERSION, encoding="utf-8")
     return root
 
@@ -136,10 +142,54 @@ def _env_without_command(name: str) -> dict[str, str]:
     return env
 
 
-def run_install(root: Path, args: list[str], env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+def run_install(
+    root: Path,
+    args: list[str],
+    env: dict[str, str] | None = None,
+    port: int | None = None,
+    cwd: Path | None = None,
+) -> subprocess.CompletedProcess:
     install_ps1 = root / "installer" / "install.ps1"
-    cmd = [POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(install_ps1), *args]
-    return subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=120)
+    cmd = [POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(install_ps1)]
+    if port is not None:
+        cmd += ["-Port", str(port)]
+    cmd += list(args)
+    return subprocess.run(cmd, capture_output=True, text=True, env=env, cwd=str(cwd) if cwd else None, timeout=120)
+
+
+def run_step9_launcher(tmp_path: Path, root: Path, *, data_name: str = "data") -> tuple[subprocess.CompletedProcess, Path, Path]:
+    """Dot-source install.ps1 (-NoAutoRun, point d'injection pour les tests)
+    puis appelle Invoke-Step9-Launcher directement : les etapes 2, 3, 5 et 8
+    ont besoin du reseau (python, uv, claude, modeles) et ne sont donc
+    jamais traversees par un test qui tourne par defaut."""
+    app_dir = tmp_path / "app"
+    app_dir.mkdir()
+    data_dir = tmp_path / data_name
+    template_path = root / "installer" / "Clipper.bat.template"
+    script_path = tmp_path / "_invoke_step9.ps1"
+    script_path.write_text(
+        "\n".join(
+            [
+                f". '{root / 'installer' / 'install.ps1'}' -NoAutoRun",
+                (
+                    f"Invoke-Step9-Launcher -App '{app_dir}' -Data '{data_dir}' "
+                    f"-TemplatePath '{template_path}' -Root '{root}' -SansRaccourci -DryRun:$false"
+                ),
+                "Write-Host 'STEP9_DONE'",
+            ]
+        ),
+        # BOM obligatoire : sans lui, PowerShell 5.1 relit un .ps1 UTF-8 en
+        # ANSI (page de code systeme), ce qui corrompt tout caractere
+        # accentue passe ici (--data) avant meme qu'il atteigne install.ps1.
+        encoding="utf-8-sig",
+    )
+    result = subprocess.run(
+        [POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script_path)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    return result, app_dir, data_dir
 
 
 def run_desinstaller(
@@ -179,6 +229,7 @@ def _dir_snapshot(path: Path) -> set[str]:
         "desinstaller.ps1",
         "Clipper.bat.template",
         "PREMIER-CLIP.txt",
+        "overrides.txt",
     ],
 )
 def test_installer_files_exist(name: str) -> None:
@@ -265,6 +316,10 @@ def test_installer_bat_wrapper_finds_install_ps1_under_installer_subdir(zip_layo
 def test_desinstaller_bat_wrapper_finds_desinstaller_ps1_under_installer_subdir(zip_layout_dir: Path) -> None:
     app_dir = zip_layout_dir / "app"
     app_dir.mkdir()
+    # I6 : une installation sans marqueur (install.json/version.txt) est
+    # refusee ; ce test verifie seulement le branchement .bat -> .ps1, pas
+    # ce refus (couvert par test_i6_...), donc un marqueur minimal est pose.
+    (app_dir / "version.txt").write_text(NEW_VERSION, encoding="utf-8")
 
     result = run_bat(zip_layout_dir / "Desinstaller.bat", ["--app", str(app_dir), "--dry-run"])
 
@@ -485,8 +540,8 @@ def test_pip_install_targets_app_venv_explicitly() -> None:
     creer sous $App -- observe reellement (clipper installe dans le venv du
     depot, jamais dans app\\.venv)."""
     source = _strip_powershell_comments((INSTALLER_SRC / "install.ps1").read_text(encoding="utf-8"))
-    match = re.search(r"&\s*uv pip install[^\r\n]*", source)
-    assert match, "commande '& uv pip install' introuvable dans install.ps1"
+    match = re.search(r"&\s*\$Uv pip install[^\r\n]*", source)
+    assert match, "commande '& $Uv pip install' introuvable dans install.ps1"
     assert "--python" in match.group(0), match.group(0)
     assert "venvDir" in match.group(0) or "venvPython" in match.group(0)
 
@@ -584,3 +639,290 @@ def test_premier_clip_txt_is_french_and_actionable() -> None:
     assert len(text.strip()) > 0
     assert "clip" in text.lower()
     assert "console" in text.lower()
+
+
+# --------------------------------------------------------------------------
+# TASK-4f1d7d1ee341 : les 16 points confirmes de la relecture Fable
+# (research/reviews/installeur.md, C1-C3, I1-I7, M1-M6).
+# --------------------------------------------------------------------------
+
+
+REDUCED_PATH = "C:\\Windows\\System32;C:\\Windows;C:\\Windows\\System32\\WindowsPowerShell\\v1.0"
+
+
+def _env_with_reduced_path() -> dict[str, str]:
+    """PATH d'un PC sans outil de developpement (System32 seul, meme
+    disposition que research/reviews/scratch-installeur/path_vierge.ps1) :
+    ni uv ni clipper n'y sont reperables."""
+    env = dict(os.environ)
+    env["PATH"] = REDUCED_PATH
+    return env
+
+
+def test_c1_uv_called_by_full_path_not_bare(installer_dir: Path) -> None:
+    """C1 : sans uv.exe a cote d'Installer.bat (jamais dans ce fixture) et
+    sans uv sur le PATH, l'etape 2 doit echouer par un message rouge
+    explicite (Fail), jamais par l'exception PowerShell brute que produirait
+    un appel a nu '& uv' ('Le terme «uv» n'est pas reconnu...')."""
+    app_dir = installer_dir / "app"
+    data_dir = installer_dir / "data"
+
+    result = run_install(
+        installer_dir, ["--app", str(app_dir), "--data", str(data_dir)], env=_env_with_reduced_path()
+    )
+
+    assert result.returncode != 0
+    assert "uv.exe" in result.stdout
+    assert "n'est pas reconnu" not in result.stdout
+    assert not (app_dir / ".venv").exists()
+
+
+def test_c2_clipper_called_by_full_path_not_bare() -> None:
+    """C2 : Invoke-Step7-Data et Invoke-Step8-Models appellent clipper via
+    un chemin complet sous $App\\.venv\\Scripts, jamais '& clipper' a nu
+    (qui, avant l'etape 10, resoudrait au mieux un clipper ambiant d'un
+    autre venv, au pire rien du tout sur un PC cible)."""
+    source = _strip_powershell_comments((INSTALLER_SRC / "install.ps1").read_text(encoding="utf-8"))
+    for fn_name in ("Invoke-Step7-Data", "Invoke-Step8-Models"):
+        match = re.search(rf"function {fn_name}\b.*?\n}}\n", source, re.DOTALL)
+        assert match, f"{fn_name} introuvable dans install.ps1"
+        body = match.group(0)
+        assert re.search(r'\$clipper\s*=\s*Join-Path\s+\$App\s+"\.venv\\Scripts\\clipper\.exe"', body), body
+        assert "& $clipper" in body, body
+        assert "& clipper " not in body, body
+
+
+def test_c3_venv_removed_even_on_interrupted_fresh_install(installer_dir: Path) -> None:
+    """C3 : une premiere installation interrompue apres l'etape 3 (donc
+    app\\.venv existe, mais app\\version.txt n'a jamais ete ecrit, seulement
+    a l'etape 11) doit quand meme voir .venv supprime a la relance, sinon
+    'uv venv' echoue dessus a chaque nouvelle tentative."""
+    app_dir = installer_dir / "app"
+    data_dir = installer_dir / "data"
+    app_dir.mkdir()
+    venv_dir = app_dir / ".venv"
+    venv_dir.mkdir()
+    (venv_dir / "marker.txt").write_text("installation precedente interrompue", encoding="utf-8")
+
+    result = run_install(
+        installer_dir, ["--app", str(app_dir), "--data", str(data_dir)], env=_env_with_reduced_path()
+    )
+
+    assert result.returncode != 0  # echoue plus tard, a l'etape 2 (uv.exe absent, C1)
+    assert "premiere installation" in result.stdout
+    assert not venv_dir.exists()
+
+
+def test_i1_opencv_override_shipped_in_zip_and_verified() -> None:
+    """I1 : l'override OpenCV est un fichier livre dans le zip
+    (installer/overrides.txt, jamais un pyproject.toml ambiant trouve en
+    remontant depuis le dossier courant) et passe explicitement en
+    --override, puis l'environnement est verifie (un seul paquet
+    opencv*.dist-info et 'import cv2' fonctionne) plutot que suppose
+    correct."""
+    overrides_content = (INSTALLER_SRC / "overrides.txt").read_text(encoding="utf-8")
+    assert "opencv-python" in overrides_content
+
+    source = _strip_powershell_comments((INSTALLER_SRC / "install.ps1").read_text(encoding="utf-8"))
+    match = re.search(r"function Invoke-Step3-Venv\b.*?\n}\n", source, re.DOTALL)
+    assert match, "Invoke-Step3-Venv introuvable dans install.ps1"
+    body = match.group(0)
+    assert re.search(r'Join-Path\s+\$Root\s+"installer\\overrides\.txt"', body), body
+    assert "--override" in body, body
+    assert "opencv*.dist-info" in body, body
+    assert "import cv2" in body, body
+
+
+def test_i2_launcher_written_with_oem_encoding_for_accented_data_path(tmp_path: Path, zip_layout_dir: Path) -> None:
+    """I2 : Clipper.bat est ecrit dans la page de code OEM (celle que lit
+    cmd.exe), jamais la page ANSI par defaut de Set-Content en PowerShell
+    5.1 : un chemin de donnees accentue doit survivre a l'aller-retour."""
+    accent = "\u00e9"
+    result, app_dir, data_dir = run_step9_launcher(
+        tmp_path, zip_layout_dir, data_name=f"d{accent}sir{accent}-donnees"
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    launcher_path = app_dir / "Clipper.bat"
+    assert launcher_path.is_file()
+    oem_code_page = ctypes.windll.kernel32.GetOEMCP()
+    decoded = launcher_path.read_bytes().decode(f"cp{oem_code_page}")
+    assert str(data_dir) in decoded, decoded
+
+
+def test_i3_update_refuses_when_console_port_listens_before_removing_venv(
+    installer_dir: Path, listening_port: int
+) -> None:
+    """I3 : en mise a jour, le port de la console est controle avant toute
+    suppression de .venv (R6) ; sans ce controle, une console laissee
+    ouverte se retrouve avec un .venv a moitie supprime sous elle."""
+    app_dir = installer_dir / "app"
+    data_dir = installer_dir / "data"
+    app_dir.mkdir()
+    (app_dir / "version.txt").write_text(OLDER_VERSION, encoding="utf-8")
+    venv_dir = app_dir / ".venv"
+    venv_dir.mkdir()
+    (venv_dir / "marker.txt").write_text("venv existant", encoding="utf-8")
+
+    result = run_install(
+        installer_dir, ["--app", str(app_dir), "--data", str(data_dir)], port=listening_port
+    )
+
+    assert result.returncode != 0
+    assert str(listening_port) in result.stdout
+    assert venv_dir.exists()
+
+
+@pytest.mark.parametrize("bat_name", ["Installer.bat", "Desinstaller.bat"])
+def test_i4_bat_pauses_on_error_for_double_click_visibility(bat_name: str) -> None:
+    """I4 : en double-clic, cmd fermerait la fenetre (et le message rouge
+    avec elle) en moins d'une seconde a la fin du script ; une pause
+    conditionnee a l'echec le garde visible, sans jamais gener un appel
+    reussi depuis un terminal ou un test."""
+    text = (INSTALLER_SRC / bat_name).read_text(encoding="utf-8")
+    assert "if not %EXIT_CODE%==0 pause" in text, text
+
+
+def test_i5_rereads_install_json_pointer_when_app_and_data_not_given(installer_dir: Path, tmp_path: Path) -> None:
+    """I5 : sans --app ni --data, une relance relit le pointeur laisse par
+    une installation precedente plutot que de retomber sur les chemins par
+    defaut (vides) et de donner l'impression que les clips sont perdus."""
+    fake_localappdata = tmp_path / "localappdata"
+    pointer_dir = fake_localappdata / "Clipper"
+    pointer_dir.mkdir(parents=True)
+    custom_app = str(tmp_path / "CustomApp")
+    custom_data = str(tmp_path / "CustomData")
+    (pointer_dir / "install.json").write_text(
+        json.dumps({"app": custom_app, "data": custom_data, "version": NEW_VERSION}),
+        encoding="utf-8",
+    )
+    env = dict(os.environ)
+    env["LOCALAPPDATA"] = str(fake_localappdata)
+
+    result = run_install(installer_dir, ["--dry-run"], env=env)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"app={custom_app}" in result.stdout
+    assert f"data={custom_data}" in result.stdout
+
+
+def test_i5_finish_step_writes_pointer_install_json() -> None:
+    """I5 (ecriture) : Step11-Finish ecrit aussi le pointeur sous
+    %LOCALAPPDATA%\\Clipper\\install.json, a cote de app\\install.json,
+    pour que la relecture ci-dessus fonctionne meme avec --app personnalise."""
+    source = _strip_powershell_comments((INSTALLER_SRC / "install.ps1").read_text(encoding="utf-8"))
+    match = re.search(r"function Invoke-Step11-Finish\b.*?\n}\n", source, re.DOTALL)
+    assert match, "Invoke-Step11-Finish introuvable dans install.ps1"
+    body = match.group(0)
+    assert 'Join-Path $env:LOCALAPPDATA "Clipper"' in body, body
+    assert body.count("install.json") >= 2, body
+
+
+def test_i6_desinstaller_refuses_when_app_has_no_install_marker(installer_dir: Path) -> None:
+    """I6 : un dossier $App sans install.json ni version.txt n'est pas une
+    installation Clipper connue ; avant ce correctif, Desinstaller.bat
+    affichait "Desinstallation terminee." en vert sans rien supprimer (ou,
+    avec un --app errone, supprimait n'importe quel dossier sans verifier)."""
+    app_dir = installer_dir / "app"
+    app_dir.mkdir()
+    (app_dir / "unrelated.txt").write_text("rien a voir", encoding="utf-8")
+
+    result = run_desinstaller(installer_dir, ["--app", str(app_dir), "--dry-run"], port=_free_port())
+
+    assert result.returncode != 0
+    assert "install.json" in result.stdout
+    assert app_dir.exists()
+
+
+def test_i7_desinstaller_copied_into_app(tmp_path: Path, zip_layout_dir: Path) -> None:
+    """I7 : Desinstaller.bat et desinstaller.ps1 sont copies dans app a
+    l'etape 9, sinon ils disparaissent avec le dossier dezippe (R2, docs)."""
+    result, app_dir, _data_dir = run_step9_launcher(tmp_path, zip_layout_dir)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (app_dir / "Desinstaller.bat").is_file()
+    assert (app_dir / "installer" / "desinstaller.ps1").is_file()
+
+
+def test_m1_icon_copied_into_app_and_shortcut_points_there(tmp_path: Path, zip_layout_dir: Path) -> None:
+    """M1 : clipper.ico est copie dans app (le raccourci pointe sur cette
+    copie, pas sur le zip dezippe, qui peut disparaitre apres l'installation
+    sans casser l'icone du raccourci)."""
+    result, app_dir, _data_dir = run_step9_launcher(tmp_path, zip_layout_dir)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (app_dir / "clipper.ico").is_file()
+
+    source = _strip_powershell_comments((INSTALLER_SRC / "install.ps1").read_text(encoding="utf-8"))
+    match = re.search(r"function Invoke-Step9-Launcher\b.*?\n}\n", source, re.DOTALL)
+    assert match, "Invoke-Step9-Launcher introuvable dans install.ps1"
+    body = match.group(0)
+    assert re.search(r"\$lnk\.IconLocation\s*=\s*\"\$appIconPath,0\"", body), body
+
+
+def test_m2_relative_app_and_data_resolved_to_absolute(installer_dir: Path) -> None:
+    """M2 : --app/--data relatifs sont resolus en absolu avant d'etre
+    ecrits dans le lanceur ou install.json, sinon le lanceur et le
+    raccourci ne fonctionnent plus lances d'un autre dossier."""
+    cwd = installer_dir
+
+    result = run_install(installer_dir, ["--app", "rel-app", "--data", "rel-data", "--dry-run"], cwd=cwd)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    expected_app = str((cwd / "rel-app").resolve())
+    expected_data = str((cwd / "rel-data").resolve())
+    assert f"app={expected_app}" in result.stdout
+    assert f"data={expected_data}" in result.stdout
+    assert "app=rel-app" not in result.stdout
+    assert "data=rel-data" not in result.stdout
+
+
+def test_m3_app_option_without_value_fails_cleanly(installer_dir: Path) -> None:
+    """M3 : --app (ou --data) sans valeur apres doit produire un message
+    rouge explicite, jamais l'exception PowerShell brute ('Impossible de
+    lier l'argument au parametre') que leve un index hors bornes sur
+    $RawArgs."""
+    result = run_install(installer_dir, ["--app"])
+
+    assert result.returncode != 0
+    assert "sans valeur" in result.stdout.lower()
+    assert "impossible de lier" not in (result.stdout + result.stderr).lower()
+
+
+def test_m4_cache_dir_set_before_step2_python_install() -> None:
+    """M4 : UV_CACHE_DIR est pose avant le premier appel a uv (etape 2),
+    sinon 'uv python install' ecrit l'archive CPython telechargee dans
+    %LOCALAPPDATA%\\uv\\cache, jamais nettoyee par l'etape 11."""
+    source = _strip_powershell_comments((INSTALLER_SRC / "install.ps1").read_text(encoding="utf-8"))
+    match = re.search(r"function Invoke-Step2-Python\b.*?\n}\n", source, re.DOTALL)
+    assert match, "Invoke-Step2-Python introuvable dans install.ps1"
+    body = match.group(0)
+    cache_pos = body.find("UV_CACHE_DIR")
+    call_pos = body.find("$Uv python install 3.11")
+    assert cache_pos != -1, body
+    assert call_pos != -1, body
+    assert cache_pos < call_pos, body
+
+
+def test_m5_premier_clip_not_rewritten_when_already_present(installer_dir: Path) -> None:
+    """M5 : PREMIER-CLIP.txt n'est recopie que s'il manque (premiere
+    installation ou fichier disparu), jamais a chaque mise a jour : R6 et
+    la doc disent que data n'est jamais ecrit sans raison."""
+    app_dir = installer_dir / "app"
+    data_dir = installer_dir / "data"
+    data_dir.mkdir()
+    (data_dir / "config.toml").write_text("[pipeline]\n", encoding="utf-8")
+    (data_dir / "PREMIER-CLIP.txt").write_text("deja la, ne pas toucher", encoding="utf-8")
+
+    result = run_install(installer_dir, ["--app", str(app_dir), "--data", str(data_dir), "--dry-run"])
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "PREMIER-CLIP.txt sera ecrit" not in result.stdout
+    assert "deja present" in result.stdout
+
+
+def test_m6_premier_clip_txt_does_not_mention_phantom_doctor_menu() -> None:
+    """M6 : PREMIER-CLIP.txt ne renvoie plus vers un bouton "Reglages" de la
+    console qui n'existe pas (clipper/web/ n'a aucun appel a doctor)."""
+    text = (INSTALLER_SRC / "PREMIER-CLIP.txt").read_text(encoding="utf-8")
+    assert "Reglages" not in text, text

@@ -19,6 +19,16 @@
 #>
 
 param(
+    # Point d'injection pour les tests (dot-sourcing direct des fonctions
+    # ci-dessous, puis appel isole d'une fonction Invoke-StepN-...) : jamais
+    # transmis par Installer.bat, jamais documente (meme principe que -Port
+    # ci-dessous et dans desinstaller.ps1).
+    [switch]$NoAutoRun,
+    # Port de la console Clipper a verifier avant une mise a jour (R6) :
+    # jamais une option publique (Installer.bat ne la transmet pas),
+    # seulement un point d'injection pour les tests, la vraie console
+    # ecoutant toujours sur 8000.
+    [int]$Port = 8000,
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$RawArgs = @()
 )
@@ -69,6 +79,12 @@ function Write-Log {
     $logPath = Join-Path $App "installer.log"
     $line = "$(Get-Date -Format 'yyyy-MM-ddTHH:mm:ss') $Message"
     Add-Content -Path $logPath -Value $line
+}
+
+function Test-ConsolePortListening {
+    param([int]$Port)
+    $conn = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
+    return ($null -ne $conn)
 }
 
 function Compare-ClipperVersion {
@@ -134,8 +150,9 @@ function Format-ClipperBat {
 # --------------------------------------------------------------------------
 
 function Invoke-Step1-Prepare {
-    param([string]$App, [string]$Data, [string]$NewVersion, [switch]$DryRun)
+    param([string]$App, [string]$Data, [string]$NewVersion, [int]$Port, [switch]$DryRun)
     $versionFile = Join-Path $App "version.txt"
+    $venvDir = Join-Path $App ".venv"
     $isUpdate = $false
     if (Test-Path $versionFile) {
         $oldVersion = (Get-Content $versionFile -Raw).Trim()
@@ -148,17 +165,27 @@ function Invoke-Step1-Prepare {
         $isUpdate = $true
         Write-Step 1 "Preparation : app=$App (mise a jour $oldVersion -> $NewVersion) ; data=$Data"
         Write-Detail ".venv sera supprime puis recree (python/ et ffmpeg/ conserves)"
+        if ($DryRun -and (Test-ConsolePortListening -Port $Port)) {
+            Write-Detail "le port $Port est deja occupe : une vraie installation s'arreterait ici avant de toucher .venv"
+        }
     } else {
         Write-Step 1 "Preparation : app=$App (premiere installation, version $NewVersion) ; data=$Data"
+        if (Test-Path $venvDir) {
+            Write-Detail ".venv existant (installation precedente interrompue) sera supprime puis recree"
+        }
     }
     if (-not $DryRun) {
+        if ($isUpdate -and (Test-ConsolePortListening -Port $Port)) {
+            Fail "la console Clipper tourne (port $Port)" "ferme la fenetre 'Clipper serve' puis relance Installer.bat"
+        }
         New-Item -ItemType Directory -Force -Path $App | Out-Null
         New-Item -ItemType Directory -Force -Path $Data | Out-Null
-        if ($isUpdate) {
-            $venvDir = Join-Path $App ".venv"
-            if (Test-Path $venvDir) {
-                Remove-Item -Recurse -Force -Path $venvDir
-            }
+        # Supprime .venv qu'il s'agisse d'une mise a jour ou d'une premiere
+        # installation interrompue apres l'etape 3 (C3) : version.txt (ecrit
+        # seulement a l'etape 11) ne distingue pas ces deux cas, mais dans
+        # les deux un .venv existant doit disparaitre avant 'uv venv'.
+        if (Test-Path $venvDir) {
+            Remove-Item -Recurse -Force -Path $venvDir
         }
         Write-Log $App "etape 1/$TOTAL_STEPS : preparation ($App, $Data)"
     }
@@ -166,14 +193,22 @@ function Invoke-Step1-Prepare {
 }
 
 function Invoke-Step2-Python {
-    param([string]$App, [switch]$DryRun)
+    param([string]$App, [string]$Uv, [switch]$DryRun)
     $pythonDir = Join-Path $App "python"
     Write-Step 2 "Python 3.11 sous $pythonDir (uv python install 3.11)"
     if ($DryRun) {
         return
     }
+    if (-not (Test-Path $Uv)) {
+        Fail "uv.exe introuvable ($Uv)" "retelecharge le zip complet depuis la page des releases"
+    }
+    # UV_CACHE_DIR pose ici (M4), avant le premier appel a uv : sans cela,
+    # 'uv python install' ecrit l'archive CPython telechargee dans
+    # %LOCALAPPDATA%\uv\cache (jamais nettoye), au lieu de app\cache (vide a
+    # l'etape 11).
+    $env:UV_CACHE_DIR = Join-Path $App "cache"
     $env:UV_PYTHON_INSTALL_DIR = $pythonDir
-    & uv python install 3.11
+    & $Uv python install 3.11
     if ($LASTEXITCODE -ne 0) {
         Fail "'uv python install 3.11' a echoue" "verifie la connexion reseau puis relance Installer.bat"
     }
@@ -181,7 +216,7 @@ function Invoke-Step2-Python {
 }
 
 function Invoke-Step3-Venv {
-    param([string]$App, [string]$Root, [string]$Device, [switch]$DryRun)
+    param([string]$App, [string]$Root, [string]$Uv, [string]$Device, [switch]$DryRun)
     $venvDir = Join-Path $App ".venv"
     if ($Device -eq "cuda") {
         Write-Step 3 "Environnement sous $venvDir ; GPU : [cuda] detecte, extra clipper[cuda] installe"
@@ -191,12 +226,14 @@ function Invoke-Step3-Venv {
     if ($DryRun) {
         return
     }
+    if (-not (Test-Path $Uv)) {
+        Fail "uv.exe introuvable ($Uv)" "retelecharge le zip complet depuis la page des releases"
+    }
     $wheel = Resolve-Wheel -Root $Root
     if (-not $wheel) {
         Fail "wheel clipper introuvable a cote d'Installer.bat" "retelecharge le zip complet depuis la page des releases"
     }
-    $env:UV_CACHE_DIR = Join-Path $App "cache"
-    & uv venv $venvDir --python 3.11
+    & $Uv venv $venvDir --python 3.11
     if ($LASTEXITCODE -ne 0) {
         Fail "'uv venv' a echoue" "relance Installer.bat"
     }
@@ -204,15 +241,36 @@ function Invoke-Step3-Venv {
     if ($Device -eq "cuda") {
         $target = "$wheel[cuda]"
     }
+    # Override livre dans le zip (I1), jamais genere a l'installation :
+    # 'uv pip install' ne lit [tool.uv] override-dependencies que dans un
+    # pyproject.toml trouve en remontant depuis le dossier courant, absent
+    # chez l'utilisateur (Telechargements). Sans lui, scenedetect tire
+    # opencv-python et mediapipe tire opencv-contrib-python : deux paquets
+    # ecrivent le meme cv2/ (AGENTS.md, Pieges).
+    $overridesPath = Join-Path $Root "installer\overrides.txt"
+    if (-not (Test-Path $overridesPath)) {
+        Fail "fichier d'overrides introuvable ($overridesPath)" "retelecharge le zip complet depuis la page des releases"
+    }
     # --python explicite : sans lui, "uv pip install" cherche un .venv en
     # remontant depuis le dossier courant (ou VIRTUAL_ENV) et peut installer
     # dans un venv totalement different de celui qu'on vient de creer sous
     # $App (observe reellement quand Installer.bat est lance depuis un
     # dossier dont un ancetre contient un .venv de developpement).
     $venvPython = Join-Path $venvDir "Scripts\python.exe"
-    & uv pip install --python $venvPython $target
+    & $Uv pip install --python $venvPython --override $overridesPath $target
     if ($LASTEXITCODE -ne 0) {
         Fail "'uv pip install' a echoue" "verifie la connexion reseau puis relance Installer.bat"
+    }
+    $sitePackages = Join-Path $venvDir "Lib\site-packages"
+    $opencvDistInfos = @(Get-ChildItem -Path $sitePackages -Filter "opencv*.dist-info" -ErrorAction SilentlyContinue)
+    if ($opencvDistInfos.Count -ne 1) {
+        Fail `
+            "l'environnement contient $($opencvDistInfos.Count) paquet(s) OpenCV (1 attendu) : $($opencvDistInfos.Name -join ', ')" `
+            "verifie l'override OpenCV (installer\overrides.txt) puis relance Installer.bat"
+    }
+    & $venvPython -c "import cv2"
+    if ($LASTEXITCODE -ne 0) {
+        Fail "'import cv2' a echoue dans l'environnement installe" "relance Installer.bat ; si l'echec persiste, ouvre une issue avec le rapport clipper doctor"
     }
     Write-Log $App "etape 3/$TOTAL_STEPS : environnement installe ($Device)"
 }
@@ -265,8 +323,30 @@ function Invoke-Step5-Claude {
         return
     }
     if (-not $found) {
-        Invoke-Expression (Invoke-WebRequest -Uri "https://claude.ai/install.ps1" -UseBasicParsing).Content
+        # .Content peut etre un System.Byte[] (pas une String) selon le
+        # Content-Type renvoye : Invoke-Expression exige une String, sinon
+        # ParameterBindingException ("Impossible de convertir System.Byte[]"),
+        # jamais observe sur un PC de dev ou 'claude' est deja sur le PATH
+        # (cette branche n'est alors jamais executee).
+        $installScript = (Invoke-WebRequest -Uri "https://claude.ai/install.ps1" -UseBasicParsing).Content
+        if ($installScript -is [byte[]]) {
+            $installScript = [Text.Encoding]::UTF8.GetString($installScript)
+        }
+        Invoke-Expression $installScript
         $found = Get-Command "claude" -ErrorAction SilentlyContinue
+        if (-not $found) {
+            # L'installeur officiel pose claude.exe sous ...\.local\bin et ne
+            # met a jour que le PATH utilisateur (registre), jamais
+            # $env:Path du process courant (confirme par un run reel,
+            # TASK-4f1d7d1ee341, douteux #1) : cherche-le explicitement avant
+            # de conclure a un echec.
+            $localBin = Join-Path $env:USERPROFILE ".local\bin"
+            $localClaude = Join-Path $localBin "claude.exe"
+            if (Test-Path $localClaude) {
+                $env:Path = "$localBin;" + $env:Path
+                $found = Get-Command "claude" -ErrorAction SilentlyContinue
+            }
+        }
         if (-not $found) {
             Fail "l'installation de claude a echoue" "installe-le manuellement (https://claude.ai/install.ps1) puis relance Installer.bat"
         }
@@ -307,19 +387,29 @@ function Invoke-Step7-Data {
     param([string]$App, [string]$Data, [string]$PremierClipSource, [switch]$DryRun)
     $configPath = Join-Path $Data "config.toml"
     $initNeeded = -not (Test-Path $configPath)
+    $premierClipPath = Join-Path $Data "PREMIER-CLIP.txt"
+    # M5 : copie seulement a la premiere installation (ou si le fichier a
+    # disparu) ; sinon une mise a jour reecrit PREMIER-CLIP.txt dans data a
+    # chaque fois, contrairement a R6/docs ("data jamais ecrit").
+    $premierClipNeeded = $initNeeded -or -not (Test-Path $premierClipPath)
     if ($initNeeded) {
         Write-Step 7 "Donnees : clipper init sera execute dans $Data (config.toml absent)"
     } else {
         Write-Step 7 "Donnees : $Data existe deja (config.toml present), clipper init non appele"
     }
-    Write-Detail "$Data\PREMIER-CLIP.txt sera ecrit"
+    if ($premierClipNeeded) {
+        Write-Detail "$premierClipPath sera ecrit"
+    } else {
+        Write-Detail "$premierClipPath deja present, conserve"
+    }
     if ($DryRun) {
         return
     }
     if ($initNeeded) {
+        $clipper = Join-Path $App ".venv\Scripts\clipper.exe"
         Push-Location $Data
         try {
-            & clipper init
+            & $clipper init
             if ($LASTEXITCODE -ne 0) {
                 Fail "'clipper init' a echoue dans $Data" "verifie les droits d'ecriture de $Data"
             }
@@ -327,7 +417,9 @@ function Invoke-Step7-Data {
             Pop-Location
         }
     }
-    Copy-Item -Path $PremierClipSource -Destination (Join-Path $Data "PREMIER-CLIP.txt") -Force
+    if ($premierClipNeeded) {
+        Copy-Item -Path $PremierClipSource -Destination $premierClipPath -Force
+    }
     Write-Log $App "etape 7/$TOTAL_STEPS : donnees pretes dans $Data (init $(if ($initNeeded) { 'execute' } else { 'ignore' }))"
 }
 
@@ -337,9 +429,10 @@ function Invoke-Step8-Models {
     if ($DryRun) {
         return
     }
+    $clipper = Join-Path $App ".venv\Scripts\clipper.exe"
     Push-Location $Data
     try {
-        & clipper models prefetch
+        & $clipper models prefetch
         if ($LASTEXITCODE -ne 0) {
             Fail "'clipper models prefetch' a echoue" "verifie la connexion reseau puis relance Installer.bat (une relance reprend la ou il s'est arrete)"
         }
@@ -350,21 +443,43 @@ function Invoke-Step8-Models {
 }
 
 function Invoke-Step9-Launcher {
-    param([string]$App, [string]$Data, [string]$TemplatePath, [switch]$SansRaccourci, [switch]$DryRun)
+    param([string]$App, [string]$Data, [string]$TemplatePath, [string]$Root, [switch]$SansRaccourci, [switch]$DryRun)
     $launcherPath = Join-Path $App "Clipper.bat"
     $filled = Format-ClipperBat -TemplatePath $TemplatePath -App $App -Data $Data
+    $appIconPath = Join-Path $App "clipper.ico"
+    $sourceIconPath = Join-Path $Root "installer\clipper.ico"
+    $appDesinstallerBat = Join-Path $App "Desinstaller.bat"
+    $appDesinstallerPs1 = Join-Path $App "installer\desinstaller.ps1"
     if ($SansRaccourci) {
         Write-Step 9 "Lanceur : $launcherPath (PATH = ffmpeg\bin puis .venv\Scripts, data courant, ouvre http://127.0.0.1:8000) ; aucun raccourci (--sans-raccourci)"
     } else {
         Write-Step 9 "Lanceur : $launcherPath (PATH = ffmpeg\bin puis .venv\Scripts, data courant, ouvre http://127.0.0.1:8000) et raccourci Clipper.lnk sur le Bureau"
     }
+    # I7 : Desinstaller.bat (et desinstaller.ps1) copies dans app, sinon
+    # jamais presents une fois le dossier dezippe supprime (R2, docs).
+    Write-Detail "$appDesinstallerBat sera copie (desinstallation future)"
+    # M1 : icone copiee dans app, sinon le raccourci pointe sur le zip
+    # dezippe et perd son icone une fois ce dossier supprime.
+    Write-Detail "$appIconPath sera copie"
     if ($DryRun) {
         Write-Host "--- $launcherPath (apercu) ---"
         Write-Host $filled
         Write-Host "--- fin de l'apercu ---"
         return
     }
-    Set-Content -Path $launcherPath -Value $filled -NoNewline
+    # Encodage OEM (I2), pas la page ANSI par defaut de Set-Content en
+    # PowerShell 5.1 : cmd.exe lit un .bat dans sa page de code OEM, pas en
+    # cp1252. Un chemin accentue (--data "...\Desire\...") ecrit en cp1252
+    # est relu comme un autre caractere par cmd (echec silencieux du 'cd').
+    $oemCodePage = [Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage
+    $oemEncoding = [Text.Encoding]::GetEncoding($oemCodePage)
+    [IO.File]::WriteAllText($launcherPath, $filled, $oemEncoding)
+    New-Item -ItemType Directory -Force -Path (Join-Path $App "installer") | Out-Null
+    Copy-Item -Path (Join-Path $Root "Desinstaller.bat") -Destination $appDesinstallerBat -Force
+    Copy-Item -Path (Join-Path $Root "installer\desinstaller.ps1") -Destination $appDesinstallerPs1 -Force
+    if (Test-Path $sourceIconPath) {
+        Copy-Item -Path $sourceIconPath -Destination $appIconPath -Force
+    }
     if ($SansRaccourci) {
         Write-Log $App "etape 9/$TOTAL_STEPS : lanceur $launcherPath, pas de raccourci (--sans-raccourci)"
         return
@@ -375,9 +490,8 @@ function Invoke-Step9-Launcher {
     $lnk = $shell.CreateShortcut($shortcutPath)
     $lnk.TargetPath = $launcherPath
     $lnk.WorkingDirectory = $Data
-    $iconPath = Join-Path $PSScriptRoot "clipper.ico"
-    if (Test-Path $iconPath) {
-        $lnk.IconLocation = "$iconPath,0"
+    if (Test-Path $appIconPath) {
+        $lnk.IconLocation = "$appIconPath,0"
     }
     $lnk.Description = "Console Clipper"
     $lnk.Save()
@@ -426,6 +540,13 @@ function Invoke-Step11-Finish {
         date    = (Get-Date -Format "o")
     }
     $payload | ConvertTo-Json | Set-Content -Path $installJson
+    # Pointeur (I5) sous %LOCALAPPDATA%\Clipper\install.json, toujours a cet
+    # emplacement fixe meme avec --app personnalise : une relance sans
+    # --app/--data le relit (voir plus bas, avant Step1) pour retrouver le
+    # meme app/data plutot que de retomber sur les chemins par defaut.
+    $pointerDir = Join-Path $env:LOCALAPPDATA "Clipper"
+    New-Item -ItemType Directory -Force -Path $pointerDir | Out-Null
+    $payload | ConvertTo-Json | Set-Content -Path (Join-Path $pointerDir "install.json")
     # Step1-Prepare lit ce fichier pour decider premiere installation / mise
     # a jour : sans lui, une relance se croit toujours a sa premiere
     # installation, ne supprime jamais l'ancien .venv et 'uv venv' echoue
@@ -442,6 +563,13 @@ function Invoke-Step11-Finish {
     }
 }
 
+if ($NoAutoRun) {
+    # Point d'injection pour les tests : les fonctions ci-dessus sont
+    # definies dans la portee de l'appelant (dot-sourcing), rien d'autre ne
+    # s'execute.
+    return
+}
+
 # --------------------------------------------------------------------------
 # Lecture des options (style GNU : --app, --data, --cpu, --cuda,
 # --sans-console, --dry-run), puis execution des 11 etapes dans l'ordre.
@@ -449,6 +577,8 @@ function Invoke-Step11-Finish {
 
 $App = Join-Path $env:LOCALAPPDATA "Clipper\app"
 $Data = Join-Path ([Environment]::GetFolderPath("MyDocuments")) "Clipper"
+$AppGiven = $false
+$DataGiven = $false
 $Cpu = $false
 $Cuda = $false
 $SansConsole = $false
@@ -459,11 +589,19 @@ $i = 0
 while ($i -lt $RawArgs.Count) {
     $token = $RawArgs[$i]
     if ($token -eq "--app") {
+        if ($i + 1 -ge $RawArgs.Count) {
+            Fail "option $token sans valeur" "passe un dossier apres $token, par exemple $token C:\Clipper"
+        }
         $i++
         $App = $RawArgs[$i]
+        $AppGiven = $true
     } elseif ($token -eq "--data") {
+        if ($i + 1 -ge $RawArgs.Count) {
+            Fail "option $token sans valeur" "passe un dossier apres $token, par exemple $token C:\Clipper"
+        }
         $i++
         $Data = $RawArgs[$i]
+        $DataGiven = $true
     } elseif ($token -eq "--cpu") {
         $Cpu = $true
     } elseif ($token -eq "--cuda") {
@@ -484,25 +622,49 @@ if ($Cpu -and $Cuda) {
     Fail "options --cpu et --cuda incompatibles (choisis l'une des deux, ou aucune pour la detection automatique)" "relance avec --cpu ou --cuda, jamais les deux"
 }
 
+# I5 : sans --app ni --data, relit le pointeur laisse par une installation
+# precedente (toujours a cet emplacement fixe, meme avec --app personnalise,
+# voir Step11-Finish) plutot que de retomber sur les chemins par defaut, qui
+# pointeraient vers une installation vide.
+if (-not $AppGiven -and -not $DataGiven) {
+    $pointerPath = Join-Path $env:LOCALAPPDATA "Clipper\install.json"
+    if (Test-Path $pointerPath) {
+        $pointerInfo = Get-Content -Path $pointerPath -Raw | ConvertFrom-Json
+        if ($pointerInfo.app) {
+            $App = [string]$pointerInfo.app
+        }
+        if ($pointerInfo.data) {
+            $Data = [string]$pointerInfo.data
+        }
+    }
+}
+
+# M2 : chemins toujours resolus en absolu, jamais ecrits relatifs tels quels
+# dans le lanceur ou install.json (un "--app monapp" depuis un terminal
+# casserait le lanceur et le raccourci des qu'ils sont lances d'ailleurs).
+$App = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($App)
+$Data = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Data)
+
 $versionFile = Join-Path (Split-Path -Parent $PSScriptRoot) "version.txt"
 if (-not (Test-Path $versionFile)) {
     Fail "fichier version.txt introuvable ($versionFile)" "reconstruis le zip (tools/build_portable.py)"
 }
 $newVersion = (Get-Content $versionFile -Raw).Trim()
 $root = Split-Path -Parent $versionFile
+$uv = Join-Path $root "uv.exe"
 $templatePath = Join-Path $PSScriptRoot "Clipper.bat.template"
 $premierClipSource = Join-Path $PSScriptRoot "PREMIER-CLIP.txt"
 
-$isUpdate = Invoke-Step1-Prepare -App $App -Data $Data -NewVersion $newVersion -DryRun:$DryRun
-Invoke-Step2-Python -App $App -DryRun:$DryRun
+$isUpdate = Invoke-Step1-Prepare -App $App -Data $Data -NewVersion $newVersion -Port $Port -DryRun:$DryRun
+Invoke-Step2-Python -App $App -Uv $uv -DryRun:$DryRun
 $device = Get-GpuDecision -Cpu:$Cpu -Cuda:$Cuda
-Invoke-Step3-Venv -App $App -Root $root -Device $device -DryRun:$DryRun
+Invoke-Step3-Venv -App $App -Root $root -Uv $uv -Device $device -DryRun:$DryRun
 Invoke-Step4-Ffmpeg -App $App -DryRun:$DryRun
 Invoke-Step5-Claude -App $App -DryRun:$DryRun
 Invoke-Step6-Chrome -App $App -DryRun:$DryRun
 Invoke-Step7-Data -App $App -Data $Data -PremierClipSource $premierClipSource -DryRun:$DryRun
 Invoke-Step8-Models -App $App -Data $Data -DryRun:$DryRun
-Invoke-Step9-Launcher -App $App -Data $Data -TemplatePath $templatePath -SansRaccourci:$SansRaccourci -DryRun:$DryRun
+Invoke-Step9-Launcher -App $App -Data $Data -TemplatePath $templatePath -Root $root -SansRaccourci:$SansRaccourci -DryRun:$DryRun
 Invoke-Step10-Doctor -App $App -Data $Data -DryRun:$DryRun
 Invoke-Step11-Finish -App $App -Data $Data -Version $newVersion -Device $device -SansConsole:$SansConsole -DryRun:$DryRun
 

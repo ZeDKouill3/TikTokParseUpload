@@ -89,8 +89,9 @@ détection automatique ne convient pas.
 ## Mise à jour
 
 Télécharge le nouveau `Clipper-portable-<version>.zip` depuis les Releases,
-dézippe-le et relance `Installer.bat` (mêmes options que la première fois, par
-exemple `--app`/`--data` si tu les avais changés). Le dossier programme est
+dézippe-le et relance `Installer.bat` sans option : il retrouve seul les
+dossiers choisis à la première installation (`--app`/`--data`, si tu les
+avais changés). Le dossier programme est
 recréé avec la nouvelle version ; ffmpeg et les modèles déjà téléchargés sont
 conservés. Le dossier de données n'est ni lu ni modifié. Un zip plus ancien
 que la version installée est refusé explicitement : pas de retour en arrière
@@ -109,8 +110,8 @@ cache.
 
 ## Diagnostic : clipper doctor
 
-En cas de doute, lance `clipper doctor` depuis la console Clipper (menu
-Réglages) ou dans un terminal ouvert dans ton dossier de données. Il affiche
+En cas de doute, lance `clipper doctor` dans un terminal ouvert dans ton
+dossier de données (`Documents\Clipper` par défaut). Il affiche
 une ligne par point vérifié (Python, ffmpeg, Claude et sa connexion, Chrome,
 GPU, modèles, configuration, dossiers de données) et dit précisément ce qui
 manque.
