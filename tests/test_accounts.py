@@ -13,6 +13,8 @@ import string
 import subprocess
 import sys
 import time
+from datetime import datetime as _datetime
+from datetime import timezone as _timezone
 from pathlib import Path
 
 import pytest
@@ -884,11 +886,35 @@ def test_unreadable_cookies_on_opening_keep_the_known_state_and_say_so(config, v
     assert "ferme la fenêtre Chrome" in row["login_error"] and "non vérifiable" in row["ready_blocked_reason"]
 
 
-def test_the_accounts_screen_rows_carry_posts_of_the_day_cap_and_last_failure(config, vault, cookies):
+# Preuve TASK-b778469259de : le fuseau par defaut d'un compte est Europe/Paris (test_a_new_account_has_no_slots...),
+# donc _account_overview decide du "jour" des posts en heure de Paris. Rejoue a l'horloge reelle puis a 23:58/00:02
+# Paris, ete (UTC+2) et hiver (UTC+1).
+_PARIS_BOUNDARY_CASES = [
+    pytest.param(None, id="horloge-reelle"),
+    pytest.param(_datetime(2026, 6, 14, 21, 58, tzinfo=_timezone.utc), id="23h58-paris-ete"),
+    pytest.param(_datetime(2026, 6, 14, 22, 2, tzinfo=_timezone.utc), id="00h02-paris-ete"),
+    pytest.param(_datetime(2025, 12, 31, 22, 58, tzinfo=_timezone.utc), id="23h58-paris-hiver"),
+    pytest.param(_datetime(2025, 12, 31, 23, 2, tzinfo=_timezone.utc), id="00h02-paris-hiver"),
+]
+
+
+@pytest.mark.parametrize("frozen_at", _PARIS_BOUNDARY_CASES)
+def test_the_accounts_screen_rows_carry_posts_of_the_day_cap_and_last_failure(config, vault, cookies, monkeypatch, frozen_at):
     from datetime import datetime, timezone
 
-    account = accounts.add_account(config, {"label": "Compte"})
-    now = datetime.now(timezone.utc)
+    from clipper.web import app as web_app
+
+    account = accounts.add_account(config, {"label": "Compte"})  # fuseau par defaut : Europe/Paris
+    now = frozen_at or datetime.now(timezone.utc)
+    # TASK-b778469259de : _account_overview lit datetime.now(tz) (Europe/Paris) une seconde fois, a quelques
+    # ms de ``now`` ci-dessus, pour decider du jour calendaire des entrees ; pres de minuit a Paris les deux
+    # lectures peuvent tomber de part et d'autre de la frontiere. On fige la lecture du serveur sur ``now``.
+    class _Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.astimezone(tz) if tz else now
+
+    monkeypatch.setattr(web_app, "datetime", _Frozen)
     Path("presets").mkdir()
     Path("presets/ma_chaine.toml").write_text(
         f'[channel]\ntimezone = "UTC"\ntiktok_account = "{account["id"]}"\n', encoding="utf-8")

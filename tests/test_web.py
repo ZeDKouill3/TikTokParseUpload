@@ -3241,17 +3241,41 @@ def test_the_publish_view_of_an_account_excludes_the_posts_of_another_account(tm
     assert _ids(b["done"]) == [(PUB_NOCHAN_VIDEO, "01")]
 
 
-def test_a_post_created_through_the_form_on_a_second_account_appears_in_its_publish_view(tmp_path, isolated_cwd):
+@pytest.mark.parametrize("frozen_at", [
+    pytest.param(None, id="horloge-reelle"),
+    pytest.param(datetime(2026, 8, 2, 21, 58, tzinfo=timezone.utc), id="23h58-paris-ete"),   # dimanche 23:58 Paris
+    pytest.param(datetime(2026, 8, 2, 22, 2, tzinfo=timezone.utc), id="00h02-paris-ete"),    # lundi 00:02 Paris
+])
+def test_a_post_created_through_the_form_on_a_second_account_appears_in_its_publish_view(
+        tmp_path, isolated_cwd, monkeypatch, frozen_at):
+    """Figer l'horloge du serveur (TASK-b778469259de) : la publication immediate est horodatee par
+    ``clipper.publish.create_post`` (datetime.now() interne, jamais reçu de ``now`` depuis la route),
+    et ``monday`` etait recalcule juste apres par une deuxieme lecture reelle ; les deux pouvaient
+    tomber de part et d'autre de minuit (Europe/Paris, le fuseau par defaut de la semaine publiee),
+    faisant disparaitre l'entree de la semaine interrogee. ``monday`` doit aussi etre calcule dans
+    ce meme fuseau (et non en UTC) : c'est celui que ``_publish_range_view`` utilise pour grouper."""
+    from clipper import publish as publish_mod
+    from zoneinfo import ZoneInfo
+
     _publications_setup(tmp_path)
     _write_state(tmp_path, PUB_NOCHAN_VIDEO)
     _write_clip(tmp_path, PUB_NOCHAN_VIDEO, {**_clip_sidecar("01"), "video_id": PUB_NOCHAN_VIDEO})
     c = _pub_client(tmp_path)
+    now = frozen_at or _dt.now(_tz.utc)
 
+    class _Frozen(_dt):
+        @classmethod
+        def now(cls, tz=None):
+            return now.astimezone(tz) if tz else now
+
+    monkeypatch.setattr(web_app, "datetime", _Frozen)
+    monkeypatch.setattr(publish_mod, "datetime", _Frozen)
     created = c.post("/api/publications", json={
         "video_id": PUB_NOCHAN_VIDEO, "clip_id": "01", "account": SPARE, "mode": "immediate"})
 
     assert created.status_code == 201, created.text
-    monday = (_dt.now(_tz.utc) - _td(days=_dt.now(_tz.utc).weekday())).date().isoformat()
+    local = now.astimezone(ZoneInfo("Europe/Paris"))
+    monday = (local - _td(days=local.weekday())).date().isoformat()
     for account in (SPARE, ""):
         view = c.get("/api/publish", params={"account": account, "week": monday}).json()
         rows = [*view["done"], *view["off_slot"], *view["unscheduled"]]
