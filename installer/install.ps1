@@ -30,14 +30,16 @@ $ErrorActionPreference = "Stop"
 
 $TOTAL_STEPS = 11
 
-# ffmpeg Windows 64 bits (BtbN/FFmpeg-Builds, build "n9.0", tag "latest" du
-# depot : ce tag est reconstruit periodiquement mais le nom de fichier et le
-# sha256 ci-dessous sont ceux captures a la date d'ecriture). Pour renouveler :
-# ouvrir https://github.com/BtbN/FFmpeg-Builds/releases, telecharger la ligne
-# "win64-gpl" de la version souhaitee, calculer son sha256 avec
-# `Get-FileHash -Algorithm SHA256 <fichier>`, et remplacer les deux constantes.
-$FFMPEG_URL = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n9.0-latest-win64-gpl-9.0.zip"
-$FFMPEG_SHA256 = "2e2b8f168bec7ca279f20b22b78c626093c8757ab70c152aea24eb71d82ca31d"
+# ffmpeg Windows 64 bits (GyanD/codexffmpeg, tag de version figee "9.0.2" :
+# jamais "latest" ni "master", qui bougent et perimeraient le sha256 ci-
+# dessous en silence). Pour renouveler : ouvrir
+# https://github.com/GyanD/codexffmpeg/releases, choisir un tag de version
+# (pas "latest"), telecharger son asset "*-essentials_build.zip", calculer
+# son sha256 avec `Get-FileHash -Algorithm SHA256 <fichier>`, puis remplacer
+# les deux constantes par la nouvelle URL (avec le tag dans le chemin) et le
+# nouveau sha256.
+$FFMPEG_URL = "https://github.com/GyanD/codexffmpeg/releases/download/9.0.2/ffmpeg-9.0.2-essentials_build.zip"
+$FFMPEG_SHA256 = "60f467265b1e312373dbcd92200c2618a74850f98d3d078e94296bb3fa2047ba"
 
 function Write-Step {
     param([int]$Number, [string]$Message)

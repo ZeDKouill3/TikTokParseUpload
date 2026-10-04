@@ -393,6 +393,29 @@ def test_clipper_bat_preview_has_path_and_launch_logic(installer_dir: Path) -> N
 
 
 # --------------------------------------------------------------------------
+# (TASK-5d378e43fda0) ffmpeg epingle sur une version figee : l'URL ne
+# contient ni "latest" ni "master", et le --dry-run l'affiche telle quelle.
+# --------------------------------------------------------------------------
+
+
+def test_ffmpeg_url_is_pinned_and_shown_in_dry_run(installer_dir: Path) -> None:
+    source = (INSTALLER_SRC / "install.ps1").read_text(encoding="utf-8")
+    match = re.search(r'\$FFMPEG_URL\s*=\s*"([^"]+)"', source)
+    assert match, "constante $FFMPEG_URL introuvable dans install.ps1"
+    url = match.group(1)
+    assert "latest" not in url.lower()
+    assert "master" not in url.lower()
+
+    app_dir = installer_dir / "app"
+    data_dir = installer_dir / "data"
+
+    result = run_install(installer_dir, ["--app", str(app_dir), "--data", str(data_dir), "--dry-run"])
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert url in result.stdout
+
+
+# --------------------------------------------------------------------------
 # (5) desinstaller.ps1 --dry-run.
 # --------------------------------------------------------------------------
 
