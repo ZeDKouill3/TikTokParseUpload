@@ -984,6 +984,43 @@ def _ago(**kw):
     return datetime.now(timezone.utc) - timedelta(**kw)
 
 
+def _frozen_now(monkeypatch, at: datetime | None = None) -> datetime:
+    """Fige l'horloge lue par ``worker._publish_next``/``_publish_one`` sur un seul instant (TASK-b778469259de) :
+    sans ca, un test qui seme des entrees avec ``now`` puis appelle ``tick()`` lit l'heure reelle une seconde
+    fois (a quelques ms d'ecart) a l'interieur de ``worker.py`` ; un plafond par jour est compte par jour
+    calendaire, et les deux lectures peuvent tomber de part et d'autre de minuit. Figer ``worker.datetime.now()``
+    sur l'instant deja capture (ou sur ``at``, pour simuler une heure precise) retire cette course, quelle que
+    soit l'heure reelle (y compris pile a minuit)."""
+    at = at or datetime.now(timezone.utc)
+
+    class _Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return at.astimezone(tz) if tz else at
+
+    monkeypatch.setattr(worker, "datetime", _Frozen)
+    return at
+
+
+def _same_day_before(now: datetime, **kw) -> datetime:
+    """``now - timedelta(**kw)``, sans jamais passer avant minuit du jour de ``now`` (TASK-b778469259de) :
+    un ecart de plusieurs minutes « avant maintenant » retomberait la veille si ``now`` est tout pres de
+    minuit, ce qui changerait le jour calendaire teste (et donc le resultat du plafond par jour) au lieu
+    de rester un detail d'horaire sans incidence sur ce que le test verifie."""
+    start_of_day = datetime.combine(now.date(), datetime.min.time(), tzinfo=now.tzinfo)
+    return max(now - timedelta(**kw), start_of_day)
+
+
+# Preuve TASK-b778469259de : le compte des tests ci-dessous a son fuseau a "UTC" (_pub_env), donc le plafond
+# par jour est compte par jour calendaire UTC (pas Europe/Paris) ; la frontiere qui compte ici est minuit UTC.
+# Chaque test parametre ci-dessous est rejoue a l'horloge reelle, puis a 23:58 et 00:02 UTC.
+_DAY_BOUNDARY_CASES = [
+    pytest.param(None, id="horloge-reelle"),
+    pytest.param(datetime(2026, 6, 14, 23, 58, tzinfo=timezone.utc), id="23h58-utc"),
+    pytest.param(datetime(2026, 6, 15, 0, 2, tzinfo=timezone.utc), id="00h02-utc"),
+]
+
+
 def test_tick_publishes_a_due_immediate_entry_with_mp4_caption_and_hashtags(tmp_path, monkeypatch):
     config = _pub_env(tmp_path, monkeypatch)
     _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1))
@@ -1207,12 +1244,13 @@ def test_an_unexpected_error_is_logged_and_fails_the_entry_instead_of_killing_th
     assert "boum" in caplog.text
 
 
-def test_r6_posts_per_day_cap_postpones_to_the_next_free_slot_and_logs_it(tmp_path, monkeypatch, caplog):
+@pytest.mark.parametrize("frozen_at", _DAY_BOUNDARY_CASES)
+def test_r6_posts_per_day_cap_postpones_to_the_next_free_slot_and_logs_it(tmp_path, monkeypatch, caplog, frozen_at):
     config = _pub_env(tmp_path, monkeypatch)  # 1 post par jour, 480 min d'ecart
-    now = datetime.now(timezone.utc)
-    _seed(tmp_path, "ma_chaine", "00", _ago(hours=0, seconds=1), status="published",
+    now = _frozen_now(monkeypatch, frozen_at)  # TASK-b778469259de : un seul instant pour le seed et pour le tick
+    _seed(tmp_path, "ma_chaine", "00", now - timedelta(seconds=1), status="published",
           tiktok_publish_at=(now - timedelta(seconds=1)).isoformat(), published_at=now.isoformat())
-    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1))
+    _seed(tmp_path, "ma_chaine", "01", now - timedelta(minutes=1))
     pub = FakePublisher()
 
     with caplog.at_level(logging.WARNING):
@@ -1243,14 +1281,15 @@ def test_r6_min_gap_postpones_even_when_the_daily_cap_is_not_reached(tmp_path, m
     assert datetime.fromisoformat(entry["slot_at"]) >= now + timedelta(minutes=595)
 
 
-def test_r6_a_published_post_counts_for_the_account_across_channels(tmp_path, monkeypatch):
+@pytest.mark.parametrize("frozen_at", _DAY_BOUNDARY_CASES)
+def test_r6_a_published_post_counts_for_the_account_across_channels(tmp_path, monkeypatch, frozen_at):
     config = _pub_env(tmp_path, monkeypatch)
     (tmp_path / "presets" / "autre.toml").write_text(
         '[channel]\ntimezone = "UTC"\n', encoding="utf-8")
-    now = datetime.now(timezone.utc)
-    _seed(tmp_path, "autre", "00", _ago(minutes=5), status="published", video_id="bbbbbbbbbbb",
+    now = _frozen_now(monkeypatch, frozen_at)  # TASK-b778469259de : un seul instant pour le seed et pour le tick
+    _seed(tmp_path, "autre", "00", _same_day_before(now, minutes=5), status="published", video_id="bbbbbbbbbbb",
           tiktok_publish_at=(now - timedelta(seconds=5)).isoformat(), published_at=now.isoformat())
-    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1))
+    _seed(tmp_path, "ma_chaine", "01", _same_day_before(now, minutes=1))
     pub = FakePublisher()
 
     _pub_worker(config, pub).tick()
@@ -1548,13 +1587,14 @@ def test_an_entry_without_account_field_never_falls_back_to_a_style_account(tmp_
     assert _entries(tmp_path)[0]["status"] == "failed"
 
 
-def test_a_capped_entry_is_postponed_to_a_slot_of_its_account_not_of_a_style(tmp_path, monkeypatch):
+@pytest.mark.parametrize("frozen_at", _DAY_BOUNDARY_CASES)
+def test_a_capped_entry_is_postponed_to_a_slot_of_its_account_not_of_a_style(tmp_path, monkeypatch, frozen_at):
     config = _pub_env(tmp_path, monkeypatch, tiktok_settings={"max_posts_per_day": 1, "min_gap_minutes": 0},
                       slots=[{"day": d, "time": "09:00"} for d in ("mon", "tue", "wed", "thu", "fri", "sat", "sun")])
-    now = datetime.now(timezone.utc)
-    _seed(tmp_path, "ma_chaine", "00", _ago(minutes=5), status="published", video_id="bbbbbbbbbbb",
+    now = _frozen_now(monkeypatch, frozen_at)  # TASK-b778469259de : un seul instant pour le seed et pour le tick
+    _seed(tmp_path, "ma_chaine", "00", _same_day_before(now, minutes=5), status="published", video_id="bbbbbbbbbbb",
           tiktok_publish_at=(now - timedelta(seconds=5)).isoformat(), published_at=now.isoformat())
-    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1))  # plafond du jour atteint par 00
+    _seed(tmp_path, "ma_chaine", "01", _same_day_before(now, minutes=1))  # plafond du jour atteint par 00
     pub = FakePublisher()
 
     _pub_worker(config, pub).tick()
@@ -1566,12 +1606,13 @@ def test_a_capped_entry_is_postponed_to_a_slot_of_its_account_not_of_a_style(tmp
     assert entry["postponed_reason"]
 
 
-def test_a_capped_entry_whose_account_has_no_slot_waits_with_an_explicit_reason(tmp_path, monkeypatch):
+@pytest.mark.parametrize("frozen_at", _DAY_BOUNDARY_CASES)
+def test_a_capped_entry_whose_account_has_no_slot_waits_with_an_explicit_reason(tmp_path, monkeypatch, frozen_at):
     config = _pub_env(tmp_path, monkeypatch, tiktok_settings={"max_posts_per_day": 1, "min_gap_minutes": 0}, slots=[])
-    now = datetime.now(timezone.utc)
-    _seed(tmp_path, "ma_chaine", "00", _ago(minutes=5), status="published", video_id="bbbbbbbbbbb",
+    now = _frozen_now(monkeypatch, frozen_at)  # TASK-b778469259de : un seul instant pour le seed et pour le tick
+    _seed(tmp_path, "ma_chaine", "00", _same_day_before(now, minutes=5), status="published", video_id="bbbbbbbbbbb",
           tiktok_publish_at=(now - timedelta(seconds=5)).isoformat(), published_at=now.isoformat())
-    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1))
+    _seed(tmp_path, "ma_chaine", "01", _same_day_before(now, minutes=1))
     pub = FakePublisher()
 
     _pub_worker(config, pub).tick()
@@ -1862,11 +1903,12 @@ def test_scheduled_beyond_the_window_is_kept_then_scheduled_once_the_date_enters
     assert _entries(tmp_path, NO_CHANNEL)[0]["tiktok_state"] == "scheduled_on_tiktok"
 
 
-def test_a_manual_entry_over_the_account_cap_waits_with_the_reason_and_is_never_moved(tmp_path, monkeypatch):
+@pytest.mark.parametrize("frozen_at", _DAY_BOUNDARY_CASES)
+def test_a_manual_entry_over_the_account_cap_waits_with_the_reason_and_is_never_moved(tmp_path, monkeypatch, frozen_at):
     config = _pub_env(tmp_path, monkeypatch, tiktok_settings={"max_posts_per_day": 1, "min_gap_minutes": 0})
-    _seed(tmp_path, "ma_chaine", "00", _ago(seconds=5), status="published", published_at=_ago(seconds=5).isoformat(),
-          account="ef34ab")
-    slot = datetime.now(timezone.utc)
+    slot = _frozen_now(monkeypatch, frozen_at)  # TASK-b778469259de : un seul instant pour le seed et pour le tick
+    _seed(tmp_path, "ma_chaine", "00", slot - timedelta(seconds=5), status="published",
+          published_at=(slot - timedelta(seconds=5)).isoformat(), account="ef34ab")
     _manual(tmp_path, "01", slot)
     pub = FakePublisher()
 
@@ -2035,12 +2077,13 @@ def test_a_youtube_setting_error_fails_the_entry_without_halting_the_account(tmp
     assert entry["status"] == "failed" and entry["error"] == "titre manquant" and not entry["halted"]
 
 
-def test_the_youtube_daily_cap_postpones_and_logs_the_report(tmp_path, monkeypatch, caplog):
+@pytest.mark.parametrize("frozen_at", _DAY_BOUNDARY_CASES)
+def test_the_youtube_daily_cap_postpones_and_logs_the_report(tmp_path, monkeypatch, caplog, frozen_at):
     config = _youtube_env(tmp_path, monkeypatch, youtube_settings={"max_posts_per_day": 1, "min_gap_minutes": 0})
-    now = datetime.now(timezone.utc)
-    _seed(tmp_path, "ma_chaine", "00", _ago(hours=0, seconds=1), status="published",
+    now = _frozen_now(monkeypatch, frozen_at)  # TASK-b778469259de : un seul instant pour le seed et pour le tick
+    _seed(tmp_path, "ma_chaine", "00", now - timedelta(seconds=1), status="published",
           tiktok_publish_at=(now - timedelta(seconds=1)).isoformat(), published_at=now.isoformat())
-    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1))
+    _seed(tmp_path, "ma_chaine", "01", now - timedelta(minutes=1))
     yt = FakeYouTubePublisher()
 
     with caplog.at_level(logging.WARNING):
