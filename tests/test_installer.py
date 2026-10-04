@@ -58,6 +58,24 @@ def installer_dir(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
+def zip_layout_dir(tmp_path: Path) -> Path:
+    """Disposition exacte du zip (SPEC-38f7761891f6 R1) : Installer.bat et
+    Desinstaller.bat a la racine, le reste sous installer/ ; contrairement a
+    ``installer_dir`` ci-dessus (tout a plat dans un seul dossier), c'est la
+    seule disposition qui exerce le chemin relatif que les .bat calculent
+    reellement a l'execution (``%~dp0``)."""
+    root = tmp_path / f"Clipper-portable-{NEW_VERSION}"
+    sub = root / "installer"
+    sub.mkdir(parents=True)
+    for name in ("Installer.bat", "Desinstaller.bat"):
+        shutil.copy(INSTALLER_SRC / name, root / name)
+    for name in ("install.ps1", "desinstaller.ps1", "Clipper.bat.template", "PREMIER-CLIP.txt"):
+        shutil.copy(INSTALLER_SRC / name, sub / name)
+    (root / "version.txt").write_text(NEW_VERSION, encoding="utf-8")
+    return root
+
+
+@pytest.fixture
 def fake_nvidia_smi(tmp_path: Path) -> Path:
     """Dossier contenant un nvidia-smi.bat simule (sortie non vide, code 0),
     a placer en tete du PATH : jamais le vrai nvidia-smi."""
@@ -133,6 +151,11 @@ def run_desinstaller(
         cmd += ["-Port", str(port)]
     cmd += list(args)
     return subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=120)
+
+
+def run_bat(bat_path: Path, args: list[str], env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+    cmd = ["cmd", "/c", str(bat_path), *args]
+    return subprocess.run(cmd, cwd=str(bat_path.parent), capture_output=True, text=True, env=env, timeout=120)
 
 
 def _dir_snapshot(path: Path) -> set[str]:
@@ -223,6 +246,37 @@ def test_dry_run_shows_resolved_paths(installer_dir: Path) -> None:
 # --------------------------------------------------------------------------
 # (6) options incompatibles : message explicite, code non nul.
 # --------------------------------------------------------------------------
+
+
+def test_installer_bat_wrapper_finds_install_ps1_under_installer_subdir(zip_layout_dir: Path) -> None:
+    app_dir = zip_layout_dir / "app"
+    data_dir = zip_layout_dir / "data"
+
+    result = run_bat(
+        zip_layout_dir / "Installer.bat",
+        ["--app", str(app_dir), "--data", str(data_dir), "--dry-run"],
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "n'existe pas" not in result.stdout
+    assert "[1/11]" in result.stdout
+
+
+def test_desinstaller_bat_wrapper_finds_desinstaller_ps1_under_installer_subdir(zip_layout_dir: Path) -> None:
+    app_dir = zip_layout_dir / "app"
+    app_dir.mkdir()
+
+    result = run_bat(zip_layout_dir / "Desinstaller.bat", ["--app", str(app_dir), "--dry-run"])
+
+    # Pas d'assertion sur returncode/stdout complet : Desinstaller.bat ne
+    # transmet jamais -Port (toujours le vrai port 8000, par conception,
+    # desinstaller.ps1), donc le resultat depend de ce qui tourne reellement
+    # sur la machine. Seul le branchement .bat -> installer/desinstaller.ps1
+    # est en jeu ici : si le chemin etait faux, PowerShell echouerait avant
+    # meme d'atteindre une ligne ecrite par le script.
+    combined = result.stdout + result.stderr
+    assert "n'existe pas" not in combined
+    assert "desinstaller.ps1" not in combined.lower() or "parametre -file" not in combined.lower()
 
 
 def test_cpu_and_cuda_together_is_rejected(installer_dir: Path) -> None:
@@ -396,6 +450,58 @@ def test_clipper_bat_preview_has_path_and_launch_logic(installer_dir: Path) -> N
 # (TASK-5d378e43fda0) ffmpeg epingle sur une version figee : l'URL ne
 # contient ni "latest" ni "master", et le --dry-run l'affiche telle quelle.
 # --------------------------------------------------------------------------
+
+
+def test_sans_raccourci_skips_desktop_shortcut_mention(installer_dir: Path) -> None:
+    app_dir = installer_dir / "app"
+    data_dir = installer_dir / "data"
+
+    result = run_install(
+        installer_dir,
+        ["--app", str(app_dir), "--data", str(data_dir), "--sans-raccourci", "--dry-run"],
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Bureau" not in result.stdout
+    assert "Clipper.lnk" not in result.stdout
+
+
+def test_without_sans_raccourci_mentions_desktop_shortcut(installer_dir: Path) -> None:
+    app_dir = installer_dir / "app"
+    data_dir = installer_dir / "data"
+
+    result = run_install(installer_dir, ["--app", str(app_dir), "--data", str(data_dir), "--dry-run"])
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Bureau" in result.stdout
+    assert "Clipper.lnk" in result.stdout
+
+
+def test_pip_install_targets_app_venv_explicitly() -> None:
+    """Regression (TASK-a093c293ea3f, trouve par le vrai passage) : sans
+    --python explicite, 'uv pip install' remonte les dossiers (ou lit
+    VIRTUAL_ENV) pour choisir un venv, et peut tomber sur un .venv de
+    developpement ambiant totalement different de celui que l'on vient de
+    creer sous $App -- observe reellement (clipper installe dans le venv du
+    depot, jamais dans app\\.venv)."""
+    source = _strip_powershell_comments((INSTALLER_SRC / "install.ps1").read_text(encoding="utf-8"))
+    match = re.search(r"&\s*uv pip install[^\r\n]*", source)
+    assert match, "commande '& uv pip install' introuvable dans install.ps1"
+    assert "--python" in match.group(0), match.group(0)
+    assert "venvDir" in match.group(0) or "venvPython" in match.group(0)
+
+
+def test_finish_step_writes_app_version_file() -> None:
+    """Regression (TASK-a093c293ea3f, trouve par le vrai passage) : sans
+    cette ecriture, Step1-Prepare ne voit jamais app\\version.txt et croit
+    toujours etre a la premiere installation ; une relance ne supprime alors
+    pas l'ancien .venv et 'uv venv' echoue -- deja observe reellement (une
+    mise a jour sur un app existant plantait a chaque fois)."""
+    source = _strip_powershell_comments((INSTALLER_SRC / "install.ps1").read_text(encoding="utf-8"))
+    match = re.search(r"function Invoke-Step11-Finish\b.*?\n}\n", source, re.DOTALL)
+    assert match, "Invoke-Step11-Finish introuvable dans install.ps1"
+    body = match.group(0)
+    assert re.search(r'Set-Content\s+-Path\s+\(Join-Path\s+\$App\s+"version\.txt"\)', body), body
 
 
 def test_ffmpeg_url_is_pinned_and_shown_in_dry_run(installer_dir: Path) -> None:

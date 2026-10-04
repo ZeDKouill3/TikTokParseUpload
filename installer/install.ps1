@@ -8,7 +8,8 @@
     ternaire), sans elevation. Appele par Installer.bat, qui transmet les
     options telles quelles. Options (style GNU, pas les parametres nommes
     PowerShell) : --app <dossier>, --data <dossier>, --cpu, --cuda,
-    --sans-console, --dry-run.
+    --sans-console, --sans-raccourci (aucun raccourci Clipper.lnk sur le
+    Bureau), --dry-run.
 
     --dry-run traverse exactement le meme code de decision que l'installation
     reelle (une fonction par etape, qui recoit -DryRun) : il affiche le plan
@@ -203,7 +204,13 @@ function Invoke-Step3-Venv {
     if ($Device -eq "cuda") {
         $target = "$wheel[cuda]"
     }
-    & uv pip install $target
+    # --python explicite : sans lui, "uv pip install" cherche un .venv en
+    # remontant depuis le dossier courant (ou VIRTUAL_ENV) et peut installer
+    # dans un venv totalement different de celui qu'on vient de creer sous
+    # $App (observe reellement quand Installer.bat est lance depuis un
+    # dossier dont un ancetre contient un .venv de developpement).
+    $venvPython = Join-Path $venvDir "Scripts\python.exe"
+    & uv pip install --python $venvPython $target
     if ($LASTEXITCODE -ne 0) {
         Fail "'uv pip install' a echoue" "verifie la connexion reseau puis relance Installer.bat"
     }
@@ -343,10 +350,14 @@ function Invoke-Step8-Models {
 }
 
 function Invoke-Step9-Launcher {
-    param([string]$App, [string]$Data, [string]$TemplatePath, [switch]$DryRun)
+    param([string]$App, [string]$Data, [string]$TemplatePath, [switch]$SansRaccourci, [switch]$DryRun)
     $launcherPath = Join-Path $App "Clipper.bat"
     $filled = Format-ClipperBat -TemplatePath $TemplatePath -App $App -Data $Data
-    Write-Step 9 "Lanceur : $launcherPath (PATH = ffmpeg\bin puis .venv\Scripts, data courant, ouvre http://127.0.0.1:8000) et raccourci Clipper.lnk sur le Bureau"
+    if ($SansRaccourci) {
+        Write-Step 9 "Lanceur : $launcherPath (PATH = ffmpeg\bin puis .venv\Scripts, data courant, ouvre http://127.0.0.1:8000) ; aucun raccourci (--sans-raccourci)"
+    } else {
+        Write-Step 9 "Lanceur : $launcherPath (PATH = ffmpeg\bin puis .venv\Scripts, data courant, ouvre http://127.0.0.1:8000) et raccourci Clipper.lnk sur le Bureau"
+    }
     if ($DryRun) {
         Write-Host "--- $launcherPath (apercu) ---"
         Write-Host $filled
@@ -354,6 +365,10 @@ function Invoke-Step9-Launcher {
         return
     }
     Set-Content -Path $launcherPath -Value $filled -NoNewline
+    if ($SansRaccourci) {
+        Write-Log $App "etape 9/$TOTAL_STEPS : lanceur $launcherPath, pas de raccourci (--sans-raccourci)"
+        return
+    }
     $desktop = [Environment]::GetFolderPath("Desktop")
     $shortcutPath = Join-Path $desktop "Clipper.lnk"
     $shell = New-Object -ComObject WScript.Shell
@@ -411,6 +426,11 @@ function Invoke-Step11-Finish {
         date    = (Get-Date -Format "o")
     }
     $payload | ConvertTo-Json | Set-Content -Path $installJson
+    # Step1-Prepare lit ce fichier pour decider premiere installation / mise
+    # a jour : sans lui, une relance se croit toujours a sa premiere
+    # installation, ne supprime jamais l'ancien .venv et 'uv venv' echoue
+    # (deja observe reellement, R2).
+    Set-Content -Path (Join-Path $App "version.txt") -Value $Version -NoNewline
     if (Test-Path $cacheDir) {
         Remove-Item -Recurse -Force -Path $cacheDir
     }
@@ -432,6 +452,7 @@ $Data = Join-Path ([Environment]::GetFolderPath("MyDocuments")) "Clipper"
 $Cpu = $false
 $Cuda = $false
 $SansConsole = $false
+$SansRaccourci = $false
 $DryRun = $false
 
 $i = 0
@@ -449,10 +470,12 @@ while ($i -lt $RawArgs.Count) {
         $Cuda = $true
     } elseif ($token -eq "--sans-console") {
         $SansConsole = $true
+    } elseif ($token -eq "--sans-raccourci") {
+        $SansRaccourci = $true
     } elseif ($token -eq "--dry-run") {
         $DryRun = $true
     } else {
-        Fail "option inconnue : $token" "options valides : --app, --data, --cpu, --cuda, --sans-console, --dry-run"
+        Fail "option inconnue : $token" "options valides : --app, --data, --cpu, --cuda, --sans-console, --sans-raccourci, --dry-run"
     }
     $i++
 }
@@ -479,7 +502,7 @@ Invoke-Step5-Claude -App $App -DryRun:$DryRun
 Invoke-Step6-Chrome -App $App -DryRun:$DryRun
 Invoke-Step7-Data -App $App -Data $Data -PremierClipSource $premierClipSource -DryRun:$DryRun
 Invoke-Step8-Models -App $App -Data $Data -DryRun:$DryRun
-Invoke-Step9-Launcher -App $App -Data $Data -TemplatePath $templatePath -DryRun:$DryRun
+Invoke-Step9-Launcher -App $App -Data $Data -TemplatePath $templatePath -SansRaccourci:$SansRaccourci -DryRun:$DryRun
 Invoke-Step10-Doctor -App $App -Data $Data -DryRun:$DryRun
 Invoke-Step11-Finish -App $App -Data $Data -Version $newVersion -Device $device -SansConsole:$SansConsole -DryRun:$DryRun
 

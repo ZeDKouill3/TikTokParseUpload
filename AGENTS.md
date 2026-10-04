@@ -25,6 +25,17 @@ vrai modèle ou du vrai Claude est un test optionnel, sauté par défaut via
 explicitement, ex. `CLIPPER_CLAUDE_INTEGRATION=1`, `CLIPPER_REAL_MODELS=1`) —
 jamais lancé en CI ni par défaut en local.
 
+Test réel de l'installeur portable (SPEC-38f7 R9) : construit le vrai zip,
+l'installe en CPU dans un dossier temporaire sous `research/installer-real/`
+(jamais `%LOCALAPPDATA%\Clipper` ni le Bureau), vérifie `clipper doctor`, une
+mise à jour, puis la désinstallation complète. Plusieurs minutes et ~700 Mo
+téléchargés : jamais en parallèle d'un autre travail réseau/CPU lourd.
+
+```powershell
+$env:CLIPPER_INSTALLER_REAL = "1"
+python -m pytest -q tests/test_installer_real.py
+```
+
 ## Règles ank
 
 - CLI ank seulement : jamais lire ou écrire `.ank/` à la main, cet état est
