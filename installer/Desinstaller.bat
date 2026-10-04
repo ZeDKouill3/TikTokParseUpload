@@ -4,5 +4,5 @@ rem terminal avec des options : Desinstaller.bat [--donnees] [--dry-run].
 rem Toutes les options sont transmises telles quelles a
 rem installer\desinstaller.ps1.
 setlocal
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0desinstaller.ps1" %*
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0installer\desinstaller.ps1" %*
 exit /b %errorlevel%
