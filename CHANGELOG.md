@@ -10,23 +10,98 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ## [Non publié]
 
+## [0.4.1] - 2026-10-04
+
+Installeur portable Windows et calendrier de publication Jour / Semaine /
+Mois : le zip `Clipper-portable-0.4.1.zip`, à télécharger depuis la
+Release GitHub, installe tout sans outil de développement, et le calendrier de
+publication affiche chaque jour sans rien cacher. Pas de fichier de notes
+séparé pour cette version : cette section du changelog suffit.
+
 ### Ajouté
 
-- **Installeur portable Windows** (SPEC-38f7761891f6, ADR-e1dac9ba2284) :
-  un zip d'amorçage léger (`Clipper-portable-<version>.zip`, < 150 Mo,
-  `uv.exe` + wheel + scripts, jamais de Python ni de site-packages dedans)
-  construit par `tools/build_portable.py` et attaché à chaque Release.
-  `Installer.bat` installe Python 3.11, l'environnement, ffmpeg (version
-  figée) et `claude` dans un dossier programme jetable
-  (`%LOCALAPPDATA%\Clipper\app` par défaut), prépare un dossier de données
-  séparé (`Documents\Clipper` par défaut), détecte automatiquement le GPU
-  (CUDA si `nvidia-smi` répond, CPU sinon), précharge les modèles et termine
-  par un `clipper doctor`. `Desinstaller.bat` supprime le dossier programme
-  et conserve les données par défaut (`--donnees` pour tout supprimer).
-  Mise à jour par simple relance d'un zip plus récent, refus explicite d'une
-  version plus ancienne. Documentation complète du parcours dans
+**Installeur portable Windows** (ADR-e1da et SPEC-38f7, ratifiées)
+
+- Un zip d'amorçage léger, `Clipper-portable-0.4.1.zip` (< 150 Mo : `uv.exe`,
+  la wheel et les scripts, jamais de Python ni de site-packages dedans),
+  construit par `tools/build_portable.py` et à télécharger depuis la Release
+  GitHub. Le programme se construit chez toi à l'installation.
+- `Installer.bat` installe Python 3.11, l'environnement, ffmpeg et `claude`
+  dans un dossier programme jetable (`%LOCALAPPDATA%\Clipper\app` par défaut),
+  prépare un dossier de données séparé (`Documents\Clipper` par défaut,
+  jamais touché par une mise à jour), précharge les modèles et termine par un
+  `clipper doctor`. Un raccourci et un lanceur ouvrent la console.
+- `Desinstaller.bat` supprime le dossier programme et conserve les données
+  par défaut (`--donnees` pour tout supprimer) ; il refuse de supprimer si la
+  console tourne encore.
+- GPU automatique : CUDA seulement si `nvidia-smi` répond, CPU sinon. Pour
+  les installations hors installeur, l'extra `clipper[cuda]` installe les
+  paquets `nvidia-cublas-cu12` et `nvidia-cudnn-cu12`, et leurs dossiers `bin`
+  sont ajoutés au PATH du processus sans manipulation manuelle.
+- ffmpeg figé sur une version précise (GyanD 9.0.2, somme de contrôle
+  vérifiée) au lieu d'une URL « latest » qui changeait en quelques jours et
+  cassait l'installation.
+- `clipper doctor` vérifie l'installation et `clipper models prefetch`
+  télécharge les modèles à l'avance ; chaque échec est affiché, jamais remplacé en silence.
+- Mise à jour par simple relance d'un zip plus récent (refus explicite d'une
+  version plus ancienne). Parcours complet dans
   [`docs/INSTALLATION.md`](docs/INSTALLATION.md), nouvelle section
-  « Installation sans outils de développement » dans le README.
+  « Installation sans outils de développement » dans le README, critère n°1 de
+  la v1.0.0 reformulé autour du zip portable.
+- Test réel optionnel de l'installeur (`CLIPPER_INSTALLER_REAL=1`) : construit
+  le vrai zip, l'installe en CPU dans un dossier temporaire, vérifie
+  `clipper doctor`, une mise à jour puis la désinstallation complète ; jamais
+  lancé en CI ni par défaut. Option `--sans-raccourci` pour ne jamais toucher
+  au vrai Bureau.
+
+**Calendrier de publication**
+
+- Trois vues, **Jour**, **Semaine** (par défaut) et **Mois**, avec navigation
+  précédent / suivant / aujourd'hui adaptée ; `/api/publish` accepte
+  `range=day|week|month` (422 si invalide) et regroupe chaque publication
+  dans son jour, calculé en heure de Paris.
+- En Semaine, **toutes** les publications du jour sont affichées : plus de
+  « +N autres », ni défilement ni coupure, la case s'agrandit (paliers
+  normal / compact / mini conservés).
+- En Mois, chaque case montre le numéro du jour et le **nombre de vidéos** du
+  jour ; un clic sur la case ouvre la vue Jour.
+- Les créneaux libres restent des cibles de glisser-déposer en Jour et en
+  Semaine, jamais tronqués.
+- La **légende en couleurs** (planifié / programmé, publié, échec) reprend
+  les couleurs des boîtes du calendrier.
+
+### Modifié
+
+- Semaine : la colonne vide de gauche (reste de l'ancienne grille horaire)
+  est retirée, sept colonnes de jours.
+- Le critère n°1 de la v1.0.0 (`docs/versions.md`) porte sur le zip portable
+  de la Release.
+
+### Corrigé
+
+- Séries programmées : quand des clips validés existent mais qu'aucune série
+  ne tient dans N places, le message n'affirme plus à tort « aucun clip
+  validé » : il indique combien de clips et de parties sont validés et
+  propose de passer à N vidéos ou de décocher « Parties ensemble ».
+- Installeur, 16 points confirmés par une relecture : `uv.exe` et
+  `clipper.exe` appelés par leur chemin complet, relance possible après une
+  installation interrompue, override OpenCV livré dans le zip (un seul paquet
+  OpenCV installé), lanceur en encodage OEM, pause sur erreur en
+  double-clic, `install.json` relu à la relance, désinstallation qui vérifie
+  le dossier programme, `Desinstaller.bat` et icône copiés dans `app`.
+- Installeur, corrigé grâce au vrai passage de test : `Installer.bat` et
+  `Desinstaller.bat` pointaient le mauvais chemin de `install.ps1` ;
+  `uv pip install` sans `--python` pouvait installer dans un environnement
+  ambiant (désormais explicite) ; `app\version.txt` n'était jamais écrit, si
+  bien qu'une relance se croyait en première installation ; le script
+  `claude.ai/install.ps1` peut renvoyer un `Byte[]` (plantait avec
+  `Invoke-Expression`) et `claude` installé restait hors du PATH du processus
+  courant.
+- Tests dépendants de l'heure rendus déterministes : plusieurs tests
+  (plafond par jour TikTok/YouTube du worker, semaine publiée) lisaient
+  l'horloge deux fois et pouvaient échouer près de minuit ; l'horloge est
+  figée, le calcul de « lundi » se fait dans le fuseau du compte (Paris) et
+  non plus en UTC. Aucun bug du code livré n'a été révélé.
 
 ## [0.4.0] - 2026-10-03
 
@@ -533,7 +608,8 @@ verticaux sous-titrés, en local.
 - Aucune publication automatique sur TikTok : le dépôt produit les clips
   et leurs métadonnées, la mise en ligne reste manuelle.
 
-[Non publié]: https://github.com/ZeDKouill3/TikTokParseUpload/compare/v0.4.0...HEAD
+[Non publié]: https://github.com/ZeDKouill3/TikTokParseUpload/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/ZeDKouill3/TikTokParseUpload/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/ZeDKouill3/TikTokParseUpload/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/ZeDKouill3/TikTokParseUpload/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/ZeDKouill3/TikTokParseUpload/compare/v0.1.0...v0.2.0

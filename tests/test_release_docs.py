@@ -229,3 +229,44 @@ def test_versions_keeps_the_next_version_after_real_usage():
     text = _read(VERSIONS)
     row = next(line for line in text.splitlines() if line.startswith(f"| v{NEXT_VERSION} "))
     assert "Mode auto" in row and row.rstrip().endswith("| après une semaine d'usage réel |")
+
+
+def test_readme_wheel_example_and_section_link_follow_the_current_version():
+    text = _read(README)
+    assert f"clipper-{VERSION}-py3-none-any.whl" in text
+    assert f"(section `[{VERSION}]`)" in text
+    assert "0.4.0-py3-none" not in text
+
+
+def test_readme_portable_zip_points_to_the_release_with_the_current_version():
+    text = _read(README)
+    start = text.index("## Installation sans outils de développement")
+    end = text.index("## Installation développeur")
+    section = text[start:end]
+    assert f"Clipper-portable-{VERSION}.zip" in section
+    assert f"{REPO_URL}/releases" in section
+    assert "<version>" not in section
+
+
+def test_versions_row_for_the_current_version_names_the_portable_installer_and_calendar():
+    lines = _read(VERSIONS).splitlines()
+    row = next(line for line in lines if line.startswith(f"| {TAG} "))
+    assert "Installeur portable Windows et calendrier Jour/Semaine/Mois" in row
+
+
+REQUIRED_CHANGELOG_TERMS = (
+    "ADR-e1da", "SPEC-38f7", f"Clipper-portable-{VERSION}.zip", "Release GitHub",
+    "Installer.bat", "Desinstaller.bat", "GPU", "ffmpeg", "clipper doctor",
+    "clipper models prefetch", "[cuda]", "mise à jour", "Jour", "Semaine", "Mois",
+    "légende", "série", "déterministes", "CLIPPER_INSTALLER_REAL",
+)
+
+
+@pytest.mark.parametrize("term", REQUIRED_CHANGELOG_TERMS)
+def test_changelog_current_version_covers_the_portable_installer_and_calendar(term):
+    body = _changelog_section(_read(CHANGELOG), rf"\[{ESC_VERSION}\]")
+    assert term in body, f"{term!r} absent de la section [{VERSION}]"
+
+
+def test_changelog_current_version_has_no_separate_release_notes_file():
+    assert not NOTES.exists(), f"{NOTES.name} : le changelog suffit pour {TAG}"
