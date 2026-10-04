@@ -68,11 +68,12 @@ const pubShift = (ymd, days) => { const d = pubUtc(ymd); d.setUTCDate(d.getUTCDa
 // Décale d'un nombre de mois en se calant au 1er (sinon le 31 janvier + 1 mois déborde sur mars) : seulement
 // pour choisir la plage à demander au serveur (navigation), jamais pour grouper des publications par jour.
 const pubShiftMonth = (ymd, months) => { const d = pubUtc(ymd); d.setUTCMonth(d.getUTCMonth() + months, 1); return d.toISOString().slice(0, 10); };
-// Seuil de densité d'une case jour (TASK-ad4d) : au-delà, les boîtes se compactent pour tenir dans la case
-// plutôt que de déborder sur la page (la case elle-même défile verticalement en dernier recours).
+// Palier de densité d'une case jour (TASK-460904227d2f, remplace TASK-ad4d) : normal <= 4 (case pleine),
+// compact <= 10 (boîtes réduites), mini au-delà (une ligne heure + titre + pastille, tronquée avec « +N »
+// si ça déborde quand même : voir PUB_WEEK_MINI_CAP).
 function pubBoxClass(count) {
-  if (count >= 7) return "compact";
-  if (count >= 4) return "dense";
+  if (count > 10) return "mini";
+  if (count > 4) return "compact";
   return "";
 }
 const pubSlotLabel = (iso) => `${pubFmt(pubDate(iso), { weekday: "long", day: "numeric", month: "long" })} à ${pubTime(iso)}`;
@@ -196,23 +197,55 @@ function pubDayItems(d, ymd) {
   return [...posts, ...frees.map((s) => ({ __free: true, ...s }))].sort((a, b) => at(a).localeCompare(at(b)));
 }
 
+// Au-dela de ce qui tient dans la case (TASK-460904227d2f), les items restants ne sont jamais caches sans
+// indication : K premiers puis un lien « +N autres » qui ouvre la vue Jour de ce jour (data-pub-more).
+const PUB_WEEK_MINI_CAP = 10;  // palier mini (Semaine) : une ligne par item, la case defile encore en-deca
+const PUB_MONTH_CAP = 4;       // case Mois : toujours minuscule, jamais de palier a tailles multiples
+
+/* Ligne minuscule d'une publication (palier mini Semaine, case Mois) : heure + titre tronque + pastille de
+   statut, pas de vignette ni de details (ADR-ad2e : rien n'est cache, juste reduit au minimum lisible). Les
+   creneaux libres restent des cibles de depot normales (pubFreeSlot) : seules les publications se tronquent. */
+function pubMiniRow(it) {
+  const at = it.slot_at_paris || it.published_at_paris || "";
+  return `<div class="cal-mini-row" data-post="${esc(pubKey(it))}" tabindex="0" role="button" aria-label="${esc(pubTitle(it))}, ${esc(pubStatusOf(it).label)}">
+    <span class="cal-mini-time">${esc(pubTime(at))}</span><span class="cal-mini-title">${esc(pubTitle(it))}</span>
+    <i class="cal-mini-dot ${esc(it.publish_status || "")}" aria-hidden="true"></i></div>`;
+}
+
+/* Lien « +N autres » (TASK-460904227d2f) : jamais de post cache sans indication, cible la vue Jour de ce jour. */
+function pubMoreLink(ymd, hidden) {
+  return `<button type="button" class="cal-more" data-pub-more="${esc(ymd)}">+${hidden} autres</button>`;
+}
+
 function pubDayBoxHtml(d, ymd, extraClass) {
   const items = pubDayItems(d, ymd);
-  const count = items.filter((it) => !it.__free).length;
-  const body = items.map((it) => (it.__free ? pubFreeSlot(it)
-    : pubPost(it, `<span class="pub-day-time">${esc(pubTime(it.slot_at_paris || it.published_at_paris))}</span>`))).join("");
-  return `<div class="cal-day${pubBoxClass(count) ? ` ${pubBoxClass(count)}` : ""}${ymd === pubToday() ? " today" : ""}${extraClass ? ` ${extraClass}` : ""}" data-date="${esc(ymd)}">
+  const posts = items.filter((it) => !it.__free);
+  const frees = items.filter((it) => it.__free);
+  const count = posts.length;
+  const month = extraClass === "small";
+  const tier = pubBoxClass(count);
+  const mini = month || tier === "mini";
+  const cap = month ? PUB_MONTH_CAP : PUB_WEEK_MINI_CAP;
+  const visiblePosts = mini ? posts.slice(0, cap) : posts;
+  const hidden = mini ? Math.max(0, posts.length - cap) : 0;
+  const body = mini
+    ? visiblePosts.map(pubMiniRow).join("") + frees.map((s) => pubFreeSlot(s)).join("") + (hidden ? pubMoreLink(ymd, hidden) : "")
+    : items.map((it) => (it.__free ? pubFreeSlot(it)
+      : pubPost(it, `<span class="pub-day-time">${esc(pubTime(it.slot_at_paris || it.published_at_paris))}</span>`))).join("");
+  const cls = [month ? "mini" : tier, ymd === pubToday() ? "today" : "", extraClass || ""].filter(Boolean).join(" ");
+  return `<div class="cal-day${cls ? ` ${cls}` : ""}" data-date="${esc(ymd)}">
     <div class="cal-day-h"><span class="n">${esc(pubFmt(ymd, { day: "numeric" }))}</span>${count ? `<span class="cal-day-count">${count}</span>` : ""}</div>
     <div class="cal-day-body">${body}</div>
   </div>`;
 }
 
 /* Semaine : une case par jour (toutes ses publications, mises à l'échelle avec leur nombre) plutôt qu'une
-   case par heure (TASK-ad4d, remplace la grille horaire de TASK-5c00). */
+   case par heure (TASK-ad4d, remplace la grille horaire de TASK-5c00). Pas de colonne d'heure (TASK-460904227d2f,
+   reste de l'ancienne grille horaire) : sept colonnes, une par jour. */
 function pubCalendarWeek(d) {
   const days = Array.from({ length: 7 }, (_, i) => pubShift(d.week_start, i));
-  const head = `<div class="cal-h"></div>${days.map((ymd) => `<div class="cal-h${ymd === pubToday() ? " today" : ""}"><div class="d">${esc(pubFmt(ymd, { weekday: "short" }))}</div><div class="n">${esc(pubFmt(ymd, { day: "numeric" }))}</div></div>`).join("")}`;
-  const body = `<div class="cal-row-label"></div>${days.map((ymd) => pubDayBoxHtml(d, ymd)).join("")}`;
+  const head = days.map((ymd) => `<div class="cal-h${ymd === pubToday() ? " today" : ""}"><div class="d">${esc(pubFmt(ymd, { weekday: "short" }))}</div><div class="n">${esc(pubFmt(ymd, { day: "numeric" }))}</div></div>`).join("");
+  const body = days.map((ymd) => pubDayBoxHtml(d, ymd)).join("");
   return `<div class="cal-wrap"><div class="cal cal-boxes" id="pub-cal">${head}${body}</div></div>`;
 }
 
@@ -291,7 +324,7 @@ function pubToolbar(d) {
       <button type="button" class="btn btn-xs btn-ghost" data-week="0">${esc(labels.today)}</button></div>
     <span class="grow"></span>
     <span class="pub-account-style">${style}</span>
-    <div class="legend"><span><i style="background:var(--info)"></i>planifié / programmé</span><span><i style="background:var(--ok)"></i>publié</span><span><i style="background:var(--bad)"></i>échec</span></div>
+    <div class="legend"><span><i class="pub-leg info"></i>planifié / programmé</span><span><i class="pub-leg ok"></i>publié</span><span><i class="pub-leg bad"></i>échec</span></div>
   </div>`;
 }
 
@@ -1295,6 +1328,13 @@ function pubWire(body) {
     el.onclick = open;
     el.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); } };
   });
+  // « +N autres » (TASK-460904227d2f) : jamais de post caché sans indication, ouvre la vue Jour de ce jour.
+  $$("[data-pub-more]", body).forEach((b) => (b.onclick = () => {
+    pubUi.range = "day";
+    pubUi.week = b.dataset.pubMore;
+    pubUi.data = null; pubUi.html = "";
+    renderCurrent();
+  }));
   pubWireMouse(body);
   pubWireTouch(body);
   if (pubUi.landed) {
