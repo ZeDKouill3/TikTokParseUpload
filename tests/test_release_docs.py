@@ -86,12 +86,19 @@ def _published_headings(text: str) -> list[str]:
     return [h for h in re.findall(r"^## (.+)$", text, re.M) if h != "[Non publié]"]
 
 
-def test_changelog_has_empty_unreleased_then_the_current_version_first():
+def test_changelog_has_unreleased_then_the_current_version_first():
     text = _read(CHANGELOG)
     headings = re.findall(r"^## (.+)$", text, re.M)
     assert headings[0] == "[Non publié]"
     assert re.fullmatch(rf"\[{ESC_VERSION}\] - \d{{4}}-\d{{2}}-\d{{2}}", headings[1]), headings[1]
-    assert _changelog_section(text, r"\[Non publié\]").strip() == ""
+    # [Non publié] recoit les changements entre deux versions : vide, ou rangé en sections Keep a Changelog.
+    unreleased = _changelog_section(text, r"\[Non publié\]").strip()
+    if unreleased:
+        titles = re.findall(r"^### (.+)$", unreleased, re.M)
+        assert titles and unreleased.startswith("### "), "[Non publié] non vide : contenu hors section ###"
+        assert set(titles) <= {
+            "Ajouté", "Modifié", "Corrigé", "Sécurité", "Retiré", "Obsolète", "À savoir pour migrer",
+        }, titles
     assert _published_headings(text)[0].startswith(f"[{VERSION}]")
     assert headings[-1].startswith("[0.1.0]")
 
