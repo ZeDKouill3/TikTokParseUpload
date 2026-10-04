@@ -3358,11 +3358,14 @@ def test_publish_screen_is_wired_with_calendar_queue_and_actions():
 def test_publish_calendar_css_scales_day_boxes_and_never_overflows_the_page():
     css = (STATIC / "style.css").read_text(encoding="utf-8")
 
-    for sel in (".cal-day", ".cal-day.compact", ".cal-day.mini", ".cal-month", ".pub-day-list", ".cal-mini-row", ".cal-more"):
+    for sel in (".cal-day", ".cal-day.compact", ".cal-day.mini", ".cal-month", ".pub-day-list", ".cal-mini-row", ".cal-month-count"):
         assert sel in css, sel
     assert ".cal-day.dense" not in css                                  # palier retire (TASK-460904227d2f)
+    assert ".cal-more" not in css                                       # plus de « +N autres » (TASK-39bbe20b3284)
     body = css[css.index(".cal-day {"):css.index(".cal-day {") + css[css.index(".cal-day {"):].index("}")]
-    assert "overflow-y: auto" in body and "max-height" in body          # defile plutot que deborder sur la page
+    assert "overflow-y" not in body and "max-height" not in body        # la case s'agrandit, ni defilement ni coupure
+    assert "max-height" not in css[css.index(".cal-month .cal-day.small"):].split("\n", 1)[0]
+    assert "overflow-y" not in css[css.index("@media (max-width: 900px) {\n  .cal-day"):]
 
 
 # --------------------------------------------------------------------------
@@ -7025,21 +7028,24 @@ def test_publish_box_density_class_scales_with_post_count():
     assert out == ["", "", "", "compact", "compact", "mini", "mini"]
 
 
-@_NODE
-def test_publish_week_box_truncates_a_busy_day_to_mini_rows_with_a_counted_link_to_day_view():
-    # Relevé réel (2026-10-04, 17 posts le dimanche) : la case coupait sans l'indiquer (TASK-460904227d2f).
-    ymd = "2026-10-11"
+def _busy_week(ymd, n, free=None):
     posts = [{"video_id": "v", "clip_id": f"{i:02d}", "publish_status": "scheduled", "screen_title": f"Clip {i}",
-              "service": "tiktok", "slot_at": f"2026-10-11T{i:02d}:00:00+00:00", "slot_at_paris": f"2026-10-11T{i:02d}:00:00+02:00",
-              "video_url": "/m", "thumbnail_url": "/t"} for i in range(17)]
-    week = {"week_start": "2026-10-05", "week_end": "2026-10-11", "slots": [], "days": _week_days({ymd: posts})}
+              "service": "tiktok", "slot_at": f"{ymd}T{i % 24:02d}:00:00+00:00", "slot_at_paris": f"{ymd}T{i % 24:02d}:00:00+02:00",
+              "video_url": "/m", "thumbnail_url": "/t"} for i in range(n)]
+    return {"week_start": "2026-10-05", "week_end": "2026-10-11", "slots": [free] if free else [], "days": _week_days({ymd: posts})}
 
-    out = _run_publish(f"pubCalendarWeek({json.dumps(week)})")
 
-    assert "cal-day mini" in out                               # palier mini (17 > 10)
-    assert out.count("cal-mini-row") == 10                     # cap visible (PUB_WEEK_MINI_CAP)
-    assert "+7 autres" in out                                  # 17 - 10 caches, jamais sans indication
-    assert f'data-pub-more="{ymd}"' in out                     # cible : vue Jour de ce jour
+@_NODE
+@pytest.mark.parametrize("n", [20, 40])
+def test_publish_week_box_renders_every_post_of_a_busy_day_without_any_more_link(n):
+    # Demande utilisateur 2026-10-04 (TASK-39bbe20b3284) : tout est visible en Semaine, la case s'agrandit.
+    ymd = "2026-10-11"
+
+    out = _run_publish(f"pubCalendarWeek({json.dumps(_busy_week(ymd, n))})")
+
+    assert "cal-day mini" in out                               # le palier mini reste pour garder la case lisible
+    assert out.count("cal-mini-row") == n                      # aucune coupure : une boite par publication
+    assert "autres" not in out and "data-pub-more" not in out and "cal-more" not in out
 
 
 @_NODE
@@ -7056,7 +7062,7 @@ def test_publish_week_box_mini_tier_keeps_free_slots_as_full_drop_targets():
     out = _run_publish(f"pubCalendarWeek({json.dumps(week)})")
 
     assert 'class="cal-c slot free' in out and 'data-slot-at="2026-10-11T22:00:00+02:00"' in out
-    assert out.count("cal-mini-row") == 10                     # le creneau libre ne consomme pas le cap des posts
+    assert out.count("cal-mini-row") == 12                     # les 12 posts rendus, le creneau libre en plus
 
 
 @_NODE
@@ -7075,20 +7081,28 @@ def test_publish_week_box_compact_tier_keeps_full_post_cards_without_truncation(
 
 
 @_NODE
-def test_publish_month_box_shows_first_posts_then_a_counted_link_to_day_view():
-    ymd = "2026-10-11"
-    posts = [{"video_id": "v", "clip_id": f"{i:02d}", "publish_status": "scheduled", "screen_title": f"Clip {i}",
-              "service": "tiktok", "slot_at": f"2026-10-11T{i:02d}:00:00+00:00", "slot_at_paris": f"2026-10-11T{i:02d}:00:00+02:00",
-              "video_url": "/m", "thumbnail_url": "/t"} for i in range(6)]
-    days = [{"date": f"2026-10-{d:02d}", "count": (6 if f"2026-10-{d:02d}" == ymd else 0),
-             "posts": (posts if f"2026-10-{d:02d}" == ymd else [])} for d in range(1, 32)]
+def test_publish_month_box_shows_only_the_day_number_and_the_video_count_linking_to_day_view():
+    posts = lambda ymd, n: [{"video_id": "v", "clip_id": f"{i:02d}", "publish_status": "scheduled", "screen_title": f"Clip {i}",
+                             "service": "tiktok", "slot_at": f"{ymd}T10:00:00+00:00", "slot_at_paris": f"{ymd}T12:00:00+02:00",
+                             "video_url": "/m", "thumbnail_url": "/t"} for i in range(n)]
+    counts = {"2026-10-06": 0, "2026-10-07": 1, "2026-10-08": 17}
+    days = [{"date": f"2026-10-{d:02d}", "count": counts.get(f"2026-10-{d:02d}", 0),
+             "posts": posts(f"2026-10-{d:02d}", counts.get(f"2026-10-{d:02d}", 0))} for d in range(1, 32)]
     month = {"range": "month", "range_start": "2026-10-01", "range_end": "2026-10-31", "slots": [], "days": days}
 
-    out = _run_publish(f"pubCalendarMonth({json.dumps(month)})")
+    out = _run_publish(f"""(() => {{
+      const html = pubCalendarMonth({json.dumps(month)});
+      const cell = (ymd) => html.split('<div class="cal-day ').slice(1).find((c) => c.includes('data-date="' + ymd + '"'));
+      return {{ html, zero: cell("2026-10-06"), one: cell("2026-10-07"), many: cell("2026-10-08") }};
+    }})()""")
 
-    assert out.count("cal-mini-row") == 4                      # cap visible (PUB_MONTH_CAP)
-    assert "+2 autres" in out                                  # 6 - 4 caches, jamais sans indication
-    assert f'data-pub-more="{ymd}"' in out                     # cible : vue Jour de ce jour
+    html = out["html"]
+    assert "cal-mini-row" not in html and 'class="post' not in html and "data-post=" not in html   # plus aucune boite de publication
+    assert "autres" not in html and "cal-more" not in html
+    assert "17 vidéos" in out["many"] and 'data-pub-day="2026-10-08"' in out["many"]               # clic -> vue Jour
+    assert "1 vidéo<" in out["one"] and "1 vidéos" not in out["one"] and 'data-pub-day="2026-10-07"' in out["one"]
+    assert "vidéo" not in out["zero"] and "cal-day-count" not in out["zero"]                       # rien si 0
+    assert ">8<" in out["many"] and ">6<" in out["zero"]                                           # le numero du jour reste
 
 
 def test_publish_week_calendar_has_no_leading_empty_hour_column():
