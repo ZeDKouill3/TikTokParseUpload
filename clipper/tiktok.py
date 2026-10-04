@@ -689,6 +689,13 @@ class _Flow:
         switch = self.page.query_selector(self.sel["selectors"]["content_check_switch"])
         if switch is None:
             raise self.stop("element_missing", "interrupteur « Vérification de contenu simple » introuvable")
+        limit_reached = self.page.query_selector("text=/limite de vérifications/i") is not None
+        if switch.is_checked() and (switch.is_disabled() or limit_reached):
+            # Limite quotidienne de vérifications atteinte : TikTok grise l'interrupteur (« Tu as atteint la
+            # limite de vérifications pour aujourd'hui »), aucune vérification ne tourne, rien à couper.
+            logger.info("TikTok %s : vérification de contenu indisponible (interrupteur grisé, limite du jour)",
+                        self.account)
+            return
         if switch.is_checked():
             switch.uncheck(force=True)
             self.pause()

@@ -2378,15 +2378,30 @@ def test_a_missing_stats_selector_is_an_explicit_error(tmp_path):
 
 
 class FakeSwitch:
-    def __init__(self, checked):
-        self.checked, self.unchecks = checked, 0
+    def __init__(self, checked, disabled=False):
+        self.checked, self.unchecks, self.disabled = checked, 0, disabled
 
     def is_checked(self):
         return self.checked
 
+    def is_disabled(self):
+        return self.disabled
+
     def uncheck(self, **kwargs):
         self.unchecks += 1
-        self.checked = False
+        if not self.disabled:  # TikTok grise l'interrupteur : le clic ne change rien
+            self.checked = False
+
+
+def test_content_check_off_with_the_switch_greyed_by_the_daily_limit_publishes_without_unchecking(tmp_path, monkeypatch):
+    # Relevé réel 2026-10-04 : « Tu as atteint la limite de vérifications pour aujourd'hui » -> interrupteur
+    # coché mais désactivé ; uncheck(force=True) ne change rien et arrêtait la publication (unexpected_page).
+    env = Env(tmp_path, monkeypatch, settings={"content_check": "off"})
+    switch = FakeSwitch(True, disabled=True)
+    real = env.page.query_selector
+    env.page.query_selector = lambda css: switch if css == _sel()["selectors"]["content_check_switch"] else real(css)
+    env.publish()
+    assert switch.unchecks == 0
 
 
 def test_content_check_off_turns_the_switch_off_and_never_waits(tmp_path, monkeypatch):
