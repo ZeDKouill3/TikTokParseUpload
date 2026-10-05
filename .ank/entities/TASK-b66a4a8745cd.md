@@ -5,7 +5,7 @@ slug: relev-des-stats-tiktok-la-liste-des-publications
 title: "Relevé des stats TikTok : la liste des Publications s'arrête aux ~8 premières vidéos (le défilement ne charge pas la suite)"
 created: 2026-10-05T18:50:32Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/tiktok.py
   - clipper/assets/tiktok_selectors.toml
@@ -16,8 +16,15 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: diagnose
+proof:
+  - type: test
+    ref: local/7e16ff2d63f4@9145e80
+    tree: scope/6a68b26109c4
+    criteria: 8b8692072c18
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---
 
 Signalé par l'utilisateur 2026-10-05 : « tu ne fais pas le tour de toutes les vidéos quand tu scannes ». Conséquence : la détection des vidéos restreintes (TASK-4777) ne voit pas les vidéos déjà en ligne.

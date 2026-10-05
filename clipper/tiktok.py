@@ -74,7 +74,7 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "stats_detail_days": 7,            # un post publie depuis moins de N jours est relu en detail a chaque releve
     "stats_detail_max": 50,            # plafond de posts relus en detail (3 pages chacun) par releve
     "stats_audience_min_views": 100,   # Spectateurs / Engagement : TikTok ne les remplit qu'a partir de 100 vues
-    "stats_scroll_rounds": 10,         # limite de securite : defilements de la liste des Publications ; atteinte = arret journalise
+    "stats_scroll_rounds": 100,        # limite de securite : pas de defilement de la liste des Publications (~5 posts chacun) ; atteinte = arret journalise
     "stats_empty_wait_s": 8,           # attente des lignes (ou de l'etat vide) de la page Publications avant de conclure « aucun post »
 }
 
@@ -104,6 +104,7 @@ VIEWERS_SECTIONS = ("types", "age", "gender", "locations")
 _DETECT_KINDS = ("captcha", "verification", "login")
 _POST_ID = re.compile(r"/video/(\d+)")
 _POST_ID_END = re.compile(r"/video/(\d+)/?(?:[?#].*)?$")
+_SCROLL_IDLE = 2  # pas de defilement consecutifs sans nouvelle ligne, bas atteint, avant de conclure que la liste est finie
 
 
 class TikTokError(Exception):
@@ -927,25 +928,28 @@ class _Flow:
         return tiles
 
     def list_posts(self) -> dict[str, dict[str, Any]]:
-        """Page Publications, defilee jusqu'a ce que la liste ne grandisse plus : un dict par post (id -> ligne).
-        Un compte sans aucun post (page vide) rend ``{}`` sans erreur. Si la liste grandit encore apres
-        ``stats_scroll_rounds`` defilements, c'est un arret journalise (R7 : jamais une liste tronquee en silence)."""
+        """Page Publications : un dict par post (id -> ligne). La liste est virtualisee (le DOM ne garde que
+        quelques lignes) : on la descend pas a pas (``scroll_script``) et on CUMULE les lignes lues a chaque pas.
+        Fin = bas atteint et ``_SCROLL_IDLE`` tours de suite sans nouvelle ligne. Un compte sans aucun post (page
+        vide) rend ``{}`` sans erreur. Si la fin n'est pas atteinte apres ``stats_scroll_rounds`` pas, c'est un arret
+        journalise (R7 : jamais une liste tronquee en silence)."""
         self.open_page(self.sel["urls"]["stats"], self.sel["expect"]["stats_url_prefix"])
         rows = self.wait_rows_or_empty()
         if not rows:
             return {}
         rounds = int(self.settings["stats_scroll_rounds"])
+        idle = 0
         for _ in range(rounds):
-            self.page.evaluate(self.sel["stats"]["scroll_script"])
+            at_bottom = self.page.evaluate(self.sel["stats"]["scroll_script"]) is True
             self.pause()
-            more = self.read_rows()
-            if len(more) <= len(rows):
+            fresh = {i: row for i, row in self.read_rows().items() if i not in rows}
+            rows.update(fresh)
+            idle = 0 if fresh else idle + 1
+            if at_bottom and idle >= _SCROLL_IDLE:
                 return rows
-            rows = more
-        raise self.stop("scroll_limit", f"la liste des Publications grandit encore après {rounds} défilements ({len(rows)} posts "
+        raise self.stop("scroll_limit", f"la liste des Publications n'est pas finie après {rounds} défilements ({len(rows)} posts "
                                         f"lus) : relevé arrêté pour ne pas garder une liste tronquée, augmente "
                                         f"[tiktok] stats_scroll_rounds")
-
     def wait_rows_or_empty(self) -> dict[str, dict[str, Any]]:
         """Attend les lignes de la page Publications OU son etat vide, en course et quelques secondes seulement
         (``stats_empty_wait_s``, pas les 30 s d'un repere manquant) : un compte neuf n'a aucune ligne. Rend les
