@@ -7793,6 +7793,32 @@ def test_a_post_deleted_on_tiktok_disappears_from_the_videos_and_the_sheet_but_n
     assert len(list((tmp_path / "state" / "stats" / "tiktok" / TT_ACCOUNT).glob("*.json"))) == 2  # historique intact
 
 
+@pytest.mark.skipif(shutil.which("node") is None, reason="node absent du PATH")
+def test_stats_count_restricted_videos_among_those_online_and_never_guess_unknown_ones():
+    out = _stats_js_run(["statsRestriction"], (
+        'statsRestriction([{fyf_eligible: false}, {fyf_eligible: true}, {fyf_eligible: true}, '
+        '{fyf_eligible: null}, {}])'))
+    assert out == {"restricted": 1, "online": 3}  # programmee (null) ou jamais relevee : ni restreinte ni en ligne
+    assert _stats_js_run(["statsRestriction"], "statsRestriction([])") == {"restricted": 0, "online": 0}
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node absent du PATH")
+def test_stats_restricted_chip_and_account_summary_are_rendered():
+    js = _static("screens", "stats.js")
+    assert "Restreinte : pas dans Pour toi" in js and "en ligne</span>" in js
+    assert "fyf_eligible === false" in js and "fyf_notice" in js  # pastille par post + texte de TikTok dans la fiche
+    chip = _stats_js_run(["statsRestrictedChip"], '(globalThis.icon = () => "", statsRestrictedChip({fyf_eligible: false}))')
+    assert "Restreinte : pas dans Pour toi" in chip
+    assert _stats_js_run(["statsRestrictedChip"], '(globalThis.icon = () => "", statsRestrictedChip({fyf_eligible: true}))') == ""
+    assert _stats_js_run(["statsRestrictedChip"], '(globalThis.icon = () => "", statsRestrictedChip({fyf_eligible: null}))') == ""
+    one = _stats_js_run(["statsRestriction", "statsRestrictionSummary"], 'statsRestrictionSummary([{fyf_eligible: false}, {fyf_eligible: true}])')
+    assert "1 vidéo restreinte sur 2 en ligne" in one
+    many = _stats_js_run(["statsRestriction", "statsRestrictionSummary"], 'statsRestrictionSummary([{fyf_eligible: false}, {fyf_eligible: false}, {fyf_eligible: true}])')
+    assert "2 vidéos restreintes sur 3 en ligne" in many
+    assert "0 vidéo restreinte sur 1 en ligne" in _stats_js_run(["statsRestriction", "statsRestrictionSummary"], 'statsRestrictionSummary([{fyf_eligible: true}])')
+    assert _stats_js_run(["statsRestriction", "statsRestrictionSummary"], 'statsRestrictionSummary([{fyf_eligible: null}, {}])') == ""  # rien de relevé
+
+
 def test_the_stats_screen_triggers_the_opening_fetch_and_shows_the_running_state():
     js = (Path(__file__).resolve().parent.parent / "clipper" / "web" / "static" / "screens" / "stats.js").read_text(encoding="utf-8")
     assert "/api/stats/tiktok/open" in js and "refreshing" in js and "Relevé en cours" in js

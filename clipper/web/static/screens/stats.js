@@ -311,6 +311,24 @@ function statsOverview(account) {
     </div>`;
 }
 
+/* Restriction « Pour toi » (bandeau de TikTok Studio, relevé par vidéo) : false = restreinte, true = éligible,
+   null/absent = programmée ou jamais relevée : jamais comptée, jamais devinée. */
+function statsRestriction(videos) {
+  const known = videos.filter((v) => v.fyf_eligible === true || v.fyf_eligible === false);
+  return { restricted: known.filter((v) => v.fyf_eligible === false).length, online: known.length };
+}
+
+function statsRestrictedChip(v) {
+  return v.fyf_eligible === false
+    ? `<span class="chip warn" data-stats-restricted title="${esc(v.fyf_notice || "")}">${icon("triangle-alert", "i-xs")}Restreinte : pas dans Pour toi</span>` : "";
+}
+
+function statsRestrictionSummary(videos) {
+  const r = statsRestriction(videos);
+  if (!r.online) return "";
+  return `<span class="chip ${r.restricted ? "warn" : "plain ok"}" data-stats-restriction-summary>${esc(fr(r.restricted))} vidéo${r.restricted > 1 ? "s" : ""} restreinte${r.restricted > 1 ? "s" : ""} sur ${esc(fr(r.online))} en ligne</span>`;
+}
+
 function statsVideoRow(v) {
   const vis = STATS_VISIBILITY[v.visibility] || (v.visibility ? esc(v.visibility) : "—");
   const proc = v.processing;
@@ -319,7 +337,7 @@ function statsVideoRow(v) {
   const origin = v.outside_clipper ? `<span class="chip plain">publié hors Clipper</span>` : `<span class="chip plain ok">clip Clipper</span>`;
   return `<tr class="clickable" tabindex="0" role="link" data-stats-open="${esc(v.post_id)}" aria-label="Fiche : ${esc(v.caption || v.post_id)}">
     <td class="c-thumb"><div class="thumb-p ${proc ? "proc" : ""}" ${proc ? "" : `style="${statsPoster(v.post_id)}"`}><i></i></div></td>
-    <td class="c-cap"><div class="cap">${esc(v.caption || "(sans légende)")}</div><div class="vis">${proc ? `<span class="chip warn">En cours de traitement</span>` : `<span class="chip plain ${v.visibility === "public" ? "ok" : ""}">${vis}</span>`}${origin}</div></td>
+    <td class="c-cap"><div class="cap">${esc(v.caption || "(sans légende)")}</div><div class="vis">${proc ? `<span class="chip warn">En cours de traitement</span>` : `<span class="chip plain ${v.visibility === "public" ? "ok" : ""}">${vis}</span>`}${statsRestrictedChip(v)}${origin}</div></td>
     <td class="c-date">${esc(statsPostedAt(v.posted_at, v.posted_at_text))}</td>
     ${nums.map((n, i) => `<td class="r ${proc || n === "—" ? "dim" : ""}" data-l="${labels[i]}">${esc(n)}</td>`).join("")}</tr>`;
 }
@@ -335,7 +353,7 @@ function statsVideosList(account) {
   const body = videos.length ? videos.map(statsVideoRow).join("")
     : `<tr><td colspan="9" class="muted" style="text-align:center;padding:32px">Aucune légende ne contient « ${esc(statsUi.q)} ».</td></tr>`;
   return `<div class="panel" data-stats-videos>
-    <div class="panel-head"><h2>Vidéos de ${esc(account.label)}</h2><div class="right"><span class="input-ico">${icon("search")}<input class="input" id="stats-q" data-stats-q type="search" placeholder="Filtrer par légende" value="${esc(statsUi.q)}" aria-label="Filtrer par légende" style="width:220px"></span></div></div>
+    <div class="panel-head"><h2>Vidéos de ${esc(account.label)}</h2><div class="right">${statsRestrictionSummary(statsUi.videos)}<span class="input-ico">${icon("search")}<input class="input" id="stats-q" data-stats-q type="search" placeholder="Filtrer par légende" value="${esc(statsUi.q)}" aria-label="Filtrer par légende" style="width:220px"></span></div></div>
     <div class="sort-m"><select class="input" data-stats-sort-select aria-label="Trier par">${STATS_COLUMNS.map(([key, label]) => `<option value="${key}"${sort.key === key ? " selected" : ""}>Trier : ${esc(label)}</option>`).join("")}</select><button class="btn" type="button" data-stats-sort-dir aria-label="Inverser le tri">${sort.dir === "asc" ? "▲" : "▼"}</button></div>
     <div style="overflow-x:auto"><table class="table ptable"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>
     <div class="pager-note">${icon("info", "i-xs")}<span>${esc(fr(videos.length))} vidéo${videos.length > 1 ? "s" : ""} · cliquer une ligne ouvre sa fiche. Les vidéos en cours de traitement sont relevées à nouveau au prochain passage.</span></div></div>`;
@@ -402,7 +420,8 @@ function statsVideoSheet(account) {
   return `${back}<div class="video-sheet" data-stats-sheet>
     <div><div class="poster-big" style="${v.processing ? "background:var(--surface-3)" : statsPoster(v.post_id)}"><span>${esc((v.caption || "").split("#")[0].trim() || v.post_id)}</span></div>
       <h2 style="font-size:17px;margin-top:16px">${esc(v.caption || "(sans légende)")}</h2>
-      <div class="muted" style="font-size:13px;margin-top:8px">Publié le ${esc(statsPostedAt(v.posted_at, v.posted_at_text))} · <span class="chip plain ${v.visibility === "public" ? "ok" : ""}">${esc(vis)}</span></div>
+      <div class="muted" style="font-size:13px;margin-top:8px">Publié le ${esc(statsPostedAt(v.posted_at, v.posted_at_text))} · <span class="chip plain ${v.visibility === "public" ? "ok" : ""}">${esc(vis)}</span> ${statsRestrictedChip(v)}</div>
+      ${v.fyf_eligible === false ? `<div class="reason" data-stats-fyf-notice>${icon("triangle-alert", "i-sm")}<span><b>TikTok ne recommande pas cette vidéo dans le fil Pour toi.</b> ${esc(v.fyf_notice || "")}</span></div>` : ""}
       <div class="dlinks">${links.join("")}</div>${origin}</div>
     <div><div class="tabs" role="tablist" aria-label="Sections de la fiche">${STATS_VIDEO_TABS.map(([id, label]) => `<button type="button" role="tab" class="${tab === id ? "on" : ""}" aria-selected="${tab === id}" data-stats-vtab="${id}">${esc(label)}</button>`).join("")}</div>
       ${v.processing ? `<div class="reason">${icon("hourglass", "i-sm")}<span><b>TikTok traite encore cette vidéo.</b> Les chiffres arrivent en général dans l'heure qui suit la publication ; Clipper la relèvera au prochain passage.</span></div>` : ""}

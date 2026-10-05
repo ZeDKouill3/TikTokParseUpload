@@ -96,7 +96,7 @@ MAX_POPUP_ROUNDS = 5   # fenetres successives fermees par un meme controle avant
 MAX_MONTH_STEPS = 24   # fleches du calendrier cliquees au plus avant d'abandonner
 REQUIRED_STATS_SELECTORS = ("row", "post_link", "likes", "comments", "metric_card", "traffic_sources", "processing",
                             "views", "visibility", "created", "retention_point", "viewers_card", "engagement_card",
-                            "page_text", "scroll_script")
+                            "page_text", "scroll_script", "fyf_notice")
 METRICS = ("views", "watch_total", "watch_avg", "watched_full", "new_followers", "retention")
 TILES = ("views", "profile_views", "likes", "comments", "shares")   # tuiles de la page Donnees analytiques (SPEC-86fe R1)
 PERIODS = (7, 28, 60)                                                # periodes relevees, en jours
@@ -1038,6 +1038,7 @@ class _Flow:
             read = self.read_value(value, key, parse, f"post {post_id}")
             post[field] = read if read is not None or field != "views" else row.get("views")
         post["retention_curve"] = self.read_retention_curve(post_id)
+        post["fyf_eligible"], post["fyf_notice"] = self.read_fyf_notice(post_id, row)
         sources = self.page.query_selector(self.sel["stats"]["traffic_sources"])
         text = _squash(str(sources.inner_text())) if sources is not None else ""
         post["traffic_sources"] = None if not text or self.sel["stats"]["processing"].casefold() in text.casefold() else text
@@ -1053,6 +1054,20 @@ class _Flow:
         post["shares"] = None if engagement is None else engagement.get("shares")
         post["detailed_at"] = self.now.isoformat()
         return post
+
+    def read_fyf_notice(self, post_id: str, row: dict[str, Any]) -> tuple[bool | None, str | None]:
+        """Bandeau « pas eligible au fil Pour toi » de l'analyse (repere par son texte) : ``(eligible, texte)``.
+        Absent = eligible ; post programme pas encore en ligne = ``(None, None)`` (rien a dire, jamais devine)."""
+        posted = _naive_utc(row.get("posted_at"))
+        if posted is not None and posted > self.now:
+            return None, None
+        banner = self.page.query_selector(self.sel["stats"]["fyf_notice"])
+        if banner is None:
+            return True, None
+        text = _squash(str(banner.inner_text()))
+        if not text:
+            raise self.reject("unexpected_page", f"bandeau de restriction vide (post {post_id})")
+        return False, text
 
     def read_retention_curve(self, post_id: str) -> list[dict[str, Any]] | None:
         """Courbe de retention : un point par element ``retention_point`` (« instant | part encore presente »)."""
@@ -1473,7 +1488,7 @@ def fetch_stats(
 
 VIDEO_SORTS = ("posted_at", "caption", "views", "likes", "comments", "shares", "avg_watch_s", "watched_full")
 _LIGHT_FIELDS = ("post_id", "post_url", "caption", "posted_at", "posted_at_text", "visibility", "views", "likes",
-                 "comments", "shares", "avg_watch_s", "watched_full")
+                 "comments", "shares", "avg_watch_s", "watched_full", "fyf_eligible", "fyf_notice")
 
 
 def _day(stamp: str) -> date:
