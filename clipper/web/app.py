@@ -1753,6 +1753,19 @@ def _stats_body_account(raw: bytes, *, required: bool) -> str | None:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
+def _stats_refresh_body(raw: bytes) -> tuple[str | None, bool]:
+    """Corps de ``POST /api/stats/tiktok/refresh`` : ``{"account": id, "full": bool}`` (``full`` facultatif : releve
+    sans plafond du detail, « Releve complet »). 422 si ``full`` n'est pas un booleen."""
+    try:
+        body = json.loads(raw) if raw.strip() else {}
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="corps JSON invalide") from exc
+    full = body.pop("full", False) if isinstance(body, dict) else False
+    if not isinstance(full, bool):
+        raise HTTPException(status_code=422, detail=f"full : un booléen est attendu, reçu {full!r}")
+    return _stats_body_account(json.dumps(body).encode(), required=False), full
+
+
 class ChannelBody(BaseModel):
     preset: dict[str, Any]
 
@@ -3112,7 +3125,9 @@ def create_app(config: Config | None = None) -> FastAPI:
             history = _stats_tiktok_call(tiktok_mod.read_history, found["id"], config=config)
             full = [s for s in history if s.get("origin") == "full"]
             stale = info["ready"] and _stats_tiktok_call(tiktok_mod.stats_stale, found["id"], config=config)
+            known = len(full[-1]["posts"]) if full else 0
             accounts.append({**info, "fetched_at": history[-1]["fetched_at"] if history else None,
+                             "known_posts": known, "full_pages": 2 + 3 * known if known else None,
                              "last_full_at": full[-1]["fetched_at"] if full else None, "snapshots": len(history),
                              "error": _stats_tiktok_call(tiktok_mod.read_error, found["id"], config=config),
                              "stale": bool(stale), "refreshing": stats_refreshes.running(found["id"]),
@@ -3121,7 +3136,7 @@ def create_app(config: Config | None = None) -> FastAPI:
 
     @app.get("/api/stats/tiktok/{account_id}")
     def stats_tiktok_overview(account_id: str, period: int = 28) -> dict[str, Any]:
-        """Vue d'ensemble d'un compte sur ``period`` jours (7, 28 ou 60) : 5 tuiles avec evolution, courbes par jour."""
+        """Vue d'ensemble d'un compte sur ``period`` jours (7, 28, 60 ou 365) : 5 tuiles avec evolution, courbes par jour."""
         info = _stats_account_info(config, account_id)
         return {**info, **_stats_tiktok_call(tiktok_mod.account_overview, account_id, period, config=config)}
 
@@ -3170,11 +3185,11 @@ def create_app(config: Config | None = None) -> FastAPI:
 
     @app.post("/api/stats/tiktok/refresh")
     async def stats_tiktok_refresh(request: Request) -> dict[str, Any]:
-        """Releve a la demande (« Relever maintenant », SPEC-47e2 R4c) : un compte (``{"account": id}``) ou, sans corps,
+        """Releve a la demande (« Relever maintenant », SPEC-47e2 R4c ; ``"full": true`` = « Relevé complet », detail sans plafond) : un compte (``{"account": id}``) ou, sans corps,
         tous les comptes prets. Un compte non pret n'est pas releve (409 avec la raison). Un compte dont un releve
         tourne deja n'est pas relance : son entree vaut ``{"running": true}``. Ouvre le Chrome visible du profil sur
         cette machine ; un arret sur (R4 de SPEC-9225) est une 409 avec sa raison."""
-        account = _stats_body_account(await request.body(), required=False)
+        account, full = _stats_refresh_body(await request.body())
         wanted = [account] if account is not None else None
         known = {a["id"]: a for a in _accounts_call(accounts_mod.list_accounts, config)}
         for account in wanted or []:
@@ -3191,7 +3206,8 @@ def create_app(config: Config | None = None) -> FastAPI:
                 done[account] = {"running": True, "fetched_at": None, "posts": None}  # deja en cours : rien n'est relance
                 continue
             try:
-                report = await run_in_threadpool(tiktok_mod.fetch_stats, account, config=config)
+                options = {"full": True} if full else {}  # le releve normal garde le plafond du detail
+                report = await run_in_threadpool(tiktok_mod.fetch_stats, account, config=config, **options)
             except (tiktok_mod.TikTokStop, browser_mod.BrowserError) as exc:
                 raise HTTPException(status_code=409, detail=f"relevé du compte {account} arrêté : {exc}") from exc
             except tiktok_mod.TikTokError as exc:

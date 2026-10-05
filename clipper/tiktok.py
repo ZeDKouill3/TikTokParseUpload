@@ -72,7 +72,7 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "stats_stale_min": 60,             # ecran Statistiques : releve a l'ouverture si le dernier a plus de N minutes (0 = jamais)
     "stats_dir": "state/stats/tiktok",  # historique par compte : <stats_dir>/<compte>/<horodatage>.json (SPEC-86fe R2)
     "stats_detail_days": 7,            # un post publie depuis moins de N jours est relu en detail a chaque releve
-    "stats_detail_max": 50,            # plafond de posts relus en detail (3 pages chacun) par releve
+    "stats_detail_max": 30,            # detail (3 pages chacun) seulement pour les N posts les plus recents de la liste ; les autres : chiffres de la liste. « Releve complet » : sans plafond
     "stats_audience_min_views": 100,   # Spectateurs / Engagement : TikTok ne les remplit qu'a partir de 100 vues
     "stats_scroll_rounds": 100,        # limite de securite : pas de defilement de la liste des Publications (~5 posts chacun) ; atteinte = arret journalise
     "stats_empty_wait_s": 8,           # attente des lignes (ou de l'etat vide) de la page Publications avant de conclure « aucun post »
@@ -99,7 +99,7 @@ REQUIRED_STATS_SELECTORS = ("row", "post_link", "likes", "comments", "metric_car
                             "page_text", "scroll_script", "fyf_notice")
 METRICS = ("views", "watch_total", "watch_avg", "watched_full", "new_followers", "retention")
 TILES = ("views", "profile_views", "likes", "comments", "shares")   # tuiles de la page Donnees analytiques (SPEC-86fe R1)
-PERIODS = (7, 28, 60)                                                # periodes relevees, en jours
+PERIODS = (7, 28, 60, 365)                                           # periodes relevees, en jours
 VIEWERS_SECTIONS = ("types", "age", "gender", "locations")
 _DETECT_KINDS = ("captcha", "verification", "login")
 _POST_ID = re.compile(r"/video/(\d+)")
@@ -323,6 +323,7 @@ def read_events(since: str | None = None, *, config: Config | None = None) -> li
 _ABSENT = frozenset({"", "-", "--", "–", "—", "N/A", "n/a"})
 _SUFFIX = {"": 1, "k": 1_000, "m": 1_000_000, "md": 1_000_000_000, "b": 1_000_000_000}
 _COUNT = re.compile(r"(\d[\d ]*)(?:[.,](\d+))?\s*([kKmMbB]|Md)?")
+_COUNT_THOUSANDS = re.compile(r"\d{1,3}(?:,\d{3})+")  # « 1,432 », « 12,345,678 » : virgule + exactement 3 chiffres = milliers anglais
 _PERCENT = re.compile(r"(\d+(?:[.,]\d+)?)\s*%")
 _CLOCK = re.compile(r"(?:(\d+):)?(\d+):(\d{2})")
 _HMS = re.compile(r"(?:(\d+)\s*h\s*:?\s*)?(?:(\d+)\s*m\s*:?\s*)?(?:(\d+(?:[.,]\d+)?)\s*s)?")  # 0h:00m:00s, 12s
@@ -351,10 +352,12 @@ def _text(value: Any) -> str:
 
 
 def parse_count(value: Any) -> int | None:
-    """« 1 200 », « 1,2 K », « 2.5M » -> entier ; tiret ou vide -> ``None`` ; autre -> ``ValueError``."""
+    """« 1 200 », « 1,432 », « 1,2 K », « 2.5M » -> entier ; tiret ou vide -> ``None`` ; autre -> ``ValueError``."""
     text = _text(value)
     if text in _ABSENT:
         return None
+    if _COUNT_THOUSANDS.fullmatch(text):
+        return int(text.replace(",", ""))
     match = _COUNT.fullmatch(text)
     if match is None or (match[2] and not match[3]):  # decimale sans K/M : ambigu, pas de supposition
         raise ValueError(f"nombre illisible : {text!r}")
@@ -391,6 +394,7 @@ def parse_duration(value: Any) -> float | None:
     return float(int(minutes or 0) * 60 + float((match[2] or "0").replace(",", ".")))
 
 
+_TILE_DELTA = re.compile(r"(?<=\S)\s+[+\-\u2212\u2013]\d[\d.,]*\s*[kKmM]?$")
 _CHANGE = re.compile(r"([+\-\u2212\u2013]?)\s*(\d+(?:[.,]\d+)?)\s*%")
 _SHORT_DATE = re.compile(r"(\d{1,2})\s+([^\W\d_]+)\.?\s+(\d{4})(?:[,\s]+(\d{1,2})[:h](\d{2}))?")
 # Page Publications : « 2 oct., 12:30 » sans annee (annee de la page, deduite de la date du releve).
@@ -872,15 +876,21 @@ class _Flow:
             return None, f"{type(exc).__name__} : {exc}"
 
     # -- releve des statistiques (SPEC-86fe R1) : lecture seule, aucun clic hors le menu des periodes
-    def stats(self, previous: dict[str, dict[str, Any]]) -> dict[str, Any]:
-        """Page Donnees analytiques du compte (3 periodes), liste des Publications, puis l'analyse des posts
-        a lire en detail (``needs_detail``). ``previous`` : les posts deja releves (historique fusionne)."""
+    def stats(self, previous: dict[str, dict[str, Any]], full: bool = False) -> dict[str, Any]:
+        """Page Donnees analytiques du compte (4 periodes), liste des Publications, puis l'analyse des posts
+        a lire en detail. ``previous`` : les posts deja releves (historique fusionne). ``full`` : sans le plafond
+        ``stats_detail_max``. Un post sans detail ni ancien detail porte ``detail_not_read`` (jamais de champ invente)."""
         overview = self.account_overview()
         rows = self.list_posts()
-        todo = self.pick_details(rows, previous)
+        todo = self.pick_details(rows, previous, full=full)
         posts = []
         for post_id, row in rows.items():
-            posts.append(self.read_post(post_id, row) if post_id in todo else dict(row))
+            if post_id in todo:
+                posts.append(self.read_post(post_id, row))
+            elif (previous.get(post_id) or {}).get("detailed_at"):
+                posts.append(dict(row))  # la vue fusionnee garde son detail ancien
+            else:
+                posts.append({**row, "detail_not_read": True})
         return {"overview": overview, "posts": posts}
 
     def open_page(self, url: str, prefix: str) -> None:
@@ -891,7 +901,7 @@ class _Flow:
         self.pause()
 
     def account_overview(self) -> dict[str, dict[str, dict[str, Any]]]:
-        """Tuiles de la page Donnees analytiques pour 7, 28 et 60 jours : ``{periode: {tuile: {value, change_pct}}}``."""
+        """Tuiles de la page Donnees analytiques pour 7, 28, 60 et 365 jours : ``{periode: {tuile: {value, change_pct}}}``."""
         self.open_page(self.sel["urls"]["analytics_account"], self.sel["expect"]["account_analytics_url_prefix"])
         self.wait("tile", table="account")
         out = {}
@@ -939,6 +949,7 @@ class _Flow:
             change = re.search(r"\(([^()]*)\)\s*$", rest)
             body = rest[:change.start()].strip() if change else rest
             body = re.sub(r"^(?:--|\|)\s+(?=\S)", "", body)  # « -- 0 » : le premier tiret est un separateur
+            body = _TILE_DELTA.sub("", body)  # « 24 -2 (-7.7%) » : variation absolue avant le pourcentage, ignoree
             where = f"tuile {key}, {days} jours"
             tiles[key] = {"value": self.read_value(body, key, parse_count, where),
                           "change_pct": self.read_value(change[1] if change else None, key, parse_change, where)}
@@ -1022,12 +1033,15 @@ class _Flow:
         except ValueError:
             raise self.reject("unexpected_page", f"valeur illisible ({where}, {key}) : {text!r}") from None
 
-    def pick_details(self, rows: dict[str, dict[str, Any]], previous: dict[str, dict[str, Any]]) -> set[str]:
+    def pick_details(self, rows: dict[str, dict[str, Any]], previous: dict[str, dict[str, Any]],
+                     full: bool = False) -> set[str]:
         """Posts a lire en detail (analyse + spectateurs + engagement) : jamais lus, encore « en cours de
-        traitement » (vues nulles) ou publies depuis moins de ``stats_detail_days`` ; au plus ``stats_detail_max``."""
+        traitement » (vues nulles) ou publies depuis moins de ``stats_detail_days``, parmi les ``stats_detail_max``
+        plus recents de la liste (ordre de la page Publications, recents d'abord) ; ``full`` : toute la liste."""
         recent = timedelta(days=float(self.settings["stats_detail_days"]))
         fresh, others = [], []
-        for post_id, row in rows.items():
+        within = list(rows.items()) if full else list(rows.items())[: int(self.settings["stats_detail_max"])]
+        for post_id, row in within:
             old = previous.get(post_id)
             if old is None or not old.get("detailed_at"):
                 fresh.append(post_id)
@@ -1035,11 +1049,10 @@ class _Flow:
             posted = _naive_utc(row.get("posted_at"))
             if old.get("views") is None or (posted is not None and self.now - posted < recent):
                 others.append(post_id)
-        picked = (fresh + others)[: int(self.settings["stats_detail_max"])]
-        if len(fresh) + len(others) > len(picked):
-            logger.warning("TikTok %s : %d posts à relire en détail, %d seulement ([tiktok] stats_detail_max)",
-                           self.account, len(fresh) + len(others), len(picked))
-        return set(picked)
+        if len(within) < len(rows):
+            logger.info("TikTok %s : détail relevé pour les %d posts les plus récents sur %d ([tiktok] stats_detail_max)",
+                        self.account, len(within), len(rows))
+        return set(fresh + others)
 
     def read_post(self, post_id: str, row: dict[str, Any]) -> dict[str, Any]:
         """Analyse d'un post : cartes de metriques lues par libelle, puis onglets Spectateurs et Engagement."""
@@ -1074,6 +1087,7 @@ class _Flow:
         post["engagement"] = engagement
         post["shares"] = None if engagement is None else engagement.get("shares")
         post["detailed_at"] = self.now.isoformat()
+        post["detail_not_read"] = False
         return post
 
     def read_fyf_notice(self, post_id: str, row: dict[str, Any]) -> tuple[bool | None, str | None]:
@@ -1219,13 +1233,13 @@ class BrowserBackend:
 
     def fetch_stats(self, account: str, previous: dict[str, dict[str, Any]], *, settings: dict[str, Any],
                     selectors: dict[str, Any], now: datetime, opener: Opener | None, sleep: Callable[[float], None],
-                    rng: Any, on_tick: Callable[[], None] | None) -> dict[str, Any]:
+                    rng: Any, on_tick: Callable[[], None] | None, full: bool = False) -> dict[str, Any]:
         open_profile = opener or browser._open_context
         with open_profile(account, headless=False) as context:
             page = context.pages[0] if context.pages else context.new_page()
             flow = _Flow(page, account, selectors, settings, now=now, sleep=sleep, rng=rng, on_tick=on_tick)
             try:
-                return flow.stats(previous)
+                return flow.stats(previous, full=full)
             except TikTokStop:
                 raise
             except Exception as exc:  # noqa: BLE001 - erreur Playwright : arret sur avec capture
@@ -1474,10 +1488,12 @@ def fetch_stats(
     account: str, *, config: Config | None = None, now: datetime | None = None,
     selectors: dict[str, Any] | None = None, opener: Opener | None = None,
     sleep: Callable[[float], None] = time.sleep, rng: Any = None, on_tick: Callable[[], None] | None = None,
+    full: bool = False,
 ) -> dict[str, Any]:
     """Releve complet de ``account`` dans TikTok Studio (SPEC-86fe R1, lecture seule) : page Donnees analytiques
-    (7, 28 et 60 jours), liste des Publications (tous les posts du compte, publies ou non par Clipper), puis
-    l'analyse, les spectateurs et l'engagement des posts a lire en detail. Ajoute le releve horodate a
+    (7, 28, 60 et 365 jours), liste des Publications (tous les posts du compte, publies ou non par Clipper), puis
+    l'analyse, les spectateurs et l'engagement des posts a lire en detail (les ``stats_detail_max`` plus recents,
+    tous si ``full``). Ajoute le releve horodate a
     l'historique ``<stats_dir>/<compte>/`` (jamais d'ecrasement) et le rend. Une valeur absente de la page ou
     « en cours de traitement » est ``None``. Leve ``TikTokStop`` (R4 : l'echec est aussi ajoute a l'historique
     et signale a la console), ``BrowserError`` ou ``TikTokError``. Le compte doit etre pret a publier : c'est a
@@ -1495,7 +1511,7 @@ def fetch_stats(
         data = backend.fetch_stats(
             account, previous, settings=settings, selectors=selectors or load_selectors(), now=now,
             opener=opener or _default_opener(config),
-            sleep=sleep, rng=rng or random.Random(), on_tick=on_tick)
+            sleep=sleep, rng=rng or random.Random(), on_tick=on_tick, full=full)
     except (TikTokStop, browser.BrowserError) as exc:
         _record_stats_failure(account, exc, config, settings, now)
         raise
@@ -1509,7 +1525,7 @@ def fetch_stats(
 
 VIDEO_SORTS = ("posted_at", "caption", "views", "likes", "comments", "shares", "avg_watch_s", "watched_full")
 _LIGHT_FIELDS = ("post_id", "post_url", "caption", "posted_at", "posted_at_text", "visibility", "views", "likes",
-                 "comments", "shares", "avg_watch_s", "watched_full", "fyf_eligible", "fyf_notice")
+                 "comments", "shares", "avg_watch_s", "watched_full", "fyf_eligible", "fyf_notice", "detail_not_read")
 
 
 def _day(stamp: str) -> date:
@@ -1517,7 +1533,7 @@ def _day(stamp: str) -> date:
 
 
 def account_overview(account: str, period: int, *, config: Config | None = None) -> dict[str, Any]:
-    """Vue d'ensemble du compte pour ``period`` jours (7, 28 ou 60), calculee sur l'historique : les tuiles du dernier
+    """Vue d'ensemble du compte pour ``period`` jours (7, 28, 60 ou 365), calculee sur l'historique : les tuiles du dernier
     releve complet (valeur, evolution donnee par TikTok ``change_pct``, evolution recalculee depuis l'historique
     ``history_change_pct`` = valeur du releve d'il y a ``period`` jours) et, par tuile, la courbe par jour : un point
     par jour (dernier releve complet du jour, la valeur de la tuile de la periode), vide un jour sans releve, et la
