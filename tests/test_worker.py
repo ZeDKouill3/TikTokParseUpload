@@ -2647,3 +2647,66 @@ def test_enqueue_youtube_never_calls_ytdlp(tmp_path, fake_ydl):
     _join_thumbnail_threads()
 
     assert fake_ydl.calls == []
+
+
+# --------------------------------------------------------------------------
+# TASK-9d24 : le style de la file est garde dans pipeline.json
+# --------------------------------------------------------------------------
+
+
+def test_tick_writes_queue_channel_into_new_pipeline_json(tmp_path):
+    config = _config(tmp_path)
+    worker.enqueue(URL_A, "twitch", "run", config=config)
+
+    worker.Worker(config=config, spawner=FakeSpawner()).tick()
+
+    assert pipeline.load_state(VIDEO_A, config=config)["channel"] == "twitch"
+
+
+def test_tick_sets_channel_on_existing_state_without_channel(tmp_path):
+    config = _config(tmp_path)
+    _pipeline_state(VIDEO_A, config, status="failed")
+    worker.enqueue(URL_A, "twitch", "run", config=config)
+
+    worker.Worker(config=config, spawner=FakeSpawner()).tick()
+
+    assert pipeline.load_state(VIDEO_A, config=config)["channel"] == "twitch"
+
+
+def test_tick_never_overwrites_an_assigned_channel(tmp_path):
+    config = _config(tmp_path)
+    state = pipeline.new_state(VIDEO_A, URL_A, config.mode, channel="autre")
+    pipeline.save_state(state, config=config)
+    worker.enqueue(URL_A, "twitch", "run", config=config)
+
+    worker.Worker(config=config, spawner=FakeSpawner()).tick()
+
+    assert pipeline.load_state(VIDEO_A, config=config)["channel"] == "autre"
+
+
+def test_tick_without_channel_keeps_state_channel_null(tmp_path):
+    config = _config(tmp_path)
+    _pipeline_state(VIDEO_A, config, status="failed")
+    worker.enqueue(URL_A, None, "run", config=config)
+
+    worker.Worker(config=config, spawner=FakeSpawner()).tick()
+
+    assert pipeline.load_state(VIDEO_A, config=config)["channel"] is None
+
+
+def test_retry_after_launch_keeps_the_style(tmp_path):
+    config = _config(tmp_path)
+    worker.enqueue(URL_A, "twitch", "run", config=config)
+    spawner = FakeSpawner()
+    w = worker.Worker(config=config, spawner=spawner)
+    w.tick()
+    state = pipeline.load_state(VIDEO_A, config=config)
+    state.update(status="failed")
+    state["steps"]["download"]["status"] = "done"
+    pipeline.save_state(state, config=config)
+    spawner.process.finish(1)
+    w.tick()
+
+    entry = worker.enqueue(URL_A, pipeline.load_state(VIDEO_A, config=config).get("channel"), "run", config=config)
+
+    assert entry["channel"] == "twitch"

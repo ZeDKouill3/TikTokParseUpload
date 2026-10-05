@@ -908,6 +908,7 @@ class Worker:
             if entry.get("channel"):
                 self._sync_channel_mode(entry["channel"])
             self._launched_at = datetime.now(timezone.utc)
+            self._keep_channel(entry)
             process = self._spawn(entry, _build_command(entry))
             entry["status"] = "running"
             entry["pid"] = process.pid
@@ -915,6 +916,26 @@ class Worker:
         self._process = process
         self._entry = entry
         return True
+
+    def _keep_channel(self, entry: dict[str, Any]) -> None:
+        """Ecrit le style de l'entree dans ``pipeline.json`` avant le lancement (TASK-9d24) : l'enfant
+        (``clipper run|render``) ne le connait que par ``--config`` et ne l'ecrit pas, et une relance
+        (``_channel_of``, ``enqueue_resume``) le relit depuis l'etat. Un style deja attribue est conserve ;
+        une entree sans style n'en invente pas."""
+        from clipper import pipeline
+
+        channel = entry.get("channel")
+        if not channel:
+            return
+        try:
+            state = pipeline.load_state(entry["video_id"], config=self.config)
+        except pipeline.PipelineError:
+            state = pipeline.new_state(entry["video_id"], entry["url"], self.config.mode, channel=channel)
+        else:
+            if state.get("channel"):
+                return
+            state["channel"] = channel
+        pipeline.save_state(state, config=self.config)
 
     def _spawn(self, entry: dict[str, Any], cmd: list[str]) -> Any:
         if self.spawner is not None:
