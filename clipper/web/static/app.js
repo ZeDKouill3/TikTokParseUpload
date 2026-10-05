@@ -157,6 +157,7 @@ async function onServerEvent(event) {
 const NET_REFRESH_MS = 60000;
 
 function paintNetwork(net) {
+  setNetLast(net); // source unique de la garde réseau au clic (netGuard, ui.js)
   const pill = $("#net-pill");
   const label = $("#net-label");
   if (!net || net.ok === null || net.ok === undefined) {

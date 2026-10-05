@@ -590,6 +590,7 @@ async function pubFormSubmit(f, d) {
   if (!body.account) { err.textContent = "Choisis un compte prêt à publier (écran Comptes)."; err.hidden = false; return; }
   if (!f.edit && !f.selected) { err.textContent = "Choisis un clip."; err.hidden = false; return; }
   const [video_id, clip_id] = f.edit ? [f.edit.video_id, f.edit.clip_id] : f.selected.split("/");
+  if (!(await netGuard())) return;
   try {
     if (f.edit) await api(`/api/publications/${pubEnc(video_id)}/${pubEnc(clip_id)}`, jsonBody("PATCH", body));
     else await api("/api/publications", jsonBody("POST", Object.assign({ video_id, clip_id }, body)));
@@ -920,6 +921,7 @@ async function pubSeriesSubmit(f, d) {
   if (!f.preview || !f.preview.ok) return;
   const err = $("#pubs-error", d);
   err.hidden = true;
+  if (!(await netGuard())) return;
   try {
     const res = await api("/api/publications/series", jsonBody("POST", pubSeriesBody(f, d)));
     closeLayer();
@@ -1089,6 +1091,7 @@ async function pubMarkPublished(c) {
 }
 
 async function pubRetry(c) {
+  if (!(await netGuard())) return false;
   try {
     await api(`/api/publish/${pubEnc(c.video_id)}/${pubEnc(c.clip_id)}/retry`, { method: "POST" });
     await pubLoad();

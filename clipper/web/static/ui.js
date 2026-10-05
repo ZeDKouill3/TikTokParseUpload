@@ -130,6 +130,74 @@ function confirmDialog(opts) {
   });
 }
 
+/* ---------- Garde réseau au clic (TASK-120a) ----------
+   Une seule source : la dernière valeur de /api/network relevée par app.js (paintNetwork -> setNetLast).
+   Toute action qui publie ou programme passe par netGuard() : ok=false ouvre une fenêtre d'alerte (rien
+   n'est lancé sans « Continuer quand même », absent si le serveur bloque le navigateur) ; ok=true ou ok=null
+   (inconnu) : aucune fenêtre. Aucune alerte quand le réseau change, seulement au clic. Le refus serveur
+   (clipper.browser) reste la vraie barrière. */
+let netLast = null;
+function setNetLast(net) { netLast = net || null; }
+
+// null : pas de fenêtre ; "block" : le serveur refusera, on ne propose que Fermer ; "ask" : Continuer possible.
+function netAlertMode(net) {
+  if (!net || net.ok !== false) return null;
+  return net.block_browser ? "block" : "ask";
+}
+
+function netAlertDialog(net, mode) {
+  return new Promise((resolve) => {
+    const detected = net.country_name ? `${net.country_name} (${net.country})` : (net.country || "inconnu");
+    const expected = net.expected_country_name || net.expected_country || "inconnu";
+    const root = document.createElement("div");
+    root.className = "net-alert";
+    root.innerHTML = `<div class="net-alert-back"></div>
+      <div class="modal modal-confirm net-alert-box show" role="alertdialog" aria-modal="true">
+        <div class="modal-head"><h2>IP hors du pays attendu</h2></div>
+        <div class="modal-body">
+          <p>Pays détecté : <b>${esc(detected)}</b><br>Pays attendu : <b>${esc(expected)}</b></p>
+          <p class="muted">${mode === "block"
+    ? "La publication sera refusée : Clipper ne pilote pas le navigateur depuis cette IP. Change de réseau (VPN) puis recommence."
+    : "La publication est risquée : le compte peut être signalé ou bloqué depuis cette IP."}</p>
+        </div>
+        <div class="modal-foot">
+          ${mode === "block"
+    ? `<button type="button" class="btn btn-primary" data-net-close>Fermer</button>`
+    : `<button type="button" class="btn btn-ghost" data-net-cancel>Annuler</button>
+          <button type="button" class="btn btn-bad" data-net-go>Continuer quand même</button>`}
+        </div>
+      </div>`;
+    let done = false;
+    const finish = (v) => {
+      if (done) return;
+      done = true;
+      document.removeEventListener("keydown", onKey);
+      root.remove();
+      resolve(v);
+    };
+    const onKey = (e) => { if (e.key === "Escape") finish(false); };
+    document.addEventListener("keydown", onKey);
+    document.body.appendChild(root);
+    const bind = (sel, v) => { const b = root.querySelector(sel); if (b) b.onclick = () => finish(v); };
+    bind("[data-net-close]", false);
+    bind("[data-net-cancel]", false);
+    bind("[data-net-go]", true);
+    root.querySelector(".net-alert-back").onclick = () => finish(false);
+    const first = root.querySelector("[data-net-close], [data-net-cancel]");
+    if (first) setTimeout(() => first.focus(), 30);
+  });
+}
+
+/* true : l'action peut partir. */
+async function netGuard() {
+  if (netLast === null) {
+    try { netLast = await api("/api/network"); } catch (err) { netLast = null; }
+  }
+  const mode = netAlertMode(netLast);
+  if (!mode) return true;
+  return netAlertDialog(netLast, mode);
+}
+
 /* ---------- Presse-papiers ---------- */
 function copyText(text, what) {
   const done = () => toast({ kind: "ok", title: `${what} copiée`, ms: 2600 });

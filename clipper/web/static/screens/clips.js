@@ -199,6 +199,7 @@ async function clipsApproveSelection(account) {
     return { video_id, clip_id };
   });
   if (!clips.length) return;
+  if (!(await netGuard())) return;
   try {
     const approved = await api("/api/clips/approve", jsonBody("POST", { clips, account }));
     clipsUi.selecting = false;
@@ -346,6 +347,7 @@ async function openClipDrawer(key) {
     if (approve) approve.onclick = async () => {
       const chosen = $("#clip-account", d).value;
       if (!chosen) { toast({ kind: "warn", title: "Compte manquant", body: "Choisis le compte qui publiera ce clip." }); return; }
+      if (!(await netGuard())) return;
       try {
         await api(clipUrl(c, "/approve"), jsonBody("POST", { account: chosen }));
         closeLayer();
