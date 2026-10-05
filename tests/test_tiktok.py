@@ -760,7 +760,7 @@ def test_clip_payload_reads_mp4_caption_and_hashtags_from_the_sidecar(tmp_path):
     ("login_marker", {"page_kwargs": {"redirect": "https://www.tiktok.com/login?redirect=x"}}, "login", "connexion expirée"),
     ("login_form", {"detect": ["login"]}, "login", "connexion expirée"),
     ("missing_element", {"remove": ["caption_editor"]}, "element_missing", "caption_editor"),
-    ("content_check_failed", {"page_kwargs": {"check": "problem"}}, "content_check", "problème"),
+    ("content_check_failed", {"page_kwargs": {"check": "problem"}}, "content_check_refused", "problème"),
     ("unexpected_page", {"page_kwargs": {"redirect": "https://www.tiktok.com/error"}}, "unexpected_page", "page inattendue"),
 ])
 def test_r4_stops_immediately_with_a_screenshot_and_never_acts_blindly(tmp_path, monkeypatch, case, kwargs, code, words):
@@ -879,7 +879,7 @@ def test_content_check_problem_is_an_explicit_r4_failure_and_nothing_is_posted(t
     with pytest.raises(tiktok.TikTokStop) as stop:
         env.publish()
 
-    assert stop.value.code == "content_check" and "problème" in str(stop.value)
+    assert stop.value.code == "content_check_refused" and "problème" in str(stop.value)  # refus, pas un arrêt R4
     assert stop.value.capture is not None and stop.value.capture.is_file()
     assert env.page.posted == [] and _sel()["selectors"]["post_button"] not in env.page.clicks()
 

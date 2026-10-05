@@ -113,7 +113,7 @@ class TikTokError(Exception):
 
 class TikTokStop(TikTokError):
     """Arret sur de la page (SPEC-9225 R4). ``code`` : captcha | verification | login |
-    element_missing | unexpected_page | content_check | publish_unconfirmed ; ``capture`` : la capture d'ecran, ou None."""
+    element_missing | unexpected_page | content_check | content_check_refused | publish_unconfirmed ; ``capture`` : la capture d'ecran, ou None."""
 
     def __init__(self, code: str, reason: str, capture: Path | None = None) -> None:
         super().__init__(reason)
@@ -718,8 +718,9 @@ class _Flow:
         return any(e.is_visible() for e in elements)
 
     def await_content_check(self) -> None:
-        """Avant le clic final : attend « Aucun probleme constate ». Probleme signale ou delai depasse :
-        arret R4 (code ``content_check``), jamais de publication d'un contenu non verifie."""
+        """Avant le clic final : attend « Aucun probleme constate ». Probleme signale par TikTok : arret de CE clip
+        (code ``content_check_refused``, le worker le marque refuse par la plateforme et le compte continue) ; delai
+        depasse : arret R4 (code ``content_check``). Jamais de publication d'un contenu non verifie."""
         sel = self.sel["selectors"]
         timeout, interval = float(self.settings["content_check_timeout_s"]), float(self.settings["poll_interval_s"])
         waited = 0.0
@@ -734,7 +735,7 @@ class _Flow:
             problem = self.page.query_selector(sel["content_check_problem"])
             if problem is not None:
                 detail = " ".join(str(problem.inner_text()).split())[:150]
-                raise self.stop("content_check", "vérification de contenu : problème signalé par TikTok"
+                raise self.stop("content_check_refused", "vérification de contenu : problème signalé par TikTok"
                                 + (f" ({detail})" if detail else ""))
             if not running and self.shown(sel["content_check_ok"]):
                 logger.info("TikTok %s : vérification de contenu sans problème constaté", self.account)

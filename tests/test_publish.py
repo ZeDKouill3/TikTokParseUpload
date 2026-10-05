@@ -2482,3 +2482,38 @@ def test_set_mode_refuses_an_entry_in_progress_published_or_rejected(isolated_cw
         publish.set_mode("vid1", "01", "ma_chaine", "immediate")
 
     assert _read_state(isolated_cwd, "ma_chaine") == before
+
+
+# --------------------------------------------------------------------------
+# TASK-7f582251f6c5 : clip refuse par TikTok a la verification de contenu
+# --------------------------------------------------------------------------
+
+
+def test_mark_refused_by_platform_records_reason_and_capture_without_halting_the_account(isolated_cwd):
+    publish = _tiktok_env(isolated_cwd, ("01", "02"))
+
+    entry = publish.mark_refused_by_platform(
+        "vid1", "01", "ma_chaine", "vérification de contenu : problème signalé par TikTok",
+        capture="state/browser/ab12cd/captures/x.png")
+
+    assert entry["status"] == "refused_by_platform"
+    assert entry["error"] == "vérification de contenu : problème signalé par TikTok"
+    assert entry["capture"] == "state/browser/ab12cd/captures/x.png"
+    assert entry["halted"] is False and entry["slot_at"] is None and entry["refused_at"]
+    assert publish.halted_account(_ACCOUNT) is None  # le compte continue
+    assert "refused_by_platform" not in publish.UNFINISHED_STATUSES  # le clip est clos, rien à republier
+    assert [e["clip_id"] for _, e in publish.refused_by_platform()] == ["01"]
+
+
+def test_a_clip_refused_by_the_platform_is_never_republished_moved_edited_or_approved_again(isolated_cwd):
+    publish = _tiktok_env(isolated_cwd, ("01",))
+    publish.mark_refused_by_platform("vid1", "01", "ma_chaine", "problème")
+
+    with pytest.raises(publish.PublishError, match="refused_by_platform"):
+        publish.retry("vid1", "01", "ma_chaine")
+    with pytest.raises(publish.PublishError, match="refused_by_platform"):
+        publish.unschedule("vid1", "01", "ma_chaine")
+    with pytest.raises(publish.PublishError, match="refused_by_platform"):
+        publish.create_post("vid1", "01", "ma_chaine", account=_ACCOUNT, mode="immediate", now=NOW)
+    assert publish.approval_refusal(publish.list_entries("ma_chaine")[0]) is not None
+    assert publish.list_entries("ma_chaine")[0]["status"] == "refused_by_platform"
