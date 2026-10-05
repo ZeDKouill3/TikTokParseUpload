@@ -2359,3 +2359,115 @@ def test_real_vod_webcam_by_period_with_the_real_claude(vod):
     calls = [json.loads(line) for line in usage.read_text(encoding="utf-8").splitlines() if line.strip()]
     assert len(calls) == sum(p["answer"] is not None for p in periods)
     print(f"{vod}: {len(calls)} appel(s), cout {sum((c.get('cost_usd') or 0.0) for c in calls):.4f} $")
+
+
+# --------------------------------------------------------------------------
+# TASK-baa8d32f7076 : candidats de webcam (revue Fable nuit I1, M1, M2)
+# --------------------------------------------------------------------------
+
+
+class _NoFaces:
+    def detect(self, image):
+        return []
+
+
+def _candidate_setup(monkeypatch, boxes, face_support=None, face_box_index=0):
+    """Detecteurs simules : ``boxes`` = cadres nets (x0, y0, x1, y1) a support
+    plein, et, si ``face_support``, un visage dans ``boxes[face_box_index]``."""
+    from clipper import reframe
+
+    settings = dict(reframe.CONFIG_DEFAULTS)
+    images = [np.zeros((720, 1280, 3), dtype=np.uint8) for _ in range(4)]
+    frames = [{"kind": "cadre", "box": b, "support": len(images), "edge_reason": None} for b in boxes]
+    monkeypatch.setattr(reframe, "_frame_candidates", lambda counts, n, grays, s: (frames, []))
+    if face_support is None:
+        monkeypatch.setattr(reframe, "_face_clusters", lambda *a, **k: [])
+    else:
+        x0, y0, x1, y1 = boxes[face_box_index]
+        monkeypatch.setattr(
+            reframe, "_face_clusters", lambda *a, **k: [((x0 + 20.0, y0 + 10.0, x1 - 20.0, y1 - 10.0), face_support)]
+        )
+
+        def fake_rect(counts, n, face, width, height, s):
+            rect, _ = reframe._size_camera_rect((x0 + x1) / 2, (y0 + y1) / 2, x1 - x0, y1 - y0, width, height, s)
+            return rect, None, None
+
+        monkeypatch.setattr(reframe, "_facecam_rect", fake_rect)
+    return reframe, images, settings
+
+
+def test_face_plus_frame_candidate_is_never_evicted_before_pure_frames(monkeypatch):
+    boxes = [(40 + 130 * i, 40, 160 + 130 * i, 130) for i in range(9)]  # 1 webcam + 8 cadres de HUD
+    reframe, images, settings = _candidate_setup(monkeypatch, boxes, face_support=2)
+
+    candidates, rejected = reframe._period_candidates(images, _NoFaces(), settings)
+
+    assert len(candidates) == settings["facecam_candidate_max"]
+    both = [c for c in candidates if c["kind"] == "visage+cadre"]
+    assert len(both) == 1
+    assert both[0]["support"] == len(images)  # le support du cadre, pas celui du visage
+
+
+def test_candidates_cut_by_the_maximum_are_written_in_rejected_with_a_reason(monkeypatch):
+    boxes = [(40 + 130 * i, 40, 160 + 130 * i, 130) for i in range(9)]
+    reframe, images, settings = _candidate_setup(monkeypatch, boxes)
+
+    candidates, rejected = reframe._period_candidates(images, _NoFaces(), settings)
+
+    assert len(candidates) == 8
+    cut = [r for r in rejected if "facecam_candidate_max" in r["reason"]]
+    assert len(cut) == 1
+    assert cut[0]["kind"] == "cadre"
+    assert cut[0]["box"] and "8" in cut[0]["reason"]
+
+
+def test_prompt_does_not_claim_the_face_is_seen_on_all_frames(monkeypatch):
+    boxes = [(40, 40, 200, 130)]
+    reframe, images, settings = _candidate_setup(monkeypatch, boxes, face_support=2)
+
+    candidates, _ = reframe._period_candidates(images, _NoFaces(), settings)
+    prompt = reframe._facecam_prompt(candidates, 0, 60)
+
+    assert candidates[0]["kind"] == "visage+cadre"
+    assert "visage vu sur 2 image(s)" in prompt
+    assert f"cadre net sur {len(images)} image(s)" in prompt
+
+
+def test_two_nested_frames_without_a_face_are_not_labelled_face_plus_frame(monkeypatch):
+    boxes = [(40, 40, 200, 130), (44, 44, 204, 134)]  # bordure externe + interne
+    reframe, images, settings = _candidate_setup(monkeypatch, boxes)
+
+    candidates, _ = reframe._period_candidates(images, _NoFaces(), settings)
+
+    assert [c["kind"] for c in candidates] == ["cadre"]
+    prompt = reframe._facecam_prompt(candidates, 0, 60)
+    assert "visage" not in prompt.split("Rectangles candidats :")[1].split("Reponds")[0]
+
+
+def test_period_candidates_keeps_gray_frames_as_uint8(monkeypatch):
+    from clipper import reframe
+
+    seen = []
+    real = reframe._frame_candidates
+
+    def spy(counts, n, grays, s):
+        seen.extend(g.dtype for g in grays)
+        return real(counts, n, grays, s)
+
+    monkeypatch.setattr(reframe, "_frame_candidates", spy)
+    images = [np.zeros((720, 1280, 3), dtype=np.uint8) for _ in range(3)]
+    reframe._period_candidates(images, _NoFaces(), dict(reframe.CONFIG_DEFAULTS))
+    assert seen and all(d == np.uint8 for d in seen)
+
+
+def test_rect_moves_gives_the_same_answer_on_uint8_and_float_grays():
+    from clipper import reframe
+
+    settings = dict(reframe.CONFIG_DEFAULTS)
+    rng = np.random.default_rng(0)
+    grays8 = [rng.integers(0, 256, (200, 300), dtype=np.uint8) for _ in range(4)]
+    still8 = [grays8[0].copy() for _ in range(4)]
+    rect = (20, 20, 200, 120)
+    assert reframe._rect_moves(grays8, rect, settings) is True
+    assert reframe._rect_moves([g.astype(np.float64) for g in grays8], rect, settings) is True
+    assert reframe._rect_moves(still8, rect, settings) is False
