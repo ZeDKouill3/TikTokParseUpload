@@ -19,6 +19,7 @@ import logging
 import os
 import signal
 import sys
+import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -178,7 +179,29 @@ def enqueue(
                 raise WorkerError(f"deja en file d'attente : {video_id} ({action})")
         entries.append(entry)
         _write_queue(path, entries)
+    if action == "run":
+        _start_thumbnail_fetch(url, config)
     return entry
+
+
+def _start_thumbnail_fetch(url: str, config: Config) -> threading.Thread | None:
+    """URL non YouTube : recupere la miniature (metadonnees yt-dlp, sans telecharger) dans un fil
+    d'arriere-plan qui ne bloque pas l'ajout. Un echec est journalise, jamais une miniature inventee."""
+    from clipper import pipeline
+
+    download = pipeline.download
+    if download.is_youtube_url(url):
+        return None
+
+    def run() -> None:
+        try:
+            download.fetch_thumbnail(url, config.workspace_dir)
+        except Exception:
+            log.exception("miniature indisponible pour %s", url)
+
+    thread = threading.Thread(target=run, name="thumbnail-fetch", daemon=True)
+    thread.start()
+    return thread
 
 
 def move_to_front(video_id: str, *, config: Config | None = None) -> None:

@@ -121,6 +121,39 @@ def _save_thumbnail(video_dir: Path, url: str) -> None:
     path.write_text(json.dumps({"url": url}), encoding="utf-8")
 
 
+def is_youtube_url(url: str) -> bool:
+    """Vrai pour une URL YouTube (dont youtu.be) : sa miniature se deduit de l'identifiant."""
+    host = urlparse(url).netloc.lower().removeprefix("www.")
+    return host == "youtu.be" or host in _YOUTUBE_HOSTS
+
+
+def fetch_thumbnail(
+    url: str,
+    workspace_dir: str | Path = "workspace",
+    *,
+    ydl_factory: Callable[[dict[str, Any]], Any] | None = None,
+) -> str | None:
+    """Recupere l'URL de miniature par les metadonnees yt-dlp, sans telecharger la video
+    (skip_download), et l'ecrit dans workspace/<id>/thumbnail.json comme le fait le
+    telechargement. Un thumbnail.json deja present n'est pas refait. Leve DownloadError
+    si yt-dlp echoue ou ne donne aucune miniature : jamais une image inventee (ADR-ad2e)."""
+    video_id = extract_video_id(url)
+    video_dir = Path(workspace_dir) / video_id
+    if (video_dir / THUMBNAIL_FILE).exists():
+        return None
+    opts: dict[str, Any] = {"skip_download": True, "quiet": True, "noprogress": True}
+    try:
+        with (ydl_factory or yt_dlp.YoutubeDL)(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as exc:
+        raise DownloadError(f"miniature de {url!r} : {exc}") from exc
+    thumbnail = (info or {}).get("thumbnail")
+    if not thumbnail:
+        raise DownloadError(f"miniature de {url!r} : yt-dlp n'en donne aucune")
+    _save_thumbnail(video_dir, thumbnail)
+    return thumbnail
+
+
 def _progress_hook(video_id: str, video_dir: Path | None = None) -> Callable[[dict[str, Any]], None]:
     """Journalise la progression du telechargement (pourcentage, debit) :
     DEBUG a chaque evenement yt-dlp, INFO au plus toutes les 30 s ou tous les
