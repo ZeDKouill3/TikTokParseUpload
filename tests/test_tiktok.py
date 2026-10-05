@@ -841,6 +841,24 @@ def test_content_check_in_progress_then_ok_waits_before_the_final_click(tmp_path
     assert env.ticks >= env.page.waits  # le battement du worker continue pendant l'attente
 
 
+def test_content_check_ok_text_elsewhere_while_still_running_keeps_waiting(tmp_path, monkeypatch):
+    # Relevé réel 2026-10-05 : « Vérification en cours » visible, mais un texte « Aucun problème constaté »
+    # existe ailleurs dans la page -> fausse fin, nouvel essai, fenêtre « Continuer à publier ? » revenue.
+    env = Env(tmp_path, monkeypatch, page_kwargs={"check": "running"})
+    sel = _sel()["selectors"]
+    env.page.present.add(sel["content_check_ok"])
+
+    def finished():
+        env.page.set_check("ok")
+
+    env.page.timeline = [lambda: None, lambda: None, finished]
+
+    result = env.publish()
+
+    assert env.page.waits == 3
+    assert env.page.posted == ["now"] and result["state"] == "published"
+
+
 def test_content_check_problem_is_an_explicit_r4_failure_and_nothing_is_posted(tmp_path, monkeypatch):
     env = Env(tmp_path, monkeypatch, page_kwargs={"check": "running"})
     env.page.timeline = [lambda: env.page.set_check("problem")]
