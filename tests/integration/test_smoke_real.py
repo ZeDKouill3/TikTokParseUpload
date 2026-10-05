@@ -382,6 +382,23 @@ def _smoke_qa(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------
+# facecam (clipper.reframe, webcam par periode, TASK-5745)
+# --------------------------------------------------------------------------
+
+
+def _smoke_facecam(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    board_path = tmp_path / "period_0.jpg"
+    _write_tiny_image(board_path, "1")
+    candidates = [{"id": 1, "kind": "visage", "support": 3}]
+    answer = llm.ask(
+        "facecam", reframe._facecam_prompt(candidates, 0.0, 600.0), [board_path], reframe.FACECAM_SCHEMA,
+        config=config, check=reframe._facecam_check({1}),
+    )
+    assert answer["webcam"] in (None, 1)
+
+
+# --------------------------------------------------------------------------
 # Registre : un usage LLM du pipeline -> comment lui faire un vrai appel
 # minuscule. tests/test_smoke_coverage.py verifie qu'il n'en manque aucun.
 # --------------------------------------------------------------------------
@@ -394,6 +411,7 @@ USAGES: dict[str, Callable[[Path], None]] = {
     "parts": _smoke_parts,
     "captions": _smoke_captions,
     "layout": _smoke_layout,
+    "facecam": _smoke_facecam,
     "emphasis": _smoke_emphasis,
     "qa": _smoke_qa,
 }

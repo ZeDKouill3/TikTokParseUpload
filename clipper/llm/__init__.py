@@ -102,6 +102,8 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "usages": {
         "moments": {"model": "strong"},
         "parts": {"model": "strong"},
+        # Choix du numero de la webcam sur une planche (reframe, TASK-5745).
+        "facecam": {"model": "fast"},
     },
     "claude_cli": {
         "command": "claude",

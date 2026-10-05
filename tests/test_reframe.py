@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -1306,28 +1307,33 @@ def stream_config(tmp_path, **reframe):
     return make_config(tmp_path, **reframe)
 
 
-def run_stream(tmp_path, *, start=0.0, end=20.0, clip_id="01", factory=None, force=False, **reframe):
+def run_stream(tmp_path, *, start=0.0, end=20.0, clip_id="01", factory=None, force=False, answers=None, **reframe):
     from clipper.reframe import reframe as do_reframe
 
     factory = factory or PixelDetectorFactory()
-    fake = FakeBackend([])
+    fake = FakeBackend(answers or [{"webcam": 1, "reason": "r"}])
     with llm.use_backend(fake):
         out = do_reframe(
             VIDEO_ID, clip_id, start, end, tmp_path / "workspace",
             config=stream_config(tmp_path, **reframe), force=force,
             detector_factory=factory, frame_source=FakeVideo(),
         )
-    assert fake.calls == []  # jamais d'appel LLM pour le format stream
     return out, factory
 
 
-def detect(tmp_path, factory=None, force=False, **reframe):
+def detect(tmp_path, factory=None, force=False, answers=None, **reframe):
     from clipper.reframe import detect_facecam
 
     factory = factory or PixelDetectorFactory()
-    path = detect_facecam(VIDEO_ID, tmp_path / "workspace", config=stream_config(tmp_path, **reframe),
-                          force=force, detector_factory=factory)
+    with llm.use_backend(FakeBackend(answers or [{"webcam": 1, "reason": "r"}])):
+        path = detect_facecam(VIDEO_ID, tmp_path / "workspace", config=stream_config(tmp_path, **reframe),
+                              force=force, detector_factory=factory)
     return path, factory
+
+
+def period0(path):
+    """Premiere (et souvent seule) periode de facecam.json."""
+    return load(path)["periods"][0]
 
 
 def rect_box(r):
@@ -1339,7 +1345,7 @@ def test_stable_facecam_on_90_percent_of_keyframes_gives_a_fixed_rectangle(tmp_p
     path, factory = detect(tmp_path)
 
     assert path == video_dir / "facecam.json"
-    data = load(path)
+    data = period0(path)
     assert data["reason"] is None
     rect = data["facecam"]
     assert set(rect) == {"x", "y", "w", "h"}
@@ -1348,32 +1354,32 @@ def test_stable_facecam_on_90_percent_of_keyframes_gives_a_fixed_rectangle(tmp_p
     assert rect["w"] * rect["h"] < W * H / 4
     # rectangle au format du panneau camera (1080 x 40 % de 1920)
     assert rect["w"] / rect["h"] == pytest.approx(1080 / 768, rel=0.02)
-    assert data["share"] == pytest.approx(0.9)
     # detecteur construit une fois avec le device de clipper.gpu, puis ferme
     assert len(factory.built) == 1
     assert isinstance(factory.built[0][1], Device)
     assert factory.detectors[0].closed
-    # 5 appels par image cle : l'image entiere puis les 4 coins agrandis
-    # (TASK-c7e682a88189, petites facecams).
-    assert factory.detectors[0].frames == 20 * 5
+    # 1 appel pour l'image echantillonnee (une par minute), puis 5 par image
+    # candidate (20 images cles < facecam_candidate_frames) : l'image entiere
+    # et les 4 coins agrandis (TASK-c7e682a88189, petites facecams).
+    assert factory.detectors[0].frames == 1 + 20 * 5
 
 
-def test_facecam_on_5_percent_of_keyframes_is_a_motivated_absence(tmp_path, video_dir):
-    # SPEC-8257 regle 1 : seuil de localisation par defaut nettement plus bas
-    # (facecam_localize_min_share = 0.1) que l'ancien facecam_min_share (0.8).
+def test_face_seen_on_a_single_board_image_is_not_a_candidate_and_the_absence_is_motivated(tmp_path, video_dir):
+    # un visage vu sur 1 seule des 8 images de la planche (facecam_candidate_min_frames = 2)
     write_keyframes(video_dir, pattern(20, 1))
     path, factory = detect(tmp_path)
 
-    data = load(path)
+    data = period0(path)
     assert data["facecam"] is None
-    assert "5" in data["reason"] and "10" in data["reason"]
+    assert data["candidates"] == []
+    assert "aucun rectangle candidat" in data["reason"]
     assert factory.detectors[0].closed
 
 
 def test_face_moving_beyond_the_tolerance_is_not_a_facecam(tmp_path, video_dir):
     faces = [(0.5 + k, (100 + 60 * k, 70, 230 + 60 * k, 220)) for k in range(20)]
     write_keyframes(video_dir, faces)
-    data = load(detect(tmp_path)[0])
+    data = period0(detect(tmp_path, facecam_cluster_ratio=0)[0])
     assert data["facecam"] is None
     assert data["reason"]
 
@@ -1383,24 +1389,23 @@ def test_facecam_tolerance_is_configurable(tmp_path, video_dir):
     # (40 px, aucune paire ne se recolle), regroupe par une tolerance large.
     faces = [(0.5 + k, (100 + 60 * k, 70, 230 + 60 * k, 220)) for k in range(20)]
     write_keyframes(video_dir, faces)
-    assert load(detect(tmp_path, facecam_tolerance=40)[0])["facecam"] is None
-    assert load(detect(tmp_path, facecam_tolerance=2000, force=True)[0])["facecam"] is not None
+    assert period0(detect(tmp_path, facecam_tolerance=40, facecam_cluster_ratio=0)[0])["facecam"] is None
+    assert period0(detect(tmp_path, facecam_tolerance=2000, facecam_cluster_ratio=0, force=True)[0])["facecam"] is not None
 
 
-def test_facecam_localize_min_share_is_configurable(tmp_path, video_dir):
-    # seuil de la regle 1 (SPEC-8257), distinct de celui de la regle 2
-    # (facecam_clip_min_share, teste plus bas).
-    write_keyframes(video_dir, pattern(20, 1))  # visage sur 5 % des images cles
-    assert load(detect(tmp_path)[0])["facecam"] is None  # sous le defaut (10 %)
-    assert load(detect(tmp_path, facecam_localize_min_share=0.05, force=True)[0])["facecam"] is not None
+def test_facecam_candidate_min_frames_is_configurable(tmp_path, video_dir):
+    write_keyframes(video_dir, pattern(20, 1))  # visage sur 1 image de la planche
+    assert period0(detect(tmp_path)[0])["facecam"] is None  # sous le defaut (2 images)
+    assert period0(detect(tmp_path, force=True, facecam_candidate_min_frames=1)[0])["facecam"] is not None
 
 
 def test_stable_face_whose_zone_exceeds_a_quarter_of_the_image_is_not_a_facecam(tmp_path, video_dir):
     # un presentateur plein cadre : visage stable, mais pas une incrustation
     write_keyframes(video_dir, pattern(20, 20, box=(760, 240, 1160, 740)))
-    data = load(detect(tmp_path)[0])
+    data = period0(detect(tmp_path)[0])
     assert data["facecam"] is None
-    assert "quart" in data["reason"]
+    assert data["candidates"] == []
+    assert any("quart" in r["reason"] for r in data["rejected"])  # ecarte, avec la raison
 
 
 # --------------------------------------------------------------------------
@@ -1447,7 +1452,7 @@ def write_panel_keyframes(
 
 def test_incrustation_edges_used_when_present_cover_the_panel(tmp_path, video_dir):
     write_panel_keyframes(video_dir, PANEL, pattern(20, 20))
-    data = load(detect(tmp_path)[0])
+    data = period0(detect(tmp_path)[0])
 
     assert data["reason"] is None
     assert data["edge_reason"] is None  # bords trouves, pas de repli
@@ -1467,7 +1472,7 @@ def test_incrustation_edges_missing_falls_back_to_face_rect_with_logged_reason(t
     # dessinee autour du visage, donc aucun bord net a trouver.
     write_keyframes(video_dir, pattern(20, 18))
     with caplog.at_level("INFO", logger="clipper.reframe"):
-        data = load(detect(tmp_path)[0])
+        data = period0(detect(tmp_path)[0])
 
     assert data["reason"] is None  # le facecam existe quand meme (repli)
     assert data["edge_reason"]  # mais la raison du repli est journalisee
@@ -1491,7 +1496,7 @@ FACE_AT_TOP_RIGHT_CORNER = (W - 526 + 90, 40, W - 526 + 220, 190)
 
 def test_incrustation_stuck_to_the_right_edge_uses_the_image_border_as_that_edge(tmp_path, video_dir):
     write_panel_keyframes(video_dir, PANEL_AT_RIGHT_EDGE, pattern(20, 20, box=FACE_AT_RIGHT_EDGE))
-    data = load(detect(tmp_path)[0])
+    data = period0(detect(tmp_path)[0])
 
     assert data["reason"] is None
     assert data["edge_reason"] is None  # bord droit = bord d'image, pas un repli
@@ -1505,7 +1510,7 @@ def test_incrustation_stuck_to_the_right_edge_uses_the_image_border_as_that_edge
 
 def test_incrustation_stuck_to_two_edges_in_a_corner_uses_the_image_border_for_both(tmp_path, video_dir):
     write_panel_keyframes(video_dir, PANEL_AT_TOP_RIGHT_CORNER, pattern(20, 20, box=FACE_AT_TOP_RIGHT_CORNER))
-    data = load(detect(tmp_path)[0])
+    data = period0(detect(tmp_path)[0])
 
     assert data["reason"] is None
     assert data["edge_reason"] is None  # bords droit et haut = bords d'image, pas un repli
@@ -1586,7 +1591,7 @@ def test_small_facecam_only_visible_in_an_enlarged_corner_vignette_gives_a_top_r
 
     path, factory = detect(tmp_path, factory=factory)
 
-    data = load(path)
+    data = period0(path)
     assert data["reason"] is None
     rect = data["facecam"]
     assert rect is not None
@@ -1606,56 +1611,34 @@ def test_face_too_small_even_in_corner_vignettes_keeps_the_reason(tmp_path, vide
 
     path, factory = detect(tmp_path, factory=factory)
 
-    data = load(path)
+    data = period0(path)
     assert data["facecam"] is None
-    assert "aucun visage detecte" in data["reason"]
+    assert "aucun rectangle candidat" in data["reason"]
 
 
 # --------------------------------------------------------------------------
-# Echantillonnage des images cles (TASK-493f184c4ce1) : borne le nombre
-# d'appels au detecteur sur une video a beaucoup d'images cles (248 s sur
-# 2326 images cles avant ce reglage).
+# Echantillonnage (TASK-493f184c4ce1, TASK-5745) : le nombre d'appels au
+# detecteur ne depend pas du nombre d'images cles de scenes.json (248 s sur
+# 2326 images cles avant la borne) mais de facecam_period_step et de
+# facecam_board_frames.
 # --------------------------------------------------------------------------
 
 
-def test_detector_calls_are_bounded_by_facecam_max_keyframes(tmp_path, video_dir):
-    # 50 images cles, cadence limitee a 10 : 5 appels (image + 4 coins) par
-    # image cle examinee, jamais plus que 10 * 5, quel que soit le nombre
-    # d'images cles de scenes.json.
-    write_keyframes(video_dir, pattern(50, 45))
-    path, factory = detect(tmp_path, facecam_max_keyframes=10)
-    assert factory.detectors[0].frames == 10 * 5
-    assert len(load(path)["keyframes"]) == 10
+def test_detector_calls_are_bounded_by_the_period_step_and_the_board_size(tmp_path, video_dir):
+    # 120 images cles (10 s d'ecart), une image echantillonnee tous les 120 s :
+    # 10 appels pour reperer les periodes, puis 5 par image candidate (24).
+    write_timeline(video_dir, every(10.0, 120, "game"))
+    path, factory = detect(tmp_path, facecam_period_step=120.0)
+    assert factory.detectors[0].frames == 10 + 24 * 5
+    assert len(load(path)["keyframes"]) == 120  # toutes les images cles restent listees
 
 
-def test_sampled_keyframes_are_spread_over_the_whole_video_and_find_the_facecam(tmp_path, video_dir):
-    # Visage present partout (45/50) mais examine seulement 10 images cles,
-    # reparties du debut a la fin : le partage mesure sur l'echantillon
-    # retrouve quand meme la facecam (share proche de 45/50 = 0.9).
-    write_keyframes(video_dir, pattern(50, 45))
-    path, _ = detect(tmp_path, facecam_max_keyframes=10)
-    data = load(path)
-    timecodes = [k["timecode"] for k in data["keyframes"]]
-    assert timecodes[0] == pytest.approx(0.5)  # premiere image cle
-    assert timecodes[-1] == pytest.approx(49.5)  # derniere image cle
-    assert data["facecam"] is not None
-    assert data["reason"] is None
-
-
-def test_fewer_keyframes_than_facecam_max_keyframes_examines_them_all(tmp_path, video_dir):
-    # Reglage plus grand que le nombre d'images cles disponibles : aucun
-    # echantillonnage, tout est examine comme avant.
-    write_keyframes(video_dir, pattern(20, 18))
-    path, factory = detect(tmp_path, facecam_max_keyframes=200)
-    assert factory.detectors[0].frames == 20 * 5
-    assert load(path)["share"] == pytest.approx(0.9)
-
-
-def test_facecam_max_keyframes_default_does_not_affect_small_videos(tmp_path, video_dir):
-    write_keyframes(video_dir, pattern(20, 18))
-    path, factory = detect(tmp_path)  # reglage par defaut
-    assert factory.detectors[0].frames == 20 * 5
-    assert load(path)["share"] == pytest.approx(0.9)
+def test_board_frame_count_is_configurable(tmp_path, video_dir):
+    write_timeline(video_dir, every(10.0, 120, "game"))
+    path, factory = detect(tmp_path, facecam_board_frames=4)
+    assert factory.detectors[0].frames == 20 + 24 * 5  # la planche n'en montre que 4
+    board = cv2.imread(str(video_dir / period0(path)["board"]))
+    assert board.shape[1] == 4 * 480 and board.shape[0] == 270  # 4 images sur une ligne
 
 
 def test_facecam_detection_is_cached_per_video(tmp_path, video_dir):
@@ -1751,12 +1734,10 @@ def test_clip_with_a_live_but_faceless_facecam_stays_stream(tmp_path, video_dir)
     assert data["layout"] == "stream"
     [plan] = data["plans"]
     assert plan["layout"] == "stream"
-    facecam = load(video_dir / "facecam.json")["facecam"]
+    facecam = period0(video_dir / "facecam.json")["facecam"]
     assert rect_box(facecam) == STREAM_PANEL  # bords reels retrouves exactement (aspect deja au format camera)
     assert data["facecam"] == facecam
-    # aucun visage detecte dans les images cles du clip lui-meme
-    clip_keys = [k for k in load(video_dir / "facecam.json")["keyframes"] if k["timecode"] < 100.0]
-    assert clip_keys and all(not k["faces"] for k in clip_keys)
+    assert data["facecam_decision"] == {"period": 0, "candidate": 1, "reason": "r"}
     panels = {p["name"]: p for p in plan["panels"]}
     [cam] = panels["camera"]["rects"]
     assert {k: cam[k] for k in "xywh"} == facecam
@@ -1794,7 +1775,7 @@ def test_video_without_facecam_stays_letterbox_with_a_logged_reason(tmp_path, vi
     data = load(out)
     assert data["layout"] == "letterbox"
     assert data["layout_reason"]
-    assert load(video_dir / "facecam.json")["reason"] in data["layout_reason"]
+    assert period0(video_dir / "facecam.json")["reason"] in data["layout_reason"]
     assert data["layout_reason"] in caplog.text
 
 
@@ -1862,7 +1843,8 @@ def test_default_layout_is_letterbox_without_facecam_detection(tmp_path, video_d
     from clipper.reframe import CONFIG_DEFAULTS
 
     assert CONFIG_DEFAULTS["layout"] == "letterbox"
-    assert CONFIG_DEFAULTS["facecam_localize_min_share"] == 0.1
+    assert CONFIG_DEFAULTS["facecam_period_step"] == 60.0
+    assert "facecam_localize_min_share" not in CONFIG_DEFAULTS and "facecam_max_keyframes" not in CONFIG_DEFAULTS
     assert CONFIG_DEFAULTS["facecam_clip_min_share"] == 0.8
     write_keyframes(video_dir, pattern(20, 20))
     out, factory, fake = run(tmp_path, static(), [], format="letterbox", start=0.0, end=20.0)
@@ -2078,3 +2060,302 @@ def test_split_reframe_cached_with_a_different_stream_variant_is_an_error_withou
         run_stream(tmp_path, stream_variant="split")
     out, _ = run_stream(tmp_path, stream_variant="split", force=True)
     assert load(out)["layout"] == "stream_split"
+
+
+# --------------------------------------------------------------------------
+# Webcam par periode du stream (TASK-5745) : periodes reperees en local
+# (Just Chatting plein ecran puis jeu), rectangles candidats numerotes
+# dessines sur une planche, Claude (usage "facecam") repond un numero ou
+# "aucun", chaque clip prend le rectangle de la periode de son debut.
+# --------------------------------------------------------------------------
+
+CHAT_FACE = (760, 240, 1160, 740)  # grand visage plein ecran (500 px = 46 % de H)
+PANEL2 = (1380, 600, 1920, 984)  # 540 x 384, colle au bord droit : autre incrustation
+FACE2 = (1470, 640, 1600, 790)
+
+
+def write_timeline(video_dir, specs, *, seed=0):
+    """scenes.json + images cles synthetiques. ``specs`` : liste de (temps,
+    mode) ; mode : "chat" (grand visage blanc plein ecran), "game" (jeu
+    bruite + panneau STREAM_PANEL avec un visage), "game2" (idem avec
+    PANEL2), "live" (panneau STREAM_PANEL sans visage, contenu qui change),
+    "static" (panneau STREAM_PANEL fixe, jamais en mouvement), "plain"
+    (jeu bruite sans rien)."""
+    rng = np.random.default_rng(seed)
+    frames_dir = video_dir / "frames"
+    frames_dir.mkdir(exist_ok=True)
+    frames = []
+    static_patch = rng.integers(60, 121, size=(384, 540, 3), dtype=np.uint8)
+    for k, (t, mode) in enumerate(specs):
+        image = rng.integers(0, 40, size=(H, W, 3), dtype=np.uint8)
+        dx = (k % 3) - 1
+        if mode == "chat":
+            x0, y0, x1, y1 = CHAT_FACE
+            image[y0:y1, x0:x1] = 255
+        elif mode in ("game", "game2"):
+            panel, face = (STREAM_PANEL, STREAM_FACE) if mode == "game" else (PANEL2, FACE2)
+            px0, py0, px1, py1 = panel
+            image[py0:py1, px0:px1] = 90
+            fx0, fy0, fx1, fy1 = face
+            image[fy0 - dx:fy1 - dx, fx0 + dx:fx1 + dx] = 255
+        elif mode == "live":
+            px0, py0, px1, py1 = STREAM_PANEL
+            image[py0:py1, px0:px1] = rng.integers(60, 121, size=(py1 - py0, px1 - px0, 3), dtype=np.uint8)
+        elif mode == "static":
+            px0, py0, px1, py1 = STREAM_PANEL
+            image[py0:py1, px0:px1] = static_patch
+        name = f"scene0000_{k:03d}.bmp"
+        (frames_dir / name).write_bytes(cv2.imencode(".bmp", image)[1].tobytes())
+        frames.append({"path": f"frames/{name}", "timecode": t, "scene": 0})
+    end = max(t for t, _ in specs) + 10.0
+    (video_dir / "scenes.json").write_text(
+        json.dumps({"scenes": [{"start": 0.0, "end": end}], "frames": frames}), encoding="utf-8"
+    )
+
+
+def every(step, count, mode, t0=0.0):
+    return [(t0 + k * step, mode) for k in range(count)]
+
+
+def webcam_answer(number, reason="r"):
+    return {"webcam": number, "reason": reason}
+
+
+def run_detect(tmp_path, responses, *, force=False, **reframe):
+    """detect_facecam avec un Claude factice ; renvoie (chemin, FakeBackend)."""
+    from clipper.reframe import detect_facecam
+
+    fake = FakeBackend(responses)
+    with llm.use_backend(fake):
+        path = detect_facecam(
+            VIDEO_ID, tmp_path / "workspace", config=stream_config(tmp_path, **reframe),
+            force=force, detector_factory=PixelDetectorFactory(),
+        )
+    return path, fake
+
+
+def test_just_chatting_then_game_gives_two_periods_cut_at_the_first_game_keyframe(tmp_path, video_dir):
+    write_timeline(video_dir, [(10.0 * k, "chat" if k < 60 else "game") for k in range(120)])
+    path, fake = run_detect(tmp_path, [webcam_answer(1)])
+
+    periods = load(path)["periods"]
+    assert [(p["start"], p["end"]) for p in periods] == [(0.0, 600.0), (600.0, 1190.0)]
+    # le grand visage plein ecran n'est pas un candidat (plus d'un quart de l'image) :
+    # pas de planche pour la 1re periode, une seule pour la 2e
+    assert periods[0]["candidates"] == [] and periods[0]["board"] is None
+    assert periods[1]["board"] is not None
+    assert len(fake.calls) == 1
+
+
+def test_a_transition_that_is_not_clean_gives_a_single_period(tmp_path, video_dir):
+    # du jeu, puis un grand visage au milieu du stream : pas un Just Chatting
+    # suivi du jeu, la majorite des images de la planche decide
+    specs = [(10.0 * k, "chat" if 60 <= k < 90 else "game") for k in range(120)]
+    write_timeline(video_dir, specs)
+    path, fake = run_detect(tmp_path, [webcam_answer(1)])
+
+    periods = load(path)["periods"]
+    assert len(periods) == 1
+    assert periods[0]["start"] == 0.0
+    assert "nette" in periods[0]["transition"]
+    assert len(fake.calls) == 1
+
+
+def test_a_big_face_coming_back_later_in_the_game_stays_in_the_second_period(tmp_path, video_dir):
+    # Just Chatting au debut, jeu, puis une pause face camera plus tard : 2 periodes seulement
+    specs = [(10.0 * k, "chat" if k < 30 or 80 <= k < 100 else "game") for k in range(120)]
+    write_timeline(video_dir, specs)
+    path, _ = run_detect(tmp_path, [webcam_answer(1)])
+    assert [(p["start"], p["end"]) for p in load(path)["periods"]] == [(0.0, 300.0), (300.0, 1190.0)]
+
+
+def test_a_faceless_intro_before_the_just_chatting_does_not_hide_the_transition(tmp_path, video_dir):
+    specs = [(10.0 * k, "plain" if k < 6 else "chat" if k < 60 else "game") for k in range(120)]
+    write_timeline(video_dir, specs)
+    path, _ = run_detect(tmp_path, [webcam_answer(1)])
+    assert [(p["start"], p["end"]) for p in load(path)["periods"]] == [(0.0, 600.0), (600.0, 1190.0)]
+
+
+def test_a_stream_without_just_chatting_is_a_single_period(tmp_path, video_dir):
+    write_timeline(video_dir, every(10.0, 120, "game"))
+    path, fake = run_detect(tmp_path, [webcam_answer(1)])
+    [period] = load(path)["periods"]
+    assert period["facecam"] is not None
+    assert len(fake.calls) == 1
+
+
+def test_claude_gets_one_board_per_period_and_never_coordinates(tmp_path, video_dir):
+    write_timeline(video_dir, every(10.0, 120, "game"))
+    path, fake = run_detect(tmp_path, [webcam_answer(1)])
+
+    [call] = fake.calls
+    assert call.usage == "facecam"
+    [image] = call.images
+    assert image.exists()
+    assert str(image).startswith(str(tmp_path / "workspace" / VIDEO_ID))
+    board = cv2.imread(str(image))
+    assert board is not None and board.shape[1] <= 2400  # une seule planche, taille bornee
+    assert set(call.schema["properties"]) == {"webcam", "reason"}
+    assert set(call.schema["required"]) == {"webcam", "reason"}
+    assert "numero" in call.prompt.lower()
+    assert "coordonn" in call.prompt.lower()  # le prompt interdit les coordonnees
+
+
+def test_candidates_are_numbered_from_one_and_written_with_the_answer(tmp_path, video_dir):
+    write_timeline(video_dir, every(10.0, 120, "game"))
+    path, _ = run_detect(tmp_path, [webcam_answer(1, "c'est la webcam")])
+
+    [period] = load(path)["periods"]
+    ids = [c["id"] for c in period["candidates"]]
+    assert ids == list(range(1, len(ids) + 1)) and ids
+    assert period["answer"] == {"webcam": 1, "reason": "c'est la webcam"}
+    chosen = [c for c in period["candidates"] if c["id"] == 1][0]
+    assert period["facecam"] == chosen["rect"]
+    assert contains(period["facecam"], STREAM_FACE)
+    assert period["facecam"]["w"] / period["facecam"]["h"] == pytest.approx(1080 / 768, rel=0.02)
+
+
+def test_a_webcam_without_any_face_is_still_a_candidate_when_it_moves(tmp_path, video_dir):
+    write_timeline(video_dir, every(10.0, 120, "live"))
+    path, fake = run_detect(tmp_path, [webcam_answer(1)])
+
+    [period] = load(path)["periods"]
+    assert contains(period["facecam"], STREAM_PANEL, eps=3)  # cadre retrouve a 2-3 px pres
+    assert period["facecam"]["w"] <= (STREAM_PANEL[2] - STREAM_PANEL[0]) + 6
+    assert all(c["kind"] == "cadre" for c in period["candidates"])
+
+
+def test_a_framed_rectangle_that_never_moves_is_not_a_candidate(tmp_path, video_dir):
+    write_timeline(video_dir, every(10.0, 120, "static"))
+    path, fake = run_detect(tmp_path, [webcam_answer(1)])
+
+    [period] = load(path)["periods"]
+    assert period["candidates"] == []
+    assert period["facecam"] is None
+    assert period["answer"] is None
+    assert period["reason"]
+    assert fake.calls == []  # rien a numeroter : pas d'appel a Claude
+
+
+def test_none_answer_gives_no_webcam_for_the_period_with_claudes_reason(tmp_path, video_dir):
+    write_timeline(video_dir, every(10.0, 120, "game"))
+    path, _ = run_detect(tmp_path, [webcam_answer(None, "c'est un widget de chat")])
+
+    [period] = load(path)["periods"]
+    assert period["facecam"] is None
+    assert "widget de chat" in period["reason"]
+
+
+def test_an_answer_naming_an_unknown_rectangle_is_an_explicit_failure(tmp_path, video_dir):
+    write_timeline(video_dir, every(10.0, 120, "game"))
+    with pytest.raises(llm.SchemaError):
+        run_detect(tmp_path, [webcam_answer(42)])
+    assert not (video_dir / "facecam.json").exists()  # rien d'ecrit a moitie
+
+
+def test_each_clip_takes_the_rectangle_of_the_period_that_contains_its_start(tmp_path, video_dir):
+    write_timeline(video_dir, [(10.0 * k, "chat" if k < 20 else "game") for k in range(120)])
+    answers = [webcam_answer(1)]  # seule la periode de jeu a une planche
+    out, _ = run_stream(tmp_path, start=400.0, end=430.0, answers=answers)
+    data = load(out)
+    assert data["layout"] == "stream"
+    assert data["facecam_decision"]["period"] == 1
+    assert data["facecam_decision"]["candidate"] == 1
+    # clip qui commence pendant le Just Chatting : periode 0, "aucun" -> letterbox
+    out0, _ = run_stream(tmp_path, start=20.0, end=50.0, clip_id="02", answers=answers)
+    data0 = load(out0)
+    assert data0["layout"] == "letterbox"
+    decision = data0["facecam_decision"]
+    assert (decision["period"], decision["candidate"]) == (0, None)
+    assert "aucun rectangle candidat" in decision["reason"]
+    assert decision["reason"] in data0["layout_reason"]
+
+
+def test_period_without_webcam_keeps_the_letterbox_rule_with_the_decision_written(tmp_path, video_dir):
+    write_timeline(video_dir, every(10.0, 120, "game"))
+    out, _ = run_stream(tmp_path, start=100.0, end=130.0, answers=[webcam_answer(None, "pas de webcam ici")])
+    data = load(out)
+    assert data["layout"] == "letterbox"
+    assert "pas de webcam ici" in data["layout_reason"]
+    assert data["facecam_decision"]["candidate"] is None
+
+
+def test_nothing_is_remembered_from_one_stream_to_another(tmp_path, video_dir):
+    from clipper.reframe import detect_facecam
+
+    write_timeline(video_dir, every(10.0, 120, "game"))
+    path, _ = run_detect(tmp_path, [webcam_answer(1)])
+    other = tmp_path / "workspace" / "zzzzzzzzzzz"
+    other.mkdir()
+    (other / "zzzzzzzzzzz.mp4").write_bytes(b"x")
+    write_timeline(other, every(10.0, 120, "game"))
+
+    fake2 = FakeBackend([webcam_answer(None)])
+    with llm.use_backend(fake2):
+        p2 = detect_facecam("zzzzzzzzzzz", tmp_path / "workspace", config=stream_config(tmp_path),
+                            detector_factory=PixelDetectorFactory())
+    assert len(fake2.calls) == 1  # il redemande, il ne reprend pas la reponse de l'autre
+    assert load(p2)["periods"][0]["facecam"] is None
+    assert load(path)["periods"][0]["facecam"] is not None
+
+
+# --------------------------------------------------------------------------
+# Vraie passe de controle (optionnelle, jamais lancee par defaut) : le vrai
+# Claude et le vrai detecteur mediapipe sur les copies de travail des deux VOD
+# reelles (constats du 2026-10-05). Sautee sauf CLIPPER_CLAUDE_INTEGRATION=1
+# avec `claude` dans le PATH. Entrees en lecture seule (liens physiques vers
+# workspace/<vid>/frames, copie de scenes.json) ; tout est ecrit sous
+# research/facecam-5745/<vid>/, jamais dans workspace/, output/ ni state/.
+# Cout attendu : environ 0,05 $ par VOD (1 a 3 appels vision), journalise dans
+# research/facecam-5745/<vid>/llm_usage.jsonl.
+#   $env:CLIPPER_CLAUDE_INTEGRATION = "1"
+#   $env:CLIPPER_REAL_WORKSPACE = "E:\...\workspace"      (defaut : workspace)
+#   $env:CLIPPER_REAL_RESEARCH = "E:\...\research"        (defaut : research)
+#   python -m pytest -q tests/test_reframe.py -k real_vod
+# --------------------------------------------------------------------------
+
+REAL_VODS = ("v2887364910", "v2888230655")
+
+
+@pytest.mark.skipif(
+    os.environ.get("CLIPPER_CLAUDE_INTEGRATION") != "1" or shutil.which("claude") is None,
+    reason="vrai Claude : CLIPPER_CLAUDE_INTEGRATION=1 et `claude` dans le PATH",
+)
+@pytest.mark.parametrize("vod", REAL_VODS)
+def test_real_vod_webcam_by_period_with_the_real_claude(vod):
+    from clipper.reframe import detect_facecam
+
+    source = Path(os.environ.get("CLIPPER_REAL_WORKSPACE", "workspace")) / vod
+    if not (source / "scenes.json").exists():
+        pytest.skip(f"VOD reelle absente : {source}")
+    root = Path(os.environ.get("CLIPPER_REAL_RESEARCH", "research")) / "facecam-5745"
+    work = root / vod
+    work.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source / "scenes.json", work / "scenes.json")
+    if not (work / "frames").exists():
+        try:
+            shutil.copytree(source / "frames", work / "frames", copy_function=os.link)
+        except OSError:
+            shutil.copytree(source / "frames", work / "frames")
+    usage = work / "llm_usage.jsonl"
+    usage.unlink(missing_ok=True)
+
+    config = Config(
+        mode="review", workspace_dir=root, output_dir=root,
+        _sections={"reframe": {"format": "letterbox", "layout": "stream_auto"}},
+    )
+    with llm.usage_log(usage):
+        path = detect_facecam(vod, root, config=config, force=True)
+
+    periods = load(path)["periods"]
+    assert periods
+    for period in periods:
+        assert period["candidates"] or period["answer"] is None  # rien a numeroter : pas d'appel
+        if period["answer"] is not None:
+            assert period["answer"]["webcam"] in [None] + [c["id"] for c in period["candidates"]]
+        assert (period["facecam"] is None) == (period["reason"] is not None)
+    # chacun de ces deux streams a une vraie webcam pendant le jeu
+    assert any(p["facecam"] is not None for p in periods), [p["reason"] for p in periods]
+    calls = [json.loads(line) for line in usage.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert len(calls) == sum(p["answer"] is not None for p in periods)
+    print(f"{vod}: {len(calls)} appel(s), cout {sum((c.get('cost_usd') or 0.0) for c in calls):.4f} $")

@@ -129,6 +129,17 @@ def test_usage_strong_tier_maps_to_opus_and_other_usages_to_sonnet(fake_run):
     assert models == ["opus", "sonnet"]
 
 
+def test_facecam_usage_is_declared_on_the_fast_model_and_can_be_overridden(fake_run):
+    # TASK-5745 : une planche de rectangles numerotes, un choix simple -> modele rapide
+    section = make_config().section("llm")
+    assert section["usages"]["facecam"] == {"model": "fast"}
+    run = fake_run(json.dumps(RECORDED_CLAUDE_CLI_OK))
+    llm.ask("facecam", "p", [], COLOR_SCHEMA, config=make_config())
+    llm.ask("facecam", "p", [], COLOR_SCHEMA, config=make_config(usages={"facecam": {"model": "strong"}}))
+    models = [c["cmd"][c["cmd"].index("--model") + 1] for c in run.calls]
+    assert models == ["sonnet", "opus"]
+
+
 def test_usage_can_override_backend_and_literal_model():
     fake = FakeBackend([{"couleur": "bleu"}])
     cfg = make_config(usages={"qa": {"backend": "fake", "model": "mon-modele"}})
