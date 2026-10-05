@@ -49,6 +49,7 @@ from clipper import render as render_mod
 from clipper import tiktok as tiktok_mod
 from clipper import youtube as youtube_mod
 from clipper import watch as watch_mod
+from clipper import workspace as workspace_mod
 from clipper import worker as worker_mod
 from clipper.config import (
     DEFAULTS as _CONFIG_FLAT_DEFAULTS,
@@ -279,6 +280,7 @@ def _enrich(state: dict[str, Any], config: Config) -> dict[str, Any]:
     out["current_step"] = _current_step(state)
     out["durations"] = _step_durations(state)
     out["platform_thumbnail"] = _platform_thumbnail(config, video_id, state.get("source_url"))
+    out["purged"] = workspace_mod.is_purged(video_id, config.workspace_dir)
     return out
 
 
@@ -475,8 +477,26 @@ def _channel_of(video_id: str, config: Config) -> str | None:
     return state.get("channel")
 
 
+_SOURCE_PURGED = "source purgée : retélécharger (relancer depuis l'étape « download »)"
+
+
+def _require_source(video_id: str, action: str, force_steps: list[str] | None, config: Config) -> None:
+    """TASK-886a : une video purgee n'a plus sa source ; tout rendu ou etape qui en a besoin est refuse en
+    clair (409), sauf si le retelechargement (etape download) fait partie de la relance."""
+    if not workspace_mod.is_purged(video_id, config.workspace_dir) or "download" in (force_steps or []):
+        return
+    try:
+        steps = pipeline.load_state(video_id, config=config)["steps"]
+    except pipeline.PipelineError:
+        return
+    if action == "render" or any(st.get("status") != "done" for st in steps.values()) or force_steps:
+        raise HTTPException(status_code=409, detail=f"{video_id} : {_SOURCE_PURGED}")
+
+
 def _enqueue(url: str, channel: str | None, action: str, force_steps: list[str] | None,
              config: Config) -> JSONResponse:
+    if _SAFE_ID.fullmatch(url):
+        _require_source(url, action, force_steps, config)
     try:
         entry = worker_mod.enqueue(url, channel, action, force_steps, config=config)
     except worker_mod.WorkerError as exc:
@@ -880,6 +900,10 @@ class _NoChannel(HTTPException):
         self.video_id, self.channels = video_id, channels
 
 
+class PurgeBody(BaseModel):
+    clips: bool = False  # « clips aussi » : supprime aussi output/<video_id>/
+
+
 class BulkApproveClip(BaseModel):
     video_id: str
     clip_id: str
@@ -914,6 +938,7 @@ def _require_channel(video_id: str, clip_id: str, config: Config, *, or_no_chann
 
 
 def _enqueue_clip_render(video_id: str, config: Config) -> dict[str, Any]:
+    _require_source(video_id, "render", list(_RERENDER_STEPS), config)
     try:
         return worker_mod.enqueue(video_id, _channel_of(video_id, config), "render", list(_RERENDER_STEPS), config=config)
     except worker_mod.WorkerError as exc:
@@ -2305,6 +2330,76 @@ def create_app(config: Config | None = None) -> FastAPI:
             return _enrich(pipeline.restore_video(video_id, config=config), config)
         except pipeline.PipelineError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    # ----------------------------------------------------------------
+    # Purge disque (TASK-886a) : taille d'abord (GET), suppression ensuite (POST, confirmee cote ecran)
+    # ----------------------------------------------------------------
+
+    def _purge_call(fn, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return fn(*args, **kwargs)
+        except workspace_mod.PurgeRefused as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    def _purge_plan(video_id: str, clips: bool) -> dict[str, Any]:
+        """Tailles qui seraient liberees ; refuse (409) comme la purge elle-meme."""
+        ws_root, queue = config.workspace_dir, _queue_path(config)
+        if not (Path(ws_root) / video_id).is_dir():
+            raise HTTPException(status_code=409, detail=f"dossier de la video introuvable : {Path(ws_root) / video_id}")
+        reason = _purge_call(workspace_mod.busy_reason, video_id, ws_root, queue)
+        if reason:
+            raise HTTPException(status_code=409, detail=f"purge refusee : {reason}")
+        heavy = workspace_mod.heavy_size(video_id, ws_root)
+        clips_bytes = 0
+        if clips:
+            _purge_call(workspace_mod.check_clips_purgeable, video_id, _publish_dir(config))
+            clips_bytes = workspace_mod.clips_size(video_id, config.output_dir)
+        return {"video_id": video_id, "heavy_bytes": heavy, "clips_bytes": clips_bytes, "total_bytes": heavy + clips_bytes}
+
+    @app.get("/api/disk")
+    def disk_usage() -> dict[str, int]:
+        return workspace_mod.disk_usage(config.workspace_dir, config.output_dir)
+
+    @app.get("/api/purge-completed")
+    def purge_completed_preview() -> dict[str, Any]:
+        videos = []
+        for state in _list_states(config):
+            if state.get("status") != "done":
+                continue
+            try:
+                plan = _purge_plan(state["video_id"], False)
+            except HTTPException:
+                continue  # en file ou illisible : hors de la purge groupee
+            if plan["heavy_bytes"]:
+                videos.append({"video_id": state["video_id"], "bytes": plan["heavy_bytes"]})
+        return {"videos": videos, "total_bytes": sum(v["bytes"] for v in videos)}
+
+    @app.post("/api/purge-completed")
+    def purge_completed() -> dict[str, Any]:
+        purged, skipped, freed = [], [], 0
+        for item in purge_completed_preview()["videos"]:
+            try:
+                freed += workspace_mod.purge_heavy(item["video_id"], config.workspace_dir, queue_path=_queue_path(config))
+                purged.append(item["video_id"])
+            except workspace_mod.PurgeRefused as exc:
+                skipped.append({"video_id": item["video_id"], "reason": str(exc)})
+        logger.info("purge des videos terminees : %d video(s), %d octets liberes", len(purged), freed)
+        return {"videos": purged, "skipped": skipped, "freed_bytes": freed}
+
+    @app.get("/api/purge/{video_id}")
+    def purge_preview(video_id: str, clips: bool = False) -> dict[str, Any]:
+        _validate_video_id(video_id)
+        return _purge_plan(video_id, clips)
+
+    @app.post("/api/purge/{video_id}")
+    def purge_video(video_id: str, body: PurgeBody) -> dict[str, Any]:
+        _validate_video_id(video_id)
+        if body.clips:
+            _purge_call(workspace_mod.check_clips_purgeable, video_id, _publish_dir(config))  # avant toute suppression
+        freed = _purge_call(workspace_mod.purge_heavy, video_id, config.workspace_dir, queue_path=_queue_path(config))
+        clips_freed = (_purge_call(workspace_mod.purge_clips, video_id, config.output_dir, _publish_dir(config))
+                       if body.clips else 0)
+        return {"video_id": video_id, "freed_bytes": freed + clips_freed, "heavy_bytes": freed, "clips_bytes": clips_freed}
 
     @app.get("/api/videos/{video_id}/events")
     def video_events(video_id: str, since: str | None = None) -> list[dict[str, Any]]:

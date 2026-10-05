@@ -8722,3 +8722,154 @@ def test_videos_screen_offers_resume_and_cancel_on_an_interrupted_video(tmp_path
     assert "/cancel" in js
     idx = js.index("/resume")
     assert "confirmDialog(" in js[max(0, idx - 800):idx]
+
+
+# --------------------------------------------------------------------------
+# Purge des videos (TASK-886a)
+# --------------------------------------------------------------------------
+
+
+def _purge_video(tmp_path, video_id="aaaaaaaaaaa", status="done", heavy=100):
+    _write_state(tmp_path, video_id, status=status)
+    d = tmp_path / "workspace" / video_id
+    (d / f"{video_id}.mp4").write_bytes(b"x" * heavy)
+    (d / "frames").mkdir()
+    (d / "frames" / "f.jpg").write_bytes(b"x" * 10)
+    (d / "meta.json").write_text(json.dumps({"title": "Ma vidéo"}), encoding="utf-8")
+    return d
+
+
+def _purge_clip(tmp_path, video_id="aaaaaaaaaaa", clip_id="01-p1"):
+    out = tmp_path / "output" / video_id
+    out.mkdir(parents=True, exist_ok=True)
+    (out / f"{clip_id}.mp4").write_bytes(b"y" * 50)
+    (out / f"{clip_id}.json").write_text(json.dumps({"video_id": video_id, "clip_id": clip_id}), encoding="utf-8")
+    return out
+
+
+def test_purge_preview_shows_the_size_and_deletes_nothing(tmp_path, isolated_cwd):
+    d = _purge_video(tmp_path)
+
+    resp = client(tmp_path).get("/api/purge/aaaaaaaaaaa")
+
+    assert resp.status_code == 200
+    assert resp.json()["heavy_bytes"] == 110 and resp.json()["total_bytes"] == 110
+    assert (d / "aaaaaaaaaaa.mp4").is_file()
+
+
+def test_purge_video_frees_heavy_files_and_keeps_the_video_listed_with_its_clips(tmp_path, isolated_cwd):
+    d = _purge_video(tmp_path)
+    _purge_clip(tmp_path)
+    c = client(tmp_path)
+
+    resp = c.post("/api/purge/aaaaaaaaaaa", json={})
+
+    assert resp.status_code == 200 and resp.json()["freed_bytes"] == 110
+    assert not (d / "aaaaaaaaaaa.mp4").exists()
+    listed = c.get("/api/videos").json()
+    assert [v["video_id"] for v in listed] == ["aaaaaaaaaaa"]
+    assert listed[0]["status"] == "done" and listed[0]["purged"] is True and listed[0]["title"] == "Ma vidéo"
+    assert (tmp_path / "output" / "aaaaaaaaaaa" / "01-p1.mp4").is_file()
+    assert [x["clip_id"] for x in c.get("/api/videos/aaaaaaaaaaa/clips").json()] == ["01-p1"]
+
+
+def test_purge_video_refuses_a_running_video_with_409(tmp_path, isolated_cwd):
+    d = _purge_video(tmp_path, status="running")
+    _busy_worker(tmp_path)
+
+    resp = client(tmp_path).post("/api/purge/aaaaaaaaaaa", json={})
+
+    assert resp.status_code == 409 and "en cours" in resp.json()["detail"]
+    assert (d / "aaaaaaaaaaa.mp4").is_file()
+
+
+def test_purge_video_with_clips_option_deletes_output(tmp_path, isolated_cwd):
+    _purge_video(tmp_path)
+    out = _purge_clip(tmp_path)
+    c = client(tmp_path)
+
+    preview = c.get("/api/purge/aaaaaaaaaaa?clips=true").json()
+    assert preview["clips_bytes"] > 50 and preview["total_bytes"] == preview["heavy_bytes"] + preview["clips_bytes"]
+    assert c.post("/api/purge/aaaaaaaaaaa", json={"clips": True}).status_code == 200
+
+    assert not out.exists()
+
+
+def test_purge_clips_refused_when_a_clip_has_a_pending_publication_names_the_clip(tmp_path, isolated_cwd):
+    d = _purge_video(tmp_path)
+    _purge_clip(tmp_path, clip_id="02-p2")
+    pub = tmp_path / "state" / "publish"
+    pub.mkdir(parents=True)
+    (pub / "style.json").write_text(json.dumps(
+        [{"video_id": "aaaaaaaaaaa", "clip_id": "02-p2", "status": "scheduled"}]), encoding="utf-8")
+    c = client(tmp_path)
+
+    resp = c.post("/api/purge/aaaaaaaaaaa", json={"clips": True})
+    assert resp.status_code == 409 and "02-p2" in resp.json()["detail"]
+    assert c.get("/api/purge/aaaaaaaaaaa?clips=true").status_code == 409
+
+    assert (d / "aaaaaaaaaaa.mp4").is_file()  # rien n'a ete purge a moitie
+    assert (tmp_path / "output" / "aaaaaaaaaaa" / "02-p2.mp4").is_file()
+
+
+def test_purge_completed_previews_then_purges_only_done_videos(tmp_path, isolated_cwd):
+    done = _purge_video(tmp_path, "aaaaaaaaaaa", status="done", heavy=100)
+    failed = _purge_video(tmp_path, "bbbbbbbbbbb", status="failed", heavy=200)
+    _purge_video(tmp_path, "ccccccccccc", status="done", heavy=300)
+    c = client(tmp_path)
+
+    preview = c.get("/api/purge-completed").json()
+    assert sorted(v["video_id"] for v in preview["videos"]) == ["aaaaaaaaaaa", "ccccccccccc"]
+    assert preview["total_bytes"] == 110 + 310
+    assert (done / "aaaaaaaaaaa.mp4").is_file()
+
+    resp = c.post("/api/purge-completed")
+
+    assert resp.status_code == 200 and resp.json()["freed_bytes"] == 420
+    assert not (done / "aaaaaaaaaaa.mp4").exists()
+    assert (failed / "bbbbbbbbbbb.mp4").is_file()
+
+
+def test_disk_endpoint_reports_workspace_and_output_totals(tmp_path, isolated_cwd):
+    _purge_video(tmp_path)
+    _purge_clip(tmp_path)
+
+    body = client(tmp_path).get("/api/disk").json()
+
+    assert body["workspace_bytes"] > 110 and body["output_bytes"] > 50
+
+
+def test_rerun_of_a_purged_video_says_source_purged_instead_of_crashing(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import worker
+
+    _purge_video(tmp_path)
+    c = client(tmp_path)
+    c.post("/api/purge/aaaaaaaaaaa", json={})
+    monkeypatch.setattr(worker, "enqueue", lambda url, channel, action, force_steps, *, config=None: {
+        "id": "e1", "video_id": "aaaaaaaaaaa", "url": url, "channel": channel, "action": action,
+        "force_steps": force_steps or [], "status": "waiting"})
+
+    for resp in (c.post("/api/videos/aaaaaaaaaaa/render"),
+                 c.post("/api/videos/aaaaaaaaaaa/retry", json={"from_step": "render"})):
+        assert resp.status_code == 409
+        assert "source purgée : retélécharger" in resp.json()["detail"]
+    assert c.post("/api/videos/aaaaaaaaaaa/retry", json={"from_step": "download"}).status_code == 202
+
+
+def test_purge_endpoints_validate_the_video_id(tmp_path, isolated_cwd):
+    c = client(tmp_path)
+
+    assert c.post("/api/purge/zzzzzzzzzzz", json={}).status_code == 409  # dossier introuvable, explicite
+    assert c.get("/api/purge/..%2Fx").status_code in (400, 404, 422)
+
+
+def test_videos_screen_has_purge_buttons_confirmations_and_disk_usage():
+    js = _static("screens", "videos.js")
+
+    assert "Purger les vidéos terminées" in js and "data-purge-video" in js and "data-purge-completed" in js
+    assert "/api/purge/" in js and "/api/purge-completed" in js and "/api/disk" in js
+    assert "confirmDialog" in js[js.index("async function purgeVideo"):]
+    assert "purged" in js and "source purgée" in js
+    if shutil.which("node"):
+        subprocess.run(["node", "--check", str(Path(web_app.__file__).parent / "static" / "screens" / "videos.js")],
+                       check=True)

@@ -23,6 +23,15 @@
     channelsAsked: false, formChannels: null,
   };
 
+  /* Octets en unites lisibles (Ko/Mo/Go, base 1024). */
+  function fmtBytes(n) {
+    if (n == null) return "taille inconnue";
+    const units = ["o", "Ko", "Mo", "Go", "To"];
+    let v = n, i = 0;
+    while (v >= 1024 && i < units.length - 1) { v /= 1024; i += 1; }
+    return `${i === 0 ? v : v.toFixed(v < 10 ? 2 : 1).replace(".", ",")} ${units[i]}`;
+  }
+
   const selectedId = () => {
     const hit = location.hash.match(/^#\/videos\/([^/?#]+)/);
     return hit ? decodeURIComponent(hit[1]) : null;
@@ -64,12 +73,17 @@
               ${Object.keys(STATUS_LABELS).map((k) => `<option value="${k}">${esc(STATUS_LABELS[k])}</option>`).join("")}<option value="interrupted">interrompue</option></select>
             <span class="grow"></span><span class="muted" data-vcount></span>
           </div>
+          <div class="toolbar vdisk">
+            <span class="muted" data-vdisk>Espace disque : calcul…</span><span class="grow"></span>
+            <button type="button" class="btn btn-sm" data-purge-completed>${icon("trash-2")}Purger les vidéos terminées</button>
+          </div>
           <div class="jobs" data-vlist></div>
         </div>
         <div data-vdetail-view hidden></div>
       </div>`;
     state.root = body;
     $("[data-add-form]", body).onsubmit = submitAdd;
+    $("[data-purge-completed]", body).onclick = purgeCompleted;
     const filterChange = () => {
       state.filters.channel = $('[name="filter-channel"]', body).value;
       state.filters.status = $('[name="filter-status"]', body).value;
@@ -168,7 +182,7 @@
         <div style="margin-top:10px">${segs(video)}</div>
         ${video.reason ? `<p class="reason ${video.status === "failed" ? "bad" : ""}">${esc(video.reason)}</p>` : ""}
       </div>
-      <div class="job-side">${videoChip(video.status)}${video.dismissed_at ? `<span class="chip pending plain">retirée</span>` : ""}</div>
+      <div class="job-side">${videoChip(video.status)}${video.dismissed_at ? `<span class="chip pending plain">retirée</span>` : ""}${video.purged ? `<span class="chip pending plain">source purgée</span>` : `<button type="button" class="btn btn-xs btn-ghost" data-purge-video="${esc(video.video_id)}">${icon("trash-2", "i-xs")}Purger</button>`}</div>
     </a>`;
   }
 
@@ -181,6 +195,57 @@
       : (filtered
         ? emptyState("inbox", "Aucune vidéo ne correspond", "Change les filtres, ou ajoute une vidéo par son adresse.")
         : emptyState("film", "Aucune vidéo", "Ajoute une vidéo par son adresse ci-dessus pour lancer un premier traitement."));
+    $$("[data-purge-video]", state.root).forEach((b) => (b.onclick = (e) => { e.preventDefault(); e.stopPropagation(); purgeVideo(b.dataset.purgeVideo, false); }));
+    refreshDisk();
+  }
+
+  /* ---------- Purge disque (TASK-886a) : la taille d'abord, la confirmation ensuite ---------- */
+  async function refreshDisk() {
+    const el = $("[data-vdisk]", state.root);
+    if (!el) return;
+    try {
+      const d = await api("/api/disk");
+      el.textContent = `Espace disque : workspace/ ${fmtBytes(d.workspace_bytes)} · output/ ${fmtBytes(d.output_bytes)} (total ${fmtBytes(d.workspace_bytes + d.output_bytes)})`;
+    } catch (err) { el.textContent = `Espace disque indisponible : ${err.message || err}`; }
+  }
+
+  async function purgeVideo(id, withClips) {
+    const enc = encodeURIComponent(id);
+    let plan;
+    try { plan = await api(`/api/purge/${enc}${withClips ? "?clips=true" : ""}`); }
+    catch (err) { toastError("Purge impossible", err); return; }
+    const ok = await confirmDialog({
+      title: withClips ? "Purger la vidéo et ses clips ?" : "Purger cette vidéo ?",
+      body: `${fmtBytes(plan.total_bytes)} seront libérés (source téléchargée, audio, images)${withClips ? `, plus ${fmtBytes(plan.clips_bytes)} de clips rendus : irréversible` : ""}. La vidéo reste listée avec son état${withClips ? "" : " et ses clips"} ; pour la retraiter, il faudra la retélécharger.`,
+      confirmLabel: "Purger",
+    });
+    if (!ok) return;
+    try {
+      const done = await api(`/api/purge/${enc}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ clips: Boolean(withClips) }) });
+      toast({ kind: "ok", title: "Vidéo purgée", body: `${id} : ${fmtBytes(done.freed_bytes)} libérés` });
+      await loadVideos();
+      refreshList();
+      if (state.detailId) refreshDetail();
+    } catch (err) { toastError("Purge impossible", err); }
+  }
+
+  async function purgeCompleted() {
+    let plan;
+    try { plan = await api("/api/purge-completed"); }
+    catch (err) { toastError("Purge impossible", err); return; }
+    if (!plan.videos.length) { toast({ kind: "ok", title: "Rien à purger", body: "Aucune vidéo terminée n'a de fichiers lourds." }); return; }
+    const ok = await confirmDialog({
+      title: "Purger les vidéos terminées ?",
+      body: `${plan.videos.length} vidéo${plan.videos.length > 1 ? "s" : ""} terminée${plan.videos.length > 1 ? "s" : ""} : ${fmtBytes(plan.total_bytes)} seront libérés. Les clips rendus sont gardés ; pour retraiter une vidéo purgée, il faudra la retélécharger.`,
+      confirmLabel: "Purger",
+    });
+    if (!ok) return;
+    try {
+      const done = await api("/api/purge-completed", { method: "POST" });
+      toast({ kind: "ok", title: "Vidéos purgées", body: `${done.videos.length} vidéo(s) : ${fmtBytes(done.freed_bytes)} libérés${done.skipped.length ? ` · ${done.skipped.length} ignorée(s)` : ""}` });
+      await loadVideos();
+      refreshList();
+    } catch (err) { toastError("Purge impossible", err); }
   }
 
   /* ---------- Fiche d'une video ---------- */
@@ -319,6 +384,8 @@
           ${video.status === "running" || video.status === "interrupted" ? `<button type="button" class="btn btn-bad" data-cancel-video>${icon("ban")}Annuler le traitement</button>` : ""}
           ${(video.status === "failed" || video.status === "queued") && !video.dismissed_at ? `<button type="button" class="btn" data-retry-video="${esc(video.video_id)}" data-from-step="${esc(video.current_step || "")}">${icon("rotate-ccw")}Relancer</button>
             <button type="button" class="btn btn-ghost" data-dismiss-video="${esc(video.video_id)}">Retirer</button>` : ""}
+          ${video.purged ? `<span class="chip pending plain">source purgée : retélécharger</span>` : `<button type="button" class="btn" data-purge-video="${esc(video.video_id)}">${icon("trash-2")}Purger</button>`}
+          ${video.status === "done" ? `<button type="button" class="btn btn-ghost" data-purge-video-clips="${esc(video.video_id)}">Purger aussi les clips</button>` : ""}
           ${video.dismissed_at ? `<span class="chip pending plain">retirée des échecs</span> <button type="button" class="btn" data-restore-video="${esc(video.video_id)}">Rétablir</button>` : ""}
         </div>
       </div>
@@ -352,6 +419,8 @@
     if (cancel) cancel.onclick = () => cancelVideo(video);
     const resume = $("[data-resume-video]", view);
     if (resume) resume.onclick = () => resumeVideo(video);
+    $$("[data-purge-video]", view).forEach((b) => (b.onclick = () => purgeVideo(b.dataset.purgeVideo, false)));
+    $$("[data-purge-video-clips]", view).forEach((b) => (b.onclick = () => purgeVideo(b.dataset.purgeVideoClips, true)));
     const assign = $("[data-assign-channel]", view);
     if (assign) assign.onclick = () => openAssignChannel(video.video_id);
     $("[data-log-copy]", view).onclick = () => copyText(state.events.map((e) => `${e.at} ${e.level} ${e.step || ""} ${e.message}`).join("\n"), "Journal");
