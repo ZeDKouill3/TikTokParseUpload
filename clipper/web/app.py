@@ -38,6 +38,7 @@ from pydantic import BaseModel, StrictBool
 
 from clipper import accounts as accounts_mod
 from clipper import browser as browser_mod
+from clipper import network as network_mod
 from clipper import channel as channel_mod
 from clipper import gpu as gpu_mod
 from clipper import journal as journal_mod
@@ -1177,7 +1178,7 @@ def _save_channel_preset(name: str, preset: dict[str, Any]) -> None:
 # --------------------------------------------------------------------------
 
 _SETTINGS_FLAT = tuple(_CONFIG_FLAT_DEFAULTS)
-_SETTINGS_SECTIONS = ("llm", "web", "worker")
+_SETTINGS_SECTIONS = ("llm", "web", "worker", "network")
 _SETTINGS_TOKEN_MASK = "•" * 8
 _SETTINGS_QUOTED = re.compile(r'"(?:[^"\\]|\\.)*"|\'[^\']*\'')
 
@@ -1301,6 +1302,9 @@ def _settings_merge(raw: dict[str, Any], settings: dict[str, Any]) -> dict[str, 
         raise ConfigError("[web] token : le jeton ne se modifie pas depuis l'interface (fichier + redémarrage)")
     if "llm" in settings:
         _settings_check_llm(settings["llm"])
+    country = settings.get("network", {}).get("expected_country")
+    if country is not None and not (isinstance(country, str) and re.fullmatch(r"[A-Za-z]{2}", country)):
+        raise ConfigError(f"[network] expected_country : code pays ISO à deux lettres attendu (FR, GB...), reçu {country!r}")
     port = web.get("port")
     if port is not None and not 1 <= port <= 65535:
         raise ConfigError(f"[web] port : entre 1 et 65535 attendu, reçu {port!r}")
@@ -3039,6 +3043,11 @@ def create_app(config: Config | None = None) -> FastAPI:
     # ----------------------------------------------------------------
     # Journal (TASK-8067) : lecture seule des fichiers logs/journal-*.log
     # ----------------------------------------------------------------
+
+    @app.get("/api/network")
+    def get_network() -> dict[str, Any]:
+        """Pays de l'IP publique (TASK-30cc) : ``ok`` True / False / None (inconnu), cache ``[network] cache_s``."""
+        return network_mod.status(config)
 
     @app.get("/api/journal")
     def get_journal(lines: int = 200, q: str | None = None, level: str | None = None) -> dict[str, Any]:

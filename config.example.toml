@@ -57,6 +57,12 @@ output_dir = "output"
 # [browser]
 # pilot_wait_s = 300         # un seul compte pilote a la fois : attente du compte en cours avant d'echouer
 
+# [network]  # pays de l'IP publique (TASK-30cc) : pastille en haut a droite de la console, garde du navigateur pilote
+# expected_country = "FR"   # pays attendu (code ISO a deux lettres) ; modifiable dans Reglages > Reseau
+# geo_url = "https://ipinfo.io/json"  # service HTTPS gratuit sans cle : rend ip, city, country, org
+# cache_s = 60              # duree (s) pendant laquelle un pays connu est reutilise
+# block_browser = true      # refuse d'ouvrir le navigateur pilote (publication, statistiques) hors du pays attendu ou si le pays est inconnu
+
 # [journal]  # journal global de toutes les actions (TASK-8067), un fichier par jour sous logs/
 # enabled = true            # desactive (tests isoles) : aucun handler, aucun dossier logs/
 # dir = "logs"

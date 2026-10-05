@@ -216,6 +216,16 @@ kbd {
   border-radius: 14px; font-size: 12px; font-weight: 600; color: var(--ok);
   background: var(--ok-soft); letter-spacing: 0.02em;
 }
+.net-pill {
+  white-space: nowrap; max-width: 46vw; overflow: hidden; text-overflow: ellipsis;
+  display: inline-flex; align-items: center; gap: 8px; height: 28px; padding: 0 12px;
+  border-radius: 14px; font-size: 12px; font-weight: 600; letter-spacing: 0.02em; cursor: default;
+  color: var(--ok); background: var(--ok-soft);
+}
+.net-dot { flex: none; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.net-pill.bad { color: var(--bad); background: var(--bad-soft); }
+.net-pill.unknown { color: var(--muted); background: var(--surface-2); }
+@media (max-width: 900px) { .net-pill { max-width: 38vw; padding: 0 8px; } }
 .live-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--ok); position: relative; }
 .live-dot::after {
   content: ""; position: absolute; inset: -4px; border-radius: 50%; border: 2px solid var(--ok);

@@ -8899,3 +8899,84 @@ def test_videos_screen_has_purge_buttons_confirmations_and_disk_usage():
     if shutil.which("node"):
         subprocess.run(["node", "--check", str(Path(web_app.__file__).parent / "static" / "screens" / "videos.js")],
                        check=True)
+
+
+# --------------------------------------------------------------------------
+# TASK-30cc : pays de l'IP publique (/api/network, pastille de la barre du haut, réglage)
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def geo(monkeypatch):
+    from clipper import network as network_mod
+
+    network_mod.reset()
+    state = {"answer": {"ip": "1.2.3.4", "city": "Paris", "country": "FR", "org": "AS51207 Free Mobile SAS"}, "calls": 0}
+
+    def fetch(url):
+        state["calls"] += 1
+        if isinstance(state["answer"], Exception):
+            raise state["answer"]
+        return state["answer"]
+
+    network_mod.use_fetcher(fetch)
+    yield state
+    network_mod.use_fetcher(None)
+    network_mod.reset()
+
+
+def test_api_network_reports_expected_country(tmp_path, isolated_cwd, geo):
+    data = client(tmp_path).get("/api/network").json()
+    assert data["ok"] is True and data["country"] == "FR" and data["city"] == "Paris"
+    assert data["ip"] == "1.2.3.4" and data["isp"] == "AS51207 Free Mobile SAS"
+    assert data["expected_country"] == "FR"
+
+
+def test_api_network_flags_other_country_and_respects_the_cache(tmp_path, isolated_cwd, geo):
+    geo["answer"] = {"ip": "5.6.7.8", "city": "London", "country": "GB", "org": "AS1 BT"}
+    c = client(tmp_path)
+    first = c.get("/api/network").json()
+    c.get("/api/network")
+    assert first["ok"] is False and first["country_name"] == "Royaume-Uni"
+    assert geo["calls"] == 1
+
+
+def test_api_network_unknown_when_service_is_down(tmp_path, isolated_cwd, geo):
+    geo["answer"] = OSError("coupé")
+    resp = client(tmp_path).get("/api/network")
+    assert resp.status_code == 200
+    assert resp.json()["ok"] is None and "coupé" in resp.json()["error"]
+
+
+def test_settings_edit_expected_country(tmp_path, isolated_cwd):
+    path = _settings_setup(tmp_path)
+    c = sclient(tmp_path)
+    assert c.get("/api/settings").json()["effective"]["network"]["expected_country"] == "FR"
+    resp = c.put("/api/settings", json={"settings": {"network": {"expected_country": "BE"}}})
+    assert resp.status_code == 200, resp.text
+    assert tomllib.loads(path.read_text(encoding="utf-8"))["network"]["expected_country"] == "BE"
+    assert resp.json()["effective"]["network"]["expected_country"] == "BE"
+
+
+@pytest.mark.parametrize("value", ["", "FRA", "F", "1A", 5])
+def test_settings_refuses_a_bad_country_code(tmp_path, isolated_cwd, value):
+    path = _settings_setup(tmp_path)
+    before = path.read_text(encoding="utf-8")
+    resp = sclient(tmp_path).put("/api/settings", json={"settings": {"network": {"expected_country": value}}})
+    assert resp.status_code == 422 and "expected_country" in resp.json()["detail"]
+    assert path.read_text(encoding="utf-8") == before
+
+
+def test_topbar_has_a_network_pill_wired_to_the_api_every_60s(tmp_path, isolated_cwd):
+    html = served(tmp_path, "/")
+    top = html[html.index('<header class="topbar"'):html.index("</header>")]
+    assert 'id="net-pill"' in top
+    js = served(tmp_path, "/static/app.js")
+    assert "/api/network" in js and "60000" in js and "visibilitychange" in js
+    assert "IP hors " in js and "pays inconnu" in js
+    assert ".net-pill" in served(tmp_path, "/static/style.css")
+
+
+def test_settings_screen_has_a_country_choice(tmp_path, isolated_cwd):
+    js = served(tmp_path, "/static/screens/settings.js")
+    assert "network.expected_country" in js and "[network]" in js

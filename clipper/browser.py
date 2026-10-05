@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 from urllib.parse import urlparse
 
+from clipper import network
 from clipper.config import Config
 
 logger = logging.getLogger(__name__)
@@ -310,8 +311,12 @@ def _pilot_lock(account: str, wait: float) -> Iterator[None]:
 def _open_context(account: str, *, headless: bool, config: Config | None = None) -> Iterator[Any]:
     """Contexte Playwright du profil, en heure de Paris (R8). Un seul compte est piloté à la fois, tous
     services et tous processus confondus : un second appel attend ``[browser] pilot_wait_s`` puis échoue
-    explicitement."""
+    explicitement. Hors du pays attendu (``[network]``, TASK-30cc) ou pays inconnu : refus avant toute ouverture."""
     directory = profile_dir(account)
+    try:
+        network.require_expected_country(config)
+    except network.NetworkError as exc:
+        raise BrowserError(str(exc)) from None
     wait = float(_settings(config)["pilot_wait_s"])
     with _pilot_lock(account, wait):
         manager = _playwright_factory()()
