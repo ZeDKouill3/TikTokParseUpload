@@ -5,7 +5,7 @@ slug: recadrage-stream-webcam-localis-e-par-clip-sur-u
 title: "Recadrage stream : webcam localisée PAR CLIP sur un échantillon d'images (vote), position fixée du style prioritaire, aperçu du rectangle retenu"
 created: 2026-10-05T21:36:55Z
 author: nicoc@zedk_ordi
-status: open
+status: closed
 scope:
   - clipper/reframe.py
   - tests/test_reframe.py
@@ -18,7 +18,7 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 schema: 4
-version: 1
+version: 2
 ---
 
 Choix utilisateur 2026-10-05 : « d'accord pour la 2, sur un échantillon de plusieurs images dans la vidéo ». Écart avec SPEC-8257 et SPEC-76dc (proposées, non ratifiées) qui disent « localisation une fois par vidéo » : ajouter une spec successeur (ank new spec --supersedes SPEC-76dc...) décrivant la localisation par clip, à laisser proposée pour ratification humaine (ne jamais ank accept).
