@@ -6,6 +6,11 @@ Deux mises en page (``format`` en config) :
 - ``crop`` : suivi de visage par plan, mise en page par plan, visages jamais
   coupes (option figee, sans nouveau developpement).
 
+En letterbox avec ``layout = "stream_auto"``, la webcam du stream est
+trouvee par periode (Just Chatting puis jeu) : candidats locaux numerotes
+sur une planche, Claude (usage ``facecam``) choisit le numero ; voir
+``detect_facecam`` (TASK-5745).
+
 Le reste de ce docstring decrit le format crop.
 
 Entrees : workspace/<video_id>/<video_id>.mp4 et scenes.json (etape scenes).
@@ -103,26 +108,51 @@ CONFIG_DEFAULTS: dict[str, object] = {
     # des images clés du clip, sinon letterbox (raison journalisée). Voir
     # detect_facecam et _clip_facecam.
     "layout": "letterbox",
-    # Part des images clés où un visage doit rester au même endroit pour repérer la facecam.
-    # Localisation de la facecam (une fois par vidéo, SPEC-8257 règle 1) :
-    # visage à la même position (centre à moins de facecam_tolerance px) sur
-    # au moins facecam_localize_min_share des images clés de scenes.json,
-    # dans une zone de moins de facecam_max_area de l'image. Seuil distinct
-    # de, et par défaut bien plus bas que, celui exigé par clip
-    # (facecam_clip_min_share ci-dessous) : une facecam est repérée des
-    # qu'un visage y apparaît de temps en temps, même rarement (jeu sombre,
-    # webcam petite, casque).
-    "facecam_localize_min_share": 0.1,
+    # Secondes entre deux images examinées pour repérer la fin du Just Chatting.
+    # Webcam par période du stream, une fois par vidéo : une image clé environ toutes les
+    # facecam_period_step secondes ; un visage d'au moins
+    # facecam_fullscreen_face_height de la hauteur de l'image (Just Chatting
+    # plein écran) sur au moins facecam_period_min_samples images d'affilée,
+    # dès les premières facecam_period_lead_share des images (un début sans
+    # visage ne gêne pas), puis le jeu (sans grand visage) sur au moins
+    # autant, coupent la vidéo en deux périodes ; sinon (transition pas
+    # nette) une seule période. Un grand visage qui revient plus tard dans
+    # le jeu reste dans la 2e période.
+    "facecam_period_step": 60.0,
+    "facecam_fullscreen_face_height": 0.25,
+    "facecam_period_min_samples": 2,
+    "facecam_period_lead_share": 0.1,
+    # Visages d'un même candidat : centres à moins de
+    # max(facecam_tolerance px, facecam_cluster_ratio x hauteur du visage) (la
+    # tête bouge dans la webcam).
+    "facecam_cluster_ratio": 1.0,
+    # Candidats d'une période, calculés en local sur facecam_candidate_frames
+    # images équiréparties, dont facecam_board_frames (équiréparties aussi)
+    # forment la planche envoyée à Claude, chacune facecam_board_tile_width
+    # px de large : zones de visage à la même
+    # position (centre à moins de facecam_tolerance px) sur au moins
+    # facecam_candidate_min_frames images, et rectangles à cadre net (traits
+    # fixes sur au moins facecam_candidate_edge_share des images, refermés
+    # sur facecam_candidate_close de la largeur, côtés ajustés
+    # de facecam_candidate_slack px, nets sur facecam_candidate_side_share de
+    # leur longueur, un côté à facecam_candidate_snap de la dimension d'un
+    # bord d'image est ramené sur ce bord) dont le contenu bouge (voir facecam_frozen_* plus bas), d'au
+    # moins facecam_candidate_min_area de l'image et de moins de
+    # facecam_max_area ; au plus facecam_candidate_max candidats. Claude
+    # choisit un numéro parmi eux ou « aucun » (usage llm « facecam »).
     "facecam_tolerance": 40,
     "facecam_max_area": 0.25,
-    # Nombre maximal d'images clés examinées pour chercher la facecam.
-    # Pour detect_facecam seulement (TASK-493f184c4ce1) : au plus ce nombre
-    # d'images clés examinées (image entière + 4 coins agrandis), a
-    # intervalles réguliers sur toute la durée de la vidéo (indices
-    # équirépartis, bornes comprises) quand scenes.json en fournit plus ;
-    # borne le nombre d'appels au détecteur sur une vidéo à beaucoup
-    # d'images clés (248 s sur 2326 images clés avant ce réglage).
-    "facecam_max_keyframes": 200,
+    "facecam_candidate_frames": 24,
+    "facecam_board_frames": 8,
+    "facecam_board_tile_width": 480,
+    "facecam_candidate_min_frames": 2,
+    "facecam_candidate_max": 8,
+    "facecam_candidate_min_area": 0.005,
+    "facecam_candidate_close": 0.01,
+    "facecam_candidate_edge_share": 0.9,
+    "facecam_candidate_slack": 8,
+    "facecam_candidate_side_share": 0.6,
+    "facecam_candidate_snap": 0.01,
     # detect_facecam seulement : en plus de l'image entière, chaque coin de
     # l'image clé est recadré à facecam_corner_size de la largeur/hauteur puis
     # agrandi facecam_corner_zoom fois avant détection (coordonnées ramenées
@@ -1396,17 +1426,20 @@ def _facecam_rect(
 
 
 def _stable_face(
-    detections: list[list[Box]], tolerance: float
+    detections: list[list[Box]], tolerance: float, size_ratio: float = 0.0
 ) -> tuple[Box | None, int]:
-    """Visage a la meme position (centre a moins de ``tolerance`` px) sur le
-    plus d'images : sa boite mediane et le nombre d'images ou il est."""
+    """Visage a la meme position (centre a moins de ``tolerance`` px, ou de
+    ``size_ratio`` fois la hauteur du visage de reference s'il est plus
+    grand) sur le plus d'images : sa boite mediane et le nombre d'images ou
+    il est."""
     best: tuple[int, list[Box]] | None = None
     for boxes in detections:
         for ref in boxes:
             rc = _center(ref)
+            radius = max(tolerance, size_ratio * (ref[3] - ref[1]))
             support = []
             for other in detections:
-                near = [b for b in other if math.dist(_center(b), rc) <= tolerance]
+                near = [b for b in other if math.dist(_center(b), rc) <= radius]
                 if near:
                     support.append(min(near, key=lambda b: math.dist(_center(b), rc)))
             if best is None or len(support) > best[0]:
@@ -1463,6 +1496,332 @@ def _sample_keyframes(frames: list[dict[str, Any]], max_count: int) -> list[dict
     return [frames[i] for i in indices]
 
 
+FACECAM_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        # Numero du rectangle dessine sur la planche, ou null s'il n'y a pas de webcam.
+        "webcam": {"type": ["integer", "null"]},
+        "reason": {"type": "string"},
+    },
+    "required": ["webcam", "reason"],
+    "additionalProperties": False,
+}
+
+
+def _sample_every(frames: list[dict[str, Any]], step: float) -> list[int]:
+    """Indices des images cles les plus proches de 0, ``step``, 2 ``step``...
+    (une image environ par ``step`` secondes sur toute la video, sans doublon)."""
+    if not frames:
+        return []
+    times = [f["timecode"] for f in frames]
+    picked: list[int] = []
+    t = times[0]
+    while t <= times[-1] + 1e-9:
+        i = min(range(len(times)), key=lambda k: abs(times[k] - t))
+        if not picked or i != picked[-1]:
+            picked.append(i)
+        t += step
+    return picked
+
+
+def _has_big_face(detections: list[Box], height: int, settings: dict[str, Any]) -> bool:
+    """Un visage plein ecran : sa hauteur atteint ``facecam_fullscreen_face_height``
+    de l'image (Just Chatting)."""
+    limit = float(settings["facecam_fullscreen_face_height"]) * height
+    return any(b[3] - b[1] >= limit for b in detections)
+
+
+def _runs(flags: list[bool], value: bool) -> list[tuple[int, int]]:
+    """Plages [debut, fin) d'images consecutives egales a ``value``."""
+    out: list[tuple[int, int]] = []
+    start: int | None = None
+    for i, flag in enumerate(flags + [not value]):
+        if flag == value and start is None:
+            start = i
+        elif flag != value and start is not None:
+            out.append((start, i))
+            start = None
+    return out
+
+
+def _find_periods(flags: list[bool], min_samples: int, lead_share: float) -> tuple[int | None, str]:
+    """Position (dans ``flags``) de la premiere image apres le Just Chatting
+    quand la transition est nette, sinon ``None`` et pourquoi il n'y a qu'une
+    periode. Nette : une plage d'au moins ``min_samples`` images consecutives
+    avec un grand visage, qui commence dans les ``lead_share`` premieres
+    images (un debut sans visage, intro ou ecran d'attente, ne gene pas),
+    suivie d'au moins ``min_samples`` images consecutives sans. Un grand
+    visage qui revient plus tard dans le jeu (pause, discussion) ne change
+    rien : il reste dans la 2e periode, ou la majorite des images decide."""
+    n = len(flags)
+    big = [r for r in _runs(flags, True) if r[1] - r[0] >= min_samples]
+    if not big:
+        return None, (
+            f"pas de transition nette : grand visage plein ecran sur {sum(flags)}/{n} images, jamais "
+            f"{min_samples} d'affilee, une seule periode"
+        )
+    first, last = big[0]
+    if first > lead_share * n:
+        return None, (
+            f"pas de transition nette : le grand visage plein ecran ne commence qu'a l'image {first}/{n} "
+            f"(au-dela des {lead_share:.0%} du debut), une seule periode"
+        )
+    after = [r for r in _runs(flags, False) if r[0] >= last and r[1] - r[0] >= min_samples]
+    if last >= n or not after or after[0][0] != last:
+        return None, (
+            f"pas de transition nette : le grand visage plein ecran ne cede pas la place au jeu "
+            f"({min_samples} images consecutives sans visage apres l'image {last}/{n}), une seule periode"
+        )
+    return last, f"grand visage plein ecran jusqu'a l'image {last}/{n}, puis le jeu"
+
+
+def _face_clusters(
+    detections: list[list[Box]], tolerance: float, size_ratio: float, min_frames: int, limit: int
+) -> list[tuple[Box, int]]:
+    """Visages a la meme position (voir ``_stable_face``) sur au moins
+    ``min_frames`` images : (boite mediane, nombre d'images), du plus present
+    au moins present, au plus ``limit``."""
+    remaining = [list(boxes) for boxes in detections]
+    out: list[tuple[Box, int]] = []
+    while len(out) < limit:
+        face, count = _stable_face(remaining, tolerance, size_ratio)
+        if face is None or count < min_frames:
+            break
+        out.append((face, count))
+        centre = _center(face)
+        radius = max(tolerance, size_ratio * (face[3] - face[1]))
+        remaining = [[b for b in boxes if math.dist(_center(b), centre) > radius] for boxes in remaining]
+    return out
+
+
+def _rect_moves(grays: list[np.ndarray], rect: tuple[int, int, int, int], settings: dict[str, Any]) -> bool:
+    """Le contenu du rectangle change d'une image a l'autre : en moyenne, au
+    moins ``facecam_frozen_min_pixel_share`` des pixels different d'au moins
+    ``facecam_frozen_min_diff`` niveaux entre deux images successives."""
+    x, y, w, h = rect
+    inset = max(4, round(0.03 * min(w, h)))  # le fond autour du cadre bouge, pas son contenu
+    x, y, w, h = x + inset, y + inset, w - 2 * inset, h - 2 * inset
+    crops = [g[y:y + h, x:x + w] for g in grays]
+    diff = float(settings["facecam_frozen_min_diff"])
+    shares = [float((np.abs(a - b) >= diff).mean()) for a, b in zip(crops, crops[1:]) if a.shape == b.shape and a.size]
+    return bool(shares) and sum(shares) / len(shares) >= float(settings["facecam_frozen_min_pixel_share"])
+
+
+def _side_cover(mask: np.ndarray, side: str, box: tuple[int, int, int, int], offset: int) -> float:
+    """Part de la longueur du cote ``side`` de ``box`` (x0, y0, x1, y1), decale
+    de ``offset`` px vers l'exterieur, ou ``mask`` a un pixel allume (bande de
+    3 px d'epaisseur)."""
+    height, width = mask.shape
+    x0, y0, x1, y1 = box
+    if side in ("left", "right"):
+        c = (x0 if side == "left" else x1) + offset
+        if not 0 <= c < width or y1 <= y0:
+            return 0.0
+        return float(mask[y0:y1, max(0, c - 1):c + 2].max(axis=1).mean())
+    c = (y0 if side == "top" else y1) + offset
+    if not 0 <= c < height or x1 <= x0:
+        return 0.0
+    return float(mask[max(0, c - 1):c + 2, x0:x1].max(axis=0).mean())
+
+
+def _frame_candidates(
+    counts: np.ndarray, n_frames: int, grays: list[np.ndarray], settings: dict[str, Any]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Rectangles a cadre net dont le contenu bouge : (candidats, ecartes avec
+    la raison). Les traits qui restent au meme endroit sur la plupart des
+    images (``counts``, voir ``_edge_mask``) sont refermes
+    (``facecam_candidate_close`` de la largeur) : le cadre d'une webcam et sa
+    decoration fixe forment un bloc, dont la boite englobante est ajustee de
+    ``facecam_candidate_slack`` px au plus sur chaque cote. Un cote doit etre
+    net sur ``facecam_candidate_side_share`` de sa longueur, sauf s'il est a
+    ``facecam_candidate_snap`` de la dimension d'un bord de l'image : il est
+    alors ramene sur ce bord, qui compte comme cote net (une incrustation
+    collee au bord n'y montre jamais de discontinuite)."""
+    height, width = counts.shape
+    persistent = (counts >= float(settings["facecam_candidate_edge_share"]) * n_frames - 1e-9).astype(np.uint8)
+    k = max(9, round(float(settings["facecam_candidate_close"]) * width)) | 1
+    closed = cv2.morphologyEx(persistent, cv2.MORPH_CLOSE, np.ones((k, k), np.uint8))
+    count, _, stats, _ = cv2.connectedComponentsWithStats(closed, connectivity=8)
+    snap_x = float(settings["facecam_candidate_snap"]) * width
+    snap_y = float(settings["facecam_candidate_snap"]) * height
+    slack = int(settings["facecam_candidate_slack"])
+    side_share = float(settings["facecam_candidate_side_share"])
+    area_range = (
+        float(settings["facecam_candidate_min_area"]) * width * height,
+        float(settings["facecam_max_area"]) * width * height,
+    )
+    found: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    for i in range(1, count):
+        x, y, w, h, _ = (int(v) for v in stats[i])
+        if not area_range[0] <= w * h:
+            continue
+        box = [x, y, x + w, y + h]
+        weak: list[str] = []
+        for pos, side in enumerate(("left", "top", "right", "bottom")):
+            limit = width if side in ("left", "right") else height
+            near = (snap_x if side in ("left", "right") else snap_y)
+            if side in ("left", "top") and box[pos] <= near:
+                box[pos] = 0
+            elif side in ("right", "bottom") and box[pos] >= limit - near:
+                box[pos] = limit
+            else:
+                # Un pixel isole a moins de k px du cadre elargit la boite
+                # englobante de k px au plus : on cherche le cote vers l'interieur.
+                offsets = range(-slack, k + 1) if side in ("left", "top") else range(-k, slack + 1)
+                best = max(
+                    offsets,
+                    key=lambda o: _side_cover(persistent, side, tuple(box), o),  # type: ignore[arg-type]
+                )
+                if _side_cover(persistent, side, tuple(box), best) < side_share:  # type: ignore[arg-type]
+                    weak.append(side)
+                else:
+                    box[pos] += best
+        if weak:
+            rejected.append({"kind": "cadre", "box": [x, y, x + w, y + h], "reason": f"cote(s) {', '.join(weak)} pas nets"})
+            continue
+        if not _rect_moves(grays, (box[0], box[1], box[2] - box[0], box[3] - box[1]), settings):
+            rejected.append({"kind": "cadre", "box": box, "reason": "contenu qui ne bouge jamais"})
+            continue
+        found.append({"kind": "cadre", "box": tuple(box), "support": n_frames, "edge_reason": None})
+    return found, rejected
+
+
+def _period_candidates(
+    images: list[np.ndarray], detector: Any, settings: dict[str, Any]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Rectangles probables de webcam d'une periode, calcules en local sur ses
+    images : zones de visage (cale sur le cadre reel de l'incrustation quand
+    il est trouve) et rectangles a cadre net dont le contenu bouge. Chacun est
+    au format du panneau camera ; numerotes de 1, dans l'ordre de lecture.
+    Renvoie (candidats, ecartes avec la raison)."""
+    min_conf = float(settings["min_confidence"])
+    dup_iou = float(settings["duplicate_iou"])
+    edge_threshold = float(settings["facecam_edge_min_gradient"])
+    height, width = images[0].shape[:2]
+    detections: list[list[Box]] = []
+    counts = np.zeros((height, width), dtype=np.uint32)
+    grays = []
+    for image in images:
+        found = [tuple(float(v) for v in d[:5]) for d in detector.detect(image)]
+        found += _detect_corners(detector, image, width, height, settings)
+        found = [d for d in found if d[4] >= min_conf]
+        detections.append([d[:4] for d in _nms(found, dup_iou)])  # type: ignore[misc]
+        counts += _edge_mask(image, edge_threshold)
+        grays.append(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.float64))
+    n = len(images)
+
+    raw: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    for face, support in _face_clusters(
+        detections, float(settings["facecam_tolerance"]), float(settings["facecam_cluster_ratio"]),
+        int(settings["facecam_candidate_min_frames"]), int(settings["facecam_candidate_max"]),
+    ):
+        rect, reason, edge_reason = _facecam_rect(counts, n, face, width, height, settings)
+        if rect is None:
+            rejected.append({"kind": "visage", "box": [round(v, 1) for v in face], "reason": reason})
+            continue
+        raw.append({"kind": "visage", "rect": rect, "support": support, "edge_reason": edge_reason or reason})
+    frames, frame_rejected = _frame_candidates(counts, n, grays, settings)
+    rejected += frame_rejected
+    for item in frames:
+        x0, y0, x1, y1 = item["box"]
+        rect, reason = _size_camera_rect((x0 + x1) / 2, (y0 + y1) / 2, x1 - x0, y1 - y0, width, height, settings)
+        if rect is None:
+            rejected.append({"kind": "cadre", "box": list(item["box"]), "reason": reason})
+            continue
+        for other in raw:
+            if _iou(_rect_box(rect), _rect_box(other["rect"])) >= 0.5:
+                other["kind"] = "visage+cadre"
+                break
+        else:
+            raw.append({"kind": "cadre", "rect": rect, "support": item["support"], "edge_reason": None})
+
+    raw.sort(key=lambda c: -c["support"])
+    raw = raw[: int(settings["facecam_candidate_max"])]
+    raw.sort(key=lambda c: (c["rect"][1], c["rect"][0]))
+    candidates = [
+        {
+            "id": i,
+            "kind": c["kind"],
+            "rect": dict(zip("xywh", (int(v) for v in c["rect"]))),
+            "support": c["support"],
+            "edge_reason": c["edge_reason"],
+        }
+        for i, c in enumerate(raw, start=1)
+    ]
+    return candidates, rejected
+
+
+def _rect_box(rect: Sequence[int] | dict[str, int]) -> tuple[float, float, float, float]:
+    if isinstance(rect, dict):
+        rect = (rect["x"], rect["y"], rect["w"], rect["h"])
+    return (float(rect[0]), float(rect[1]), float(rect[0] + rect[2]), float(rect[1] + rect[3]))
+
+
+_BOARD_COLORS = [
+    (0, 0, 255), (0, 200, 0), (255, 0, 0), (0, 200, 255),
+    (255, 0, 255), (255, 255, 0), (0, 128, 255), (128, 0, 255),
+]
+
+
+def _draw_board(
+    images: list[np.ndarray], times: list[float], candidates: list[dict[str, Any]], path: Path, settings: dict[str, Any]
+) -> None:
+    """Planche des images de la periode (grille, ``facecam_board_tile_width``
+    de large chacune), tous les rectangles candidats dessines et numerotes sur
+    chaque image."""
+    tile_w = int(settings["facecam_board_tile_width"])
+    height, width = images[0].shape[:2]
+    scale = tile_w / width
+    tile_h = round(height * scale)
+    columns = min(len(images), 4)
+    rows = math.ceil(len(images) / columns)
+    board = np.zeros((rows * tile_h, columns * tile_w, 3), dtype=np.uint8)
+    thickness = max(1, round(tile_w / 240))
+    for k, (image, t) in enumerate(zip(images, times)):
+        tile = cv2.resize(image, (tile_w, tile_h), interpolation=cv2.INTER_AREA)
+        for c in candidates:
+            r = c["rect"]
+            color = _BOARD_COLORS[(c["id"] - 1) % len(_BOARD_COLORS)]
+            p0 = (round(r["x"] * scale), round(r["y"] * scale))
+            p1 = (round((r["x"] + r["w"]) * scale), round((r["y"] + r["h"]) * scale))
+            cv2.rectangle(tile, p0, p1, color, thickness * 2)
+            cv2.putText(
+                tile, str(c["id"]), (p0[0] + 4, p0[1] + 6 + tile_w // 16),
+                cv2.FONT_HERSHEY_SIMPLEX, tile_w / 240, color, thickness * 2,
+            )
+        cv2.putText(tile, f"{t:.0f}s", (4, tile_h - 6), cv2.FONT_HERSHEY_SIMPLEX, tile_w / 600, (255, 255, 255), 1)
+        r0, c0 = divmod(k, columns)
+        board[r0 * tile_h:(r0 + 1) * tile_h, c0 * tile_w:(c0 + 1) * tile_w] = tile
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not cv2.imwrite(str(path), board, [cv2.IMWRITE_JPEG_QUALITY, int(settings["jpeg_quality"])]):
+        raise ReframeError(f"ecriture de la planche impossible : {path}")
+
+
+def _facecam_prompt(candidates: list[dict[str, Any]], start: float, end: float) -> str:
+    listing = "\n".join(f"- {c['id']} : rectangle {c['kind']}, vu sur {c['support']} image(s)" for c in candidates)
+    return (
+        "Cette planche reunit des images d'un stream (jeu video, ou discussion) entre "
+        f"{start:.0f}s et {end:.0f}s. Des rectangles numerotes sont dessines sur chaque image : "
+        "ce sont les emplacements possibles de la webcam du streamer (sa propre camera filmant "
+        "sa personne, incrustee par-dessus le jeu).\n"
+        f"Rectangles candidats :\n{listing}\n"
+        "Reponds le numero du rectangle qui est la webcam du streamer, ou null si aucun ne l'est "
+        "(widget, alerte, chat, camera de jeu, zone de l'interface du jeu, personne a l'ecran). "
+        "Ne donne jamais de coordonnees : seulement le numero. Explique en une phrase dans reason."
+    )
+
+
+def _facecam_check(ids: set[int]) -> Callable[[Any], None]:
+    def check(answer: Any) -> None:
+        number = answer["webcam"]
+        if number is not None and number not in ids:
+            raise llm.SchemaError(f"webcam {number} n'est pas un rectangle de la planche (attendu : {sorted(ids)} ou null)")
+
+    return check
+
+
 def detect_facecam(
     video_id: str,
     workspace_dir: str | Path = "workspace",
@@ -1472,28 +1831,38 @@ def detect_facecam(
     detector_factory: Callable[[dict[str, Any], Device], Any] | None = None,
     image_reader: Callable[[str], np.ndarray | None] = cv2.imread,
 ) -> Path:
-    """Detection de la facecam, une fois par video (SPEC-8257 regle 1), sur
-    les images cles de scenes.json ; resultat en cache dans
-    workspace/<video_id>/facecam.json (pas refait sauf ``force``) :
+    """Webcam du stream, trouvee par periode (TASK-5745), une fois par video ;
+    resultat en cache dans workspace/<video_id>/facecam.json (pas refait sauf
+    ``force``), planches sous workspace/<video_id>/facecam/ :
 
         {"video_id", "source": {"width", "height"},
-         "facecam": {"x", "y", "w", "h"} | null, "reason": null | pourquoi pas,
-         "edge_reason": null | pourquoi le rectangle est centre sur le seul
-             visage plutot que cale sur les bords reels de l'incrustation
-             (TASK-6404, ADR-ad2e),
-         "face": [x0, y0, x1, y1] | null, "share", "localize_min_share",
-         "keyframes": [{"timecode", "path", "faces", "face_in_rect"}]}
+         "periods": [{"index", "start", "end", "transition", "candidates":
+                      [{"id", "kind", "rect": {x, y, w, h}, "support", "edge_reason"}],
+                      "rejected": [{"kind", "box", "reason"}], "board": chemin | null,
+                      "answer": {"webcam": id | null, "reason"} | null,
+                      "facecam": {x, y, w, h} | null, "reason": null | pourquoi pas,
+                      "edge_reason": null | pourquoi le rectangle est centre sur le seul visage}],
+         "keyframes": [{"timecode", "path"}]}
 
-    ``face_in_rect`` reste un indicateur informatif (visage detecte dans le
-    rectangle sur cette image cle) : le choix du format par clip
-    (``_clip_facecam``, SPEC-8257 regle 2) ne s'appuie plus dessus, seulement
-    sur la presence et la vivacite du rectangle lui-meme.
+    1. PERIODES (local) : une image cle environ par ``facecam_period_step``
+       secondes ; un grand visage plein ecran (Just Chatting) puis le jeu
+       coupent la video en deux periodes (limite affinee a l'image cle
+       pres) ; sans transition nette, une seule periode.
+    2. CANDIDATS (local) : sur ``facecam_board_frames`` images de la periode,
+       zones de visage et rectangles a cadre net dont le contenu bouge
+       (``_period_candidates``), numerotes et dessines sur une planche.
+    3. CLAUDE (clipper.llm, usage "facecam") : une planche par periode, il
+       repond un numero ou null ; une reponse invalide est une erreur
+       explicite (ADR-ad2e). Aucune coordonnee demandee, aucune memoire d'un
+       stream a l'autre.
 
     Detecteur de visages de reframe (``detector``), device via clipper.gpu,
-    ferme avant de rendre la main (ADR-fb9b)."""
+    ferme avant le premier appel a Claude (ADR-fb9b)."""
     video_dir = Path(workspace_dir) / video_id
     out = video_dir / "facecam.json"
     if out.exists() and not force:
+        if "periods" not in json.loads(out.read_text(encoding="utf-8")):
+            raise ReframeError(f"{out} d'un ancien format (sans periodes) : relancer reframe --force")
         return out
     settings = _settings(config)
     scenes_file = video_dir / "scenes.json"
@@ -1501,7 +1870,6 @@ def detect_facecam(
         raise ReframeError(f"scenes.json absent : {scenes_file}")
     frames = sorted(json.loads(scenes_file.read_text(encoding="utf-8")).get("frames", []),
                     key=lambda f: f["timecode"])
-    frames = _sample_keyframes(frames, int(settings["facecam_max_keyframes"]))
     if detector_factory is None:
         if settings["detector"] not in _DETECTORS:
             raise ReframeError(
@@ -1509,84 +1877,120 @@ def detect_facecam(
             )
         detector_factory = _DETECTORS[settings["detector"]]
 
+    def read(i: int) -> np.ndarray:
+        path = video_dir / frames[i]["path"]
+        image = image_reader(str(path))
+        if image is None:
+            raise ReframeError(f"image cle illisible : {path}")
+        return image
+
     min_conf = float(settings["min_confidence"])
-    dup_iou = float(settings["duplicate_iou"])
-    edge_threshold = float(settings["facecam_edge_min_gradient"])
-    detections: list[list[Box]] = []
     size: tuple[int, int] | None = None
-    # Comptes de pixels a fort gradient, cumules image cle par image cle (pas
-    # de pile d'images en memoire : une video peut en avoir des milliers).
-    edge_counts: np.ndarray | None = None
+    period_inputs: list[dict[str, Any]] = []
     if frames:
         detector = detector_factory(settings, get_device())
         try:
-            for frame_info in frames:
-                path = video_dir / frame_info["path"]
-                image = image_reader(str(path))
-                if image is None:
-                    raise ReframeError(f"image cle illisible : {path}")
-                height, width = image.shape[:2]
-                size = size or (width, height)
-                found = [tuple(float(v) for v in d[:5]) for d in detector.detect(image)]
-                found += _detect_corners(detector, image, width, height, settings)
-                found = [d for d in found if d[4] >= min_conf]
-                detections.append([d[:4] for d in _nms(found, dup_iou)])  # type: ignore[misc]
-                mask = _edge_mask(image, edge_threshold)
-                if edge_counts is None:
-                    edge_counts = np.zeros((height, width), dtype=np.uint32)
-                edge_counts += mask
+            def big(i: int) -> bool:
+                nonlocal size
+                image = read(i)
+                size = size or (image.shape[1], image.shape[0])
+                found = [d for d in detector.detect(image) if d[4] >= min_conf]
+                return _has_big_face([d[:4] for d in found], image.shape[0], settings)  # type: ignore[misc]
+
+            samples = _sample_every(frames, float(settings["facecam_period_step"]))
+            flags = [big(i) for i in samples]
+            lead, transition = _find_periods(
+                flags, int(settings["facecam_period_min_samples"]), float(settings["facecam_period_lead_share"])
+            )
+            if lead is None:
+                bounds = [(0, len(frames), transition)]
+            else:
+                lo, hi = samples[lead - 1], samples[lead]  # grand visage en lo, plus en hi
+                while hi - lo > 1:
+                    mid = (lo + hi) // 2
+                    if big(mid):
+                        lo = mid
+                    else:
+                        hi = mid
+                bounds = [(0, hi, transition), (hi, len(frames), transition)]
+            for first, last, note in bounds:
+                chosen = _sample_keyframes(frames[first:last], int(settings["facecam_candidate_frames"]))
+                indices = [frames.index(f) for f in chosen]
+                images = [read(i) for i in indices]
+                candidates, rejected = _period_candidates(images, detector, settings)
+                shown = _sample_keyframes(
+                    [{"k": k} for k in range(len(indices))], int(settings["facecam_board_frames"])
+                )
+                period_inputs.append({
+                    "start": 0.0 if first == 0 else frames[first]["timecode"],
+                    "end": frames[last - 1]["timecode"],
+                    "transition": note,
+                    "images": [images[f["k"]] for f in shown],
+                    "times": [frames[indices[f["k"]]]["timecode"] for f in shown],
+                    "candidates": candidates,
+                    "rejected": rejected,
+                })
         finally:
             detector.close()
             detector = None
             gc.collect()
 
-    min_share = float(settings["facecam_localize_min_share"])
-    tolerance = float(settings["facecam_tolerance"])
-    rect: tuple[int, int, int, int] | None = None
-    edge_reason: str | None = None
-    face, count = _stable_face(detections, tolerance)
-    share = count / len(frames) if frames else 0.0
-    if not frames:
-        reason = "aucune image cle dans scenes.json"
-    elif face is None:
-        reason = f"aucun visage detecte sur les {len(frames)} images cles"
-    elif share < min_share - 1e-9:
-        reason = (
-            f"visage a la meme position (tolerance {tolerance:g} px) sur {share:.0%} des images cles "
-            f"seulement (facecam_localize_min_share = {min_share:.0%})"
-        )
-    else:
-        assert size is not None and edge_counts is not None
-        rect, reason, edge_reason = _facecam_rect(edge_counts, len(frames), face, size[0], size[1], settings)
-
-    keyframes = []
-    for frame_info, boxes in zip(frames, detections):
-        keyframes.append({
-            "timecode": frame_info["timecode"],
-            "path": frame_info["path"],
-            "faces": [[round(v, 1) for v in b] for b in boxes],
-            "face_in_rect": None if rect is None else any(_contains_point(
-                (rect[0], rect[1], rect[0] + rect[2], rect[1] + rect[3]), _center(b)) for b in boxes),
+    for before, after in zip(period_inputs, period_inputs[1:]):
+        before["end"] = after["start"]  # periodes jointives
+    periods: list[dict[str, Any]] = []
+    for index, item in enumerate(period_inputs):
+        candidates = item["candidates"]
+        board: str | None = None
+        answer: dict[str, Any] | None = None
+        rect: dict[str, int] | None = None
+        edge_reason: str | None = None
+        if not candidates:
+            reason = "aucun rectangle candidat de webcam sur cette periode (cadre net et contenu en mouvement, ou visage)"
+        else:
+            path = video_dir / "facecam" / f"period_{index}.jpg"
+            _draw_board(item["images"], item["times"], candidates, path, settings)
+            board = path.relative_to(video_dir).as_posix()
+            answer = llm.ask(
+                "facecam", _facecam_prompt(candidates, item["start"], item["end"]), [path], FACECAM_SCHEMA,
+                config=config, check=_facecam_check({c["id"] for c in candidates}),
+            )
+            if answer["webcam"] is None:
+                reason = f"Claude : aucune webcam sur cette periode ({answer['reason']})"
+            else:
+                chosen = next(c for c in candidates if c["id"] == answer["webcam"])
+                rect, edge_reason, reason = dict(chosen["rect"]), chosen["edge_reason"], None
+        periods.append({
+            "index": index,
+            "start": item["start"],
+            "end": item["end"],
+            "transition": item["transition"],
+            "candidates": candidates,
+            "rejected": item["rejected"],
+            "board": board,
+            "answer": answer,
+            "facecam": rect,
+            "reason": reason,
+            "edge_reason": edge_reason,
         })
+        if rect is None:
+            log.warning("%s : periode %d sans webcam, clips en letterbox (%s)", video_id, index, reason)
+        else:
+            log.info("%s : periode %d, webcam %s (candidat %s)", video_id, index, rect, answer and answer["webcam"])
+            if edge_reason is not None:
+                log.info("%s : periode %d, bords de l'incrustation non trouves (%s)", video_id, index, edge_reason)
+    if not frames:
+        periods = [{
+            "index": 0, "start": 0.0, "end": 0.0, "transition": "aucune image cle", "candidates": [],
+            "rejected": [], "board": None, "answer": None, "facecam": None,
+            "reason": "aucune image cle dans scenes.json", "edge_reason": None,
+        }]
+        log.warning("%s : aucune image cle, clips en letterbox", video_id)
     data = {
         "video_id": video_id,
         "source": None if size is None else {"width": size[0], "height": size[1]},
-        "facecam": None if rect is None else dict(zip("xywh", rect)),
-        "reason": reason,
-        "edge_reason": edge_reason,
-        "face": None if face is None else [round(v, 1) for v in face],
-        "share": share,
-        "localize_min_share": min_share,
-        "keyframes": keyframes,
+        "periods": periods,
+        "keyframes": [{"timecode": f["timecode"], "path": f["path"]} for f in frames],
     }
-    if rect is None:
-        log.warning("%s : pas de facecam, clips en letterbox (%s)", video_id, reason)
-    elif edge_reason is not None:
-        log.info(
-            "%s : facecam %s, bords de l'incrustation non trouves (%s)", video_id, data["facecam"], edge_reason
-        )
-    else:
-        log.info("%s : facecam %s (visage sur %.0f%% des images cles)", video_id, data["facecam"], share * 100)
     _write_plan(out, data)
     return out
 
@@ -1669,7 +2073,7 @@ def _clip_facecam(
     soit detecte ; sinon ``None`` et la raison (ADR-ad2e : jamais un repli
     silencieux)."""
     if facecam["facecam"] is None:
-        return None, f"pas de facecam dans la video : {facecam['reason']}"
+        return None, f"pas de webcam sur la periode {facecam['index']} : {facecam['reason']}"
     rect = facecam["facecam"]
     keys = [k for k in facecam["keyframes"] if start - 1e-6 <= k["timecode"] <= end + 1e-6]
     if not keys:
@@ -2313,19 +2717,31 @@ def reframe(
         raise ReframeError(f"video absente : {video}")
 
     if settings["format"] == "letterbox" and settings["layout"] == "stream_auto":
-        facecam = json.loads(
+        detected = json.loads(
             detect_facecam(video_id, workspace_dir, config=config, detector_factory=detector_factory)
             .read_text(encoding="utf-8")
         )
+        # Chaque clip prend la webcam de la periode qui contient son debut.
+        period = [p for p in detected["periods"] if p["start"] <= start + 1e-9][-1]
+        facecam = {**period, "source": detected["source"], "keyframes": detected["keyframes"]}
         rect, reason = _clip_facecam(facecam, start, end, settings, video_dir)
+        candidate = None if period["answer"] is None else period["answer"]["webcam"]
         if rect is not None:
             if settings["stream_variant"] == "split":
-                return _reframe_stream_split(video_id, clip_id, start, end, out, facecam, rect, settings)
-            return _reframe_stream(video_id, clip_id, start, end, out, facecam, rect, settings)
-        log.info("reframe %s/%s : letterbox, pas de stream (%s)", video_id, clip_id, reason)
-        return _reframe_letterbox(
-            video_id, clip_id, start, end, out, video, settings, frame_source, layout_reason=reason
-        )
+                path = _reframe_stream_split(video_id, clip_id, start, end, out, facecam, rect, settings)
+            else:
+                path = _reframe_stream(video_id, clip_id, start, end, out, facecam, rect, settings)
+            decision = {"period": period["index"], "candidate": candidate, "reason": period["answer"]["reason"]}
+        else:
+            log.info("reframe %s/%s : letterbox, pas de stream (%s)", video_id, clip_id, reason)
+            path = _reframe_letterbox(
+                video_id, clip_id, start, end, out, video, settings, frame_source, layout_reason=reason
+            )
+            decision = {"period": period["index"], "candidate": None, "reason": reason}
+        plan = json.loads(path.read_text(encoding="utf-8"))
+        plan["facecam_decision"] = decision
+        _write_plan(path, plan)
+        return path
     if settings["format"] == "letterbox":
         return _reframe_letterbox(video_id, clip_id, start, end, out, video, settings, frame_source)
 

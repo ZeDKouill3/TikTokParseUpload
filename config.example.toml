@@ -26,6 +26,14 @@ output_dir = "output"
 # letterbox_zoom = 1.3     # fenetre centrale de largeur source_w / zoom
 # layout = "stream_auto"   # letterbox (defaut) | stream_auto (facecam detectee, SPEC-3a88)
 # stream_variant = "split" # top (defaut, inchange) | split (SPEC-76dc, webcam haut/jeu bas)
+# # Webcam du stream trouvee par periode (Just Chatting puis jeu), TASK-5745 : rectangles candidats
+# # numerotes dessines sur une planche, Claude (usage [llm.usages.facecam], modele rapide par defaut)
+# # repond un numero ou « aucun ». Valeurs par defaut de CONFIG_DEFAULTS, a ne changer que si besoin :
+# facecam_period_step = 60.0             # une image environ par minute pour reperer la fin du Just Chatting
+# facecam_fullscreen_face_height = 0.25  # grand visage plein ecran : part de la hauteur de l'image
+# facecam_candidate_frames = 24          # images de la periode ou chercher les rectangles candidats
+# facecam_board_frames = 8               # images de la planche envoyee a Claude (6 a 8)
+# facecam_candidate_max = 8              # nombre maximal de candidats numerotes
 #
 # [captions]
 # screen_title_allow_emoji = false   # SPEC-6a86 (defaut) : titre d'ecran sobre, sans emoji
