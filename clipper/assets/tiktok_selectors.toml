@@ -169,6 +169,9 @@ likes = "[data-tt='components_RowLayout_FlexRow_7']"
 comments = "[data-tt='components_RowLayout_FlexRow_8']"
 # Page d'analyse d'un post : une carte par metrique, texte « libelle | valeur ».
 metric_card = "[data-tt='VideoOverviewPage_VideoMetricsCard_FlexItem']"
+# Bandeau en haut de l'analyse d'un post restreint (verifie en reel 2026-10-04) : « Cette vidéo n'est pas éligible à la
+# recommandation dans le fil d'actualité Pour toi... ». Classes generees (css-xxxx) : reperage par le TEXTE, FR et EN.
+fyf_notice = "span:text-matches(\"pas éligible à la recommandation|not eligible for recommendation\", \"i\")"
 # Bloc des sources de trafic (visibles a partir de 100 vues). A VERIFIER SUR LA VRAIE PAGE.
 traffic_sources = "[data-tt='VideoOverviewPage_TrafficSourceCard_FlexRow']"
 # Valeur affichee tant que TikTok n'a pas fini de calculer (retention, sources) : relevee « null ».

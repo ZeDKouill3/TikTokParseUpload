@@ -1254,8 +1254,10 @@ def analytics_url(post_id, tab=None):
 class Post:
     """Ce que TikTok Studio affiche pour un post : une ligne de la page Publications et ses pages d'analyse."""
 
-    def __init__(self, post_id, *, row=None, cards=None, curve=None, sources=None, viewers="ok", engagement="ok"):
+    def __init__(self, post_id, *, row=None, cards=None, curve=None, sources=None, viewers="ok", engagement="ok",
+                 notice=None):
         self.id = post_id
+        self.notice = notice  # bandeau « pas eligible au fil Pour toi » affiche en haut de l'analyse, ou None
         self.row = _row(post_id) if row is None else row
         self.cards = _cards() if cards is None else cards
         self.curve = _curve() if curve is None else curve
@@ -1313,6 +1315,8 @@ class FakeStudio(FakePage):
         if view == "overview" and post in self.posts:
             if selector == stats["metric_card"]:
                 return list(self.posts[post].cards)
+            if selector == stats["fyf_notice"] and self.posts[post].notice is not None:
+                return [FakeCell(self.posts[post].notice)]
             if selector == stats["retention_point"]:
                 return list(self.posts[post].curve)
             if selector == stats["traffic_sources"] and self.posts[post].sources is not None:
@@ -1619,6 +1623,55 @@ def test_filled_metrics_are_read_by_label_and_converted(tmp_path, monkeypatch):
     assert got["new_followers"] == 4
     assert (got["likes"], got["comments"]) == (85, 7)  # depuis la ligne de la page Publications
     assert got["detailed_at"] == NOW.isoformat()
+
+
+FYF_NOTICE = ("Cette vidéo n'est pas éligible à la recommandation dans le fil d'actualité Pour toi. Si tu n'es pas "
+              "d'accord avec cette restriction de contenu, tu peux envoyer une contestation.")
+
+
+def test_the_for_you_restriction_banner_is_read_by_text_on_the_post_analytics(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [Post(ID_A, notice=FYF_NOTICE), Post(ID_B)])
+
+    by_id = {p["post_id"]: p for p in env.fetch()["posts"]}
+
+    assert by_id[ID_A]["fyf_eligible"] is False and by_id[ID_A]["fyf_notice"] == FYF_NOTICE
+    assert by_id[ID_B]["fyf_eligible"] is True and by_id[ID_B]["fyf_notice"] is None  # pas de bandeau : eligible
+
+
+def test_a_scheduled_post_not_yet_online_has_an_unknown_eligibility(tmp_path, monkeypatch):
+    future = Post(ID_A, row=_row(ID_A, created="2026-10-02 18:00"), notice=FYF_NOTICE)
+    env = StatsEnv(tmp_path, monkeypatch, [future])
+
+    got = env.fetch()["posts"][0]
+
+    assert got["fyf_eligible"] is None and got["fyf_notice"] is None  # jamais devine
+
+
+def test_the_restriction_selector_matches_the_french_and_english_texts_without_generated_classes():
+    data = _sel()["stats"]
+    pattern = data["fyf_notice"]
+    assert "pas éligible à la recommandation" in pattern and "not eligible for recommendation" in pattern
+    assert "css-" not in pattern  # classes generees : reperage par le texte
+
+
+def test_the_restriction_selector_is_required(tmp_path):
+    text = tiktok.SELECTORS_PATH.read_text(encoding="utf-8")
+    broken = tmp_path / "s.toml"
+    broken.write_text(chr(10).join(l for l in text.splitlines() if not l.startswith("fyf_notice")), encoding="utf-8")
+    with pytest.raises(tiktok.TikTokError, match="fyf_notice"):
+        tiktok.load_selectors(broken)
+
+
+def test_the_restriction_state_reaches_the_video_list_and_sheet(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [Post(ID_A, notice=FYF_NOTICE), Post(ID_B)])
+    env.fetch()
+
+    videos = {v["post_id"]: v for v in tiktok.list_videos("ma_chaine", config=env.config)}
+    detail = tiktok.video_detail("ma_chaine", ID_A, config=env.config)
+
+    assert videos[ID_A]["fyf_eligible"] is False and videos[ID_A]["fyf_notice"] == FYF_NOTICE
+    assert videos[ID_B]["fyf_eligible"] is True
+    assert detail["fyf_eligible"] is False
 
 
 def test_metrics_at_zero_are_real_zeros_not_nulls(tmp_path, monkeypatch):
