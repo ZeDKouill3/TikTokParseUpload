@@ -1304,7 +1304,7 @@ class FakeStudio(FakePage):
     def __init__(self, posts, *, tiles=None, batches=None, **kwargs):
         super().__init__(set(), **kwargs)
         self.posts = {p.id: p for p in posts}
-        self.tiles = tiles if tiles is not None else {7: _tiles(), 28: _tiles(), 60: _tiles()}
+        self.tiles = tiles if tiles is not None else {7: _tiles(), 28: _tiles(), 60: _tiles(), 365: _tiles()}
         self.batches = batches or [[p.id for p in posts]]  # fenetre virtualisee : identifiants dans le DOM apres 0, 1, 2... pas de defilement
         self.scrolled, self.period, self.menu = 0, 7, False
         self.view = ("other", None)
@@ -1336,7 +1336,7 @@ class FakeStudio(FakePage):
                 return [FakeCell(text) for text in self.tiles[self.period].values()]
             if selector == acc["period_button"]:
                 return [FakeElement(self, selector, text=f"{self.period} derniers jours", on_click=lambda: setattr(self, "menu", True))]
-            for days in (7, 28, 60):
+            for days in (7, 28, 60, 365):
                 if selector == acc["period_option"].format(days=days) and self.menu:
                     return [FakeElement(self, selector, on_click=lambda days=days: self.pick_period(days))]
         if view == "content":
@@ -1431,7 +1431,7 @@ def test_stats_settings_have_defaults_and_invalid_values_are_refused(tmp_path):
     d = tiktok.CONFIG_DEFAULTS
     assert d["stats_interval_h"] == 0 and d["stats_dir"] == "state/stats/tiktok"  # SPEC-47e2 R4 : coupe par defaut
     assert d["stats_stale_min"] == 60
-    assert (d["stats_detail_days"], d["stats_detail_max"], d["stats_scroll_rounds"]) == (7, 50, 100)
+    assert (d["stats_detail_days"], d["stats_detail_max"], d["stats_scroll_rounds"]) == (7, 30, 100)
     for key, bad in (("stats_interval_h", -1), ("stats_interval_h", "24"), ("stats_interval_h", True),
                      ("stats_stale_min", -1), ("stats_stale_min", "60"), ("stats_stale_min", True),
                      ("stats_empty_wait_s", -1), ("stats_empty_wait_s", True),
@@ -1463,15 +1463,15 @@ def test_a_full_fetch_reads_the_account_page_then_the_posts_list_then_each_post_
     assert env.page.fills() == []
 
 
-def test_the_account_tiles_are_read_for_the_three_periods_with_the_evolution_given_by_tiktok(tmp_path, monkeypatch):
+def test_the_account_tiles_are_read_for_the_four_periods_with_the_evolution_given_by_tiktok(tmp_path, monkeypatch):
     tiles = {7: _tiles(views=("1 200", "+12,5%"), profile_views=("85", "-3%"), likes=("40", "--"), comments=("0", "--"),
                        shares=("--", "--")),
-             28: _tiles(views=("4,8 K", "+8%")), 60: _tiles(views=("9 000", "0%"))}
+             28: _tiles(views=("4,8 K", "+8%")), 60: _tiles(views=("9 000", "0%")), 365: _tiles(views=("1,2 M", "+2%"))}
     env = StatsEnv(tmp_path, monkeypatch, [Post(ID_A)], tiles=tiles)
 
     overview = env.fetch()["overview"]
 
-    assert set(overview) == {"7", "28", "60"}
+    assert set(overview) == {"7", "28", "60", "365"}
     assert overview["7"]["views"] == {"value": 1200, "change_pct": 12.5}
     assert overview["7"]["profile_views"] == {"value": 85, "change_pct": -3.0}
     assert overview["7"]["likes"] == {"value": 40, "change_pct": None}  # « (--) » : TikTok ne donne pas l'evolution
@@ -1479,6 +1479,7 @@ def test_the_account_tiles_are_read_for_the_three_periods_with_the_evolution_giv
     assert overview["7"]["shares"] == {"value": None, "change_pct": None}  # « -- » : null explicite
     assert overview["28"]["views"] == {"value": 4800, "change_pct": 8.0}
     assert overview["60"]["views"] == {"value": 9000, "change_pct": 0.0}
+    assert overview["365"]["views"] == {"value": 1_200_000, "change_pct": 2.0}
 
 
 def test_the_period_menu_is_only_clicked_when_the_period_is_not_already_shown(tmp_path, monkeypatch):
@@ -1487,23 +1488,24 @@ def test_the_period_menu_is_only_clicked_when_the_period_is_not_already_shown(tm
 
     env.fetch()
 
-    assert env.page.clicks().count(acc["period_button"]) == 2  # 28 et 60 jours ; 7 jours est deja affiche
+    assert env.page.clicks().count(acc["period_button"]) == 3  # 28, 60 et 365 jours ; 7 jours est deja affiche
     assert env.page.clicks().count(acc["period_option"].format(days=28)) == 1
     assert env.page.clicks().count(acc["period_option"].format(days=60)) == 1
+    assert env.page.clicks().count(acc["period_option"].format(days=365)) == 1
     assert acc["period_option"].format(days=7) not in env.page.clicks()
     assert set(env.page.clicks()) <= {acc["period_button"], acc["period_option"].format(days=28),
-                                      acc["period_option"].format(days=60)}  # rien d'autre n'est clique
+                                      acc["period_option"].format(days=60), acc["period_option"].format(days=365)}  # rien d'autre n'est clique
 
 
 def test_a_tile_missing_from_the_page_is_an_explicit_null_never_an_invented_zero(tmp_path, monkeypatch):
-    tiles = {n: {k: v for k, v in _tiles().items() if k != "shares"} for n in (7, 28, 60)}
+    tiles = {n: {k: v for k, v in _tiles().items() if k != "shares"} for n in (7, 28, 60, 365)}
     env = StatsEnv(tmp_path, monkeypatch, [Post(ID_A)], tiles=tiles)
 
     assert env.fetch()["overview"]["7"]["shares"] == {"value": None, "change_pct": None}
 
 
 def test_an_unreadable_tile_is_an_unexpected_page_stop_not_a_guess(tmp_path, monkeypatch):
-    tiles = {7: _tiles(views="beaucoup (+1%)"), 28: _tiles(), 60: _tiles()}
+    tiles = {7: _tiles(views="beaucoup (+1%)"), 28: _tiles(), 60: _tiles(), 365: _tiles()}
     env = StatsEnv(tmp_path, monkeypatch, [Post(ID_A)], tiles=tiles)
 
     with pytest.raises(tiktok.TikTokStop) as stop:
@@ -1851,7 +1853,8 @@ def test_durations_are_converted_to_seconds(text, expected):
 
 @pytest.mark.parametrize("text,expected", [
     ("1 200", 1200), ("1 200", 1200), ("1,2 K", 1200), ("1.5M", 1500000), ("2,5 Md", 2500000000), ("987", 987),
-    ("--", None),
+    ("--", None), ("1,432", 1432), ("12,345,678", 12345678), ("1,4 k", 1400), ("2,3 M", 2300000), ("1.4K", 1400),
+    ("1 432", 1432), ("999", 999),
 ])
 def test_counts_are_parsed_from_the_displayed_text(text, expected):
     assert tiktok.parse_count(text) == expected
@@ -2032,6 +2035,110 @@ def test_a_post_with_null_views_is_read_again_and_the_detail_count_is_capped(tmp
     capped = StatsEnv(tmp_path / "c", monkeypatch, [Post(ID_A), Post(ID_B), Post(ID_C)], settings={"stats_detail_max": 2})
     snapshot = capped.fetch()
     assert [p["post_id"] for p in snapshot["posts"] if "detailed_at" in p] == [ID_A, ID_B]
+
+
+# -- TASK-2aa5 : plafond du detail, releve complet, tuile « 24 -2 (-7.7%) », periode 365 jours
+
+
+def _many_posts(count):
+    """``count`` posts, du plus recent (premier de la liste) au plus ancien, tous inconnus de l'historique."""
+    ids = [str(7300000000000001000 + n) for n in range(count)]
+    return [Post(i) for i in ids], ids
+
+
+def _opened_analyses(env, ids):
+    wanted = {analytics_url(i): i for i in ids}
+    return [wanted[u] for u in env.page.gotos() if u in wanted]
+
+
+def test_the_detail_is_capped_to_the_thirty_most_recent_posts_by_default(tmp_path, monkeypatch):
+    posts, ids = _many_posts(40)
+    env = StatsEnv(tmp_path, monkeypatch, posts)
+
+    snapshot = env.fetch()
+
+    assert tiktok.CONFIG_DEFAULTS["stats_detail_max"] == 30
+    assert _opened_analyses(env, ids) == ids[:30]  # 30 pages d'analyse ouvertes, les plus recentes
+    by_id = {p["post_id"]: p for p in snapshot["posts"]}
+    assert len(by_id) == 40  # la liste est complete
+    for post_id in ids[:30]:
+        assert by_id[post_id]["detailed_at"] and by_id[post_id]["detail_not_read"] is False
+    for post_id in ids[30:]:
+        old = by_id[post_id]
+        assert old["views"] == 1200 and old["likes"] == 85 and old["comments"] == 7  # chiffres de la liste
+        assert old["detail_not_read"] is True  # « detail non releve »
+        for field in ("detailed_at", "retention_curve", "fyf_notice", "fyf_eligible", "traffic_sources", "viewers", "engagement"):
+            assert field not in old  # jamais invente
+
+
+def test_a_full_fetch_has_no_cap(tmp_path, monkeypatch):
+    posts, ids = _many_posts(40)
+    env = StatsEnv(tmp_path, monkeypatch, posts)
+
+    snapshot = env.fetch(full=True)
+
+    assert _opened_analyses(env, ids) == ids
+    assert all(p["detailed_at"] and p["detail_not_read"] is False for p in snapshot["posts"])
+
+
+def test_a_post_read_in_detail_later_loses_the_not_read_mark_in_the_merged_view(tmp_path, monkeypatch):
+    posts, ids = _many_posts(32)
+    env = StatsEnv(tmp_path, monkeypatch, posts)
+    env.fetch()
+    merged = tiktok.merged_posts(tiktok.read_history("ma_chaine", config=env.config))
+    assert merged[ids[31]]["detail_not_read"] is True
+
+    env.fetch(now=NOW + timedelta(days=1), full=True)
+
+    merged = tiktok.merged_posts(tiktok.read_history("ma_chaine", config=env.config))
+    assert merged[ids[31]]["detail_not_read"] is False and merged[ids[31]]["detailed_at"]
+
+
+@pytest.mark.parametrize("tile,expected", [
+    ("24 -2 (-7.7%)", {"value": 24, "change_pct": -7.7}),
+    ("1 432 +30 (+2,1%)", {"value": 1432, "change_pct": 2.1}),
+    ("24 (-7.7%)", {"value": 24, "change_pct": -7.7}),
+    ("-- 24 (--)", {"value": 24, "change_pct": None}),
+    ("-- (--)", {"value": None, "change_pct": None}),
+])
+def test_a_tile_with_the_absolute_change_before_the_percentage_is_read(tmp_path, monkeypatch, tile, expected):
+    tiles = {n: _tiles() for n in (7, 28, 60, 365)}
+    tiles[7] = _tiles(views=tile)
+    env = StatsEnv(tmp_path, monkeypatch, [Post(ID_A)], tiles=tiles)
+
+    assert env.fetch()["overview"]["7"]["views"] == expected
+
+
+def test_a_tile_value_with_english_thousands_is_read(tmp_path, monkeypatch):
+    tiles = {n: _tiles() for n in (7, 28, 60, 365)}
+    tiles[7] = _tiles(views=("1,432", "+1%"))
+    env = StatsEnv(tmp_path, monkeypatch, [Post(ID_A, row=_row(ID_A, views="1,432"), cards=_cards(views="1,432"))], tiles=tiles)
+
+    snapshot = env.fetch()
+
+    assert snapshot["overview"]["7"]["views"]["value"] == 1432 and snapshot["posts"][0]["views"] == 1432
+
+
+def test_a_missing_365_day_period_is_an_explicit_stop_saying_so(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [Post(ID_A)])
+    real = env.page._elements
+    env.page._elements = lambda selector: [] if selector == _sel()["account"]["period_option"].format(days=365) else real(selector)
+
+    with pytest.raises(tiktok.TikTokStop) as stop:
+        env.fetch()
+
+    assert stop.value.code == "element_missing" and "365 derniers jours" in stop.value.reason
+
+
+def test_the_overview_of_365_days_is_served_from_the_history(tmp_path, monkeypatch):
+    tiles = {n: _tiles() for n in (7, 28, 60, 365)}
+    tiles[365] = _tiles(views=("52 000", "+4%"))
+    env = StatsEnv(tmp_path, monkeypatch, [Post(ID_A)], tiles=tiles)
+    env.fetch()
+
+    out = tiktok.account_overview("ma_chaine", 365, config=env.config)
+
+    assert out["period"] == 365 and out["tiles"]["views"]["value"] == 52000 and len(out["series"]["views"]["labels"]) == 365
 
 
 # -- (3) liste des videos, fiche d'une video, liens (R3, R5)

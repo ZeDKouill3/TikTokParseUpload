@@ -5590,7 +5590,7 @@ def _tt_snapshot(tmp_path, day, *, account=TT_ACCOUNT, views=100, posts=(), orig
     stamp = f"2026-10-{day:02d}T{hour:02d}:00:00+00:00"
     overview = None if origin != "full" else {
         str(n): {key: {"value": views * (n // 7) + i, "change_pct": 4.5 if key == "views" else None}
-                 for i, key in enumerate(_TT_TILES)} for n in (7, 28, 60)}
+                 for i, key in enumerate(_TT_TILES)} for n in (7, 28, 60, 365)}
     _write_json(tmp_path / "state" / "stats" / "tiktok" / account / f"202610{day:02d}T{hour:02d}0000000000Z.json",
                 {"account": account, "fetched_at": stamp, "source": "tiktok_studio", "origin": origin,
                  "overview": overview, "posts": list(posts)})
@@ -5836,6 +5836,64 @@ def test_refresh_route_refuses_an_invalid_body_or_account(tmp_path, isolated_cwd
     assert client(tmp_path).post("/api/stats/tiktok/refresh", json={"account": "../x"}).status_code == 422
     assert client(tmp_path).post("/api/stats/tiktok/refresh", json={"autre": 1}).status_code == 422
     assert fetch.calls == []
+
+
+
+def test_refresh_route_runs_a_full_fetch_without_cap_only_when_asked(tmp_path, isolated_cwd, monkeypatch):
+    _tt_accounts(tmp_path)
+    seen = []
+
+    def fetch(account, *, config=None, **kwargs):
+        seen.append(kwargs)
+        return {"account": account, "fetched_at": "2026-09-27T08:00:00+00:00", "posts": [{}], "overview": {}}
+
+    monkeypatch.setattr(tiktok_mod, "fetch_stats", fetch)
+
+    assert client(tmp_path).post("/api/stats/tiktok/refresh", json={"account": TT_ACCOUNT}).status_code == 200
+    assert client(tmp_path).post("/api/stats/tiktok/refresh", json={"account": TT_ACCOUNT, "full": True}).status_code == 200
+    assert client(tmp_path).post("/api/stats/tiktok/refresh", json={"account": TT_ACCOUNT, "full": False}).status_code == 200
+
+    assert seen == [{}, {"full": True}, {}]  # le releve normal garde le plafond
+
+
+def test_refresh_route_refuses_a_full_flag_that_is_not_a_boolean(tmp_path, isolated_cwd, monkeypatch):
+    _tt_accounts(tmp_path)
+    fetch = FakeFetch()
+    monkeypatch.setattr(tiktok_mod, "fetch_stats", fetch)
+
+    resp = client(tmp_path).post("/api/stats/tiktok/refresh", json={"account": TT_ACCOUNT, "full": "oui"})
+
+    assert resp.status_code == 422 and "full" in resp.json()["detail"] and fetch.calls == []
+
+
+def test_the_stats_accounts_list_gives_the_page_count_of_a_full_fetch(tmp_path, isolated_cwd):
+    _tt_accounts(tmp_path, ready=(TT_ACCOUNT,))
+    _tt_snapshot(tmp_path, 1, posts=[_tt_post(TT_ID_A, "Un"), _tt_post(TT_ID_B, "Deux")])
+
+    accounts = {a["account"]: a for a in _tt_get(tmp_path, "").json()["accounts"]}
+
+    # 2 pages d'ensemble (analyse du compte, liste des Publications) + 3 par post connu (analyse, spectateurs, engagement)
+    assert accounts[TT_ACCOUNT]["known_posts"] == 2 and accounts[TT_ACCOUNT]["full_pages"] == 8
+    assert accounts[TT_OTHER]["known_posts"] == 0 and accounts[TT_OTHER]["full_pages"] is None  # jamais releve : inconnu
+
+
+def test_the_stats_overview_accepts_365_days(tmp_path, isolated_cwd):
+    _tt_accounts(tmp_path)
+    _tt_snapshot(tmp_path, 1, posts=[_tt_post(TT_ID_A, "Un")])
+
+    data = _tt_get(tmp_path, f"/{TT_ACCOUNT}", period=365).json()
+
+    assert data["period"] == 365 and len(data["series"]["views"]["labels"]) == 365
+
+
+def test_the_stats_screen_has_a_full_fetch_button_with_a_confirmation_saying_the_page_count():
+    js = _static("screens", "stats.js")
+    assert "data-stats-full" in js and "Relevé complet" in js and "confirmDialog" in js
+    assert "full: true" in js
+    said = _stats_js_run(["statsFullConfirmBody"], 'statsFullConfirmBody({full_pages: 1234, known_posts: 410})')
+    assert "1 234" in said.replace(" ", " ").replace(" ", " ") and "pages" in said
+    unknown = _stats_js_run(["statsFullConfirmBody"], 'statsFullConfirmBody({full_pages: null, known_posts: 0})')
+    assert "pages" in unknown and "inconnu" in unknown.lower()
 
 
 # --------------------------------------------------------------------------
@@ -7407,7 +7465,7 @@ def test_the_stats_screen_follows_the_mockup_account_period_scan_tabs_and_video_
                 "data-stats-q", "data-stats-open", "data-stats-vtab", "data-stats-tiles", "data-stats-notready"):
         assert key in js, key
     assert "toastError" in js and "target=\"_blank\" rel=\"noopener noreferrer\"" in js
-    for period in ("7", "28", "60"):
+    for period in ("7", "28", "60", "365"):
         assert period in js[js.index("STATS_PERIODS"):js.index("STATS_PERIODS") + 40]
     for label in ("Vues de vidéo", "Vues du profil", "J'aime", "Commentaires", "Partages"):
         assert f'"{label}"' in js

@@ -12,7 +12,7 @@
 const STATS_STALE_MS = 4000;
 const STATS_POLL_MS = 3000; // pendant un releve en tache de fond : relecture de l'etat des comptes
 const STATS_VISIT_GAP_MS = 30000; // ecran quitte plus longtemps que ca : nouvelle ouverture, donc nouvelle demande
-const STATS_PERIODS = [7, 28, 60];
+const STATS_PERIODS = [7, 28, 60, 365];
 const STATS_METRICS = [
   { id: "views", label: "Vues de vidéo", icon: "eye" },
   { id: "profile_views", label: "Vues du profil", icon: "user" },
@@ -257,6 +257,15 @@ function statsEmpty(iconName, title, text, action) { return `<div class="panel">
 
 const statsScanButton = (account) => `<button class="btn btn-primary" type="button" data-stats-scan${statsRefreshing(account) || !account.ready ? " disabled" : ""}>${icon("refresh-cw", statsRefreshing(account) ? "spin" : "")}${statsRefreshing(account) ? "Relevé en cours" : "Relever maintenant"}</button>`;
 
+const statsFullButton = (account) => `<button class="btn" type="button" data-stats-full${statsRefreshing(account) || !account.ready ? " disabled" : ""}>${icon("layers", "")}Relevé complet</button>`;
+
+/* « Relevé complet » : detail de TOUTES les videos (le releve normal est plafonne aux plus recentes) ; la confirmation
+   dit combien de pages TikTok Studio seront ouvertes (2 + 3 par video connue, jamais devine quand rien n'est connu). */
+function statsFullConfirmBody(account) {
+  if (!account.full_pages) return "Clipper va ouvrir TikTok Studio et relever le détail de toutes les vidéos, sans plafond. Le nombre de pages à ouvrir est inconnu : aucun relevé n'est encore enregistré pour ce compte. Cela peut durer longtemps.";
+  return `Clipper va ouvrir environ ${fr(account.full_pages)} pages dans TikTok Studio (${fr(account.known_posts)} vidéo${account.known_posts > 1 ? "s" : ""} connue${account.known_posts > 1 ? "s" : ""}, 3 pages par vidéo + 2 pages d'ensemble) et relever le détail de chacune, sans plafond. Cela peut durer longtemps ; le relevé normal, lui, reste plafonné aux vidéos les plus récentes.`;
+}
+
 function statsControls(account) {
   const accounts = statsUi.accounts;
   const options = accounts.map((a) => `<option value="${esc(a.account)}"${a.account === account.account ? " selected" : ""}>${esc(a.label)} · ${esc(a.account)}</option>`).join("");
@@ -270,7 +279,7 @@ function statsControls(account) {
   return `<section class="ctl" aria-label="Compte et période">
       <div class="acct field"><label for="stats-account">Compte TikTok</label><select class="input" id="stats-account" data-stats-account>${options}</select></div>
       <div class="field"><span class="field-label" id="stats-lbl-period">Période</span><div class="seg stats-seg" data-stats-periods role="group" aria-labelledby="stats-lbl-period">${periods}</div></div>
-      <div class="scan"><div class="scan-when">${when}</div>${statsScanButton(account)}</div>
+      <div class="scan"><div class="scan-when">${when}</div>${statsScanButton(account)}${statsFullButton(account)}</div>
     </section>${notReady}${running}${failed}`;
 }
 
@@ -425,6 +434,7 @@ function statsVideoSheet(account) {
       <div class="dlinks">${links.join("")}</div>${origin}</div>
     <div><div class="tabs" role="tablist" aria-label="Sections de la fiche">${STATS_VIDEO_TABS.map(([id, label]) => `<button type="button" role="tab" class="${tab === id ? "on" : ""}" aria-selected="${tab === id}" data-stats-vtab="${id}">${esc(label)}</button>`).join("")}</div>
       ${v.processing ? `<div class="reason">${icon("hourglass", "i-sm")}<span><b>TikTok traite encore cette vidéo.</b> Les chiffres arrivent en général dans l'heure qui suit la publication ; Clipper la relèvera au prochain passage.</span></div>` : ""}
+      ${v.detail_not_read ? `<div class="reason">${icon("info", "i-sm")}<span><b>Détail non relevé.</b> Cette vidéo est plus ancienne que les dernières relevées : seuls les chiffres de la liste sont connus. Le bouton « Relevé complet » relève aussi son détail.</span></div>` : ""}
       ${content}</div></div>`;
 }
 
@@ -432,11 +442,12 @@ function statsVideoSheet(account) {
 
 /* Ouvre le Chrome du profil sur ce PC (visible) ; un arret sur (captcha, connexion expiree, compte non pret) revient
    en 409 avec sa raison, affichee telle quelle. */
-async function statsScan(account) {
+async function statsScan(account, full) {
+  if (full && !(await confirmDialog({ title: "Lancer un relevé complet ?", body: statsFullConfirmBody(account), confirmLabel: "Relevé complet", danger: false }))) return;
   statsUi.refreshing = true;
   renderCurrent();
   try {
-    const sent = await api("/api/stats/tiktok/refresh", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ account: account.account }) });
+    const sent = await api("/api/stats/tiktok/refresh", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(full ? { account: account.account, full: true } : { account: account.account }) });
     const posts = Object.values(sent.accounts).reduce((t, a) => t + (a.posts || 0), 0);
     if (Object.values(sent.accounts).some((a) => a.running)) toast({ kind: "info", title: "Relevé déjà en cours", body: `${account.label} : un relevé tourne déjà, rien n'est relancé.` });
     else toast({ kind: "ok", title: "Relevé terminé", body: `${account.label} : ${posts} publication${posts > 1 ? "s" : ""} relevée${posts > 1 ? "s" : ""}.` });
@@ -455,7 +466,9 @@ function statsWire(body, account) {
   $$("[data-stats-period]", body).forEach((b) => (b.onclick = () => { statsUi.period = Number(b.dataset.statsPeriod); renderCurrent(); statsLoad(); }));
   $$("[data-stats-metric]", body).forEach((b) => (b.onclick = () => { statsUi.metric = b.dataset.statsMetric; renderCurrent(); }));
   const scan = $("[data-stats-scan]", body);
-  if (scan) scan.onclick = () => statsScan(account);
+  if (scan) scan.onclick = () => statsScan(account, false);
+  const fullScan = $("[data-stats-full]", body);
+  if (fullScan) fullScan.onclick = () => statsScan(account, true);
   $$("[data-stats-sort]", body).forEach((b) => (b.onclick = () => {
     const key = b.dataset.statsSort;
     statsUi.sort = statsUi.sort.key === key ? { key, dir: statsUi.sort.dir === "asc" ? "desc" : "asc" } : { key, dir: key === "caption" ? "asc" : "desc" };
