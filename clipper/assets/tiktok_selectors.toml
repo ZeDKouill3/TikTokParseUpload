@@ -194,8 +194,10 @@ unavailable = ["dès 100 vues", "en cours de traitement"]
 # Vide = on n'invente rien : le relevé attend les lignes quelques secondes ([tiktok] stats_empty_wait_s) puis rend 0 post.
 # Renseigné = attendu en course avec les lignes (le relevé n'attend plus rien dès qu'il s'affiche).
 empty_state = ""
-# Faire defiler la liste des Publications pour charger les posts suivants : une lecture apres chaque defilement.
-scroll_script = "window.scrollTo(0, document.body.scrollHeight)"
+# Un pas de defilement de la liste des Publications. Releve reel 2026-10-05 : la liste est VIRTUALISEE (le DOM ne garde que
+# ~8 lignes de 100 px) et defile dans un conteneur interne (overflow auto), pas dans la fenetre. Le script descend ce conteneur
+# de 80 % de sa hauteur visible et rend true quand le bas est atteint ; le relevé lit les lignes apres chaque pas et les cumule.
+scroll_script = "(() => { let e = document.querySelector(\"a[href*='/video/']\"); while (e && !(e.scrollHeight > e.clientHeight + 5 && /auto|scroll/.test(getComputedStyle(e).overflowY))) e = e.parentElement; const box = e || document.scrollingElement; box.scrollTop += Math.max(100, Math.floor(box.clientHeight * 0.8)); return box.scrollTop + box.clientHeight >= box.scrollHeight - 2; })()"
 
 # Libelle de chaque metrique de l'analyse d'un post (langue de TikTok Studio : francais).
 [metrics]

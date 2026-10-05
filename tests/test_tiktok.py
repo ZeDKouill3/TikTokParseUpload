@@ -1274,7 +1274,7 @@ class FakeStudio(FakePage):
         super().__init__(set(), **kwargs)
         self.posts = {p.id: p for p in posts}
         self.tiles = tiles if tiles is not None else {7: _tiles(), 28: _tiles(), 60: _tiles()}
-        self.batches = batches or [[p.id for p in posts]]  # identifiants affiches apres 0, 1, 2... defilements
+        self.batches = batches or [[p.id for p in posts]]  # fenetre virtualisee : identifiants dans le DOM apres 0, 1, 2... pas de defilement
         self.scrolled, self.period, self.menu = 0, 7, False
         self.view = ("other", None)
         self.timeouts: list[tuple[str, Any]] = []  # (selecteur, delai) de chaque attente
@@ -1310,8 +1310,7 @@ class FakeStudio(FakePage):
                     return [FakeElement(self, selector, on_click=lambda days=days: self.pick_period(days))]
         if view == "content":
             if selector == stats["row"]:
-                shown = {i for batch in self.batches[: self.scrolled + 1] for i in batch}
-                return [self.posts[i].row for i in dict.fromkeys(i for b in self.batches for i in b) if i in shown]
+                return [self.posts[i].row for i in self.batches[self.scrolled]]  # liste virtualisee : seule la fenetre courante est dans le DOM
         if view == "overview" and post in self.posts:
             if selector == stats["metric_card"]:
                 return list(self.posts[post].cards)
@@ -1350,6 +1349,7 @@ class FakeStudio(FakePage):
     def evaluate(self, script):
         self.calls.append(("evaluate", script))
         self.scrolled = min(self.scrolled + 1, len(self.batches) - 1)
+        return self.scrolled == len(self.batches) - 1  # true = bas du conteneur atteint
 
     def gotos(self):
         return [c[1] for c in self.calls if c[0] == "goto"]
@@ -1400,7 +1400,7 @@ def test_stats_settings_have_defaults_and_invalid_values_are_refused(tmp_path):
     d = tiktok.CONFIG_DEFAULTS
     assert d["stats_interval_h"] == 0 and d["stats_dir"] == "state/stats/tiktok"  # SPEC-47e2 R4 : coupe par defaut
     assert d["stats_stale_min"] == 60
-    assert (d["stats_detail_days"], d["stats_detail_max"], d["stats_scroll_rounds"]) == (7, 50, 10)
+    assert (d["stats_detail_days"], d["stats_detail_max"], d["stats_scroll_rounds"]) == (7, 50, 100)
     for key, bad in (("stats_interval_h", -1), ("stats_interval_h", "24"), ("stats_interval_h", True),
                      ("stats_stale_min", -1), ("stats_stale_min", "60"), ("stats_stale_min", True),
                      ("stats_empty_wait_s", -1), ("stats_empty_wait_s", True),
@@ -1534,18 +1534,47 @@ def test_the_list_is_scrolled_until_it_stops_growing(tmp_path, monkeypatch):
     assert [p["post_id"] for p in snapshot["posts"]] == [ID_A, ID_B, ID_C]
     scrolls = [c for c in env.page.calls if c[0] == "evaluate"]
     assert scrolls and all(c[1] == _sel()["stats"]["scroll_script"] for c in scrolls)
-    assert len(scrolls) == 3  # deux defilements qui ajoutent un post, un troisieme qui ne change rien
+    assert len(scrolls) == 4  # deux pas qui ajoutent un post (bas atteint), puis deux pas de suite sans nouvelle ligne
+
+
+def test_a_virtualized_list_of_25_posts_shown_8_at_a_time_is_read_in_full(tmp_path, monkeypatch):
+    # releve reel 2026-10-05 : le DOM ne garde que ~8 lignes ; chaque pas de defilement en remplace une partie
+    ids = [f"73000000000000{n:05d}" for n in range(25)]
+    windows = [ids[0:8], ids[4:12], ids[8:16], ids[12:20], ids[16:24], ids[17:25]]
+    env = StatsEnv(tmp_path, monkeypatch, [Post(i) for i in ids], batches=windows)
+
+    assert [p["post_id"] for p in env.fetch()["posts"]] == ids
+
+
+def test_the_list_that_only_grows_at_the_second_step_is_not_cut_short(tmp_path, monkeypatch):
+    posts = [Post(ID_A), Post(ID_B)]
+    env = StatsEnv(tmp_path, monkeypatch, posts, batches=[[ID_A], [ID_A], [ID_A, ID_B]])  # le 1er pas ne charge rien
+
+    assert [p["post_id"] for p in env.fetch()["posts"]] == [ID_A, ID_B]
+
+
+def test_the_end_of_the_list_needs_the_bottom_of_the_container_and_two_idle_steps(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [Post(ID_A)], batches=[[ID_A], [ID_A], [ID_A], [ID_A]])
+
+    env.fetch()
+
+    assert len([c for c in env.page.calls if c[0] == "evaluate"]) == 3  # 2 pas sans nouvelle ligne ne suffisent pas tant que le bas n'est pas atteint (3e pas)
+
+
+def test_the_scroll_script_scrolls_the_inner_container_not_the_window():
+    script = _sel()["stats"]["scroll_script"]
+    assert "scrollTop" in script and "overflowY" in script and "window.scrollTo" not in script
 
 
 def test_a_list_of_three_batches_is_read_in_full(tmp_path, monkeypatch):
     ids = [f"73000000000000{n:05d}" for n in range(55)]
     env = StatsEnv(tmp_path, monkeypatch, [Post(i) for i in ids],
-                   batches=[ids[:20], ids[:40], ids])  # 20 + 20 + 15 posts apres 0, 1, 2 defilements
+                   batches=[ids[:20], ids[20:40], ids[40:]])  # fenetres de 20 + 20 + 15 posts (liste virtualisee)
 
     snapshot = env.fetch()
 
     assert [p["post_id"] for p in snapshot["posts"]] == ids  # 55 posts lus, aucun perdu
-    assert len([c for c in env.page.calls if c[0] == "evaluate"]) == 3  # le 3e defilement ne change rien : fin
+    assert len([c for c in env.page.calls if c[0] == "evaluate"]) == 4  # 2 pas qui ajoutent + 2 pas sans nouvelle ligne : fin
 
 
 def test_reaching_the_scroll_limit_is_a_logged_error_never_a_silently_truncated_list(tmp_path, monkeypatch, caplog):
@@ -1566,7 +1595,7 @@ def test_reaching_the_scroll_limit_is_a_logged_error_never_a_silently_truncated_
 
 def test_the_scroll_limit_is_not_reached_when_the_list_stops_growing_just_in_time(tmp_path, monkeypatch):
     posts = [Post(ID_A), Post(ID_B)]
-    env = StatsEnv(tmp_path, monkeypatch, posts, batches=[[ID_A], [ID_A, ID_B]], settings={"stats_scroll_rounds": 2})
+    env = StatsEnv(tmp_path, monkeypatch, posts, batches=[[ID_A], [ID_A, ID_B]], settings={"stats_scroll_rounds": 3})
 
     assert [p["post_id"] for p in env.fetch()["posts"]] == [ID_A, ID_B]
 
