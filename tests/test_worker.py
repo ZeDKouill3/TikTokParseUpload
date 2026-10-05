@@ -2710,3 +2710,80 @@ def test_retry_after_launch_keeps_the_style(tmp_path):
     entry = worker.enqueue(URL_A, pipeline.load_state(VIDEO_A, config=config).get("channel"), "run", config=config)
 
     assert entry["channel"] == "twitch"
+
+
+# --------------------------------------------------------------------------
+# TASK-7f582251f6c5 : clip refuse par TikTok a la verification de contenu
+# --------------------------------------------------------------------------
+
+_REFUSED = "vérification de contenu : problème signalé par TikTok (contenu non conforme)"
+
+
+def test_a_content_check_refusal_marks_the_entry_refused_keeps_the_account_ready_and_the_next_post_goes(
+    tmp_path, monkeypatch, caplog,
+):
+    config = _pub_env(tmp_path, monkeypatch, tiktok_settings={"max_posts_per_day": 5, "min_gap_minutes": 0})
+    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=2))
+    _seed(tmp_path, "ma_chaine", "02", _ago(minutes=1))
+    capture = tmp_path / "state" / "browser" / ACCOUNT / "captures" / "x-refused.png"
+    pub = FakePublisher(error=tiktok.TikTokStop("content_check_refused", _REFUSED, capture))
+    w = _pub_worker(config, pub)
+
+    with caplog.at_level(logging.WARNING):
+        w.tick()
+
+    first, second = _entries(tmp_path)
+    assert first["status"] == "refused_by_platform" and first["error"] == _REFUSED
+    assert first["capture"] == str(capture) and first["halted"] is False
+    assert second["status"] == "scheduled"
+    assert _REFUSED in caplog.text  # journalisé
+    stored = _account_state(tmp_path, ACCOUNT)
+    assert stored["ready_to_publish"] is True  # aucun arrêt de publication pour ce cas
+    event = tiktok.read_events(config=config)[-1]
+    assert (event["account"], event["clip_id"], event["capture"]) == (ACCOUNT, "01", str(capture))
+
+    pub.error = None
+    w.tick()  # la publication suivante du compte part normalement
+
+    assert len(pub.calls) == 2 and _entries(tmp_path)[1]["status"] == "published"
+    assert _entries(tmp_path)[0]["status"] == "refused_by_platform"  # jamais republié tout seul
+
+
+def test_a_content_check_timeout_stays_an_explicit_halt_not_a_refusal(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1))
+    stop = tiktok.TikTokStop("content_check", "vérification de contenu non terminée après 900 s", None)
+
+    _pub_worker(config, FakePublisher(error=stop)).tick()
+
+    entry = _entries(tmp_path)[0]
+    assert entry["status"] == "failed" and entry["halted"] is True
+    assert _account_state(tmp_path, ACCOUNT)["ready_to_publish"] is False
+
+
+def test_the_next_part_of_a_series_goes_when_the_previous_part_was_refused_by_tiktok(tmp_path, monkeypatch, caplog):
+    config = _pub_env(tmp_path, monkeypatch, tiktok_settings=_NO_CAP)
+    _series_part(tmp_path, "c01-p1", 1, _ago(hours=2), status="refused_by_platform", error=_REFUSED)
+    _series_part(tmp_path, "c01-p2", 2, _ago(minutes=1))
+    pub = FakePublisher()
+
+    with caplog.at_level(logging.INFO):
+        _pub_worker(config, pub).tick()
+
+    assert len(pub.calls) == 1
+    assert next(e for e in _entries(tmp_path) if e["clip_id"] == "c01-p2")["status"] == "published"
+    assert "partie 1 refusée par TikTok, série poursuivie" in caplog.text
+
+
+def test_a_series_skips_every_refused_part_and_still_waits_for_an_unpublished_earlier_one(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch, tiktok_settings=_NO_CAP)
+    _series_part(tmp_path, "c01-p1", 1, _ago(hours=3), status="failed", error="mp4 introuvable")
+    _series_part(tmp_path, "c01-p2", 2, _ago(hours=2), status="refused_by_platform", error=_REFUSED)
+    _series_part(tmp_path, "c01-p3", 3, _ago(minutes=1))
+    pub = FakePublisher()
+
+    _pub_worker(config, pub).tick()
+
+    assert pub.calls == []  # la partie 1 échouée (pas refusée) retient toujours la suite
+    entry = next(e for e in _entries(tmp_path) if e["clip_id"] == "c01-p3")
+    assert "partie 1 non publiée" in entry["waiting_reason"]

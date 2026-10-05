@@ -18,6 +18,7 @@ const PUB_TIKTOK = {
   pending: { label: "En attente", cls: "pending" }, in_progress: { label: "En cours", cls: "info" }, scheduled_on_tiktok: { label: "Programmée sur TikTok", cls: "info" },
   scheduled_on_youtube: { label: "Programmée sur YouTube", cls: "info" },
   published: { label: "Publiée", cls: "ok" }, failed: { label: "Échec", cls: "bad" },
+  refused_by_platform: { label: "Refusé par TikTok", cls: "bad" },
 };
 const PUB_STALE_MS = 4000;
 const PUB_HOLD_MS = 250;      // appui long avant de saisir un clip au toucher
@@ -393,7 +394,19 @@ function pubPostsSection() {
   if (pubPosts.error) return `<section>${head}<p class="reason bad">Chargement impossible : ${esc(pubPosts.error.message || pubPosts.error)}</p></section>`;
   if (!pubPosts.data) return `<section>${head}<div class="skeleton skeleton-line"></div></section>`;
   return `<section>${head}${rows.length ? `<div class="panel" id="pub-posts">${rows.map(pubPostRow).join("")}</div>`
-    : `<p class="muted" style="font-size:13px">Aucune publication en attente : « Nouvelle publication » choisit un clip, le compte, maintenant ou à une date. Les publications terminées sont dans le calendrier.</p>`}</section>`;
+    : `<p class="muted" style="font-size:13px">Aucune publication en attente : « Nouvelle publication » choisit un clip, le compte, maintenant ou à une date. Les publications terminées sont dans le calendrier.</p>`}</section>${pubRefusedSection()}`;
+}
+
+/* Clips refusés par TikTok à la vérification de contenu (TASK-7f582251f6c5) : retirés des clips disponibles, listés
+   à part avec la raison et la capture, jamais republiés automatiquement ; le compte et la série continuent. */
+function pubRefusedSection() {
+  const rows = pubPosts.data ? (pubPosts.data.refused_by_platform || []).filter((p) => !pubUi.account || p.account === pubUi.account) : [];
+  if (!rows.length) return "";
+  const row = (p) => `<div class="list-item"><div class="li-main"><div class="li-title">${esc(pubTitle(p))}</div>
+      <div class="li-sub bad">Refusé par TikTok : ${esc(p.error || "problème signalé à la vérification de contenu")}</div>
+      ${p.capture_url ? `<a href="${esc(p.capture_url)}" target="_blank" rel="noopener">voir la capture d'écran</a>` : ""}</div></div>`;
+  return `<section id="pub-refused"><div class="section-title">${icon("circle-x")}Refusés par TikTok <span class="more">${rows.length}</span></div>
+    <div class="panel">${rows.map(row).join("")}</div></section>`;
 }
 
 async function pubPostCancel(p) {

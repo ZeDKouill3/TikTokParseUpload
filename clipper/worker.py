@@ -752,7 +752,14 @@ class Worker:
             publisher = self.youtube_publisher if service == "youtube" else self.publisher
             result = publisher(clip, account, mode=mode, schedule_at=slot if mode == "scheduled" else None,
                                config=self.config, on_tick=self._beat, **extra)
-        except (tiktok.TikTokStop, youtube.YouTubeStop) as stop:
+        except tiktok.TikTokStop as stop:
+            if stop.code == "content_check_refused":
+                self._refused(entry, name, stop.reason, account=account, capture=stop.capture,
+                              state_dir=paths["state_dir"])
+            else:
+                self._fail(entry, name, stop.reason, halted=True, account=account, capture=stop.capture,
+                           state_dir=paths["state_dir"])
+        except youtube.YouTubeStop as stop:
             self._fail(entry, name, stop.reason, halted=True, account=account, capture=stop.capture,
                        state_dir=paths["state_dir"])
         except browser.BrowserError as exc:
@@ -788,10 +795,20 @@ class Worker:
             return None
         if entry.get("parts_together") is False:
             return None
-        previous = next((e for e in publish_mod.list_entries(channel, state_dir=state_dir)
-                         if e["video_id"] == entry["video_id"] and e.get("series_id") == series_id
-                         and e.get("part") == part - 1), None)
-        reason = f"partie {part - 1} non publiée"
+        siblings = [e for e in publish_mod.list_entries(channel, state_dir=state_dir)
+                    if e["video_id"] == entry["video_id"] and e.get("series_id") == series_id]
+        number = part - 1
+        # une partie refusee par TikTok (verification de contenu) sort de la serie : la serie continue sans elle
+        while number >= 1:
+            found = next((e for e in siblings if e.get("part") == number), None)
+            if found is None or found["status"] != publish_mod.REFUSED_BY_PLATFORM:
+                break
+            log.info("%s/%s : partie %d refusée par TikTok, série poursuivie", entry["video_id"], found["clip_id"], number)
+            number -= 1
+        if number < 1:
+            return None
+        previous = next((e for e in siblings if e.get("part") == number), None)
+        reason = f"partie {number} non publiée"
         if previous is None:
             return f"{reason} (absente de la file) : la série part entière et dans l'ordre"
         if previous["status"] != "published":
@@ -842,6 +859,18 @@ class Worker:
             reason += " (« prêt à publier » décoché)"
         self._wait(entry, channel, account, reason, state_dir)
         return False
+
+    def _refused(self, entry: dict[str, Any], channel: str, reason: str, *, account: str | None,
+                 state_dir: str | Path, capture: Path | None = None) -> None:
+        """Probleme signale par TikTok a la verification de contenu (TASK-7f582251f6c5) : rien n'est publie, l'entree
+        passe en ``refused_by_platform`` (raison + capture), journal et evenement console ; contrairement a ``_fail``,
+        le compte n'est PAS arrete (« pret a publier » reste coche) et la publication suivante part normalement."""
+        video_id, clip_id = entry["video_id"], entry["clip_id"]
+        log.error("%s/%s : refusé par TikTok : %s", video_id, clip_id, reason)
+        publish_mod.mark_refused_by_platform(video_id, clip_id, channel, reason, capture=capture, state_dir=state_dir)
+        tiktok.emit_event({"level": "error", "account": account, "channel": channel, "video_id": video_id,
+                           "clip_id": clip_id, "reason": f"refusé par TikTok : {reason}",
+                           "capture": str(capture) if capture else None}, config=self.config)
 
     def _fail(self, entry: dict[str, Any], channel: str, reason: str, *, halted: bool, account: str | None,
               state_dir: str | Path, capture: Path | None = None) -> None:

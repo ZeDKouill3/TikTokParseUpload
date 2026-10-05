@@ -8980,3 +8980,38 @@ def test_topbar_has_a_network_pill_wired_to_the_api_every_60s(tmp_path, isolated
 def test_settings_screen_has_a_country_choice(tmp_path, isolated_cwd):
     js = served(tmp_path, "/static/screens/settings.js")
     assert "network.expected_country" in js and "[network]" in js
+
+
+# --------------------------------------------------------------------------
+# TASK-7f582251f6c5 : liste « Refusés par TikTok »
+# --------------------------------------------------------------------------
+
+
+def test_a_clip_refused_by_tiktok_is_not_available_and_is_listed_apart_with_its_reason(tmp_path, isolated_cwd):
+    _fable_setup(tmp_path, clips=("01", "02"))
+    _write_publish(tmp_path, "ma_chaine", [_entry("01", "refused_by_platform", slot_at=None, halted=False,
+                                                  error="vérification de contenu : problème signalé par TikTok",
+                                                  refused_at="2026-10-05T20:00:00+00:00")])
+    c = client(tmp_path)
+
+    clips = {x["clip_id"]: x for x in c.get("/api/clips", params={"video_id": CLIPS_VIDEO}).json()}
+    assert clips["01"]["publish_status"] == "refused_by_platform"  # plus « à valider » : hors des clips disponibles
+    assert clips["02"]["publish_status"] == "à valider"
+    assert c.post(f"/api/clips/{CLIPS_VIDEO}/01/approve", json={"account": READY}).status_code == 409
+    bulk = c.post("/api/clips/approve", json=_bulk_body([(CLIPS_VIDEO, "01")]))
+    assert bulk.status_code == 409 and "refused_by_platform" in bulk.json()["refused"][0]
+
+    body = c.get("/api/publications").json()
+    assert body["publications"] == []  # ni dans la file ni sur le calendrier
+    refused = body["refused_by_platform"]
+    assert [(r["clip_id"], r["error"]) for r in refused] == [
+        ("01", "vérification de contenu : problème signalé par TikTok")]
+    assert refused[0]["tiktok_status"] == "refused_by_platform" and refused[0]["editable"] is False
+
+
+def test_the_screens_list_the_clips_refused_by_tiktok():
+    publish_js = (STATIC / "screens" / "publish.js").read_text(encoding="utf-8")
+    clips_js = (STATIC / "screens" / "clips.js").read_text(encoding="utf-8")
+
+    assert "refused_by_platform" in publish_js and "Refusés par TikTok" in publish_js
+    assert '["refused_by_platform", "Refusés par TikTok"]' in clips_js
