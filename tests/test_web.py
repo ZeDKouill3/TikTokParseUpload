@@ -9073,3 +9073,92 @@ def test_the_screens_list_the_clips_refused_by_tiktok():
 
     assert "refused_by_platform" in publish_js and "Refusés par TikTok" in publish_js
     assert '["refused_by_platform", "Refusés par TikTok"]' in clips_js
+
+
+# --------------------------------------------------------------------------
+# Alerte réseau au clic Publier / Valider (TASK-120a)
+# --------------------------------------------------------------------------
+
+def _net_guard_src() -> str:
+    js = (STATIC / "ui.js").read_text(encoding="utf-8")
+    start = js.index("let netLast = null;")
+    return js[start:js.index("/* ---------- Presse-papiers", start)]
+
+
+def _net_script(net, body: str, dialog_answer: str = "true") -> str:
+    """Évalue la garde réseau d'ui.js avec netAlertDialog remplacée : la réponse de la fenêtre est fixée."""
+    return (
+        "const esc = (s) => String(s);\n"
+        "let dialogs = [];\n"
+        + _net_guard_src().replace("function netAlertDialog(", "function netAlertDialogReal(")
+        + f"\nfunction netAlertDialog(net, mode) {{ dialogs.push(mode); return Promise.resolve({dialog_answer}); }}\n"
+        "let apiCalls = [];\n"
+        "async function api(url) { apiCalls.push(url); return " + json.dumps(net) + "; }\n"
+        + body
+    )
+
+
+_NET_BAD = {"ok": False, "country": "US", "expected_country_name": "France", "block_browser": False}
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node absent du PATH")
+@pytest.mark.parametrize("net,expect_dialog,expect_pass", [
+    ({"ok": False, "block_browser": False}, "ask", True),
+    ({"ok": False, "block_browser": True}, "block", False),
+    ({"ok": True}, None, True),
+    ({"ok": None}, None, True),
+])
+def test_net_guard_opens_a_dialog_only_when_ip_country_is_wrong(net, expect_dialog, expect_pass):
+    script = _net_script(net, "setNetLast(" + json.dumps(net) + ");\n"
+                         "netGuard().then((r) => console.log(JSON.stringify([r, dialogs, apiCalls])));")
+    # block : la réponse de la fenêtre est « fermée » (false) ; ask : « Continuer » (true)
+    script = script.replace("Promise.resolve(true)", "Promise.resolve(mode !== 'block')")
+    result, dialogs, calls = json.loads(_node_run(script))
+    assert dialogs == ([expect_dialog] if expect_dialog else [])
+    assert result is expect_pass
+    assert calls == []  # une seule source : la valeur déjà relevée, pas de nouvel appel
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node absent du PATH")
+def test_net_guard_cancel_returns_false_and_unknown_state_fetches_once():
+    script = _net_script(_NET_BAD, "netGuard().then((a) => netGuard().then((b) => "
+                         "console.log(JSON.stringify([a, b, dialogs, apiCalls]))));", dialog_answer="false")
+    a, b, dialogs, calls = json.loads(_node_run(script))
+    assert (a, b) == (False, False) and dialogs == ["ask", "ask"]
+    assert calls == ["/api/network"]  # état absent : relevé une seule fois
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node absent du PATH")
+@pytest.mark.parametrize("ok,answer,expect_called", [(False, "false", False), (False, "true", True), (True, "false", True)])
+def test_net_guard_decides_whether_publishing_actions_run(ok, answer, expect_called):
+    js = (STATIC / "screens" / "publish.js").read_text(encoding="utf-8")
+    start = js.index("async function pubRetry(c)")
+    fn = js[start:js.index("\n}\n", start) + 3]
+    net = {"ok": ok, "block_browser": False}
+    body = (
+        "const pubEnc = (s) => s; const pubTitle = () => 't'; const toast = () => {}; const toastError = () => {};\n"
+        "async function pubLoad() {}\n" + fn.replace("await api(", "await postApi(") +
+        "\nasync function postApi(u) { posted.push(u); }\nlet posted = [];\n"
+        "setNetLast(" + json.dumps(net) + ");\n"
+        "pubRetry({video_id: 'v', clip_id: 'c'}).then((r) => console.log(JSON.stringify([r, posted, dialogs])));"
+    )
+    r, posted, dialogs = json.loads(_node_run(_net_script(net, body, answer)))
+    assert (len(posted) == 1) is expect_called and r is expect_called
+    assert dialogs == ([] if ok else ["ask"])
+
+
+def test_every_publishing_action_goes_through_the_same_net_guard():
+    publish = (STATIC / "screens" / "publish.js").read_text(encoding="utf-8")
+    clips = (STATIC / "screens" / "clips.js").read_text(encoding="utf-8")
+
+    def guarded(js: str, fn_start: str, call: str) -> bool:
+        body = js[js.index(fn_start):]
+        return 0 <= body.index("await netGuard()") < body.index(call)
+
+    assert guarded(publish, "async function pubFormSubmit", 'api("/api/publications", jsonBody("POST"')   # Nouvelle publication / Publier
+    assert guarded(publish, "async function pubSeriesSubmit", "/api/publications/series")                  # Série programmée
+    assert guarded(publish, "async function pubRetry", "/retry")                                           # Réessayer
+    assert guarded(clips, "async function clipsApproveSelection", "/api/clips/approve")                    # sélection
+    assert guarded(clips, "if (approve) approve.onclick", 'clipUrl(c, "/approve")')                        # un clip
+    app = (STATIC / "app.js").read_text(encoding="utf-8")
+    assert "setNetLast(net)" in app[app.index("function paintNetwork"):app.index("async function refreshNetwork")]
