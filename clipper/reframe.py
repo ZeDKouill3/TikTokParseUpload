@@ -1603,7 +1603,10 @@ def _rect_moves(grays: list[np.ndarray], rect: tuple[int, int, int, int], settin
     x, y, w, h = x + inset, y + inset, w - 2 * inset, h - 2 * inset
     crops = [g[y:y + h, x:x + w] for g in grays]
     diff = float(settings["facecam_frozen_min_diff"])
-    shares = [float((np.abs(a - b) >= diff).mean()) for a, b in zip(crops, crops[1:]) if a.shape == b.shape and a.size]
+    shares = [
+        float((np.abs(a.astype(np.int16) - b.astype(np.int16)) >= diff).mean())
+        for a, b in zip(crops, crops[1:]) if a.shape == b.shape and a.size
+    ]
     return bool(shares) and sum(shares) / len(shares) >= float(settings["facecam_frozen_min_pixel_share"])
 
 
@@ -1708,7 +1711,7 @@ def _period_candidates(
         found = [d for d in found if d[4] >= min_conf]
         detections.append([d[:4] for d in _nms(found, dup_iou)])  # type: ignore[misc]
         counts += _edge_mask(image, edge_threshold)
-        grays.append(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.float64))
+        grays.append(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY))  # uint8 : 8 fois moins de memoire
     n = len(images)
 
     raw: list[dict[str, Any]] = []
@@ -1721,7 +1724,10 @@ def _period_candidates(
         if rect is None:
             rejected.append({"kind": "visage", "box": [round(v, 1) for v in face], "reason": reason})
             continue
-        raw.append({"kind": "visage", "rect": rect, "support": support, "edge_reason": edge_reason or reason})
+        raw.append({
+            "kind": "visage", "rect": rect, "support": support, "face_support": support,
+            "edge_reason": edge_reason or reason,
+        })
     frames, frame_rejected = _frame_candidates(counts, n, grays, settings)
     rejected += frame_rejected
     for item in frames:
@@ -1731,14 +1737,30 @@ def _period_candidates(
             rejected.append({"kind": "cadre", "box": list(item["box"]), "reason": reason})
             continue
         for other in raw:
-            if _iou(_rect_box(rect), _rect_box(other["rect"])) >= 0.5:
+            if other["kind"] == "visage" and _iou(_rect_box(rect), _rect_box(other["rect"])) >= 0.5:
+                # le cadre net recouvre le visage : le candidat a le support du cadre
                 other["kind"] = "visage+cadre"
+                other["support"] = max(other["support"], item["support"])
                 break
         else:
-            raw.append({"kind": "cadre", "rect": rect, "support": item["support"], "edge_reason": None})
+            if any(
+                other["kind"] != "visage" and _iou(_rect_box(rect), _rect_box(other["rect"])) >= 0.5
+                for other in raw
+            ):
+                continue  # doublon cadre/cadre (bordure externe et interne de la meme incrustation)
+            raw.append({
+                "kind": "cadre", "rect": rect, "support": item["support"], "face_support": None, "edge_reason": None,
+            })
 
-    raw.sort(key=lambda c: -c["support"])
-    raw = raw[: int(settings["facecam_candidate_max"])]
+    limit = int(settings["facecam_candidate_max"])
+    raw.sort(key=lambda c: (-c["support"], c["kind"] != "visage+cadre"))
+    for cut in raw[limit:]:
+        rejected.append({
+            "kind": cut["kind"], "box": list(_rect_box(cut["rect"])),
+            "reason": f"coupe par facecam_candidate_max ({limit}) : support {cut['support']} image(s) parmi les "
+                      f"{len(raw)} candidats",
+        })
+    raw = raw[:limit]
     raw.sort(key=lambda c: (c["rect"][1], c["rect"][0]))
     candidates = [
         {
@@ -1746,6 +1768,7 @@ def _period_candidates(
             "kind": c["kind"],
             "rect": dict(zip("xywh", (int(v) for v in c["rect"]))),
             "support": c["support"],
+            "face_support": c["face_support"],
             "edge_reason": c["edge_reason"],
         }
         for i, c in enumerate(raw, start=1)
@@ -1800,7 +1823,12 @@ def _draw_board(
 
 
 def _facecam_prompt(candidates: list[dict[str, Any]], start: float, end: float) -> str:
-    listing = "\n".join(f"- {c['id']} : rectangle {c['kind']}, vu sur {c['support']} image(s)" for c in candidates)
+    def seen(c: dict[str, Any]) -> str:
+        if c["kind"] == "visage+cadre":
+            return f"cadre net sur {c['support']} image(s), visage vu sur {c['face_support']} image(s)"
+        return f"vu sur {c['support']} image(s)"
+
+    listing = "\n".join(f"- {c['id']} : rectangle {c['kind']}, {seen(c)}" for c in candidates)
     return (
         "Cette planche reunit des images d'un stream (jeu video, ou discussion) entre "
         f"{start:.0f}s et {end:.0f}s. Des rectangles numerotes sont dessines sur chaque image : "
