@@ -245,7 +245,7 @@ def test_refused_hook_text_is_sent_back_to_the_llm_with_the_error_and_repaired(w
                   [answer(hook_text=ten_words), answer(hook_text="trois mots courts")])
 
     assert len(fake.calls) == 2
-    assert "texte d'accroche de 10 mots, 8 au plus" in fake.calls[1].prompt
+    assert "texte d'accroche de 10 mots, il en faut 6 au plus : supprime 4 mots" in fake.calls[1].prompt
     assert "1. un" in fake.calls[1].prompt and "10. dix" in fake.calls[1].prompt
     assert by_id(read_captions(workspace), "00")["hook_text"] == "trois mots courts"
 
@@ -1266,3 +1266,84 @@ def test_caption_and_hook_text_emoji_control_leaves_hashtags_unchanged(workspace
     )
 
     assert by_id(read_captions(workspace), "00")["hashtags"] == ["#un", "#deux"]
+
+
+# --------------------------------------------------------------------------
+# TASK-35a1 : viser plus court que la limite (cible < max), validation = max
+# --------------------------------------------------------------------------
+
+
+def test_config_defaults_carry_word_targets_below_the_maxima():
+    from clipper.captions import CONFIG_DEFAULTS
+
+    assert CONFIG_DEFAULTS["hook_words_target"] == 6
+    assert CONFIG_DEFAULTS["hook_words_target"] < CONFIG_DEFAULTS["hook_words_max"]
+    assert CONFIG_DEFAULTS["screen_title_words_target"] == 5
+    assert CONFIG_DEFAULTS["screen_title_words_target"] < CONFIG_DEFAULTS["screen_title_words_max"]
+
+
+def test_schema_descriptions_ask_for_the_target_and_not_to_copy_a_long_quote():
+    from clipper.captions import CONFIG_DEFAULTS, response_schema
+
+    props = response_schema(CONFIG_DEFAULTS)["properties"]
+
+    hook = props["hook_text"]["description"]
+    assert "6 mots" in hook and "recopie" in hook.lower()
+    title = props["screen_title"]["description"]
+    assert "5 mots" in title and "recopie" in title.lower()
+
+
+def test_prompt_asks_for_the_target_and_not_to_copy_a_long_quote(workspace, tmp_path):
+    write_moments(workspace, moment(0))
+    write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
+
+    fake, _ = run(workspace, make_config(tmp_path), [answer()])
+
+    prompt = fake.calls[0].prompt
+    assert "viser 6 mots" in prompt
+    assert "viser 5 mots" in prompt
+    assert "ne recopie pas une citation" in prompt
+
+
+def test_hook_correction_message_gives_exact_excess_and_target(workspace, tmp_path):
+    write_moments(workspace, moment(0))
+    write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
+    nine_words = "Il a sorti son flingue, il nous a pointés"
+
+    fake, _ = run(workspace, make_config(tmp_path),
+                  [answer(hook_text=nine_words), answer(hook_text="Il a sorti son flingue")])
+
+    assert "9 mots, il en faut 6 au plus : supprime 3 mots" in fake.calls[1].prompt
+
+
+def test_screen_title_correction_message_gives_exact_excess_and_target(workspace, tmp_path):
+    write_moments(workspace, moment(0))
+    write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
+    seven_words = "un deux trois quatre cinq six sept"
+
+    fake, _ = run(workspace, make_config(tmp_path),
+                  [answer(screen_title=seven_words), answer(screen_title="un deux trois")])
+
+    assert "7 mots, il en faut 5 au plus : supprime 2 mots" in fake.calls[1].prompt
+
+
+def test_fake_backend_answering_nine_words_then_six_passes_without_truncation(workspace, tmp_path):
+    write_moments(workspace, moment(0))
+    write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
+    nine_words = "un deux trois quatre cinq six sept huit neuf"
+    six_words = "un deux trois quatre cinq six"
+
+    fake, _ = run(workspace, make_config(tmp_path),
+                  [answer(hook_text=nine_words), answer(hook_text=six_words)])
+
+    assert len(fake.calls) == 2
+    assert by_id(read_captions(workspace), "00")["hook_text"] == six_words
+
+
+def test_target_above_max_is_capped_to_max(workspace, tmp_path):
+    write_moments(workspace, moment(0))
+    write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
+
+    with pytest.raises(llm.SchemaError, match="3 mots, il en faut 2 au plus : supprime 1 mot"):
+        run(workspace, make_config(tmp_path, hook_words_max=2),
+            [answer(hook_text="un deux trois")] * 2)

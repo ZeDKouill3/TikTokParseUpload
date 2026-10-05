@@ -710,6 +710,9 @@ class Manager:
         return Playwright()
 
 browser.use_playwright(lambda: Manager())
+# Processus enfant : la fixture de conftest n'y est pas, on simule aussi l'IP française (jamais le vrai service).
+from clipper import network
+network.use_fetcher(lambda url: {"ip": "192.0.2.1", "country": "FR", "city": "Test", "org": "test"})
 account, out, hold = sys.argv[1], Path(sys.argv[2]), float(sys.argv[3])
 try:
     with browser._open_context(account, headless=True):
