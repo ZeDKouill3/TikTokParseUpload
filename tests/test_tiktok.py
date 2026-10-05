@@ -859,6 +859,19 @@ def test_content_check_ok_text_elsewhere_while_still_running_keeps_waiting(tmp_p
     assert env.page.posted == ["now"] and result["state"] == "published"
 
 
+def test_a_hidden_running_text_left_in_the_page_does_not_block_a_finished_check(tmp_path, monkeypatch):
+    # Relevé réel 2026-10-05 : la page affiche « Aucun problème constaté » mais un texte « Vérification en
+    # cours » reste dans le DOM sans être affiché : Clipper attendait jusqu'au délai.
+    env = Env(tmp_path, monkeypatch, page_kwargs={"check": "ok"})
+    sel = _sel()["selectors"]
+    env.page.present.add(sel["content_check_running"])
+    env.page.hidden.add(sel["content_check_running"])
+
+    result = env.publish()
+
+    assert env.page.posted == ["now"] and result["state"] == "published"
+
+
 def test_content_check_problem_is_an_explicit_r4_failure_and_nothing_is_posted(tmp_path, monkeypatch):
     env = Env(tmp_path, monkeypatch, page_kwargs={"check": "running"})
     env.page.timeline = [lambda: env.page.set_check("problem")]

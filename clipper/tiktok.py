@@ -708,6 +708,15 @@ class _Flow:
                 raise self.stop("unexpected_page", "la vérification de contenu n'a pas pu être coupée")
             logger.info("TikTok %s : vérification de contenu coupée avant publication", self.account)
 
+    def shown(self, css: str) -> bool:
+        """Vrai si un element VISIBLE correspond : un texte reste parfois dans la page sans etre affiche
+        (releve reel 2026-10-05 : « Vérification en cours » trouve apres la fin de la verification)."""
+        elements = list(self.page.query_selector_all(css) or [])
+        if not elements:
+            element = self.page.query_selector(css)
+            elements = [element] if element is not None else []
+        return any(e.is_visible() for e in elements)
+
     def await_content_check(self) -> None:
         """Avant le clic final : attend « Aucun probleme constate ». Probleme signale ou delai depasse :
         arret R4 (code ``content_check``), jamais de publication d'un contenu non verifie."""
@@ -718,8 +727,8 @@ class _Flow:
             self.guard()
             # « Vérification en cours » encore affiché : pas fini, même si « Aucun problème constaté » existe
             # ailleurs dans la page (relevé réel 2026-10-05, fausse fin puis fenêtre « Continuer à publier ? »).
-            running = self.page.query_selector(sel["content_check_running"]) is not None
-            if not running and self.page.query_selector(sel["content_check_ok"]) is not None:
+            running = self.shown(sel["content_check_running"])
+            if not running and self.shown(sel["content_check_ok"]):
                 logger.info("TikTok %s : vérification de contenu sans problème constaté", self.account)
                 return
             problem = self.page.query_selector(sel["content_check_problem"])
@@ -727,7 +736,7 @@ class _Flow:
                 detail = " ".join(str(problem.inner_text()).split())[:150]
                 raise self.stop("content_check", "vérification de contenu : problème signalé par TikTok"
                                 + (f" ({detail})" if detail else ""))
-            if not running and self.page.query_selector(sel["content_check_ok"]) is not None:
+            if not running and self.shown(sel["content_check_ok"]):
                 logger.info("TikTok %s : vérification de contenu sans problème constaté", self.account)
                 return
             if waited >= timeout:
