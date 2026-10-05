@@ -41,7 +41,11 @@ _cache: dict[str, Any] = {}  # {"url", "at", "geo"} : seul un relevé connu est 
 
 
 class NetworkError(Exception):
-    """IP hors du pays attendu, ou pays inconnu, alors que le navigateur piloté est bloqué."""
+    """IP hors du pays attendu alors que le navigateur piloté est bloqué (arrêt sûr)."""
+
+
+class NetworkUnknown(NetworkError):
+    """Pays de l'IP inconnu (service de géolocalisation injoignable) : condition transitoire, pas un arrêt sûr."""
 
 
 def use_fetcher(fetcher: Callable[[str], dict[str, Any]] | None) -> None:
@@ -121,7 +125,7 @@ def require_expected_country(config: Config | None = None) -> None:
         return
     advice = "passe sur le partage de connexion du téléphone"
     if state["ok"] is None:
-        raise NetworkError(
+        raise NetworkUnknown(
             f"pays de l'IP inconnu ({state['error']}), attendu {state['expected_country_name']} : {advice}"
         )
     raise NetworkError(f"IP en {state['country_name']} (attendu {state['expected_country_name']}) : {advice}")

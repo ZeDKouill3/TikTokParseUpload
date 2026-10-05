@@ -81,6 +81,10 @@ class BrowserError(Exception):
     """Compte ou URL invalide, Playwright/Chrome absent, profil absent, export impossible."""
 
 
+class BrowserUnavailable(BrowserError):
+    """Navigateur refusé pour une condition transitoire (pays de l'IP inconnu) : à réessayer, pas un arrêt sûr."""
+
+
 def use_playwright(factory: Callable[[], Any] | None) -> None:
     """Branche une fabrique ``sync_playwright`` (tests : faux) ; None = le vrai."""
     global _override
@@ -315,6 +319,8 @@ def _open_context(account: str, *, headless: bool, config: Config | None = None)
     directory = profile_dir(account)
     try:
         network.require_expected_country(config)
+    except network.NetworkUnknown as exc:
+        raise BrowserUnavailable(str(exc)) from None
     except network.NetworkError as exc:
         raise BrowserError(str(exc)) from None
     wait = float(_settings(config)["pilot_wait_s"])

@@ -2802,3 +2802,19 @@ def test_the_pilot_wait_of_the_config_reaches_the_browser_for_publishing_and_sta
             with pytest.raises(browser.BrowserError, match="compte_occupe"):
                 call()
             assert time.monotonic() - started < 2, f"{name} : pilot_wait_s de config.toml ignoré"
+
+
+def test_publications_date_without_year_uses_the_paris_year_at_new_year():
+    """M3 (revue nuit) : le 31/12 23:30 UTC il est déjà le 1er janvier 00:30 à Paris, l'année est 2027."""
+    months = _sel()["calendar"]["months"]
+    now = datetime(2026, 12, 31, 23, 30, tzinfo=timezone.utc)
+    assert tiktok.parse_date("1 janv., 00:10", months, now) == "2027-01-01T00:10:00"
+    assert tiktok.parse_date("31 déc., 22:00", months, now) == "2026-12-31T22:00:00"
+    # même instant, Paris encore en 2026 : le 31/12 22:30 UTC = 23:30 Paris
+    before = datetime(2026, 12, 31, 22, 30, tzinfo=timezone.utc)
+    assert tiktok.parse_date("31 déc., 23:00", months, before) == "2026-12-31T23:00:00"
+
+
+def test_page_date_without_timezone_is_read_as_paris_time():
+    # « 1er janvier 00:10 » à Paris = 31 décembre 23:10 UTC
+    assert tiktok._naive_utc("2027-01-01T00:10:00") == datetime(2026, 12, 31, 23, 10, tzinfo=timezone.utc)

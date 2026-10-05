@@ -334,15 +334,18 @@ def _squash(text: str) -> str:
     return " ".join(text.replace("\u202f", " ").replace("\xa0", " ").split())
 
 
+_PARIS = ZoneInfo("Europe/Paris")
+
+
 def _naive_utc(stamp: Any) -> datetime | None:
-    """Date ISO d'une ligne (sans fuseau : l'heure de la page) comme instant UTC approximatif, ``None`` si absente."""
+    """Date ISO d'une ligne (sans fuseau : l'heure de Paris de la page) comme instant aware, ``None`` si absente."""
     if not isinstance(stamp, str):
         return None
     try:
         moment = datetime.fromisoformat(stamp)
     except ValueError:
         return None
-    return moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
+    return moment if moment.tzinfo else moment.replace(tzinfo=_PARIS)
 
 
 def _text(value: Any) -> str:
@@ -438,10 +441,12 @@ def parse_date(value: Any, months: list[str], today: datetime | None = None) -> 
         word = match[2].casefold()
         index = next((i for i, name in enumerate(names) if name == word or (len(word) >= 3 and name.startswith(word))), None)
         if index is not None:
-            # annee du releve ; une date a plus de 31 jours dans le futur appartient a l'annee precedente
-            iso = _iso_date(today.year, index + 1, int(match[1]), match[3], match[4])
-            if iso is not None and datetime.fromisoformat(iso) > today.replace(tzinfo=None) + timedelta(days=31):
-                iso = _iso_date(today.year - 1, index + 1, int(match[1]), match[3], match[4])
+            # annee du releve en heure de Paris (celle de la page, pas UTC) ; une date a plus de 31 jours dans le
+            # futur appartient a l'annee precedente
+            paris = (today if today.tzinfo else today.replace(tzinfo=timezone.utc)).astimezone(_PARIS).replace(tzinfo=None)
+            iso = _iso_date(paris.year, index + 1, int(match[1]), match[3], match[4])
+            if iso is not None and datetime.fromisoformat(iso) > paris + timedelta(days=31):
+                iso = _iso_date(paris.year - 1, index + 1, int(match[1]), match[3], match[4])
             return iso
     return None
 
