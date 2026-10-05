@@ -897,12 +897,63 @@ def test_letterbox_reduced_size_survives_an_emphasis_reset(tmp_path, video_dir):
     assert f"{{\\r\\fs{size}}}" in long_line["text"]
 
 
-def test_letterbox_word_that_cannot_fit_is_an_error(tmp_path, video_dir):
+def test_letterbox_repeated_letters_run_is_shortened_to_three_and_logged(tmp_path, video_dir, caplog):
+    words = [_word(" G" + "R" * 100, 0.0, 1.0), _word(" ok", 1.0, 1.2)]
+    with caplog.at_level("INFO", logger="clipper.subtitles"):
+        path = run_letterbox(tmp_path, video_dir, words=words)
+    texts = [line_text(ev).strip() for ev in lb_events(path)]
+    assert texts == ["GRRR OK"]
+    assert "R" * 4 not in "".join(texts)
+    assert any("1 mot" in r.getMessage() for r in caplog.records)
+    # le transcript d'origine n'est pas modifie
+    saved = json.loads((video_dir / "transcript.json").read_text(encoding="utf-8"))
+    assert saved["segments"][0]["words"][0]["word"] == " G" + "R" * 100
+
+
+def test_letterbox_word_of_three_repeated_letters_is_unchanged(tmp_path, video_dir):
+    words = [_word(" NOOO", 0.0, 0.5), _word(" ok", 0.5, 0.8)]
+    path = run_letterbox(tmp_path, video_dir, words=words)
+    assert " ".join(line_text(ev).strip() for ev in lb_events(path)) == "NOOO OK"
+
+
+def test_letterbox_word_of_100_r_alone_fits_after_shortening(tmp_path, video_dir):
+    words = [_word(" " + "R" * 100, 0.0, 1.0)]
+    path = run_letterbox(tmp_path, video_dir, words=words)
+    assert [line_text(ev).strip() for ev in lb_events(path)] == ["RRR"]
+
+
+def test_letterbox_normal_word_is_unchanged(tmp_path, video_dir):
+    path = run_letterbox(tmp_path, video_dir)
+    assert [line_text(ev).strip() for ev in lb_events(path)] == ["IL N'A PAS FAIT", "DE GARDE À VUE"]
+
+
+def test_letterbox_long_word_without_repetition_is_hard_cut_with_hyphens(tmp_path, video_dir, caplog):
+    word = "abcdefghij" * 6  # 60 lettres, sans repetition
+    words = [_word(" " + word, 0.0, 3.0), _word(" ok", 3.0, 3.2)]
+    with caplog.at_level("INFO", logger="clipper.subtitles"):
+        path = run_letterbox(tmp_path, video_dir, words=words)
+    events = lb_events(path)
+    texts = [line_text(ev).strip() for ev in events]
+    pieces = texts[:-1]
+    assert len(pieces) > 1 and texts[-1] == "OK"
+    assert all(p.endswith("-") for p in pieces[:-1]) and not pieces[-1].endswith("-")
+    assert "".join(p.rstrip("-") for p in pieces) == word.upper()
+    for ev in events:
+        assert_ink_in_zone(ev, 120, ZONE)
+    # meme minutage : de 0 a 3 s, dans l'ordre
+    starts = [to_seconds(ev["start"]) for ev in events[:-1]]
+    assert starts == sorted(starts) and starts[0] == 0.0
+    assert to_seconds(events[-1]["start"]) == pytest.approx(3.0, abs=0.02)
+    assert any("coupe" in r.getMessage() for r in caplog.records)
+
+
+def test_letterbox_zone_narrower_than_one_character_is_an_error(tmp_path, video_dir):
     from clipper.subtitles import SubtitlesError
 
-    words = [_word(" " + "w" * 60, 0.0, 1.0), _word(" ok", 1.0, 1.2)]
-    with pytest.raises(SubtitlesError, match="W" * 60):
-        run_letterbox(tmp_path, video_dir, words=words)
+    words = [_word(" " + "abcdefghij" * 6, 0.0, 1.0)]
+    zone = {"x0": 500, "y0": 1246, "x1": 502, "y1": 1448}
+    with pytest.raises(SubtitlesError):
+        run_letterbox(tmp_path, video_dir, words=words, zone=zone)
     assert not (tmp_path / "workspace" / VIDEO_ID / "subtitles" / f"{CLIP_ID}.ass").exists()
 
 
