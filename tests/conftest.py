@@ -16,6 +16,19 @@ import pytest
 cv2.setNumThreads(1)
 
 
+@pytest.fixture(autouse=True)
+def _no_real_geolocation():
+    """Aucun test ne lit le vrai service de géolocalisation (TASK-30cc) : la garde du navigateur piloté
+    voit une IP française simulée. Les tests de clipper.network branchent leur propre lecture."""
+    from clipper import network
+
+    network.reset()
+    network.use_fetcher(lambda url: {"ip": "192.0.2.1", "country": "FR", "city": "Test", "org": "test"})
+    yield
+    network.use_fetcher(None)
+    network.reset()
+
+
 @pytest.fixture
 def isolated_cwd(tmp_path, monkeypatch):
     """Run a test with cwd set to an empty temp dir, so config/workspace
