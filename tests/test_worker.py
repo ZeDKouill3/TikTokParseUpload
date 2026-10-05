@@ -2565,3 +2565,85 @@ def test_startup_runs_the_interrupted_video_recovery(tmp_path):
     worker.Worker(config=config, spawner=FakeSpawner()).startup()
 
     assert pipeline.load_state(ORPHAN_ID, config=config)["status"] == "failed"
+
+
+# --------------------------------------------------------------------------
+# TASK-7dc5 : miniature des VOD non YouTube des l'ajout a la file
+# --------------------------------------------------------------------------
+
+TWITCH_URL_T = "https://www.twitch.tv/videos/2888230655"
+TWITCH_ID_T = "v2888230655"
+TWITCH_THUMB_T = "https://static-cdn.example.invalid/previews/v2888230655.jpg"
+
+
+class _FakeYDL:
+    """yt-dlp simule : jamais de reseau ; enregistre les options et les appels."""
+
+    calls: list[tuple[dict, str, bool]] = []
+    error: Exception | None = None
+
+    def __init__(self, opts):
+        self.opts = opts
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def extract_info(self, url, download=True):
+        _FakeYDL.calls.append((self.opts, url, download))
+        if _FakeYDL.error:
+            raise _FakeYDL.error
+        return {"id": TWITCH_ID_T, "thumbnail": TWITCH_THUMB_T}
+
+
+@pytest.fixture
+def fake_ydl(monkeypatch):
+    import yt_dlp
+
+    _FakeYDL.calls, _FakeYDL.error = [], None
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", _FakeYDL)
+    return _FakeYDL
+
+
+def _join_thumbnail_threads() -> None:
+    import threading
+
+    for t in threading.enumerate():
+        if t.name == "thumbnail-fetch":
+            t.join(timeout=5)
+
+
+def test_enqueue_twitch_writes_thumbnail_json_without_downloading(tmp_path, fake_ydl):
+    config = _config(tmp_path)
+
+    worker.enqueue(TWITCH_URL_T, None, "run", config=config)
+    _join_thumbnail_threads()
+
+    path = tmp_path / "workspace" / TWITCH_ID_T / "thumbnail.json"
+    assert json.loads(path.read_text(encoding="utf-8")) == {"url": TWITCH_THUMB_T}
+    opts, url, download = fake_ydl.calls[0]
+    assert url == TWITCH_URL_T and download is False and opts["skip_download"] is True
+
+
+def test_enqueue_twitch_survives_ytdlp_error_and_logs_it(tmp_path, fake_ydl, caplog):
+    config = _config(tmp_path)
+    fake_ydl.error = RuntimeError("boom")
+
+    with caplog.at_level(logging.ERROR, logger="clipper.worker"):
+        entry = worker.enqueue(TWITCH_URL_T, None, "run", config=config)
+        _join_thumbnail_threads()
+
+    assert [e["video_id"] for e in _queue(config)] == [entry["video_id"]] == [TWITCH_ID_T]
+    assert not (tmp_path / "workspace" / TWITCH_ID_T / "thumbnail.json").exists()
+    assert "miniature indisponible" in caplog.text and "boom" in caplog.text
+
+
+def test_enqueue_youtube_never_calls_ytdlp(tmp_path, fake_ydl):
+    config = _config(tmp_path)
+
+    worker.enqueue(URL_A, None, "run", config=config)
+    _join_thumbnail_threads()
+
+    assert fake_ydl.calls == []

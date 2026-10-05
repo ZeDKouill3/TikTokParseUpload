@@ -513,3 +513,53 @@ def test_download_keeps_the_thumbnail_even_when_the_download_fails(isolated_cwd)
     video_dir = workspace_dir / "v2887271276"
     assert not (video_dir / "meta.json").exists()
     assert json.loads((video_dir / "thumbnail.json").read_text(encoding="utf-8")) == {"url": THUMB}
+
+
+# --- TASK-7dc5 : fetch_thumbnail ---------------------------------------------
+
+class _ThumbYDL:
+    def __init__(self, info):
+        self.info = info
+        self.calls = []
+
+    def __call__(self, opts):
+        self.opts = opts
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def extract_info(self, url, download=True):
+        self.calls.append(download)
+        return self.info
+
+
+def test_fetch_thumbnail_writes_json_with_skip_download(tmp_path):
+    from clipper.download import fetch_thumbnail
+
+    ydl = _ThumbYDL({"thumbnail": "https://img.example.invalid/a.jpg"})
+    url = fetch_thumbnail("https://www.twitch.tv/videos/55", tmp_path, ydl_factory=ydl)
+
+    assert url == "https://img.example.invalid/a.jpg"
+    assert ydl.calls == [False] and ydl.opts["skip_download"] is True
+    saved = json.loads((tmp_path / "v55" / "thumbnail.json").read_text(encoding="utf-8"))
+    assert saved == {"url": "https://img.example.invalid/a.jpg"}
+
+
+def test_fetch_thumbnail_without_thumbnail_raises_and_writes_nothing(tmp_path):
+    from clipper.download import DownloadError, fetch_thumbnail
+
+    with pytest.raises(DownloadError):
+        fetch_thumbnail("https://www.twitch.tv/videos/55", tmp_path, ydl_factory=_ThumbYDL({}))
+    assert not (tmp_path / "v55" / "thumbnail.json").exists()
+
+
+def test_is_youtube_url():
+    from clipper.download import is_youtube_url
+
+    assert is_youtube_url("https://youtu.be/AAAAAAAAAAA")
+    assert is_youtube_url("https://www.youtube.com/watch?v=AAAAAAAAAAA")
+    assert not is_youtube_url("https://www.twitch.tv/videos/55")
