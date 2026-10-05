@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from clipper import browser, __main__ as cli
+from clipper import browser, network, __main__ as cli
 from clipper.config import Config
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -98,8 +98,12 @@ def fake_playwright(monkeypatch, context=None, error=None):
 
 @pytest.fixture(autouse=True)
 def _reset_override():
+    network.reset()
+    network.use_fetcher(lambda url: {"ip": "1.2.3.4", "city": "Paris", "country": "FR", "org": "AS1 Test"})  # jamais le réseau
     yield
     browser.use_playwright(None)
+    network.use_fetcher(None)
+    network.reset()
 
 
 @pytest.fixture
@@ -775,3 +779,44 @@ def test_the_pilot_lock_is_free_again_once_the_other_process_has_finished(cwd, m
                     _sections={"browser": {"pilot_wait_s": 0.3}})
     with browser._open_context("compte_web", headless=True, config=config):
         pass
+
+
+# ---------------------------------------------------------------- garde du pays de l'IP (TASK-30cc)
+
+
+def _net_config(cwd, **network_table):
+    return Config(mode="review", workspace_dir=cwd / "w", output_dir=cwd / "o", _sections={"network": network_table})
+
+
+def test_open_context_refuses_outside_expected_country(cwd, monkeypatch):
+    fake_playwright(monkeypatch)
+    network.use_fetcher(lambda url: {"ip": "5.6.7.8", "city": "London", "country": "GB", "org": "AS1 BT"})
+    with pytest.raises(browser.BrowserError) as caught:
+        with browser._open_context("ab12cd", headless=True):
+            pytest.fail("le navigateur ne doit pas s'ouvrir hors pays")
+    assert str(caught.value) == "IP en Royaume-Uni (attendu France) : passe sur le partage de connexion du téléphone"
+
+
+def test_open_context_refuses_when_country_unknown(cwd, monkeypatch):
+    fake_playwright(monkeypatch)
+
+    def down(url):
+        raise OSError("hors ligne")
+
+    network.use_fetcher(down)
+    with pytest.raises(browser.BrowserError, match="pays de l'IP inconnu"):
+        with browser._open_context("ab12cd", headless=True):
+            pytest.fail("le navigateur ne doit pas s'ouvrir")
+
+
+def test_open_context_opens_in_expected_country(cwd, monkeypatch):
+    context, _chromium, _pw = fake_playwright(monkeypatch)
+    with browser._open_context("ab12cd", headless=True) as opened:
+        assert opened is context
+
+
+def test_open_context_free_when_block_disabled(cwd, monkeypatch):
+    context, _chromium, _pw = fake_playwright(monkeypatch)
+    network.use_fetcher(lambda url: pytest.fail("aucun appel quand block_browser = false"))
+    with browser._open_context("ab12cd", headless=True, config=_net_config(cwd, block_browser=False)) as opened:
+        assert opened is context

@@ -153,6 +153,33 @@ async function onServerEvent(event) {
   updateCounts();
 }
 
+/* ---------- Pays de l'IP publique (TASK-30cc) : pastille de la barre du haut ---------- */
+const NET_REFRESH_MS = 60000;
+
+function paintNetwork(net) {
+  const pill = $("#net-pill");
+  const label = $("#net-label");
+  if (!net || net.ok === null || net.ok === undefined) {
+    pill.className = "net-pill unknown";
+    label.textContent = "pays inconnu";
+    pill.title = net && net.error ? `Pays de l'IP inconnu : ${net.error}` : "Pays de l'IP inconnu";
+    return;
+  }
+  const where = net.city ? `${net.country} · ${net.city}` : net.country;
+  pill.className = `net-pill ${net.ok ? "ok" : "bad"}`;
+  label.textContent = net.ok ? where : `IP hors ${net.expected_country_name} (${net.country}) : ne publie pas`;
+  pill.title = [`IP ${net.ip || "?"}`, net.isp ? `FAI ${net.isp}` : "", net.city ? `Ville ${net.city}` : "",
+    `${net.country_name || net.country} (attendu ${net.expected_country_name})`].filter(Boolean).join("\n");
+}
+
+async function refreshNetwork() {
+  try {
+    paintNetwork(await api("/api/network"));
+  } catch (err) {
+    paintNetwork({ ok: null, error: String(err.message || err) });
+  }
+}
+
 /* ---------- Temps reel : SSE, repli sur polling (T3) ---------- */
 function setLive(ok) {
   $("#conn-banner").hidden = ok;
@@ -503,6 +530,9 @@ async function toggleNotifications() {
   window.addEventListener("hashchange", route);
   route();
   connectEvents();
+  refreshNetwork();
+  setInterval(refreshNetwork, NET_REFRESH_MS);
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshNetwork(); });
   Promise.all([loadVideos(), loadQueue(), loadChannels()])
     .then(() => { renderCurrent(); updateCounts(); })
     .catch((err) => {

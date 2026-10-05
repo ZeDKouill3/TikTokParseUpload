@@ -9,7 +9,7 @@
 
 const SET_SECTIONS = [
   ["general", "Général"], ["dirs", "Dossiers"], ["llm", "LLM et modèles"],
-  ["web", "Serveur web"], ["worker", "Worker"], ["access", "Accès"],
+  ["web", "Serveur web"], ["worker", "Worker"], ["network", "Réseau"], ["access", "Accès"],
 ];
 const SET_TIERS = ["strong", "fast"];
 const SET_STALE_MS = 4000;
@@ -220,6 +220,26 @@ function setWorker() {
     <div class="form-grid">${setSectionFields("worker")}</div></div></section>`;
 }
 
+const SET_COUNTRIES = [["FR", "France"], ["BE", "Belgique"], ["CH", "Suisse"], ["LU", "Luxembourg"], ["CA", "Canada"],
+  ["GB", "Royaume-Uni"], ["IE", "Irlande"], ["DE", "Allemagne"], ["ES", "Espagne"], ["IT", "Italie"], ["PT", "Portugal"],
+  ["NL", "Pays-Bas"], ["US", "États-Unis"], ["MA", "Maroc"], ["DZ", "Algérie"], ["TN", "Tunisie"]];
+
+function setNetwork() {
+  const value = String(setEffective(["network", "expected_country"]));
+  const options = SET_COUNTRIES.map(([code, name]) => `<option value="${esc(code)}" label="${esc(name)}"></option>`).join("");
+  const comment = (setUi.data.defaults.network.expected_country || {}).comment;
+  return `<section class="panel" id="set-network"><div class="panel-head"><h2>Réseau</h2><span class="muted mono">[network]</span></div><div class="panel-pad">
+    <p class="muted set-note">Le pays de l'IP publique s'affiche en haut à droite ; hors du pays attendu, la pastille passe au rouge et le navigateur piloté refuse de s'ouvrir.</p>
+    <div class="form-grid">
+      <div class="field set-field" data-fpath="network.expected_country"><label for="set-network-expected_country" class="mono">expected_country</label>
+        <input class="input mono" id="set-network-expected_country" data-path="network.expected_country" data-kind="text" type="text" list="set-countries" maxlength="2" value="${esc(value)}" autocomplete="off">
+        <datalist id="set-countries">${options}</datalist>
+        <span class="hint">${esc(comment || "Pays attendu de l'IP publique : choisis dans la liste ou saisis un code ISO à deux lettres.")}</span>
+        <span class="field-error" role="alert"></span></div>
+      ${setSectionFields("network", ["expected_country"])}
+    </div></div></section>`;
+}
+
 function setAccess() {
   const access = setUi.data.access;
   const restart = setUi.data.restart_required && !access.differs_from_config
@@ -250,7 +270,7 @@ function setHtml() {
     <div class="stack set-stack">
       ${setWarning()}
       <p class="reason bad" data-set-error role="alert" hidden></p>
-      ${setGeneral()}${setDirs()}${setLlm()}${setWeb()}${setWorker()}${setAccess()}
+      ${setGeneral()}${setDirs()}${setLlm()}${setWeb()}${setWorker()}${setNetwork()}${setAccess()}
       <div class="set-savebar${setUi.dirty ? " show" : ""}" id="set-savebar"><span class="muted">${icon("pencil", "i-sm")}</span>
         <p>Modifications non enregistrées dans <span class="mono">${esc(setUi.data.path)}</span></p>
         <button type="button" class="btn btn-sm btn-ghost" data-set-cancel>Annuler</button>
@@ -306,7 +326,7 @@ async function setSave(root) {
   button.disabled = true;
   try {
     const settings = setClone(setUi.draft);
-    ["llm", "web", "worker"].forEach((s) => { settings[s] = settings[s] || {}; });
+    ["llm", "web", "worker", "network"].forEach((s) => { settings[s] = settings[s] || {}; });
     delete settings.web.token;                       // jamais lu ni écrit par l'interface
     ["mode", "workspace_dir", "output_dir"].forEach((k) => { if (!(k in settings)) settings[k] = setUi.data.defaults.general[k].default; });
     setUi.data = await api("/api/settings", jsonBody("PUT", { settings }));
