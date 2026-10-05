@@ -514,3 +514,34 @@ def test_handler_closed_by_a_logging_reconfiguration_reopens_and_never_raises(tm
     text = "".join(p.read_text(encoding="utf-8") for p in (tmp_path / "logs").glob("journal-*.log"))
     assert "avant" in text and "apres fermeture" in text
     handler.close()
+
+
+# ---------------------------------------------------------------------------
+# TASK-8f03 : la suite n'ecrit jamais dans le vrai logs/ du depot
+# ---------------------------------------------------------------------------
+
+
+def _snapshot(dir_: Path) -> dict[str, tuple[int, int]]:
+    if not dir_.is_dir():
+        return {}
+    return {p.name: (p.stat().st_mtime_ns, p.stat().st_size) for p in dir_.iterdir()}
+
+
+def test_default_journal_dir_never_points_at_the_real_repo_logs(tmp_path):
+    from fastapi.testclient import TestClient
+
+    from clipper.web import create_app
+
+    real_logs = Path(__file__).resolve().parent.parent / "logs"
+    before = _snapshot(real_logs)
+    config = Config(mode="review", workspace_dir=tmp_path / "workspace",
+                    output_dir=tmp_path / "output", _sections={})
+
+    # Comme clipper.__main__ : handler installe avec la config par defaut (pas de [journal]).
+    journal.install("run", config)
+    TestClient(create_app(config=config)).get("/api/journal")
+    logging.getLogger("clipper.worker").info("worker[1] purge aaaaaaaaaaa")
+
+    assert _snapshot(real_logs) == before
+    written = "".join(p.read_text(encoding="utf-8") for p in (tmp_path / "logs").glob("journal-*.log"))
+    assert "purge aaaaaaaaaaa" in written
