@@ -39,6 +39,7 @@ import functools
 import json
 import logging
 import math
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -686,11 +687,76 @@ def _sizes_below(size: int, style: _Style) -> list[int]:
     return sizes
 
 
+_MAX_REPEAT = 3
+_REPEAT_RUN = re.compile(r"(.)\1{%d,}" % _MAX_REPEAT, re.IGNORECASE)
+
+
+def _shorten_repeats(text: str) -> str:
+    """Affichage seulement : une suite de plus de 3 fois la meme lettre
+    (« GRRRRRR... » transcrit par Whisper pour un cri) est ramenee a 3
+    (« GRRR »). Une suite de 3 ou moins reste inchangee."""
+    return _REPEAT_RUN.sub(lambda m: m.group(1) * _MAX_REPEAT, text)
+
+
+def _display_words(words: list[dict[str, Any]], where: str) -> list[dict[str, Any]]:
+    """Copies des mots pour l'affichage, suites de lettres repetees ramenees a
+    3 ; le transcript d'origine n'est jamais modifie. Journalise le nombre de
+    mots raccourcis."""
+    shown = [dict(w) for w in words]
+    count = 0
+    for w in shown:
+        short = _shorten_repeats(w["word"])
+        if short != w["word"]:
+            w["word"] = short
+            count += 1
+    if count:
+        log.info("%s : %d mot(s) raccourci(s) (plus de %d fois la meme lettre, ramenee a %d)",
+                 where, count, _MAX_REPEAT, _MAX_REPEAT)
+    return shown
+
+
+def _hard_cut(units: list[list[dict[str, Any]]], box: _Box, style: _Style,
+              where: str) -> list[tuple[list[list[list[dict[str, Any]]]], int]]:
+    """Mot seul qui ne tient pas meme a la taille minimale : coupure dure
+    entre lettres, un trait d'union en fin de chaque morceau sauf le dernier,
+    chaque morceau sur sa ligne a la taille minimale, le minutage du mot
+    reparti a parts egales. Erreur seulement si pas un caractere ne tient."""
+    upper = style.uppercase
+    size = style.min_font_size
+    text = _line_text(units, upper)
+    first, last = units[0][0], units[-1][-1]
+    chunks: list[str] = []
+    rest = text
+    while rest:
+        if box.fits([rest], size):
+            chunks.append(rest)
+            break
+        n = 0
+        while n < len(rest) - 1 and box.fits([rest[: n + 1] + "-"], size):
+            n += 1
+        if n < 1:
+            raise SubtitlesError(
+                f"{where} : la zone de sous-titres {box.zone} est trop etroite pour un seul "
+                f"caractere de {text!r} a la taille minimale {size}"
+            )
+        chunks.append(rest[:n] + "-")
+        rest = rest[n:]
+    log.info("%s : le mot %r ne tient pas a la taille minimale %d, coupe en %d morceaux",
+             where, text, size, len(chunks))
+    span = (last["end"] - first["start"]) / len(chunks)
+    placements = []
+    for i, chunk in enumerate(chunks):
+        piece = {**first, "word": chunk, "start": first["start"] + i * span,
+                 "end": first["start"] + (i + 1) * span, "_orig": first}
+        placements.append(([[[piece]]], size))
+    return placements
+
+
 def _place(units: list[list[dict[str, Any]]], size: int, box: _Box, style: _Style,
            where: str) -> list[tuple[list[list[list[dict[str, Any]]]], int]]:
     """Groupe -> [(lignes, taille em), ...] : une ou deux lignes a la taille
     donnee, sinon deux groupes plus courts, sinon (mot seul) taille reduite
-    par paliers ; un mot seul qui ne tient pas est une erreur."""
+    par paliers, puis coupe dure avec traits d'union (_hard_cut)."""
     upper = style.uppercase
     lines = _layout(units, size, box, upper)
     if lines:
@@ -701,10 +767,7 @@ def _place(units: list[list[dict[str, Any]]], size: int, box: _Box, style: _Styl
     for smaller in _sizes_below(size, style):
         if box.fits([_line_text(units, upper)], smaller):
             return [([units], smaller)]
-    raise SubtitlesError(
-        f"{where} : le mot {_line_text(units, upper)!r} ne tient pas dans la zone de sous-titres "
-        f"{box.zone}, meme a la taille minimale {style.min_font_size}"
-    )
+    return _hard_cut(units, box, style, where)
 
 
 def _render_positioned(
@@ -723,6 +786,7 @@ def _render_positioned(
     LLM ; split : chaque mot, son propre "mot en cours")."""
     box = _Box(zone, style, where)
     size = style.font_size
+    words = _display_words(words, where)
     index = {id(w): i for i, w in enumerate(words)}
     margin_r = PLAY_RES_X - zone["x1"]
     hold_s = float(settings["hold_s"])
@@ -752,7 +816,7 @@ def _render_positioned(
             runs = []
             for j, w in enumerate(word for unit in line for word in unit):
                 text = w["word"].upper() if style.uppercase else w["word"]
-                runs.append(_karaoke_run(w, prev_end, index[id(w)] in emphasis, emphasis_color,
+                runs.append(_karaoke_run(w, prev_end, index[id(w.get("_orig", w))] in emphasis, emphasis_color,
                                          text=text.lstrip() if j == 0 else text,
                                          reset=f"{{\\r{fs}}}"))
                 prev_end = w["end"]
