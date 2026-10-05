@@ -43,3 +43,155 @@ def test_gitignore_excludes_workspace_and_output_dirs():
 
     assert "workspace/" in lines
     assert "output/" in lines
+
+
+# --------------------------------------------------------------------------
+# Purge des fichiers lourds (TASK-886a)
+# --------------------------------------------------------------------------
+
+import json  # noqa: E402
+
+import pytest  # noqa: E402
+
+from clipper import workspace as ws_mod  # noqa: E402
+
+VID = "abcdefghijk"
+
+
+def _make_video(root, video_id=VID, status="done"):
+    d = root / "workspace" / video_id
+    for rel, size in {
+        f"{video_id}.mp4": 1000, "transcribe_audio.wav": 400, "frames/f1.jpg": 30, "frames/f2.jpg": 20,
+        "qa/01.jpg": 10, "vision_resize_tmp/a.jpg": 5, "render/03-p1/tmp.mp4": 200,
+        "pipeline.json": 3, "meta.json": 3, "transcript.json": 3, "moments.json": 3, "captions.json": 3,
+        "thumbnails/_source.jpg": 3, "subtitles/c.ass": 3, "reframe/c.json": 3, "scenes.json": 3,
+    }.items():
+        p = d / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"x" * size)
+    (d / "pipeline.json").write_text(json.dumps({"video_id": video_id, "status": status}), encoding="utf-8")
+    return d
+
+
+def _add_clip(root, clip_id="01-p1", video_id=VID):
+    out = root / "output" / video_id
+    out.mkdir(parents=True, exist_ok=True)
+    (out / f"{clip_id}.mp4").write_bytes(b"y" * 500)
+    (out / f"{clip_id}.json").write_text(json.dumps({"video_id": video_id, "clip_id": clip_id}), encoding="utf-8")
+
+
+def _purge(root, video_id=VID):
+    return ws_mod.purge_heavy(video_id, root / "workspace", queue_path=root / "queue.json")
+
+
+def test_purge_heavy_deletes_heavy_files_keeps_display_files_and_reports_size(isolated_cwd):
+    d = _make_video(isolated_cwd)
+
+    assert ws_mod.heavy_size(VID, isolated_cwd / "workspace") == 1000 + 400 + 50 + 10 + 5 + 200
+    freed = _purge(isolated_cwd)
+
+    assert freed == 1665
+    for gone in (f"{VID}.mp4", "transcribe_audio.wav", "frames", "qa", "vision_resize_tmp", "render"):
+        assert not (d / gone).exists(), gone
+    for kept in ("pipeline.json", "meta.json", "transcript.json", "moments.json", "captions.json",
+                 "thumbnails/_source.jpg", "subtitles/c.ass", "reframe/c.json", "scenes.json"):
+        assert (d / kept).is_file(), kept
+    assert ws_mod.is_purged(VID, isolated_cwd / "workspace")
+
+
+def test_purge_heavy_refuses_a_running_video(isolated_cwd):
+    d = _make_video(isolated_cwd, status="running")
+
+    with pytest.raises(ws_mod.PurgeRefused, match="en cours"):
+        _purge(isolated_cwd)
+
+    assert (d / f"{VID}.mp4").is_file()
+
+
+def test_purge_heavy_refuses_a_video_in_the_queue(isolated_cwd):
+    d = _make_video(isolated_cwd)
+    (isolated_cwd / "queue.json").write_text(json.dumps([{"video_id": VID, "status": "waiting"}]), encoding="utf-8")
+
+    with pytest.raises(ws_mod.PurgeRefused, match="file"):
+        _purge(isolated_cwd)
+
+    assert (d / f"{VID}.mp4").is_file()
+
+
+def test_purge_heavy_unknown_video_is_explicit(isolated_cwd):
+    with pytest.raises(ws_mod.PurgeRefused, match="introuvable"):
+        _purge(isolated_cwd, "zzzzzzzzzzz")
+
+
+def test_purge_clips_deletes_output_and_returns_size(isolated_cwd):
+    _make_video(isolated_cwd)
+    _add_clip(isolated_cwd)
+
+    freed = ws_mod.purge_clips(VID, isolated_cwd / "output", isolated_cwd / "publish")
+
+    assert freed > 500
+    assert not (isolated_cwd / "output" / VID).exists()
+
+
+@pytest.mark.parametrize("status", ["approved", "scheduled", "failed"])
+def test_purge_clips_refuses_a_pending_publication_and_names_the_clip(isolated_cwd, status):
+    _add_clip(isolated_cwd, "02-p2")
+    pub = isolated_cwd / "publish"
+    pub.mkdir()
+    (pub / "style.json").write_text(json.dumps([
+        {"video_id": VID, "clip_id": "02-p2", "status": status},
+        {"video_id": "other", "clip_id": "01", "status": "approved"}]), encoding="utf-8")
+
+    with pytest.raises(ws_mod.PurgeRefused, match="02-p2"):
+        ws_mod.purge_clips(VID, isolated_cwd / "output", pub)
+
+    assert (isolated_cwd / "output" / VID / "02-p2.mp4").is_file()
+
+
+def test_purge_clips_refuses_an_in_progress_publication(isolated_cwd):
+    _add_clip(isolated_cwd, "02-p2")
+    pub = isolated_cwd / "publish"
+    pub.mkdir()
+    (pub / "_sans_chaine.json").write_text(json.dumps([
+        {"video_id": VID, "clip_id": "02-p2", "status": "published", "in_progress_since": "2026-01-01T00:00:00+00:00"}]),
+        encoding="utf-8")
+
+    with pytest.raises(ws_mod.PurgeRefused, match="02-p2"):
+        ws_mod.purge_clips(VID, isolated_cwd / "output", pub)
+
+
+def test_purge_clips_allows_published_and_rejected(isolated_cwd):
+    _add_clip(isolated_cwd)
+    pub = isolated_cwd / "publish"
+    pub.mkdir()
+    (pub / "style.json").write_text(json.dumps([
+        {"video_id": VID, "clip_id": "01-p1", "status": "published"}]), encoding="utf-8")
+
+    assert ws_mod.purge_clips(VID, isolated_cwd / "output", pub) > 0
+
+
+def test_purge_clips_unreadable_publish_file_is_explicit(isolated_cwd):
+    _add_clip(isolated_cwd)
+    pub = isolated_cwd / "publish"
+    pub.mkdir()
+    (pub / "style.json").write_text("{pas du json", encoding="utf-8")
+
+    with pytest.raises(ws_mod.PurgeRefused, match="style.json"):
+        ws_mod.purge_clips(VID, isolated_cwd / "output", pub)
+
+
+def test_disk_usage_totals_workspace_and_output(isolated_cwd):
+    _make_video(isolated_cwd)
+    _add_clip(isolated_cwd)
+
+    usage = ws_mod.disk_usage(isolated_cwd / "workspace", isolated_cwd / "output")
+
+    assert usage["output_bytes"] == 500 + len(json.dumps({"video_id": VID, "clip_id": "01-p1"}))
+    assert usage["workspace_bytes"] == 1665 + 3 * 8 + len(json.dumps({"video_id": VID, "status": "done"}))
+
+
+def test_log_records_a_purge(isolated_cwd, caplog):
+    _make_video(isolated_cwd)
+    with caplog.at_level("INFO", logger="clipper.workspace"):
+        _purge(isolated_cwd)
+    assert any(VID in r.message and "1665" in r.message for r in caplog.records)
