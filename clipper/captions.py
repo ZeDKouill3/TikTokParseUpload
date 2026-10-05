@@ -87,7 +87,12 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "caption_max_chars": 300,
     "hashtags_max": 8,
     "hook_words_max": 8,
+    # TASK-35a1 : cible demandee au modele, plus courte que la limite (le
+    # modele depasse sinon d'un mot) ; la validation reste hook_words_max.
+    # Plafonnee a hook_words_max si le reglage de la limite est plus bas.
+    "hook_words_target": 6,
     "screen_title_words_max": 6,
+    "screen_title_words_target": 5,
     # SPEC-6a86 : sans configuration explicite, un screen_title avec un
     # emoji est refuse. Activer l'option ne rend pas l'emoji obligatoire,
     # elle permet seulement d'en accepter un (au plus un).
@@ -222,8 +227,10 @@ def response_schema(
             "type": "string", "minLength": 1, "maxLength": 80,
             "description": (
                 f"Texte d'accroche affiche a l'ecran les 2 premieres secondes, "
-                f"{settings['hook_words_max']} mots au plus ; ton sobre, aucun mot d'emphase "
-                f"clickbait ; {caption_emoji_desc}."
+                f"viser {_words_target(settings, 'hook_words_target', 'hook_words_max')} mots, "
+                f"{settings['hook_words_max']} au plus ; si une citation du transcript depasse, "
+                "ne la recopie pas telle quelle : raccourcis-la ou reformule ; "
+                f"ton sobre, aucun mot d'emphase clickbait ; {caption_emoji_desc}."
             ),
         },
     }
@@ -245,8 +252,10 @@ def response_schema(
             "type": "string", "minLength": 1, "maxLength": 60,
             "description": (
                 "Titre d'ecran affiche en haut, sur un encadre blanc, pendant tout le "
-                f"clip : {settings['screen_title_words_max']} mots au plus (l'emoji ne "
-                f"compte pas), ton sobre (jamais de superlatif ni de mot d'emphase "
+                f"clip : viser {_words_target(settings, 'screen_title_words_target', 'screen_title_words_max')} "
+                f"mots, {settings['screen_title_words_max']} au plus (l'emoji ne compte pas) ; "
+                "si une citation depasse, ne la recopie pas telle quelle : raccourcis-la ou "
+                f"reformule ; ton sobre (jamais de superlatif ni de mot d'emphase "
                 f"clickbait) ; {emoji_desc}."
             ),
         }
@@ -297,8 +306,11 @@ def _prompt(
         f"(pas de generique inutile), {int(settings['hashtags_max'])} au plus."
     )
     rules.append(
-        f"hook_text : le texte affiche a l'ecran des le debut, {int(settings['hook_words_max'])} mots "
-        f"au plus, qui arrete le scroll ; ton sobre, aucun mot d'emphase clickbait ; {caption_emoji_rule}."
+        f"hook_text : le texte affiche a l'ecran des le debut, viser "
+        f"{_words_target(settings, 'hook_words_target', 'hook_words_max')} mots "
+        f"({int(settings['hook_words_max'])} au plus, limite stricte), qui arrete le scroll ; "
+        "si une citation du transcript depasse, ne recopie pas une citation telle quelle : "
+        f"raccourcis-la ou reformule ; ton sobre, aucun mot d'emphase clickbait ; {caption_emoji_rule}."
     )
     if screen_title is None:
         allow_emoji = bool(settings["screen_title_allow_emoji"])
@@ -309,8 +321,9 @@ def _prompt(
         )
         forbidden_words = ", ".join(str(w) for w in settings["screen_title_forbidden_words"])
         rules.append(
-            f"screen_title : titre de 5-6 mots au plus ({int(settings['screen_title_words_max'])} au "
-            "plus) affiche dans un encadre blanc au-dessus de la video, pendant tout le clip ; ton "
+            f"screen_title : titre, viser "
+            f"{_words_target(settings, 'screen_title_words_target', 'screen_title_words_max')} mots "
+            f"({int(settings['screen_title_words_max'])} au plus, limite stricte), affiche dans un encadre blanc au-dessus de la video, pendant tout le clip ; ton "
             "sobre, de preference une phrase reellement prononcee dans ce clip (citation courte entre "
             "« »), sinon un fait concret et precis du clip, jamais un contenu absent du clip ; "
             f"{emoji_rule} ; aucun superlatif ni mot d'emphase clickbait, notamment : {forbidden_words}."
@@ -383,11 +396,22 @@ def _numbered_words(text: str) -> str:
     return ", ".join(f"{i}. {word}" for i, word in enumerate(_counted_words(text), start=1))
 
 
-def _validate_hook_text(hook_text: str, max_words: int) -> None:
+def _words_target(settings: dict[str, Any], target_key: str, max_key: str) -> int:
+    """Cible de mots demandee au modele, jamais au-dessus de la limite."""
+    return min(int(settings[target_key]), int(settings[max_key]))
+
+
+def _excess_message(n: int, target: int) -> str:
+    excess = n - target
+    return f"{n} mots, il en faut {target} au plus : supprime {excess} mot{'s' if excess > 1 else ''}"
+
+
+def _validate_hook_text(hook_text: str, max_words: int, target_words: int | None = None) -> None:
     n = _count_words(hook_text)
     if n > max_words:
+        target = max_words if target_words is None else min(target_words, max_words)
         raise llm.SchemaError(
-            f"texte d'accroche de {n} mots, {max_words} au plus : {_numbered_words(hook_text)}"
+            f"texte d'accroche de {_excess_message(n, target)} : {_numbered_words(hook_text)}"
         )
 
 
@@ -501,11 +525,13 @@ def _validate_screen_title_forbidden_words(screen_title: str, forbidden_words: l
 
 def _validate_screen_title(
     screen_title: str, max_words: int, forbidden_words: list[str], allow_emoji: bool,
+    target_words: int | None = None,
 ) -> None:
     n = _count_words(screen_title)
     if n > max_words:
+        target = max_words if target_words is None else min(target_words, max_words)
         raise llm.SchemaError(
-            f"titre d'ecran de {n} mots, {max_words} au plus : {_numbered_words(screen_title)}"
+            f"titre d'ecran de {_excess_message(n, target)} : {_numbered_words(screen_title)}"
         )
     _validate_screen_title_forbidden_words(screen_title, forbidden_words)
     _validate_screen_title_emoji(screen_title, allow_emoji)
@@ -519,6 +545,8 @@ def _check_answer(
     caption_allow_emoji: bool,
     *,
     require_screen_title: bool = True,
+    hook_words_target: int | None = None,
+    screen_title_words_target: int | None = None,
 ):
     """Controle passe a llm.ask : ce qui le refuse est renvoye au modele
     pour correction, comme une reponse hors schema. ``require_screen_title``
@@ -527,13 +555,14 @@ def _check_answer(
 
     def check(answer: dict[str, Any]) -> None:
         _validate_hashtags(answer["hashtags"])
-        _validate_hook_text(answer["hook_text"], hook_words_max)
+        _validate_hook_text(answer["hook_text"], hook_words_max, hook_words_target)
         _validate_sober_text_emoji(answer["caption"], "caption", caption_allow_emoji)
         _validate_sober_text_emoji(answer["hook_text"], "hook_text", caption_allow_emoji)
         if require_screen_title:
             _validate_screen_title(
                 answer["screen_title"], screen_title_words_max,
                 screen_title_forbidden_words, screen_title_allow_emoji,
+                screen_title_words_target,
             )
 
     return check
@@ -632,6 +661,9 @@ def _process_moment(
             list(settings["screen_title_forbidden_words"]), bool(settings["screen_title_allow_emoji"]),
             bool(settings["caption_allow_emoji"]),
             require_screen_title=request_screen_title,
+            hook_words_target=_words_target(settings, "hook_words_target", "hook_words_max"),
+            screen_title_words_target=_words_target(
+                settings, "screen_title_words_target", "screen_title_words_max"),
         )
         text = _part_text(transcript, part["start"], part["end"])
         prompt = _prompt(language, video_title, source, part, parts_total, text, settings,
