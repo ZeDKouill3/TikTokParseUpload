@@ -200,7 +200,8 @@ CONFIG_DEFAULTS: dict[str, object] = {
     #     facecam_clip_edge_min_share d'une paire de côtés opposés
     #     (gauche/droit ou haut/bas) : le rectangle n'est agrandi que sur un
     #     seul axe pour tenir le format du panneau caméra, l'autre garde le
-    #     bord réel de l'incrustation ; ignorée quand la localisation
+    #     bord réel de l'incrustation, chaque côté cherché à
+    #     facecam_clip_edge_tolerance près ; ignorée quand la localisation
     #     elle-meme n'a trouvé aucun bord réel (repli sur le seul visage
     #     stable, edge_reason non nul dans facecam.json : rien de comparable
     #     à chercher par image clé) ;
@@ -218,6 +219,13 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "facecam_black_min_mean": 12.0,
     "facecam_black_min_std": 6.0,
     "facecam_clip_edge_min_share": 0.5,
+    # (b) bis : le rectangle choisi n'est jamais exactement sur le bord réel de
+    # l'incrustation (quelques px d'écart mesurés : TheGuill v2887364910,
+    # gauche +6, droit -5, haut -1, bas +2). Chaque côté est donc cherché
+    # dans une bande de ± facecam_clip_edge_tolerance (fraction de la
+    # largeur du rectangle pour gauche/droit, de sa hauteur pour haut/bas),
+    # en gardant la meilleure ligne/colonne.
+    "facecam_clip_edge_tolerance": 0.04,
     "facecam_frozen_min_diff": 8.0,
     "facecam_frozen_min_pixel_share": 0.001,
     # Panneau caméra : part de la hauteur de sortie, à partir de stream_top
@@ -2060,14 +2068,25 @@ def _rect_edges_found(image: np.ndarray, rect: dict[str, int], settings: dict[st
     y0, y1 = max(0, y), min(height, y + h)
     if x1 - x0 < 2 or y1 - y0 < 2:
         return False
+    tolerance = float(settings["facecam_clip_edge_tolerance"])
     mask = _edge_mask(image, threshold)
+    tol_x = max(0, round(tolerance * (x1 - x0)))
+    tol_y = max(0, round(tolerance * (y1 - y0)))
 
-    def share(*bands: np.ndarray) -> float:
-        total = sum(band.size for band in bands)
-        return sum(int(band.sum()) for band in bands) / total if total else 0.0
+    def best_line(axis: str, pos: int, lo: int, hi: int, tol: int, limit: int) -> float:
+        """Meilleure part de pixels nets sur une ligne/colonne a ``pos`` +- ``tol``."""
+        best = 0.0
+        for p in range(max(0, pos - tol), min(limit - 1, pos + tol) + 1):
+            band = mask[lo:hi, p] if axis == "x" else mask[p, lo:hi]
+            best = max(best, float(band.mean()))
+        return best
 
-    left_right = share(mask[y0:y1, x0], mask[y0:y1, x1 - 1])
-    top_bottom = share(mask[y0, x0:x1], mask[y1 - 1, x0:x1])
+    left_right = (
+        best_line("x", x0, y0, y1, tol_x, width) + best_line("x", x1 - 1, y0, y1, tol_x, width)
+    ) / 2
+    top_bottom = (
+        best_line("y", y0, x0, x1, tol_y, height) + best_line("y", y1 - 1, x0, x1, tol_y, height)
+    ) / 2
     return left_right >= min_share - 1e-9 or top_bottom >= min_share - 1e-9
 
 

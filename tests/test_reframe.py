@@ -2471,3 +2471,74 @@ def test_rect_moves_gives_the_same_answer_on_uint8_and_float_grays():
     assert reframe._rect_moves(grays8, rect, settings) is True
     assert reframe._rect_moves([g.astype(np.float64) for g in grays8], rect, settings) is True
     assert reframe._rect_moves(still8, rect, settings) is False
+
+
+# --- TASK-53e3 : bords reels decales de quelques px du rectangle choisi ---
+
+_OFFSET_RECT = {"x": 32, "y": 360, "w": 336, "h": 238}
+
+
+def _offset_frame_image(phase: float, *, framed: bool) -> np.ndarray:
+    """Image 1920x1080 : fond plat sombre ; webcam au contenu lisse (gradient
+    faible, il change a chaque image) dont les vrais bords sont decales de
+    quelques px du rectangle choisi (gauche +6, droit -5, haut +5, bas -2,
+    comme TheGuill v2887364910) quand ``framed``."""
+    image = np.full((1080, 1920, 3), 30, dtype=np.uint8)
+    r = _OFFSET_RECT
+    if framed:
+        x0, x1 = r["x"] + 6, r["x"] + r["w"] - 5
+        y0, y1 = r["y"] + 5, r["y"] + r["h"] - 2
+    else:
+        x0, x1, y0, y1 = r["x"], r["x"] + r["w"], r["y"], r["y"] + r["h"]
+    xs = np.arange(x0, x1)[None, :]
+    ys = np.arange(y0, y1)[:, None]
+    wave = 120 + 30 * np.sin(xs / 16.0 + phase) * np.cos(ys / 20.0 - phase)
+    image[y0:y1, x0:x1] = np.clip(wave, 0, 255).astype(np.uint8)[..., None]
+    return image
+
+
+def _offset_facecam(n: int) -> dict:
+    return {
+        "index": 1,
+        "facecam": dict(_OFFSET_RECT),
+        "reason": None,
+        "edge_reason": None,
+        "keyframes": [{"timecode": float(i), "path": f"k{i}.jpg"} for i in range(n)],
+    }
+
+
+def _offset_reader(framed: bool):
+    def read(path: str) -> np.ndarray:
+        return _offset_frame_image(float(Path(path).stem[1:]) * 1.7, framed=framed)
+
+    return read
+
+
+def test_clip_facecam_keeps_webcam_whose_real_edges_are_a_few_px_off_the_rect(tmp_path):
+    from clipper import reframe
+
+    settings = dict(reframe.CONFIG_DEFAULTS)
+    rect, reason = reframe._clip_facecam(
+        _offset_facecam(8), 0.0, 7.0, settings, tmp_path, image_reader=_offset_reader(True)
+    )
+    assert reason is None
+    assert rect == _OFFSET_RECT
+
+
+def test_clip_facecam_still_rejects_a_rect_with_no_edge_anywhere_near(tmp_path):
+    from clipper import reframe
+
+    settings = dict(reframe.CONFIG_DEFAULTS)
+    facecam = _offset_facecam(8)
+    far = {"x": 600, "y": 100, "w": 336, "h": 238}  # fond plat, aucun bord proche
+    facecam["facecam"] = far
+
+    def read(path: str) -> np.ndarray:
+        image = _offset_frame_image(float(Path(path).stem[1:]) * 1.7, framed=True)
+        image[100:338, 600:936] = 120  # contenu non noir mais sans bord ni mouvement lisible
+        image[100:338, 600:936] += (np.arange(600, 936)[None, :, None] % 7).astype(np.uint8)
+        return image
+
+    rect, reason = reframe._clip_facecam(facecam, 0.0, 7.0, settings, tmp_path, image_reader=read)
+    assert rect is None
+    assert reason is not None
