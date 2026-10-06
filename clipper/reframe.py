@@ -184,6 +184,33 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "facecam_edge_search_ratio": 3.0,
     "facecam_edge_min_gradient": 30.0,
     "facecam_edge_min_share": 0.8,
+    # Distance maximale dont un bord du rectangle de la webcam choisi peut être déplacé pour coller à
+    # l'incrustation réelle, en part de la largeur (bords gauche/droit) ou de la hauteur (haut/bas).
+    # Recalage du rectangle choisi par Claude sur la vraie incrustation
+    # (TASK-893d) : le candidat peut être décalé (visage centré faute de bords
+    # retrouvés) ou englober une bordure / une bande d'overlay. Après le choix,
+    # chacun des 4 bords est cherché dans une bande de part et d'autre de sa
+    # position (facecam_refine_margin_ratio fois la largeur, ou la hauteur,
+    # du rectangle, jamais plus loin) : sur chaque image de la période, la
+    # position du plus fort gradient perpendiculaire au bord (moyenné sur le
+    # milieu du côté, en retirant facecam_refine_band_trim à chaque bout) vote
+    # si ce gradient dépasse facecam_refine_min_gradient et facecam_refine_peak_ratio
+    # fois la médiane de la fenêtre. Un bord est retenu quand au moins
+    # facecam_refine_min_votes images votent à facecam_refine_tolerance px
+    # près de la même position et qu'elles font au moins facecam_refine_agreement
+    # des images qui votent (0,5 : majorité) ; sinon le côté reste tel quel et
+    # la raison est journalisée. Une webcam qui change de place dans la période
+    # (Hctuan : haut 410 puis 358) n'a pas de rectangle exact : le mode majoritaire gagne.
+    # La recherche exclut le visage stable (son contour n'est pas un bord).
+    # Le rectangle affiné est agrandi au minimum au format du panneau caméra
+    # (il couvre toute l'incrustation retrouvée) et ne coupe jamais le visage.
+    "facecam_refine_margin_ratio": 0.2,
+    "facecam_refine_band_trim": 0.2,
+    "facecam_refine_min_gradient": 12.0,
+    "facecam_refine_peak_ratio": 4.0,
+    "facecam_refine_min_votes": 4,
+    "facecam_refine_agreement": 0.5,
+    "facecam_refine_tolerance": 2,
     # Part des images clés d'un clip où la facecam doit être présente pour garder l'agencement stream.
     # Présence de la facecam par clip (SPEC-8257 règle 2) : un clip reste en
     # stream si le rectangle de la facecam (déjà localisé) y est présent et
@@ -1433,6 +1460,111 @@ def _facecam_rect(
     return rect, reason, edge_reason
 
 
+def _refine_side(
+    grays: list[np.ndarray], side: str, rect: dict[str, int], face: Sequence[float] | None,
+    settings: dict[str, Any],
+) -> tuple[int | None, str]:
+    """Position du bord ``side`` ("gauche", "droit", "haut", "bas") de la vraie
+    incrustation autour de celui de ``rect``, ou ``None`` et la raison ;
+    ``_refine_rect`` explique le vote. La recherche ne descend jamais dans le
+    visage stable ``face`` (a ``2 * facecam_refine_tolerance`` px pres) : son
+    contour n'est pas un bord de l'incrustation."""
+    x, y, w, h = rect["x"], rect["y"], rect["w"], rect["h"]
+    horizontal = side in ("gauche", "droit")
+    pos0 = {"gauche": x, "droit": x + w, "haut": y, "bas": y + h}[side]
+    span = w if horizontal else h
+    margin = max(1, round(float(settings["facecam_refine_margin_ratio"]) * span))
+    trim = float(settings["facecam_refine_band_trim"])
+    min_gradient = float(settings["facecam_refine_min_gradient"])
+    peak_ratio = float(settings["facecam_refine_peak_ratio"])
+    tol = int(settings["facecam_refine_tolerance"])
+    height, width = grays[0].shape
+    length = width if horizontal else height
+    # gradient entre i et i+1 : le bord est en i+1 (exclusif a droite / en bas)
+    lo, hi = max(1, pos0 - margin), min(length - 1, pos0 + margin)
+    if face is not None:
+        slack = 2 * tol
+        fx0, fy0, fx1, fy1 = face
+        if side == "gauche":
+            hi = min(hi, int(fx0) - slack)
+        elif side == "droit":
+            lo = max(lo, int(fx1) + 1 + slack)
+        elif side == "haut":
+            hi = min(hi, int(fy0) - slack)
+        else:
+            lo = max(lo, int(fy1) + 1 + slack)
+    if hi <= lo:
+        return None, f"{side} : introuvable (fenetre de recherche vide, hors de l'image ou dans le visage stable)"
+    if horizontal:
+        b0, b1 = y + round(h * trim), y + h - round(h * trim)
+    else:
+        b0, b1 = x + round(w * trim), x + w - round(w * trim)
+    votes: list[int] = []
+    for gray in grays:
+        if horizontal:
+            profile = np.abs(np.diff(gray[b0:b1, :].astype(np.float32), axis=1)).mean(0)
+        else:
+            profile = np.abs(np.diff(gray[:, b0:b1].astype(np.float32), axis=0)).mean(1)
+        window = profile[lo - 1:hi]
+        peak = float(window.max())
+        if peak >= min_gradient and peak >= peak_ratio * max(float(np.median(window)), 1e-3):
+            index = int(window.argmax())
+            if 0 < index < len(window) - 1:  # un pic au bord de la fenetre n'est pas un pic : le bord est plus loin
+                votes.append(lo + index)
+    n = len(votes)
+    if n == 0:
+        return None, f"{side} : introuvable (aucun gradient net a +-{margin} px)"
+    best = max(votes, key=lambda v: sum(abs(u - v) <= tol for u in votes))
+    agree = [v for v in votes if abs(v - best) <= tol]
+    min_votes = int(settings["facecam_refine_min_votes"])
+    share = float(settings["facecam_refine_agreement"])
+    if len(agree) < min_votes or len(agree) < share * n:
+        return None, (
+            f"{side} : introuvable ({len(agree)} image(s) d'accord sur {n} qui votent, "
+            f"{min_votes} et {share:.0%} requis, +-{margin} px)"
+        )
+    pos = int(round(float(np.median(agree))))
+    return pos, f"{side} {pos - pos0:+d} px ({len(agree)}/{len(grays)} images)"
+
+
+def _refine_rect(
+    images: Sequence[np.ndarray],
+    rect: dict[str, int],
+    face: Sequence[float] | None,
+    settings: dict[str, Any],
+) -> tuple[dict[str, int] | None, str]:
+    """Rectangle choisi ``rect`` recale sur les bords reels de l'incrustation
+    (voir ``facecam_refine_*`` de CONFIG_DEFAULTS), par vote d'images de la
+    periode ; renvoie (rectangle affine ou ``None`` s'il n'a pas bouge, raison
+    journalisee : decalage de chaque cote retenu, ou pourquoi il reste tel
+    quel). Les cotes sans bord fiable gardent leur position ; un bord qui
+    entrerait dans le visage stable ``face`` n'est pas cherche ; le resultat est agrandi
+    au minimum au format du panneau camera (comme ``_facecam_rect``), il
+    couvre donc toute l'incrustation retrouvee."""
+    height, width = images[0].shape[:2]
+    grays = [cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) for image in images]
+    x, y, w, h = rect["x"], rect["y"], rect["w"], rect["h"]
+    box = {"gauche": x, "droit": x + w, "haut": y, "bas": y + h}
+    notes: list[str] = []
+    for side in box:
+        pos, note = _refine_side(grays, side, rect, face, settings)
+        if pos is not None:
+            box[side] = pos
+        notes.append(note)
+    reason = "; ".join(notes)
+    if box["droit"] - box["gauche"] < 16 or box["bas"] - box["haut"] < 16:
+        return None, f"rectangle affine trop petit, conserve tel quel ({reason})"
+    if (box["gauche"], box["haut"], box["droit"], box["bas"]) == (x, y, x + w, y + h):
+        return None, reason
+    sized, why = _size_camera_rect(
+        (box["gauche"] + box["droit"]) / 2, (box["haut"] + box["bas"]) / 2,
+        box["droit"] - box["gauche"], box["bas"] - box["haut"], width, height, settings,
+    )
+    if sized is None:
+        return None, f"rectangle affine inutilisable, conserve tel quel ({why}; {reason})"
+    return dict(zip("xywh", sized)), reason
+
+
 def _stable_face(
     detections: list[list[Box]], tolerance: float, size_ratio: float = 0.0
 ) -> tuple[Box | None, int]:
@@ -1734,7 +1866,7 @@ def _period_candidates(
             continue
         raw.append({
             "kind": "visage", "rect": rect, "support": support, "face_support": support,
-            "edge_reason": edge_reason or reason,
+            "edge_reason": edge_reason or reason, "face": [round(v, 1) for v in face],
         })
     frames, frame_rejected = _frame_candidates(counts, n, grays, settings)
     rejected += frame_rejected
@@ -1758,6 +1890,7 @@ def _period_candidates(
                 continue  # doublon cadre/cadre (bordure externe et interne de la meme incrustation)
             raw.append({
                 "kind": "cadre", "rect": rect, "support": item["support"], "face_support": None, "edge_reason": None,
+                "face": None,
             })
 
     limit = int(settings["facecam_candidate_max"])
@@ -1778,6 +1911,7 @@ def _period_candidates(
             "support": c["support"],
             "face_support": c["face_support"],
             "edge_reason": c["edge_reason"],
+            "face": c["face"],
         }
         for i, c in enumerate(raw, start=1)
     ]
@@ -1876,7 +2010,11 @@ def detect_facecam(
                       [{"id", "kind", "rect": {x, y, w, h}, "support", "edge_reason"}],
                       "rejected": [{"kind", "box", "reason"}], "board": chemin | null,
                       "answer": {"webcam": id | null, "reason"} | null,
-                      "facecam": {x, y, w, h} | null, "reason": null | pourquoi pas,
+                      "facecam": {x, y, w, h} | null  (le rectangle utilise : affine s'il l'est),
+                      "candidate_rect": rectangle du candidat choisi | null,
+                      "refined_rect": candidat recale sur les bords reels | null,
+                      "refine_reason": decalage retenu par cote, ou pourquoi rien n'a bouge,
+                      "reason": null | pourquoi pas,
                       "edge_reason": null | pourquoi le rectangle est centre sur le seul visage}],
          "keyframes": [{"timecode", "path"}]}
 
@@ -1891,6 +2029,8 @@ def detect_facecam(
        repond un numero ou null ; une reponse invalide est une erreur
        explicite (ADR-ad2e). Aucune coordonnee demandee, aucune memoire d'un
        stream a l'autre.
+    4. RECALAGE (local, TASK-893d) : le candidat choisi est recale bord par
+       bord sur la vraie incrustation (``_refine_rect``), sans appel LLM.
 
     Detecteur de visages de reframe (``detector``), device via clipper.gpu,
     ferme avant le premier appel a Claude (ADR-fb9b)."""
@@ -1962,6 +2102,7 @@ def detect_facecam(
                     "end": frames[last - 1]["timecode"],
                     "transition": note,
                     "images": [images[f["k"]] for f in shown],
+                    "all_images": images,
                     "times": [frames[indices[f["k"]]]["timecode"] for f in shown],
                     "candidates": candidates,
                     "rejected": rejected,
@@ -1980,6 +2121,9 @@ def detect_facecam(
         answer: dict[str, Any] | None = None
         rect: dict[str, int] | None = None
         edge_reason: str | None = None
+        candidate_rect: dict[str, int] | None = None
+        refined_rect: dict[str, int] | None = None
+        refine_reason: str | None = None
         if not candidates:
             reason = "aucun rectangle candidat de webcam sur cette periode (cadre net et contenu en mouvement, ou visage)"
         else:
@@ -1995,6 +2139,12 @@ def detect_facecam(
             else:
                 chosen = next(c for c in candidates if c["id"] == answer["webcam"])
                 rect, edge_reason, reason = dict(chosen["rect"]), chosen["edge_reason"], None
+                candidate_rect = dict(rect)
+                refined_rect, refine_reason = _refine_rect(
+                    item["all_images"], candidate_rect, chosen.get("face"), settings
+                )
+                if refined_rect is not None:
+                    rect = dict(refined_rect)
         periods.append({
             "index": index,
             "start": item["start"],
@@ -2005,6 +2155,9 @@ def detect_facecam(
             "board": board,
             "answer": answer,
             "facecam": rect,
+            "candidate_rect": candidate_rect,
+            "refined_rect": refined_rect,
+            "refine_reason": refine_reason,
             "reason": reason,
             "edge_reason": edge_reason,
         })
@@ -2014,10 +2167,18 @@ def detect_facecam(
             log.info("%s : periode %d, webcam %s (candidat %s)", video_id, index, rect, answer and answer["webcam"])
             if edge_reason is not None:
                 log.info("%s : periode %d, bords de l'incrustation non trouves (%s)", video_id, index, edge_reason)
+            if refined_rect is not None:
+                log.info(
+                    "%s : periode %d, rectangle recale %s -> %s (%s)", video_id, index, candidate_rect, refined_rect,
+                    refine_reason,
+                )
+            else:
+                log.info("%s : periode %d, rectangle conserve tel quel (%s)", video_id, index, refine_reason)
     if not frames:
         periods = [{
             "index": 0, "start": 0.0, "end": 0.0, "transition": "aucune image cle", "candidates": [],
             "rejected": [], "board": None, "answer": None, "facecam": None,
+            "candidate_rect": None, "refined_rect": None, "refine_reason": None,
             "reason": "aucune image cle dans scenes.json", "edge_reason": None,
         }]
         log.warning("%s : aucune image cle, clips en letterbox", video_id)
