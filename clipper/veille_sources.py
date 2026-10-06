@@ -37,6 +37,9 @@ TWITCH_TOKEN_URL = "https://id.twitch.tv/oauth2/token"
 TWITCH_API = "https://api.twitch.tv/helix"
 YOUTUBE_VIDEOS_URL = "https://www.googleapis.com/youtube/v3/videos"
 STEAM_API = "https://api.steampowered.com"
+STEAM_SELLERS_URL = f"{STEAM_API}/IStoreTopSellersService/GetWeeklyTopSellers/v1/"
+# Code de langue [veille] language -> nom de langue attendu par l'API magasin (autres valeurs passées telles quelles).
+_STEAM_LANGUAGES = {"fr": "french", "en": "english", "de": "german", "es": "spanish", "it": "italian", "pt": "portuguese"}
 STEAM_APPDETAILS_URL = "https://store.steampowered.com/api/appdetails"  # GetAppList v2 retiré par Valve (404)
 
 STREAM_PAGES_MAX = 5
@@ -376,6 +379,29 @@ def _steam_collector(http: Http, clock: Clock) -> Callable[[dict[str, object]], 
     return collect
 
 
+def _steam_sellers_collector(http: Http, clock: Clock) -> Callable[[dict[str, object]], dict[str, Any]]:
+    """Top des ventes de la semaine du pays ``[veille] region`` (sans clé) ; noms fournis par l'API elle-même."""
+    def collect(settings: dict[str, object]) -> dict[str, Any]:
+        client = _client(settings, http, ())
+        country = str(settings["region"]).upper()
+        language = _STEAM_LANGUAGES.get(str(settings["language"]).lower(), str(settings["language"]))
+        params = {"input_json": json.dumps({
+            "country_code": country, "page_start": 0, "page_count": int(settings["steam_sellers_top"]),  # type: ignore[call-overload]
+            "context": {"language": language, "country_code": country},
+            "data_request": {"include_basic_info": False}}, separators=(",", ":"))}
+        _, body = client.request("GET", STEAM_SELLERS_URL, params)
+        games: list[dict[str, Any]] = []
+        for rank in _field(client, STEAM_SELLERS_URL, params, body, "response", "ranks"):
+            name = _field(client, STEAM_SELLERS_URL, params, rank, "item", "name")
+            last_week = rank.get("last_week_rank")  # absent ou 0 : pas dans le top la semaine dernière
+            games.append({"appid": str(_field(client, STEAM_SELLERS_URL, params, rank, "appid")), "name": name,
+                          "rank": _field(client, STEAM_SELLERS_URL, params, rank, "rank"),
+                          "last_week_rank": last_week if isinstance(last_week, int) else 0})
+        return {"games": games}
+
+    return collect
+
+
 def current_players(settings: dict[str, object], appid: str | int, *, http: Http | None = None) -> int:
     """Joueurs en ce moment d'une app (``GetNumberOfCurrentPlayers``, sans clé)."""
     client = _client(settings, http or default_http, ())
@@ -386,8 +412,8 @@ def current_players(settings: dict[str, object], appid: str | int, *, http: Http
 
 
 def default_collectors(http: Http | None = None, clock: Clock | None = None) -> dict[str, Callable[[dict[str, object]], dict[str, Any]]]:
-    """Les trois collecteurs réels, sur le transport (et l'horloge) donnés."""
+    """Les collecteurs réels, sur le transport (et l'horloge) donnés."""
     http = http or default_http
     clock = clock or _now
     return {"twitch": _twitch_collector(http, clock), "youtube": _youtube_collector(http, clock),
-            "steam": _steam_collector(http, clock)}
+            "steam": _steam_collector(http, clock), "steam_fr": _steam_sellers_collector(http, clock)}

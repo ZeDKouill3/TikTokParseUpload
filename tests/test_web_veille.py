@@ -421,3 +421,19 @@ def test_settings_screen_has_a_veille_section_with_masked_keys():
 def test_app_counts_proposed_veille_proposals_in_the_nav():
     js = read_static("app.js")
     assert "veille" in js
+
+
+def test_veille_screen_shows_sellers_rank_and_french_count_labels():
+    js = read_static("screens/veille.js")
+    for needle in ("Ventes FR", "steam_sellers_rank", "steam_sellers_gain", "steam_sellers_new",
+                   "Nouveau dans le top ventes FR", "steam_fr:", "COUNT_LABELS", "jeux"):
+        assert needle in js, needle
+    assert "${v} ${k}" not in js  # « Steam : 99 games » : les clés d'API ne s'affichent plus telles quelles
+
+
+def test_veille_rising_indicator_counts_rank_gains_not_only_seven_day_rise():
+    js = read_static("screens/veille.js")
+    rises = js[js.index("const veilleRises"):js.index("function veilleSellers")]
+    for needle in ("steam_rank_gain", "steam_new_in_top", "steam_sellers_gain", "steam_sellers_new"):
+        assert needle in rises, needle
+    assert "steam_rank_gain_min" in js[js.index("function veilleKpis"):js.index("function veilleProposal")]

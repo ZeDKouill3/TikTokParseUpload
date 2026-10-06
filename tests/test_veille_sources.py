@@ -432,3 +432,60 @@ def test_real_steam(tmp_path):
     # appdetails réel (sans clé) : les 5 premiers jeux du top doivent avoir un nom (GetAppList v2 est mort).
     result = veille_sources.default_collectors()["steam"](_settings(tmp_path, steam_top=5))
     assert result["games"] and all(g["name"] for g in result["games"])
+
+
+# -- (7) Steam : top des ventes du pays (TASK-2784) --------------------------
+
+
+def _sellers_reply(call):
+    return 200, {"response": {"start_date": 1759708800, "ranks": [
+        {"rank": 1, "appid": 1000, "item": {"name": "AION 2"}, "last_week_rank": 5, "consecutive_weeks": 2},
+        {"rank": 5, "appid": 1091500, "item": {"name": "Cyberpunk 2077"}, "last_week_rank": 112, "consecutive_weeks": 1},
+        {"rank": 8, "appid": 2000, "item": {"name": "Minecraft Dungeons II"}, "last_week_rank": 17},
+        {"rank": 9, "appid": 3000, "item": {"name": "Jeu Neuf"}, "last_week_rank": 0},
+        {"rank": 10, "appid": 4000, "item": {"name": "Sans Semaine"}}]}}
+
+
+def _sellers(tmp_path, http, **over):
+    return veille_sources.default_collectors(http)["steam_fr"](_settings(tmp_path, **over))
+
+
+def test_steam_fr_reads_weekly_top_sellers_for_the_configured_country(tmp_path):
+    http = FakeHttp({("GET", "/IStoreTopSellersService/GetWeeklyTopSellers/v1/"): _sellers_reply})
+    result = _sellers(tmp_path, http, region="FR", language="french", steam_sellers_top=50)
+    assert result["games"][:3] == [
+        {"appid": "1000", "name": "AION 2", "rank": 1, "last_week_rank": 5},
+        {"appid": "1091500", "name": "Cyberpunk 2077", "rank": 5, "last_week_rank": 112},
+        {"appid": "2000", "name": "Minecraft Dungeons II", "rank": 8, "last_week_rank": 17}]
+    assert result["games"][3]["last_week_rank"] == 0       # 0 : absent du top la semaine dernière
+    assert result["games"][4]["last_week_rank"] == 0       # champ absent : traité comme nouveau (critère)
+    (call,) = http.calls
+    sent = json.loads(call["params"]["input_json"])
+    assert sent["country_code"] == "FR" and sent["page_start"] == 0 and sent["page_count"] == 50
+    assert sent["context"] == {"language": "french", "country_code": "FR"}
+    assert sent["data_request"] == {"include_basic_info": False}
+    assert "key" not in call["params"]
+
+
+def test_steam_fr_does_not_call_appdetails_for_names(tmp_path):
+    http = FakeHttp({("GET", "/GetWeeklyTopSellers/v1/"): _sellers_reply})
+    _sellers(tmp_path, http)
+    assert not http.to("/api/appdetails")
+
+
+def test_steam_fr_empty_response_is_a_named_error(tmp_path):
+    http = FakeHttp({("GET", "/GetWeeklyTopSellers/v1/"): [(200, {})]})
+    with pytest.raises(veille_sources.SourceError, match="response.ranks"):
+        _sellers(tmp_path, http)
+
+
+def test_steam_fr_game_without_item_name_is_a_named_error(tmp_path):
+    http = FakeHttp({("GET", "/GetWeeklyTopSellers/v1/"): [(200, {"response": {"ranks": [{"rank": 1, "appid": 1, "item": {}}]}})]})
+    with pytest.raises(veille_sources.SourceError, match="item.name"):
+        _sellers(tmp_path, http)
+
+
+@real_only
+def test_real_steam_fr(tmp_path):
+    result = veille_sources.default_collectors()["steam_fr"](_settings(tmp_path, steam_sellers_top=5))
+    assert len(result["games"]) == 5 and all(g["name"] and g["rank"] for g in result["games"])
