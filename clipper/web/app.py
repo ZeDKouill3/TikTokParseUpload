@@ -287,11 +287,28 @@ def _enrich(state: dict[str, Any], config: Config) -> dict[str, Any]:
 
 def _rubric_used(video_dir: Path) -> str | None:
     """Grille de notation utilisee par l'etape moments (rubric.path de
-    moments.json, SPEC-9216 R4) ; None tant que l'etape n'a rien ecrit."""
+    moments.json, SPEC-9216 R4) ; None tant que l'etape n'a rien ecrit. En clips
+    courts, ``rubric.path`` est la copie aux bornes courtes : la grille nommee est
+    celle d'origine (``rubric.source``)."""
     path = video_dir / "moments.json"
     if not path.exists():
         return None
-    return (_read_json(path).get("rubric") or {}).get("path")
+    rubric = _read_json(path).get("rubric") or {}
+    return rubric.get("source") or rubric.get("path")
+
+
+def _short_clips_used(video_dir: Path) -> dict[str, Any] | None:
+    """Mode clips courts ecrit dans moments.json (TASK-4f5e) : {on, min, max}
+    (bornes seulement si actif) ; None tant que l'etape n'a rien ecrit ou pour un
+    moments.json d'avant ce reglage."""
+    path = video_dir / "moments.json"
+    if not path.exists():
+        return None
+    data = _read_json(path)
+    if "short_clips" not in data:
+        return None
+    on = bool(data["short_clips"])
+    return {"on": on, **({"min": data.get("short_min"), "max": data.get("short_max")} if on else {})}
 
 
 def _matches(video: dict[str, Any], channel: str | None, status: str | None, q: str | None) -> bool:
@@ -495,11 +512,14 @@ def _require_source(video_id: str, action: str, force_steps: list[str] | None, c
 
 
 def _enqueue(url: str, channel: str | None, action: str, force_steps: list[str] | None,
-             config: Config) -> JSONResponse:
+             config: Config, short_clips: bool | None = None) -> JSONResponse:
     if _SAFE_ID.fullmatch(url):
         _require_source(url, action, force_steps, config)
+    # Le choix de la video n'est transmis que s'il est precise (TASK-4f5e) : sans lui,
+    # l'entree garde sa forme d'avant et la valeur du style s'applique.
+    extra = {} if short_clips is None else {"short_clips": short_clips}
     try:
-        entry = worker_mod.enqueue(url, channel, action, force_steps, config=config)
+        entry = worker_mod.enqueue(url, channel, action, force_steps, config=config, **extra)
     except worker_mod.WorkerError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return JSONResponse(entry, status_code=202)
@@ -1791,6 +1811,7 @@ class QueueBody(BaseModel):
     channel: str | None = None
     action: str
     force_steps: list[str] = []
+    short_clips: bool | None = None  # clips courts : None = valeur du style (TASK-4f5e)
 
 
 class AssignChannelBody(BaseModel):
@@ -2195,7 +2216,7 @@ def create_app(config: Config | None = None) -> FastAPI:
 
     @app.post("/api/queue", status_code=202)
     def enqueue_video(body: QueueBody) -> JSONResponse:
-        return _enqueue(body.url, body.channel, body.action, body.force_steps, config)
+        return _enqueue(body.url, body.channel, body.action, body.force_steps, config, body.short_clips)
 
     @app.get("/api/queue")
     def list_queue() -> list[dict[str, Any]]:
@@ -2260,6 +2281,7 @@ def create_app(config: Config | None = None) -> FastAPI:
         detail["clips"] = state.get("clips") or []
         detail["awaiting"] = state.get("awaiting") or []
         detail["rubric"] = _rubric_used(Path(config.workspace_dir) / video_id)
+        detail["short_clips"] = _short_clips_used(Path(config.workspace_dir) / video_id)
         return detail
 
     @app.get("/api/videos/{video_id}/moments")

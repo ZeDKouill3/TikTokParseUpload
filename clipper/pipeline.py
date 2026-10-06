@@ -1066,6 +1066,20 @@ def _start(
     return _Run(state, config, force, step_options, forced=forced, clip_filter=clips)
 
 
+def _with_short_clips(
+    step_options: dict[str, dict[str, Any]] | None, short_clips: bool | None
+) -> dict[str, dict[str, Any]] | None:
+    """Le choix « clips courts » de la video (TASK-4f5e) devient une option de l'etape
+    moments ; None (non precise) ne change rien : valeur du style."""
+    if short_clips is None:
+        return step_options
+    if not isinstance(short_clips, bool):
+        raise PipelineError(f"short_clips invalide : {short_clips!r} (attendu : true ou false)")
+    options = {name: dict(opts) for name, opts in (step_options or {}).items()}
+    options.setdefault("moments", {})["short_clips"] = short_clips
+    return options
+
+
 def run(
     url: str,
     *,
@@ -1074,13 +1088,16 @@ def run(
     force_steps: list[str] | None = None,
     step_options: dict[str, dict[str, Any]] | None = None,
     channel: str | None = None,
+    short_clips: bool | None = None,
 ) -> dict[str, Any]:
     """Traite la video ``url`` : jusqu'a la revue en mode review, jusqu'au
     bout en mode auto. Renvoie l'etat (voir le docstring du module).
 
     ``step_options`` : arguments supplementaires par etape (injection pour
     les tests, ex. ``{"download": {"ydl_factory": ...}}``). ``channel`` :
-    chaine dont le preset a servi (SPEC-74e9 §3.1), gardee dans l'etat."""
+    chaine dont le preset a servi (SPEC-74e9 §3.1), gardee dans l'etat.
+    ``short_clips`` : choix de la video pour les clips courts (None = valeur du style)."""
+    step_options = _with_short_clips(step_options, short_clips)
     config = config or load_config()
     try:
         video_id = download.extract_video_id(url)
@@ -1105,11 +1122,14 @@ def render(
     step_options: dict[str, dict[str, Any]] | None = None,
     channel: str | None = None,
     clips: list[str] | None = None,
+    short_clips: bool | None = None,
 ) -> dict[str, Any]:
     """Reprend une video deja lancee jusqu'au bout (captions .. qa) ; en mode
     review, exige une decision pour chaque moment (PipelineError sinon).
     ``clips`` restreint reframe/subtitles/render/qa a ces clip_id (render
-    cible, SPEC-74e9 §4.5) ; le resume final reste sur tous les clips."""
+    cible, SPEC-74e9 §4.5) ; le resume final reste sur tous les clips.
+    ``short_clips`` : voir ``run`` (utile si l'etape moments est relancee)."""
+    step_options = _with_short_clips(step_options, short_clips)
     config = config or load_config()
     state = load_state(video_id, config=config)
     if channel is not None:

@@ -10,6 +10,19 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ## [Non publié]
 
+### Ajouté
+
+- **Clips courts** (TASK-4f5e) : interrupteur `[moments] short_clips` (défaut
+  `false`, bornes `short_min` = 20 s et `short_max` = 45 s), réglable par style
+  ou dans `config.toml`. Actif, il remplace les durées de la grille (clip
+  unique et parties de série) et demande à Claude un clip qui démarre sur le
+  moment fort. Par vidéo : case « Clips courts » à trois états (valeur du
+  style / oui / non) dans *Ajouter une vidéo*, `--short-clips` /
+  `--no-short-clips` en ligne de commande, champ optionnel `short_clips` de
+  `POST /api/queue` (les anciennes entrées gardent la valeur du style). Le mode
+  est écrit dans `moments.json` et visible sur la fiche de la vidéo. Inactif :
+  comportement inchangé.
+
 ## [0.4.2] - 2026-10-06
 
 Webcam du stream retrouvée avec l'aide de Claude, garde-fou réseau pour le

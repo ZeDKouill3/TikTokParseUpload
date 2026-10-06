@@ -437,7 +437,25 @@ small, medium, large-v3...), `language` (défaut détection auto),
 grille embarquée dans le paquet, sans fichier local), `max_transcript_chars`,
 `chunk_chars` (découpe les longues vidéos), `exploration_share` = 0.1 (part
 de candidats hors grille stricte, pour ne pas se figer sur les mêmes
-formats).
+formats), `short_clips` = false (interrupteur « clips courts », voir
+ci-dessous), `short_min` = 20 et `short_max` = 45 (bornes en secondes).
+
+**Clips courts.** Un clip de 90 s accroche mal (premier post TikTok mesuré :
+3,9 % de visionnage complet). Avec `short_clips = true`, les durées de la
+grille (`[durations]`, clip unique **et** parties de série) sont remplacées par
+`short_min`–`short_max`, et la consigne donnée à Claude exige que le clip
+démarre directement sur le moment fort (accroche dans les 2 premières
+secondes, pas de mise en place) tout en restant compréhensible seul. À `false`
+(défaut), rien ne change. Le réglage se pose par style
+(`presets/<style>.toml`, `[moments] short_clips = true`) ou dans `config.toml`.
+Par vidéo, la case « Clips courts » du formulaire *Ajouter une vidéo* a trois
+états : non précisé (valeur du style), coché (oui), décoché (non, même si le
+style dit oui) ; en ligne de commande : `clipper run <url> --short-clips` ou
+`--no-short-clips`. Le mode utilisé est écrit dans `moments.json`
+(`short_clips`, `short_min`, `short_max`) et affiché sur la fiche de la vidéo ;
+`workspace/<id>/rubric-short.toml` est la copie de la grille aux bornes courtes
+que lit l'étape parts. Une valeur invalide (`short_clips` non booléen,
+`short_max` ≤ `short_min`) est une erreur explicite.
 
 `[vision]` — `window_seconds` = 10, `batch_size` = 8, `max_width` = 768,
 `parallel` = 4.
