@@ -30,7 +30,7 @@ from zoneinfo import ZoneInfo
 import tomllib
 
 from clipper import accounts as accounts_mod
-from clipper import browser
+from clipper import browser, network
 from clipper import channel as channel_mod
 from clipper import publish as publish_mod
 from clipper import tiktok, youtube
@@ -736,6 +736,16 @@ class Worker:
 
         if service == "tiktok" and not self._connected(entry, name, account, paths["state_dir"]):
             return False  # YouTube : la connexion est « prete a publier » (derniere verification) ; Studio arrete sur Google
+        try:
+            network.require_expected_country(self.config)
+        except network.NetworkUnknown as exc:
+            # service de geolocalisation injoignable : condition transitoire, l'entree attend et sera retentee ;
+            # le compte reste « pret a publier » et le navigateur n'est pas ouvert (I2, revue nuit)
+            self._wait(entry, name, account, str(exc), paths["state_dir"])
+            return False
+        except network.NetworkError as exc:  # IP dans un autre pays : arret sur (R4)
+            self._fail(entry, name, str(exc), halted=True, account=account, state_dir=paths["state_dir"])
+            return True
         if entry.get("waiting_reason"):
             publish_mod.set_waiting_reason(video_id, clip_id, name, None, state_dir=paths["state_dir"])
         try:
@@ -762,6 +772,8 @@ class Worker:
         except youtube.YouTubeStop as stop:
             self._fail(entry, name, stop.reason, halted=True, account=account, capture=stop.capture,
                        state_dir=paths["state_dir"])
+        except browser.BrowserUnavailable as exc:  # pays devenu inconnu pendant la prise en main : echec reessayable
+            self._fail(entry, name, str(exc), halted=False, account=account, state_dir=paths["state_dir"])
         except browser.BrowserError as exc:
             self._fail(entry, name, str(exc), halted=True, account=account, state_dir=paths["state_dir"])
         except (tiktok.TikTokError, youtube.YouTubeError, publish_mod.PublishError) as exc:

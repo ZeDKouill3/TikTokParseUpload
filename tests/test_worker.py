@@ -2787,3 +2787,60 @@ def test_a_series_skips_every_refused_part_and_still_waits_for_an_unpublished_ea
     assert pub.calls == []  # la partie 1 échouée (pas refusée) retient toujours la suite
     entry = next(e for e in _entries(tmp_path) if e["clip_id"] == "c01-p3")
     assert "partie 1 non publiée" in entry["waiting_reason"]
+
+
+def _geo(country):
+    from clipper import network
+    network.reset()
+    if country is None:
+        def down(url):
+            raise OSError("hors ligne")
+        network.use_fetcher(down)
+    else:
+        network.use_fetcher(lambda url: {"ip": "5.6.7.8", "city": "X", "country": country, "org": "AS1"})
+
+
+def test_unknown_country_makes_the_entry_wait_without_unticking_the_account_nor_opening_anything(tmp_path, monkeypatch):
+    """I2 (revue nuit) : service de géolocalisation injoignable = attente + réessai, compte toujours prêt."""
+    config = _pub_env(tmp_path, monkeypatch)
+    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1))
+    pub = FakePublisher()
+    _geo(None)
+
+    _pub_worker(config, pub).tick()
+
+    assert pub.calls == []
+    entry = _entries(tmp_path)[0]
+    assert entry["status"] == "scheduled" and not entry.get("in_progress_since")
+    assert "pays de l'IP inconnu" in entry["waiting_reason"]
+    assert _account_state(tmp_path, ACCOUNT)["ready_to_publish"] is True
+
+    _geo("FR")  # le service revient : réessai au tour suivant
+    _pub_worker(config, pub).tick()
+    assert len(pub.calls) == 1 and _entries(tmp_path)[0]["status"] == "published"
+
+
+def test_other_country_halts_the_entry_and_unticks_the_account(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1))
+    pub = FakePublisher()
+    _geo("GB")
+
+    _pub_worker(config, pub).tick()
+
+    assert pub.calls == []
+    entry = _entries(tmp_path)[0]
+    assert entry["status"] == "failed" and entry["halted"] is True and "IP en Royaume-Uni" in entry["error"]
+    assert _account_state(tmp_path, ACCOUNT)["ready_to_publish"] is False
+
+
+def test_a_country_that_turns_unknown_inside_the_publisher_fails_without_halting(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1))
+    pub = FakePublisher(error=browser.BrowserUnavailable("pays de l'IP inconnu (hors ligne)"))
+
+    _pub_worker(config, pub).tick()
+
+    entry = _entries(tmp_path)[0]
+    assert entry["status"] == "failed" and entry["halted"] is False
+    assert _account_state(tmp_path, ACCOUNT)["ready_to_publish"] is True

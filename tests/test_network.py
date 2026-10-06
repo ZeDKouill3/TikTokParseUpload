@@ -161,3 +161,17 @@ def test_config_example_documents_the_network_table(path):
     assert "# [network]" in text
     for key in network.CONFIG_DEFAULTS:
         assert f"# {key} = " in text, key
+
+
+def test_unknown_country_is_a_distinct_error_from_a_wrong_country():
+    """I2 (revue nuit) : « inconnu » (service injoignable) se distingue de « différent » (arrêt sûr)."""
+    def boom(url):
+        raise OSError("down")
+
+    network.use_fetcher(boom)
+    with pytest.raises(network.NetworkUnknown):
+        network.require_expected_country()
+    network.use_fetcher(_uk)
+    with pytest.raises(network.NetworkError) as exc:
+        network.require_expected_country()
+    assert not isinstance(exc.value, network.NetworkUnknown)

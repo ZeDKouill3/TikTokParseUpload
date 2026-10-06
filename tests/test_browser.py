@@ -823,3 +823,22 @@ def test_open_context_free_when_block_disabled(cwd, monkeypatch):
     network.use_fetcher(lambda url: pytest.fail("aucun appel quand block_browser = false"))
     with browser._open_context("ab12cd", headless=True, config=_net_config(cwd, block_browser=False)) as opened:
         assert opened is context
+
+
+def test_open_context_unknown_country_is_unavailable_but_other_country_is_a_plain_refusal(cwd, monkeypatch):
+    """I2 : pays inconnu = BrowserUnavailable (condition transitoire) ; pays différent = BrowserError simple."""
+    fake_playwright(monkeypatch)
+
+    def down(url):
+        raise OSError("hors ligne")
+
+    network.use_fetcher(down)
+    with pytest.raises(browser.BrowserUnavailable):
+        with browser._open_context("ab12cd", headless=True):
+            pytest.fail("le navigateur ne doit pas s'ouvrir")
+    network.reset()
+    network.use_fetcher(lambda url: {"ip": "5.6.7.8", "city": "London", "country": "GB", "org": "AS1 BT"})
+    with pytest.raises(browser.BrowserError) as caught:
+        with browser._open_context("ab12cd", headless=True):
+            pytest.fail("le navigateur ne doit pas s'ouvrir hors pays")
+    assert not isinstance(caught.value, browser.BrowserUnavailable)
