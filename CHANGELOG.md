@@ -12,6 +12,11 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ### Ajouté
 
+- TikTok : une vérification de contenu bloquée (« Vérification en cours » sans résultat après
+  `[tiktok] content_check_retrigger_s`, 120 s) est relancée en décochant puis recochant l'interrupteur ;
+  l'erreur rouge « Une erreur est survenue » est relancée par « Réessayer ». Au plus
+  `content_check_retriggers` relances (3), toujours dans `content_check_timeout_s` ; erreur persistante
+  après les relances : arrêt `content_check` avec le message de TikTok.
 - Veille : chaque VOD proposée (Twitch et YouTube) affiche sa miniature, lue dans
   la réponse de l'API, à la place du bloc gris (qui reste si la miniature manque).
 - Veille : le détail de la source Twitch compte les VOD réservées aux abonnés ou

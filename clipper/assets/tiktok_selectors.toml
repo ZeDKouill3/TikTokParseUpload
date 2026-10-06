@@ -112,6 +112,10 @@ schedule_picker_close = "[data-e2e='schedule_container']"
 # « Aucun probleme constate » (vert) ou un probleme signale.
 content_check_running = "text=/Vérification en cours/"
 content_check_ok = "text=/Aucun problème constaté/"
+# Erreur rouge sous l'interrupteur (releve reel 2026-10-06, apres 15 min) : « Une erreur est survenue. Merci de
+# reessayer plus tard. » + lien « Reessayer » (vise par son texte).
+content_check_error = "text=/Une erreur est survenue/"
+content_check_retry = 'text=/^\s*Réessayer\s*$/'
 # :has-text ignore la casse et cherche un fragment : « Aucun problème constaté » contient « problème constaté ».
 content_check_problem = "div:has-text('problème constaté'):not(:has-text('Aucun problème')), div:has-text('problème détecté'):not(:has-text('Aucun problème'))"
 # Interrupteur de la verification de contenu : le libelle exact, puis l'interrupteur du bloc le plus proche.
