@@ -6,7 +6,7 @@
   **Une vidéo longue en entrée, des clips verticaux sous-titrés en sortie, publiés sur TikTok depuis une console web locale.**
 
   <p>
-    <img alt="Version" src="https://img.shields.io/badge/version-0.4.1%20pr%C3%A9--version-orange">
+    <img alt="Version" src="https://img.shields.io/badge/version-0.4.2%20pr%C3%A9--version-orange">
     <img alt="Python" src="https://img.shields.io/badge/python-3.11-blue">
     <img alt="Plateforme" src="https://img.shields.io/badge/plateforme-Windows-lightgrey">
     <img alt="GPU" src="https://img.shields.io/badge/GPU-CUDA%20optionnel-76b900">
@@ -17,7 +17,7 @@
 
 > ⚠️ **Pré-version.** Pas encore de garantie de stabilité de la ligne de
 > commande ni du format de configuration. Voir
-> [`CHANGELOG.md`](CHANGELOG.md) (section `[0.4.1]`) et le plan de versions
+> [`CHANGELOG.md`](CHANGELOG.md) (section `[0.4.2]`) et le plan de versions
 > [`docs/versions.md`](docs/versions.md).
 
 ## Ce que ça fait
@@ -198,7 +198,7 @@ toute seule.
 Pas envie de cloner le dépôt, d'installer Python ou `uv` ? Télécharge le zip
 portable de la
 [Release GitHub](https://github.com/ZeDKouill3/TikTokParseUpload/releases)
-(`Clipper-portable-0.4.1.zip`), dézippe-le et double-clique sur
+(`Clipper-portable-0.4.2.zip`), dézippe-le et double-clique sur
 `Installer.bat` : il installe Python, ffmpeg, `claude` et les modèles dans son
 propre dossier, sans rien toucher d'autre sur ta machine. Parcours complet
 (prérequis, connexion à Claude, premier clip, mise à jour, désinstallation,
@@ -222,7 +222,7 @@ Python 3.11, ffmpeg, `claude`, `ank`, GPU optionnel, Google Chrome pour
 
 Depuis la release (sans cloner le dépôt) : télécharge le `.whl` de la
 [dernière release](CHANGELOG.md), `uv pip install
-clipper-0.4.1-py3-none-any.whl` puis `clipper init` (écrit `config.toml` et
+clipper-0.4.2-py3-none-any.whl` puis `clipper init` (écrit `config.toml` et
 `rubric.toml` — la grille par défaut, embarquée dans la wheel — dans le
 dossier courant). La commande `clipper` s'ajoute à `python -m clipper`.
 
