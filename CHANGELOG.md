@@ -10,6 +10,23 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ## [Non publié]
 
+### Corrigé
+
+- **Veille Steam : noms des jeux sans `GetAppList`** (TASK-7486) : Valve a
+  retiré `ISteamApps/GetAppList/v2` (HTTP 404), la source Steam tombait en
+  erreur. Les noms viennent maintenant de l'API magasin sans clé
+  (`store.steampowered.com/api/appdetails`), demandés seulement pour les jeux du
+  top, mis en cache sous `state/veille/steam_names.json` (un nom connu ne se
+  redemande pas) et plafonnés par `[veille] steam_name_lookups_max` (100) par
+  relevé. Un jeu dont le nom reste introuvable n'est pas relevé et sa raison est
+  gardée (`unnamed` dans l'état de la source), jamais un nom inventé.
+- **Veille Steam : montée immédiate par le rang** (TASK-7486) : le relevé garde
+  `rank` et `last_week_rank` de `GetMostPlayedGames` ; chaque jeu porte
+  `steam_rank_gain` (gain de rang vs semaine dernière) et `steam_new_in_top`
+  (`last_week_rank` 0 = nouveau dans le top, sans gain chiffré ; champ absent =
+  `null`), transmis à Claude avec les candidats à côté de la montée vs 7 jours,
+  qui reste `null` tant que l'historique manque.
+
 ### Ajouté
 
 - **Légendes : mots-clés de recherche en tête** (TASK-b8a0) : la consigne de

@@ -262,11 +262,24 @@ def test_youtube_key_not_in_error_url(tmp_path):
 def _steam_routes(applist_calls=None):
     return {
         ("GET", "/GetMostPlayedGames/v1/"): [(200, {"response": {"ranks": [
-            {"rank": 1, "appid": 10, "peak_in_game": 900}, {"rank": 2, "appid": 20, "peak_in_game": 500},
-            {"rank": 3, "appid": 30, "peak_in_game": 100}, {"rank": 4, "appid": 99, "peak_in_game": 50}]}})],
-        ("GET", "/GetAppList/v2/"): [(200, {"applist": {"apps": [
-            {"appid": 10, "name": "Jeu Alpha"}, {"appid": 20, "name": "Jeu Beta"}, {"appid": 30, "name": "Gamma"}]}})],
+            {"rank": 1, "appid": 10, "last_week_rank": 4, "peak_in_game": 900},
+            {"rank": 2, "appid": 20, "last_week_rank": 0, "peak_in_game": 500},
+            {"rank": 3, "appid": 30, "last_week_rank": 3, "peak_in_game": 100},
+            {"rank": 4, "appid": 99, "last_week_rank": 1, "peak_in_game": 50}]}})],
+        # GetAppList a été retiré par Valve : 404 s'il est appelé (défaut du 2026-10-06).
+        ("GET", "/GetAppList/v2/"): [(404, "Method 'GetAppList' not found in interface 'ISteamApps'")],
+        ("GET", "/api/appdetails"): _appdetails({"10": "Jeu Alpha", "20": "Jeu Beta", "30": "Gamma"}),
     }
+
+
+def _appdetails(names):
+    """Réponse store.steampowered.com/api/appdetails : ``{appid: {success, data: {name}}}``."""
+    def reply(call):
+        appid = call["params"]["appids"]
+        if appid in names:
+            return 200, {appid: {"success": True, "data": {"name": names[appid], "type": "game"}}}
+        return 200, {appid: {"success": False}}
+    return reply
 
 
 def _steam(tmp_path, http, clock=lambda: NOW, **over):
@@ -276,25 +289,55 @@ def _steam(tmp_path, http, clock=lambda: NOW, **over):
 def test_steam_top_names_and_no_key_sent(tmp_path):
     http = FakeHttp(_steam_routes())
     result = _steam(tmp_path, http, steam_top=3)
-    assert result == {"games": [{"appid": "10", "name": "Jeu Alpha", "players": 900},
-                                {"appid": "20", "name": "Jeu Beta", "players": 500},
-                                {"appid": "30", "name": "Gamma", "players": 100}]}
+    assert result == {"games": [
+        {"appid": "10", "name": "Jeu Alpha", "players": 900, "rank": 1, "last_week_rank": 4},
+        {"appid": "20", "name": "Jeu Beta", "players": 500, "rank": 2, "last_week_rank": 0},
+        {"appid": "30", "name": "Gamma", "players": 100, "rank": 3, "last_week_rank": 3}], "unnamed": []}
     for call in http.calls:
         assert "key" not in call["params"] and "Authorization" not in call["headers"]
 
 
-def test_steam_game_without_name_is_not_reported(tmp_path):
+def test_steam_does_not_call_removed_getapplist(tmp_path):
+    http = FakeHttp(_steam_routes())
+    _steam(tmp_path, http, steam_top=3)
+    assert http.to("/GetAppList/v2/") == []
+    assert {c["params"]["appids"] for c in http.to("/api/appdetails")} == {"10", "20", "30"}
+    assert all(c["params"]["filters"] == "basic" for c in http.to("/api/appdetails"))
+
+
+def test_steam_game_without_name_is_not_reported_but_has_a_reason(tmp_path):
     result = _steam(tmp_path, FakeHttp(_steam_routes()), steam_top=100)
     assert "99" not in [g["appid"] for g in result["games"]]
+    unnamed = {u["appid"]: u["reason"] for u in result["unnamed"]}
+    assert set(unnamed) == {"99"} and "99" in unnamed["99"] and "appdetails" in unnamed["99"]
 
 
-def test_applist_read_at_most_once_per_day(tmp_path):
+def test_steam_known_names_are_never_asked_again(tmp_path):
     http = FakeHttp(_steam_routes())
-    _steam(tmp_path, http)
-    _steam(tmp_path, http, clock=lambda: NOW + timedelta(hours=2))
-    assert len(http.to("/GetAppList/v2/")) == 1
-    _steam(tmp_path, http, clock=lambda: NOW + timedelta(days=1))
-    assert len(http.to("/GetAppList/v2/")) == 2
+    _steam(tmp_path, http, steam_top=3)
+    assert len(http.to("/api/appdetails")) == 3
+    _steam(tmp_path, http, steam_top=3, clock=lambda: NOW + timedelta(days=1))
+    assert len(http.to("/api/appdetails")) == 3
+    cache = json.loads((tmp_path / "state" / "veille" / "steam_names.json").read_text(encoding="utf-8"))
+    assert cache["names"] == {"10": "Jeu Alpha", "20": "Jeu Beta", "30": "Gamma"}
+
+
+def test_steam_lookups_are_capped_and_the_rest_marked(tmp_path):
+    http = FakeHttp(_steam_routes())
+    result = _steam(tmp_path, http, steam_top=3, steam_name_lookups_max=2)
+    assert len(http.to("/api/appdetails")) == 2
+    assert [g["appid"] for g in result["games"]] == ["10", "20"]
+    assert [u["appid"] for u in result["unnamed"]] == ["30"] and "limite" in result["unnamed"][0]["reason"]
+    again = _steam(tmp_path, http, steam_top=3, steam_name_lookups_max=2)  # le reste se complète au relevé suivant
+    assert [g["appid"] for g in again["games"]] == ["10", "20", "30"]
+
+
+def test_steam_appdetails_http_error_marks_the_game_with_reason(tmp_path):
+    routes = _steam_routes()
+    routes[("GET", "/api/appdetails")] = [(429, "Too Many Requests")]
+    result = _steam(tmp_path, FakeHttp(routes), steam_top=2)
+    assert result["games"] == []
+    assert all("HTTP 429" in u["reason"] for u in result["unnamed"]) and len(result["unnamed"]) == 2
 
 
 def test_current_players_for_one_appid(tmp_path):
@@ -386,4 +429,6 @@ def test_real_youtube(tmp_path):
 
 @real_only
 def test_real_steam(tmp_path):
-    assert veille_sources.default_collectors()["steam"](_settings(tmp_path, steam_top=5))["games"]
+    # appdetails réel (sans clé) : les 5 premiers jeux du top doivent avoir un nom (GetAppList v2 est mort).
+    result = veille_sources.default_collectors()["steam"](_settings(tmp_path, steam_top=5))
+    assert result["games"] and all(g["name"] for g in result["games"])

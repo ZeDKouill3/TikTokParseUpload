@@ -25,7 +25,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlencode
-from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -38,6 +37,7 @@ TWITCH_TOKEN_URL = "https://id.twitch.tv/oauth2/token"
 TWITCH_API = "https://api.twitch.tv/helix"
 YOUTUBE_VIDEOS_URL = "https://www.googleapis.com/youtube/v3/videos"
 STEAM_API = "https://api.steampowered.com"
+STEAM_APPDETAILS_URL = "https://store.steampowered.com/api/appdetails"  # GetAppList v2 retiré par Valve (404)
 
 STREAM_PAGES_MAX = 5
 _TOKEN_MARGIN = timedelta(seconds=60)
@@ -323,20 +323,17 @@ def _youtube_collector(http: Http, clock: Clock) -> Callable[[dict[str, object]]
 # --------------------------------------------------------------------------
 
 
-def _steam_names(client: _Client, settings: dict[str, object], clock: Clock) -> dict[str, str]:
-    """``{appid: nom}`` de GetAppList, relu au plus une fois par jour (cache daté)."""
-    day = clock().astimezone(ZoneInfo(str(settings["timezone"]))).date().isoformat()
-    path = _sdir(settings) / "steam_applist.json"
-    cached = _read_json(path)
-    if isinstance(cached, dict) and cached.get("date") == day and isinstance(cached.get("names"), dict):
-        return cached["names"]
-    url = f"{STEAM_API}/ISteamApps/GetAppList/v2/"
-    _, body = client.request("GET", url, {})
-    apps = _field(client, url, {}, body, "applist", "apps")
-    names = {str(a["appid"]): a["name"] for a in apps if "appid" in a and "name" in a}
-    with channel_mod.file_lock(path):
-        channel_mod.atomic_write_json(path, {"date": day, "names": names})
-    return names
+def _steam_name(client: _Client, appid: str) -> str:
+    """Nom d'une app par l'API magasin (sans clé) ; ``SourceError`` dit pourquoi il manque."""
+    params = {"appids": appid, "filters": "basic"}
+    _, body = client.request("GET", STEAM_APPDETAILS_URL, params)
+    entry = body.get(appid) if isinstance(body, dict) else None
+    if not isinstance(entry, dict) or not entry.get("success"):
+        raise SourceError(f"nom introuvable : appdetails ne connaît pas l'app {appid} (success=false)")
+    name = (entry.get("data") or {}).get("name")
+    if not isinstance(name, str) or not name:
+        raise client.fail(STEAM_APPDETAILS_URL, params, body, f"{appid}.data.name")
+    return name
 
 
 def _steam_collector(http: Http, clock: Clock) -> Callable[[dict[str, object]], dict[str, Any]]:
@@ -345,14 +342,36 @@ def _steam_collector(http: Http, clock: Clock) -> Callable[[dict[str, object]], 
         url = f"{STEAM_API}/ISteamChartsService/GetMostPlayedGames/v1/"
         _, body = client.request("GET", url, {})
         ranks = _field(client, url, {}, body, "response", "ranks")
-        names = _steam_names(client, settings, clock)
+        path = _sdir(settings) / "steam_names.json"  # un nom connu ne se redemande jamais
+        cached = _read_json(path)
+        names: dict[str, str] = dict(cached["names"]) if isinstance(cached, dict) and isinstance(cached.get("names"), dict) else {}
+        lookups_left = int(settings["steam_name_lookups_max"])  # type: ignore[call-overload]
         games: list[dict[str, Any]] = []
+        unnamed: list[dict[str, str]] = []
+        learned = False
         for rank in ranks[: int(settings["steam_top"])]:  # type: ignore[call-overload]
             appid = str(_field(client, url, {}, rank, "appid"))
             players = _field(client, url, {}, rank, "peak_in_game")  # pic du jour : seul chiffre du classement
-            if appid in names:  # sans nom, pas de correspondance Twitch possible : non relevé
-                games.append({"appid": appid, "name": names[appid], "players": players})
-        return {"games": games}
+            place = rank.get("rank")
+            last_week = rank.get("last_week_rank")  # 0 : absent du top la semaine dernière ; champ absent : inconnu
+            if appid not in names:
+                if lookups_left <= 0:
+                    unnamed.append({"appid": appid, "reason": f"nom non demandé : limite de {int(settings['steam_name_lookups_max'])} requêtes appdetails par relevé atteinte"})  # type: ignore[call-overload]
+                    continue
+                lookups_left -= 1
+                try:
+                    names[appid] = _steam_name(client, appid)
+                    learned = True
+                except SourceError as exc:  # sans nom, pas de correspondance Twitch : non relevé, raison gardée
+                    unnamed.append({"appid": appid, "reason": str(exc)})
+                    continue
+            games.append({"appid": appid, "name": names[appid], "players": players,
+                          "rank": place if isinstance(place, int) else None,
+                          "last_week_rank": last_week if isinstance(last_week, int) else None})
+        if learned:
+            with channel_mod.file_lock(path):
+                channel_mod.atomic_write_json(path, {"names": names})
+        return {"games": games, "unnamed": unnamed}
 
     return collect
 

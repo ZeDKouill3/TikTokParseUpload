@@ -17,7 +17,8 @@ chacun un callable ``collector(settings) -> dict`` (``settings`` = la table
     twitch  {"games": [{"name", "viewers_fr"}],
              "vods":  [VOD]}
     youtube {"videos": [VOD]}
-    steam   {"games": [{"appid", "name", "players"}]}
+    steam   {"games": [{"appid", "name", "players", "rank", "last_week_rank"}],
+             "unnamed": [{"appid", "reason"}]}  (optionnel : jeux sans nom, avec leur raison)
 
 avec ``VOD = {video_id, url, title, channel_name, game_name | None,
 duration_s, published_at (ISO 8601), view_count, views_per_hour}``. Un direct
@@ -61,6 +62,7 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "youtube_max_results": 50,
     "youtube_min_duration_s": 600,
     "steam_top": 100,
+    "steam_name_lookups_max": 100,
     "twitch_client_id": "",
     "twitch_client_secret": "",
     "youtube_api_key": "",
@@ -197,6 +199,17 @@ def _delta(today: float | None, avg_values: list[float]) -> tuple[float | None, 
     return avg, round((today - avg) / avg * 100)
 
 
+def _rank_signal(info: dict[str, Any] | None) -> tuple[int | None, bool | None]:
+    """Montée immédiate Steam : ``(gain de rang vs semaine dernière, nouveau dans le top)``.
+    ``last_week_rank`` 0 = absent du top la semaine dernière (nouveau, pas de gain chiffré) ;
+    rang inconnu (champ absent, jeu non relevé) = ``(None, None)``, jamais inventé."""
+    if not info or not isinstance(info.get("rank"), int) or not isinstance(info.get("last_week_rank"), int):
+        return None, None
+    if info["last_week_rank"] <= 0:
+        return None, True
+    return info["last_week_rank"] - info["rank"], False
+
+
 def _build_games(
     twitch: dict[str, dict[str, Any]],
     steam: dict[str, dict[str, Any]],
@@ -213,11 +226,14 @@ def _build_games(
         steam_values = [p["steam"][appid]["players"] for p in previous if appid and appid in p.get("steam", {})]
         steam_players = steam_info["players"] if steam_info else None
         steam_avg, steam_delta = _delta(steam_players, steam_values) if steam_info else (None, None)
+        rank_gain, new_in_top = _rank_signal(steam_info)
         games.append({
             "key": key, "name": info["name"],
             "twitch_fr_viewers": info["viewers_fr"], "twitch_avg": twitch_avg, "twitch_delta_pct": twitch_delta,
             "steam_appid": appid, "steam_match": steam_info is not None, "steam_players": steam_players,
             "steam_avg": steam_avg, "steam_delta_pct": steam_delta,
+            "steam_rank": steam_info.get("rank") if steam_info else None,
+            "steam_rank_gain": rank_gain, "steam_new_in_top": new_in_top,
             "youtube_views_per_hour": youtube.get(key, {}).get("views_per_hour_sum"),
             "vod_count": vod_counts.get(key, 0),
             "baseline_days_available": len(previous),
@@ -308,9 +324,13 @@ def collect(
                 status["counts"] = {"videos": len(vods)}
             else:
                 for game in result["games"]:
-                    steam_hist[str(game["appid"])] = {"name": game["name"], "players": game["players"]}
+                    steam_hist[str(game["appid"])] = {"name": game["name"], "players": game["players"],
+                                                      "rank": game.get("rank"), "last_week_rank": game.get("last_week_rank")}
                 vods = []
                 status["counts"] = {"games": len(steam_hist)}
+                if result.get("unnamed"):
+                    status["unnamed"] = list(result["unnamed"])
+                    log.warning("veille steam : %d jeu(x) sans nom, ex. %s", len(status["unnamed"]), status["unnamed"][0]["reason"])
             for vod in vods:
                 _parse_published(vod["published_at"])
                 vod["video_id"], vod["url"], vod["duration_s"]  # champs obligatoires
@@ -350,7 +370,8 @@ def collect(
     for candidate in candidates:
         game = by_key.get(candidate["game_key"])
         if game:
-            candidate["signals"] = {"twitch_delta_pct": game["twitch_delta_pct"], "steam_delta_pct": game["steam_delta_pct"]}
+            candidate["signals"] = {"twitch_delta_pct": game["twitch_delta_pct"], "steam_delta_pct": game["steam_delta_pct"],
+                                    "steam_rank_gain": game["steam_rank_gain"], "steam_new_in_top": game["steam_new_in_top"]}
 
     _write(sdir / "history" / f"{day}.json", {
         "date": day, "at": now.isoformat(), "twitch": twitch_hist, "steam": steam_hist, "youtube": youtube_hist,
@@ -422,13 +443,15 @@ def _prompt(day_state: dict[str, Any], table: dict[str, object]) -> str:
         "goûts, en privilégiant ce qui monte, sans juger les personnes. Une donnée inconnue est inconnue : "
         "ne l'invente pas.",
         "",
-        "Jeux (viewers Twitch FR, joueurs Steam, variation vs moyenne des jours précédents) :",
+        "Jeux (viewers Twitch FR, joueurs Steam, variation vs moyenne des jours précédents, gain de rang Steam vs semaine dernière) :",
     ]
     for game in day_state["games"]:
         lines.append(
             f"- {game['name']} : twitch_fr_viewers={_fmt(game['twitch_fr_viewers'])} "
             f"twitch_delta_pct={_fmt(game['twitch_delta_pct'])} steam_players={_fmt(game.get('steam_players'))} "
             f"steam_delta_pct={_fmt(game['steam_delta_pct'])} "
+            f"steam_rank_gain_vs_last_week={_fmt(game.get('steam_rank_gain'))} "
+            f"steam_new_in_top={_fmt(game.get('steam_new_in_top'))} "
             f"youtube_views_per_hour={_fmt(game.get('youtube_views_per_hour'))} vod_count={_fmt(game.get('vod_count'))}")
     lines += ["", "Candidats (VOD) :"]
     for c in day_state["candidates"]:
@@ -438,7 +461,9 @@ def _prompt(day_state: dict[str, Any], table: dict[str, object]) -> str:
             f"jeu={_fmt(c.get('game_name'))} durée_s={c['duration_s']} publiée={c['published_at']} "
             f"vues={_fmt(c.get('view_count'))} vues_par_heure={_fmt(c.get('views_per_hour'))} "
             f"twitch_delta_pct={_fmt(signals.get('twitch_delta_pct'))} "
-            f"steam_delta_pct={_fmt(signals.get('steam_delta_pct'))}")
+            f"steam_delta_pct={_fmt(signals.get('steam_delta_pct'))} "
+            f"steam_rank_gain_vs_last_week={_fmt(signals.get('steam_rank_gain'))} "
+            f"steam_new_in_top={_fmt(signals.get('steam_new_in_top'))}")
     return "\n".join(lines)
 
 
