@@ -106,7 +106,7 @@ def test_config_defaults_are_exactly_r1():
         "baseline_days": 7, "history_days": 90, "rise_min_pct": 50, "vod_min_duration_s": 1800,
         "vod_max_age_h": 36, "twitch_top_games": 20, "twitch_vods_per_game": 10,
         "youtube_max_results": 50, "youtube_min_duration_s": 600, "steam_top": 100,
-        "twitch_client_id": "", "twitch_client_secret": "", "youtube_api_key": "",
+        "steam_name_lookups_max": 100, "twitch_client_id": "", "twitch_client_secret": "", "youtube_api_key": "",
         "state_dir": "state/veille", "http_timeout_s": 20,
     }
 
@@ -141,7 +141,7 @@ def test_collect_writes_history_and_day_files(tmp_path, config):
     history = _read(_sdir(tmp_path) / "history" / f"{TODAY}.json")
     assert history["date"] == TODAY
     assert history["twitch"] == {"jeu alpha": {"name": "Jeu Alpha", "viewers_fr": 1000}}
-    assert history["steam"] == {"42": {"name": "Jeu  Alpha !", "players": 5000}}
+    assert history["steam"] == {"42": {"name": "Jeu  Alpha !", "players": 5000, "rank": None, "last_week_rank": None}}
     day = _read(_sdir(tmp_path) / "days" / f"{TODAY}.json")
     assert day["date"] == TODAY and day["started_at"] and day["finished_at"]
     assert {s: day["sources"][s]["status"] for s in ("twitch", "youtube", "steam")} == {
@@ -213,6 +213,49 @@ def test_not_enough_history_gives_null_delta(tmp_path, config, previous):
     game = _read(_sdir(tmp_path) / "days" / f"{TODAY}.json")["games"][0]
     assert game["twitch_delta_pct"] is None and game["steam_delta_pct"] is None
     assert game["baseline_days_available"] == previous
+
+
+def _rank_collectors(**steam):
+    collectors = _collectors()
+    collectors["steam"] = Collector({"games": [{"appid": "42", "name": "Jeu Alpha", "players": 5000, **steam}]})
+    return collectors
+
+
+def _alpha(tmp_path, config, **steam):
+    veille.collect(NOW, collectors=_rank_collectors(**steam), config=config)
+    return _read(_sdir(tmp_path) / "days" / f"{TODAY}.json")
+
+
+def test_steam_rank_gain_is_an_immediate_signal_without_history(tmp_path, config):
+    day = _alpha(tmp_path, config, rank=3, last_week_rank=10)
+    game = day["games"][0]
+    assert game["baseline_days_available"] == 0 and game["steam_delta_pct"] is None
+    assert game["steam_rank"] == 3 and game["steam_rank_gain"] == 7 and game["steam_new_in_top"] is False
+    saved = _read(_sdir(tmp_path) / "history" / f"{TODAY}.json")["steam"]["42"]
+    assert saved["rank"] == 3 and saved["last_week_rank"] == 10
+
+
+def test_steam_absent_last_week_means_new_in_top_not_a_number(tmp_path, config):
+    game = _alpha(tmp_path, config, rank=5, last_week_rank=0)["games"][0]
+    assert game["steam_new_in_top"] is True and game["steam_rank_gain"] is None
+
+
+def test_steam_unknown_last_week_rank_is_null_not_invented(tmp_path, config):
+    game = _alpha(tmp_path, config)["games"][0]
+    assert game["steam_new_in_top"] is None and game["steam_rank_gain"] is None
+
+
+def test_steam_rank_signal_reaches_candidates_and_claude(tmp_path, config):
+    collectors = _rank_collectors(rank=3, last_week_rank=10)
+    collectors["twitch"] = Collector({"games": [{"name": "Jeu Alpha", "viewers_fr": 10}], "vods": [_vod("v1")]})
+    state = veille.collect(NOW, collectors=collectors, config=config)
+    signals = state["candidates"][0]["signals"]
+    assert signals["steam_rank_gain"] == 7 and signals["steam_new_in_top"] is False
+    fake = FakeBackend([{"picks": [], "skipped_note": ""}])
+    with llm.use_backend(fake):
+        veille.decide(state, config)
+    assert fake.calls[0].prompt.count("steam_rank_gain_vs_last_week=7") == 2
+    assert "steam_new_in_top=False" in fake.calls[0].prompt
 
 
 def test_twitch_game_without_steam_app_is_not_zero(tmp_path, config):
