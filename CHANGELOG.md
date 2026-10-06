@@ -12,6 +12,13 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ### Ajouté
 
+- **Légendes : mots-clés de recherche en tête** (TASK-b8a0) : la consigne de
+  `captions` exige que la première phrase de la légende contienne le nom du jeu
+  (écrit officiellement) et le streamer ou la chaîne de la source (`channel` de
+  `meta.json`), puis le moment, en restant naturelle. Jeu ou chaîne inconnus :
+  la consigne le dit à Claude, rien n'est inventé. Réglage
+  `[captions] caption_keywords_first` (défaut `true`) ; à `false`, consigne
+  identique à avant.
 - **Clips courts** (TASK-4f5e) : interrupteur `[moments] short_clips` (défaut
   `false`, bornes `short_min` = 20 s et `short_max` = 45 s), réglable par style
   ou dans `config.toml`. Actif, il remplace les durées de la grille (clip

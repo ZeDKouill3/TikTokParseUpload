@@ -1347,3 +1347,69 @@ def test_target_above_max_is_capped_to_max(workspace, tmp_path):
     with pytest.raises(llm.SchemaError, match="3 mots, il en faut 2 au plus : supprime 1 mot"):
         run(workspace, make_config(tmp_path, hook_words_max=2),
             [answer(hook_text="un deux trois")] * 2)
+
+
+# --------------------------------------------------------------------------
+# TASK-b8a0 : la legende commence par les mots-cles de recherche
+# --------------------------------------------------------------------------
+
+
+def _write_meta_full(workspace, **meta):
+    (workspace / VIDEO_ID / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+
+
+def _single_prompt(workspace, tmp_path, **captions_overrides):
+    write_moments(workspace, moment(0))
+    write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
+    fake, _ = run(workspace, make_config(tmp_path, **captions_overrides), [answer()])
+    return fake.calls[0].prompt
+
+
+def test_caption_keywords_first_defaults_to_true():
+    from clipper.captions import CONFIG_DEFAULTS
+
+    assert CONFIG_DEFAULTS["caption_keywords_first"] is True
+
+
+def test_prompt_requires_game_and_streamer_keywords_in_the_first_sentence(workspace, tmp_path):
+    _write_meta_full(workspace, title="Minecraft hardcore jour 3", channel="Leila")
+
+    prompt = _single_prompt(workspace, tmp_path)
+
+    assert "PREMIERE phrase" in prompt
+    assert "nom du jeu" in prompt
+    assert "Chaine / streamer de la source : Leila" in prompt
+    assert "pas une liste de mots-cles" in prompt
+
+
+def test_prompt_says_the_streamer_is_unknown_when_meta_has_no_channel(workspace, tmp_path):
+    write_meta(workspace, title="Minecraft hardcore jour 3")
+
+    prompt = _single_prompt(workspace, tmp_path)
+
+    assert "Chaine / streamer de la source : inconnu" in prompt
+    assert "n'invente aucun nom de streamer" in prompt
+
+
+def test_prompt_tells_claude_not_to_invent_an_unknown_game(workspace, tmp_path):
+    write_meta(workspace, title="Une video")
+
+    prompt = _single_prompt(workspace, tmp_path)
+
+    assert "si le jeu n'est identifiable ni dans le titre, ni dans la transcription, ni dans le contexte" in prompt
+    assert "n'invente aucun nom de jeu" in prompt
+
+
+def test_keywords_first_false_gives_the_exact_previous_prompt(workspace, tmp_path):
+    _write_meta_full(workspace, title="Minecraft hardcore jour 3", channel="Leila")
+    off = _single_prompt(workspace, tmp_path, caption_keywords_first=False)
+
+    assert "PREMIERE phrase" not in off
+    assert "Chaine / streamer" not in off
+    assert "nom du jeu" not in off
+    # la consigne 'caption' est celle d'avant, mot pour mot
+    assert (
+        "caption : la legende publiee sous le clip, qui donne envie de regarder en entier ; "
+        "ton sobre, aucun mot d'emphase clickbait ; aucun emoji.\n4. hashtags"
+    ) in off
+    assert "Video source : Minecraft hardcore jour 3\nPourquoi" in off
