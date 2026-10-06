@@ -401,6 +401,12 @@ def test_veille_screen_follows_the_mockup_sections():
         assert needle in js, needle
 
 
+def test_veille_rising_table_marks_steam_risers_outside_twitch_fr():
+    js = read_static("screens/veille.js")
+    for needle in ("Nouveau dans le top Steam", "hors Twitch FR", "steam_new_in_top", "steam_rank_gain", "places"):
+        assert needle in js, needle
+
+
 def test_clips_screen_has_an_archived_filter():
     js = read_static("screens/clips.js")
     assert "Archivés" in js and "archived=1" in js
