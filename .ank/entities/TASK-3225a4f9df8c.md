@@ -5,7 +5,7 @@ slug: veille-3-4-choix-des-vod-par-claude-usage-veille
 title: "Veille (3/4) : choix des VOD par Claude (usage veille, FakeBackend), relevé quotidien et Rafraîchir par le worker, Clipper/Ignorer, sélection des meilleurs clips du jour avec archivage réversible"
 created: 2026-10-06T11:32:40Z
 author: w-veille
-status: open
+status: done
 scope:
   - clipper/veille.py
   - clipper/worker.py
@@ -19,8 +19,21 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/394dd8d753d0@a2f7aa9
+    tree: scope/b2e91c2cb0dc
+    criteria: dda1ba3c5c6d
+    verifier: tests@904a5eea5add
+    via: verifier
+  - type: test
+    ref: local/01121e88eefc@a2f7aa9
+    tree: scope/b2e91c2cb0dc
+    criteria: dda1ba3c5c6d
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 1
+version: 4
 ---
 
 Contexte : ADR ADR-ca9a5792739c (proposé) et SPEC SPEC-bdd9e0db8905 (proposée), planifiés le 2026-10-06 ; maquette research/maquettes/veille.html (local). Lire d'abord clipper/watch.py (même forme de bibliothèque, listeur injecté) et tests/test_watch.py (fixture env). Pour le hook worker, suivre _watch_channels (worker.py) : import local de clipper.veille, erreur journalisée une fois. Pour la sélection, lire les sidecars comme clipper/publish.py (read_sidecar) et les entrées de publication (list_entries) sans modifier output/.

@@ -104,6 +104,8 @@ CONFIG_DEFAULTS: dict[str, object] = {
         "parts": {"model": "strong"},
         # Choix du numero de la webcam sur une planche (reframe, TASK-5745).
         "facecam": {"model": "fast"},
+        # Choix des VOD de la veille des sujets chauds (SPEC-bdd9 R6).
+        "veille": {"model": "strong"},
     },
     "claude_cli": {
         "command": "claude",

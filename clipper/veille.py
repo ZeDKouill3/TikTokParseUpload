@@ -7,6 +7,8 @@ aucun import de ``clipper.web`` ni d'une étape. Tout l'état est en JSON sous
     history/<date>.json   relevé du jour (viewers Twitch, joueurs Steam, YouTube)
     days/<date>.json      sources, jeux, candidats, exclus, llm, propositions
     seen.json             VOD déjà mises en file ou ignorées
+    selection/<date>.json meilleurs clips du jour (gardés / archivés / restaurés)
+    refresh.json          demande de relevé immédiat (déposée par l'interface)
 
 Les collecteurs sont injectés : ``collectors = {"twitch", "youtube", "steam"}``,
 chacun un callable ``collector(settings) -> dict`` (``settings`` = la table
@@ -28,15 +30,16 @@ autres continuent (ADR-ad2e : aucun chiffre inventé, une donnée absente est
 from __future__ import annotations
 
 import json
+import logging
 import re
 import unicodedata
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from clipper import channel as channel_mod
-from clipper import veille_sources
+from clipper import llm, publish, veille_sources
 from clipper.config import Config, load_config
 
 CONFIG_DEFAULTS: dict[str, object] = {
@@ -64,6 +67,8 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "state_dir": "state/veille",
     "http_timeout_s": 20,
 }
+
+log = logging.getLogger(__name__)
 
 SOURCES = ("twitch", "youtube", "steam")
 Collector = Callable[[dict[str, object]], dict[str, Any]]
@@ -259,11 +264,13 @@ def collect(
     *,
     collectors: dict[str, Collector] | None = None,
     config: Config | None = None,
+    finalize: bool = True,
 ) -> dict[str, Any]:
     """Un relevé (SPEC-bdd9 R2, R4, R5) : appelle les collecteurs injectés, écrit
     ``history/<date>.json`` et ``days/<date>.json`` et rend l'état du jour.
     Une source en erreur n'arrête pas les autres ; seuls un réglage invalide
-    ou un fichier d'état illisible lèvent ``VeilleError``."""
+    ou un fichier d'état illisible lèvent ``VeilleError``. ``finalize=False`` laisse
+    ``finished_at`` à ``null`` (le choix de Claude suit, voir ``run_if_due``)."""
     config = config or load_config()
     collectors = veille_sources.default_collectors() if collectors is None else collectors
     table = settings(config)
@@ -349,7 +356,7 @@ def collect(
         "date": day, "at": now.isoformat(), "twitch": twitch_hist, "steam": steam_hist, "youtube": youtube_hist,
     })
     state = {
-        "date": day, "started_at": started_at, "finished_at": now.isoformat(), "sources": sources,
+        "date": day, "started_at": started_at, "finished_at": now.isoformat() if finalize else None, "sources": sources,
         "games": games, "candidates": candidates, "excluded": excluded,
         "llm": {"status": "skipped", "error": None, "model": None},
         "proposals": [], "skipped_note": "", "refresh_requested_at": None,
@@ -357,3 +364,344 @@ def collect(
     _write(sdir / "days" / f"{day}.json", state)
     _prune_history(sdir, today, int(table["history_days"]))
     return state
+
+
+# --------------------------------------------------------------------------
+# Choix de Claude (R6)
+# --------------------------------------------------------------------------
+
+_DECIDED = ("queued", "ignored")
+
+
+def _schema(max_picks: int) -> dict[str, Any]:
+    return {
+        "type": "object",
+        "required": ["picks", "skipped_note"],
+        "additionalProperties": False,
+        "properties": {
+            "picks": {
+                "type": "array", "maxItems": max_picks,
+                "items": {
+                    "type": "object", "required": ["candidate_id", "reason"], "additionalProperties": False,
+                    "properties": {
+                        "candidate_id": {"type": "string"},
+                        "reason": {"type": "string", "minLength": 1, "maxLength": 240},
+                    },
+                },
+            },
+            "skipped_note": {"type": "string", "maxLength": 300},
+        },
+    }
+
+
+def _check_picks(candidate_ids: set[str]) -> Callable[[Any], None]:
+    def check(value: Any) -> None:
+        seen: set[str] = set()
+        for pick in value["picks"]:
+            cid = pick["candidate_id"]
+            if cid not in candidate_ids:
+                raise llm.SchemaError(f"candidate_id inconnu : {cid!r}")
+            if cid in seen:
+                raise llm.SchemaError(f"candidate_id en double : {cid!r}")
+            seen.add(cid)
+
+    return check
+
+
+def _fmt(value: Any) -> str:
+    return "inconnu" if value is None else str(value)
+
+
+def _prompt(day_state: dict[str, Any], table: dict[str, object]) -> str:
+    taste = str(table["taste"]).strip() or "aucune préférence déclarée"
+    lines = [
+        "Tu choisis, pour un clippeur de streams, les VOD du jour dont tirer des clips courts pour TikTok.",
+        f"Goûts de l'utilisateur : {taste}",
+        f"Nombre maximum de VOD à proposer : {table['max_vods_per_day']} (zéro est une réponse valide).",
+        "Choisis les VOD dont le gameplay se prête à des clips courts compréhensibles seuls ET qui collent aux "
+        "goûts, en privilégiant ce qui monte, sans juger les personnes. Une donnée inconnue est inconnue : "
+        "ne l'invente pas.",
+        "",
+        "Jeux (viewers Twitch FR, joueurs Steam, variation vs moyenne des jours précédents) :",
+    ]
+    for game in day_state["games"]:
+        lines.append(
+            f"- {game['name']} : twitch_fr_viewers={_fmt(game['twitch_fr_viewers'])} "
+            f"twitch_delta_pct={_fmt(game['twitch_delta_pct'])} steam_players={_fmt(game.get('steam_players'))} "
+            f"steam_delta_pct={_fmt(game['steam_delta_pct'])} "
+            f"youtube_views_per_hour={_fmt(game.get('youtube_views_per_hour'))} vod_count={_fmt(game.get('vod_count'))}")
+    lines += ["", "Candidats (VOD) :"]
+    for c in day_state["candidates"]:
+        signals = c.get("signals") or {}
+        lines.append(
+            f"- id={c['id']} source={c['source']} titre={c.get('title')!r} chaîne={c.get('channel_name')!r} "
+            f"jeu={_fmt(c.get('game_name'))} durée_s={c['duration_s']} publiée={c['published_at']} "
+            f"vues={_fmt(c.get('view_count'))} vues_par_heure={_fmt(c.get('views_per_hour'))} "
+            f"twitch_delta_pct={_fmt(signals.get('twitch_delta_pct'))} "
+            f"steam_delta_pct={_fmt(signals.get('steam_delta_pct'))}")
+    return "\n".join(lines)
+
+
+def decide(day_state: dict[str, Any], config: Config) -> dict[str, Any]:
+    """Un seul appel texte à ``llm.ask("veille", ...)`` (R6) ; rend une copie de l'état avec ``llm``,
+    ``proposals`` et ``skipped_note``. Aucun candidat : ``skipped``, Claude n'est pas appelé. Réponse
+    refusée (ou erreur du backend) : ``llm.status = "error"`` avec le message, aucune proposition.
+    Chaque proposition porte un instantané de son candidat (``candidate``) : l'écran l'affiche encore
+    une fois la VOD mise en file, quand elle n'est plus candidate."""
+    table = settings(config)
+    state = {**day_state}
+    candidates = state["candidates"]
+    model = config.section("llm")["usages"].get("veille", {}).get("model")
+    if not candidates:
+        state.update(llm={"status": "skipped", "error": None, "model": None}, proposals=[], skipped_note="")
+        return state
+    try:
+        answer = llm.ask("veille", _prompt(state, table), [], _schema(int(table["max_vods_per_day"])),
+                         config=config, check=_check_picks({c["id"] for c in candidates}))
+    except llm.LLMError as exc:
+        log.error("veille : choix de Claude refusé : %s", exc)
+        state.update(llm={"status": "error", "error": str(exc), "model": model}, proposals=[], skipped_note="")
+        return state
+    by_id = {c["id"]: c for c in candidates}
+    state["proposals"] = [
+        {"candidate_id": pick["candidate_id"], "rank": rank, "reason": pick["reason"], "status": "proposed",
+         "decided_at": None, "channel": None, "queue_entry_id": None, "candidate": by_id[pick["candidate_id"]]}
+        for rank, pick in enumerate(answer["picks"], start=1)]
+    state.update(llm={"status": "ok", "error": None, "model": model}, skipped_note=answer["skipped_note"])
+    return state
+
+
+# --------------------------------------------------------------------------
+# Exécution par le worker (R7)
+# --------------------------------------------------------------------------
+
+
+def _day_path(sdir: Path, day: str) -> Path:
+    return sdir / "days" / f"{day}.json"
+
+
+def _state_lock(sdir: Path) -> Path:
+    return sdir / "state"
+
+
+def _read_day(sdir: Path, day: str) -> dict[str, Any] | None:
+    return _read_json(_day_path(sdir, day), None)
+
+
+def _due(now: datetime, table: dict[str, object], sdir: Path) -> bool:
+    if (sdir / "refresh.json").exists():
+        return True
+    local = now.astimezone(ZoneInfo(str(table["timezone"])))
+    hour, minute = str(table["run_at"]).split(":")
+    if (local.hour, local.minute) < (int(hour), int(minute)):
+        return False
+    day = _read_day(sdir, local.date().isoformat())
+    return day is None or day.get("finished_at") is None  # un relevé interrompu est repris
+
+
+def run_if_due(
+    now: datetime,
+    config: Config,
+    collectors: dict[str, Collector] | None = None,
+) -> dict[str, Any] | None:
+    """Relevé + choix de Claude si dû (R7) ; rend l'état du jour, ``None`` si rien n'était dû.
+    ``enabled`` faux : rien n'est lu ni écrit. ``refresh.json`` est consommé avant de commencer ;
+    les propositions déjà ``queued``/``ignored`` survivent à un relevé rejoué."""
+    if not config.section("veille").get("enabled"):
+        return None
+    table = settings(config)
+    sdir = _state_dir(table)
+    if not _due(now, table, sdir):
+        return None
+    day = now.astimezone(ZoneInfo(str(table["timezone"]))).date().isoformat()
+    refresh = _read_json(sdir / "refresh.json", None)
+    (sdir / "refresh.json").unlink(missing_ok=True)
+    requested_at = refresh.get("requested_at") if isinstance(refresh, dict) else None
+    skeleton = _read_day(sdir, day) or {
+        "date": day, "sources": {}, "games": [], "candidates": [], "excluded": {},
+        "llm": {"status": "skipped", "error": None, "model": None}, "proposals": [], "skipped_note": ""}
+    skeleton.update(started_at=now.isoformat(), finished_at=None, refresh_requested_at=requested_at)
+    _write(_day_path(sdir, day), skeleton)  # l'écran voit « en cours » dès maintenant
+    decided = [p for p in skeleton["proposals"] if p["status"] in _DECIDED]
+
+    state = collect(now, collectors=collectors, config=config, finalize=False)
+    state["refresh_requested_at"] = requested_at
+    state = decide(state, config)
+    state["finished_at"] = now.isoformat()
+    with channel_mod.file_lock(_state_lock(sdir)):
+        ids = {p["candidate_id"] for p in decided}
+        state["proposals"] = decided + [p for p in state["proposals"] if p["candidate_id"] not in ids]
+        _write(_day_path(sdir, day), state)
+    return state
+
+
+def _update_proposal(
+    config: Config, day: str, candidate_id: str,
+    update: Callable[[dict[str, Any], dict[str, Any]], None],
+) -> None:
+    """Relit le jour sous verrou, applique ``update(proposition, seen)``, réécrit les deux fichiers."""
+    sdir = _state_dir(settings(config))
+    with channel_mod.file_lock(_state_lock(sdir)):
+        state = _read_day(sdir, day)
+        if state is None:
+            raise VeilleError(f"aucun relevé de veille pour le {day}")
+        proposal = next((p for p in state["proposals"] if p["candidate_id"] == candidate_id), None)
+        if proposal is None:
+            raise VeilleError(f"candidat inconnu : {candidate_id} (relevé du {day})")
+        if proposal["status"] != "proposed":
+            raise VeilleError(f"candidat déjà traité : {candidate_id} ({proposal['status']})")
+        seen = _read_json(sdir / "seen.json", {"queued": [], "ignored": []})
+        update(proposal, seen)
+        _write(sdir / "seen.json", seen)
+        _write(_day_path(sdir, day), state)
+
+
+def clip(
+    day: str,
+    candidate_id: str,
+    channel: str | None,
+    short_clips: bool | None = None,
+    config: Config | None = None,
+) -> dict[str, Any]:
+    """Met la VOD proposée en file (``worker.enqueue``) ; rend l'entrée de file (R7)."""
+    from clipper import worker  # import local : worker importe veille dans sa boucle
+
+    config = config or load_config()
+    result: dict[str, Any] = {}
+
+    def update(proposal: dict[str, Any], seen: dict[str, Any]) -> None:
+        candidate = proposal["candidate"]
+        try:
+            entry = worker.enqueue(candidate["url"], channel, "run", short_clips=short_clips, config=config)
+        except worker.WorkerError as exc:
+            raise VeilleError(f"mise en file impossible pour {candidate_id} : {exc}") from exc
+        at = datetime.now(timezone.utc).isoformat()
+        proposal.update(status="queued", decided_at=at, channel=channel, queue_entry_id=entry["id"])
+        seen["queued"].append({"candidate_id": candidate_id, "video_id": entry["video_id"], "url": candidate["url"],
+                               "date": day, "channel": channel, "queue_entry_id": entry["id"], "at": at})
+        result.update(entry)
+
+    _update_proposal(config, day, candidate_id, update)
+    return result
+
+
+def ignore(day: str, candidate_id: str, config: Config | None = None) -> None:
+    """Marque la proposition ignorée ; son ``video_id`` n'est plus jamais candidat (R7)."""
+    config = config or load_config()
+
+    def update(proposal: dict[str, Any], seen: dict[str, Any]) -> None:
+        at = datetime.now(timezone.utc).isoformat()
+        proposal.update(status="ignored", decided_at=at)
+        seen["ignored"].append({"candidate_id": candidate_id, "video_id": proposal["candidate"]["video_id"],
+                                "date": day, "at": at})
+
+    _update_proposal(config, day, candidate_id, update)
+
+
+# --------------------------------------------------------------------------
+# Meilleurs clips du jour (R7) : archivage réversible, output/ jamais touché
+# --------------------------------------------------------------------------
+
+_KEEP_PUBLISH_STATUSES = ("approved", "scheduled", "published")
+
+
+def _selection_path(sdir: Path, day: str) -> Path:
+    return sdir / "selection" / f"{day}.json"
+
+
+def _series_key(clip_id: str, sidecar: dict[str, Any]) -> str:
+    """Base commune des parties d'une série (même règle que clipper.publish), sinon le clip lui-même."""
+    if sidecar.get("part") is not None and (sidecar.get("parts_total") or 1) > 1 and "-p" in clip_id:
+        return clip_id.rsplit("-p", 1)[0]
+    return clip_id
+
+
+def _protected_clips(config: Config) -> set[tuple[str, str]]:
+    """Clips dont l'entrée de publication est approuvée, programmée ou publiée (jamais archivés)."""
+    folder = Path(str(config.section("publish")["state_dir"]))
+    names = sorted(p.stem for p in folder.glob("*.json")) if folder.is_dir() else []
+    try:
+        return {(e["video_id"], e["clip_id"]) for name in names
+                for e in publish.list_entries(name, state_dir=folder) if e["status"] in _KEEP_PUBLISH_STATUSES}
+    except (publish.PublishError, ValueError) as exc:
+        raise VeilleError(f"file de publication illisible : {exc}") from exc
+
+
+def _video_clips(config: Config, video_id: str) -> list[dict[str, Any]]:
+    folder = Path(config.output_dir) / video_id
+    clips = []
+    for path in sorted(folder.glob("*.json")) if folder.is_dir() else []:
+        try:
+            sidecar = publish.read_sidecar(config.output_dir, video_id, path.stem)
+            clips.append({"video_id": video_id, "clip_id": path.stem, "qa": sidecar["qa"]["status"],
+                          "score": sidecar["score"], "series": _series_key(path.stem, sidecar)})
+        except (publish.PublishError, ValueError, KeyError, TypeError) as exc:
+            raise VeilleError(f"sidecar de clip illisible : {path} ({exc})") from exc
+    return clips
+
+
+def _finished_day(config: Config, video_id: str, tz: ZoneInfo) -> str | None:
+    state = _read_json(Path(config.workspace_dir) / video_id / "pipeline.json", None)
+    if not state or state.get("status") != "done" or not state.get("updated_at"):
+        return None
+    return datetime.fromisoformat(state["updated_at"]).astimezone(tz).date().isoformat()
+
+
+def select_best(now: datetime, config: Config) -> None:
+    """Recalcule ``selection/<jour>.json`` pour chaque jour où une VOD de la veille s'est terminée (R7)."""
+    table = settings(config)
+    sdir = _state_dir(table)
+    tz = ZoneInfo(str(table["timezone"]))
+    seen = _read_json(sdir / "seen.json", {"queued": [], "ignored": []})
+    videos_by_day: dict[str, list[str]] = {}
+    for entry in seen.get("queued", []):
+        day = _finished_day(config, entry["video_id"], tz)
+        if day and entry["video_id"] not in videos_by_day.setdefault(day, []):
+            videos_by_day[day].append(entry["video_id"])
+    if not videos_by_day:
+        return
+    protected = _protected_clips(config)
+    best = int(table["best_clips_per_day"])
+    for day, video_ids in sorted(videos_by_day.items()):
+        units: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for video_id in video_ids:
+            for item in _video_clips(config, video_id):
+                units.setdefault((video_id, item["series"]), []).append(item)
+        # une série compte pour un, au score de la série ; une partie rejetée écarte toute la série
+        ranked = sorted(
+            ((max(i["score"] for i in items), key, items) for key, items in units.items()
+             if all(i["qa"] == "passed" for i in items)),
+            key=lambda u: (-u[0], u[1]))
+        with channel_mod.file_lock(_state_lock(sdir)):
+            restored = (_read_json(_selection_path(sdir, day), {}) or {}).get("restored", [])
+            restored_ids = {(r["video_id"], r["clip_id"]) for r in restored}
+            kept: list[dict[str, Any]] = []
+            archived: list[dict[str, Any]] = []
+            for rank, (score, _key, items) in enumerate(ranked, start=1):
+                rows = [{"video_id": i["video_id"], "clip_id": i["clip_id"], "score": score, "rank": rank}
+                        for i in items]
+                if rank <= best or any((i["video_id"], i["clip_id"]) in protected for i in items):
+                    kept.extend(rows)
+                else:
+                    archived.extend(r for r in rows if (r["video_id"], r["clip_id"]) not in restored_ids)
+            _write(_selection_path(sdir, day), {
+                "date": day, "computed_at": now.isoformat(), "kept": kept, "archived": archived,
+                "restored": restored})
+
+
+def restore(video_id: str, clip_id: str, config: Config | None = None) -> None:
+    """Sort un clip de ``archived`` et le met dans ``restored`` : il reste visible aux recalculs suivants (R7)."""
+    config = config or load_config()
+    sdir = _state_dir(settings(config))
+    folder = sdir / "selection"
+    with channel_mod.file_lock(_state_lock(sdir)):
+        for path in sorted(folder.glob("*.json")) if folder.is_dir() else []:
+            selection = _read_json(path, {})
+            match = [a for a in selection.get("archived", []) if a["video_id"] == video_id and a["clip_id"] == clip_id]
+            if match:
+                selection["archived"] = [a for a in selection["archived"] if a not in match]
+                selection.setdefault("restored", []).append({
+                    "video_id": video_id, "clip_id": clip_id, "restored_at": datetime.now(timezone.utc).isoformat()})
+                _write(path, selection)
+                return
+    raise VeilleError(f"clip non archivé par la veille : {video_id}/{clip_id}")

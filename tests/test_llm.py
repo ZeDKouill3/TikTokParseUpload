@@ -1143,3 +1143,8 @@ def test_integration_real_claude_cli_imposes_array_schema_on_image(monkeypatch, 
     from clipper.llm.claude_cli import _result_object
 
     assert _result_object(outputs[0])["structured_output"] == out
+
+
+def test_veille_usage_is_declared_on_the_strong_model():
+    # TASK-3225 : choix des VOD de la veille (SPEC-bdd9 R6), jugement lourd -> modele fort
+    assert make_config().section("llm")["usages"]["veille"] == {"model": "strong"}

@@ -439,6 +439,7 @@ class Worker:
         stats_fetcher: Callable[..., dict[str, Any]] | None = None,
         login_checker: Callable[..., dict[str, Any]] | None = None,
         youtube_publisher: Callable[..., dict[str, Any]] | None = None,
+        veille_collectors: dict[str, Callable[..., dict[str, Any]]] | None = None,
     ) -> None:
         self._popen = None
         if spawner is None:
@@ -451,6 +452,8 @@ class Worker:
         self._launched_at: datetime | None = None
         self.watch_lister = watch_lister
         self._logged_watch_errors: set[str] = set()
+        self.veille_collectors = veille_collectors  # None : les collecteurs reels de clipper.veille_sources
+        self._logged_veille_errors: set[str] = set()
         self.publisher = publisher or tiktok.publish
         self.youtube_publisher = youtube_publisher or youtube.publish  # compte YouTube (SPEC-5e50 R2)
         self._logged_publish_errors: set[str] = set()
@@ -547,6 +550,7 @@ class Worker:
         de l'interface web)."""
         self._beat()
         self._watch_channels()
+        self._veille_due()
         if not self._publish_due():
             self._stats_due()
 
@@ -554,6 +558,7 @@ class Worker:
             if self._process.poll() is None:
                 return
             self._finish_current()
+            self._veille_select_best()
 
         if self._launch_head():
             return
@@ -595,6 +600,31 @@ class Worker:
             if message not in self._logged_watch_errors:
                 self._logged_watch_errors.add(message)
                 log.error("surveillance des chaines impossible : %s", message)
+
+    def _log_veille_error(self, exc: Exception) -> None:
+        message = str(exc)
+        if message not in self._logged_veille_errors:
+            self._logged_veille_errors.add(message)
+            log.error("veille impossible : %s", message)
+
+    def _veille_due(self) -> None:
+        """Releve quotidien ou « Rafraichir » de la veille (SPEC-bdd9 R7), dans ce processus seulement.
+        Une erreur de reglage ou d'etat est journalisee une fois et n'arrete pas le worker."""
+        from clipper import veille
+
+        try:
+            veille.run_if_due(datetime.now(timezone.utc), self.config, self.veille_collectors)
+        except (veille.VeilleError, ConfigError) as exc:
+            self._log_veille_error(exc)
+
+    def _veille_select_best(self) -> None:
+        """Apres chaque fin de processus enfant : recalcule les meilleurs clips du jour (SPEC-bdd9 R7)."""
+        from clipper import veille
+
+        try:
+            veille.select_best(datetime.now(timezone.utc), self.config)
+        except (veille.VeilleError, ConfigError) as exc:
+            self._log_veille_error(exc)
 
     # ------------------------------------------------------------ publication TikTok
 
