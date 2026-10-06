@@ -22,7 +22,7 @@ duration_s, published_at (ISO 8601), view_count, views_per_hour}``. Un direct
 en cours n'est pas une VOD : le collecteur ne le rend pas. Un collecteur qui
 lève, ou dont la réponse est inexploitable, met sa source en ``error`` ; les
 autres continuent (ADR-ad2e : aucun chiffre inventé, une donnée absente est
-``null``). Les collecteurs réels sont une autre tâche.
+``null``). Sans collecteurs injectés, ``clipper.veille_sources`` fournit les réels.
 """
 
 from __future__ import annotations
@@ -36,6 +36,7 @@ from typing import Any, Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from clipper import channel as channel_mod
+from clipper import veille_sources
 from clipper.config import Config, load_config
 
 CONFIG_DEFAULTS: dict[str, object] = {
@@ -256,7 +257,7 @@ def _parse_published(value: str) -> datetime:
 def collect(
     now: datetime,
     *,
-    collectors: dict[str, Collector],
+    collectors: dict[str, Collector] | None = None,
     config: Config | None = None,
 ) -> dict[str, Any]:
     """Un relevé (SPEC-bdd9 R2, R4, R5) : appelle les collecteurs injectés, écrit
@@ -264,6 +265,7 @@ def collect(
     Une source en erreur n'arrête pas les autres ; seuls un réglage invalide
     ou un fichier d'état illisible lèvent ``VeilleError``."""
     config = config or load_config()
+    collectors = veille_sources.default_collectors() if collectors is None else collectors
     table = settings(config)
     sdir = _state_dir(table)
     local_now = now.astimezone(ZoneInfo(str(table["timezone"])))
@@ -307,7 +309,7 @@ def collect(
                 vod["video_id"], vod["url"], vod["duration_s"]  # champs obligatoires
             raw_vods.extend((source, vod) for vod in vods)
         except Exception as exc:  # une source en erreur ne bloque pas les autres, jamais avalée
-            status.update(status="error", error=f"{type(exc).__name__} : {exc}" if not isinstance(exc, VeilleError) else str(exc), counts={})
+            status.update(status="error", error=f"{type(exc).__name__} : {exc}" if not isinstance(exc, (VeilleError, veille_sources.SourceError)) else str(exc), counts={})
             if source == "twitch":
                 twitch_hist = {}
             elif source == "steam":
