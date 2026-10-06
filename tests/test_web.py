@@ -9162,3 +9162,70 @@ def test_every_publishing_action_goes_through_the_same_net_guard():
     assert guarded(clips, "if (approve) approve.onclick", 'clipUrl(c, "/approve")')                        # un clip
     app = (STATIC / "app.js").read_text(encoding="utf-8")
     assert "setNetLast(net)" in app[app.index("function paintNetwork"):app.index("async function refreshNetwork")]
+
+
+# ---------- TASK-fa00f90a735a : coche « Heure par clip » (clip_dates) ----------
+
+
+def _clip_dates_body(account, dates, **extra):
+    """Corps manuel avec une date par clip ; ni intervalle ni debut (ignores par l'API en mode par clip)."""
+    return {
+        "mode": "manual", "account": account,
+        "selection": [{"video_id": CLIPS_VIDEO, "clip_id": cid} for cid in dates],
+        "clip_dates": [{"video_id": CLIPS_VIDEO, "clip_id": cid, "publish_at": at} for cid, at in dates.items()],
+        **extra,
+    }
+
+
+def test_series_preview_per_clip_dates_shows_each_date_and_refuses_clip_by_clip(tmp_path, isolated_cwd):
+    config = _series_client(tmp_path)
+    c = TestClient(create_app(config=config))
+    late, same = _soon(hours=9), _soon(hours=3)
+
+    resp = c.post("/api/publications/series/preview", json=_clip_dates_body(
+        READY, {"05": late, "02": same, "03": same}))
+
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert [(it["clip_id"], it["publish_at"]) for it in data["items"]] == [
+        ("05", _dt.fromisoformat(late).isoformat()), ("02", _dt.fromisoformat(same).isoformat()),
+        ("03", _dt.fromisoformat(same).isoformat())]
+    assert [bool(it["refusal"]) for it in data["items"]] == [False, False, True]
+    assert "même heure" in data["items"][2]["refusal"]
+    assert all(it["publish_at_paris"] for it in data["items"]) and data["ok"] is False
+
+
+def test_series_create_per_clip_dates_schedules_each_clip_at_its_own_date(tmp_path, isolated_cwd):
+    config = _series_client(tmp_path)
+    c = TestClient(create_app(config=config))
+    first, second = _soon(hours=9), _soon(hours=3)
+
+    resp = c.post("/api/publications/series", json=_clip_dates_body(READY, {"05": first, "02": second}))
+
+    assert resp.status_code == 201, resp.text
+    assert resp.json() == {"created": 2}
+    entries = json.loads((tmp_path / "state" / "publish" / "ma_chaine.json").read_text(encoding="utf-8"))
+    slots = {e["clip_id"]: e["slot_at"] for e in entries if e["status"] == "scheduled"}
+    assert slots == {"05": _dt.fromisoformat(first).isoformat(), "02": _dt.fromisoformat(second).isoformat()}
+
+
+def test_series_create_per_clip_dates_is_refused_whole_when_one_date_is_refused(tmp_path, isolated_cwd):
+    config = _series_client(tmp_path)
+    c = TestClient(create_app(config=config))
+    same = _soon(hours=3)
+
+    resp = c.post("/api/publications/series", json=_clip_dates_body(READY, {"05": same, "02": same}))
+
+    assert resp.status_code == 409 and f"{CLIPS_VIDEO}/02" in resp.json()["detail"]
+    entries = json.loads((tmp_path / "state" / "publish" / "ma_chaine.json").read_text(encoding="utf-8"))
+    assert {e["status"] for e in entries} == {"approved"}
+
+
+def test_series_preview_without_clip_dates_still_needs_the_start_and_the_interval(tmp_path, isolated_cwd):
+    config = _series_client(tmp_path)
+    c = TestClient(create_app(config=config))
+
+    resp = c.post("/api/publications/series/preview", json={
+        "mode": "manual", "account": READY, "selection": [{"video_id": CLIPS_VIDEO, "clip_id": "02"}]})
+
+    assert resp.status_code in (409, 422) and "début" in resp.text

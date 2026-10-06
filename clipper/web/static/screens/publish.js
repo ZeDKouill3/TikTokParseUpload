@@ -726,13 +726,66 @@ function pubSeriesPoolCards(f, d) {
   }));
 }
 
+/* Coche « Heure par clip » (TASK-fa00f90a735a) : chaque clip choisi (chaque partie d'un clip decoupe) a sa
+   propre date. Le JS ne fait que PRE-REMPLIR avec le rythme actuel (debut + k x intervalle, ou a la suite de la
+   derniere programmation) ; une date retouchee a la main (`edited`) n'est plus jamais recalculee. La validation
+   (fenetre, avance, plafonds, creneau pris, meme heure, ordre des parties) reste cote Python. */
+const pubSeriesClipKey = (videoId, clipId) => `${videoId}/${clipId}`;
+
+function pubSeriesRhythmStart(f, d) {
+  if ($("#pubs-after-last", d) && $("#pubs-after-last", d).checked) return f.afterAt ? new Date(f.afterAt) : null;
+  const startLocal = $("#pubs-start", d) ? $("#pubs-start", d).value : "";
+  return startLocal ? pubParisInstant(startLocal) : null;
+}
+
+/* Valeur datetime-local (heure de Paris) du k-ieme post au rythme actuel, ou "" si le rythme est incomplet. */
+function pubSeriesPrefill(start, intervalH, k) {
+  if (!start || !(intervalH > 0)) return "";
+  return pubLocalInput(new Date(start.getTime() + k * intervalH * 3600000).toISOString());
+}
+
+/* Les clips a dater, dans l'ordre de publication, avec la date a afficher (saisie ou pre-remplie). */
+function pubSeriesClipRows(f, d) {
+  const start = pubSeriesRhythmStart(f, d);
+  const intervalH = Number($("#pubs-interval", d) ? $("#pubs-interval", d).value : f.intervalH);
+  const rows = [];
+  f.selected.forEach((u) => u.clip_ids.forEach((clipId) => {
+    const key = pubSeriesClipKey(u.video_id, clipId);
+    const saved = f.clipDates[key];
+    const value = saved && saved.edited ? saved.value : pubSeriesPrefill(start, intervalH, rows.length);
+    if (!saved || !saved.edited) f.clipDates[key] = { value, edited: false };
+    rows.push({ unit: u, video_id: u.video_id, clip_id: clipId, key, value });
+  }));
+  return rows;
+}
+
+/* Refus de l'apercu affiches sous le clip concerne, sans re-rendre les champs (le focus de saisie reste). */
+function pubSeriesShowRefusals(f, d) {
+  const byKey = {};
+  if (f.preview) f.preview.items.forEach((it) => { byKey[pubSeriesClipKey(it.video_id, it.clip_id)] = it.refusal; });
+  $$("[data-pubs-refusal]", d).forEach((el) => {
+    const refusal = byKey[el.dataset.pubsRefusal];
+    el.textContent = refusal || "";
+    el.hidden = !refusal;
+  });
+}
+
+function pubSeriesClipDateHtml(row, multi) {
+  const partLabel = multi ? `Partie ${row.clip_id}` : "Date et heure";
+  return `<div class="field" style="margin:6px 0 0"><label class="muted" style="font-size:12px">${esc(partLabel)} (heure de Paris)
+      <input class="input" type="datetime-local" data-pubs-date="${esc(row.key)}" value="${esc(row.value)}"></label>
+      <div class="li-sub bad" data-pubs-refusal="${esc(row.key)}" role="alert" hidden></div></div>`;
+}
+
 function pubSeriesSelectedRows(f, d) {
   const box = $("#pubs-selected", d);
   if (!box) return;
   const last = f.selected.length - 1;
+  const clipRows = f.perClip ? pubSeriesClipRows(f, d) : [];
   box.innerHTML = f.selected.length ? f.selected.map((u, i) => `<div class="list-item">
       <span class="mini-clip">${u.thumbnail_url ? `<img loading="lazy" decoding="async" width="36" height="64" src="${esc(u.thumbnail_url)}" alt="">` : ""}</span>
-      <div class="li-main grow"><div class="li-title">${esc(pubSeriesUnitLabel(u))}</div><div class="li-sub muted">${esc(u.video_id)}</div></div>
+      <div class="li-main grow"><div class="li-title">${esc(pubSeriesUnitLabel(u))}</div><div class="li-sub muted">${esc(u.video_id)}</div>
+        ${clipRows.filter((r) => r.unit === u).map((r) => pubSeriesClipDateHtml(r, u.clip_ids.length > 1)).join("")}</div>
       <div class="row" style="gap:4px">
         <button type="button" class="btn btn-xs" data-pubs-up="${i}" aria-label="Monter"${i === 0 ? " disabled" : ""}>↑</button>
         <button type="button" class="btn btn-xs" data-pubs-down="${i}" aria-label="Descendre"${i === last ? " disabled" : ""}>↓</button>
@@ -741,6 +794,11 @@ function pubSeriesSelectedRows(f, d) {
   $$("[data-pubs-up]", box).forEach((b) => (b.onclick = () => { f.selected = pubSeriesMoveUnit(f.selected, Number(b.dataset.pubsUp), -1); pubSeriesRenderManual(f, d); }));
   $$("[data-pubs-down]", box).forEach((b) => (b.onclick = () => { f.selected = pubSeriesMoveUnit(f.selected, Number(b.dataset.pubsDown), 1); pubSeriesRenderManual(f, d); }));
   $$("[data-pubs-remove]", box).forEach((b) => (b.onclick = () => { f.selected = f.selected.filter((_, idx) => idx !== Number(b.dataset.pubsRemove)); pubSeriesRenderManual(f, d); }));
+  $$("[data-pubs-date]", box).forEach((input) => (input.oninput = () => {
+    f.clipDates[input.dataset.pubsDate] = { value: input.value, edited: true };
+    if (f.onChange) f.onChange();
+  }));
+  pubSeriesShowRefusals(f, d);
 }
 
 function pubSeriesRenderManual(f, d) {
@@ -792,6 +850,8 @@ function pubSeriesFormHtml(f) {
       <div class="field"><label class="row" style="gap:6px"><input type="checkbox" id="pubs-after-last"${f.afterLast ? " checked" : ""}> À la suite de la dernière programmation</label>
         <span class="hint" id="pubs-after-last-hint"${f.afterLast ? "" : " hidden"}>${esc(pubSeriesAfterLastHint(f))}</span></div>
       ${f.mode === "manual" ? `
+        <div class="field"><label class="row" style="gap:6px"><input type="checkbox" id="pubs-per-clip"${f.perClip ? " checked" : ""}> Heure par clip</label>
+          <span class="hint">Choisis la date et l'heure de chaque clip sélectionné (pré-remplies avec le rythme ci-dessus, modifiables une par une).</span></div>
         <div class="field"><span class="field-label">Clips disponibles</span>
           <div class="pubf-clips" id="pubs-pool" role="listbox" aria-label="Clips disponibles"></div></div>
         <div class="field"><span class="field-label">Sélection (<span id="pubs-sel-count">${count}</span> vidéo(s), ordre de publication)</span>
@@ -814,6 +874,16 @@ function pubSeriesBody(f, d) {
   const afterLast = $("#pubs-after-last", d).checked;
   const startLocal = $("#pubs-start", d).value;
   const parts_together = $("#pubs-together", d).checked;
+  if (mode === "manual" && f.perClip) {
+    // « Heure par clip » (TASK-fa00f90a735a) : la date de chaque clip part telle que saisie (heure de Paris),
+    // l'API la valide clip par clip ; ni debut ni intervalle (seulement un pre-remplissage cote ecran).
+    const rows = pubSeriesClipRows(f, d);
+    return {
+      mode, style: style || null, account, parts_together,
+      selection: f.selected.map((u) => ({ video_id: u.video_id, clip_id: u.clip_ids[0] })),
+      clip_dates: rows.map((r) => ({ video_id: r.video_id, clip_id: r.clip_id, publish_at: r.value ? pubParisInstant(r.value).toISOString() : "" })),
+    };
+  }
   const body = {
     mode, style: style || null, account, interval_hours, parts_together,
     // Coche cochee (TASK-8c4818a974fa) : la date vient de l'API (f.afterAt), jamais recalculee ici.
@@ -893,11 +963,12 @@ function pubSeriesRenderPreview(f, d) {
   // Pourquoi « Programmer » reste grise : resume visible des dates refusees (sinon seulement en petit sous chaque ligne).
   const refused = p.items.filter((it) => it.refusal);
   const summary = refused.length
-    ? `<p class="reason bad" style="margin-top:8px" data-series-refused>${refused.length} date${refused.length > 1 ? "s" : ""} refusée${refused.length > 1 ? "s" : ""} sur ${p.items.length} : ${esc(refused[0].refusal)}. Change l'intervalle, la date de début ou le nombre de vidéos.</p>`
+    ? `<p class="reason bad" style="margin-top:8px" data-series-refused>${refused.length} date${refused.length > 1 ? "s" : ""} refusée${refused.length > 1 ? "s" : ""} sur ${p.items.length} : ${esc(refused[0].refusal)}. ${f.mode === "manual" && f.perClip ? "Corrige la date du clip concerné." : "Change l'intervalle, la date de début ou le nombre de vidéos."}</p>`
     : "";
   box.innerHTML = `<div class="panel">${rows || `<p class="muted" style="padding:8px">Aucune publication.</p>`}</div>
     ${p.insufficient ? `<p class="reason bad" style="margin-top:8px">${esc(p.insufficient_reason)}</p>` : ""}${summary}`;
   if (submit) submit.disabled = !p.ok;
+  pubSeriesShowRefusals(f, d);
 }
 
 async function pubSeriesPreview(f, d) {
@@ -905,8 +976,10 @@ async function pubSeriesPreview(f, d) {
   err.hidden = true;
   const body = pubSeriesBody(f, d);
   if (!body.account) { err.textContent = "Choisis un compte prêt à publier."; err.hidden = false; return; }
-  if (!body.start_at) { err.textContent = "Choisis une date de début."; err.hidden = false; return; }
   if (body.mode === "manual" && !body.selection.length) { err.textContent = "Choisis au moins un clip."; err.hidden = false; return; }
+  if (body.clip_dates) {
+    if (body.clip_dates.some((c) => !c.publish_at)) { err.textContent = "Choisis la date et l'heure de chaque clip."; err.hidden = false; return; }
+  } else if (!body.start_at) { err.textContent = "Choisis une date de début."; err.hidden = false; return; }
   try {
     f.preview = await api("/api/publications/series/preview", jsonBody("POST", body));
   } catch (e) {
@@ -978,6 +1051,12 @@ function pubSeriesWire(f, d) {
     clearTimeout(timer);
     if (f.mode === "auto" || f.selected.length) timer = setTimeout(() => pubSeriesPreview(f, d), 500);
   };
+  f.onChange = refresh;
+  // Coche « Heure par clip » (TASK-fa00f90a735a), decochee par defaut, mode manuel seulement.
+  const perClipEl = $("#pubs-per-clip", d);
+  if (perClipEl) {
+    perClipEl.onchange = () => { f.perClip = perClipEl.checked; pubSeriesSelectedRows(f, d); refresh(); };
+  }
   // Decochee par defaut (TASK-8c4818a974fa) : cochee, desactive Debut et affiche la date calculee cote
   // Python ; decochee, rend le champ au comportement actuel.
   const afterLastEl = $("#pubs-after-last", d);
@@ -987,15 +1066,16 @@ function pubSeriesWire(f, d) {
       const input = $("#pubs-start", d), hint = $("#pubs-after-last-hint", d);
       if (input) input.disabled = f.afterLast;
       if (hint) hint.hidden = !f.afterLast;
-      if (f.afterLast) pubSeriesRefreshAfterLast(f, d).then(refresh);
-      else refresh();
+      if (f.afterLast) pubSeriesRefreshAfterLast(f, d).then(() => { if (f.perClip) pubSeriesSelectedRows(f, d); refresh(); });
+      else { if (f.perClip) pubSeriesSelectedRows(f, d); refresh(); }
     };
   }
   ["#pubs-start", "#pubs-interval", "#pubs-count"].forEach((sel) => {
     const el = $(sel, d);
     if (el) el.addEventListener("input", () => {
       // L'intervalle recalcule la date tant que la coche est active (TASK-8c4818a974fa).
-      if (sel === "#pubs-interval" && f.afterLast) { pubSeriesRefreshAfterLast(f, d).then(refresh); return; }
+      if (sel === "#pubs-interval" && f.afterLast) { pubSeriesRefreshAfterLast(f, d).then(() => { if (f.perClip) pubSeriesSelectedRows(f, d); refresh(); }); return; }
+      if (f.perClip && sel !== "#pubs-count") pubSeriesSelectedRows(f, d); // pre-remplissage : suit le rythme
       refresh();
     });
   });
@@ -1005,7 +1085,7 @@ function pubSeriesWire(f, d) {
   ["#pubs-style", "#pubs-account", "#pubs-together"].forEach((sel) => {
     const el = $(sel, d);
     if (el) el.addEventListener("change", () => pubSeriesFetchClips(f, d).then(() => {
-      if (sel === "#pubs-account" && f.afterLast) { pubSeriesRefreshAfterLast(f, d).then(refresh); return; }
+      if (sel === "#pubs-account" && f.afterLast) { pubSeriesRefreshAfterLast(f, d).then(() => { if (f.perClip) pubSeriesSelectedRows(f, d); refresh(); }); return; }
       refresh();
     }));
   });
@@ -1030,6 +1110,7 @@ async function pubOpenSeriesForm() {
     start: pubSeriesDefaultStart(), intervalH: clipsData.default_interval_h || 4,
     count: 1, selected: [], preview: null, together: true, available: null,
     afterLast: false, afterAt: null, afterAtParis: null,
+    perClip: false, clipDates: {}, onChange: null,
   };
   return openPanel("modal pub-modal pub-form", pubSeriesFormHtml(f), (d) => pubSeriesWire(f, d));
 }
