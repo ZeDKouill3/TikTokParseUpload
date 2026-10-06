@@ -152,6 +152,26 @@ def parse_iso_duration(text: str) -> int:
     return d * 86400 + h * 3600 + m * 60 + s
 
 
+TWITCH_THUMB_SIZE = ("640", "360")
+
+
+def _twitch_thumbnail(raw: Any) -> str | None:
+    """URL de miniature d'une VOD Twitch à taille fixe ; ``None`` si absente, vide ou en cours de traitement."""
+    if not isinstance(raw, str) or not raw or "404_processing" in raw:
+        return None
+    return raw.replace("%{width}", TWITCH_THUMB_SIZE[0]).replace("%{height}", TWITCH_THUMB_SIZE[1])
+
+
+def _youtube_thumbnail(thumbnails: Any) -> str | None:
+    """La plus grande miniature de ``snippet.thumbnails`` ; ``None`` si aucune."""
+    if not isinstance(thumbnails, dict):
+        return None
+    sized = [t for t in thumbnails.values() if isinstance(t, dict) and t.get("url")]
+    if not sized:
+        return None
+    return str(max(sized, key=lambda t: int(t.get("width") or 0))["url"])
+
+
 def _views_per_hour(view_count: int | None, published_at: str, now: datetime) -> float | None:
     if view_count is None:
         return None
@@ -263,6 +283,7 @@ def _twitch_collector(http: Http, clock: Clock) -> Callable[[dict[str, object]],
         ranked = sorted(named.items(), key=lambda kv: (-kv[1]["viewers_fr"], kv[1]["name"]))
 
         vods: list[dict[str, Any]] = []
+        private_vods = 0
         for game_id, entry in ranked[: int(settings["twitch_top_games"])]:  # type: ignore[call-overload]
             params = {"game_id": game_id, "language": language, "period": "day", "sort": "views",
                       "type": "archive", "first": int(settings["twitch_vods_per_game"])}  # type: ignore[call-overload]
@@ -272,15 +293,20 @@ def _twitch_collector(http: Http, clock: Clock) -> Callable[[dict[str, object]],
                 for key in ("id", "url", "duration", "published_at"):
                     if key not in video:
                         raise api.client.fail(where, params, video, f"data[].{key}")
+                if video.get("viewable", "public") != "public":
+                    private_vods += 1  # réservée aux abonnés ou privée : jamais proposée
+                    continue
                 view_count = video.get("view_count")
                 vods.append({
                     "video_id": str(video["id"]), "url": video["url"], "title": video.get("title"),
                     "channel_name": video.get("user_name"), "game_name": entry["name"],
                     "duration_s": parse_twitch_duration(video["duration"]),
                     "published_at": video["published_at"], "view_count": view_count,
+                    "thumbnail_url": _twitch_thumbnail(video.get("thumbnail_url")),
                     "views_per_hour": _views_per_hour(view_count, video["published_at"], now),
                 })
-        return {"games": [{"name": e["name"], "viewers_fr": e["viewers_fr"]} for _, e in ranked], "vods": vods}
+        return {"games": [{"name": e["name"], "viewers_fr": e["viewers_fr"]} for _, e in ranked], "vods": vods,
+                "private_vods": private_vods}
 
     return collect
 
@@ -314,6 +340,7 @@ def _youtube_collector(http: Http, clock: Clock) -> Callable[[dict[str, object]]
                 "title": snippet.get("title"), "channel_name": snippet.get("channelTitle"),
                 "game_name": None, "duration_s": parse_iso_duration(duration),
                 "published_at": published_at, "view_count": view_count,
+                "thumbnail_url": _youtube_thumbnail(snippet.get("thumbnails")),
                 "views_per_hour": _views_per_hour(view_count, published_at, now),
             })
         return {"videos": videos}

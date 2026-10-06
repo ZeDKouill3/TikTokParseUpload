@@ -8,7 +8,7 @@
 
 const VEILLE_STALE_MS = 4000;
 const SOURCE_LABELS = { twitch: "Twitch", youtube: "YouTube", steam: "Steam", steam_fr: "Ventes Steam FR" };
-const COUNT_LABELS = { games: "jeux", vods: "VOD", videos: "vidéos" };
+const COUNT_LABELS = { games: "jeux", vods: "VOD", videos: "vidéos", private: "VOD réservées écartées" };
 
 const veilleUi = { data: null, clips: [], error: null, loading: null, dirty: false, at: 0, style: {}, busy: false, html: "" };
 
@@ -61,7 +61,7 @@ const veilleSrcIcon = (source) => `<span class="src-ico src-${esc(source)}" titl
 /* Δ 7 j d'un jeu : « +80 % », ou la raison de l'absence (jamais un chiffre inventé). */
 function veilleDelta(game, kind) {
   if (!game) return `<span class="muted">jeu non relevé</span>`;
-  if (kind === "steam" && !game.steam_match) return `<span class="muted">hors Steam</span>`;
+  if (kind === "steam" && !game.steam_match) return game.steam_sellers_rank != null ? veilleSellers(game) : `<span class="muted">hors Steam</span>`;
   if (kind === "twitch" && game.twitch_match === false) return `<span class="muted">hors Twitch FR</span>`;
   const value = game[`${kind}_delta_pct`];
   if (value == null && kind === "steam" && game.steam_new_in_top) return `<b class="ok">Nouveau dans le top Steam</b>`;
@@ -129,7 +129,7 @@ function veilleProposal(p, game, channels) {
   const signals = [
     sig("twitch", "Twitch FR", veilleDelta(game, "twitch")),
     sig("steam", "Steam", veilleDelta(game, "steam")),
-    game && game.steam_sellers_rank != null ? sig("steam", "Ventes FR", veilleSellers(game)) : "",
+    game && game.steam_sellers_rank != null && game.steam_match ? sig("steam", "Ventes FR", veilleSellers(game)) : "",
     c.source === "youtube" && c.views_per_hour != null ? sig("youtube", "YouTube", `<b>${esc(fr(Math.round(c.views_per_hour)))} vues/h</b>`) : "",
   ].join("");
   const chosen = veilleUi.style[p.candidate_id] || "";
@@ -139,7 +139,7 @@ function veilleProposal(p, game, channels) {
     : `<a class="btn btn-sm btn-ghost" href="${esc(c.url)}" target="_blank" rel="noopener">Voir la VOD</a><span class="spacer"></span>${styleSelect}<button class="btn btn-sm btn-primary" type="button" data-veille-clip>Clipper</button><button class="btn btn-sm btn-ghost" type="button" data-veille-ignore>Ignorer</button>`;
   const meta = [c.channel_name, c.game_name, c.published_at ? `publié le ${veilleDay(c.published_at)}` : "", c.view_count != null ? `${fr(c.view_count)} vues` : ""].filter(Boolean).map(esc).join(" · ");
   return `<article class="prop${queued ? " queued" : ""}" data-veille-prop="${esc(p.candidate_id)}">
-    <div class="prop-thumb"><span class="rank">${esc(p.rank)}</span><div class="art"></div><span class="dur">${esc(veilleDuration(c.duration_s))}</span></div>
+    <div class="prop-thumb"><span class="rank">${esc(p.rank)}</span><div class="art">${c.thumbnail_url ? `<img loading="lazy" alt="" src="${esc(c.thumbnail_url)}" style="width:100%;height:100%;object-fit:cover;display:block" onerror="this.remove()">` : ""}</div><span class="dur">${esc(veilleDuration(c.duration_s))}</span></div>
     <div class="prop-main">
       <div class="prop-title">${esc(c.title)}</div>
       <div class="prop-meta">${veilleSrcIcon(c.source)}<span>${meta}</span></div>
@@ -196,7 +196,7 @@ function veilleRising(data) {
   const rows = games.map((g) => `<tr>
     <td>${esc(g.name)}</td>
     <td class="r">${g.twitch_match === false ? `<span class="muted">hors Twitch FR</span>` : num(g.twitch_fr_viewers, "pas relevé")}</td><td class="r">${veilleDelta(g, "twitch")}</td>
-    <td class="r">${g.steam_match ? num(g.steam_players, "pas relevé") : `<span class="muted">hors Steam</span>`}</td><td class="r">${veilleDelta(g, "steam")}</td><td class="r">${veilleSellers(g)}</td>
+    <td class="r">${g.steam_match ? num(g.steam_players, "pas relevé") : g.steam_sellers_rank != null ? `<span class="muted">ventes FR #${esc(g.steam_sellers_rank)}</span>` : `<span class="muted">hors Steam</span>`}</td><td class="r">${veilleDelta(g, "steam")}</td><td class="r">${veilleSellers(g)}</td>
     <td class="r">${num(g.youtube_views_per_hour == null ? null : Math.round(g.youtube_views_per_hour), "clé absente ou pas de vidéo")}</td>
     <td class="r">${esc(g.vod_count)}</td></tr>`).join("");
   return `<section data-veille-rising><div class="section-title">${icon("trending-up")}Ce qui monte</div><div class="panel">

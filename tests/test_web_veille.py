@@ -437,3 +437,38 @@ def test_veille_rising_indicator_counts_rank_gains_not_only_seven_day_rise():
     for needle in ("steam_rank_gain", "steam_new_in_top", "steam_sellers_gain", "steam_sellers_new"):
         assert needle in rises, needle
     assert "steam_rank_gain_min" in js[js.index("function veilleKpis"):js.index("function veilleProposal")]
+
+
+# --- TASK-a898 : miniatures, VOD réservées, libellé Steam -------------------
+
+
+def test_veille_proposal_card_shows_the_thumbnail_lazily_and_keeps_the_grey_block():
+    js = read_static("screens/veille.js")
+    card = js[js.index("function veilleProposal"):]
+    assert "c.thumbnail_url" in card and 'loading="lazy"' in card.split("c.thumbnail_url")[1].split("</div>")[0]
+    assert '<div class="art">' in card  # le bloc gris reste le fond (miniature absente ou en échec)
+
+
+def test_veille_hors_steam_only_when_absent_from_every_steam_source():
+    js = read_static("screens/veille.js")
+    delta = js[js.index("function veilleDelta"):js.index("function veilleSellers")]
+    assert 'kind === "steam" && !game.steam_match' in delta and "steam_sellers_rank" in delta
+    table = js[js.index("function veilleRising"):]
+    cell = table.split("g.steam_match ?")[1].split("</td>")[0]
+    assert "steam_sellers_rank" in cell and "hors Steam" in cell
+
+
+def test_veille_source_detail_labels_the_private_vod_counter():
+    js = read_static("screens/veille.js")
+    assert "private:" in js[js.index("const COUNT_LABELS"):].split("\n")[0]
+    assert "réservées" in js
+
+
+def test_veille_js_is_syntactically_valid():
+    import shutil
+    import subprocess
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node absent du PATH")
+    done = subprocess.run([node, "--check", str(STATIC / "screens" / "veille.js")], capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr

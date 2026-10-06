@@ -10,6 +10,19 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ## [Non publié]
 
+### Ajouté
+
+- Veille : chaque VOD proposée (Twitch et YouTube) affiche sa miniature, lue dans
+  la réponse de l'API, à la place du bloc gris (qui reste si la miniature manque).
+- Veille : le détail de la source Twitch compte les VOD réservées aux abonnés ou
+  privées écartées.
+
+### Corrigé
+
+- Veille : une VOD Twitch réservée aux abonnés ou privée n'est plus jamais proposée.
+- Veille : un jeu présent dans les ventes Steam FR mais absent du top joueurs
+  affiche son rang de ventes et sa montée au lieu de « hors Steam ».
+
 ## [0.5.0] - 2026-10-06
 
 Veille des sujets chauds (Twitch, YouTube, Steam), clips courts, heure libre

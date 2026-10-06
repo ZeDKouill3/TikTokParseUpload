@@ -831,3 +831,21 @@ def test_sellers_saved_in_history_and_signals_reach_candidates_and_claude(tmp_pa
 
 def test_sellers_settings_defaults():
     assert veille.CONFIG_DEFAULTS["steam_sellers_top"] == 50
+
+
+# --- TASK-a898 : compteur de VOD réservées, miniature conservée -------------
+
+
+def test_private_vod_count_is_shown_in_the_twitch_source_detail(tmp_path, config):
+    collectors = _collectors(vods=[_vod("ok1")])
+    collectors["twitch"].result["private_vods"] = 3
+    veille.collect(NOW, collectors=collectors, config=config)
+    day = _read(_sdir(tmp_path) / "days" / f"{TODAY}.json")
+    assert day["sources"]["twitch"]["counts"] == {"games": 1, "vods": 1, "private": 3}
+
+
+def test_candidate_carries_the_thumbnail_url_or_none(tmp_path, config):
+    with_thumb = {**_vod("t1"), "thumbnail_url": "https://cdn.test/t1.jpg"}
+    veille.collect(NOW, collectors=_collectors(vods=[with_thumb, _vod("t2")]), config=config)
+    day = _read(_sdir(tmp_path) / "days" / f"{TODAY}.json")
+    assert {c["video_id"]: c["thumbnail_url"] for c in day["candidates"]} == {"t1": "https://cdn.test/t1.jpg", "t2": None}

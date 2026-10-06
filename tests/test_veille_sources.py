@@ -201,7 +201,7 @@ def test_vods_listed_for_top_games_with_documented_params(tmp_path):
     assert result["vods"] == [{
         "video_id": "v10", "url": "https://www.twitch.tv/videos/10", "title": "Soirée",
         "channel_name": "streamer_a", "game_name": "Jeu Alpha", "duration_s": 10921,
-        "published_at": "2026-10-06T05:00:00Z", "view_count": 600, "views_per_hour": 200.0}]
+        "published_at": "2026-10-06T05:00:00Z", "view_count": 600, "thumbnail_url": None, "views_per_hour": 200.0}]
 
 
 # -- (3) YouTube ------------------------------------------------------------
@@ -230,7 +230,7 @@ def test_youtube_single_videos_list_call_and_fields(tmp_path):
     assert result == {"videos": [{
         "video_id": "y1", "url": "https://www.youtube.com/watch?v=y1", "title": "T", "channel_name": "chaine_a",
         "game_name": None, "duration_s": 3723, "published_at": "2026-10-06T04:00:00Z", "view_count": 3000,
-        "views_per_hour": 750.0}]}  # 4 h depuis la publication
+        "thumbnail_url": None, "views_per_hour": 750.0}]}  # 4 h depuis la publication
 
 
 def test_youtube_views_per_hour_floors_hours_at_one(tmp_path):
@@ -489,3 +489,55 @@ def test_steam_fr_game_without_item_name_is_a_named_error(tmp_path):
 def test_real_steam_fr(tmp_path):
     result = veille_sources.default_collectors()["steam_fr"](_settings(tmp_path, steam_sellers_top=5))
     assert len(result["games"]) == 5 and all(g["name"] and g["rank"] for g in result["games"])
+
+
+# -- miniatures et VOD réservées aux abonnés (TASK-a898) ---------------------
+
+
+def _video(video_id, **over):
+    video = {"id": video_id, "url": f"https://www.twitch.tv/videos/{video_id}", "title": "T", "user_name": "s",
+             "duration": "3h2m1s", "published_at": "2026-10-06T05:00:00Z", "view_count": 600, "type": "archive"}
+    video.update(over)
+    return video
+
+
+def _twitch_vods(tmp_path, videos):
+    http = FakeHttp(_twitch_routes({("GET", "/helix/videos"): [(200, {"data": videos})]}))
+    return _twitch(tmp_path, http, twitch_top_games=1)
+
+
+def test_twitch_thumbnail_size_placeholders_are_replaced_by_a_fixed_size(tmp_path):
+    result = _twitch_vods(tmp_path, [_video("a", thumbnail_url="https://cdn.test/t/%{width}x%{height}.jpg")])
+    assert result["vods"][0]["thumbnail_url"] == "https://cdn.test/t/640x360.jpg"
+
+
+@pytest.mark.parametrize("thumb", ["", None, "https://vod-secure.twitch.tv/_404/404_processing_%{width}x%{height}.png"])
+def test_twitch_vod_without_usable_thumbnail_has_none(tmp_path, thumb):
+    video = _video("a", thumbnail_url=thumb)
+    result = _twitch_vods(tmp_path, [video])
+    assert result["vods"][0]["thumbnail_url"] is None
+
+
+def test_twitch_vod_without_thumbnail_field_has_none(tmp_path):
+    assert _twitch_vods(tmp_path, [_video("a")])["vods"][0]["thumbnail_url"] is None
+
+
+def test_youtube_thumbnail_is_the_widest_available(tmp_path):
+    thumbs = {"default": {"url": "https://i.test/d.jpg", "width": 120, "height": 90},
+              "high": {"url": "https://i.test/h.jpg", "width": 480, "height": 360},
+              "medium": {"url": "https://i.test/m.jpg", "width": 320, "height": 180}}
+    http = FakeHttp({("GET", "/youtube/v3/videos"): [(200, {"items": [_yt_item(thumbnails=thumbs)]})]})
+    assert _youtube(tmp_path, http)["videos"][0]["thumbnail_url"] == "https://i.test/h.jpg"
+
+
+@pytest.mark.parametrize("snippet", [{}, {"thumbnails": {}}])
+def test_youtube_without_thumbnails_has_none(tmp_path, snippet):
+    http = FakeHttp({("GET", "/youtube/v3/videos"): [(200, {"items": [_yt_item(**snippet)]})]})
+    assert _youtube(tmp_path, http)["videos"][0]["thumbnail_url"] is None
+
+
+def test_twitch_non_public_vods_are_dropped_and_counted(tmp_path):
+    result = _twitch_vods(tmp_path, [_video("pub", viewable="public"), _video("priv", viewable="private"),
+                                     _video("noflag")])
+    assert [v["video_id"] for v in result["vods"]] == ["pub", "noflag"]
+    assert result["private_vods"] == 1

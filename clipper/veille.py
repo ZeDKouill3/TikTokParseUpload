@@ -358,7 +358,7 @@ def _to_candidate(source: str, vod: dict[str, Any]) -> dict[str, Any]:
         "url": vod["url"], "title": vod.get("title"), "channel_name": vod.get("channel_name"),
         "game_key": normalize(game_name) if game_name else None, "game_name": game_name,
         "duration_s": vod["duration_s"], "published_at": vod["published_at"],
-        "view_count": vod.get("view_count"), "views_per_hour": vod.get("views_per_hour"),
+        "view_count": vod.get("view_count"), "thumbnail_url": vod.get("thumbnail_url"), "views_per_hour": vod.get("views_per_hour"),
         "signals": {},
     }
 
@@ -410,7 +410,7 @@ def collect(
                 for game in result["games"]:
                     twitch_hist[normalize(game["name"])] = {"name": game["name"], "viewers_fr": game["viewers_fr"]}
                 vods = list(result["vods"])
-                status["counts"] = {"games": len(twitch_hist), "vods": len(vods)}
+                status["counts"] = {"games": len(twitch_hist), "vods": len(vods), "private": int(result.get("private_vods", 0))}
             elif source == "youtube":
                 vods = list(result["videos"])
                 for vod in vods:
