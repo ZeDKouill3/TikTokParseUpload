@@ -47,6 +47,10 @@ class FakeContext:
         self._cookies = cookies or []
         self.events: list[tuple] = []
         self.closed = False
+        self.init_scripts: list[str] = []
+
+    def add_init_script(self, script):
+        self.init_scripts.append(script)
 
     def cookies(self):
         return list(self._cookies)
@@ -693,6 +697,8 @@ from clipper import browser
 
 class Context:
     pages = []
+    def add_init_script(self, script):
+        pass
     def close(self):
         pass
 

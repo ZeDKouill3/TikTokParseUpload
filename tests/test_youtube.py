@@ -347,6 +347,9 @@ class FakeBrowserContext(FakeContext):
         super().__init__(page or FakeStudio())
         self.closed, self._on_close = False, on_close
 
+    def add_init_script(self, script):
+        pass
+
     def close(self):
         self.closed = True
         if self._on_close:

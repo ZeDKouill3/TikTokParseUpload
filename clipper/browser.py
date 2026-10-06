@@ -331,6 +331,8 @@ def _open_context(account: str, *, headless: bool, config: Config | None = None)
             try:
                 context = pw.chromium.launch_persistent_context(
                     str(directory), channel=CHANNEL, headless=headless, no_viewport=True, timezone_id=TIMEZONE,
+                    ignore_default_args=["--enable-automation"],
+                    args=["--disable-blink-features=AutomationControlled"],
                 )
             except Exception as exc:  # noqa: BLE001 - erreur Playwright : retraduite, jamais avalee
                 message = str(exc)
@@ -339,6 +341,11 @@ def _open_context(account: str, *, headless: bool, config: Config | None = None)
                         "Chrome est introuvable : installe Google Chrome, ou lance « " + INSTALL_CHROME + " »"
                     ) from None
                 raise BrowserError(f"ouverture du navigateur impossible : {message.strip().splitlines()[0] if message.strip() else type(exc).__name__}") from None
+            context.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                Object.defineProperty(navigator, 'languages', {get: () => ['fr-FR', 'fr', 'en']});
+                window.chrome = window.chrome || { runtime: {} };
+            """)
             try:
                 yield context
             finally:
