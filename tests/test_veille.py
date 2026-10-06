@@ -108,6 +108,7 @@ def test_config_defaults_are_exactly_r1():
         "youtube_max_results": 50, "youtube_min_duration_s": 600, "steam_top": 100,
         "steam_name_lookups_max": 100, "twitch_client_id": "", "twitch_client_secret": "", "youtube_api_key": "",
         "state_dir": "state/veille", "http_timeout_s": 20,
+        "steam_rank_gain_min": 5, "steam_risers_max": 10,
     }
 
 
@@ -256,6 +257,61 @@ def test_steam_rank_signal_reaches_candidates_and_claude(tmp_path, config):
         veille.decide(state, config)
     assert fake.calls[0].prompt.count("steam_rank_gain_vs_last_week=7") == 2
     assert "steam_new_in_top=False" in fake.calls[0].prompt
+
+
+def _steam_only(tmp_path, config, games, twitch_error=True):
+    """Relevé Twitch en erreur (ou sans jeu) et Steam ok."""
+    collectors = _collectors()
+    collectors["twitch"] = (Collector(error=RuntimeError("401")) if twitch_error
+                            else Collector({"games": [{"name": "Jeu Alpha", "viewers_fr": 10}], "vods": []}))
+    collectors["steam"] = Collector({"games": games})
+    veille.collect(NOW, collectors=collectors, config=config)
+    return _read(_sdir(tmp_path) / "days" / f"{TODAY}.json")
+
+
+def _sg(appid, name, rank, last, players=1000):
+    return {"appid": appid, "name": name, "players": players, "rank": rank, "last_week_rank": last}
+
+
+def test_steam_risers_listed_without_twitch(tmp_path, config):
+    day = _steam_only(tmp_path, config, [
+        _sg("1", "Jeu Nouveau", 5, -1), _sg("2", "Jeu Bond", 10, 20), _sg("3", "Jeu Stable", 3, 4),
+        _sg("4", "Jeu Inconnu", 7, None), _sg("5", "Jeu Seuil", 8, 13),
+    ])
+    assert day["sources"]["twitch"]["status"] == "error"
+    by_name = {g["name"]: g for g in day["games"]}
+    assert set(by_name) == {"Jeu Nouveau", "Jeu Bond", "Jeu Seuil"}
+    new = by_name["Jeu Nouveau"]
+    assert new["source"] == "steam" and new["twitch_match"] is False and new["steam_match"] is True
+    assert new["twitch_fr_viewers"] is None and new["twitch_delta_pct"] is None
+    assert new["steam_rank"] == 5 and new["steam_new_in_top"] is True and new["steam_rank_gain"] is None
+    assert new["steam_appid"] == "1" and new["steam_players"] == 1000 and new["vod_count"] == 0
+    assert by_name["Jeu Bond"]["steam_rank_gain"] == 10 and by_name["Jeu Bond"]["steam_new_in_top"] is False
+    assert by_name["Jeu Seuil"]["steam_rank_gain"] == 5
+
+
+def test_steam_risers_gain_threshold_and_cap_are_settings(tmp_path):
+    games = [_sg(str(i), f"Jeu {i}", i, i + 3) for i in range(1, 4)] + [_sg("9", "Jeu Neuf", 50, 0)]
+    day = _steam_only(tmp_path, _make_config(tmp_path, steam_rank_gain_min=3, steam_risers_max=2), games)
+    assert len(day["games"]) == 2
+    assert day["games"][0]["name"] == "Jeu Neuf"  # nouveau dans le top d'abord
+
+
+def test_steam_riser_already_on_twitch_is_not_duplicated(tmp_path, config):
+    day = _steam_only(tmp_path, config, [_sg("42", "Jeu Alpha", 5, 0)], twitch_error=False)
+    assert [g["key"] for g in day["games"]] == ["jeu alpha"]
+    assert day["games"][0]["twitch_match"] is True and day["games"][0]["source"] == "twitch"
+
+
+def test_steam_risers_reach_claude_context(tmp_path, config):
+    day = _steam_only(tmp_path, config, [_sg("1", "Jeu Nouveau", 5, -1)])
+    fake = FakeBackend([{"picks": [], "skipped_note": ""}])
+    day["candidates"] = [{"id": "c1", "source": "twitch", "title": "t", "channel_name": "c", "duration_s": 3600,
+                          "published_at": NOW.isoformat()}]
+    with llm.use_backend(fake):
+        veille.decide(day, config)
+    assert "- Jeu Nouveau : twitch_fr_viewers=inconnu" in fake.calls[0].prompt
+    assert "steam_new_in_top=True" in fake.calls[0].prompt
 
 
 def test_twitch_game_without_steam_app_is_not_zero(tmp_path, config):

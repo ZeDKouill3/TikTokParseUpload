@@ -68,6 +68,8 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "youtube_api_key": "",
     "state_dir": "state/veille",
     "http_timeout_s": 20,
+    "steam_rank_gain_min": 5,
+    "steam_risers_max": 10,
 }
 
 log = logging.getLogger(__name__)
@@ -216,6 +218,7 @@ def _build_games(
     youtube: dict[str, dict[str, Any]],
     vod_counts: dict[str, int],
     previous: list[dict[str, Any]],
+    table: dict[str, object] | None = None,
 ) -> list[dict[str, Any]]:
     steam_by_key = {normalize(info["name"]): (appid, info) for appid, info in steam.items()}
     games: list[dict[str, Any]] = []
@@ -228,7 +231,7 @@ def _build_games(
         steam_avg, steam_delta = _delta(steam_players, steam_values) if steam_info else (None, None)
         rank_gain, new_in_top = _rank_signal(steam_info)
         games.append({
-            "key": key, "name": info["name"],
+            "key": key, "name": info["name"], "source": "twitch", "twitch_match": True,
             "twitch_fr_viewers": info["viewers_fr"], "twitch_avg": twitch_avg, "twitch_delta_pct": twitch_delta,
             "steam_appid": appid, "steam_match": steam_info is not None, "steam_players": steam_players,
             "steam_avg": steam_avg, "steam_delta_pct": steam_delta,
@@ -238,7 +241,46 @@ def _build_games(
             "vod_count": vod_counts.get(key, 0),
             "baseline_days_available": len(previous),
         })
+    if table is not None:
+        games.extend(_steam_risers(steam, set(twitch), youtube, vod_counts, previous, table))
     return games
+
+
+def _steam_risers(
+    steam: dict[str, dict[str, Any]],
+    twitch_keys: set[str],
+    youtube: dict[str, dict[str, Any]],
+    vod_counts: dict[str, int],
+    previous: list[dict[str, Any]],
+    table: dict[str, object],
+) -> list[dict[str, Any]]:
+    """Jeux Steam qui montent sans être déjà dans la liste Twitch : nouveau dans le top, ou gain de rang
+    >= ``steam_rank_gain_min``. Champs Twitch à null (jamais inventés), plafonné à ``steam_risers_max``.
+    Rang ou semaine dernière inconnus : le jeu n'est pas retenu."""
+    gain_min = int(table["steam_rank_gain_min"])  # type: ignore[call-overload]
+    risers: list[dict[str, Any]] = []
+    for appid, info in steam.items():
+        key = normalize(info["name"])
+        if key in twitch_keys:
+            continue
+        rank_gain, new_in_top = _rank_signal(info)
+        if not (new_in_top or (rank_gain is not None and rank_gain >= gain_min)):
+            continue
+        steam_avg, steam_delta = _delta(
+            info["players"], [p["steam"][appid]["players"] for p in previous if appid in p.get("steam", {})])
+        risers.append({
+            "key": key, "name": info["name"], "source": "steam", "twitch_match": False,
+            "twitch_fr_viewers": None, "twitch_avg": None, "twitch_delta_pct": None,
+            "steam_appid": appid, "steam_match": True, "steam_players": info["players"],
+            "steam_avg": steam_avg, "steam_delta_pct": steam_delta,
+            "steam_rank": info["rank"], "steam_rank_gain": rank_gain, "steam_new_in_top": new_in_top,
+            "youtube_views_per_hour": youtube.get(key, {}).get("views_per_hour_sum"),
+            "vod_count": vod_counts.get(key, 0),
+            "baseline_days_available": len(previous),
+        })
+    # nouveaux dans le top d'abord (meilleur rang en tête), puis plus gros gains
+    risers.sort(key=lambda g: (not g["steam_new_in_top"], g["steam_rank"] if g["steam_new_in_top"] else -g["steam_rank_gain"]))
+    return risers[: int(table["steam_risers_max"])]  # type: ignore[call-overload]
 
 
 # --------------------------------------------------------------------------
@@ -365,7 +407,7 @@ def collect(
             if candidate["game_key"]:
                 vod_counts[candidate["game_key"]] = vod_counts.get(candidate["game_key"], 0) + 1
 
-    games = _build_games(twitch_hist, steam_hist, youtube_hist, vod_counts, previous)
+    games = _build_games(twitch_hist, steam_hist, youtube_hist, vod_counts, previous, table)
     by_key = {g["key"]: g for g in games}
     for candidate in candidates:
         game = by_key.get(candidate["game_key"])
@@ -448,6 +490,7 @@ def _prompt(day_state: dict[str, Any], table: dict[str, object]) -> str:
     for game in day_state["games"]:
         lines.append(
             f"- {game['name']} : twitch_fr_viewers={_fmt(game['twitch_fr_viewers'])} "
+            f"hors_twitch_fr={game.get('twitch_match') is False} "
             f"twitch_delta_pct={_fmt(game['twitch_delta_pct'])} steam_players={_fmt(game.get('steam_players'))} "
             f"steam_delta_pct={_fmt(game['steam_delta_pct'])} "
             f"steam_rank_gain_vs_last_week={_fmt(game.get('steam_rank_gain'))} "

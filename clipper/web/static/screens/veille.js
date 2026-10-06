@@ -61,7 +61,10 @@ const veilleSrcIcon = (source) => `<span class="src-ico src-${esc(source)}" titl
 function veilleDelta(game, kind) {
   if (!game) return `<span class="muted">jeu non relevé</span>`;
   if (kind === "steam" && !game.steam_match) return `<span class="muted">hors Steam</span>`;
+  if (kind === "twitch" && game.twitch_match === false) return `<span class="muted">hors Twitch FR</span>`;
   const value = game[`${kind}_delta_pct`];
+  if (value == null && kind === "steam" && game.steam_new_in_top) return `<b class="ok">Nouveau dans le top Steam</b>`;
+  if (value == null && kind === "steam" && game.steam_rank_gain != null) return `<b class="${game.steam_rank_gain >= 0 ? "ok" : "bad"}">${game.steam_rank_gain > 0 ? "+" : ""}${esc(fr(game.steam_rank_gain))} places</b>`;
   if (value == null) return `<span class="muted">pas assez d'historique (${esc(game.baseline_days_available)} j)</span>`;
   return `<b class="${value >= 0 ? "ok" : "bad"}">${value > 0 ? "+" : ""}${esc(fr(value))} %</b>`;
 }
@@ -178,7 +181,7 @@ function veilleRising(data) {
   const num = (v, reason) => (v == null ? `<span class="muted">${esc(reason)}</span>` : esc(fr(v)));
   const rows = games.map((g) => `<tr>
     <td>${esc(g.name)}</td>
-    <td class="r">${num(g.twitch_fr_viewers, "pas relevé")}</td><td class="r">${veilleDelta(g, "twitch")}</td>
+    <td class="r">${g.twitch_match === false ? `<span class="muted">hors Twitch FR</span>` : num(g.twitch_fr_viewers, "pas relevé")}</td><td class="r">${veilleDelta(g, "twitch")}</td>
     <td class="r">${g.steam_match ? num(g.steam_players, "pas relevé") : `<span class="muted">hors Steam</span>`}</td><td class="r">${veilleDelta(g, "steam")}</td>
     <td class="r">${num(g.youtube_views_per_hour == null ? null : Math.round(g.youtube_views_per_hour), "clé absente ou pas de vidéo")}</td>
     <td class="r">${esc(g.vod_count)}</td></tr>`).join("");

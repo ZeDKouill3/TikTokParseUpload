@@ -29,6 +29,15 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ### Ajouté
 
+- **Veille : jeux Steam qui montent visibles sans Twitch FR** (TASK-f4e2) :
+  `day.games` ajoute les jeux Steam du relevé absents de la liste Twitch qui
+  sont « nouveau dans le top » (`last_week_rank` <= 0) ou gagnent au moins
+  `[veille] steam_rank_gain_min` (5) places, plafonnés à `steam_risers_max`
+  (10), avec `source = "steam"`, `twitch_match = false` et les champs Twitch à
+  `null` (rang inconnu = jeu non retenu, rien d'inventé). Ils sont donnés à
+  Claude et affichés dans « Ce qui monte » (« Nouveau dans le top Steam » ou
+  « +N places », « hors Twitch FR »), même quand Twitch est en erreur.
+
 - **Légendes : mots-clés de recherche en tête** (TASK-b8a0) : la consigne de
   `captions` exige que la première phrase de la légende contienne le nom du jeu
   (écrit officiellement) et le streamer ou la chaîne de la source (`channel` de
