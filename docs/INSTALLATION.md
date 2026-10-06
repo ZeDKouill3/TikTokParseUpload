@@ -19,7 +19,7 @@ l'installeur, dans son propre dossier, sans toucher le reste de ta machine.
 
 ## Télécharger et dézipper
 
-1. Va sur la page des [Releases](https://github.com/ZeDKouill3/TikTokParseUpload/releases)
+1. Va sur la page des [Releases](https://github.com/ZeDKouill3/TiktokClipper/releases)
    du dépôt et télécharge le fichier `Clipper-portable-<version>.zip` de la
    dernière version.
 2. Dézippe-le où tu veux (Téléchargements, Bureau...) : le contenu du zip

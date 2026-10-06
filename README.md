@@ -197,7 +197,7 @@ toute seule.
 
 Pas envie de cloner le dépôt, d'installer Python ou `uv` ? Télécharge le zip
 portable de la
-[Release GitHub](https://github.com/ZeDKouill3/TikTokParseUpload/releases)
+[Release GitHub](https://github.com/ZeDKouill3/TiktokClipper/releases)
 (`Clipper-portable-0.4.2.zip`), dézippe-le et double-clique sur
 `Installer.bat` : il installe Python, ffmpeg, `claude` et les modèles dans son
 propre dossier, sans rien toucher d'autre sur ta machine. Parcours complet

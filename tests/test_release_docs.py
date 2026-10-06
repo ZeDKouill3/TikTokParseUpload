@@ -17,7 +17,7 @@ CHANGELOG = ROOT / "CHANGELOG.md"
 VERSIONS = ROOT / "docs" / "versions.md"
 PYPROJECT = ROOT / "pyproject.toml"
 README = ROOT / "README.md"
-REPO_URL = "https://github.com/ZeDKouill3/TikTokParseUpload"
+REPO_URL = "https://github.com/ZeDKouill3/TiktokClipper"
 
 # Identifiants, noms de personnes ou de chaines reels (research/, hors scope git) :
 # ne doivent jamais fuiter dans un artefact versionne.
