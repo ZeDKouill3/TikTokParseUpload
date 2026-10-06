@@ -541,3 +541,61 @@ def test_twitch_non_public_vods_are_dropped_and_counted(tmp_path):
                                      _video("noflag")])
     assert [v["video_id"] for v in result["vods"]] == ["pub", "noflag"]
     assert result["private_vods"] == 1
+
+
+# --- TASK-9495 : test d'accès d'une VOD Twitch par yt-dlp (sans téléchargement) ---
+
+
+class _FakeYdl:
+    """yt-dlp simulé : enregistre les options et les appels, lève ``error`` si fourni."""
+
+    instances = []
+
+    def __init__(self, opts, error=None):
+        self.opts, self.error, self.calls = opts, error, []
+        _FakeYdl.instances.append(self)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def extract_info(self, url, download=True, **kwargs):
+        self.calls.append((url, download))
+        if self.error:
+            raise self.error
+        return {"id": "1"}
+
+
+def _ydl_with(error=None):
+    _FakeYdl.instances.clear()
+    return lambda opts: _FakeYdl(opts, error)
+
+
+def test_check_twitch_access_extracts_without_downloading():
+    veille_sources.check_twitch_access("https://www.twitch.tv/videos/1", 7, ydl_factory=_ydl_with())
+    ydl = _FakeYdl.instances[0]
+    assert ydl.calls == [("https://www.twitch.tv/videos/1", False)]
+    assert ydl.opts["socket_timeout"] == 7 and ydl.opts["quiet"] is True
+
+
+@pytest.mark.parametrize("message", [
+    "ERROR: [twitch:vod] 1: You must be logged into an account that has access to this subscriber-only content",
+    "This video is subscriber-only",
+    "Subscribers only video",
+])
+def test_check_twitch_access_raises_restricted_for_subscriber_only(message):
+    with pytest.raises(veille_sources.AccessRestricted):
+        veille_sources.check_twitch_access("u", 5, ydl_factory=_ydl_with(Exception(message)))
+
+
+@pytest.mark.parametrize("error", [
+    ConnectionResetError("[WinError 10054] connexion fermée par l'hôte"),
+    TimeoutError("timed out"),
+    Exception("Unable to download webpage: HTTP Error 503"),
+])
+def test_check_twitch_access_lets_other_errors_through(error):
+    with pytest.raises(Exception) as caught:
+        veille_sources.check_twitch_access("u", 5, ydl_factory=_ydl_with(error))
+    assert not isinstance(caught.value, veille_sources.AccessRestricted)

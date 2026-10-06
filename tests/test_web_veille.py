@@ -472,3 +472,13 @@ def test_veille_js_is_syntactically_valid():
         pytest.skip("node absent du PATH")
     done = subprocess.run([node, "--check", str(STATIC / "screens" / "veille.js")], capture_output=True, text=True)
     assert done.returncode == 0, done.stderr
+
+
+def test_veille_source_detail_labels_the_restricted_vod_counter():
+    js = (STATIC / "screens" / "veille.js").read_text(encoding="utf-8")
+    assert "restricted:" in js[js.index("const COUNT_LABELS"):].split("\n")[0]
+
+
+def test_veille_card_shows_the_unverified_access_reason():
+    js = (STATIC / "screens" / "veille.js").read_text(encoding="utf-8")
+    assert "access_unverified" in js[js.index("function veilleProposal"):]
