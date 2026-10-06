@@ -9,9 +9,13 @@
 
 const SET_SECTIONS = [
   ["general", "Général"], ["dirs", "Dossiers"], ["llm", "LLM et modèles"],
-  ["web", "Serveur web"], ["worker", "Worker"], ["network", "Réseau"], ["access", "Accès"],
+  ["web", "Serveur web"], ["worker", "Worker"], ["network", "Réseau"], ["veille", "Veille"], ["access", "Accès"],
 ];
 const SET_TIERS = ["strong", "fast"];
+// Clés d'API de la veille : jamais renvoyées par le serveur (seulement `<clé>_set`), jamais préremplies ; vide = on garde.
+const SET_VEILLE_KEYS = [
+  ["twitch_client_id", "Twitch : client id"], ["twitch_client_secret", "Twitch : client secret"], ["youtube_api_key", "YouTube : clé API"],
+];
 const SET_STALE_MS = 4000;
 
 const setUi = { data: null, draft: null, loading: null, at: 0, dirty: false, saving: false, error: "" };
@@ -240,6 +244,36 @@ function setNetwork() {
     </div></div></section>`;
 }
 
+/* [veille] (SPEC-bdd9 R1, R8) : activation, goûts, nombres, heure, puis les clés en écriture seule. */
+function setVeilleKey(key, label) {
+  const isSet = Boolean((setUi.data.effective.veille || {})[`${key}_set`]);
+  const typed = Boolean(setGet(setUi.draft, ["veille", key]));
+  const id = `set-veille-${key}`;
+  return `<div class="field set-field" data-fpath="veille.${key}">
+    <label for="${id}" class="mono">${esc(key)}</label>
+    <input class="input mono" id="${id}" data-secret="veille.${key}" type="password" autocomplete="new-password" placeholder="${isSet ? "•••••••• (saisie, laisser vide pour la garder)" : "à saisir"}">
+    <span class="hint">${esc(label)} : ${isSet ? "déjà enregistrée dans config.toml" : "absente"}${typed ? " · nouvelle valeur à enregistrer" : ""}. Elle n'est jamais affichée ni renvoyée.</span>
+    <span class="field-error" role="alert"></span></div>`;
+}
+
+function setVeille() {
+  const shown = ["enabled", "run_at", "max_vods_per_day", "best_clips_per_day", "language", "region", "rise_min_pct", "baseline_days"];
+  const hidden = [...shown, "taste", "state_dir", ...SET_VEILLE_KEYS.map(([k]) => k)];
+  const taste = setEffective(["veille", "taste"]);
+  return `<section class="panel" id="set-veille"><div class="panel-head"><h2>Veille</h2><span class="muted mono">[veille]</span></div><div class="panel-pad">
+    <p class="muted set-note">Chaque jour, Claude propose des VOD à clipper d'après Twitch, YouTube et Steam. Rien ne tourne tant que « enabled » est faux. Les clés se créent dans les consoles Twitch et Google Cloud (docs/GUIDE.md) ; Steam n'en demande aucune.</p>
+    <div class="form-grid">
+      ${shown.map((k) => setField(["veille", k], k, (setUi.data.defaults.veille[k] || {}).comment)).join("")}
+      <div class="field set-field full" data-fpath="veille.taste"><label for="set-veille-taste" class="mono">taste</label>
+        <textarea class="input" id="set-veille-taste" data-path="veille.taste" data-kind="text" rows="2" autocomplete="off">${esc(taste)}</textarea>
+        <span class="hint">${esc((setUi.data.defaults.veille.taste || {}).comment || "Tes goûts, en texte libre : Claude les lit pour choisir les VOD.")}</span>
+        <span class="field-error" role="alert"></span></div>
+      ${SET_VEILLE_KEYS.map(([k, label]) => setVeilleKey(k, label)).join("")}
+    </div>
+    <details class="set-help"><summary>autres réglages</summary><div class="form-grid">${setSectionFields("veille", hidden)}</div></details>
+  </div></section>`;
+}
+
 function setAccess() {
   const access = setUi.data.access;
   const restart = setUi.data.restart_required && !access.differs_from_config
@@ -270,7 +304,7 @@ function setHtml() {
     <div class="stack set-stack">
       ${setWarning()}
       <p class="reason bad" data-set-error role="alert" hidden></p>
-      ${setGeneral()}${setDirs()}${setLlm()}${setWeb()}${setWorker()}${setNetwork()}${setAccess()}
+      ${setGeneral()}${setDirs()}${setLlm()}${setWeb()}${setWorker()}${setNetwork()}${setVeille()}${setAccess()}
       <div class="set-savebar${setUi.dirty ? " show" : ""}" id="set-savebar"><span class="muted">${icon("pencil", "i-sm")}</span>
         <p>Modifications non enregistrées dans <span class="mono">${esc(setUi.data.path)}</span></p>
         <button type="button" class="btn btn-sm btn-ghost" data-set-cancel>Annuler</button>
@@ -326,8 +360,9 @@ async function setSave(root) {
   button.disabled = true;
   try {
     const settings = setClone(setUi.draft);
-    ["llm", "web", "worker", "network"].forEach((s) => { settings[s] = settings[s] || {}; });
+    ["llm", "web", "worker", "network", "veille"].forEach((s) => { settings[s] = settings[s] || {}; });
     delete settings.web.token;                       // jamais lu ni écrit par l'interface
+    Object.keys(settings.veille).filter((k) => k.endsWith("_set")).forEach((k) => delete settings.veille[k]); // drapeaux du serveur, pas des réglages
     ["mode", "workspace_dir", "output_dir"].forEach((k) => { if (!(k in settings)) settings[k] = setUi.data.defaults.general[k].default; });
     setUi.data = await api("/api/settings", jsonBody("PUT", { settings }));
     setUi.draft = setClone(setUi.data.raw);
@@ -400,7 +435,13 @@ function setWire(root) {
   };
   const changed = (e) => {
     const el = e.target;
-    if (el.dataset && el.dataset.path) {
+    if (el.dataset && el.dataset.secret) {
+      // clé d'API : saisie => écrite ; champ vidé => retirée du brouillon, donc gardée côté serveur (jamais effacée par oubli)
+      const path = el.dataset.secret.split(".");
+      const table = (setUi.draft[path[0]] = setUi.draft[path[0]] || {});
+      if (el.value) table[path[1]] = el.value; else delete table[path[1]];
+      setMarkDirty();
+    } else if (el.dataset && el.dataset.path) {
       setPut(el.dataset.path.split("."), setReadInput(el));
       const field = el.closest(".set-field");
       if (field) { field.classList.remove("invalid"); $(".field-error", field).textContent = ""; }

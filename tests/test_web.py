@@ -1006,7 +1006,7 @@ import re
 from html.parser import HTMLParser
 
 SCREENS = ["dashboard", "videos", "review", "clips", "channels", "publish", "stats", "settings"]
-TAB_SCREENS = ["dashboard", "videos", "review", "clips", "publish"]
+TAB_SCREENS = ["dashboard", "veille", "review", "clips", "publish"]  # Veille remplace Vidéos dans la barre basse (SPEC-bdd9 R10)
 STATIC = Path(__file__).resolve().parent.parent / "clipper" / "web" / "static"
 
 
@@ -7409,7 +7409,7 @@ def test_every_panel_screen_keeps_its_content_off_the_edges():
     css = "\n".join(p.read_text(encoding="utf-8") for p in [STATIC / "style.css", *sorted((STATIC / "screens").glob("*.css"))])
     own_margin = {"videos"}  # .vadd, .vfilters et .job portent 16-24 px de marge
     screens = re.findall(r'<section class="screen" id="screen-(\w+)".*?<div class="([^"]*)" data-body', page, re.S)
-    assert {name for name, _ in screens} == {"dashboard", "videos", "review", "clips", "publish", "channels", "stats", "accounts", "settings", "journal"}
+    assert {name for name, _ in screens} == {"dashboard", "veille", "videos", "review", "clips", "publish", "channels", "stats", "accounts", "settings", "journal"}
     for name, classes in screens:
         if "panel" not in classes.split() or name in own_margin:
             continue

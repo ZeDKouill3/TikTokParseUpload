@@ -9,6 +9,7 @@
 <link rel="stylesheet" href="/static/fonts.css">
 <link rel="stylesheet" href="/static/style.css">
 <link rel="stylesheet" href="/static/screens/accounts.css">
+<link rel="stylesheet" href="/static/screens/veille.css">
 <script>
   // Theme avant le premier rendu : choix memorise, sinon preference du systeme.
   (function () {
@@ -33,6 +34,7 @@
     <nav class="nav" id="nav">
       <div class="nav-group">Production</div>
       <a href="#/dashboard" data-screen="dashboard"><span data-icon="layout-dashboard"></span><span>Tableau de bord</span><span class="count" data-count-for="dashboard" hidden></span></a>
+      <a href="#/veille" data-screen="veille"><span data-icon="trending-up"></span><span>Veille</span><span class="count" data-count-for="veille" hidden></span></a>
       <a href="#/videos" data-screen="videos"><span data-icon="film"></span><span>Vidéos</span><span class="count" data-count-for="videos" hidden></span></a>
       <a href="#/review" data-screen="review"><span data-icon="sparkles"></span><span>Revue</span><span class="count" data-count-for="review" hidden></span></a>
       <a href="#/clips" data-screen="clips"><span data-icon="clapperboard"></span><span>Clips</span><span class="count" data-count-for="clips" hidden></span></a>
@@ -67,6 +69,13 @@
         <div class="actions" data-actions></div>
       </div>
       <div class="dash" data-body><div class="skeleton skeleton-line"></div><div class="skeleton skeleton-card"></div><div class="skeleton skeleton-card"></div></div>
+    </section>
+    <section class="screen" id="screen-veille" data-title="Veille" hidden>
+      <div class="page-head reveal">
+        <div class="titles"><div class="eyebrow">Production</div><h1>Veille</h1><p class="sub">Ce qui monte sur Twitch, YouTube et Steam, et les VOD que Claude propose de clipper chaque jour.</p></div>
+        <div class="actions" data-actions></div>
+      </div>
+      <div class="veille-body" data-body><div class="skeleton skeleton-line"></div><div class="skeleton skeleton-card"></div><div class="skeleton skeleton-card"></div></div>
     </section>
     <section class="screen" id="screen-videos" data-title="Vidéos" hidden>
       <div class="page-head reveal">
@@ -136,7 +145,7 @@
 
   <nav class="tabbar" id="tabbar" aria-label="Navigation mobile">
     <a href="#/dashboard" data-screen="dashboard"><span data-icon="layout-dashboard"></span><span>Accueil</span><span class="count" data-count-for="dashboard" hidden></span></a>
-    <a href="#/videos" data-screen="videos"><span data-icon="film"></span><span>Vidéos</span><span class="count" data-count-for="videos" hidden></span></a>
+    <a href="#/veille" data-screen="veille"><span data-icon="trending-up"></span><span>Veille</span><span class="count" data-count-for="veille" hidden></span></a>
     <a href="#/review" data-screen="review"><span data-icon="sparkles"></span><span>Revue</span><span class="count" data-count-for="review" hidden></span></a>
     <a href="#/clips" data-screen="clips"><span data-icon="clapperboard"></span><span>Clips</span><span class="count" data-count-for="clips" hidden></span></a>
     <a href="#/publish" data-screen="publish"><span data-icon="send"></span><span>Publication</span><span class="count" data-count-for="publish" hidden></span></a>
@@ -170,6 +179,7 @@
 <script src="/static/screens/layout-letterbox.js"></script>
 <script src="/static/screens/chan-subtitles-preview.js"></script>
 <script src="/static/screens/watch.js"></script>
+<script src="/static/screens/veille.js"></script>
 <script src="/static/screens/publish.js"></script>
 <script src="/static/screens/settings.js"></script>
 <script src="/static/screens/stats.js"></script>
