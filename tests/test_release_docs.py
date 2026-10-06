@@ -248,22 +248,21 @@ def test_readme_portable_zip_points_to_the_release_with_the_current_version():
     assert "<version>" not in section
 
 
-def test_versions_row_for_the_current_version_names_the_portable_installer_and_calendar():
+def test_versions_row_for_the_current_version_names_the_release_headline():
     lines = _read(VERSIONS).splitlines()
     row = next(line for line in lines if line.startswith(f"| {TAG} "))
-    assert "Installeur portable Windows et calendrier Jour/Semaine/Mois" in row
+    assert "Webcam du stream trouvée par période" in row
 
 
 REQUIRED_CHANGELOG_TERMS = (
-    "ADR-e1da", "SPEC-38f7", f"Clipper-portable-{VERSION}.zip", "Release GitHub",
-    "Installer.bat", "Desinstaller.bat", "GPU", "ffmpeg", "clipper doctor",
-    "clipper models prefetch", "[cuda]", "mise à jour", "Jour", "Semaine", "Mois",
-    "légende", "série", "déterministes", "CLIPPER_INSTALLER_REAL",
+    f"Clipper-portable-{VERSION}.zip", "Installer.bat", "mise à jour", "SPEC-4a9b",
+    "[network]", "expected_country", "refused_by_platform", "restreintes", "Purge",
+    "interrompue", "Afficher le badge", "30 posts récents", "pipeline.json",
 )
 
 
 @pytest.mark.parametrize("term", REQUIRED_CHANGELOG_TERMS)
-def test_changelog_current_version_covers_the_portable_installer_and_calendar(term):
+def test_changelog_current_version_covers_the_release_changes(term):
     body = _changelog_section(_read(CHANGELOG), rf"\[{ESC_VERSION}\]")
     assert term in body, f"{term!r} absent de la section [{VERSION}]"
 

@@ -10,6 +10,98 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ## [Non publié]
 
+## [0.4.2] - 2026-10-06
+
+Webcam du stream retrouvée avec l'aide de Claude, garde-fou réseau pour le
+navigateur piloté, publication TikTok plus robuste, statistiques plafonnées et
+gestion de l'espace disque. Pas de fichier de notes séparé dans le dépôt pour
+cette version : cette section du changelog suffit. Le zip s'appelle
+`Clipper-portable-0.4.2.zip` ; la mise à jour se fait en relançant
+`Installer.bat` depuis ce zip, tes données ne sont pas touchées.
+
+### Ajouté
+
+**Webcam du stream**
+
+- La webcam du stream est maintenant trouvée **par période** (Just Chatting,
+  puis jeu) au lieu d'un seul rectangle pour toute la vidéo. Les rectangles
+  candidats (visages, cadres nets en mouvement) sont numérotés sur une planche
+  et Claude répond seulement par un numéro ou « aucune » : jamais de
+  coordonnées inventées. Le choix de chaque clip suit la période où il
+  commence, et la décision est écrite par clip pour pouvoir la relire
+  (SPEC-4a9b, proposée).
+
+**Réseau**
+
+- La console affiche le **pays de l'IP publique** dans une pastille en haut à
+  droite, avec un réglage du pays attendu (`[network]` : `expected_country`,
+  `geo_url`, `cache_s`, `block_browser`).
+- Le navigateur piloté (TikTok, YouTube) **refuse de s'ouvrir** quand l'IP est
+  hors du pays attendu, par exemple VPN actif.
+- Au clic sur **Publier** ou **Valider**, une fenêtre d'alerte prévient quand
+  l'IP est hors du pays attendu.
+
+**Vidéos et disque**
+
+- Purge des fichiers lourds d'une vidéo, ou de toutes les vidéos terminées,
+  avec la taille affichée et une confirmation avant suppression.
+- Une vidéo **interrompue** (serveur ou PC arrêté en plein traitement) est
+  affichée comme interrompue, jamais comme « en cours » : tu peux la
+  **reprendre** là où elle s'est arrêtée ou l'**annuler** (étapes finies
+  conservées, action journalisée).
+- La miniature des VOD non YouTube (Twitch...) apparaît dès l'ajout à la file.
+
+**Statistiques TikTok**
+
+- Les vidéos **restreintes** (non éligibles à la recommandation « Pour toi »)
+  sont repérées au relevé détaillé : pastille par post, résumé « N vidéos
+  restreintes sur M en ligne » par compte, texte de TikTok dans la fiche.
+
+**Agencement**
+
+- Éditeur d'agencement split : case **« Afficher le badge »** pour retirer ou
+  remettre le badge de style sans perdre sa position enregistrée.
+
+### Modifié
+
+- Statistiques TikTok : le détail est **plafonné aux 30 posts récents**, la
+  période par défaut passe à 365 jours, et le relevé lit correctement les
+  nombres du type « 1,432 » et la tuile « 24 -2 ».
+- Un clip **refusé par TikTok** à la vérification de contenu prend le statut
+  `refused_by_platform` : le compte et la série continuent au lieu de
+  s'arrêter.
+- Les accroches et titres d'écran visent une cible de mots **plus courte**
+  que la limite stricte, pour ne plus déborder.
+- Quand le pays de l'IP est inconnu (service de géolocalisation injoignable),
+  la publication est mise **en attente et réessayée**, le compte reste prêt ;
+  si le pays est différent, le worker s'arrête et décoche le compte.
+- Les dates des posts TikTok, dont l'année, sont lues en heure de Paris.
+- Le contrôle de la webcam par clip a été remplacé par le choix par période
+  (voir Ajouté) : une webcam avec visage et cadre n'est plus évincée.
+
+### Corrigé
+
+- TikTok : la vérification de contenu est lue sur le texte **visible** ; un
+  « Vérification en cours » resté caché ne bloque plus jusqu'au délai.
+- TikTok : une vérification encore en cours n'est plus prise pour finie quand
+  « Aucun problème constaté » est affiché ailleurs (fausse fin, nouvel essai,
+  fenêtre « Continuer à publier ? » puis échec de publication).
+- TikTok : quand la limite quotidienne de vérification est atteinte,
+  l'interrupteur grisé ne bloque plus la publication, elle continue sans lui.
+- TikTok : le relevé de la liste des Publications est **complet** (liste
+  virtualisée, défilement du conteneur, lignes cumulées) au lieu de s'arrêter
+  à quelques vidéos.
+- Sous-titres : un mot trop long est raccourci (plus de 3 lettres répétées),
+  puis coupé net au besoin, au lieu de faire échouer l'étape.
+- Worker : le style choisi pour une vidéo est écrit dans `pipeline.json` au
+  lancement, donc conservé à la relance ou à la reprise.
+- Reframe : la coupe de la webcam est journalisée et le calcul en niveaux de
+  gris reste en `uint8`.
+- Console : marges de la barre « Espace disque / Purger » de l'écran Vidéos.
+- Tests : le journal global n'écrit plus dans le vrai dossier `logs/` et aucun
+  test n'appelle le vrai service de géolocalisation (les tests du navigateur
+  piloté échouaient sur une IP hors de France).
+
 ## [0.4.1] - 2026-10-04
 
 Installeur portable Windows et calendrier de publication Jour / Semaine /
@@ -608,7 +700,8 @@ verticaux sous-titrés, en local.
 - Aucune publication automatique sur TikTok : le dépôt produit les clips
   et leurs métadonnées, la mise en ligne reste manuelle.
 
-[Non publié]: https://github.com/ZeDKouill3/TikTokParseUpload/compare/v0.4.1...HEAD
+[Non publié]: https://github.com/ZeDKouill3/TikTokParseUpload/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/ZeDKouill3/TikTokParseUpload/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/ZeDKouill3/TikTokParseUpload/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/ZeDKouill3/TikTokParseUpload/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/ZeDKouill3/TikTokParseUpload/compare/v0.2.0...v0.3.0
