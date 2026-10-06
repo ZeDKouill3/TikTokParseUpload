@@ -325,6 +325,7 @@ _SUFFIX = {"": 1, "k": 1_000, "m": 1_000_000, "md": 1_000_000_000, "b": 1_000_00
 _COUNT = re.compile(r"(\d[\d ]*)(?:[.,](\d+))?\s*([kKmMbB]|Md)?")
 _COUNT_THOUSANDS = re.compile(r"\d{1,3}(?:,\d{3})+")  # « 1,432 », « 12,345,678 » : virgule + exactement 3 chiffres = milliers anglais
 _PERCENT = re.compile(r"(\d+(?:[.,]\d+)?)\s*%")
+_BELOW_ONE = re.compile(r"<\s*\d+(?:[.,]\d+)?\s*%")
 _CLOCK = re.compile(r"(?:(\d+):)?(\d+):(\d{2})")
 _HMS = re.compile(r"(?:(\d+)\s*h\s*:?\s*)?(?:(\d+)\s*m\s*:?\s*)?(?:(\d+(?:[.,]\d+)?)\s*s)?")  # 0h:00m:00s, 12s
 _SECONDS = re.compile(r"(?:(\d+)\s*min\s*)?(?:(\d+(?:[.,]\d+)?)\s*s)?|(\d+)\s*min")
@@ -1141,16 +1142,37 @@ class _Flow:
         return cards
 
     def card(self, cards: list[list[str]], heading: str) -> list[str] | None:
+        """Lignes d'une carte (sans son titre) ; ``None`` si absente, ou si elle dit n'avoir pas encore de chiffres."""
         wanted = _squash(heading).casefold()
-        return next((c[1:] for c in cards if c[0].casefold() == wanted), None)
+        lines = next((c[1:] for c in cards if c[0].casefold() == wanted), None)
+        if lines is None:
+            return None
+        text = " ".join(lines).casefold()
+        return None if any(marker.casefold() in text for marker in self.sel["stats"]["unavailable"]) else lines
 
     def entries(self, lines: list[str], where: str) -> list[dict[str, Any]]:
-        """Couples « libelle, valeur » d'une carte ; une valeur « x % » est une fraction, sinon un nombre."""
+        """Couples « libelle, valeur » d'une carte ; une valeur « x % » est une fraction, sinon un nombre. Une barre
+        « types de spectateurs » affiche ses pourcentages PUIS ses libelles : « 63 %, 37 %, Nouveaux, Recurrents »."""
+        if lines and _PERCENT.fullmatch(lines[0]):
+            return self.bar_entries(lines, where)
         if len(lines) % 2:
             raise self.reject("unexpected_page", f"carte illisible ({where}) : couples libellé / valeur attendus, reçu {lines!r}")
-        out = []
-        for label, value in zip(lines[0::2], lines[1::2]):
-            out.append({"label": label, "value": self.read_value(value, label, parse_percent if "%" in value else parse_count, where)})
+        return [self.entry(label, value, where) for label, value in zip(lines[0::2], lines[1::2])]
+
+    def entry(self, label: str, value: str, where: str) -> dict[str, Any]:
+        if _BELOW_ONE.fullmatch(value):  # « <1% » : sous 1 %, valeur exacte inconnue, jamais devinee
+            return {"label": label, "value": None}
+        return {"label": label, "value": self.read_value(value, label, parse_percent if "%" in value else parse_count, where)}
+
+    def bar_entries(self, lines: list[str], where: str) -> list[dict[str, Any]]:
+        out, rest = [], list(lines)
+        while rest:
+            size = next((n for n, line in enumerate(rest) if not _PERCENT.fullmatch(line)), len(rest))
+            values, labels = rest[:size], rest[size:2 * size]
+            if size == 0 or len(labels) != size or any(_PERCENT.fullmatch(label) for label in labels):
+                raise self.reject("unexpected_page", f"carte illisible ({where}) : pourcentages puis libellés attendus, reçu {lines!r}")
+            out += [self.entry(label, value, where) for label, value in zip(labels, values)]
+            rest = rest[2 * size:]
         return out
 
     def read_viewers(self, post_id: str) -> dict[str, Any] | None:
