@@ -1,0 +1,18 @@
+---
+id: LOG-35d7ad0f7c5b
+type: log
+title: done, proof test:local/01121e88eefc@a2f7aa9
+created: 2026-10-06T13:16:58Z
+author: w-3225a4f9df8c
+scope:
+  - clipper/veille.py
+  - clipper/worker.py
+  - clipper/llm/__init__.py
+  - tests/test_veille*.py
+  - tests/test_worker*.py
+  - tests/test_llm.py
+about: TASK-3225a4f9df8c
+seq: 4
+schema: 4
+version: 1
+---

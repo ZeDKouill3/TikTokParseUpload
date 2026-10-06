@@ -2844,3 +2844,78 @@ def test_a_country_that_turns_unknown_inside_the_publisher_fails_without_halting
     entry = _entries(tmp_path)[0]
     assert entry["status"] == "failed" and entry["halted"] is False
     assert _account_state(tmp_path, ACCOUNT)["ready_to_publish"] is True
+
+
+# --------------------------------------------------------------------------
+# Veille (TASK-3225, SPEC-bdd9 R7) : hook de la boucle, select_best apres un enfant
+# --------------------------------------------------------------------------
+
+
+def _veille_queue_entry() -> dict:
+    return {"id": "e1", "video_id": VIDEO_A, "url": URL_A, "channel": None, "action": "run",
+            "force_steps": [], "enqueued_at": "2026-01-01T00:00:00+00:00", "status": "waiting", "pid": None}
+
+
+def test_tick_calls_veille_run_if_due_with_the_injected_collectors(tmp_path, monkeypatch):
+    from clipper import veille
+
+    config = _config(tmp_path)
+    calls = []
+    monkeypatch.setattr(veille, "run_if_due", lambda now, cfg, collectors: calls.append((now, cfg, collectors)))
+    collectors = {"twitch": object()}
+    worker.Worker(config=config, spawner=FakeSpawner(), veille_collectors=collectors).tick()
+    assert len(calls) == 1 and calls[0][1] is config and calls[0][2] is collectors
+
+
+def test_tick_logs_a_veille_error_once_and_keeps_going(tmp_path, monkeypatch, caplog):
+    from clipper import veille
+
+    config = _config(tmp_path)
+
+    def boom(now, cfg, collectors):
+        raise veille.VeilleError("réglage invalide")
+
+    monkeypatch.setattr(veille, "run_if_due", boom)
+    w = worker.Worker(config=config, spawner=FakeSpawner())
+    with caplog.at_level("ERROR"):
+        w.tick()
+        w.tick()
+    assert len([r for r in caplog.records if "réglage invalide" in r.getMessage()]) == 1
+
+
+def test_finishing_a_child_process_calls_veille_select_best(tmp_path, monkeypatch):
+    from clipper import veille
+
+    config = _config(tmp_path)
+    monkeypatch.setattr(veille, "run_if_due", lambda *a, **k: None)
+    selected = []
+    monkeypatch.setattr(veille, "select_best", lambda now, cfg: selected.append(cfg))
+    _write_queue(config, [_veille_queue_entry()])
+    process = FakeProcess()
+    w = worker.Worker(config=config, spawner=FakeSpawner(process))
+    w.tick()  # lance l'enfant
+    assert selected == []
+    process.finish(0)
+    w.tick()
+    assert selected == [config]
+
+
+def test_a_select_best_error_is_logged_and_does_not_stop_the_worker(tmp_path, monkeypatch, caplog):
+    from clipper import veille
+
+    config = _config(tmp_path)
+    monkeypatch.setattr(veille, "run_if_due", lambda *a, **k: None)
+
+    def boom(now, cfg):
+        raise veille.VeilleError("sélection impossible")
+
+    monkeypatch.setattr(veille, "select_best", boom)
+    _write_queue(config, [_veille_queue_entry()])
+    process = FakeProcess()
+    w = worker.Worker(config=config, spawner=FakeSpawner(process))
+    w.tick()
+    process.finish(0)
+    with caplog.at_level("ERROR"):
+        w.tick()
+    assert any("sélection impossible" in r.getMessage() for r in caplog.records)
+    assert w._process is None
