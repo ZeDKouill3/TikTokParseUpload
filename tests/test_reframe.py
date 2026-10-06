@@ -2542,3 +2542,123 @@ def test_clip_facecam_still_rejects_a_rect_with_no_edge_anywhere_near(tmp_path):
     rect, reason = reframe._clip_facecam(facecam, 0.0, 7.0, settings, tmp_path, image_reader=read)
     assert rect is None
     assert reason is not None
+
+
+# --------------------------------------------------------------------------
+# Recalage des bords du rectangle choisi sur la vraie incrustation (TASK-893d)
+# : Claude choisit le bon candidat, mais son rectangle est decale (visage
+# centre faute de bords retrouves) ou englobe la bordure noire / la bande de
+# l'overlay. Mesure reelle : Hctuan v2888230655 gauche +35 droit +26 haut -8
+# bas -42 px ; TheGuill v2887364910 +-6 px de bordure noire par cote.
+# --------------------------------------------------------------------------
+
+# Webcam reelle (non au format du panneau camera, comme Hctuan : 430 x 300).
+REAL_CAM = (700, 300, 1130, 600)
+# Rectangle candidat au format du panneau camera mais decale de la webcam.
+SHIFTED_RECT = {"x": 660, "y": 290, "w": 540, "h": 384}
+
+
+def refine_images(n=12, *, cam=REAL_CAM, seed=3):
+    """Images synthetiques : fond sombre qui change a chaque image (jeu),
+    webcam plus claire et fixe en ``cam`` (x0, y0, x1, y1), bruit leger."""
+    rng = np.random.default_rng(seed)
+    images = []
+    for _ in range(n):
+        img = rng.integers(0, 60, size=(H, W, 3), dtype=np.uint8)
+        x0, y0, x1, y1 = cam
+        img[y0:y1, x0:x1] = rng.integers(180, 190, size=(y1 - y0, x1 - x0, 3), dtype=np.uint8)
+        images.append(img)
+    return images
+
+
+def refine(images, rect=SHIFTED_RECT, face=None, **overrides):
+    from clipper.reframe import CONFIG_DEFAULTS, _refine_rect
+
+    return _refine_rect(images, dict(rect), face, {**CONFIG_DEFAULTS, **overrides})
+
+
+def test_refine_snaps_each_edge_on_the_real_webcam_and_keeps_the_panel_aspect():
+    refined, reason = refine(refine_images())
+    assert refined is not None, reason
+    x0, y0, x1, y1 = rect_box(refined)
+    cx0, cy0, cx1, cy1 = REAL_CAM
+    # couvre toute la vraie webcam, a 2 px pres ...
+    assert x0 <= cx0 + 2 and y0 <= cy0 + 2 and x1 >= cx1 - 2 and y1 >= cy1 - 2
+    # ... agrandie au minimum pour le format du panneau camera (ici en hauteur),
+    # donc la largeur colle a la webcam : plus de bande d'overlay a gauche/droite
+    assert refined["w"] <= (cx1 - cx0) + 4
+    assert refined["w"] / refined["h"] == pytest.approx(1080 / 768, rel=0.02)
+    # centree sur la vraie webcam
+    assert (x0 + x1) / 2 == pytest.approx((cx0 + cx1) / 2, abs=3)
+    assert (y0 + y1) / 2 == pytest.approx((cy0 + cy1) / 2, abs=3)
+    for side in ("gauche", "droit", "haut", "bas"):
+        assert side in reason
+
+
+def test_refine_never_moves_an_edge_beyond_the_margin_and_says_why():
+    # bord gauche de la vraie webcam a 400 px du rectangle : hors marge (20 % de la largeur)
+    far = (SHIFTED_RECT["x"] + 400, 300, 1300, 600)
+    refined, reason = refine(refine_images(cam=far))
+    cx0 = far[0]
+    if refined is not None:
+        assert refined["x"] < cx0  # le bord gauche n'a pas saute jusqu'a la webcam
+    assert "gauche" in reason and "introuvable" in reason
+
+
+def test_refine_margin_is_configurable():
+    refined, _ = refine(refine_images(), facecam_refine_margin_ratio=0.01)
+    assert refined is None  # decalages de 40 px et plus : tous hors d'une marge de ~5 px
+
+
+def test_refine_without_any_reliable_edge_changes_nothing_and_journals_it():
+    rng = np.random.default_rng(1)
+    images = [rng.integers(0, 60, size=(H, W, 3), dtype=np.uint8) for _ in range(12)]
+    refined, reason = refine(images)
+    assert refined is None
+    assert reason and "introuvable" in reason
+
+
+def test_refine_does_not_cut_the_stable_face():
+    # un visage tres clair colle au bord gauche de la webcam ne doit pas servir de bord
+    images = refine_images()
+    for img in images:
+        img[400:520, 700:760] = 255
+    refined, reason = refine(images, face=(700.0, 400.0, 760.0, 520.0))
+    if refined is not None:
+        assert refined["x"] <= 700
+    assert "visage" in reason or refined is not None
+
+
+def write_noise_keyframes(video_dir, n=24, cam=REAL_CAM):
+    frames_dir = video_dir / "frames"
+    frames_dir.mkdir(exist_ok=True)
+    frames = []
+    for k, img in enumerate(refine_images(n, cam=cam)):
+        name = f"scene0000_{k:03d}.bmp"
+        (frames_dir / name).write_bytes(cv2.imencode(".bmp", img)[1].tobytes())
+        frames.append({"path": f"frames/{name}", "timecode": 0.5 + k, "scene": 0})
+    (video_dir / "scenes.json").write_text(
+        json.dumps({"scenes": [{"start": 0.0, "end": 100.0}], "frames": frames}), encoding="utf-8"
+    )
+
+
+def test_detect_facecam_writes_refined_and_original_rectangles(tmp_path, video_dir, monkeypatch):
+    from clipper import reframe as reframe_mod
+
+    write_noise_keyframes(video_dir)
+    candidate = {
+        "id": 1, "kind": "visage", "rect": dict(SHIFTED_RECT), "support": 20, "face_support": 20,
+        "edge_reason": "bords introuvables : rectangle centre sur le visage conserve", "face": None,
+    }
+    monkeypatch.setattr(reframe_mod, "_period_candidates", lambda images, detector, settings: ([candidate], []))
+    path, _ = detect(tmp_path)
+
+    period = period0(path)
+    assert period["candidate_rect"] == SHIFTED_RECT  # rectangle d'origine conserve
+    refined = period["refined_rect"]
+    assert refined is not None and refined != SHIFTED_RECT
+    assert period["facecam"] == refined  # c'est lui que les clips utiliseront
+    assert period["refine_reason"]
+    x0, y0, x1, y1 = rect_box(refined)
+    assert x0 <= REAL_CAM[0] + 2 and x1 >= REAL_CAM[2] - 2 and y0 <= REAL_CAM[1] + 2 and y1 >= REAL_CAM[3] - 2
+    assert refined["w"] <= REAL_CAM[2] - REAL_CAM[0] + 4
