@@ -10,22 +10,17 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ## [Non publié]
 
-### Corrigé
+## [0.5.0] - 2026-10-06
 
-- **Veille Steam : noms des jeux sans `GetAppList`** (TASK-7486) : Valve a
-  retiré `ISteamApps/GetAppList/v2` (HTTP 404), la source Steam tombait en
-  erreur. Les noms viennent maintenant de l'API magasin sans clé
-  (`store.steampowered.com/api/appdetails`), demandés seulement pour les jeux du
-  top, mis en cache sous `state/veille/steam_names.json` (un nom connu ne se
-  redemande pas) et plafonnés par `[veille] steam_name_lookups_max` (100) par
-  relevé. Un jeu dont le nom reste introuvable n'est pas relevé et sa raison est
-  gardée (`unnamed` dans l'état de la source), jamais un nom inventé.
-- **Veille Steam : montée immédiate par le rang** (TASK-7486) : le relevé garde
-  `rank` et `last_week_rank` de `GetMostPlayedGames` ; chaque jeu porte
-  `steam_rank_gain` (gain de rang vs semaine dernière) et `steam_new_in_top`
-  (`last_week_rank` 0 = nouveau dans le top, sans gain chiffré ; champ absent =
-  `null`), transmis à Claude avec les candidats à côté de la montée vs 7 jours,
-  qui reste `null` tant que l'historique manque.
+Veille des sujets chauds (Twitch, YouTube, Steam), clips courts, heure libre
+par clip dans les séries programmées, légendes avec mots-clés de recherche,
+recalage de la webcam et statistiques TikTok relues sur la vraie page. Pas de
+fichier de notes séparé dans le dépôt pour cette version : cette section du
+changelog suffit (elle sert aussi de corps à la release). Le zip s'appelle
+`Clipper-portable-0.5.0.zip` ; la mise à jour se fait en relançant
+`Installer.bat` depuis ce zip, tes données ne sont pas touchées. La veille est
+désactivée par défaut (`[veille] enabled = false`) et les clips courts aussi
+(`[moments] short_clips = false`) : sans réglage de ta part, rien ne change.
 
 ### Ajouté
 
@@ -101,6 +96,46 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
   `POST /api/queue` (les anciennes entrées gardent la valeur du style). Le mode
   est écrit dans `moments.json` et visible sur la fiche de la vidéo. Inactif :
   comportement inchangé.
+
+### Modifié
+
+- **Webcam du stream : bords recalés sur la vraie incrustation** (TASK-893d) :
+  une fois le rectangle choisi par Claude (candidats numérotés, SPEC-4a9b), les
+  quatre bords sont recalés sur le vrai bord de l'incrustation (vote des pics de
+  gradient sur les images de la période, dans une marge bornée réglable
+  `facecam_refine_*`, hors du visage stable). La webcam n'est plus décalée et la
+  bande de texte de l'overlay ne reste plus visible sous elle. Un côté sans bord
+  fiable reste tel quel et la raison est journalisée (jamais de repli
+  silencieux). `facecam.json` garde `candidate_rect` (choix de Claude),
+  `refined_rect` et `refine_reason`.
+- **Dépôt GitHub renommé en TiktokClipper** : les liens de la documentation et
+  du changelog pointent vers le nouveau nom.
+
+### Corrigé
+
+- **Statistiques TikTok : le relevé ne s'arrête plus sur `viewers_card`**
+  (TASK-429d) : les repères des onglets Spectateurs et Engagement n'avaient
+  jamais été confirmés sur la vraie page et le relevé s'arrêtait avec « élément
+  attendu absent après 30 s : viewers_card ». Les repères viennent maintenant
+  d'un relevé réel en lecture seule (cartes `AnalyticsCard_CardWrapper`) ; les
+  barres et les valeurs « <1 % » sont lues, la courbe de rétention (un canvas)
+  reste `null`, une valeur introuvable reste `null` ou arrête explicitement le
+  relevé, jamais devinée.
+- **Veille Steam : noms des jeux sans `GetAppList`** (TASK-7486) : Valve a
+  retiré `ISteamApps/GetAppList/v2` (HTTP 404), la source Steam tombait en
+  erreur. Les noms viennent maintenant de l'API magasin sans clé
+  (`store.steampowered.com/api/appdetails`), demandés seulement pour les jeux du
+  top, mis en cache sous `state/veille/steam_names.json` (un nom connu ne se
+  redemande pas) et plafonnés par `[veille] steam_name_lookups_max` (100) par
+  relevé. Un jeu dont le nom reste introuvable n'est pas relevé et sa raison est
+  gardée (`unnamed` dans l'état de la source), jamais un nom inventé.
+- **Veille Steam : montée immédiate par le rang** (TASK-7486) : le relevé garde
+  `rank` et `last_week_rank` de `GetMostPlayedGames` ; chaque jeu porte
+  `steam_rank_gain` (gain de rang vs semaine dernière) et `steam_new_in_top`
+  (`last_week_rank` 0 = nouveau dans le top, sans gain chiffré ; champ absent =
+  `null`), transmis à Claude avec les candidats à côté de la montée vs 7 jours,
+  qui reste `null` tant que l'historique manque.
+
 
 ## [0.4.2] - 2026-10-06
 
@@ -796,7 +831,8 @@ verticaux sous-titrés, en local.
 - Aucune publication automatique sur TikTok : le dépôt produit les clips
   et leurs métadonnées, la mise en ligne reste manuelle.
 
-[Non publié]: https://github.com/ZeDKouill3/TiktokClipper/compare/v0.4.2...HEAD
+[Non publié]: https://github.com/ZeDKouill3/TiktokClipper/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/ZeDKouill3/TiktokClipper/compare/v0.4.2...v0.5.0
 [0.4.2]: https://github.com/ZeDKouill3/TiktokClipper/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/ZeDKouill3/TiktokClipper/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/ZeDKouill3/TiktokClipper/compare/v0.3.0...v0.4.0

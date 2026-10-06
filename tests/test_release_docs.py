@@ -251,13 +251,13 @@ def test_readme_portable_zip_points_to_the_release_with_the_current_version():
 def test_versions_row_for_the_current_version_names_the_release_headline():
     lines = _read(VERSIONS).splitlines()
     row = next(line for line in lines if line.startswith(f"| {TAG} "))
-    assert "Webcam du stream trouvée par période" in row
+    assert "Veille des sujets chauds" in row
 
 
 REQUIRED_CHANGELOG_TERMS = (
-    f"Clipper-portable-{VERSION}.zip", "Installer.bat", "mise à jour", "SPEC-4a9b",
-    "[network]", "expected_country", "refused_by_platform", "restreintes", "Purge",
-    "interrompue", "Afficher le badge", "30 posts récents", "pipeline.json",
+    f"Clipper-portable-{VERSION}.zip", "Installer.bat", "mise à jour", "Veille", "ADR-ca9a",
+    "SPEC-bdd9", "Clips courts", "short_clips", "Heure par clip", "mots-clés de recherche",
+    "refined_rect", "steam_fr", "viewers_card", "GetAppList", "/api/veille",
 )
 
 
