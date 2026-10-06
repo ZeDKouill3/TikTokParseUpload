@@ -97,6 +97,10 @@ cette version : cette section du changelog suffit. Le zip s'appelle
   lancement, donc conservé à la relance ou à la reprise.
 - Reframe : la coupe de la webcam est journalisée et le calcul en niveaux de
   gris reste en `uint8`.
+- Reframe : une vraie webcam encadrée n'est plus rejetée au contrôle par clip
+  quand son cadre réel est décalé de quelques pixels du rectangle retenu
+  (tolérance `facecam_clip_edge_tolerance`) ; avant, tous les clips d'un
+  stream pouvaient partir en letterbox.
 - Console : marges de la barre « Espace disque / Purger » de l'écran Vidéos.
 - Tests : le journal global n'écrit plus dans le vrai dossier `logs/` et aucun
   test n'appelle le vrai service de géolocalisation (les tests du navigateur
