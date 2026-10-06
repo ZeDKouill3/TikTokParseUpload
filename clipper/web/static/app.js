@@ -3,7 +3,7 @@
    de video. Les ecrans eux-memes vivent dans screens.js. */
 "use strict";
 
-const SCREEN_IDS = ["dashboard", "videos", "review", "clips", "channels", "publish", "stats", "accounts", "settings", "journal"];
+const SCREEN_IDS = ["dashboard", "veille", "videos", "review", "clips", "channels", "publish", "stats", "accounts", "settings", "journal"];
 const POLL_MS = 5000;
 const THEME_KEY = "clipper-theme";
 const NOTIF_KEY = "clipper-notifications";
@@ -16,7 +16,7 @@ const NOTIFY_STATUS = {
   queued: { kind: "info", title: "Vidéo remise en file" },
 };
 
-const store = { videos: null, queue: null, channels: null };
+const store = { videos: null, queue: null, channels: null, veille: null };
 let currentScreen = null;
 let source = null;
 let pollHandle = null;
@@ -309,6 +309,8 @@ function updateCounts() {
   const set = (id, n) => $$(`[data-count-for="${id}"]`).forEach((el) => { el.textContent = n; el.hidden = !n; });
   set("videos", videos.filter((v) => v.status === "running").length);
   set("review", videos.filter((v) => v.status === "awaiting_review").length);
+  const proposals = (store.veille && store.veille.day && store.veille.day.proposals) || [];
+  set("veille", proposals.filter((p) => p.status === "proposed").length);
 }
 
 /* ---------- Actions de la file et des videos (T4 : confirmation) ---------- */
@@ -549,6 +551,7 @@ async function toggleNotifications() {
   refreshNetwork();
   setInterval(refreshNetwork, NET_REFRESH_MS);
   document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshNetwork(); });
+  loadVeille(); // compteur « Veille » de la navigation (propositions à décider) ; ses erreurs s'affichent dans l'écran
   Promise.all([loadVideos(), loadQueue(), loadChannels()])
     .then(() => { renderCurrent(); updateCounts(); })
     .catch((err) => {

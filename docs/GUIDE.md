@@ -284,6 +284,10 @@ La navigation (barre latérale, onglets en bas sur téléphone) donne :
    enregistrée ; section « Accès » (hôte, jeton masqué) en lecture seule avec
    la commande à lancer.
 
+En plus de ces écrans, **Veille** (juste après Accueil ; à la place de Vidéos dans
+la barre du bas sur téléphone) propose les VOD du jour à clipper, voir
+« Veille des sujets chauds » plus bas. L'écran Clips a un filtre « Archivés ».
+
 Toute erreur de l'API s'affiche en clair (toast et à la place de l'objet),
 jamais un tiret muet. Les actions qui ont un inverse (décision de revue,
 approbation) proposent « Annuler » pendant 5 secondes ; les autres (annuler un
@@ -337,9 +341,10 @@ mémoire seule (un redémarrage reprend où l'on en était) :
 - `state/queue.json` : la file de traitement ;
 - `state/watch/<chaine>.json` : surveillance (vidéos vues, VOD en attente de
   confirmation, dernière erreur) ;
-- `state/publish/<chaine>.json` : file de publication et créneaux pris.
+- `state/publish/<chaine>.json` : file de publication et créneaux pris ;
+- `state/veille/` : la veille des sujets chauds (voir plus bas).
 
-Chemins réglables dans `[worker]`, `[watch]` et `[publish]`. Les vidéos
+Chemins réglables dans `[worker]`, `[watch]`, `[publish]` et `[veille]`. Les vidéos
 elles-mêmes restent sous `workspace/<video_id>/` et `output/<video_id>/`.
 
 ### Surveillance des VOD
@@ -351,6 +356,64 @@ directs en cours et celles déjà vues. En mode `auto` les nouvelles VOD sont
 mises en file ; en mode `review` elles apparaissent « à confirmer » sur
 l'Accueil, où l'on choisit de les confirmer (mise en file) ou de les ignorer.
 Une erreur de listage est affichée (`last_error`), le style reste surveillé.
+
+### Veille des sujets chauds
+
+L'écran **Veille** propose chaque jour 2-3 VOD à clipper, choisies par Claude
+d'après ce qui monte sur Twitch, YouTube et Steam et d'après tes goûts. Elle
+est **désactivée par défaut** et ne fait rien tant que tu ne l'actives pas.
+
+**Activer.** Réglages › Veille : coche `enabled`, écris tes goûts en texte
+libre (`taste`), règle l'heure du relevé (`run_at`, heure de Paris, 07:00 par
+défaut) et saisis les clés ci-dessous. Le premier relevé a lieu à l'heure
+réglée, ou tout de suite avec « Rafraîchir ». Le relevé et le choix de Claude
+tournent dans le worker (`python -m clipper worker` doit être lancé) ; l'écran
+web ne fait qu'afficher et déposer tes demandes.
+
+**Clés Twitch** (obligatoires pour Twitch) : sur
+<https://dev.twitch.tv/console>, « Register Your Application » (nom libre,
+URL de redirection `http://localhost`, catégorie « Application Integration »),
+puis « Manage » : copie le *Client ID* et génère un *Client Secret*. Saisis-les
+dans `twitch_client_id` et `twitch_client_secret`.
+
+**Clé YouTube** (obligatoire pour YouTube) : dans la console Google Cloud
+(<https://console.cloud.google.com>), crée un projet, active **YouTube Data
+API v3**, puis « Identifiants » › « Créer des identifiants » › « Clé API ».
+Saisis-la dans `youtube_api_key`. Le quota par défaut est de 10 000 unités par
+jour ; un relevé coûte 1 unité (un appel `videos.list`), donc très loin de la
+limite.
+
+**Steam** n'a besoin d'aucune clé (API publique des joueurs connectés).
+
+Les clés s'écrivent dans `config.toml` (`[veille]`), jamais ailleurs : l'écran
+Réglages ne les réaffiche jamais (il dit seulement « saisie » ou « absente »),
+un champ laissé vide garde la valeur actuelle, et elles sont masquées dans le
+journal. Une source dont la clé manque ou qui répond en erreur est signalée en
+rouge sur l'écran avec la cause ; les autres sources et le choix de Claude
+continuent avec ce qu'il y a.
+
+**Coût.** Les appels aux sources sont gratuits (voir le quota YouTube
+ci-dessus). Claude est appelé **une seule fois par relevé** (usage `veille`,
+texte seul, modèle `strong`) ; ce coût apparaît avec les autres dans le coût
+LLM du tableau de bord. Aucun candidat : Claude n'est pas appelé.
+
+**Utiliser.** Chaque proposition affiche la raison de Claude et les chiffres
+(Δ sur 7 jours ; « pas assez d'historique » tant que moins de 2 relevés
+existent, « hors Steam » pour un jeu sans correspondance). Choisis le style,
+puis « Clipper » (la VOD part dans la file et ne sera plus proposée) ou
+« Ignorer » (elle ne sera plus jamais proposée). Parmi les clips des VOD de
+veille terminées le même jour, les `best_clips_per_day` meilleurs sont gardés ;
+les autres sont **archivés** : masqués de l'écran Clips (filtre « Archivés »
+pour les revoir), restaurables par « Restaurer », jamais supprimés. Un clip
+déjà approuvé, programmé ou publié n'est jamais archivé.
+
+**Où sont les fichiers.** Tout est en JSON lisible sous `state/veille/`
+(`[veille] state_dir`) : `days/<date>.json` (état du jour : sources, jeux,
+candidats, propositions), `history/<date>.json` (chiffres relevés, gardés
+`history_days` jours, base de la moyenne 7 jours), `selection/<date>.json`
+(clips gardés, archivés, restaurés), `seen.json` (VOD déjà mises en file ou
+ignorées), `refresh.json` (demande de « Rafraîchir », consommée par le worker)
+et `twitch_token.json` (jeton d'application Twitch, sans le secret).
 
 ### Notifications
 

@@ -12,6 +12,26 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ### Ajouté
 
+- **Veille des sujets chauds** (ADR-ca9a, SPEC-bdd9) : chaque jour le worker
+  relève ce qui monte sur Twitch (viewers FR par jeu), YouTube (vidéos
+  populaires FR) et Steam (joueurs), compare à la moyenne des 7 jours
+  précédents et demande à Claude (usage `veille`, un seul appel texte) de
+  proposer 2-3 VOD à clipper d'après tes goûts. Nouvel écran **Veille**
+  (navigation et barre basse mobile, compteur = propositions à décider) :
+  sources avec leur erreur visible, KPI, propositions avec la raison de Claude
+  et le choix du style, boutons « Clipper » / « Ignorer », « Rafraîchir »
+  (désactivé pendant un relevé), meilleurs clips du jour (les autres sont
+  archivés, jamais supprimés, avec « Restaurer »), tableau « ce qui monte »
+  (une donnée absente est expliquée, jamais un 0). Écran Clips : filtre
+  « Archivés » (les clips archivés sont masqués ailleurs). Routes
+  `/api/veille` (lecture et demandes seulement : le serveur web n'appelle ni
+  source ni LLM) et `GET /api/clips?archived=1`. Réglages › Veille : goûts,
+  nombres, heure, et les clés d'API (`twitch_client_id`,
+  `twitch_client_secret`, `youtube_api_key`) en écriture seule : jamais
+  renvoyées par `/api/settings` (seulement `<clé>_set`), masquées dans le
+  journal. Désactivée par défaut (`[veille] enabled = false`). Voir
+  `docs/GUIDE.md`, section « Veille des sujets chauds ».
+
 - **Clips courts** (TASK-4f5e) : interrupteur `[moments] short_clips` (défaut
   `false`, bornes `short_min` = 20 s et `short_max` = 45 s), réglable par style
   ou dans `config.toml`. Actif, il remplace les durées de la grille (clip

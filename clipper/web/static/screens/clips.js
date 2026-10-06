@@ -21,6 +21,7 @@ const CLIP_LOCKED = ["scheduled", "published"];
 const CLIPS_STALE_MS = 4000;
 const CLIPS_PAGE_SIZE = 24; // la galerie n'affiche que 24 clips a la fois (« Afficher plus »)
 
+const CLIPS_ARCHIVED = ["archived", "Archivés"]; // clips archivés par la veille (SPEC-bdd9 R9), masqués des autres filtres
 const clipsUi = { data: null, error: null, loading: null, dirty: false, at: 0, filter: "à valider", channel: "", video: "", hashVideo: null, html: "", shown: CLIPS_PAGE_SIZE, selecting: false, selected: new Set() };
 
 /* Vidéo visée par l'adresse : #/clips/<video_id> (lien « Voir les N clips » de la fiche vidéo), sinon "". */
@@ -28,7 +29,9 @@ const clipsHashVideo = () => decodeURIComponent((location.hash.replace(/^#\/?/, 
 
 /* Clips affichés : statut, style et vidéo choisis (chaque filtre vide = pas de filtre). L'ordre reçu (plus récents en haut) est gardé. */
 function clipsFiltered(all, ui) {
-  return all.filter((c) => (ui.filter === "all" || c.publish_status === ui.filter) && (!ui.channel || c.channel === ui.channel) && (!ui.video || c.video_id === ui.video));
+  if (ui.filter === "archived") all = all.filter((c) => c.veille && c.veille.status === "archived");
+  else all = all.filter((c) => !(c.veille && c.veille.status === "archived"));
+  return all.filter((c) => (ui.filter === "all" || ui.filter === "archived" || c.publish_status === ui.filter) && (!ui.channel || c.channel === ui.channel) && (!ui.video || c.video_id === ui.video));
 }
 
 const clipKey = (c) => `${c.video_id}/${c.clip_id}`;
@@ -45,7 +48,7 @@ function loadClips() {
   if (clipsUi.loading) { clipsUi.dirty = true; return clipsUi.loading; }
   clipsUi.loading = (async () => {
     try {
-      clipsUi.data = await api("/api/clips");
+      clipsUi.data = await api("/api/clips?archived=1");
       clipsUi.error = null;
     } catch (err) {
       clipsUi.error = err;
@@ -115,11 +118,12 @@ function clipsView(body) {
   const more = rest > 0
     ? `<div class="row" style="justify-content:center;margin-top:24px"><button type="button" class="btn" data-clips-more>Afficher plus<span class="n">${esc(Math.min(rest, CLIPS_PAGE_SIZE))}</span></button></div>` : "";
   const scoped = clipsFiltered(all, { filter: "all", channel: clipsUi.channel, video: clipsUi.video }); // les compteurs suivent les filtres vidéo et style
-  const count = (k) => (k === "all" ? scoped.length : scoped.filter((c) => c.publish_status === k).length);
+  const archivedCount = all.filter((c) => c.veille && c.veille.status === "archived" && (!clipsUi.channel || c.channel === clipsUi.channel) && (!clipsUi.video || c.video_id === clipsUi.video)).length;
+  const count = (k) => (k === "archived" ? archivedCount : k === "all" ? scoped.length : scoped.filter((c) => c.publish_status === k).length);
   const html = `
     ${clipsUi.error ? `<p class="reason bad">Actualisation impossible : ${esc(clipsUi.error.message || clipsUi.error)}</p>` : ""}
     <div class="toolbar">
-      <div class="seg" id="clips-filter">${CLIP_FILTERS.map(([k, l]) => `<button type="button" data-filter="${esc(k)}" class="${k === clipsUi.filter ? "on" : ""}">${esc(l)}<span class="n">${count(k)}</span></button>`).join("")}</div>
+      <div class="seg" id="clips-filter">${[...CLIP_FILTERS, ...(all.some((c) => c.veille && c.veille.status === "archived") || clipsUi.filter === "archived" ? [CLIPS_ARCHIVED] : [])].map(([k, l]) => `<button type="button" data-filter="${esc(k)}" class="${k === clipsUi.filter ? "on" : ""}">${esc(l)}<span class="n">${count(k)}</span></button>`).join("")}</div>
       <span class="grow"></span>
       <select class="input" id="clips-video" aria-label="Vidéo"><option value="">Toutes les vidéos</option>${videos.map((v) => `<option value="${esc(v)}"${v === clipsUi.video ? " selected" : ""}>${esc(v)}</option>`).join("")}</select>
       ${clipsUi.video ? `<button type="button" class="btn btn-xs" data-clear-video aria-label="Retirer le filtre vidéo">${icon("x", "i-xs")}Vidéo : ${esc(clipsUi.video)}</button>` : ""}

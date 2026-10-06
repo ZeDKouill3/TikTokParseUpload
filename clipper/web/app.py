@@ -49,6 +49,7 @@ from clipper import reframe as reframe_mod
 from clipper import render as render_mod
 from clipper import tiktok as tiktok_mod
 from clipper import youtube as youtube_mod
+from clipper import veille as veille_mod
 from clipper import watch as watch_mod
 from clipper import workspace as workspace_mod
 from clipper import worker as worker_mod
@@ -897,17 +898,102 @@ def _iter_clips(config: Config, channel: str | None, video_id: str | None
 
 
 def _list_clip_views(config: Config, channel: str | None, video_id: str | None,
-                     status: str | None) -> list[dict[str, Any]]:
+                     status: str | None, archived: bool = True) -> list[dict[str, Any]]:
+    """``archived`` faux : les clips archivés par la veille sont masqués (SPEC-bdd9 R9)."""
     clips = []
+    veille_status = _veille_clip_status(config)
     jury_by_video: dict[str, dict[Any, tuple[Any, Any]]] = {}
     for video, video_channel, sidecar, entry in _iter_clips(config, channel, video_id):
         if video not in jury_by_video:
             jury_by_video[video] = _moments_jury_confidences(config, video)
         clip = _clip_view(sidecar, video_channel, entry, jury_by_video[video])
+        clip["veille"] = veille_status.get((video, clip["clip_id"]))
+        if clip["veille"] and clip["veille"]["status"] == "archived" and not archived:
+            continue
         if status is None or clip["publish_status"] == status:
             clips.append(clip)
     clips.sort(key=lambda c: str(c.get("created_at") or ""), reverse=True)  # plus récents en haut (tri stable)
     return clips
+
+
+# --------------------------------------------------------------------------
+# Veille (SPEC-bdd9 R9, ADR-ca9a) : le web lit state/veille/ et depose des
+# demandes (refresh.json, Clipper, Ignorer, Restaurer par clipper.veille) ;
+# aucun collecteur ni LLM ici (ADR-09ad).
+# --------------------------------------------------------------------------
+
+_VEILLE_SECRETS = ("twitch_client_id", "twitch_client_secret", "youtube_api_key")
+_VEILLE_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def _veille_table(config: Config) -> dict[str, Any]:
+    try:
+        return veille_mod.settings(config)
+    except veille_mod.VeilleError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+def _veille_dir(config: Config) -> Path:
+    return Path(str(_veille_table(config)["state_dir"]))
+
+
+def _veille_json(path: Path, default: Any) -> Any:
+    if not path.is_file():
+        return default
+    try:
+        return _read_json(path)
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=500, detail=f"fichier d'état de la veille illisible ({path.name}) : {exc}") from exc
+
+
+def _veille_days(sdir: Path) -> list[str]:
+    folder = sdir / "days"
+    return sorted(p.stem for p in folder.glob("*.json") if _VEILLE_DATE.fullmatch(p.stem)) if folder.is_dir() else []
+
+
+def _veille_next_run_at(table: dict[str, Any], sdir: Path) -> str | None:
+    """Prochain relevé : ``run_at`` aujourd'hui s'il n'a pas eu lieu (ou est repris), sinon demain."""
+    if not table["enabled"]:
+        return None
+    tz = ZoneInfo(str(table["timezone"]))
+    now = datetime.now(tz)
+    hour, minute = (int(part) for part in str(table["run_at"]).split(":"))
+    slot = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    day = _veille_json(sdir / "days" / f"{now.date().isoformat()}.json", None)
+    if day is not None and day.get("finished_at") is not None:
+        slot += timedelta(days=1)
+    return slot.isoformat()
+
+
+def _veille_view(config: Config, date_: str | None) -> dict[str, Any]:
+    table = _veille_table(config)
+    sdir = Path(str(table["state_dir"]))
+    if date_ is None:
+        days = _veille_days(sdir)
+        today_ = datetime.now(ZoneInfo(str(table["timezone"]))).date().isoformat()
+        date_ = today_ if today_ in days else (days[-1] if days else None)
+    day = _veille_json(sdir / "days" / f"{date_}.json", None) if date_ else None
+    selection = _veille_json(sdir / "selection" / f"{date_}.json", None) if date_ else None
+    return {
+        "date": date_, "day": day, "selection": selection, "enabled": bool(table["enabled"]),
+        "running": bool(day and day.get("started_at") and not day.get("finished_at")),
+        "next_run_at": _veille_next_run_at(table, sdir),
+        "settings": {k: v for k, v in table.items() if k not in _VEILLE_SECRETS},
+        **{f"{key}_set": bool(table[key]) for key in _VEILLE_SECRETS},
+    }
+
+
+def _veille_clip_status(config: Config) -> dict[tuple[str, str], dict[str, str]]:
+    """(video_id, clip_id) -> {date, status} d'après selection/<date>.json ; un clip hors veille est absent."""
+    folder = _veille_dir(config) / "selection"
+    found: dict[tuple[str, str], dict[str, str]] = {}
+    for path in sorted(folder.glob("*.json")) if folder.is_dir() else []:
+        selection = _veille_json(path, {})
+        for status, rows in (("kept", selection.get("kept", [])), ("archived", selection.get("archived", [])),
+                             ("restored", selection.get("restored", []))):
+            for row in rows:
+                found[(row["video_id"], row["clip_id"])] = {"date": str(selection.get("date", path.stem)), "status": status}
+    return found
 
 
 def _channel_names() -> list[str]:
@@ -921,6 +1007,11 @@ class _NoChannel(HTTPException):
     def __init__(self, detail: str, video_id: str, channels: list[str]) -> None:
         super().__init__(status_code=409, detail=detail)
         self.video_id, self.channels = video_id, channels
+
+
+class VeilleClipBody(BaseModel):
+    channel: str | None = None
+    short_clips: StrictBool | None = None
 
 
 class PurgeBody(BaseModel):
@@ -1200,7 +1291,7 @@ def _save_channel_preset(name: str, preset: dict[str, Any]) -> None:
 # --------------------------------------------------------------------------
 
 _SETTINGS_FLAT = tuple(_CONFIG_FLAT_DEFAULTS)
-_SETTINGS_SECTIONS = ("llm", "web", "worker", "network")
+_SETTINGS_SECTIONS = ("llm", "web", "worker", "network", "veille")
 _SETTINGS_TOKEN_MASK = "•" * 8
 _SETTINGS_QUOTED = re.compile(r'"(?:[^"\\]|\\.)*"|\'[^\']*\'')
 
@@ -1222,6 +1313,13 @@ def _settings_has_comments(text: str) -> bool:
 
 def _settings_without_token(web: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in web.items() if k != "token"}
+
+
+def _settings_veille_masked(veille: dict[str, Any]) -> dict[str, Any]:
+    """[veille] sans la valeur des clés : seulement ``<clé>_set`` (SPEC-bdd9 R8)."""
+    out = {k: v for k, v in veille.items() if k not in _VEILLE_SECRETS}
+    out.update({f"{key}_set": bool(veille.get(key)) for key in _VEILLE_SECRETS})
+    return out
 
 
 def _settings_access(web_cfg: dict[str, Any], file_web: dict[str, Any]) -> dict[str, Any]:
@@ -1263,8 +1361,13 @@ def _settings_detail(running_web: dict[str, Any]) -> dict[str, Any]:
     file_web = effective["web"]
     effective["web"] = _settings_without_token(file_web)
     defaults["web"].pop("token", None)
+    effective["veille"] = _settings_veille_masked(effective["veille"])
+    for key in _VEILLE_SECRETS:
+        defaults["veille"].pop(key, None)
     if "web" in raw:
         raw = {**raw, "web": _settings_without_token(raw["web"])}
+    if "veille" in raw:
+        raw = {**raw, "veille": _settings_veille_masked(raw["veille"])}
     restart = any(file_web[k] != running_web[k] for k in ("host", "port", "token"))
     return {
         "path": _BASE_CONFIG, "exists": exists, "comments_lost": _settings_has_comments(text),
@@ -1340,6 +1443,10 @@ def _settings_merge(raw: dict[str, Any], settings: dict[str, Any]) -> dict[str, 
     token = raw.get("web", {}).get("token", "")
     if "web" in settings and token:
         data["web"]["token"] = token
+    if "veille" in settings:  # les clés absentes du corps sont gardées (SPEC-bdd9 R8)
+        for key in _VEILLE_SECRETS:
+            if key not in settings["veille"] and key in raw.get("veille", {}):
+                data["veille"][key] = raw["veille"][key]
     final_web = data.get("web", {})
     if final_web.get("host", _section_defaults("web")["host"]) != _LOOPBACK_HOST and not final_web.get("token"):
         raise ConfigError(
@@ -2477,7 +2584,7 @@ def create_app(config: Config | None = None) -> FastAPI:
 
     @app.get("/api/clips")
     def list_all_clips(channel: str | None = None, video_id: str | None = None,
-                       status: str | None = None) -> list[dict[str, Any]]:
+                       status: str | None = None, archived: int = 0) -> list[dict[str, Any]]:
         if video_id is not None:
             _validate_video_id(video_id)
         if status is not None and status not in _CLIP_STATUSES:
@@ -2485,7 +2592,7 @@ def create_app(config: Config | None = None) -> FastAPI:
                 status_code=400,
                 detail=f"statut inconnu : {status!r} (attendu : {', '.join(_CLIP_STATUSES)})",
             )
-        return _list_clip_views(config, channel or None, video_id, status)
+        return _list_clip_views(config, channel or None, video_id, status, archived=bool(archived))
 
     def _decide(video_id: str, clip_id: str, action: str, **extra: Any) -> dict[str, Any]:
         _validate_video_id(video_id)
@@ -2978,6 +3085,64 @@ def create_app(config: Config | None = None) -> FastAPI:
         except watch_mod.WatchError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return {"channel": channel, "video_id": video_id, "ignored": True}
+
+    # ----------------------------------------------------------------
+    # Veille des sujets chauds (SPEC-bdd9 R9) : lecture + demandes seulement
+    # ----------------------------------------------------------------
+
+    @app.get("/api/veille")
+    def get_veille() -> dict[str, Any]:
+        return _veille_view(config, None)
+
+    @app.post("/api/veille/refresh", status_code=202)
+    def veille_refresh() -> dict[str, Any]:
+        view = _veille_view(config, None)
+        if not view["enabled"]:
+            raise HTTPException(status_code=409, detail="la veille est désactivée : l'activer dans Réglages › Veille")
+        if view["running"]:
+            raise HTTPException(status_code=409, detail="un relevé de la veille est déjà en cours")
+        request = {"requested_at": _now_iso()}
+        path = _veille_dir(config) / "refresh.json"
+        channel_mod.atomic_write_json(path, request)
+        return request
+
+    @app.get("/api/veille/{day}")
+    def get_veille_day(day: str) -> dict[str, Any]:
+        view = _veille_view(config, day) if _VEILLE_DATE.fullmatch(day) else None
+        if view is None or view["day"] is None:
+            raise HTTPException(status_code=404, detail=f"aucun relevé de veille pour le {day}")
+        return view
+
+    @app.post("/api/veille/clips/{video_id}/{clip_id}/restore")
+    def veille_restore(video_id: str, clip_id: str) -> dict[str, Any]:
+        _validate_video_id(video_id)
+        _validate_clip_id(clip_id)
+        try:
+            veille_mod.restore(video_id, clip_id, config=config)
+        except veille_mod.VeilleError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"video_id": video_id, "clip_id": clip_id, "restored": True}
+
+    def _veille_decide(action: str, day: str, candidate_id: str, *args: Any) -> Any:
+        try:
+            return getattr(veille_mod, action)(day, candidate_id, *args, config=config)
+        except veille_mod.VeilleError as exc:
+            message = str(exc)
+            status = 409 if "déjà traité" in message else 404 if ("inconnu" in message or "aucun relevé" in message) else 422
+            raise HTTPException(status_code=status, detail=message) from exc
+
+    @app.post("/api/veille/{day}/{candidate_id}/clip", status_code=202)
+    def veille_clip(day: str, candidate_id: str, body: VeilleClipBody | None = None) -> JSONResponse:
+        body = body or VeilleClipBody()
+        if body.channel:
+            _validate_channel_name(body.channel)
+        entry = _veille_decide("clip", day, candidate_id, body.channel or None, body.short_clips)
+        return JSONResponse(entry, status_code=202)
+
+    @app.post("/api/veille/{day}/{candidate_id}/ignore")
+    def veille_ignore(day: str, candidate_id: str) -> dict[str, Any]:
+        _veille_decide("ignore", day, candidate_id)
+        return {"date": day, "candidate_id": candidate_id, "ignored": True}
 
     # ----------------------------------------------------------------
     # Chaines (SPEC-74e9 §1) et temps reel (ADR-35b7 §4)

@@ -45,7 +45,7 @@ CONFIG_DEFAULTS: dict[str, object] = {
 PARIS = ZoneInfo("Europe/Paris")
 
 _FILE_RE = re.compile(r"^journal-(\d{4})-(\d{2})-(\d{2})\.log$")
-_SECRET_KEY_RE = re.compile(r"(password|mot_de_passe|cookie|token|jeton)", re.IGNORECASE)
+_SECRET_KEY_RE = re.compile(r"(password|mot_de_passe|cookie|token|jeton|client_secret|api_key)", re.IGNORECASE)
 _MASKED = "***"
 _FIELD_SEP = "\t"
 _LOCK_BYTE = 1
