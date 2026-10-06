@@ -29,6 +29,32 @@ def _no_real_geolocation():
     network.reset()
 
 
+@pytest.fixture(autouse=True)
+def _journal_in_tmp(tmp_path, monkeypatch):
+    """Le journal global (clipper.journal) ne s'ecrit jamais dans le vrai logs/ du depot (TASK-8f03) :
+    le handler installe pendant un test (clipper.__main__, TestClient, worker) par ``journal.install``
+    avec un dossier relatif (le "logs" par defaut, resolu contre le cwd du depot) est redirige sous
+    tmp_path. Un dossier absolu (tests qui choisissent leur dossier) reste tel quel ; CONFIG_DEFAULTS
+    n'est pas modifie (test_config verifie la valeur reelle)."""
+    from pathlib import Path
+
+    from clipper import journal
+
+    real_install = journal.install
+
+    class _TmpJournalConfig:
+        def __init__(self, config):
+            self._config = config
+
+        def section(self, name):
+            values = self._config.section(name)
+            if name == "journal" and not Path(values["dir"]).is_absolute():
+                values = {**values, "dir": str(tmp_path / values["dir"])}
+            return values
+
+    monkeypatch.setattr(journal, "install", lambda kind, config: real_install(kind, _TmpJournalConfig(config)))
+
+
 @pytest.fixture
 def isolated_cwd(tmp_path, monkeypatch):
     """Run a test with cwd set to an empty temp dir, so config/workspace
