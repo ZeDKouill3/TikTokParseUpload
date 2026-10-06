@@ -17,6 +17,7 @@ Numérotation : versionnage sémantique, `MAJEUR.MINEUR.CORRECTIF`.
 | v0.4.1 | Installeur portable Windows et calendrier Jour/Semaine/Mois ([détails](CHANGELOG.md)) | publiée |
 | v0.4.2 | Webcam du stream trouvée par période avec Claude, garde-fou du pays de l'IP, publication TikTok plus robuste, purge disque et reprise des vidéos interrompues ([détails](CHANGELOG.md)) | publiée |
 | v0.5.0 | Veille des sujets chauds (Twitch, YouTube, Steam, choix de Claude), clips courts, heure libre par clip dans les séries programmées, légendes avec mots-clés de recherche, recalage de la webcam, statistiques TikTok relues sur la vraie page ([détails](CHANGELOG.md)) | publiée |
+| v0.5.1 | Veille : miniatures des VOD, VOD privées écartées, libellé Steam corrigé ([détails](CHANGELOG.md)) | publiée |
 | v0.6.0 | Mode auto de bout en bout : vidéo en entrée, clips publiés sans intervention | après une semaine d'usage réel |
 | v1.0.0 | Stable | quand tous les critères ci-dessous sont tenus |
 

@@ -251,13 +251,12 @@ def test_readme_portable_zip_points_to_the_release_with_the_current_version():
 def test_versions_row_for_the_current_version_names_the_release_headline():
     lines = _read(VERSIONS).splitlines()
     row = next(line for line in lines if line.startswith(f"| {TAG} "))
-    assert "Veille des sujets chauds" in row
+    assert "Veille" in row
 
 
 REQUIRED_CHANGELOG_TERMS = (
-    f"Clipper-portable-{VERSION}.zip", "Installer.bat", "mise à jour", "Veille", "ADR-ca9a",
-    "SPEC-bdd9", "Clips courts", "short_clips", "Heure par clip", "mots-clés de recherche",
-    "refined_rect", "steam_fr", "viewers_card", "GetAppList", "/api/veille",
+    f"Clipper-portable-{VERSION}.zip", "Installer.bat", "mise à jour", "Veille", "miniature",
+    "viewable", "abonnés", "Steam",
 )
 
 
@@ -265,6 +264,14 @@ REQUIRED_CHANGELOG_TERMS = (
 def test_changelog_current_version_covers_the_release_changes(term):
     body = _changelog_section(_read(CHANGELOG), rf"\[{ESC_VERSION}\]")
     assert term in body, f"{term!r} absent de la section [{VERSION}]"
+
+
+def test_changelog_current_version_does_not_claim_subscriber_vods_are_excluded():
+    # L'API Twitch renvoie viewable=public pour une VOD abonnés : seules les VOD privées sont écartées.
+    body = _changelog_section(_read(CHANGELOG), rf"\[{ESC_VERSION}\]")
+    flat = " ".join(body.split())
+    assert "viewable = public" in flat
+    assert "ne sont pas détectées" in flat
 
 
 def test_changelog_current_version_has_no_separate_release_notes_file():

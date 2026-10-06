@@ -10,18 +10,31 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ## [Non publié]
 
+## [0.5.1] - 2026-10-06
+
+Petite version de correction autour de la veille (écran Veille). Le zip
+s'appelle `Clipper-portable-0.5.1.zip` ; la mise à jour se fait en relançant
+`Installer.bat` depuis ce zip, tes données ne sont pas touchées. Aucun nouveau
+réglage : la veille reste désactivée par défaut (`[veille] enabled = false`).
+
 ### Ajouté
 
 - Veille : chaque VOD proposée (Twitch et YouTube) affiche sa miniature, lue dans
-  la réponse de l'API, à la place du bloc gris (qui reste si la miniature manque).
-- Veille : le détail de la source Twitch compte les VOD réservées aux abonnés ou
-  privées écartées.
+  la réponse de l'API, à la place du bloc gris (qui reste si la miniature manque
+  ou si la VOD Twitch est encore en cours de traitement).
+- Veille : le détail de la source Twitch indique combien de VOD privées ont été
+  écartées.
 
 ### Corrigé
 
-- Veille : une VOD Twitch réservée aux abonnés ou privée n'est plus jamais proposée.
+- Veille : une VOD Twitch privée n'est plus jamais proposée (champ `viewable` de
+  l'API Twitch différent de `public`). Limite connue : l'API Twitch renvoie
+  `viewable = public` pour une VOD réservée aux abonnés, donc ces VOD ne sont
+  pas détectées et peuvent encore être proposées ; elles échouent alors au
+  téléchargement (contenu réservé aux abonnés).
 - Veille : un jeu présent dans les ventes Steam FR mais absent du top joueurs
-  affiche son rang de ventes et sa montée au lieu de « hors Steam ».
+  affiche son rang de ventes et sa montée au lieu de « hors Steam ». « Hors
+  Steam » ne reste que pour un jeu absent de toutes les sources Steam.
 
 ## [0.5.0] - 2026-10-06
 
@@ -844,7 +857,8 @@ verticaux sous-titrés, en local.
 - Aucune publication automatique sur TikTok : le dépôt produit les clips
   et leurs métadonnées, la mise en ligne reste manuelle.
 
-[Non publié]: https://github.com/ZeDKouill3/TiktokClipper/compare/v0.5.0...HEAD
+[Non publié]: https://github.com/ZeDKouill3/TiktokClipper/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/ZeDKouill3/TiktokClipper/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/ZeDKouill3/TiktokClipper/compare/v0.4.2...v0.5.0
 [0.4.2]: https://github.com/ZeDKouill3/TiktokClipper/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/ZeDKouill3/TiktokClipper/compare/v0.4.0...v0.4.1
