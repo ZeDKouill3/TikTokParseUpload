@@ -142,12 +142,17 @@ def enqueue(
     force_steps: list[str] | None = None,
     *,
     config: Config | None = None,
+    short_clips: bool | None = None,
 ) -> dict[str, Any]:
     """Ajoute une entree a la file (SPEC-74e9 §2.1), ecriture atomique.
+    ``short_clips`` (TASK-4f5e) : choix de la video pour les clips courts ;
+    None = non precise, l'entree n'a alors pas le champ (valeur du style).
     ``url`` est l'URL source pour ``action="run"``, le video_id pour
     ``action="render"`` (deja lance, pas d'URL a resoudre). Refuse un
     doublon deja ``waiting`` pour le meme video_id et la meme action
     (SPEC-74e9 §2.2)."""
+    if short_clips is not None and not isinstance(short_clips, bool):
+        raise WorkerError(f"short_clips invalide : {short_clips!r} (attendu : true ou false)")
     if action == "run":
         # clipper.download est une etape (ADR-b16b) : le worker n'importe
         # que clipper.pipeline, qui l'importe deja pour l'enchainement des
@@ -171,6 +176,7 @@ def enqueue(
         "enqueued_at": _now_iso(),
         "status": "waiting",
         "pid": None,
+        **({} if short_clips is None else {"short_clips": short_clips}),
     }
     with _locked(path):
         entries = _read_queue(path)
@@ -414,6 +420,8 @@ def _build_command(entry: dict[str, Any]) -> list[str]:
     cmd += [entry["action"], entry["url"] if entry["action"] == "run" else entry["video_id"]]
     for step in entry.get("force_steps") or []:
         cmd += ["--force-step", step]
+    if "short_clips" in entry:  # absent : valeur du style (anciennes entrees)
+        cmd.append("--short-clips" if entry["short_clips"] else "--no-short-clips")
     return cmd
 
 

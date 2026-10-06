@@ -51,12 +51,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--force", action="store_true", help="Relance les etapes deja faites")
     p.add_argument("--force-step", action="append", dest="force_step", metavar="ETAPE",
                    help="Relance cette etape et les suivantes (repetable)")
+    p.add_argument("--short-clips", action=argparse.BooleanOptionalAction, default=None, dest="short_clips",
+                   help="Clips courts pour cette video (sinon : [moments] short_clips du style)")
 
     p = sub.add_parser("render", help="Reprend une video apres la revue (ou apres un echec) jusqu'au bout")
     p.add_argument("video_id")
     p.add_argument("--force", action="store_true", help="Relance les etapes deja faites")
     p.add_argument("--force-step", action="append", dest="force_step", metavar="ETAPE",
                    help="Relance cette etape et les suivantes (repetable)")
+    p.add_argument("--short-clips", action=argparse.BooleanOptionalAction, default=None, dest="short_clips",
+                   help="Clips courts si l'etape moments est relancee (sinon : valeur du style)")
 
     p = sub.add_parser("decide", help="Enregistre la decision humaine sur un moment (mode review)")
     p.add_argument("video_id")
@@ -331,13 +335,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "run":
             video_id = download.extract_video_id(args.url)
             state = _run_with_progress(
-                lambda: pipeline.run(args.url, config=config, force=args.force, force_steps=args.force_step),
+                lambda: pipeline.run(args.url, config=config, force=args.force, force_steps=args.force_step,
+                                     short_clips=args.short_clips),
                 video_id, config, args.force,
             )
         elif args.command == "render":
             state = _run_with_progress(
                 lambda: pipeline.render(args.video_id, config=config, force=args.force,
-                                        force_steps=args.force_step),
+                                        force_steps=args.force_step, short_clips=args.short_clips),
                 args.video_id, config, args.force,
             )
         elif args.command == "decide":

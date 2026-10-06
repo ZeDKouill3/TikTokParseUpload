@@ -147,6 +147,12 @@ CONFIG_DEFAULTS: dict[str, object] = {
         "par contre", "puis", "ensuite", "pourtant", "sinon", "car", "en plus",
         "d'ailleurs", "bon ben", "c'est pour ça que",
     ],
+    # Clips courts : les clips durent entre short_min et short_max secondes et démarrent sur le moment fort ; choix possible vidéo par vidéo.
+    "short_clips": False,
+    # Durée minimale d'un clip court, en secondes.
+    "short_min": 20,
+    # Durée maximale d'un clip court, en secondes.
+    "short_max": 45,
 }
 
 FORMATS = ("single", "multipart")
@@ -570,7 +576,16 @@ _ROLE = (
 )
 
 
-def _moments_prompt(context: str, rubric: dict[str, Any], lines: list[str], part: tuple[int, int] | None) -> str:
+_SHORT_RULE = (
+    "6. CLIP COURT : le clip demarre directement sur le moment fort, l'accroche tombe dans les 2 "
+    "premieres secondes, sans mise en place ni preambule ; il reste comprehensible seul, sans le "
+    "contexte d'avant.\n"
+)
+
+
+def _moments_prompt(
+    context: str, rubric: dict[str, Any], lines: list[str], part: tuple[int, int] | None, short: bool = False
+) -> str:
     if part is None:
         scope = "## Transcription complete (une ligne par phrase : [debut-fin] en secondes)\n"
     else:
@@ -585,6 +600,7 @@ def _moments_prompt(context: str, rubric: dict[str, Any], lines: list[str], part
         "viral, et note chacun selon la grille. Propose aussi ceux dont tu doutes (en general 5 a 30 "
         "pour une video de plusieurs heures) : le tri se fait apres, sur tes notes.\n\n"
         + _grid_text(rubric)
+        + (_SHORT_RULE if short else "")
         + "\n"
         + context
         + "\n"
@@ -973,6 +989,58 @@ def _selection(config: Any, settings: dict[str, Any]) -> str:
     return "jury" if config.mode == "auto" else selection
 
 
+def _short_mode(settings: dict[str, Any], override: bool | None) -> tuple[bool, float, float]:
+    """(actif, short_min, short_max) : ``override`` (option de la video) l'emporte
+    sur [moments] short_clips (style) quand il est precise. Toute valeur invalide
+    est une MomentsError (ADR-ad2e), les bornes comprises quand le mode est actif."""
+    if override is not None and not isinstance(override, bool):
+        raise MomentsError(f"short_clips invalide : {override!r} (attendu : true ou false)")
+    style = settings["short_clips"]
+    if not isinstance(style, bool):
+        raise MomentsError(f"[moments] short_clips invalide : {style!r} (attendu : true ou false)")
+    active = style if override is None else override
+    low, high = settings["short_min"], settings["short_max"]
+    if active:
+        if not _number(low) or low <= 0:
+            raise MomentsError(f"[moments] short_min invalide : {low!r} (attendu : nombre > 0)")
+        if not _number(high) or high <= low:
+            raise MomentsError(f"[moments] short_max invalide : {high!r} (attendu : nombre > short_min = {low:g})")
+    return active, low, high
+
+
+def _toml_key(key: str) -> str:
+    return key if key.replace("_", "").replace("-", "").isalnum() else json.dumps(key, ensure_ascii=False)
+
+
+def _toml_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return repr(value)
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, list):
+        return "[" + ", ".join(_toml_value(v) for v in value) + "]"
+    raise MomentsError(f"valeur de grille non ecrivable en TOML : {value!r}")
+
+
+def _toml_dumps(table: dict[str, Any], prefix: str = "") -> str:
+    out = [f"{_toml_key(k)} = {_toml_value(v)}\n" for k, v in table.items() if not isinstance(v, dict)]
+    for k, v in table.items():
+        if isinstance(v, dict):
+            name = f"{prefix}{_toml_key(k)}"
+            out.append(f"\n[{name}]\n" + _toml_dumps(v, f"{name}."))
+    return "".join(out)
+
+
+def _short_rubric(rubric: dict[str, Any], low: float, high: float) -> dict[str, Any]:
+    """La grille avec les bornes de duree du clip unique et des parties de serie
+    remplacees par short_min..short_max (le reste, tolerance et nombre de parties
+    compris, est celui de la grille)."""
+    durations = {**rubric["durations"], "single_min": low, "single_max": high, "part_min": low, "part_max": high}
+    return {**rubric, "durations": durations}
+
+
 def _exploration(settings: dict[str, Any]) -> tuple[float, int] | None:
     """(part, graine) de l'exploration, None si la part vaut 0 ; un reglage
     invalide est une MomentsError."""
@@ -991,11 +1059,13 @@ def run(
     config: Any = None,
     force: bool = False,
     examples: list[dict[str, Any]] | None = None,
+    short_clips: bool | None = None,
 ) -> Path:
     """Choisit les moments de la video et ecrit workspace/<video_id>/moments.json,
     dont le chemin est renvoye. Un resultat deja present n'est pas refait,
     sauf ``force`` ; si vision.json est plus recent que lui, il est seulement
-    re-note, sans appel LLM (voir ``_rescore``)."""
+    re-note, sans appel LLM (voir ``_rescore``). ``short_clips`` : choix de la
+    video pour les clips courts (None = valeur du style, [moments] short_clips)."""
     if config is None:
         from clipper.config import load_config
 
@@ -1018,6 +1088,13 @@ def run(
     connectors = _connectors(settings)
     rubric_path = resolve_rubric_path(settings["rubric_path"])
     rubric = load_rubric(rubric_path)
+    short, short_min, short_max = _short_mode(settings, short_clips)
+    effective_path = rubric_path
+    if short:
+        # L'etape parts relit ses bornes dans le fichier de grille que designe
+        # moments.json : on lui donne une copie aux bornes courtes.
+        rubric = _short_rubric(rubric, short_min, short_max)
+        effective_path = video_dir / "rubric-short.toml"
     examples = list(examples or [])
 
     sents = split_sentences(transcript)
@@ -1034,10 +1111,10 @@ def run(
         chunks = _chunks(sents, int(settings["chunk_chars"]), float(settings["chunk_overlap_seconds"]))
         raws = []
         for n, chunk in enumerate(chunks, 1):
-            prompt = _moments_prompt(context, rubric, [_line(s) for s in chunk], (n, len(chunks)))
+            prompt = _moments_prompt(context, rubric, [_line(s) for s in chunk], (n, len(chunks)), short)
             raws += llm.ask("moments", prompt, [], schema, config=config)["moments"]
     else:
-        raws = llm.ask("moments", _moments_prompt(context, rubric, lines, None), [], schema, config=config)["moments"]
+        raws = llm.ask("moments", _moments_prompt(context, rubric, lines, None, short), [], schema, config=config)["moments"]
 
     candidates: list[dict[str, Any]] = []
     rejected: list[dict[str, Any]] = []
@@ -1084,9 +1161,15 @@ def run(
         _log_jury_decisions(video_id, vetoed, rejected_scored, kept)
     _log_moments_summary(video_id, scored_count, len(kept), rejected + rejected_scored)
 
+    rubric_out = _rubric_info(rubric_path, rubric)
+    if short:
+        rubric_out = {**rubric_out, "path": str(effective_path), "source": str(rubric_path)}
+        _write_text(effective_path, _toml_dumps(rubric))
     result = {
         "video_id": video_id,
-        "rubric": _rubric_info(rubric_path, rubric),
+        "rubric": rubric_out,
+        "short_clips": short,
+        **({"short_min": short_min, "short_max": short_max} if short else {}),
         "chunked": chunked,
         "selection": selection,
         **({"jury": jury_info} if jury_info is not None else {}),
@@ -1098,11 +1181,15 @@ def run(
     return out
 
 
-def _write(out: Path, result: dict[str, Any]) -> None:
+def _write_text(out: Path, text: str) -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
-    tmp = out.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp = out.with_name(out.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
     tmp.replace(out)
+
+
+def _write(out: Path, result: dict[str, Any]) -> None:
+    _write_text(out, json.dumps(result, ensure_ascii=False, indent=2))
 
 
 def _restore(
@@ -1131,6 +1218,13 @@ def _restore(
         **{k: entry[k] for k in ("format", "parts", "scores", "bonus", "final_score", "justification", "hook_text")},
         **({"jury": entry["jury"]} if "jury" in entry else {}),
     }
+
+
+def _short_rubric_keys(previous: dict[str, Any]) -> dict[str, Any]:
+    """Grille aux bornes courtes d'un moments.json deja ecrit (``path`` du fichier
+    copie, ``source`` de la grille d'origine) : une re-notation les garde."""
+    rubric = previous.get("rubric") or {}
+    return {k: rubric[k] for k in ("path", "source") if k in rubric} if "source" in rubric else {}
 
 
 def _rescore(video_dir: Path, out: Path, settings: dict[str, Any]) -> Path:
@@ -1183,7 +1277,7 @@ def _rescore(video_dir: Path, out: Path, settings: dict[str, Any]) -> Path:
 
     result = {
         **{k: v for k, v in previous.items() if k != "exploration"},
-        "rubric": _rubric_info(rubric_path, rubric),
+        "rubric": {**_rubric_info(rubric_path, rubric), **_short_rubric_keys(previous)},
         **({"exploration": exploration_info} if exploration_info is not None else {}),
         "moments": moments_out,
         "rejected": unscored + rejected_scored,

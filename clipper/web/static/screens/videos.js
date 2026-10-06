@@ -374,7 +374,7 @@
         <div style="min-width:0">
           <h2 class="vtitle">${esc(video.title)}</h2>
           ${video.title_reason ? `<p class="muted vsub">${esc(video.title_reason)}</p>` : ""}
-          <div class="job-meta"><span class="mono">${esc(video.video_id)}</span>${video.channel ? `<span class="tag">${esc(video.channel)}</span>` : `<span class="muted">sans style</span>`}${video.source_url ? `<span class="mono">${esc(video.source_url)}</span>` : ""}${videoChip(video.status)}${video.rubric ? `<span class="muted">Grille : <span class="mono">${esc(video.rubric)}</span></span>` : ""}</div>
+          <div class="job-meta"><span class="mono">${esc(video.video_id)}</span>${video.channel ? `<span class="tag">${esc(video.channel)}</span>` : `<span class="muted">sans style</span>`}${video.source_url ? `<span class="mono">${esc(video.source_url)}</span>` : ""}${videoChip(video.status)}${video.rubric ? `<span class="muted">Grille : <span class="mono">${esc(video.rubric)}</span></span>` : ""}${video.short_clips ? `<span class="muted">Clips courts : ${video.short_clips.on ? `oui (${esc(video.short_clips.min)}-${esc(video.short_clips.max)} s)` : "non"}</span>` : ""}</div>
         </div>
         <div class="vactions">
           ${review ? `<a class="btn btn-primary" href="#/review/${enc}">${icon("sparkles")}Revoir les moments${(video.awaiting || []).length ? ` (${video.awaiting.length})` : ""}</a>` : ""}

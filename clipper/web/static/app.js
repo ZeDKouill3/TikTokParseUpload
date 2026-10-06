@@ -440,17 +440,32 @@ async function openAddVideo(channel) {
       <div class="field"><label for="add-channel">Style</label>
         <select class="input" id="add-channel" name="channel"><option value="">Sans style (config.toml)</option>${channels.map((c) => `<option value="${esc(c)}"${c === channel ? " selected" : ""}>${esc(c)}</option>`).join("")}</select>
         ${channels.length ? "" : `<span class="hint">Aucun style : crée-en une dans l'écran Styles.</span>`}</div>
+      <div class="field"><label><input type="checkbox" id="add-short" name="short_clips"> Clips courts <span class="muted" id="add-short-state"></span></label>
+        <span class="hint">20-45 s, le clip démarre sur le moment fort. Non précisé : valeur du style.</span></div>
     </div>
     <div class="modal-foot"><button type="button" class="btn btn-ghost" data-dismiss>Annuler</button><button type="submit" class="btn btn-primary">Mettre en file</button></div></form>`,
   (el) => {
     setTimeout(() => $("#add-url", el).focus(), 60);
+    // Trois états : non précisé (valeur du style) -> coché (on) -> décoché (off) -> non précisé.
+    const short = $("#add-short", el);
+    let shortClips = null;
+    const showShort = () => {
+      short.indeterminate = shortClips === null;
+      short.checked = shortClips === true;
+      $("#add-short-state", el).textContent = shortClips === null ? "(valeur du style)" : shortClips ? "(oui)" : "(non)";
+    };
+    short.onclick = () => {  // pas de preventDefault : le navigateur annulerait l'état posé par showShort
+      shortClips = shortClips === null ? true : shortClips === true ? false : null;
+      showShort();
+    };
+    showShort();
     $("#add-form", el).onsubmit = async (e) => {
       e.preventDefault();
       const url = $("#add-url", el).value.trim();
       const channel = $("#add-channel", el).value || null;
       closeLayer();
       try {
-        const entry = await api("/api/queue", jsonBody("POST", { url, channel, action: "run" }));
+        const entry = await api("/api/queue", jsonBody("POST", { url, channel, action: "run", ...(shortClips === null ? {} : { short_clips: shortClips }) }));
         toast({ kind: "ok", title: "Vidéo mise en file", body: entry.video_id });
         await Promise.all([loadVideos(), loadQueue()]);
         renderCurrent();
