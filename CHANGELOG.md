@@ -29,6 +29,17 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ### Ajouté
 
+- **Série programmée : coche « Heure par clip »** (TASK-fa00): dans « Programmer
+  une série », mode Manuel, une coche (décochée par défaut) donne à chaque clip
+  sélectionné (chaque partie d'un clip découpé) son propre champ date et heure
+  (heure de Paris), pré-rempli au rythme actuel (début + intervalle, ou à la
+  suite de la dernière programmation) et modifiable un par un. L'aperçu et la
+  création envoient la date de chaque clip (`clip_dates`) ; chaque date est
+  validée clip par clip côté Python avec les refus explicites habituels (fenêtre
+  maximale, avance minimale, plafonds, créneau déjà pris sur le compte, même
+  heure qu'un autre clip de la série) et le refus s'affiche sous le clip
+  concerné. Une partie datée avant (ou à la même heure que) la partie
+  précédente est refusée. Décochée : comportement inchangé.
 - **Veille : top des ventes Steam du pays** (TASK-2784) : nouvelle source
   `steam_fr` (`IStoreTopSellersService/GetWeeklyTopSellers`, sans clé, pays =
   `[veille] region`, langue = `[veille] language`, `steam_sellers_top` = 50

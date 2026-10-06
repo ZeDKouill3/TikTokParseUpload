@@ -2517,3 +2517,187 @@ def test_a_clip_refused_by_the_platform_is_never_republished_moved_edited_or_app
         publish.create_post("vid1", "01", "ma_chaine", account=_ACCOUNT, mode="immediate", now=NOW)
     assert publish.approval_refusal(publish.list_entries("ma_chaine")[0]) is not None
     assert publish.list_entries("ma_chaine")[0]["status"] == "refused_by_platform"
+
+
+# --------------------------------------------------------------------------
+# TASK-fa00f90a735a : coche « Heure par clip » du formulaire série (mode manuel) --
+# ``clip_dates`` : une date par clip, validée clip par clip, jamais calculée.
+# --------------------------------------------------------------------------
+
+
+def _per_clip_preview(cwd, clip_dates, selection, **kwargs):
+    kwargs.setdefault("mode", "manual")
+    kwargs.setdefault("selection", selection)
+    kwargs["clip_dates"] = clip_dates
+    kwargs.setdefault("interval_hours", None)
+    kwargs.setdefault("start_at", None)
+    return _auto_preview(cwd, **kwargs)
+
+
+def _two_clips(cwd):
+    _series_env(cwd)
+    _write_video_channel(cwd, "vid1", "ma_chaine")
+    _write_sidecar(cwd, "vid1", "a", score=50)
+    _write_sidecar(cwd, "vid1", "b", score=60)
+
+
+def test_per_clip_dates_are_used_as_given_in_any_order(isolated_cwd):
+    _two_clips(isolated_cwd)
+    late = SERIES_NOW + timedelta(hours=9)
+    early = SERIES_NOW + timedelta(hours=2)
+
+    preview = _per_clip_preview(
+        isolated_cwd, {("vid1", "a"): late, ("vid1", "b"): early}, [("vid1", "a"), ("vid1", "b")])
+
+    assert [(it["clip_id"], it["publish_at"], it["refusal"]) for it in preview["items"]] == [
+        ("a", late.isoformat(), None), ("b", early.isoformat(), None)]
+    assert preview["ok"] is True
+
+
+def test_per_clip_dates_refuse_each_clip_with_its_own_explicit_reason(isolated_cwd):
+    _two_clips(isolated_cwd)
+    _write_sidecar(isolated_cwd, "vid1", "c", score=40)
+    settings = _series_settings()
+    far = SERIES_NOW + timedelta(days=int(settings["schedule_max_days"]) + 5)
+
+    preview = _per_clip_preview(
+        isolated_cwd,
+        {("vid1", "a"): SERIES_NOW + timedelta(minutes=1), ("vid1", "b"): far,
+         ("vid1", "c"): SERIES_NOW + timedelta(hours=3)},
+        [("vid1", "a"), ("vid1", "b"), ("vid1", "c")], settings=settings)
+
+    refusals = {it["clip_id"]: it["refusal"] for it in preview["items"]}
+    assert "avance minimale" in refusals["a"]
+    assert "hors fenêtre" in refusals["b"]
+    assert refusals["c"] is None
+    assert preview["ok"] is False
+
+
+def test_per_clip_dates_refuse_two_clips_at_the_same_time(isolated_cwd):
+    _two_clips(isolated_cwd)
+    same = SERIES_NOW + timedelta(hours=3)
+
+    preview = _per_clip_preview(
+        isolated_cwd, {("vid1", "a"): same, ("vid1", "b"): same}, [("vid1", "a"), ("vid1", "b")])
+
+    assert preview["items"][0]["refusal"] is None
+    assert "même heure" in preview["items"][1]["refusal"]
+
+
+def test_per_clip_dates_refuse_a_slot_already_taken_on_the_account(isolated_cwd):
+    from clipper import publish
+
+    _two_clips(isolated_cwd)
+    _write_sidecar(isolated_cwd, "vid1", "z", score=10)
+    taken = SERIES_NOW + timedelta(hours=3)
+    publish.create_post("vid1", "z", "ma_chaine", account=_ACCOUNT, mode="scheduled", publish_at=taken,
+                        now=SERIES_NOW, settings=_series_settings())
+
+    preview = _per_clip_preview(
+        isolated_cwd, {("vid1", "a"): taken, ("vid1", "b"): taken + timedelta(hours=1)},
+        [("vid1", "a"), ("vid1", "b")])
+
+    assert "déjà pris" in preview["items"][0]["refusal"]
+    assert preview["items"][1]["refusal"] is None
+
+
+def test_per_clip_dates_respect_the_daily_cap(isolated_cwd):
+    _two_clips(isolated_cwd)
+    base = SERIES_NOW + timedelta(hours=1)
+
+    preview = _per_clip_preview(
+        isolated_cwd, {("vid1", "a"): base, ("vid1", "b"): base + timedelta(minutes=10)},
+        [("vid1", "a"), ("vid1", "b")], settings=_series_settings(max_posts_per_day=1))
+
+    assert preview["items"][0]["refusal"] is None
+    assert "plafond de 1 publication" in preview["items"][1]["refusal"]
+
+
+def test_per_clip_dates_refuse_a_part_dated_before_the_previous_part(isolated_cwd):
+    _series_env(isolated_cwd)
+    _write_video_channel(isolated_cwd, "vid1", "ma_chaine")
+    _write_sidecar(isolated_cwd, "vid1", "x-p1", score=50, part=1, parts_total=2)
+    _write_sidecar(isolated_cwd, "vid1", "x-p2", score=50, part=2, parts_total=2)
+
+    preview = _per_clip_preview(
+        isolated_cwd,
+        {("vid1", "x-p1"): SERIES_NOW + timedelta(hours=5), ("vid1", "x-p2"): SERIES_NOW + timedelta(hours=2)},
+        [("vid1", "x-p1")])
+
+    assert [it["clip_id"] for it in preview["items"]] == ["x-p1", "x-p2"]
+    assert preview["items"][0]["refusal"] is None
+    assert "partie" in preview["items"][1]["refusal"] and "x-p1" in preview["items"][1]["refusal"]
+    assert preview["ok"] is False
+
+
+def test_per_clip_dates_accept_parts_in_order(isolated_cwd):
+    _series_env(isolated_cwd)
+    _write_video_channel(isolated_cwd, "vid1", "ma_chaine")
+    _write_sidecar(isolated_cwd, "vid1", "x-p1", score=50, part=1, parts_total=2)
+    _write_sidecar(isolated_cwd, "vid1", "x-p2", score=50, part=2, parts_total=2)
+
+    preview = _per_clip_preview(
+        isolated_cwd,
+        {("vid1", "x-p1"): SERIES_NOW + timedelta(hours=2), ("vid1", "x-p2"): SERIES_NOW + timedelta(hours=5)},
+        [("vid1", "x-p2")])
+
+    assert preview["ok"] is True
+
+
+def test_per_clip_dates_need_a_date_for_every_selected_clip(isolated_cwd):
+    from clipper import publish
+
+    _two_clips(isolated_cwd)
+
+    with pytest.raises(publish.PublishError, match="vid1/b"):
+        _per_clip_preview(isolated_cwd, {("vid1", "a"): SERIES_NOW + timedelta(hours=2)},
+                          [("vid1", "a"), ("vid1", "b")])
+
+
+def test_per_clip_dates_are_manual_only_and_need_a_timezone(isolated_cwd):
+    from clipper import publish
+
+    _two_clips(isolated_cwd)
+    with pytest.raises(publish.PublishError, match="manuel"):
+        _per_clip_preview(isolated_cwd, {("vid1", "a"): SERIES_NOW + timedelta(hours=2)}, None,
+                          mode="auto", count=1)
+    with pytest.raises(publish.PublishError, match="fuseau"):
+        _per_clip_preview(isolated_cwd, {("vid1", "a"): datetime(2026, 10, 2, 9, 0)}, [("vid1", "a")])
+
+
+def test_without_clip_dates_a_missing_start_is_still_refused(isolated_cwd):
+    from clipper import publish
+
+    _two_clips(isolated_cwd)
+    with pytest.raises(publish.PublishError, match="début"):
+        _auto_preview(isolated_cwd, mode="manual", selection=[("vid1", "a")], start_at=None)
+
+
+def test_create_series_per_clip_dates_schedules_each_clip_at_its_date(isolated_cwd):
+    from clipper import publish
+
+    _two_clips(isolated_cwd)
+    late = SERIES_NOW + timedelta(hours=9)
+    early = SERIES_NOW + timedelta(hours=2)
+
+    created = publish.create_series(
+        mode="manual", style="ma_chaine", account=_ACCOUNT, service="tiktok", interval_hours=None, start_at=None,
+        selection=[("vid1", "a"), ("vid1", "b")], clip_dates={("vid1", "a"): late, ("vid1", "b"): early},
+        settings=_series_settings(), now=SERIES_NOW)
+
+    assert [(e["clip_id"], e["slot_at"]) for e in created] == [("a", late.isoformat()), ("b", early.isoformat())]
+
+
+def test_create_series_per_clip_dates_is_all_or_nothing(isolated_cwd):
+    from clipper import publish
+
+    _two_clips(isolated_cwd)
+    same = SERIES_NOW + timedelta(hours=3)
+
+    with pytest.raises(publish.PublishError, match="vid1/b"):
+        publish.create_series(
+            mode="manual", style="ma_chaine", account=_ACCOUNT, service="tiktok", interval_hours=None,
+            start_at=None, selection=[("vid1", "a"), ("vid1", "b")],
+            clip_dates={("vid1", "a"): same, ("vid1", "b"): same}, settings=_series_settings(), now=SERIES_NOW)
+
+    assert _read_state(isolated_cwd, "ma_chaine") == []

@@ -1569,6 +1569,22 @@ def _series_item_refusal(when: datetime, settings: dict[str, Any], now_dt: datet
     return None
 
 
+def _per_clip_refusal(
+    clip_id: str, when: datetime, previous: tuple[str, datetime] | None, account_taken: set[datetime],
+    series_taken: set[datetime],
+) -> str | None:
+    """Refus explicite (ADR-ad2e) propre a la date saisie clip par clip (TASK-fa00f90a735a) : creneau deja
+    pris sur le compte, meme heure qu'un autre clip de la serie, partie datee avant ou avec la precedente."""
+    if when in account_taken:
+        return f"créneau déjà pris sur ce compte : {when.isoformat()}"
+    if when in series_taken:
+        return f"même heure qu'un autre clip de la série : {when.isoformat()}"
+    if previous is not None and when <= previous[1]:
+        return (f"la partie doit être publiée après la partie précédente ({previous[0]}, "
+                f"{previous[1].isoformat()}) : choisis une date plus tardive")
+    return None
+
+
 def _auto_series_units(pool: list[dict[str, Any]], count: int) -> tuple[list[dict[str, Any]], int]:
     """Les meilleures unites (score decroissant) qui tiennent dans ``count`` posts : une unite trop grande
     pour les places restantes est sautee (jamais coupee), la suivante (par score) est tentee (complement
@@ -1626,10 +1642,11 @@ def preview_series(
     style: str | None,
     account: str,
     service: str = "tiktok",
-    interval_hours: int,
-    start_at: datetime,
+    interval_hours: int | None = None,
+    start_at: datetime | None = None,
     count: int | None = None,
     selection: list[tuple[str, str]] | None = None,
+    clip_dates: dict[tuple[str, str], datetime] | None = None,
     together: bool = True,
     settings: dict[str, Any] | None = None,
     now: datetime | None = None,
@@ -1656,7 +1673,11 @@ def preview_series(
     r-comptes 9) ; sans ``schedule``, celui du style sert encore (compatibilite) ; ``create_series`` doit
     passer le meme ``schedule`` qu'ici, sous peine d'un apercu « ok » que la creation refuse. Rend
     ``{"items", "available", "requested", "insufficient", "insufficient_reason", "ok"}`` ; ``ok`` est faux
-    des qu'un item est refuse ou que la serie est incomplete."""
+    des qu'un item est refuse ou que la serie est incomplete. ``clip_dates`` (coche « Heure par clip »,
+    TASK-fa00f90a735a, mode manuel seulement) : la date de CHAQUE clip de la serie (parties incluses), libre
+    et sans fuseau implicite ; ``interval_hours`` et ``start_at`` sont alors ignores. Chaque date est validee
+    clip par clip (memes refus que ci-dessus, plus « creneau deja pris » sur le compte, « meme heure » qu'un
+    autre clip de la serie, et une partie datee avant ou a la meme heure que la precedente)."""
     if mode not in ("auto", "manual"):
         raise PublishError(f"mode de série invalide : {mode!r} (attendu : auto | manual)")
     if not account:
@@ -1664,6 +1685,8 @@ def preview_series(
 
     settings = service_settings(service, settings)
     now_dt = _now(now)
+    if clip_dates is not None and mode != "manual":
+        raise PublishError("date par clip : seulement en mode manuel")
     # Mode auto : seules les unites deja validees (approuvees, sans creneau) pour CE compte (ou aucun) sont
     # eligibles (TASK-16eeaccfaf09) ; mode manuel : aucune restriction de compte, ready et validees proposees.
     pool = available_series_clips(
@@ -1681,14 +1704,38 @@ def preview_series(
         selected_units, used = _manual_series_units(pool, selection or [])
         requested = used
 
-    dates = plan_series_dates(start_at, interval_hours, used) if used else []
+    first_at = start_at
+    if clip_dates is not None:
+        for when in clip_dates.values():
+            if when.tzinfo is None:
+                raise PublishError("série : chaque date doit avoir un fuseau horaire")
+        missing = [
+            f"{unit['video_id']}/{cid}" for unit in selected_units for cid in unit["clip_ids"]
+            if (unit["video_id"], cid) not in clip_dates
+        ]
+        if missing:
+            raise PublishError(f"date manquante pour : {', '.join(missing)}")
+        dates = [
+            clip_dates[(unit["video_id"], cid)].astimezone(timezone.utc)
+            for unit in selected_units for cid in unit["clip_ids"]
+        ]
+        # Les reglages du post ne dependent pas de la date : une date sonde valide evite qu'un clip trop
+        # proche ne fasse refuser tous les autres au titre des reglages (son propre refus est par clip).
+        first_at = now_dt + timedelta(minutes=int(settings["schedule_min_minutes"]) + 1)
+    else:
+        if start_at is None:
+            raise PublishError("série : la date de début est manquante")
+        if interval_hours is None:
+            raise PublishError("intervalle invalide : un nombre entier d'heures >= 1 est attendu (pas de demi-heure)")
+        dates = plan_series_dates(start_at, interval_hours, used) if used else []
 
     # Refus des reglages du post (visibilite privee/non publique programmee) une seule fois : si la
     # creation le refuserait pour chaque publication de la serie (meme reglages, seule la date change),
     # l'apercu doit le dire aussi (revue r-publication M1), jamais "ok" puis refuse a la creation.
     settings_refusal: str | None = None
     try:
-        _check_post_input("scheduled", account, start_at, None, settings, now_dt, service)
+        if first_at is not None:
+            _check_post_input("scheduled", account, first_at, None, settings, now_dt, service)
     except PublishError as exc:
         settings_refusal = str(exc)
 
@@ -1696,14 +1743,21 @@ def preview_series(
     committed: list[datetime] = list(
         planned_times(account, state_dir=state_dir, presets_dir=presets_dir, base=base)
     )
+    account_taken = set(committed)
+    series_taken: set[datetime] = set()
     i = 0
     for unit in selected_units:
         channel = unit["channel"] or NO_CHANNEL
         tz = _tz(schedule) if schedule else _tz(channel_settings(channel, presets_dir, base))
+        previous: tuple[str, datetime] | None = None
         for clip_id in unit["clip_ids"]:
             when = dates[i]
             i += 1
             refusal = settings_refusal or _series_item_refusal(when, settings, now_dt, service)
+            if refusal is None and clip_dates is not None:
+                refusal = _per_clip_refusal(clip_id, when, previous, account_taken, series_taken)
+            previous = (clip_id, when)
+            series_taken.add(when)
             if refusal is None:
                 reason = tiktok.check_limits(committed, when, settings, tz)
                 if reason is not None:
@@ -1751,10 +1805,11 @@ def create_series(
     style: str | None,
     account: str,
     service: str = "tiktok",
-    interval_hours: int,
-    start_at: datetime,
+    interval_hours: int | None = None,
+    start_at: datetime | None = None,
     count: int | None = None,
     selection: list[tuple[str, str]] | None = None,
+    clip_dates: dict[tuple[str, str], datetime] | None = None,
     together: bool = True,
     settings: dict[str, Any] | None = None,
     now: datetime | None = None,
@@ -1775,8 +1830,8 @@ def create_series(
     partie precedente que si elle vaut True)."""
     preview = preview_series(
         mode=mode, style=style, account=account, service=service, interval_hours=interval_hours,
-        start_at=start_at, count=count, selection=selection, together=together, settings=settings, now=now,
-        workspace_dir=workspace_dir, output_dir=output_dir, state_dir=state_dir, presets_dir=presets_dir, base=base,
+        start_at=start_at, count=count, selection=selection, clip_dates=clip_dates, together=together,
+        settings=settings, now=now, workspace_dir=workspace_dir, output_dir=output_dir, state_dir=state_dir, presets_dir=presets_dir, base=base,
         schedule=schedule,
     )
     if preview["insufficient"]:

@@ -3017,10 +3017,16 @@ def create_app(config: Config | None = None) -> FastAPI:
         account = _require_ready_account(config, body.account)
         service = _account_service(config, account)
         selection = [(s.video_id, s.clip_id) for s in (body.selection or [])] if body.mode == "manual" else None
+        # Coche « Heure par clip » : une date par clip (TASK-fa00f90a735a), validee clip par clip cote Python.
+        clip_dates = (
+            {(d.video_id, d.clip_id): _publish_parse_slot(d.publish_at) for d in body.clip_dates}
+            if body.clip_dates is not None else None
+        )
         return dict(
             mode=body.mode, style=body.style or None, account=account, service=service,
-            interval_hours=body.interval_hours, start_at=_publish_parse_slot(body.start_at),
-            count=body.count, selection=selection, together=body.parts_together,
+            interval_hours=body.interval_hours,
+            start_at=_publish_parse_slot(body.start_at) if body.start_at is not None else None,
+            count=body.count, selection=selection, clip_dates=clip_dates, together=body.parts_together,
             schedule=_account_schedule(config, account),
             **_series_scope(service),
         )
@@ -3568,15 +3574,22 @@ class SeriesSelectionItem(BaseModel):
     clip_id: str
 
 
+class SeriesClipDate(BaseModel):
+    video_id: str
+    clip_id: str
+    publish_at: str                             # date ISO avec fuseau (coche « Heure par clip »)
+
+
 class SeriesBody(BaseModel):
     """Formulaire « Programmer une série » (TASK-5bbf, SPEC-1ed3, SPEC-6076 R3/R6)."""
     mode: str                                   # auto | manual
     style: str | None = None                    # None = tous les styles
     account: str
-    interval_hours: int
-    start_at: str
+    interval_hours: int | None = None           # requis sans ``clip_dates``
+    start_at: str | None = None                 # requis sans ``clip_dates``
     count: int | None = None                    # requis en mode auto
     selection: list[SeriesSelectionItem] | None = None  # requis en mode manuel, dans l'ordre choisi
+    clip_dates: list[SeriesClipDate] | None = None      # coche « Heure par clip » (manuel) : une date par clip
     parts_together: bool = True                 # coche « Parties ensemble » (TASK-fc561e4dc7e9), ON par defaut
 
 
