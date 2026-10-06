@@ -65,6 +65,8 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "content_check": "off",            # off : coupe la verification de contenu de TikTok avant de publier
                                        # (rapide, comme a la main) ; wait : attend son resultat (~10 min)
     "content_check_timeout_s": 900,    # attente du resultat de la verification de contenu (~10 min)
+    "content_check_retrigger_s": 120,  # « Verification en cours » affiche plus de N s sans resultat : decoche/recoche l'interrupteur
+    "content_check_retriggers": 3,     # relances au plus (decoche/recoche ou « Reessayer ») ; toujours dans content_check_timeout_s
     "poll_interval_s": 5,              # pas d'attente entre deux lectures de la verification
     "type_delay_ms": 50,               # delai entre deux touches de la legende
     "events_path": "state/tiktok/events.json",
@@ -90,7 +92,8 @@ REQUIRED_SELECTORS = (
     "ai_switch", "schedule_now", "schedule_later", "schedule_inputs",
     "calendar_month_title", "calendar_year_title", "calendar_arrow", "calendar_day", "timepicker_hour",
     "timepicker_minute", "schedule_picker_close", "content_check_running", "content_check_ok",
-    "content_check_problem", "post_button", "discard_button", "published_marker",
+    "content_check_problem", "content_check_error", "content_check_retry",
+    "content_check_switch", "post_button", "discard_button", "published_marker",
 )
 MAX_POPUP_ROUNDS = 5   # fenetres successives fermees par un meme controle avant d'abandonner
 MAX_MONTH_STEPS = 24   # fleches du calendrier cliquees au plus avant d'abandonner
@@ -132,7 +135,7 @@ def get_settings(config: Config | None) -> dict[str, Any]:
     for key, minimum in (("max_posts_per_day", 1), ("min_gap_minutes", 0), ("min_action_delay_s", 0),
                          ("max_action_delay_s", 0), ("schedule_max_days", 1), ("schedule_min_minutes", 0),
                          ("action_timeout_s", 1), ("upload_timeout_s", 1), ("publish_confirm_timeout_s", 1),
-                         ("content_check_timeout_s", 1),
+                         ("content_check_timeout_s", 1), ("content_check_retrigger_s", 1), ("content_check_retriggers", 0),
                          ("poll_interval_s", 1), ("type_delay_ms", 0)):
         value = settings[key]
         if isinstance(value, bool) or not isinstance(value, (int, float)) or value < minimum:
@@ -733,7 +736,9 @@ class _Flow:
         depasse : arret R4 (code ``content_check``). Jamais de publication d'un contenu non verifie."""
         sel = self.sel["selectors"]
         timeout, interval = float(self.settings["content_check_timeout_s"]), float(self.settings["poll_interval_s"])
-        waited = 0.0
+        retrigger_s, max_retriggers = float(self.settings["content_check_retrigger_s"]), int(self.settings["content_check_retriggers"])
+        waited, since, retriggers = 0.0, 0.0, 0   # since : depart, derniere relance, ou derniere fois non « en cours »
+        acted = None                              # instant de la derniere relance (tentee) : espace les erreurs
         while True:
             self.guard()
             # « Vérification en cours » encore affiché : pas fini, même si « Aucun problème constaté » existe
@@ -753,10 +758,58 @@ class _Flow:
             if waited >= timeout:
                 raise self.stop("content_check", f"vérification de contenu non terminée après {timeout:g} s "
                                                  f"([tiktok] content_check_timeout_s)")
+            if not running:
+                since = waited
+            # Erreur TikTok (relevé réel 2026-10-06) : « Réessayer » ; sinon « en cours » trop long : décocher/recocher.
+            error = self.page.query_selector(sel["content_check_error"]) if self.shown(sel["content_check_error"]) else None
+            if error is not None and (acted is None or waited - acted >= retrigger_s):
+                if retriggers >= max_retriggers:
+                    message = " ".join(str(error.inner_text()).split())[:150]
+                    raise self.stop("content_check", f"vérification de contenu en erreur après {retriggers} relance(s) "
+                                                     f"([tiktok] content_check_retriggers) : « {message} »")
+                if self._relaunch_content_check(retriggers + 1, max_retriggers, error=True):
+                    retriggers += 1
+                since = acted = waited
+            elif error is None and running and retriggers < max_retriggers and waited - since >= retrigger_s:
+                if self._relaunch_content_check(retriggers + 1, max_retriggers, error=False):
+                    retriggers += 1
+                since = acted = waited
             self.page.wait_for_timeout(interval * 1000)
             waited += interval
             if self.on_tick is not None:
                 self.on_tick()
+
+    def _relaunch_content_check(self, number: int, total: int, *, error: bool) -> bool:
+        """Relance le scan : lien « Réessayer » (erreur TikTok) sinon interrupteur décoché puis recoché. Faux (et
+        journalisé) si rien ne peut être relancé : l'attente continue telle quelle. La case doit être recochée,
+        sinon arrêt ``unexpected_page`` : jamais de publication sans vérification en mode wait."""
+        sel = self.sel["selectors"]
+        if error:
+            link = self.page.query_selector(sel["content_check_retry"])
+            if link is not None:
+                link.click()
+                self.pause()
+                logger.info("TikTok %s : vérification de contenu en erreur, « Réessayer » cliqué (relance %d/%d)",
+                            self.account, number, total)
+                return True
+        switch = self.page.query_selector(sel["content_check_switch"])
+        if switch is None:
+            logger.info("TikTok %s : vérification de contenu bloquée, interrupteur introuvable : relance impossible, "
+                        "l'attente continue", self.account)
+            return False
+        if switch.is_disabled():
+            logger.info("TikTok %s : vérification de contenu bloquée, interrupteur grisé : relance impossible, "
+                        "l'attente continue", self.account)
+            return False
+        switch.uncheck(force=True)
+        self.pause()
+        switch.check(force=True)
+        self.pause()
+        if not switch.is_checked():
+            raise self.stop("unexpected_page", "la vérification de contenu n'a pas été réactivée après la relance")
+        logger.info("TikTok %s : vérification de contenu bloquée, interrupteur décoché puis recoché (relance %d/%d)",
+                    self.account, number, total)
+        return True
 
     def post(self, mode: str) -> None:
         """Le bouton final unique ; son texte doit correspondre au mode, sinon la page n'est pas dans l'etat voulu."""

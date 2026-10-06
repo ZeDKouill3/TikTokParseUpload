@@ -19,6 +19,11 @@ réglage : la veille reste désactivée par défaut (`[veille] enabled = false`)
 
 ### Ajouté
 
+- TikTok : une vérification de contenu bloquée (« Vérification en cours » sans résultat après
+  `[tiktok] content_check_retrigger_s`, 120 s) est relancée en décochant puis recochant l'interrupteur ;
+  l'erreur rouge « Une erreur est survenue » est relancée par « Réessayer ». Au plus
+  `content_check_retriggers` relances (3), toujours dans `content_check_timeout_s` ; erreur persistante
+  après les relances : arrêt `content_check` avec le message de TikTok.
 - Veille : chaque VOD proposée (Twitch et YouTube) affiche sa miniature, lue dans
   la réponse de l'API, à la place du bloc gris (qui reste si la miniature manque
   ou si la VOD Twitch est encore en cours de traitement).

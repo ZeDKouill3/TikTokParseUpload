@@ -2910,3 +2910,223 @@ def test_the_retention_curve_of_the_real_page_is_a_chart_without_point_elements_
     got = StatsEnv(tmp_path, monkeypatch, [_real_post(curve=[])]).fetch()["posts"][0]
 
     assert got["retention_curve"] is None
+
+
+# ---------------------------------------------------------------- relance de la vérification bloquée (TASK-aa57)
+
+
+class RetriggerSwitch:
+    """L'interrupteur « Vérification de contenu simple » en mode wait : coché au départ ; décocher puis recocher
+    relance le scan (``on_check`` est appelé à chaque recochage)."""
+
+    def __init__(self, *, disabled=False, sticky_off=False, on_check=None):
+        self.checked, self.disabled, self.sticky_off, self.on_check = True, disabled, sticky_off, on_check
+        self.events: list[str] = []
+
+    def is_checked(self):
+        return self.checked
+
+    def is_disabled(self):
+        return self.disabled
+
+    def uncheck(self, **kwargs):
+        self.events.append("uncheck")
+        self.checked = False
+
+    def check(self, **kwargs):
+        self.events.append("check")
+        if self.sticky_off:   # la case ne se recoche pas
+            return
+        self.checked = True
+        if self.on_check is not None:
+            self.on_check(len([e for e in self.events if e == "check"]))
+
+
+def _stuck_env(tmp_path, monkeypatch, switch, **settings):
+    env = Env(tmp_path, monkeypatch, page_kwargs={"check": "running"},
+              settings={"poll_interval_s": 5, "content_check_retrigger_s": 10, **settings})
+    real = env.page.query_selector
+    sw = _sel()["selectors"]["content_check_switch"]
+    env.page.query_selector = lambda css: switch if css == sw else real(css)
+    return env
+
+
+def test_a_stuck_content_check_is_retriggered_by_unchecking_then_rechecking_the_switch(tmp_path, monkeypatch, caplog):
+    switch = RetriggerSwitch()
+    env = _stuck_env(tmp_path, monkeypatch, switch)
+    env.page.timeline = [None] * 3 + [lambda: env.page.set_check("ok")]   # fini 4 pas après le départ
+
+    with caplog.at_level("INFO"):
+        result = env.publish()
+
+    assert switch.events == ["uncheck", "check"] and switch.checked is True
+    assert env.page.posted == ["now"] and result["state"] == "published"
+    assert any("relance 1/3" in r.getMessage() and "ma_chaine" in r.getMessage() for r in caplog.records)
+
+
+def test_retriggers_are_capped_by_content_check_retriggers_then_the_wait_continues_to_the_timeout(tmp_path, monkeypatch):
+    switch = RetriggerSwitch()
+    env = _stuck_env(tmp_path, monkeypatch, switch, content_check_retriggers=2, content_check_timeout_s=100)
+
+    with pytest.raises(tiktok.TikTokStop) as stop:
+        env.publish()
+
+    assert switch.events == ["uncheck", "check"] * 2
+    assert stop.value.code == "content_check" and env.page.posted == []
+
+
+def test_retriggers_stay_inside_the_content_check_timeout(tmp_path, monkeypatch):
+    switch = RetriggerSwitch()
+    env = _stuck_env(tmp_path, monkeypatch, switch, content_check_timeout_s=25)
+
+    with pytest.raises(tiktok.TikTokStop) as stop:
+        env.publish()
+
+    assert switch.events == ["uncheck", "check"] * 2   # à 10 s et 20 s, pas de troisième avant 25 s
+    assert stop.value.code == "content_check" and "25 s" in str(stop.value)
+
+
+def test_a_check_finishing_before_the_delay_is_never_retriggered(tmp_path, monkeypatch):
+    switch = RetriggerSwitch()
+    env = _stuck_env(tmp_path, monkeypatch, switch, content_check_retrigger_s=60)
+    env.page.timeline = [lambda: env.page.set_check("ok")]
+    env.publish()
+    assert switch.events == []
+
+
+def test_a_greyed_switch_is_logged_and_the_wait_continues_without_touching_it(tmp_path, monkeypatch, caplog):
+    switch = RetriggerSwitch(disabled=True)
+    env = _stuck_env(tmp_path, monkeypatch, switch)
+    env.page.timeline = [None] * 3 + [lambda: env.page.set_check("ok")]
+
+    with caplog.at_level("INFO"):
+        result = env.publish()
+
+    assert switch.events == [] and result["state"] == "published"
+    assert any("grisé" in r.getMessage() for r in caplog.records)
+
+
+def test_a_missing_switch_is_logged_and_the_wait_continues(tmp_path, monkeypatch, caplog):
+    env = _stuck_env(tmp_path, monkeypatch, None)
+    env.page.timeline = [None] * 3 + [lambda: env.page.set_check("ok")]
+
+    with caplog.at_level("INFO"):
+        result = env.publish()
+
+    assert result["state"] == "published"
+    assert any("introuvable" in r.getMessage() for r in caplog.records)
+
+
+def test_a_switch_left_unchecked_after_the_retrigger_stops_explicitly_and_nothing_is_posted(tmp_path, monkeypatch):
+    switch = RetriggerSwitch(sticky_off=True)
+    env = _stuck_env(tmp_path, monkeypatch, switch)
+
+    with pytest.raises(tiktok.TikTokStop) as stop:
+        env.publish()
+
+    assert stop.value.code == "unexpected_page"
+    assert env.page.posted == [] and _sel()["selectors"]["post_button"] not in env.page.clicks()
+
+
+def test_a_problem_reported_after_a_retrigger_still_refuses_the_clip(tmp_path, monkeypatch):
+    switch = RetriggerSwitch(on_check=lambda n: setattr(env.page, "timeline", [None] * env.page.waits + [lambda: env.page.set_check("problem")]))
+    env = _stuck_env(tmp_path, monkeypatch, switch)
+    env.page.timeline = [None] * 3
+
+    with pytest.raises(tiktok.TikTokStop) as stop:
+        env.publish()
+
+    assert stop.value.code == "content_check_refused" and env.page.posted == []
+
+
+def test_retrigger_settings_have_defaults_and_are_validated(tmp_path):
+    assert tiktok.CONFIG_DEFAULTS["content_check_retrigger_s"] == 120
+    assert tiktok.CONFIG_DEFAULTS["content_check_retriggers"] == 3
+    for key, bad in (("content_check_retrigger_s", 0), ("content_check_retrigger_s", "120"),
+                     ("content_check_retriggers", -1), ("content_check_retriggers", True)):
+        config = Config(mode="review", workspace_dir=tmp_path, output_dir=tmp_path, _sections={"tiktok": {key: bad}})
+        with pytest.raises(tiktok.TikTokError, match=key):
+            tiktok.get_settings(config)
+
+
+class RetryLink:
+    """Le lien « Réessayer » sous l'erreur rouge : un clic relance le scan (``on_click``)."""
+
+    def __init__(self, page, on_click=None):
+        self.page, self.on_click, self.clicks = page, on_click, 0
+
+    def click(self, **kwargs):
+        self.clicks += 1
+        if self.on_click is not None:
+            self.on_click(self.clicks)
+
+
+def _error_env(tmp_path, monkeypatch, switch=None, link=None, **settings):
+    env = _stuck_env(tmp_path, monkeypatch, switch, **settings)
+    sel = _sel()["selectors"]
+    env.page.present.discard(sel["content_check_running"])
+    env.page.present.add(sel["content_check_error"])
+    env.page.texts[sel["content_check_error"]] = "Une erreur est survenue. Merci de réessayer plus tard."
+    real = env.page.query_selector
+    env.page.query_selector = lambda css: link if css == sel["content_check_retry"] and link else (
+        None if css == sel["content_check_retry"] else real(css))
+    return env
+
+
+def test_a_tiktok_error_is_retried_by_clicking_reessayer_counted_and_logged(tmp_path, monkeypatch, caplog):
+    env_ref = []
+
+    def recovered(n):
+        env_ref[0].page.present.discard(_sel()["selectors"]["content_check_error"])
+        env_ref[0].page.set_check("ok")
+
+    link = RetryLink(None, on_click=recovered)
+    switch = RetriggerSwitch()
+    env = _error_env(tmp_path, monkeypatch, switch, link)
+    env_ref.append(env)
+
+    with caplog.at_level("INFO"):
+        result = env.publish()
+
+    assert link.clicks == 1 and switch.events == []   # le lien, pas l'interrupteur
+    assert result["state"] == "published" and env.page.posted == ["now"]
+    assert any("Réessayer" in r.getMessage() and "relance 1/3" in r.getMessage() for r in caplog.records)
+
+
+def test_an_error_without_a_reessayer_link_falls_back_to_unchecking_then_rechecking(tmp_path, monkeypatch):
+    env_ref = []
+
+    def recovered(n):
+        env_ref[0].page.present.discard(_sel()["selectors"]["content_check_error"])
+        env_ref[0].page.set_check("ok")
+
+    switch = RetriggerSwitch(on_check=recovered)
+    env = _error_env(tmp_path, monkeypatch, switch, None)
+    env_ref.append(env)
+
+    result = env.publish()
+
+    assert switch.events == ["uncheck", "check"] and result["state"] == "published"
+
+
+def test_an_error_still_shown_after_all_retries_stops_with_tiktoks_message(tmp_path, monkeypatch):
+    link = RetryLink(None)
+    env = _error_env(tmp_path, monkeypatch, RetriggerSwitch(), link, content_check_retriggers=2)
+
+    with pytest.raises(tiktok.TikTokStop) as stop:
+        env.publish()
+
+    assert link.clicks == 2
+    assert stop.value.code == "content_check" and "Une erreur est survenue" in str(stop.value)
+    assert env.page.posted == []
+
+
+def test_error_retries_share_the_budget_with_the_stuck_retriggers_and_stay_inside_the_timeout(tmp_path, monkeypatch):
+    link = RetryLink(None)
+    env = _error_env(tmp_path, monkeypatch, RetriggerSwitch(), link, content_check_timeout_s=25)
+
+    with pytest.raises(tiktok.TikTokStop) as stop:
+        env.publish()
+
+    assert link.clicks == 3 and stop.value.code == "content_check"
+    assert env.page.posted == []
