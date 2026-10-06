@@ -5,15 +5,19 @@ slug: veille-r-glages-veille-fichiers-state-veille-sou
 title: "Veille : réglages [veille], fichiers state/veille/, sources Twitch/YouTube/Steam, montée vs 7 jours, candidats, choix de Claude, actions Clipper/Ignorer, meilleurs clips du jour archivés, routes et écran Veille"
 created: 2026-10-06T11:32:12Z
 author: w-veille
-status: proposed
+status: accepted
 scope:
   - clipper/worker.py
   - clipper/web/app.py
   - clipper/web/static/**
   - clipper/llm/__init__.py
 references: [ADR-ca9a5792739c, ADR-35b778a98d22, SPEC-74e9fda61a5a, ADR-b1c17749b528, ADR-ad2e562b1810, ADR-09ad233678f2, SPEC-c1001cb7cbdb]
+ratified: 8103b133f6fb
+verified:
+  - by: nicoc@zedk_ordi
+    at: 2026-10-06T11:37:03Z
 schema: 4
-version: 2
+version: 3
 ---
 
 ## Objet
