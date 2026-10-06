@@ -28,7 +28,7 @@
 # VU SUR LA VRAIE PAGE SANS SELECTEUR CONFIRME (SPEC-86fe, releve FR du 2026-10-01) : les libelles de la page Donnees
 # analytiques (tuiles, bouton de periode « 7 derniers jours »), du tableau Publications et des onglets Spectateurs /
 # Engagement sont ceux de la page ; les reperes ([account] tile et menu des periodes, [stats] views, visibility, created,
-# retention_point, viewers_card, engagement_card, page_text) sont a confirmer sur la vraie page : tant qu'ils ne le sont
+# page_text) sont a confirmer sur la vraie page : tant qu'ils ne le sont
 # pas, une valeur introuvable est relevee « null » ou arrete le releve (jamais devinee).
 #
 # Un selecteur est une chaine CSS/Playwright. Une liste (captcha, verification,
@@ -181,15 +181,24 @@ processing = "en cours de traitement"
 views = "[data-tt='components_RowLayout_FlexRow_6']"
 visibility = "[data-tt='components_PrivacyCell_TUXButton']"
 created = "[data-tt='components_PublishStageLabel_TUXText']"
-# Points de la courbe de retention d'un post, texte « instant | part encore presente ». A VERIFIER SUR LA VRAIE PAGE.
-retention_point = "[data-tt*='Retention'] [data-tt*='Point']"
-# Cartes des onglets Spectateurs et Engagement : titre puis couples « libelle | valeur ». A VERIFIER SUR LA VRAIE PAGE.
-viewers_card = "[data-tt*='Viewers'][data-tt*='Card']"
-engagement_card = "[data-tt*='Engagement'][data-tt*='Card']"
+# Points de la courbe de retention d'un post (texte « instant | part encore presente »). Releve reel 2026-10-06 : la
+# courbe de la carte « Taux de retention » (VideoOverviewPage_RetentionCard) est un graphe echarts dessine en canvas sous
+# une video, SANS element par point dans le DOM (seuls « 0:00 (100%) » et « 1:01 » en texte). Ce repere ne designe donc
+# aucun element de la vraie page : la courbe est relevee « null », jamais devinee.
+retention_point = "[data-tt='VideoOverviewPage_RetentionCard_Point']"
+# Cartes des onglets Spectateurs et Engagement (verifie en reel 2026-10-06) : une carte = un bloc AnalyticsCard_CardWrapper,
+# texte « titre, puis lignes » (un noeud texte par ligne). Spectateurs : « Total des spectateurs, 1.3K, +1, (contre...) » ;
+# « Types de spectateurs » = les pourcentages d'une barre PUIS ses libelles ; Age / Sexe / Lieux = « libelle, valeur % »
+# (« <1% » pour un pays sous 1 %). Engagement : « J'aime » (video + courbe, sans couples) et « Mots les plus utilises... ».
+viewers_card = "[data-tt='components_AnalyticsCard_CardWrapper']"
+engagement_card = "[data-tt='components_AnalyticsCard_CardWrapper']"
 # Texte de la page, lu seulement quand les cartes manquent, pour reconnaitre un onglet « pas encore disponible ».
 page_text = "body"
 # Messages de TikTok quand un onglet n'a pas encore de chiffres : relevee « null » (jamais un 0 invente).
-unavailable = ["dès 100 vues", "en cours de traitement"]
+# Verifies en reel : « ...quand les vues de video atteindront le nombre de 100 » (carte Age/Sexe/Lieux sous 100 vues),
+# « ...sont en cours de traitement » (carte), « Tu pourras voir ces informations quand suffisamment de donnees... » (carte
+# Mots les plus utilises). Une carte qui en porte un est « null » ; l'onglet sans carte et avec l'un d'eux aussi.
+unavailable = ["dès 100 vues", "en cours de traitement", "atteindront le nombre de 100", "Tu pourras voir ces informations"]
 # Etat vide de la page Publications (compte sans aucun post). À VÉRIFIER EN RÉEL : sélecteur non connu, donc vide.
 # Vide = on n'invente rien : le relevé attend les lignes quelques secondes ([tiktok] stats_empty_wait_s) puis rend 0 post.
 # Renseigné = attendu en course avec les lignes (le relevé n'attend plus rien dès qu'il s'affiche).

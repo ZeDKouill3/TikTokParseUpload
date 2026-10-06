@@ -2573,7 +2573,8 @@ def test_the_account_page_selectors_and_labels_are_in_the_selectors_file():
     assert data["tiles"] == {"views": "Vues de la vidéo", "profile_views": "Vues du profil", "likes": "J'aime",
                              "comments": "Commentaires", "shares": "Partages"}
     assert "{days}" in data["account"]["period_label"] and "{days}" in data["account"]["period_option"]
-    assert data["stats"]["unavailable"] == ["dès 100 vues", "en cours de traitement"]
+    assert data["stats"]["unavailable"] == ["dès 100 vues", "en cours de traitement", "atteindront le nombre de 100",
+                                                "Tu pourras voir ces informations"]
     assert data["viewers"]["age"] == "Âge" and data["engagement"]["comment_words"].startswith("Mots les plus utilisés")
 
 
@@ -2818,3 +2819,94 @@ def test_publications_date_without_year_uses_the_paris_year_at_new_year():
 def test_page_date_without_timezone_is_read_as_paris_time():
     # « 1er janvier 00:10 » à Paris = 31 décembre 23:10 UTC
     assert tiktok._naive_utc("2027-01-01T00:10:00") == datetime(2026, 12, 31, 23, 10, tzinfo=timezone.utc)
+
+
+# -- onglets Spectateurs / Engagement et retention sur des extraits de la VRAIE page (TASK-429d, releve 2026-10-06)
+
+_FIXTURES = Path(__file__).parent / "fixtures" / "tiktok"
+_SIMPLE_TT = __import__("re").compile(r"\[data-tt='([^']+)'\]")
+
+
+class _Dom(__import__("html.parser", fromlist=["HTMLParser"]).HTMLParser):
+    """Arbre minimal d'un extrait HTML ; ``texts`` = lignes de texte (un noeud texte = une ligne, comme innerText)."""
+
+    def __init__(self, source):
+        super().__init__(convert_charrefs=True)
+        self.nodes, self.stack = [], []
+        self.feed(source)
+
+    def handle_starttag(self, tag, attrs):
+        node = {"tt": dict(attrs).get("data-tt"), "texts": []}
+        self.nodes.append(node)
+        self.stack.append(node)
+        self.fresh = True
+
+    def handle_endtag(self, tag):
+        if self.stack:
+            self.stack.pop()
+        self.fresh = True
+
+    def handle_data(self, data):  # un meme texte peut arriver en plusieurs morceaux (« &lt; » puis « 1% »)
+        if not data.strip():
+            return
+        for node in self.stack:
+            if self.fresh or not node["texts"]:
+                node["texts"].append(data.strip())
+            else:
+                node["texts"][-1] += data.strip()
+        self.fresh = False
+
+
+def _real_cells(name, selector):
+    """Les elements que ``selector`` (un simple ``[data-tt='X']``, le seul genre que l'extrait sait rejouer) trouve
+    dans l'extrait ``name``, chacun avec son texte."""
+    match = _SIMPLE_TT.fullmatch(selector)
+    assert match, f"repère à confirmer sur la vraie page, pas un [data-tt='...'] exact : {selector!r}"
+    source = (_FIXTURES / f"analytics_{name}.html").read_text(encoding="utf-8")
+    return [FakeCell("\n".join(node["texts"])) for node in _Dom(source).nodes if node["tt"] == match[1]]
+
+
+def _real_post(**kwargs):
+    stats = _sel()["stats"]
+    return Post(ID_A, viewers=_real_cells("viewers", stats["viewers_card"]),
+                engagement=_real_cells("engagement", stats["engagement_card"]), **kwargs)
+
+
+def test_the_selectors_of_the_three_unconfirmed_landmarks_are_no_longer_marked_to_verify():
+    text = (Path(tiktok.__file__).parent / "assets" / "tiktok_selectors.toml").read_text(encoding="utf-8")
+    for key in ("retention_point", "viewers_card", "engagement_card"):
+        line = next(i for i, row in enumerate(text.splitlines()) if row.startswith(f"{key} = "))
+        assert "A VERIFIER" not in text.splitlines()[line - 1].upper().replace("É", "E"), key
+
+
+def test_the_viewers_cards_of_the_real_page_are_found_by_the_configured_landmark():
+    cards = _real_cells("viewers", _sel()["stats"]["viewers_card"])
+
+    assert [c.inner_text().splitlines()[0] for c in cards] == ["Total des spectateurs", "Types de spectateurs", "Âge", "Sexe", "Lieux"]
+
+
+def test_the_viewers_tab_of_the_real_page_is_read_card_by_card(tmp_path, monkeypatch):
+    got = StatsEnv(tmp_path, monkeypatch, [_real_post()]).fetch()["posts"][0]["viewers"]
+
+    assert got["total"] == 1300  # « 1.3K »
+    assert got["types"] == [{"label": "Nouveaux spectateurs", "value": 0.63}, {"label": "Spectateurs récurrents", "value": 0.37},
+                            {"label": "Non followers", "value": 1.0}, {"label": "Followers", "value": 0.0}]
+    assert got["age"][0] == {"label": "18-24", "value": 0.45} and len(got["age"]) == 5
+    assert got["gender"] == [{"label": "Hommes", "value": 0.78}, {"label": "Femmes", "value": 0.2}, {"label": "Autre", "value": 0.02}]
+    assert got["locations"][0] == {"label": "France", "value": 0.864}
+    assert {"label": "Pays-bas", "value": None} in got["locations"]  # « <1% » : sous 1 %, jamais deviné
+
+
+def test_the_engagement_tab_of_the_real_page_is_read_and_an_unfilled_card_is_a_null(tmp_path, monkeypatch):
+    got = StatsEnv(tmp_path, monkeypatch, [_real_post()]).fetch()["posts"][0]
+
+    assert got["engagement"]["comment_words"] is None  # « Tu pourras voir ces informations quand suffisamment de données... »
+
+
+def test_the_retention_curve_of_the_real_page_is_a_chart_without_point_elements_so_it_is_a_null(tmp_path, monkeypatch):
+    # releve reel : la rétention est un graphe echarts (canvas) sous une video, aucun element par point dans le DOM
+    stats = _sel()["stats"]
+    assert _real_cells("overview", stats["retention_point"]) == []
+    got = StatsEnv(tmp_path, monkeypatch, [_real_post(curve=[])]).fetch()["posts"][0]
+
+    assert got["retention_curve"] is None
