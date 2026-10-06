@@ -10,8 +10,9 @@ Entrees (workspace/<video_id>/) :
   chaque moment retenu, par ``id`` ;
 - transcript.json (transcribe) : ``language`` et les mots horodates, pour
   donner a l'IA le texte exact prononce dans chaque partie ;
-- meta.json (download), facultatif : titre de la video, pour des hashtags
-  plus pertinents.
+- meta.json (download), facultatif : titre de la video et chaine (hashtags
+  plus pertinents ; mots-cles de la premiere phrase de la legende,
+  [captions] caption_keywords_first, TASK-b8a0).
 
 Sortie : workspace/<video_id>/captions.json
 
@@ -118,6 +119,11 @@ CONFIG_DEFAULTS: dict[str, object] = {
     # hashtags, memes regles que les autres (commencent par #, sans doublon).
     "cta_line": "",
     "cta_hashtags": [],
+    # TASK-b8a0 : la premiere phrase de la legende porte les mots-cles de
+    # recherche reels du clip (jeu, streamer/chaine, moment), la legende
+    # servant de metadonnee de recherche TikTok. A false, consigne strictement
+    # identique a celle d'avant ce reglage.
+    "caption_keywords_first": True,
 }
 
 _EDGE = 0.1
@@ -268,6 +274,26 @@ def response_schema(
     }
 
 
+def _keywords_rule(channel: str) -> str:
+    """TASK-b8a0 : consigne de la premiere phrase de ``caption`` (mots-cles de
+    recherche reels). Jeu ou streamer inconnu : la consigne le dit au modele,
+    rien n'est invente (ADR-ad2e)."""
+    streamer = (
+        "le nom du streamer ou de la chaine de la source (voir Contexte)"
+        if channel
+        else "le streamer n'est pas connu (voir Contexte) : n'invente aucun nom de streamer"
+    )
+    return (
+        "caption, mots-cles de recherche : la PREMIERE phrase de la legende contient les mots-cles "
+        "reels sous lesquels on chercherait ce clip, dans cet ordre : le nom du jeu, tel qu'il est "
+        f"ecrit officiellement ; {streamer} ; puis le moment lui-meme. Reste naturelle : une vraie "
+        "phrase, pas une liste de mots-cles, pas une liste de noms ni de bourrage. Le jeu se lit dans "
+        "le titre de la video source, la transcription ou le contexte ; si le jeu n'est identifiable "
+        "ni dans le titre, ni dans la transcription, ni dans le contexte, ecris la phrase sans "
+        "nom de jeu et n'invente aucun nom de jeu."
+    )
+
+
 def _prompt(
     language: str,
     video_title: str,
@@ -279,6 +305,7 @@ def _prompt(
     *,
     screen_title: str | None = None,
     title: str | None = None,
+    channel: str = "",
 ) -> str:
     context = ""
     if parts_total > 1:
@@ -301,6 +328,9 @@ def _prompt(
         "caption : la legende publiee sous le clip, qui donne envie de regarder en entier ; ton sobre, "
         f"aucun mot d'emphase clickbait ; {caption_emoji_rule}."
     )
+    keywords_first = bool(settings["caption_keywords_first"])
+    if keywords_first:
+        rules.append(_keywords_rule(channel))
     rules.append(
         "hashtags : chacun commence par #, jamais deux fois le meme, pertinents pour ce clip precis "
         f"(pas de generique inutile), {int(settings['hashtags_max'])} au plus."
@@ -349,6 +379,9 @@ def _prompt(
             f"\nTitre d'ecran deja choisi pour ce moment, le meme dans toutes ses parties (ne pas "
             f"le redemander) : {screen_title}\n"
         )
+    channel_line = (
+        f"Chaine / streamer de la source : {channel or 'inconnu'}\n" if keywords_first else ""
+    )
     return (
         "Tu ecris les metadonnees d'un clip vertical TikTok tire d'une video plus longue.\n\n"
         "## Regles\n"
@@ -358,6 +391,7 @@ def _prompt(
         f"{screen_title_context}\n"
         "## Contexte\n"
         f"Video source : {video_title or '(sans titre)'}\n"
+        f"{channel_line}"
         f"Pourquoi ce moment a ete retenu : {moment.get('justification', '')}\n"
         f"Accroche du moment : {moment.get('hook_text', '')}\n\n"
         "## Texte prononce dans ce clip\n"
@@ -636,6 +670,7 @@ def _process_moment(
     screen_title_words_max: int,
     config: Any,
     log_path: Path,
+    channel: str = "",
 ) -> list[dict[str, Any]]:
     """Clips d'un moment, ses parties traitees dans l'ordre, sequentiellement
     (la partie 1 fixe title et screen_title, repris par les suivantes)."""
@@ -667,7 +702,7 @@ def _process_moment(
         )
         text = _part_text(transcript, part["start"], part["end"])
         prompt = _prompt(language, video_title, source, part, parts_total, text, settings,
-                          screen_title=screen_title, title=title)
+                          screen_title=screen_title, title=title, channel=channel)
         answer = llm.ask("captions", prompt, [], schema, config=config, check=check, log_path=log_path)
         if request_screen_title:
             screen_title = answer["screen_title"]
@@ -718,6 +753,7 @@ def run(
     workers = parallel_workers(settings)
     language = transcript.get("language") or ""
     video_title = meta.get("title") or ""
+    channel = meta.get("channel") or ""
     moments_by_id = {m["id"]: m for m in moments_data["moments"]}
     hook_words_max = int(settings["hook_words_max"])
     screen_title_words_max = int(settings["screen_title_words_max"])
@@ -734,7 +770,7 @@ def run(
         moment, source = pair
         return _process_moment(
             moment, source, transcript, language, video_title, settings,
-            hook_words_max, screen_title_words_max, config, log_path,
+            hook_words_max, screen_title_words_max, config, log_path, channel,
         )
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
