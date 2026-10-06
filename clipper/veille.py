@@ -19,6 +19,8 @@ chacun un callable ``collector(settings) -> dict`` (``settings`` = la table
     youtube {"videos": [VOD]}
     steam   {"games": [{"appid", "name", "players", "rank", "last_week_rank"}],
              "unnamed": [{"appid", "reason"}]}  (optionnel : jeux sans nom, avec leur raison)
+    steam_fr {"games": [{"appid", "name", "rank", "last_week_rank"}]}  (top des ventes du pays ``region`` ;
+             ``last_week_rank`` 0 = absent du top la semaine dernière)
 
 avec ``VOD = {video_id, url, title, channel_name, game_name | None,
 duration_s, published_at (ISO 8601), view_count, views_per_hour}``. Un direct
@@ -63,6 +65,7 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "youtube_min_duration_s": 600,
     "steam_top": 100,
     "steam_name_lookups_max": 100,
+    "steam_sellers_top": 50,
     "twitch_client_id": "",
     "twitch_client_secret": "",
     "youtube_api_key": "",
@@ -74,7 +77,7 @@ CONFIG_DEFAULTS: dict[str, object] = {
 
 log = logging.getLogger(__name__)
 
-SOURCES = ("twitch", "youtube", "steam")
+SOURCES = ("twitch", "youtube", "steam", "steam_fr")
 Collector = Callable[[dict[str, object]], dict[str, Any]]
 
 # Clés exigées par source (steam n'en demande aucune).
@@ -82,6 +85,7 @@ _REQUIRED_KEYS = {
     "twitch": ("twitch_client_id", "twitch_client_secret"),
     "youtube": ("youtube_api_key",),
     "steam": (),
+    "steam_fr": (),
 }
 _RUN_AT = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 _DATE_FILE = re.compile(r"^\d{4}-\d{2}-\d{2}\.json$")
@@ -212,6 +216,49 @@ def _rank_signal(info: dict[str, Any] | None) -> tuple[int | None, bool | None]:
     return info["last_week_rank"] - info["rank"], False
 
 
+def _sellers_signal(info: dict[str, Any] | None) -> dict[str, Any]:
+    """Champs « ventes du pays » d'un jeu : rang, rang de la semaine dernière, gain de places, nouveau dans le top.
+    ``last_week_rank`` absent ou 0 = nouveau (pas de gain chiffré) ; jeu hors du top ventes = tout à ``None``."""
+    if not info:
+        return {"steam_sellers_rank": None, "steam_sellers_last_week_rank": None,
+                "steam_sellers_gain": None, "steam_sellers_new": None}
+    last = info.get("last_week_rank")
+    new = not isinstance(last, int) or last <= 0
+    return {"steam_sellers_rank": info["rank"], "steam_sellers_last_week_rank": None if new else last,
+            "steam_sellers_gain": None if new else last - info["rank"], "steam_sellers_new": new}
+
+
+def _sellers_risers(
+    sellers: dict[str, dict[str, Any]],
+    known_keys: set[str],
+    youtube: dict[str, dict[str, Any]],
+    vod_counts: dict[str, int],
+    previous: list[dict[str, Any]],
+    table: dict[str, object],
+) -> list[dict[str, Any]]:
+    """Jeux qui montent dans le top ventes du pays (nouveau, ou gain >= ``steam_rank_gain_min``) et pas
+    encore dans la liste (Twitch, Steam mondial) : champs Twitch/joueurs à null, jamais inventés."""
+    gain_min = int(table["steam_rank_gain_min"])  # type: ignore[call-overload]
+    risers: list[dict[str, Any]] = []
+    for appid, info in sellers.items():
+        key = normalize(info["name"])
+        signal = _sellers_signal(info)
+        if key in known_keys or not (signal["steam_sellers_new"] or signal["steam_sellers_gain"] >= gain_min):
+            continue
+        risers.append({
+            "key": key, "name": info["name"], "source": "steam_fr", "twitch_match": False,
+            "twitch_fr_viewers": None, "twitch_avg": None, "twitch_delta_pct": None,
+            "steam_appid": appid, "steam_match": False, "steam_players": None,
+            "steam_avg": None, "steam_delta_pct": None,
+            "steam_rank": None, "steam_rank_gain": None, "steam_new_in_top": None, **signal,
+            "youtube_views_per_hour": youtube.get(key, {}).get("views_per_hour_sum"),
+            "vod_count": vod_counts.get(key, 0),
+            "baseline_days_available": len(previous),
+        })
+    risers.sort(key=lambda g: (not g["steam_sellers_new"], g["steam_sellers_rank"] if g["steam_sellers_new"] else -g["steam_sellers_gain"]))
+    return risers[: int(table["steam_risers_max"])]  # type: ignore[call-overload]
+
+
 def _build_games(
     twitch: dict[str, dict[str, Any]],
     steam: dict[str, dict[str, Any]],
@@ -219,6 +266,7 @@ def _build_games(
     vod_counts: dict[str, int],
     previous: list[dict[str, Any]],
     table: dict[str, object] | None = None,
+    sellers: dict[str, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     steam_by_key = {normalize(info["name"]): (appid, info) for appid, info in steam.items()}
     games: list[dict[str, Any]] = []
@@ -243,6 +291,11 @@ def _build_games(
         })
     if table is not None:
         games.extend(_steam_risers(steam, set(twitch), youtube, vod_counts, previous, table))
+    sellers_by_key = {normalize(info["name"]): info for info in (sellers or {}).values()}
+    for game in games:  # fusion par clé normalisée : un jeu déjà présent porte les champs, jamais de doublon
+        game.update(_sellers_signal(sellers_by_key.get(game["key"])))
+    if table is not None and sellers:
+        games.extend(_sellers_risers(sellers, {g["key"] for g in games}, youtube, vod_counts, previous, table))
     return games
 
 
@@ -345,6 +398,7 @@ def collect(
     sources: dict[str, dict[str, Any]] = {}
     twitch_hist: dict[str, dict[str, Any]] = {}
     steam_hist: dict[str, dict[str, Any]] = {}
+    sellers_hist: dict[str, dict[str, Any]] = {}
     youtube_hist: dict[str, dict[str, Any]] = {}
     raw_vods: list[tuple[str, dict[str, Any]]] = []
 
@@ -364,6 +418,12 @@ def collect(
                         entry = youtube_hist.setdefault(normalize(vod["game_name"]), {"views_per_hour_sum": 0})
                         entry["views_per_hour_sum"] += vod["views_per_hour"]
                 status["counts"] = {"videos": len(vods)}
+            elif source == "steam_fr":
+                for game in result["games"]:
+                    sellers_hist[str(game["appid"])] = {"name": game["name"], "rank": game["rank"],
+                                                        "last_week_rank": game.get("last_week_rank")}
+                vods = []
+                status["counts"] = {"games": len(sellers_hist)}
             else:
                 for game in result["games"]:
                     steam_hist[str(game["appid"])] = {"name": game["name"], "players": game["players"],
@@ -383,6 +443,8 @@ def collect(
                 twitch_hist = {}
             elif source == "steam":
                 steam_hist = {}
+            elif source == "steam_fr":
+                sellers_hist = {}
             else:
                 youtube_hist = {}
             raw_vods = [(s, v) for s, v in raw_vods if s != source]
@@ -407,16 +469,17 @@ def collect(
             if candidate["game_key"]:
                 vod_counts[candidate["game_key"]] = vod_counts.get(candidate["game_key"], 0) + 1
 
-    games = _build_games(twitch_hist, steam_hist, youtube_hist, vod_counts, previous, table)
+    games = _build_games(twitch_hist, steam_hist, youtube_hist, vod_counts, previous, table, sellers_hist)
     by_key = {g["key"]: g for g in games}
     for candidate in candidates:
         game = by_key.get(candidate["game_key"])
         if game:
             candidate["signals"] = {"twitch_delta_pct": game["twitch_delta_pct"], "steam_delta_pct": game["steam_delta_pct"],
-                                    "steam_rank_gain": game["steam_rank_gain"], "steam_new_in_top": game["steam_new_in_top"]}
+                                    "steam_rank_gain": game["steam_rank_gain"], "steam_new_in_top": game["steam_new_in_top"],
+                                    "steam_sellers_gain": game["steam_sellers_gain"], "steam_sellers_new": game["steam_sellers_new"]}
 
     _write(sdir / "history" / f"{day}.json", {
-        "date": day, "at": now.isoformat(), "twitch": twitch_hist, "steam": steam_hist, "youtube": youtube_hist,
+        "date": day, "at": now.isoformat(), "twitch": twitch_hist, "steam": steam_hist, "steam_fr": sellers_hist, "youtube": youtube_hist,
     })
     state = {
         "date": day, "started_at": started_at, "finished_at": now.isoformat() if finalize else None, "sources": sources,
@@ -485,7 +548,7 @@ def _prompt(day_state: dict[str, Any], table: dict[str, object]) -> str:
         "goûts, en privilégiant ce qui monte, sans juger les personnes. Une donnée inconnue est inconnue : "
         "ne l'invente pas.",
         "",
-        "Jeux (viewers Twitch FR, joueurs Steam, variation vs moyenne des jours précédents, gain de rang Steam vs semaine dernière) :",
+        "Jeux (viewers Twitch FR, joueurs Steam, variation vs moyenne des jours précédents, gain de rang Steam vs semaine dernière, rang et gain dans le top des ventes Steam du pays) :",
     ]
     for game in day_state["games"]:
         lines.append(
@@ -495,6 +558,9 @@ def _prompt(day_state: dict[str, Any], table: dict[str, object]) -> str:
             f"steam_delta_pct={_fmt(game['steam_delta_pct'])} "
             f"steam_rank_gain_vs_last_week={_fmt(game.get('steam_rank_gain'))} "
             f"steam_new_in_top={_fmt(game.get('steam_new_in_top'))} "
+            f"ventes_fr_rang={_fmt(game.get('steam_sellers_rank'))} "
+            f"ventes_fr_gain_vs_semaine_derniere={_fmt(game.get('steam_sellers_gain'))} "
+            f"ventes_fr_nouveau={_fmt(game.get('steam_sellers_new'))} "
             f"youtube_views_per_hour={_fmt(game.get('youtube_views_per_hour'))} vod_count={_fmt(game.get('vod_count'))}")
     lines += ["", "Candidats (VOD) :"]
     for c in day_state["candidates"]:
@@ -506,7 +572,9 @@ def _prompt(day_state: dict[str, Any], table: dict[str, object]) -> str:
             f"twitch_delta_pct={_fmt(signals.get('twitch_delta_pct'))} "
             f"steam_delta_pct={_fmt(signals.get('steam_delta_pct'))} "
             f"steam_rank_gain_vs_last_week={_fmt(signals.get('steam_rank_gain'))} "
-            f"steam_new_in_top={_fmt(signals.get('steam_new_in_top'))}")
+            f"steam_new_in_top={_fmt(signals.get('steam_new_in_top'))} "
+            f"ventes_fr_gain_vs_semaine_derniere={_fmt(signals.get('steam_sellers_gain'))} "
+            f"ventes_fr_nouveau={_fmt(signals.get('steam_sellers_new'))}")
     return "\n".join(lines)
 
 

@@ -82,6 +82,7 @@ def _collectors(*, viewers=1000, players=5000, vods=(), videos=()):
         "twitch": Collector({"games": [{"name": "Jeu Alpha", "viewers_fr": viewers}], "vods": list(vods)}),
         "youtube": Collector({"videos": list(videos)}),
         "steam": Collector({"games": [{"appid": "42", "name": "Jeu  Alpha !", "players": players}]}),
+        "steam_fr": Collector({"games": []}),
     }
 
 
@@ -108,7 +109,7 @@ def test_config_defaults_are_exactly_r1():
         "youtube_max_results": 50, "youtube_min_duration_s": 600, "steam_top": 100,
         "steam_name_lookups_max": 100, "twitch_client_id": "", "twitch_client_secret": "", "youtube_api_key": "",
         "state_dir": "state/veille", "http_timeout_s": 20,
-        "steam_rank_gain_min": 5, "steam_risers_max": 10,
+        "steam_rank_gain_min": 5, "steam_risers_max": 10, "steam_sellers_top": 50,
     }
 
 
@@ -740,3 +741,93 @@ def test_restore_moves_an_archived_clip_to_restored_and_it_stays_after_recompute
     assert sel["archived"] == [] and [r["clip_id"] for r in sel["restored"]] == ["a2"]
     with pytest.raises(veille.VeilleError):
         veille.restore("OTHER", "o1", config)
+
+
+# --- TASK-2784 : top des ventes Steam du pays ----------------------------------
+
+
+def _sellers_collectors(sellers, **twitch):
+    collectors = _collectors()
+    collectors["steam_fr"] = Collector({"games": sellers})
+    if twitch:
+        collectors["twitch"] = Collector(twitch)
+    return collectors
+
+
+def _seller(appid, name, rank, last):
+    return {"appid": appid, "name": name, "rank": rank, "last_week_rank": last}
+
+
+def test_sellers_merge_by_normalized_key_into_twitch_game_without_duplicate(tmp_path, config):
+    state = veille.collect(NOW, collectors=_sellers_collectors([_seller("9", "JEU alpha", 4, 14)]), config=config)
+    assert [g["key"] for g in state["games"]] == ["jeu alpha"]
+    game = state["games"][0]
+    assert game["steam_sellers_rank"] == 4 and game["steam_sellers_last_week_rank"] == 14
+    assert game["steam_sellers_gain"] == 10 and game["steam_sellers_new"] is False
+    assert state["sources"]["steam_fr"]["status"] == "ok" and state["sources"]["steam_fr"]["counts"] == {"games": 1}
+
+
+def test_sellers_game_without_sellers_entry_has_null_fields(tmp_path, config):
+    game = veille.collect(NOW, collectors=_collectors(), config=config)["games"][0]
+    assert game["steam_sellers_rank"] is None and game["steam_sellers_gain"] is None and game["steam_sellers_new"] is None
+
+
+def test_sellers_new_in_top_has_no_numeric_gain(tmp_path, config):
+    game = veille.collect(NOW, collectors=_sellers_collectors([_seller("9", "Jeu Alpha", 4, 0)]), config=config)["games"][0]
+    assert game["steam_sellers_new"] is True and game["steam_sellers_gain"] is None
+
+
+def test_sellers_risers_are_added_without_twitch_and_small_gain_is_not(tmp_path, config):
+    sellers = [_seller("1", "Montant", 8, 17), _seller("2", "Nouveau", 3, 0), _seller("3", "Stable", 1, 3),
+               _seller("4", "Recule", 5, 2)]
+    state = veille.collect(NOW, collectors=_sellers_collectors(sellers), config=config)
+    added = {g["name"]: g for g in state["games"] if g["source"] == "steam_fr"}
+    assert set(added) == {"Montant", "Nouveau"}
+    assert added["Montant"]["twitch_match"] is False and added["Montant"]["twitch_fr_viewers"] is None
+    assert added["Montant"]["steam_sellers_gain"] == 9 and added["Nouveau"]["steam_sellers_new"] is True
+    assert added["Montant"]["steam_match"] is False and added["Montant"]["steam_players"] is None
+
+
+def test_sellers_riser_already_a_world_steam_riser_is_not_duplicated(tmp_path, config):
+    collectors = _collectors()
+    collectors["steam"] = Collector({"games": [{"appid": "7", "name": "Montant", "players": 10, "rank": 2, "last_week_rank": 30}]})
+    collectors["steam_fr"] = Collector({"games": [_seller("7", "Montant", 8, 17)]})
+    games = veille.collect(NOW, collectors=collectors, config=config)["games"]
+    assert [g["name"] for g in games].count("Montant") == 1
+    montant = next(g for g in games if g["name"] == "Montant")
+    assert montant["steam_rank_gain"] == 28 and montant["steam_sellers_gain"] == 9
+
+
+def test_sellers_risers_are_capped_by_steam_risers_max(tmp_path):
+    config = _make_config(tmp_path, steam_risers_max=1)
+    sellers = [_seller("1", "A", 3, 0), _seller("2", "B", 4, 0)]
+    games = veille.collect(NOW, collectors=_sellers_collectors(sellers), config=config)["games"]
+    assert [g["name"] for g in games if g["source"] == "steam_fr"] == ["A"]
+
+
+def test_sellers_error_is_named_and_other_sources_continue(tmp_path, config):
+    collectors = _collectors()
+    collectors["steam_fr"] = Collector(error=veille.veille_sources.SourceError("HTTP 500 boom"))
+    state = veille.collect(NOW, collectors=collectors, config=config)
+    assert state["sources"]["steam_fr"]["status"] == "error" and "HTTP 500 boom" in state["sources"]["steam_fr"]["error"]
+    assert state["sources"]["steam"]["status"] == "ok" and state["sources"]["twitch"]["status"] == "ok"
+    assert state["games"][0]["steam_sellers_rank"] is None
+
+
+def test_sellers_saved_in_history_and_signals_reach_candidates_and_claude(tmp_path, config):
+    collectors = _sellers_collectors([_seller("9", "Jeu Alpha", 4, 14)],
+                                     games=[{"name": "Jeu Alpha", "viewers_fr": 10}], vods=[_vod("v1")])
+    state = veille.collect(NOW, collectors=collectors, config=config)
+    assert _read(_sdir(tmp_path) / "history" / f"{TODAY}.json")["steam_fr"]["9"] == {
+        "name": "Jeu Alpha", "rank": 4, "last_week_rank": 14}
+    signals = state["candidates"][0]["signals"]
+    assert signals["steam_sellers_gain"] == 10 and signals["steam_sellers_new"] is False
+    fake = FakeBackend([{"picks": [], "skipped_note": ""}])
+    with llm.use_backend(fake):
+        veille.decide(state, config)
+    prompt = fake.calls[0].prompt
+    assert prompt.count("ventes_fr_rang=4") == 1 and prompt.count("ventes_fr_gain_vs_semaine_derniere=10") == 2
+
+
+def test_sellers_settings_defaults():
+    assert veille.CONFIG_DEFAULTS["steam_sellers_top"] == 50

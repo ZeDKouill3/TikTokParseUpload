@@ -29,6 +29,21 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ### Ajouté
 
+- **Veille : top des ventes Steam du pays** (TASK-2784) : nouvelle source
+  `steam_fr` (`IStoreTopSellersService/GetWeeklyTopSellers`, sans clé, pays =
+  `[veille] region`, langue = `[veille] language`, `steam_sellers_top` = 50
+  places relevées). Les noms viennent de la réponse (pas d'appel `appdetails`).
+  Les jeux de `day.games` déjà présents (Twitch, Steam mondial) portent
+  `steam_sellers_rank`, `steam_sellers_last_week_rank`, `steam_sellers_gain` ou
+  `steam_sellers_new` (« nouveau dans le top ventes FR » : semaine dernière
+  absente ou 0), fusionnés par clé normalisée sans doublon ; les jeux nouveaux
+  ou gagnant au moins `steam_rank_gain_min` places sont ajoutés comme les jeux
+  Steam qui montent (`source = "steam_fr"`, plafond `steam_risers_max`), même
+  sans Twitch. Claude les reçoit en contexte ; une erreur de cette source est
+  nommée sans bloquer les autres. Écran Veille : colonne « Ventes FR » (« #5
+  +107 places » / « Nouveau dans le top ventes FR »), libellés de relevé en
+  français (« 99 jeux » au lieu de « 99 games »), et « Jeux qui montent » compte
+  aussi les gains de places Steam (mondial et FR).
 - **Veille : jeux Steam qui montent visibles sans Twitch FR** (TASK-f4e2) :
   `day.games` ajoute les jeux Steam du relevé absents de la liste Twitch qui
   sont « nouveau dans le top » (`last_week_rank` <= 0) ou gagnent au moins

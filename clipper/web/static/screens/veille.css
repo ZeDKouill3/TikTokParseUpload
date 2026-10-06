@@ -4,7 +4,7 @@
 .src-pill { display: inline-flex; align-items: center; gap: 8px; padding: 2px 10px 2px 2px; border-radius: 999px; background: var(--surface-2); color: var(--text-2); font-size: 12px; }
 .src-pill.bad { background: var(--bad-soft); color: var(--bad); }
 .src-youtube { background: #e5291f; color: #fff; }
-.src-steam { background: #1b3a5c; color: #fff; }
+.src-steam, .src-steam_fr { background: #1b3a5c; color: #fff; }
 .kpis-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 .prop { display: flex; gap: 16px; padding: 16px 24px; border-bottom: 1px solid var(--line); }
 .prop.queued { background: var(--surface-2); }

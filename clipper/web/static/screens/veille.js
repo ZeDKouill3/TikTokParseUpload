@@ -7,7 +7,8 @@
 "use strict";
 
 const VEILLE_STALE_MS = 4000;
-const SOURCE_LABELS = { twitch: "Twitch", youtube: "YouTube", steam: "Steam" };
+const SOURCE_LABELS = { twitch: "Twitch", youtube: "YouTube", steam: "Steam", steam_fr: "Ventes Steam FR" };
+const COUNT_LABELS = { games: "jeux", vods: "VOD", videos: "vidéos" };
 
 const veilleUi = { data: null, clips: [], error: null, loading: null, dirty: false, at: 0, style: {}, busy: false, html: "" };
 
@@ -69,7 +70,19 @@ function veilleDelta(game, kind) {
   return `<b class="${value >= 0 ? "ok" : "bad"}">${value > 0 ? "+" : ""}${esc(fr(value))} %</b>`;
 }
 
-const veilleRises = (game, min) => [game.twitch_delta_pct, game.steam_delta_pct].some((v) => v != null && v >= min);
+/* Un jeu monte : hausse vs 7 jours (Twitch, Steam) ≥ min %, OU nouveau dans un top Steam (mondial ou ventes FR),
+   OU gain de places ≥ gainMin dans l'un de ces tops. */
+const veilleRises = (game, min, gainMin = 5) => [game.twitch_delta_pct, game.steam_delta_pct].some((v) => v != null && v >= min)
+  || game.steam_new_in_top === true || game.steam_sellers_new === true
+  || [game.steam_rank_gain, game.steam_sellers_gain].some((v) => v != null && v >= gainMin);
+
+/* Top des ventes Steam du pays : « #5 (+107 places) », « #3 (nouveau dans le top ventes FR) », ou la raison de l'absence. */
+function veilleSellers(game) {
+  if (game.steam_sellers_rank == null) return `<span class="muted">hors top ventes FR</span>`;
+  const gain = game.steam_sellers_new ? `<b class="ok">Nouveau dans le top ventes FR</b>`
+    : game.steam_sellers_gain != null ? `<b class="${game.steam_sellers_gain >= 0 ? "ok" : "bad"}">${game.steam_sellers_gain > 0 ? "+" : ""}${esc(fr(game.steam_sellers_gain))} places</b>` : "";
+  return `<span class="mono">#${esc(game.steam_sellers_rank)}</span> ${gain}`;
+}
 
 /* ---------- sections ---------- */
 
@@ -79,7 +92,7 @@ function veilleSources(data) {
     const s = (day.sources || {})[name];
     if (!s) return `<span class="src-pill">${veilleSrcIcon(name)}${esc(SOURCE_LABELS[name])} : pas relevée</span>`;
     const bad = s.status === "error";
-    const counts = Object.entries(s.counts || {}).map(([k, v]) => `${v} ${k}`).join(", ");
+    const counts = Object.entries(s.counts || {}).map(([k, v]) => `${v} ${COUNT_LABELS[k] || k}`).join(", ");
     return `<span class="src-pill${bad ? " bad" : ""}">${veilleSrcIcon(name)}${esc(SOURCE_LABELS[name])}${bad ? " : erreur" : counts ? ` : ${esc(counts)}` : ""}</span>`;
   }).join("");
   const errors = Object.keys(SOURCE_LABELS).filter((n) => (day.sources || {})[n] && day.sources[n].status === "error")
@@ -95,14 +108,14 @@ function veilleSources(data) {
 
 function veilleKpis(data) {
   const day = data.day, cfg = data.settings || {};
-  const rising = (day.games || []).filter((g) => veilleRises(g, cfg.rise_min_pct ?? 50)).length;
+  const rising = (day.games || []).filter((g) => veilleRises(g, cfg.rise_min_pct ?? 50, cfg.steam_rank_gain_min ?? 5)).length;
   const proposed = day.proposals.filter((p) => p.status !== "ignored").length;
   const sel = data.selection || { kept: [], archived: [] };
   const clipKeys = (rows) => new Set(rows.map((r) => `${r.video_id}/${r.clip_id}`)).size;
   const kept = clipKeys(sel.kept), rendered = kept + clipKeys(sel.archived);
   const kpi = (label, value, foot, cls) => `<div class="kpi${cls ? ` ${cls}` : ""}"><div class="kpi-label">${esc(label)}</div><div class="kpi-value">${value}</div><div class="kpi-foot">${esc(foot)}</div></div>`;
   return `<div class="kpis kpis-4" data-veille-kpi>
-    ${kpi("Jeux qui montent", esc(rising), `sur ${(day.games || []).length} relevés (≥ ${cfg.rise_min_pct ?? 50} %)`, "accent")}
+    ${kpi("Jeux qui montent", esc(rising), `sur ${(day.games || []).length} relevés (≥ ${cfg.rise_min_pct ?? 50} % ou ≥ ${cfg.steam_rank_gain_min ?? 5} places Steam)`, "accent")}
     ${kpi("VOD proposées", `${esc(proposed)}<small>/ ${esc(cfg.max_vods_per_day ?? "?")}</small>`, day.excluded ? `${day.excluded.already_known || 0} déjà connues, ${day.excluded.too_short || 0} trop courtes` : "")}
     ${kpi("Clips gardés", `${esc(kept)}<small>/ ${esc(rendered)} rendus</small>`, `${cfg.best_clips_per_day ?? "?"} meilleurs par jour`)}
     ${kpi("Prochain relevé", data.next_run_at ? esc(veilleWhen(data.next_run_at, true)) : "—", data.enabled ? `à ${cfg.run_at || "?"} (${cfg.timezone || "Europe/Paris"})` : "veille désactivée")}
@@ -116,6 +129,7 @@ function veilleProposal(p, game, channels) {
   const signals = [
     sig("twitch", "Twitch FR", veilleDelta(game, "twitch")),
     sig("steam", "Steam", veilleDelta(game, "steam")),
+    game && game.steam_sellers_rank != null ? sig("steam", "Ventes FR", veilleSellers(game)) : "",
     c.source === "youtube" && c.views_per_hour != null ? sig("youtube", "YouTube", `<b>${esc(fr(Math.round(c.views_per_hour)))} vues/h</b>`) : "",
   ].join("");
   const chosen = veilleUi.style[p.candidate_id] || "";
@@ -182,13 +196,13 @@ function veilleRising(data) {
   const rows = games.map((g) => `<tr>
     <td>${esc(g.name)}</td>
     <td class="r">${g.twitch_match === false ? `<span class="muted">hors Twitch FR</span>` : num(g.twitch_fr_viewers, "pas relevé")}</td><td class="r">${veilleDelta(g, "twitch")}</td>
-    <td class="r">${g.steam_match ? num(g.steam_players, "pas relevé") : `<span class="muted">hors Steam</span>`}</td><td class="r">${veilleDelta(g, "steam")}</td>
+    <td class="r">${g.steam_match ? num(g.steam_players, "pas relevé") : `<span class="muted">hors Steam</span>`}</td><td class="r">${veilleDelta(g, "steam")}</td><td class="r">${veilleSellers(g)}</td>
     <td class="r">${num(g.youtube_views_per_hour == null ? null : Math.round(g.youtube_views_per_hour), "clé absente ou pas de vidéo")}</td>
     <td class="r">${esc(g.vod_count)}</td></tr>`).join("");
   return `<section data-veille-rising><div class="section-title">${icon("trending-up")}Ce qui monte</div><div class="panel">
-    ${rows ? `<div class="table-wrap"><table class="table"><thead><tr><th>Jeu</th><th class="r">Twitch FR (viewers)</th><th class="r">Δ 7 j</th><th class="r">Steam (joueurs)</th><th class="r">Δ 7 j</th><th class="r">YouTube FR (vues/h)</th><th class="r">VOD FR</th></tr></thead><tbody>${rows}</tbody></table></div>`
+    ${rows ? `<div class="table-wrap"><table class="table"><thead><tr><th>Jeu</th><th class="r">Twitch FR (viewers)</th><th class="r">Δ 7 j</th><th class="r">Steam (joueurs)</th><th class="r">Δ 7 j</th><th class="r">Ventes FR</th><th class="r">YouTube FR (vues/h)</th><th class="r">VOD FR</th></tr></thead><tbody>${rows}</tbody></table></div>`
       : `<div class="list-item muted">Aucun jeu relevé : vérifie les sources ci-dessus.</div>`}
-    <div class="arch-row"><span class="t muted">Un jeu sans correspondance Steam l'indique ; une donnée absente est expliquée, aucune valeur n'est inventée.</span></div>
+    <div class="arch-row"><span class="t muted">Un jeu sans correspondance Steam ou hors du top ventes FR l'indique ; une donnée absente est expliquée, aucune valeur n'est inventée.</span></div>
   </div></section>`;
 }
 
