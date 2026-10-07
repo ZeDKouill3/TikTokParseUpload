@@ -3109,3 +3109,85 @@ def test_learning_disabled_does_nothing(tmp_path):
     worker.Worker(config=config, spawner=FakeSpawner(),
                   learning_runner=lambda now, *, config: calls.append(1) or {}).tick()
     assert calls == []
+
+
+# ---- pause manuelle d'un compte (SPEC-f348 R7.3, R7.5)
+
+
+def _pause(config, account=ACCOUNT):
+    accounts_mod.pause(config, account)
+
+
+def test_an_entry_of_a_paused_account_is_not_attempted_and_waits_with_a_visible_reason(tmp_path, monkeypatch, caplog):
+    config = _pub_env(tmp_path, monkeypatch)
+    _pause(config)
+    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1))
+    pub, login = FakePublisher(), FakeLogin()
+    worker_ = _pub_worker(config, pub, login)
+
+    with caplog.at_level(logging.WARNING):
+        worker_.tick()
+        worker_.tick()
+
+    assert pub.calls == [] and login.calls == []
+    entry = _entries(tmp_path)[0]
+    assert entry["status"] == "scheduled" and entry["error"] is None
+    assert "en pause (manuel)" in entry["waiting_reason"] and "compte A" in entry["waiting_reason"]
+    assert "choisis un autre compte" in entry["waiting_reason"]
+    assert caplog.text.count("en pause (manuel)") == 1  # un seul journal par raison
+    events = [e for e in tiktok.read_events(config=config) if e.get("clip_id") == "01"]
+    assert len(events) == 1 and "en pause (manuel)" in events[0]["reason"]
+
+
+def test_a_paused_account_never_falls_back_to_another_account(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)  # la chaine pointe ab12cd, l'entree vise l'autre compte
+    _pause(config, OTHER)
+    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1), account=OTHER)
+    pub = FakePublisher()
+
+    _pub_worker(config, pub).tick()
+
+    assert pub.calls == []
+    assert "en pause (manuel)" in _entries(tmp_path)[0]["waiting_reason"]
+
+
+def test_after_resume_with_a_verified_connection_the_entry_is_attempted_on_the_next_tick(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    _pause(config)
+    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1))
+    pub, login = FakePublisher(), FakeLogin()
+    worker_ = _pub_worker(config, pub, login)
+    worker_.tick()
+    assert pub.calls == []
+
+    accounts_mod.record_login(config, ACCOUNT, _CONNECTED)  # l'ouverture de l'ecran Comptes revérifie la connexion
+    accounts_mod.resume(config, ACCOUNT)
+    worker_.tick()
+
+    assert [c["account"] for c in pub.calls] == [ACCOUNT]
+    entry = _entries(tmp_path)[0]
+    assert entry["status"] == "published" and entry["waiting_reason"] is None
+
+
+def test_the_periodic_stats_fetch_still_covers_a_paused_connected_account(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch, tiktok_settings={"stats_interval_h": 2})
+    _set_account_state(tmp_path, "ef34ab", ready_to_publish=False)
+    _pause(config)
+    fetcher = FakeStatsFetcher(tmp_path)
+
+    _stats_worker(config, fetcher).tick()
+
+    assert [c["account"] for c in fetcher.calls] == [ACCOUNT]
+
+
+def test_the_periodic_stats_fetch_skips_a_paused_account_with_an_expired_connection(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch, tiktok_settings={"stats_interval_h": 2})
+    _set_account_state(tmp_path, "ef34ab", ready_to_publish=False)
+    _pause(config)
+    _set_account_state(tmp_path, ACCOUNT, login={"state": "expired", "checked_at": "2026-10-01T10:00:00+00:00",
+                                                 "expires_at": None})
+    fetcher = FakeStatsFetcher(tmp_path)
+
+    _stats_worker(config, fetcher).tick()
+
+    assert fetcher.calls == []

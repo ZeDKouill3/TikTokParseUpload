@@ -274,7 +274,7 @@ def _public(account: dict[str, Any]) -> dict[str, Any]:
     out.update(has_password=bool(account.get("has_password")), channel=account.get("channel"),
                created_at=account.get("created_at"), updated_at=account.get("updated_at"),
                ready_to_publish=bool(account.get("ready_to_publish")),
-               ready_note=account.get("ready_note"), login=account.get("login"),
+               ready_note=account.get("ready_note"), paused_at=account.get("paused_at"), login=account.get("login"),
                r4_halt=account.get("r4_halt"), slots=list(account.get("slots") or []),
                timezone=account.get("timezone") or DEFAULT_TIMEZONE)
     return out
@@ -408,9 +408,35 @@ def get_password(config: Config, account_id: str) -> str:
 # ---------------------------------------------------------------- compte de publication
 
 
+def _paris(iso: str) -> str:
+    """Date affichee en heure de Paris (SPEC-5e50 R8)."""
+    try:
+        return datetime.fromisoformat(iso).astimezone(ZoneInfo(DEFAULT_TIMEZONE)).strftime("%d/%m/%Y à %H:%M")
+    except ValueError:
+        return iso
+
+
+def pause_reason(account: dict[str, Any]) -> str | None:
+    """Raison de la pause manuelle (SPEC-f348 R3 c), None si le compte n'est pas en pause."""
+    if not account.get("paused_at"):
+        return None
+    return f"En pause (manuel) depuis le {paused_since(account)} : recoche « Prêt à publier » pour reprendre"
+
+
+def paused_since(account: dict[str, Any]) -> str | None:
+    """Date de la pause manuelle en heure de Paris, None si le compte n'est pas en pause."""
+    return _paris(account["paused_at"]) if account.get("paused_at") else None
+
+
 def ready_blocked_reason(account: dict[str, Any]) -> str | None:
-    """Pourquoi le compte n'est pas « pret a publier » (None : il l'est) : connexion du service non verifiee
-    ou expiree, ou arret R4 en attente (R3)."""
+    """Pourquoi le compte n'est pas « pret a publier » (None : il l'est) : pause manuelle (R3 c), puis connexion
+    du service non verifiee ou expiree, ou arret R4 en attente (R3)."""
+    return pause_reason(account) or connection_blocked_reason(account)
+
+
+def connection_blocked_reason(account: dict[str, Any]) -> str | None:
+    """La part connexion / arret R4 de ``ready_blocked_reason``, sans la pause : un compte en pause connecte et sans
+    arret reste relevable pour les statistiques (SPEC-f348 R7.5)."""
     service = account.get("service") or DEFAULT_SERVICE
     label = SERVICE_LABELS.get(service, service)
     login = account.get("login") or {}
@@ -527,6 +553,50 @@ def clear_halt(config: Config, account_id: str) -> dict[str, Any]:
     if halt:
         logger.info("compte %s : arrêt de publication effacé par l'utilisateur (%s)", account_id, halt.get("reason"))
     out.update(auto_checked=change == "checked", auto_unchecked=change == "unchecked")
+    return out
+
+
+def pause(config: Config, account_id: str) -> dict[str, Any]:
+    """Pause manuelle (SPEC-f348 R3 c, R7.1) : pose ``paused_at`` (ISO UTC), decoche la case avec la raison
+    « En pause (manuel) depuis le <date> ». Idempotent. La connexion et l'arret R4 restent enregistres tels quels."""
+    with _lock, _file_lock(config):
+        accounts = _read(config)
+        account = _find(accounts, account_id)
+        changed = not account.get("paused_at")
+        was_ready = bool(account.get("ready_to_publish"))
+        if changed:
+            account["paused_at"] = _now()
+            account["ready_to_publish"] = False
+            account["ready_note"] = pause_reason(account)
+            account["updated_at"] = _now()
+            _write(config, accounts)
+        out = _public(account)
+    if changed:
+        logger.warning("compte %s : mis en pause manuellement%s", account_id,
+                       ", « prêt à publier » décoché" if was_ready else "")
+    out.update(auto_checked=False, auto_unchecked=changed and was_ready)
+    return out
+
+
+def resume(config: Config, account_id: str) -> dict[str, Any]:
+    """Reprise (SPEC-f348 R7.2) : retire ``paused_at`` ; la case suit R3 (cochee si connexion verifiee et aucun arret
+    R4, sinon decochee avec la raison de connexion ou d'arret). Sans pause : rien ne change."""
+    with _lock, _file_lock(config):
+        accounts = _read(config)
+        account = _find(accounts, account_id)
+        was_paused = bool(account.pop("paused_at", None))
+        change = None
+        if was_paused:
+            change = _sync_ready(account, account_id)
+            if not account.get("ready_to_publish"):
+                account["ready_note"] = connection_blocked_reason(account)
+            account["updated_at"] = _now()
+            _write(config, accounts)
+        out = _public(account)
+    if was_paused:
+        logger.info("compte %s : pause manuelle levée (reprise)%s", account_id,
+                    ", « prêt à publier » coché" if change == "checked" else "")
+    out.update(auto_checked=change == "checked", auto_unchecked=False)
     return out
 
 

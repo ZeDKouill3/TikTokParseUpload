@@ -1862,11 +1862,20 @@ def _stats_account_info(config: Config, account_id: str) -> dict[str, Any]:
     found = next((a for a in _accounts_call(accounts_mod.list_accounts, config) if a["id"] == account_id), None)
     if found is None:
         raise HTTPException(status_code=404, detail=f"compte introuvable : {account_id!r}")
-    ready = bool(found.get("ready_to_publish"))
-    reason = None if ready else (accounts_mod.ready_blocked_reason(found) or found.get("ready_note")
+    ready = _stats_relevable(found)
+    reason = None if ready else ((accounts_mod.connection_blocked_reason(found) if found.get("paused_at") else None)
+                                 or accounts_mod.ready_blocked_reason(found) or found.get("ready_note")
                                  or "le compte n'est pas coché « prêt à publier »")
     return {"account": account_id, "label": found.get("label") or account_id,
-            "ready": ready, "not_ready_reason": reason}
+            "ready": ready, "not_ready_reason": reason, "paused_at": found.get("paused_at")}
+
+
+def _stats_relevable(found: dict[str, Any]) -> bool:
+    """Un compte est relevable s'il est « pret a publier » ou en pause manuelle avec une connexion verifiee et sans
+    arret R4 : la pause n'arrete que la publication, pas les statistiques (SPEC-f348 R7.5)."""
+    if found.get("ready_to_publish"):
+        return True
+    return bool(found.get("paused_at")) and accounts_mod.connection_blocked_reason(found) is None
 
 
 def _stats_tiktok_call(fn: Any, *args: Any, **kwargs: Any) -> Any:
@@ -2213,6 +2222,31 @@ def _account_resolve(config: Config, account_id: str) -> dict[str, Any]:
     return out
 
 
+def _account_pause(config: Config, account_id: str) -> dict[str, Any]:
+    """Pause manuelle (SPEC-f348 R7.1) : la case se decoche, la console en est prevenue comme pour un decochage
+    automatique ; la connexion et l'arret R4 ne bougent pas."""
+    out = _accounts_call(accounts_mod.pause, config, account_id)
+    if out.pop("auto_unchecked"):
+        _emit_unchecked(config, account_id, out["ready_note"])
+    out.pop("auto_checked", None)
+    return out
+
+
+def _account_resume(config: Config, account_id: str) -> dict[str, Any]:
+    """Reprise (SPEC-f348 R7.2) : revérifie la connexion (R2) puis leve la pause ; la case suit R3. Cookies illisibles :
+    409, la pause reste en place."""
+    account = next((a for a in _accounts_call(accounts_mod.list_accounts, config) if a["id"] == account_id), None)
+    if account is None:
+        raise HTTPException(status_code=404, detail=f"compte introuvable : {account_id!r}")
+    verified = _verify_login(config, account)
+    if verified.get("login_error") is not None:
+        raise HTTPException(status_code=409, detail=f"connexion non vérifiable : {verified['login_error']} "
+                            "(le compte reste en pause)")
+    out = _accounts_call(accounts_mod.resume, config, account_id)
+    out.pop("auto_checked", None), out.pop("auto_unchecked", None)
+    return out
+
+
 class _LimitRefused(Exception):
     """Plafond du compte depasse : 409 avec la raison et la prochaine heure possible (SPEC-1ed3 R4)."""
 
@@ -2234,7 +2268,7 @@ def _publish_accounts(config: Config) -> list[dict[str, Any]]:
     """Comptes proposes a la publication, des deux services : id, libelle, service, pret ou non (aucun secret,
     lisible hors du PC)."""
     return [{"id": a["id"], "label": a["label"], "ready_to_publish": a["ready_to_publish"],
-             "service": a["service"], "service_label": accounts_mod.SERVICE_LABELS.get(a["service"], a["service"])}
+             "paused_at": a.get("paused_at"), "service": a["service"], "service_label": accounts_mod.SERVICE_LABELS.get(a["service"], a["service"])}
             for a in _accounts_call(accounts_mod.list_accounts, config)]
 
 
@@ -2259,6 +2293,10 @@ def _require_ready_account(config: Config, account_id: Any) -> str:
     found = next((a for a in _publish_accounts(config) if a["id"] == account_id), None)
     if found is None:
         raise HTTPException(status_code=409, detail=f"compte inconnu : {account_id!r} (écran Comptes)")
+    if found.get("paused_at"):
+        raise HTTPException(status_code=409, detail=f"compte {found['label'] or account_id} en pause (manuel) depuis le "
+                            f"{accounts_mod.paused_since(found)} : "
+                            "recoche « Prêt à publier » dans l'écran Comptes pour reprendre, ou choisis un autre compte")
     if not found["ready_to_publish"]:
         raise HTTPException(status_code=409, detail=f"compte {found['label'] or account_id} non prêt à publier : "
                             "« prêt à publier » est automatique : connecte-le (Se connecter) ou règle l'arrêt en attente dans l'écran Comptes")
@@ -3491,7 +3529,7 @@ def create_app(config: Config | None = None) -> FastAPI:
             if not info["ready"]:
                 raise HTTPException(status_code=409, detail=f"compte {info['label']} non prêt à publier, pas de relevé : "
                                                             f"{info['not_ready_reason']}")
-        accounts = wanted if wanted is not None else [a for a, found in known.items() if found.get("ready_to_publish")]
+        accounts = wanted if wanted is not None else [a for a, found in known.items() if _stats_relevable(found)]
         if not accounts:
             raise HTTPException(status_code=409, detail="aucun compte prêt à publier : rien à relever")
         done: dict[str, Any] = {}
@@ -3525,8 +3563,17 @@ def create_app(config: Config | None = None) -> FastAPI:
         raise HTTPException(
             status_code=405, headers={"Allow": "GET"},
             detail="« prêt à publier » est automatique (connexion TikTok vérifiée, aucun arrêt en attente) : "
-                   "il ne se coche ni ne se décoche à la main ; clique sur « Se connecter » ou « J'ai réglé le problème »",
+                   "il ne se coche ni ne se décoche à la main ; clique sur « Se connecter » ou « J'ai réglé le problème », "
+                   "ou mets le compte en pause / reprends-le (POST /api/accounts/{id}/pause et /resume)",
         )
+
+    @app.post("/api/accounts/{account_id}/pause")
+    async def accounts_pause(account_id: str) -> dict[str, Any]:
+        return await run_in_threadpool(_account_pause, config, account_id)
+
+    @app.post("/api/accounts/{account_id}/resume")
+    async def accounts_resume(account_id: str) -> dict[str, Any]:
+        return await run_in_threadpool(_account_resume, config, account_id)
 
     @app.post("/api/accounts/{account_id}/resolve")
     async def accounts_resolve(account_id: str) -> dict[str, Any]:

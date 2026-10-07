@@ -1039,3 +1039,181 @@ def test_accounts_screen_edits_slots_like_the_old_channel_form():
     for marker in ("accSlotsEditor", "accReadSlots", "data-slot-add", "data-slot-del", "data-acc-slots",
                    "slots: accReadSlots(slotsBox)", "timezone:", "Créneaux de publication"):
         assert marker in js
+
+
+# ---- pause manuelle d'un compte (SPEC-f348 R3 c, R7.1-R7.5)
+
+
+def test_pause_sets_paused_at_unticks_ready_and_says_so(config, vault, caplog):
+    account = accounts.add_account(config, {"label": "Compte"})
+    accounts.record_login(config, account["id"], CONNECTED)
+
+    with caplog.at_level(logging.INFO):
+        out = accounts.pause(config, account["id"])
+
+    assert out["ready_to_publish"] is False and out["auto_unchecked"] is True
+    assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\+00:00", out["paused_at"])
+    reloaded = accounts.list_accounts(config)[0]
+    assert reloaded["paused_at"] == out["paused_at"] and reloaded["ready_to_publish"] is False
+    assert "En pause (manuel) depuis le " in accounts.ready_blocked_reason(reloaded)
+    assert "En pause (manuel) depuis le " in reloaded["ready_note"]
+    assert "pause" in caplog.text and account["id"] in caplog.text
+
+
+def test_a_second_pause_changes_nothing(config, vault):
+    account = accounts.add_account(config, {"label": "Compte"})
+    first = accounts.pause(config, account["id"])
+    before = Path("state/accounts.json").read_text(encoding="utf-8")
+
+    second = accounts.pause(config, account["id"])
+
+    assert second["paused_at"] == first["paused_at"] and second["auto_unchecked"] is False
+    assert Path("state/accounts.json").read_text(encoding="utf-8") == before
+
+
+def test_resume_ticks_ready_when_connected_without_halt(config, vault, caplog):
+    account = accounts.add_account(config, {"label": "Compte"})
+    accounts.record_login(config, account["id"], CONNECTED)
+    accounts.pause(config, account["id"])
+
+    with caplog.at_level(logging.INFO):
+        out = accounts.resume(config, account["id"])
+
+    assert out["paused_at"] is None and out["ready_to_publish"] is True and out["auto_checked"] is True
+    assert accounts.list_accounts(config)[0]["paused_at"] is None
+    assert "reprise" in caplog.text or "resume" in caplog.text
+
+
+def test_resume_leaves_ready_off_with_the_connection_or_halt_reason(config, vault):
+    a = accounts.add_account(config, {"label": "A"})
+    accounts.pause(config, a["id"])
+    out = accounts.resume(config, a["id"])
+    assert out["ready_to_publish"] is False and "non vérifiée" in accounts.ready_blocked_reason(out)
+    assert "En pause" not in (out["ready_note"] or "")
+
+    b = accounts.add_account(config, {"label": "B"})
+    accounts.record_login(config, b["id"], CONNECTED)
+    accounts.uncheck_ready(config, b["id"], "arrêt de publication : captcha détecté")
+    accounts.pause(config, b["id"])
+    out = accounts.resume(config, b["id"])
+    assert out["ready_to_publish"] is False and "captcha détecté" in accounts.ready_blocked_reason(out)
+    assert "En pause" not in (out["ready_note"] or "")
+
+
+def test_resume_without_pause_changes_nothing(config, vault):
+    account = accounts.add_account(config, {"label": "Compte"})
+    accounts.record_login(config, account["id"], CONNECTED)
+    before = Path("state/accounts.json").read_text(encoding="utf-8")
+
+    out = accounts.resume(config, account["id"])
+
+    assert out["ready_to_publish"] is True and out["auto_checked"] is False and out["paused_at"] is None
+    assert Path("state/accounts.json").read_text(encoding="utf-8") == before
+    with pytest.raises(accounts.AccountNotFound):
+        accounts.pause(config, "inconnu")
+    with pytest.raises(accounts.AccountNotFound):
+        accounts.resume(config, "inconnu")
+
+
+def test_during_a_pause_login_and_halt_are_recorded_but_ready_stays_off(config, vault):
+    account = accounts.add_account(config, {"label": "Compte"})
+    accounts.pause(config, account["id"])
+
+    out = accounts.record_login(config, account["id"], CONNECTED)
+    assert out["ready_to_publish"] is False and out["auto_checked"] is False
+    assert out["login"]["state"] == "connected" and "En pause (manuel)" in accounts.ready_blocked_reason(out)
+    assert accounts.connection_blocked_reason(out) is None
+
+    accounts.uncheck_ready(config, account["id"], "captcha")
+    out = accounts.clear_halt(config, account["id"])
+    assert out["ready_to_publish"] is False and out["r4_halt"] is None and out["auto_checked"] is False
+    assert "En pause (manuel)" in accounts.ready_blocked_reason(out)
+
+    accounts.uncheck_ready(config, account["id"], "captcha 2")
+    halted = accounts.list_accounts(config)[0]
+    assert halted["r4_halt"]["reason"] == "captcha 2" and halted["login"]["state"] == "connected"
+    assert "captcha 2" in accounts.connection_blocked_reason(halted)
+
+
+def test_paused_at_and_ready_cannot_be_set_by_update(config, vault):
+    account = accounts.add_account(config, {"label": "Compte"})
+    for field in ("paused_at", "ready_to_publish"):
+        with pytest.raises(accounts.AccountsError, match="champ"):
+            accounts.update_account(config, account["id"], {field: "2026-10-07T10:00:00+00:00"})
+    c = local_client(config)
+    for field in ("paused_at", "ready_to_publish"):
+        assert c.put(f"/api/accounts/{account['id']}", json={field: True}).status_code == 422
+
+
+# ---- routes pause / resume (SPEC-f348 R7.1, R7.2, R7.4)
+
+
+def test_the_pause_route_unticks_notifies_the_console_and_shows_in_both_listings(config, vault, cookies):
+    from clipper import tiktok
+
+    account = accounts.add_account(config, {"label": "Compte"})
+    cookies.set(account["id"], [_session()])
+    c = local_client(config)
+    assert c.get("/api/accounts").json()[0]["ready_to_publish"] is True
+
+    resp = c.post(f"/api/accounts/{account['id']}/pause", json={})
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["ready_to_publish"] is False and body["paused_at"] and "auto_unchecked" not in body
+    event = tiktok.read_events(config=config)[-1]
+    assert event["account"] == account["id"] and "En pause (manuel)" in event["reason"]
+    row = c.get("/api/accounts").json()[0]  # la connexion reste verifiee, la case ne se recoche pas toute seule
+    assert row["paused_at"] == body["paused_at"] and row["ready_to_publish"] is False
+    assert row["login"]["state"] == "connected" and "En pause (manuel)" in row["ready_blocked_reason"]
+    published = c.get("/api/publish/accounts").json()["accounts"][0]
+    assert published["paused_at"] == body["paused_at"] and published["ready_to_publish"] is False
+
+
+def test_the_resume_route_rechecks_the_connection_before_giving_the_state_back(config, vault, cookies):
+    account = accounts.add_account(config, {"label": "Compte"})
+    cookies.set(account["id"], [_session()])
+    c = local_client(config)
+    c.get("/api/accounts")
+    c.post(f"/api/accounts/{account['id']}/pause", json={})
+    cookies.set(account["id"], [_session(days=-1)])  # la session a expire pendant la pause
+
+    resp = c.post(f"/api/accounts/{account['id']}/resume", json={})
+
+    assert resp.status_code == 200
+    assert resp.json()["paused_at"] is None and resp.json()["ready_to_publish"] is False
+    assert "expirée" in accounts.ready_blocked_reason(resp.json())
+    cookies.set(account["id"], [_session()])
+    c.post(f"/api/accounts/{account['id']}/pause", json={})
+    resumed = c.post(f"/api/accounts/{account['id']}/resume", json={})
+    assert resumed.json()["paused_at"] is None and resumed.json()["ready_to_publish"] is True
+
+
+def test_the_resume_route_with_unreadable_cookies_keeps_the_pause(config, vault, cookies):
+    account = accounts.add_account(config, {"label": "Compte"})
+    cookies.set(account["id"], [_session()])
+    c = local_client(config)
+    c.post(f"/api/accounts/{account['id']}/pause", json={})
+    cookies.error = "cookies du profil illisibles : ferme la fenêtre Chrome de ce compte"
+
+    resp = c.post(f"/api/accounts/{account['id']}/resume", json={})
+
+    assert resp.status_code == 409 and "ferme la fenêtre Chrome" in resp.json()["detail"]
+    assert accounts.list_accounts(config)[0]["paused_at"] is not None
+
+
+def test_pause_and_resume_routes_are_local_only_and_404_for_an_unknown_account(config, vault, cookies):
+    account = accounts.add_account(config, {"label": "Compte"})
+    remote = TestClient(create_app(config=config), base_url="http://exemple.invalid", client=("203.0.113.5", 50000))
+    for action in ("pause", "resume"):
+        assert local_client(config).post(f"/api/accounts/inconnu/{action}", json={}).status_code == 404
+        assert remote.post(f"/api/accounts/{account['id']}/{action}", json={}).status_code == 403
+    assert accounts.list_accounts(config)[0]["paused_at"] is None
+
+
+def test_the_manual_ready_route_stays_405_and_names_pause_and_resume(config, vault, cookies):
+    account = accounts.add_account(config, {"label": "Compte"})
+
+    resp = local_client(config).put(f"/api/accounts/{account['id']}/ready", json={"ready": True})
+
+    assert resp.status_code == 405 and "pause" in resp.json()["detail"] and "resume" in resp.json()["detail"]
