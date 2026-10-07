@@ -5,14 +5,18 @@ slug: boucle-d-apprentissage-branch-e-sur-les-relev-s
 title: "Boucle d'apprentissage branchée sur les relevés réels : rattachement post→clip après relevé, versement stats→outcomes, métrique normalisée à maturité, recalibrage automatique, coach sur déclencheur validé dans l'interface, bilan des VOD de veille (amende ADR-1cf0)"
 created: 2026-10-07T10:24:36Z
 author: w-learnplan
-status: proposed
+status: accepted
 scope:
   - clipper/**
 constraint: |
   Toute statistique de plateforme relevée sous state/stats/<service>/<compte>/ est versée dans le journal des résultats (clipper.outcomes) par la bibliothèque clipper/learning.py, exécutée par le worker seul à chaque tour et jamais par clipper/web, de façon idempotente, chaque entrée portant video_id, clip_id et moment_id ; un post relevé n'est relié à un clip que par l'id de post du sidecar ou par un rattachement sans ambiguïté (légende, compte, instant de publication) écrit dans le sidecar et l'entrée de publication, jamais deviné ; la métrique d'apprentissage est le rang 0-1 des vues à maturité (au moins maturity_days après publication) parmi les posts mûrs du même compte, un compte sous min_account_posts posts mûrs à vues > 0 n'entrant pas dans l'apprentissage ; le recalibrage des poids suit automatiquement chaque versement selon ADR-1cf0 ; le coach ne tourne que sur déclencheur (nouveaux cas mûrs et intervalle minimum), via clipper.llm, et aucune de ses propositions n'est appliquée sans une validation humaine explicite dans l'interface, l'adoption écrivant la perspective dans config.toml ; la veille reçoit dans son prompt le bilan chiffré des VOD choisies précédemment ; toute panne de la boucle est journalisée et visible, jamais remplacée par une valeur de secours ; YouTube n'entre dans la boucle qu'une fois son relevé existant.
 amends: [ADR-1cf0b17d48b3]
+ratified: a78a1a8d9afc
+verified:
+  - by: nicoc@zedk_ordi
+    at: 2026-10-07T10:32:22Z
 schema: 4
-version: 1
+version: 2
 ---
 
 ## Contexte
