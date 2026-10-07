@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import struct
+import subprocess
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -24,6 +27,8 @@ CONFIG_DEFAULTS: dict[str, object] = {
     # Coupures reseau (WinError 10054 sur usher.ttvnw.net...) : essais rapproches avant d'echouer.
     "network_retries": 15,
     "network_retry_pause_s": 5,
+    # Binaire ffmpeg du remux d'un mp4 fragmente (resolu par le PATH).
+    "ffmpeg_bin": "ffmpeg",
 }
 
 # Marqueurs d'une erreur de transport reseau (connexion fermee/coupee), cherches dans le message
@@ -267,6 +272,61 @@ def _extract_with_retries(
             sleep(pause_s)
 
 
+def is_fragmented_mp4(path: str | Path) -> bool:
+    """Vrai si le mp4 contient au moins une boite `moof` au premier niveau (mp4 fragmente).
+    Ne lit que les en-tetes des boites, en sautant leur contenu ; un fichier illisible comme
+    mp4 (en-tete incoherent) n'est pas considere fragmente."""
+    with open(path, "rb") as f:
+        pos = 0
+        size_total = os.fstat(f.fileno()).st_size
+        while pos + 8 <= size_total:
+            f.seek(pos)
+            header = f.read(8)
+            if len(header) < 8:
+                return False
+            size, kind = struct.unpack(">I4s", header)
+            if kind == b"moof":
+                return True
+            if size == 1:
+                ext = f.read(8)
+                if len(ext) < 8:
+                    return False
+                size = struct.unpack(">Q", ext)[0]
+            elif size == 0:  # la boite va jusqu'a la fin du fichier
+                return False
+            if size < 8:
+                return False
+            pos += size
+    return False
+
+
+def _remux_if_fragmented(video_file: Path, video_id: str, ffmpeg_bin: str) -> None:
+    """Remuxe sans reencodage un mp4 fragmente en mp4 indexe (sinon chaque seek ffmpeg lit tout le
+    fichier). Echec : DownloadError, fichier temporaire supprime, original laisse en place."""
+    if not is_fragmented_mp4(video_file):
+        return
+    tmp = video_file.with_name(f"{video_file.stem}.remux.mp4")
+    started = time.monotonic()
+    cmd = [ffmpeg_bin, "-v", "error", "-y", "-i", str(video_file), "-map", "0",
+           "-c", "copy", "-movflags", "+faststart", str(tmp)]
+    try:
+        try:
+            proc = subprocess.run(cmd, capture_output=True)
+        except FileNotFoundError as exc:
+            raise DownloadError(f"{video_id} : remux impossible, ffmpeg introuvable ({ffmpeg_bin})") from exc
+        if proc.returncode != 0:
+            detail = proc.stderr.decode(errors="replace").strip()[-300:]
+            raise DownloadError(f"{video_id} : remux ffmpeg echoue (code {proc.returncode}) : {detail}")
+        if not tmp.exists() or tmp.stat().st_size == 0:
+            raise DownloadError(f"{video_id} : remux ffmpeg a produit un fichier vide")
+        size = tmp.stat().st_size
+        os.replace(tmp, video_file)
+    finally:
+        tmp.unlink(missing_ok=True)
+    log.info("%s : mp4 fragmente remuxe en mp4 indexe (%.2f Go, %.0f s)",
+             video_id, size / 1e9, time.monotonic() - started)
+
+
 def download(
     url: str,
     workspace_dir: str | Path = "workspace",
@@ -279,6 +339,7 @@ def download(
     network_retries: int = 15,
     network_retry_pause_s: float = 5,
     sleep: Callable[[float], None] = time.sleep,
+    ffmpeg_bin: str = "ffmpeg",
 ) -> dict[str, Any]:
     """Download a YouTube video and write its metadata (ADR-b16b: a step
     reads its inputs and writes workspace/<video_id>/ itself).
@@ -311,6 +372,8 @@ def download(
     info = _extract_with_retries(
         url, opts, ydl_factory, video_id, network_retries, network_retry_pause_s, sleep
     )
+
+    _remux_if_fragmented(video_file, video_id, ffmpeg_bin)
 
     meta = _build_meta(info, url)
     meta_file.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")

@@ -358,6 +358,7 @@ def test_config_section_download_resolves_via_clipper_config(isolated_cwd):
         "js_runtimes": "node",
         "network_retries": 15,
         "network_retry_pause_s": 5,
+        "ffmpeg_bin": "ffmpeg",
     }
 
 
@@ -659,3 +660,162 @@ def test_download_does_not_retry_other_errors(isolated_cwd, message):
         )
     assert len(calls) == 1
     assert sleeps == []
+
+
+# --- TASK-349a : remux d'un mp4 fragmente (VOD Twitch fMP4) -----------------------------------------
+
+import shutil
+import subprocess
+
+needs_ffmpeg = pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg absent du PATH")
+
+
+def _make_mp4(path: Path, *, fragmented: bool, seconds: int = 2) -> None:
+    movflags = "frag_keyframe+empty_moov" if fragmented else "+faststart"
+    subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-y",
+            "-f", "lavfi", "-i", f"testsrc=duration={seconds}:size=160x90:rate=10",
+            "-f", "lavfi", "-i", f"sine=duration={seconds}",
+            "-c:v", "libx264", "-g", "5", "-c:a", "aac", "-shortest",
+            "-movflags", movflags, str(path),
+        ],
+        check=True,
+    )
+
+
+def _duration(path: Path) -> float:
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(path)],
+        capture_output=True, text=True, check=True,
+    )
+    return float(out.stdout.strip())
+
+
+@needs_ffmpeg
+def test_is_fragmented_detects_fmp4_and_not_a_normal_mp4(tmp_path):
+    from clipper.download import is_fragmented_mp4
+
+    frag, normal = tmp_path / "frag.mp4", tmp_path / "normal.mp4"
+    _make_mp4(frag, fragmented=True)
+    _make_mp4(normal, fragmented=False)
+
+    assert is_fragmented_mp4(frag) is True
+    assert is_fragmented_mp4(normal) is False
+
+
+def test_is_fragmented_is_false_for_garbage_bytes(tmp_path):
+    from clipper.download import is_fragmented_mp4
+
+    junk = tmp_path / "junk.mp4"
+    junk.write_bytes(b"fake video bytes")
+    assert is_fragmented_mp4(junk) is False
+
+
+def _fragmented_ydl(info: dict, make):
+    class Ydl:
+        def __init__(self, opts):
+            self._opts = opts
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        def extract_info(self, url, download=True):
+            path = Path(self._opts["outtmpl"] % {"id": info["id"], "ext": "mp4"})
+            path.parent.mkdir(parents=True, exist_ok=True)
+            make(path)
+            return info
+
+    return Ydl
+
+
+@needs_ffmpeg
+def test_download_remuxes_a_fragmented_mp4_keeping_duration(isolated_cwd, caplog):
+    import logging
+
+    from clipper.download import download, is_fragmented_mp4
+
+    info = {**_load_fixture("info_dict_full.json"), "id": "v123"}
+    factory = _fragmented_ydl(info, lambda p: _make_mp4(p, fragmented=True, seconds=3))
+    with caplog.at_level(logging.INFO, logger="clipper.download"):
+        download("https://www.twitch.tv/videos/123", workspace_dir=isolated_cwd / "ws", ydl_factory=factory)
+
+    video = isolated_cwd / "ws" / "v123" / "v123.mp4"
+    assert not is_fragmented_mp4(video)
+    assert _duration(video) == pytest.approx(3.0, abs=0.3)
+    assert (isolated_cwd / "ws" / "v123" / "meta.json").exists()
+    assert not list((isolated_cwd / "ws" / "v123").glob("*.remux*"))
+    assert any("remux" in r.getMessage().lower() for r in caplog.records)
+
+
+def test_download_remux_failure_raises_and_keeps_original(isolated_cwd, monkeypatch):
+    from clipper import download as dl
+
+    info = {**_load_fixture("info_dict_full.json"), "id": "v123"}
+    monkeypatch.setattr(dl, "is_fragmented_mp4", lambda p: True)
+    monkeypatch.setattr(
+        dl.subprocess, "run",
+        lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, b"", b"boom"),
+    )
+    factory = _fragmented_ydl(info, lambda p: p.write_bytes(b"original"))
+
+    with pytest.raises(dl.DownloadError, match="remux"):
+        dl.download("https://www.twitch.tv/videos/123", workspace_dir=isolated_cwd / "ws", ydl_factory=factory)
+
+    vdir = isolated_cwd / "ws" / "v123"
+    assert (vdir / "v123.mp4").read_bytes() == b"original"
+    assert not (vdir / "meta.json").exists()
+    assert sorted(p.name for p in vdir.iterdir() if p.name != "thumbnail.json") == ["v123.mp4"]
+
+
+def test_download_remux_with_ffmpeg_missing_raises(isolated_cwd, monkeypatch):
+    from clipper import download as dl
+
+    info = {**_load_fixture("info_dict_full.json"), "id": "v123"}
+    monkeypatch.setattr(dl, "is_fragmented_mp4", lambda p: True)
+
+    def boom(cmd, **kw):
+        raise FileNotFoundError("ffmpeg")
+
+    monkeypatch.setattr(dl.subprocess, "run", boom)
+    factory = _fragmented_ydl(info, lambda p: p.write_bytes(b"original"))
+
+    with pytest.raises(dl.DownloadError, match="ffmpeg"):
+        dl.download("https://www.twitch.tv/videos/123", workspace_dir=isolated_cwd / "ws", ydl_factory=factory)
+    assert not (isolated_cwd / "ws" / "v123" / "meta.json").exists()
+
+
+def test_download_remux_empty_output_raises(isolated_cwd, monkeypatch):
+    from clipper import download as dl
+
+    info = {**_load_fixture("info_dict_full.json"), "id": "v123"}
+    monkeypatch.setattr(dl, "is_fragmented_mp4", lambda p: True)
+
+    def fake_run(cmd, **kw):
+        Path(cmd[-1]).write_bytes(b"")
+        return subprocess.CompletedProcess(cmd, 0, b"", b"")
+
+    monkeypatch.setattr(dl.subprocess, "run", fake_run)
+    factory = _fragmented_ydl(info, lambda p: p.write_bytes(b"original"))
+
+    with pytest.raises(dl.DownloadError, match="vide"):
+        dl.download("https://www.twitch.tv/videos/123", workspace_dir=isolated_cwd / "ws", ydl_factory=factory)
+    vdir = isolated_cwd / "ws" / "v123"
+    assert (vdir / "v123.mp4").read_bytes() == b"original"
+    assert not (vdir / "meta.json").exists()
+    assert sorted(p.name for p in vdir.iterdir() if p.name != "thumbnail.json") == ["v123.mp4"]
+
+
+def test_download_normal_mp4_never_calls_ffmpeg(isolated_cwd, monkeypatch):
+    from clipper import download as dl
+
+    info = {**_load_fixture("info_dict_full.json"), "id": "v123"}
+    calls: list = []
+    monkeypatch.setattr(dl.subprocess, "run", lambda *a, **k: calls.append(a))
+    factory = _fragmented_ydl(info, lambda p: p.write_bytes(b"fake video bytes"))
+
+    dl.download("https://www.twitch.tv/videos/123", workspace_dir=isolated_cwd / "ws", ydl_factory=factory)
+    assert calls == []
