@@ -2919,3 +2919,43 @@ def test_a_select_best_error_is_logged_and_does_not_stop_the_worker(tmp_path, mo
         w.tick()
     assert any("sélection impossible" in r.getMessage() for r in caplog.records)
     assert w._process is None
+
+
+# ---- rattachement post -> clip (TASK-32ae)
+
+def test_tick_calls_the_learning_linker_every_turn(tmp_path):
+    calls = []
+
+    def linker(now, *, config):
+        calls.append(config)
+        return [{"video_id": VIDEO_A, "clip_id": "c1", "post_id": "1"}]
+
+    config = _config(tmp_path)
+    w = worker.Worker(config=config, spawner=FakeSpawner(), learning_linker=linker)
+    w.tick()
+    w.tick()
+    assert calls == [config, config]
+
+
+def test_a_learning_error_is_logged_once_and_does_not_stop_the_worker(tmp_path, caplog):
+    import logging
+
+    from clipper import learning
+
+    def linker(now, *, config):
+        raise learning.LearningError("sidecar illisible (casse.json)")
+
+    w = worker.Worker(config=_config(tmp_path), spawner=FakeSpawner(), learning_linker=linker)
+    with caplog.at_level(logging.ERROR):
+        w.tick()
+        w.tick()
+    assert caplog.text.count("casse.json") == 1
+
+
+def test_learning_disabled_does_nothing(tmp_path):
+    calls = []
+    config = _config(tmp_path)
+    config._sections["learning"] = {"enabled": False}
+    worker.Worker(config=config, spawner=FakeSpawner(),
+                  learning_linker=lambda now, *, config: calls.append(1) or []).tick()
+    assert calls == []

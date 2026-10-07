@@ -32,6 +32,7 @@ import tomllib
 from clipper import accounts as accounts_mod
 from clipper import browser, network
 from clipper import channel as channel_mod
+from clipper import learning
 from clipper import publish as publish_mod
 from clipper import tiktok, youtube
 from clipper.config import Config, ConfigError, load_config
@@ -437,6 +438,7 @@ class Worker:
         watch_lister: Callable[[str], list[dict[str, Any]]] | None = None,
         publisher: Callable[..., dict[str, Any]] | None = None,
         stats_fetcher: Callable[..., dict[str, Any]] | None = None,
+        learning_linker: Callable[..., list[dict[str, Any]]] | None = None,
         login_checker: Callable[..., dict[str, Any]] | None = None,
         youtube_publisher: Callable[..., dict[str, Any]] | None = None,
         veille_collectors: dict[str, Callable[..., dict[str, Any]]] | None = None,
@@ -458,6 +460,8 @@ class Worker:
         self.youtube_publisher = youtube_publisher or youtube.publish  # compte YouTube (SPEC-5e50 R2)
         self._logged_publish_errors: set[str] = set()
         self.stats_fetcher = stats_fetcher or tiktok.fetch_stats
+        self.learning_linker = learning_linker or learning.link_if_due  # rattachement post -> clip apres releve
+        self._logged_learning_errors: set[str] = set()
         self.login_checker = login_checker or browser.login_state  # connexion verifiee avant chaque publication
         self._stats_attempts: dict[str, datetime] = {}
         self._logged_stats_errors: set[str] = set()
@@ -553,6 +557,7 @@ class Worker:
         self._veille_due()
         if not self._publish_due():
             self._stats_due()
+        self._learning_due()
 
         if self._process is not None:
             if self._process.poll() is None:
@@ -682,6 +687,22 @@ class Worker:
             if message not in self._logged_stats_errors:
                 self._logged_stats_errors.add(message)
                 log.error("relevé des statistiques TikTok impossible : %s", message)
+
+    def _learning_due(self) -> None:
+        """Rattache apres releve les posts TikTok aux clips sans id de post (ADR-c260, SPEC-00db R1), dans ce
+        processus seulement ; coupe par ``[learning] enabled = false``. Un etat illisible est journalise une
+        fois et n'arrete pas le worker (ADR-ad2e)."""
+        try:
+            if not self.config.section("learning")["enabled"]:
+                return
+            for done in self.learning_linker(datetime.now(timezone.utc), config=self.config):
+                log.info("%s/%s : rattaché au post TikTok %s", done["video_id"], done["clip_id"], done["post_id"])
+        except (learning.LearningError, tiktok.TikTokError, publish_mod.PublishError, channel_mod.ChannelError,
+                ConfigError, OSError, ValueError) as exc:
+            message = str(exc)
+            if message not in self._logged_learning_errors:
+                self._logged_learning_errors.add(message)
+                log.error("rattachement des posts impossible : %s", message)
 
     def _service_settings(self, service: str, cache: dict[str, dict[str, Any]]) -> dict[str, Any]:
         """Reglages [tiktok] ou [youtube] du service d'un compte, lus (et valides) une fois par passage."""
