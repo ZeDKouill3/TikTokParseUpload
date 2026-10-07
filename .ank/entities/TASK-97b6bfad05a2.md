@@ -5,7 +5,7 @@ slug: veille-historique-1-3-sources-steam-reviews-hist
 title: "Veille historique (2/5) : sources steam_reviews (histogramme des avis, endpoint non documenté lu strictement) et twitch_vods_30d (Get Videos sur un mois, pages bornées, 429), twitch_id des jeux, jeux suivis, séries 30 j à trous (sources + historique propre), résumé par semaine, lignes tendance_30j du prompt (SPEC-85a0 R22-R25, R27 prompt)"
 created: 2026-10-07T13:02:16Z
 author: w-histplan
-status: open
+status: done
 scope:
   - clipper/veille.py
   - clipper/veille_sources.py
@@ -17,8 +17,15 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/7a4d2107e663@23fc6da
+    tree: scope/a011fbc18ad2
+    criteria: 714bbde94d6f
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 4
+version: 6
 ---
 
 Brief : research/cloud/veille-historique-plan.txt (local). Au 07/10/2026 : 23 jeux ont communauté ok et au moins une candidate, 4 d'entre eux un appid Steam ; 166/186 candidates « accès non vérifié ». Sources vérifiées à la main le 07/10/2026 (ADR-6e21). Ordre de collect : sources -> candidats -> communauté -> test d'accès (règle actuelle tant que 2/3 n'est pas faite) -> jeux suivis -> steam_reviews / twitch_vods_30d -> trend_30d -> prompt. Réutiliser le motif 429 de _steam_followers_collector (RateLimited, _retry_after_s) ; le transport rend un 3-uplet avec les en-têtes sur 429 : ajouter Ratelimit-Reset à côté de Retry-After.
