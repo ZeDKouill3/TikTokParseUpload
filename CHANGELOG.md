@@ -10,6 +10,15 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ## [Non publié]
 
+### Corrigé
+
+- Veille : les VOD Twitch réservées aux abonnés (que Helix annonce pourtant `public`) ne sont plus
+  proposées. Avant le choix de Claude, l'accès de chaque VOD candidate est testé par yt-dlp sans
+  téléchargement (nouveau réglage `[veille] twitch_access_check_max`, 30, les plus vues d'abord) ;
+  une VOD refusée « abonnés seulement » est écartée et comptée dans le détail de la source Twitch
+  (« VOD abonnés écartées »). Une autre erreur (réseau, connexion fermée, délai) ou le dépassement du
+  plafond garde la VOD, marquée « Accès non vérifié » avec la raison sur sa carte.
+
 ## [0.5.1] - 2026-10-06
 
 Petite version de correction autour de la veille (écran Veille). Le zip

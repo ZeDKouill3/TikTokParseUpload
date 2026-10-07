@@ -65,6 +65,7 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "youtube_min_duration_s": 600,
     "steam_top": 100,
     "steam_name_lookups_max": 100,
+    "twitch_access_check_max": 30,
     "steam_sellers_top": 50,
     "twitch_client_id": "",
     "twitch_client_secret": "",
@@ -107,6 +108,9 @@ def settings(config: Config) -> dict[str, object]:
         value = table[key]
         if not isinstance(value, int) or isinstance(value, bool) or value < 1:
             raise VeilleError(f"[veille] {key} doit être un entier >= 1 (reçu {value!r})")
+    access_max = table["twitch_access_check_max"]
+    if not isinstance(access_max, int) or isinstance(access_max, bool) or access_max < 0:
+        raise VeilleError(f"[veille] twitch_access_check_max doit être un entier >= 0 (reçu {access_max!r})")
     history_days = table["history_days"]
     if not isinstance(history_days, int) or isinstance(history_days, bool) or history_days < table["baseline_days"]:
         raise VeilleError(
@@ -359,8 +363,33 @@ def _to_candidate(source: str, vod: dict[str, Any]) -> dict[str, Any]:
         "game_key": normalize(game_name) if game_name else None, "game_name": game_name,
         "duration_s": vod["duration_s"], "published_at": vod["published_at"],
         "view_count": vod.get("view_count"), "thumbnail_url": vod.get("thumbnail_url"), "views_per_hour": vod.get("views_per_hour"),
-        "signals": {},
+        "signals": {}, "access_unverified": None,
     }
+
+
+def _check_twitch_access(
+    candidates: list[dict[str, Any]], table: dict[str, object], access_check: Callable[[str, float], None],
+) -> tuple[list[dict[str, Any]], int]:
+    """Teste l'accès des VOD Twitch (les plus vues d'abord, au plus ``twitch_access_check_max``).
+    Réservée aux abonnés : écartée et comptée. Autre erreur ou au-delà du plafond : gardée, marquée
+    ``access_unverified`` avec la raison (jamais écartée ni validée en silence). Rend (gardées, écartées)."""
+    twitch = [c for c in candidates if c["source"] == "twitch"]
+    twitch.sort(key=lambda c: -(c["view_count"] or 0))  # tri stable : à vues égales, ordre de la source
+    cap = int(table["twitch_access_check_max"])
+    timeout_s = float(table["http_timeout_s"])
+    dropped: set[str] = set()
+    for rank, candidate in enumerate(twitch):
+        if rank >= cap:
+            candidate["access_unverified"] = f"au-delà du plafond de {cap} VOD testées (twitch_access_check_max)"
+            continue
+        try:
+            access_check(candidate["url"], timeout_s)
+        except veille_sources.AccessRestricted:
+            dropped.add(candidate["id"])
+        except Exception as exc:  # réseau, connexion fermée, délai : ni écartée ni validée
+            candidate["access_unverified"] = f"{type(exc).__name__} : {exc}"[:300]
+            log.warning("veille twitch : accès de %s non vérifié (%s)", candidate["url"], candidate["access_unverified"])
+    return [c for c in candidates if c["id"] not in dropped], len(dropped)
 
 
 def _parse_published(value: str) -> datetime:
@@ -376,12 +405,15 @@ def collect(
     collectors: dict[str, Collector] | None = None,
     config: Config | None = None,
     finalize: bool = True,
+    access_check: Callable[[str, float], None] | None = None,
 ) -> dict[str, Any]:
     """Un relevé (SPEC-bdd9 R2, R4, R5) : appelle les collecteurs injectés, écrit
     ``history/<date>.json`` et ``days/<date>.json`` et rend l'état du jour.
     Une source en erreur n'arrête pas les autres ; seuls un réglage invalide
     ou un fichier d'état illisible lèvent ``VeilleError``. ``finalize=False`` laisse
-    ``finished_at`` à ``null`` (le choix de Claude suit, voir ``run_if_due``)."""
+    ``finished_at`` à ``null`` (le choix de Claude suit, voir ``run_if_due``).
+    ``access_check(url, timeout_s)`` teste l'accès des VOD Twitch (défaut :
+    ``veille_sources.check_twitch_access``, yt-dlp sans téléchargement) : voir ``_check_twitch_access``."""
     config = config or load_config()
     collectors = veille_sources.default_collectors() if collectors is None else collectors
     table = settings(config)
@@ -453,7 +485,6 @@ def collect(
     # Candidats (R5)
     excluded = {"too_short": 0, "too_old": 0, "already_known": 0}
     candidates: list[dict[str, Any]] = []
-    vod_counts: dict[str, int] = {}
     max_age = timedelta(hours=float(table["vod_max_age_h"]))
     for source, vod in raw_vods:
         min_duration = table["youtube_min_duration_s" if source == "youtube" else "vod_min_duration_s"]
@@ -464,10 +495,15 @@ def collect(
         elif vod["video_id"] in known or (workspace / vod["video_id"]).exists():
             excluded["already_known"] += 1
         else:
-            candidate = _to_candidate(source, vod)
-            candidates.append(candidate)
-            if candidate["game_key"]:
-                vod_counts[candidate["game_key"]] = vod_counts.get(candidate["game_key"], 0) + 1
+            candidates.append(_to_candidate(source, vod))
+
+    if sources["twitch"]["status"] == "ok":
+        candidates, restricted = _check_twitch_access(candidates, table, access_check or veille_sources.check_twitch_access)
+        sources["twitch"]["counts"]["restricted"] = restricted
+    vod_counts: dict[str, int] = {}
+    for candidate in candidates:
+        if candidate["game_key"]:
+            vod_counts[candidate["game_key"]] = vod_counts.get(candidate["game_key"], 0) + 1
 
     games = _build_games(twitch_hist, steam_hist, youtube_hist, vod_counts, previous, table, sellers_hist)
     by_key = {g["key"]: g for g in games}

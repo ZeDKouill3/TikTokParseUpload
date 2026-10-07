@@ -27,6 +27,7 @@ from typing import Any, Callable
 from urllib.parse import urlencode
 
 import httpx
+import yt_dlp
 
 from clipper import channel as channel_mod
 
@@ -53,6 +54,28 @@ _ISO_DURATION = re.compile(r"^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)
 
 class SourceError(Exception):
     """Une source n'a pas pu être relevée (HTTP, JSON, champ absent)."""
+
+
+class AccessRestricted(Exception):
+    """La VOD est réservée aux abonnés (refus d'accès de yt-dlp), pas une panne réseau."""
+
+
+# Messages yt-dlp d'un contenu réservé ; tout autre message (réseau, délai...) n'en est pas un.
+_RESTRICTED = re.compile(r"subscriber[- ]?only|subscribers[- ]only|sub[- ]only|logged into an account that has access", re.IGNORECASE)
+
+
+def check_twitch_access(url: str, timeout_s: float, *, ydl_factory: Callable[[dict[str, Any]], Any] | None = None) -> None:
+    """Teste l'accès d'une VOD Twitch par yt-dlp, sans rien télécharger (``download=False``).
+    Rend ``None`` si elle est lisible, lève ``AccessRestricted`` si elle est réservée aux abonnés ;
+    toute autre erreur (réseau, connexion fermée, délai) remonte telle quelle à l'appelant."""
+    opts = {"quiet": True, "no_warnings": True, "socket_timeout": timeout_s, "skip_download": True}
+    try:
+        with (ydl_factory or yt_dlp.YoutubeDL)(opts) as ydl:
+            ydl.extract_info(url, download=False)
+    except Exception as exc:
+        if _RESTRICTED.search(str(exc)):
+            raise AccessRestricted(str(exc)) from exc
+        raise
 
 
 def _now() -> datetime:

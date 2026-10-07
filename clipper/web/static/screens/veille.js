@@ -8,7 +8,7 @@
 
 const VEILLE_STALE_MS = 4000;
 const SOURCE_LABELS = { twitch: "Twitch", youtube: "YouTube", steam: "Steam", steam_fr: "Ventes Steam FR" };
-const COUNT_LABELS = { games: "jeux", vods: "VOD", videos: "vidéos", private: "VOD réservées écartées" };
+const COUNT_LABELS = { games: "jeux", vods: "VOD", videos: "vidéos", private: "VOD réservées écartées", restricted: "VOD abonnés écartées" };
 
 const veilleUi = { data: null, clips: [], error: null, loading: null, dirty: false, at: 0, style: {}, busy: false, html: "" };
 
@@ -144,6 +144,7 @@ function veilleProposal(p, game, channels) {
       <div class="prop-title">${esc(c.title)}</div>
       <div class="prop-meta">${veilleSrcIcon(c.source)}<span>${meta}</span></div>
       <div class="signals">${signals}</div>
+      ${c.access_unverified ? `<p class="reason"><b>Accès non vérifié :</b> ${esc(c.access_unverified)}</p>` : ""}
       <p class="reason"><b>Pourquoi :</b> ${esc(p.reason)}</p>
       <div class="prop-actions">${actions}</div>
     </div>

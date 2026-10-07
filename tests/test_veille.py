@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from clipper import veille
+from clipper import veille, veille_sources
 from clipper.config import Config, load_config
 
 NOW = datetime(2026, 10, 6, 8, 0, tzinfo=timezone.utc)  # 10:00 à Paris
@@ -39,6 +39,12 @@ def _make_config(tmp_path, **veille_table) -> Config:
 @pytest.fixture
 def config(tmp_path):
     return _make_config(tmp_path)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_access_check(monkeypatch):
+    """Aucun test ne lance yt-dlp : le test d'accès par défaut est neutralisé (sauf test dédié)."""
+    monkeypatch.setattr(veille_sources, "check_twitch_access", lambda url, timeout_s: None)
 
 
 def _sdir(tmp_path):
@@ -107,7 +113,7 @@ def test_config_defaults_are_exactly_r1():
         "baseline_days": 7, "history_days": 90, "rise_min_pct": 50, "vod_min_duration_s": 1800,
         "vod_max_age_h": 36, "twitch_top_games": 20, "twitch_vods_per_game": 10,
         "youtube_max_results": 50, "youtube_min_duration_s": 600, "steam_top": 100,
-        "steam_name_lookups_max": 100, "twitch_client_id": "", "twitch_client_secret": "", "youtube_api_key": "",
+        "steam_name_lookups_max": 100, "twitch_access_check_max": 30, "twitch_client_id": "", "twitch_client_secret": "", "youtube_api_key": "",
         "state_dir": "state/veille", "http_timeout_s": 20,
         "steam_rank_gain_min": 5, "steam_risers_max": 10, "steam_sellers_top": 50,
     }
@@ -841,7 +847,7 @@ def test_private_vod_count_is_shown_in_the_twitch_source_detail(tmp_path, config
     collectors["twitch"].result["private_vods"] = 3
     veille.collect(NOW, collectors=collectors, config=config)
     day = _read(_sdir(tmp_path) / "days" / f"{TODAY}.json")
-    assert day["sources"]["twitch"]["counts"] == {"games": 1, "vods": 1, "private": 3}
+    assert day["sources"]["twitch"]["counts"] == {"games": 1, "vods": 1, "private": 3, "restricted": 0}
 
 
 def test_candidate_carries_the_thumbnail_url_or_none(tmp_path, config):
@@ -849,3 +855,93 @@ def test_candidate_carries_the_thumbnail_url_or_none(tmp_path, config):
     veille.collect(NOW, collectors=_collectors(vods=[with_thumb, _vod("t2")]), config=config)
     day = _read(_sdir(tmp_path) / "days" / f"{TODAY}.json")
     assert {c["video_id"]: c["thumbnail_url"] for c in day["candidates"]} == {"t1": "https://cdn.test/t1.jpg", "t2": None}
+
+
+# --- TASK-9495 : test d'accès des VOD Twitch avant de les proposer ------------
+
+
+class FakeAccess:
+    """Test d'accès factice : ``outcomes[video_id]`` = exception à lever (absent = accessible)."""
+
+    def __init__(self, outcomes=None):
+        self.outcomes = outcomes or {}
+        self.urls = []
+
+    def __call__(self, url, timeout_s):
+        self.urls.append(url)
+        outcome = self.outcomes.get(url.rsplit("/", 1)[-1])
+        if outcome is not None:
+            raise outcome
+
+
+def _day(tmp_path):
+    return _read(_sdir(tmp_path) / "days" / f"{TODAY}.json")
+
+
+def test_access_check_max_default_is_30():
+    assert veille.CONFIG_DEFAULTS["twitch_access_check_max"] == 30
+
+
+def test_subscriber_only_vod_is_dropped_and_counted(tmp_path, config):
+    err = veille_sources.AccessRestricted("You must be logged into an account that has access to this subscriber-only content")
+    access = FakeAccess({"sub": err})
+    veille.collect(NOW, collectors=_collectors(vods=[_vod("ok"), _vod("sub")]), config=config, access_check=access)
+    day = _day(tmp_path)
+    assert [c["video_id"] for c in day["candidates"]] == ["ok"]
+    assert day["sources"]["twitch"]["counts"]["restricted"] == 1
+    assert day["sources"]["twitch"]["counts"]["private"] == 0
+
+
+def test_accessible_vod_is_kept_without_unverified_mark(tmp_path, config):
+    veille.collect(NOW, collectors=_collectors(vods=[_vod("ok")]), config=config, access_check=FakeAccess())
+    cand = _day(tmp_path)["candidates"][0]
+    assert cand["access_unverified"] is None
+    assert _day(tmp_path)["sources"]["twitch"]["counts"]["restricted"] == 0
+
+
+def test_other_error_keeps_candidate_marked_unverified_with_reason(tmp_path, config):
+    access = FakeAccess({"net": ConnectionResetError("WinError 10054 connexion fermée")})
+    veille.collect(NOW, collectors=_collectors(vods=[_vod("net")]), config=config, access_check=access)
+    day = _day(tmp_path)
+    assert [c["video_id"] for c in day["candidates"]] == ["net"]
+    assert "WinError 10054" in day["candidates"][0]["access_unverified"]
+    assert day["sources"]["twitch"]["counts"]["restricted"] == 0
+
+
+def test_cap_checks_most_viewed_first_and_marks_the_rest_unverified(tmp_path):
+    config = _make_config(tmp_path, twitch_access_check_max=2)
+    vods = [{**_vod(f"v{i}"), "view_count": views} for i, views in enumerate([10, 500, 300, 5])]
+    access = FakeAccess()
+    veille.collect(NOW, collectors=_collectors(vods=vods), config=config, access_check=access)
+    assert sorted(u.rsplit("/", 1)[-1] for u in access.urls) == ["v1", "v2"]
+    marks = {c["video_id"]: c["access_unverified"] for c in _day(tmp_path)["candidates"]}
+    assert marks["v1"] is None and marks["v2"] is None
+    assert marks["v0"] and marks["v3"]  # raison non vide : au-delà du plafond
+
+
+def test_filtered_out_vods_are_not_tested(tmp_path, config):
+    access = FakeAccess()
+    veille.collect(NOW, collectors=_collectors(vods=[_vod("short", duration_s=60), _vod("ok")]), config=config, access_check=access)
+    assert [u.rsplit("/", 1)[-1] for u in access.urls] == ["ok"]
+
+
+def test_no_access_call_when_twitch_source_is_in_error(tmp_path, config):
+    collectors = _collectors(vods=[_vod("ok")])
+    collectors["twitch"] = Collector(error=RuntimeError("helix down"))
+    access = FakeAccess()
+    veille.collect(NOW, collectors=collectors, config=config, access_check=access)
+    assert access.urls == []
+
+
+def test_youtube_candidates_are_not_access_tested(tmp_path, config):
+    access = FakeAccess()
+    veille.collect(NOW, collectors=_collectors(videos=[_vod("yt1", source="youtube")]), config=config, access_check=access)
+    assert access.urls == []
+    assert _day(tmp_path)["candidates"][0]["access_unverified"] is None
+
+
+def test_default_access_check_goes_through_veille_sources(tmp_path, config, monkeypatch):
+    seen = []
+    monkeypatch.setattr(veille_sources, "check_twitch_access", lambda url, timeout_s: seen.append((url, timeout_s)))
+    veille.collect(NOW, collectors=_collectors(vods=[_vod("ok")]), config=config)
+    assert seen == [("https://example.test/ok", 20)]
