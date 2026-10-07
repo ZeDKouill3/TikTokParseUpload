@@ -90,6 +90,8 @@ def scenario(n=10, video_id="v1", at=NOW - timedelta(days=1)):
 def calibrate(traces, **settings):
     from clipper import jury_calibration
 
+    settings.setdefault("stats_metric", "watched_full")  # les donnees synthetiques portent watched_full
+
     return jury_calibration.calibrate(traces, config=make_config(settings), now=NOW)
 
 
@@ -304,7 +306,7 @@ def test_stats_are_linked_through_result_entries_with_same_clip_id(isolated_cwd)
     from clipper import jury_calibration
 
     result = jury_calibration.calibrate(
-        traces, config=make_config({"min_clips": 5}), now=datetime.now(timezone.utc) + timedelta(minutes=1)
+        traces, config=make_config({"min_clips": 5, "stats_metric": "watched_full"}), now=datetime.now(timezone.utc) + timedelta(minutes=1)
     )
 
     # qa identique partout : seul watched_full, relie par clip_id, departage.
@@ -450,3 +452,52 @@ def test_jury_reads_the_configured_weights_path(isolated_cwd):
         result = jury.deliberate([{"id": "a", "text": "texte"}], RUBRIC, config=config)
 
     assert result["candidates"][0]["scores"] == {"hook": 8}
+
+
+# --------------------------------------------------------------------------
+# TASK-7136 : entrees reliees directement, metrique par defaut, statistique sans metrique
+# --------------------------------------------------------------------------
+
+
+def direct_stats(video_id, moment_id, clip_id, percentile):
+    return {
+        "kind": "stats", "video_id": video_id, "clip_id": clip_id, "moment_id": moment_id,
+        "stats": {"views": 10, "views_percentile": percentile}, "recorded_at": (NOW - timedelta(days=1)).isoformat(),
+    }
+
+
+def test_stats_with_video_and_moment_are_linked_directly_even_when_clip_id_repeats(isolated_cwd):
+    """Deux videos portent le meme clip_id « 03 » : plus d'ambiguite des que la stats porte video_id et moment_id."""
+    traces, journal = [], []
+    for k in range(6):
+        for video in ("va", "vb"):
+            # le meme clip_id dans les deux videos, resultats inverses entre elles
+            journal.append(result_entry(video, k, f"{k:02d}", qa="passed"))
+            percentile = k / 5 if video == "va" else 1 - k / 5
+            journal.append(direct_stats(video, k, f"{k:02d}", percentile))
+            scores = {"retention": 10 * k if video == "va" else 10 * (5 - k), "spectateur": 50, "monteur": 50,
+                      "avocat": 50, "conformite": 50}
+            traces.append({"video_id": video, "moment_id": k, "candidate": candidate(scores)})
+    write_journal(journal)
+
+    result = calibrate(traces, min_clips=5, stats_metric="views_percentile")
+
+    assert result["ignored_stats"] == []
+    assert result["judges"]["retention"]["clips"] == 12
+    assert result["judges"]["retention"]["agreement"] == pytest.approx(1.0)
+
+
+def test_stats_metric_defaults_to_views_percentile():
+    from clipper import jury_calibration
+
+    assert jury_calibration.CONFIG_DEFAULTS["stats_metric"] == "views_percentile"
+
+
+def test_stats_without_the_metric_are_ignored_not_an_error(isolated_cwd):
+    traces = scenario(n=6)  # stats CSV : pas de views_percentile
+    write_journal([{"kind": "stats", "video_id": "v1", "clip_id": "v1-00", "moment_id": 0,
+                    "stats": {"views": 5}, "recorded_at": (NOW - timedelta(days=1)).isoformat()}])
+
+    result = calibrate(traces, min_clips=5, stats_metric="views_percentile")
+
+    assert {"clip_id": "v1-00", "reason": "no_metric", "matches": [["v1", 0]]} in result["ignored_stats"]
