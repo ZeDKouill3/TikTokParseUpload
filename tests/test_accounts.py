@@ -943,7 +943,7 @@ def test_the_accounts_screen_is_wired_for_publication_accounts():
 
     assert "data-acc-ready" in js and "Prêt à publier" in js
     assert "/ready" not in js and "accSetReady" not in js                # plus aucune coche manuelle
-    assert "ready_blocked_reason" in js and "aria-readonly" in js        # case en lecture seule, avec la raison
+    assert "ready_blocked_reason" in js and "aria-readonly" not in js    # case cliquable (SPEC-f348 R5), avec la raison
     assert "preventDefault" in js and "accBrowserLogin" in js            # cliquer sur la case non prête = Se connecter
     assert "/resolve" in js and "J'ai réglé le problème" in js and "r4_halt" in js
     assert "login.state" in js or "a.login" in js                       # état de connexion

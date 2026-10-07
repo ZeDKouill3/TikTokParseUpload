@@ -5,7 +5,7 @@ slug: comptes-case-pr-t-publier-cliquable-pause-repris
 title: "Comptes : case « Prêt à publier » cliquable (pause / reprise), « En pause (manuel) » dans Comptes, Clips et Publication, GUIDE et CHANGELOG (SPEC-f348 R5, R7.6)"
 created: 2026-10-07T21:01:46Z
 author: w-pauseplan
-status: open
+status: done
 scope:
   - clipper/web/static/**
   - docs/GUIDE.md
@@ -17,8 +17,15 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/94791066673e@9e0de18
+    tree: scope/9c2533b829ad
+    criteria: 52a5ff562d37
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---
 
 Partie écrans de SPEC-f348954318c1 (R5, R7.6), après TASK-6ceb549b0edb qui apporte l'état `paused_at`, les routes `POST /api/accounts/{id}/pause` / `resume`, `ready_blocked_reason` avec la raison de pause et `paused_at` dans `GET /api/publish/accounts`.
