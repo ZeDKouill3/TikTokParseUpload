@@ -10,28 +10,47 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ## [Non publié]
 
+## [0.5.3] - 2026-10-07
+
+Version autour de la veille (sorties de jeux IGDB, jeu des VOD YouTube) et de la fiabilité
+du téléchargement Twitch. Le zip s'appelle `Clipper-portable-0.5.3.zip` ; la mise à jour se
+fait en relançant `Installer.bat` depuis ce zip, tes données ne sont pas touchées. Nouveaux
+réglages `[veille]` : `upcoming_days`, `release_window_days`, `igdb_min_hypes`,
+`igdb_recent_max`, `igdb_upcoming_max`, `igdb_pages_max`, `youtube_game_min_chars` ;
+`[download]` : `network_retries`, `network_retry_pause_s`. La veille reste désactivée par défaut.
+
 ### Ajouté
 
-- Veille : écran « Sorties de jeux » (IGDB) entre les propositions et les meilleurs clips : sorties récentes
-  (badge J+N) et à venir (badge J-N) avec hypes, plateformes et lien ; badge « Sortie J+N » sur les
-  propositions et dans « Ce qui monte » ; source « IGDB (sorties) » dans le bandeau. Réglages › Veille :
-  `upcoming_days`, `release_window_days`, `igdb_min_hypes`, validés à l'enregistrement (400 hors bornes).
+- Veille : écran « Sorties de jeux » (IGDB) entre les propositions et les meilleurs clips : sorties
+  récentes (badge J+N) et à venir (badge J-N) avec hypes, plateformes et lien ; badge « Sortie J+N »
+  sur les propositions et dans « Ce qui monte » ; source « IGDB (sorties) » dans le bandeau.
+  Réglages › Veille : `upcoming_days`, `release_window_days`, `igdb_min_hypes`, validés à
+  l'enregistrement (400 hors bornes).
+- Veille : la collecte IGDB interroge les jeux de toute la fenêtre de sorties, triés par hypes
+  décroissants (plus de jeux du jour sans hype qui noient les vrais), au plus `igdb_pages_max` pages
+  de 500. Un jeu sous `igdb_min_hypes` est écarté sauf s'il est déjà en tendance (Twitch, Steam). Les
+  sorties récentes sont coupées à `igdb_recent_max` (12) et les à venir à `igdb_upcoming_max` (20) ;
+  l'ancien réglage `igdb_releases_max` est ignoré s'il traîne dans `config.toml`.
+- Veille : une sortie qui arrive sur une plateforme nouvelle alors que le jeu existe déjà ailleurs
+  (par exemple Switch 2 après PS4) porte l'étiquette « Portage », transmise à Claude avec la
+  proposition.
 - Veille : une VOD YouTube sans jeu reçoit son jeu si son titre ou ses tags contiennent, en mot(s)
-  entier(s), le nom d'un jeu déjà relevé aujourd'hui (Twitch, Steam, IGDB). Plusieurs jeux : le nom le
-  plus long gagne s'il contient les autres, sinon aucun jeu. Aucune devinette, aucun appel à Claude pour
-  ce choix. La carte affiche « jeu déduit du titre » et Claude reçoit les signaux de tendance du jeu.
-  Nouveau réglage `[veille] youtube_game_min_chars` (défaut 5) : les noms plus courts sont ignorés.
+  entier(s), le nom d'un jeu déjà relevé aujourd'hui (Twitch, Steam, IGDB). Plusieurs jeux : le nom
+  le plus long gagne s'il contient les autres, sinon aucun jeu. Aucune devinette, aucun appel à
+  Claude pour ce choix. La carte affiche « jeu déduit du titre » et Claude reçoit les signaux de
+  tendance du jeu. Nouveau réglage `[veille] youtube_game_min_chars` (5) : les noms plus courts sont
+  ignorés.
 
 ### Corrigé
 
 - Download : une VOD Twitch réservée aux abonnés (yt-dlp « subscriber-only content ») est un échec
-  définitif avec un message lisible, jamais un échec transitoire réessayé, même si la chaîne d'erreurs
-  contient aussi une erreur réseau ou un 403 ; une coupure réseau seule reste réessayée (TASK-e2a1).
-- Download : une coupure réseau (connexion fermée par l'hôte distant, WinError 10054 sur `usher.ttvnw.net`,
-  « Failed to download m3u8 information ») est réessayée aussitôt, jusqu'à `[download] network_retries`
-  fois (15) avec `[download] network_retry_pause_s` (5 s) de pause, chaque essai journalisé ; essais
-  épuisés, l'erreur d'origine remonte comme avant. Les autres erreurs (abonnés, privé, format) échouent
-  au premier essai.
+  définitif avec un message lisible, jamais un échec transitoire réessayé, même si la chaîne
+  d'erreurs contient aussi une erreur réseau ou un 403 ; une coupure réseau seule reste réessayée.
+- Download : une coupure réseau (connexion fermée par l'hôte distant, WinError 10054 sur
+  `usher.ttvnw.net`, « Failed to download m3u8 information ») est réessayée aussitôt, jusqu'à
+  `[download] network_retries` fois (15) avec `[download] network_retry_pause_s` (5 s) de pause,
+  chaque essai journalisé ; essais épuisés, l'erreur d'origine remonte comme avant. Les autres
+  erreurs (abonnés, privé, format) échouent au premier essai.
 
 ## [0.5.2] - 2026-10-07
 
@@ -917,7 +936,8 @@ verticaux sous-titrés, en local.
 - Aucune publication automatique sur TikTok : le dépôt produit les clips
   et leurs métadonnées, la mise en ligne reste manuelle.
 
-[Non publié]: https://github.com/ZeDKouill3/TiktokClipper/compare/v0.5.2...HEAD
+[Non publié]: https://github.com/ZeDKouill3/TiktokClipper/compare/v0.5.3...HEAD
+[0.5.3]: https://github.com/ZeDKouill3/TiktokClipper/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/ZeDKouill3/TiktokClipper/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/ZeDKouill3/TiktokClipper/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/ZeDKouill3/TiktokClipper/compare/v0.4.2...v0.5.0

@@ -255,8 +255,9 @@ def test_versions_row_for_the_current_version_names_the_release_headline():
 
 
 REQUIRED_CHANGELOG_TERMS = (
-    f"Clipper-portable-{VERSION}.zip", "Installer.bat", "mise à jour", "Veille", "TikTok",
-    "vérification de contenu", "yt-dlp", "abonnés", "twitch_access_check_max",
+    f"Clipper-portable-{VERSION}.zip", "Installer.bat", "mise à jour", "Veille", "IGDB", "Sorties de jeux",
+    "Portage", "hypes", "igdb_min_hypes", "igdb_recent_max", "igdb_upcoming_max", "YouTube",
+    "youtube_game_min_chars", "abonnés", "network_retries", "network_retry_pause_s",
 )
 
 
@@ -266,11 +267,11 @@ def test_changelog_current_version_covers_the_release_changes(term):
     assert term in body, f"{term!r} absent de la section [{VERSION}]"
 
 
-def test_changelog_current_version_does_not_announce_igdb():
-    # IGDB (ADR-798c, SPEC-4efa) n'est que proposé : aucun code, donc rien à annoncer.
+def test_changelog_current_version_does_not_announce_unmerged_work():
+    # Calendrier en jaquettes (TASK-4944) et filtre de communauté Steam (TASK-82da) : pas encore fusionnés.
     body = _changelog_section(_read(CHANGELOG), rf"\[{ESC_VERSION}\]")
-    assert "IGDB" not in body
-
+    for term in ("jaquette", "memberslistxml", "filtre de communauté", "SteamDB", "frise"):
+        assert term not in body, f"{term!r} annoncé dans [{VERSION}] alors que non livré"
 
 def test_changelog_current_version_has_no_separate_release_notes_file():
     assert not NOTES.exists(), f"{NOTES.name} : le changelog suffit pour {TAG}"
