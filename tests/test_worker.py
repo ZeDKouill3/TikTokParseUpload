@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
@@ -2856,6 +2857,81 @@ def _veille_queue_entry() -> dict:
             "force_steps": [], "enqueued_at": "2026-01-01T00:00:00+00:00", "status": "waiting", "pid": None}
 
 
+def _join_veille(w) -> None:
+    thread = w._veille_thread
+    if thread is not None:
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+
+def _blocking_run_if_due(monkeypatch):
+    """run_if_due simule : signale son depart puis bloque jusqu'a ``release``."""
+    from clipper import veille
+
+    started, release, calls = threading.Event(), threading.Event(), []
+
+    def run(now, cfg, collectors):
+        calls.append(collectors)
+        started.set()
+        release.wait(timeout=10)
+
+    monkeypatch.setattr(veille, "run_if_due", run)
+    return started, release, calls
+
+
+def test_tick_returns_while_the_veille_runs_in_a_daemon_thread(tmp_path, monkeypatch):
+    started, release, _calls = _blocking_run_if_due(monkeypatch)
+    _write_queue(_config(tmp_path), [_veille_queue_entry()])
+    spawner = FakeSpawner(FakeProcess())
+    w = worker.Worker(config=_config(tmp_path), spawner=spawner)
+    try:
+        w.tick()  # reviendrait jamais avant release si le releve etait synchrone
+        assert started.wait(timeout=5)
+        thread = w._veille_thread
+        assert thread.is_alive() and thread.daemon and thread.name == "veille"
+        assert spawner.calls, "l'enfant doit etre lance pendant le releve"
+    finally:
+        release.set()
+        _join_veille(w)
+
+
+def test_only_one_veille_thread_runs_at_a_time(tmp_path, monkeypatch):
+    started, release, calls = _blocking_run_if_due(monkeypatch)
+    w = worker.Worker(config=_config(tmp_path), spawner=FakeSpawner())
+    try:
+        w.tick()
+        assert started.wait(timeout=5)
+        first = w._veille_thread
+        w.tick()
+        w.tick()
+        assert w._veille_thread is first and len(calls) == 1
+    finally:
+        release.set()
+        _join_veille(w)
+
+
+def test_an_unexpected_veille_error_is_logged_with_its_type_and_a_new_run_can_start(
+        tmp_path, monkeypatch, caplog):
+    from clipper import veille
+
+    calls = []
+
+    def run(now, cfg, collectors):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("panne inattendue")
+
+    monkeypatch.setattr(veille, "run_if_due", run)
+    w = worker.Worker(config=_config(tmp_path), spawner=FakeSpawner())
+    with caplog.at_level("ERROR"):
+        w.tick()
+        _join_veille(w)
+        w.tick()  # rejoint le fil mort, repart
+        _join_veille(w)
+    assert any(r.exc_info and r.exc_info[0] is RuntimeError for r in caplog.records)
+    assert len(calls) == 2
+
+
 def test_tick_calls_veille_run_if_due_with_the_injected_collectors(tmp_path, monkeypatch):
     from clipper import veille
 
@@ -2863,7 +2939,9 @@ def test_tick_calls_veille_run_if_due_with_the_injected_collectors(tmp_path, mon
     calls = []
     monkeypatch.setattr(veille, "run_if_due", lambda now, cfg, collectors: calls.append((now, cfg, collectors)))
     collectors = {"twitch": object()}
-    worker.Worker(config=config, spawner=FakeSpawner(), veille_collectors=collectors).tick()
+    w = worker.Worker(config=config, spawner=FakeSpawner(), veille_collectors=collectors)
+    w.tick()
+    _join_veille(w)
     assert len(calls) == 1 and calls[0][1] is config and calls[0][2] is collectors
 
 
@@ -2879,7 +2957,9 @@ def test_tick_logs_a_veille_error_once_and_keeps_going(tmp_path, monkeypatch, ca
     w = worker.Worker(config=config, spawner=FakeSpawner())
     with caplog.at_level("ERROR"):
         w.tick()
+        _join_veille(w)
         w.tick()
+        _join_veille(w)
     assert len([r for r in caplog.records if "réglage invalide" in r.getMessage()]) == 1
 
 
