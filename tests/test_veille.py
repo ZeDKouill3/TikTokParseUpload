@@ -124,6 +124,9 @@ def test_config_defaults_are_exactly_r1():
         "steam_followers_retry_max": 3, "steam_followers_retry_wait_max_s": 60.0,
         "community_min_steam_players": 1000, "community_min_steam_followers": 10000,
         "community_min_twitch_viewers": 200, "community_min_hypes": 50, "max_vods_per_game": 1,
+        "trend_days": 30, "trend_games_max": 40, "steam_reviews_pause_s": 2.0, "steam_reviews_retry_max": 3,
+        "steam_reviews_retry_wait_max_s": 60.0, "twitch_history_pages_max": 5, "twitch_history_retry_max": 2,
+        "twitch_history_retry_wait_max_s": 60.0,
     }
 
 
@@ -156,10 +159,32 @@ def test_load_config_accepts_veille_table(tmp_path):
     ({"steam_followers_retry_wait_max_s": 0}, "steam_followers_retry_wait_max_s"),
     ({"steam_followers_retry_wait_max_s": 601}, "steam_followers_retry_wait_max_s"),
     ({"max_vods_per_game": 0}, "max_vods_per_game"),
+    ({"trend_days": 6}, "trend_days"),
+    ({"trend_days": 91}, "trend_days"),
+    ({"trend_days": 30.0}, "trend_days"),
+    ({"trend_games_max": -1}, "trend_games_max"),
+    ({"steam_reviews_pause_s": 0.1}, "steam_reviews_pause_s"),
+    ({"steam_reviews_pause_s": 61}, "steam_reviews_pause_s"),
+    ({"steam_reviews_retry_max": -1}, "steam_reviews_retry_max"),
+    ({"steam_reviews_retry_max": 11}, "steam_reviews_retry_max"),
+    ({"steam_reviews_retry_wait_max_s": 0.5}, "steam_reviews_retry_wait_max_s"),
+    ({"steam_reviews_retry_wait_max_s": 601}, "steam_reviews_retry_wait_max_s"),
+    ({"twitch_history_pages_max": 0}, "twitch_history_pages_max"),
+    ({"twitch_history_pages_max": 6}, "twitch_history_pages_max"),
+    ({"twitch_history_retry_max": -1}, "twitch_history_retry_max"),
+    ({"twitch_history_retry_max": 11}, "twitch_history_retry_max"),
+    ({"twitch_history_retry_wait_max_s": 0}, "twitch_history_retry_wait_max_s"),
+    ({"twitch_history_retry_wait_max_s": 601}, "twitch_history_retry_wait_max_s"),
 ])
 def test_invalid_settings_raise_naming_the_key(tmp_path, table, key):
     config = _make_config(tmp_path, **table)
     with pytest.raises(veille.VeilleError, match=key):
+        veille.collect(NOW, collectors=_collectors(), config=config)
+
+
+def test_history_days_below_trend_days_names_both_keys(tmp_path):
+    config = _make_config(tmp_path, trend_days=40, history_days=39)
+    with pytest.raises(veille.VeilleError, match=r"history_days.*trend_days|trend_days.*history_days"):
         veille.collect(NOW, collectors=_collectors(), config=config)
 
 
@@ -170,7 +195,7 @@ def test_collect_writes_history_and_day_files(tmp_path, config):
     veille.collect(NOW, collectors=_collectors(), config=config)
     history = _read(_sdir(tmp_path) / "history" / f"{TODAY}.json")
     assert history["date"] == TODAY
-    assert history["twitch"] == {"jeu alpha": {"name": "Jeu Alpha", "viewers_fr": 1000}}
+    assert history["twitch"] == {"jeu alpha": {"name": "Jeu Alpha", "viewers_fr": 1000, "twitch_id": None}}
     assert history["steam"] == {"42": {"name": "Jeu  Alpha !", "players": 5000, "rank": None, "last_week_rank": None}}
     day = _read(_sdir(tmp_path) / "days" / f"{TODAY}.json")
     assert day["date"] == TODAY and day["started_at"] and day["finished_at"]
@@ -401,7 +426,7 @@ def test_youtube_candidates_use_youtube_min_duration(tmp_path, config):
 
 
 def test_old_history_files_are_pruned(tmp_path):
-    config = _make_config(tmp_path, history_days=10)
+    config = _make_config(tmp_path, history_days=10, trend_days=7)  # history_days >= trend_days (R22)
     _write_history(tmp_path, "2026-09-20", viewers=1, players=1)  # 16 j : supprimé
     _write_history(tmp_path, "2026-09-30", viewers=1, players=1)  # 6 j : gardé
     veille.collect(NOW, collectors=_collectors(), config=config)
@@ -1947,3 +1972,338 @@ def test_bilan_block_size_is_bounded(tmp_path):
     prompt = _prompt_with_bilan(tmp_path)
     block = prompt.split(_BILAN_HEADER, 1)[1].split("Candidats (VOD) :")[0]
     assert len(block) < 20 * 400
+
+
+# ==========================================================================
+# TASK-97b6 : tendance sur 30 jours (SPEC-85a0 R22-R25, R27 prompt)
+# ==========================================================================
+
+SINCE = "2026-09-07"  # J-29 pour TODAY = 2026-10-06 et trend_days = 30
+
+
+def _pt(date, value):
+    return {"date": date, "value": value, "up": 0, "down": 0}
+
+
+def _vpt(date, vods, views):
+    return {"date": date, "vods": vods, "views": views}
+
+
+def _write_full_history(tmp_path, date, *, twitch=None, steam=None, steam_now=None, followers=None):
+    path = _sdir(tmp_path) / "history" / f"{date}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "date": date, "twitch": {"jeu alpha": {"name": "Jeu Alpha", "viewers_fr": twitch}} if twitch is not None else {},
+        "steam": {"42": {"name": "Jeu Alpha", "players": steam}} if steam is not None else {},
+        "steam_now": {"42": steam_now} if steam_now is not None else {},
+        "steam_followers": {"42": followers} if followers is not None else {},
+        "steam_fr": {}, "youtube": {}}), encoding="utf-8")
+
+
+def _trend_collectors(*, reviews=None, vods=None, reviews_error=None, vods_error=None, twitch_error=None,
+                      reviews_extra=None, vods_extra=None):
+    """Scénario R23 : Alpha (steam 42) et Beta (hors Steam) suivis ; Delta sans candidate ; Gamma sans communauté."""
+    collectors = _community_collectors(
+        twitch=(("Jeu Alpha", 1000), ("Jeu Delta", 900), ("Jeu Beta", 500), ("Jeu Gamma", 10)),
+        followers={"42": 20000}, players={})
+    collectors["twitch"] = Collector({
+        "games": [{"name": n, "viewers_fr": v, "igdb_id": "", "twitch_id": i}
+                  for n, v, i in (("Jeu Alpha", 1000, "1"), ("Jeu Delta", 900, "4"), ("Jeu Beta", 500, "2"),
+                                  ("Jeu Gamma", 10, "3"))],
+        "vods": [_vod("a1", game="Jeu Alpha"), _vod("b1", game="Jeu Beta"), _vod("g1", game="Jeu Gamma")]},
+        error=twitch_error)
+    collectors["steam_reviews"] = Lookup("histograms", reviews if reviews is not None else {"42": []}, reviews_error,
+                                         **(reviews_extra or {}))
+    collectors["twitch_vods_30d"] = Lookup("vods", vods if vods is not None else {
+        "1": {"since": SINCE, "points": []}, "2": {"since": SINCE, "points": []}}, vods_error, **(vods_extra or {}))
+    return collectors
+
+
+def _trend_state(tmp_path, collectors=None, **table):
+    collectors = collectors or _trend_collectors()
+    state = veille.collect(NOW, collectors=collectors, config=_make_config(tmp_path, **table))
+    return state, collectors
+
+
+def _trend(state, key="jeu alpha"):
+    return _game_of(state, key)["trend_30d"]
+
+
+def test_twitch_id_is_set_on_games_and_written_in_the_history_file(tmp_path):
+    state, _ = _trend_state(tmp_path)
+    assert {g["key"]: g["twitch_id"] for g in state["games"]} == {
+        "jeu alpha": "1", "jeu delta": "4", "jeu beta": "2", "jeu gamma": "3"}
+    history = _read(_sdir(tmp_path) / "history" / f"{TODAY}.json")
+    assert history["twitch"]["jeu alpha"]["twitch_id"] == "1"
+
+
+def test_followed_games_are_community_ok_with_a_candidate_in_games_order(tmp_path):
+    state, collectors = _trend_state(tmp_path)
+    assert collectors["steam_reviews"].calls == [["42"]]  # Beta n'a pas d'appid ; Delta et Gamma ne sont pas suivis
+    assert collectors["twitch_vods_30d"].calls == [["1", "2"]]
+    assert _trend(state, "jeu alpha") is not None and _trend(state, "jeu beta") is not None
+    assert _trend(state, "jeu delta") is None  # communauté ok mais aucune candidate
+    assert _trend(state, "jeu gamma") is None  # candidate mais communauté insuffisante
+
+
+def test_followed_games_are_fixed_before_the_access_check(tmp_path):
+    def reject_all(url, timeout_s):
+        raise veille_sources.AccessRestricted("réservée aux abonnés")
+
+    collectors = _trend_collectors()
+    state = veille.collect(NOW, collectors=collectors, config=_make_config(tmp_path), access_check=reject_all)
+    assert state["candidates"] == [] and collectors["steam_reviews"].calls == [["42"]]
+    assert _trend(state, "jeu alpha") is not None  # un jeu dont toutes les VOD sont écartées reste suivi
+
+
+def test_trend_games_max_cuts_in_games_order_and_counts_skipped_on_both_sources(tmp_path):
+    state, collectors = _trend_state(tmp_path, trend_games_max=1)
+    assert collectors["steam_reviews"].calls == [["42"]] and collectors["twitch_vods_30d"].calls == [["1"]]
+    assert _trend(state, "jeu alpha") is not None and _trend(state, "jeu beta") is None
+    assert state["sources"]["steam_reviews"]["counts"] == {
+        "requested": 1, "found": 1, "unknown": 0, "skipped": 1, "rate_limited": 0}
+    assert state["sources"]["twitch_vods_30d"]["counts"] == {
+        "requested": 1, "found": 1, "unknown": 0, "skipped": 1, "rate_limited": 0}
+
+
+def test_trend_games_max_zero_skips_both_sources_without_a_call(tmp_path):
+    state, collectors = _trend_state(tmp_path, trend_games_max=0)
+    assert collectors["steam_reviews"].calls == [] and collectors["twitch_vods_30d"].calls == []
+    for source in ("steam_reviews", "twitch_vods_30d"):
+        assert state["sources"][source]["status"] == "skipped"
+        assert state["sources"][source]["counts"]["skipped"] == 2 and state["sources"][source]["counts"]["requested"] == 0
+    assert all(g["trend_30d"] is None for g in state["games"])
+
+
+def test_source_counts_requested_found_unknown_and_rate_limited(tmp_path):
+    collectors = _trend_collectors(vods={"1": {"since": SINCE, "points": []}, "2": None},
+                                   vods_extra={"rate_limited": 1})
+    state, _ = _trend_state(tmp_path, collectors)
+    reviews, vods = state["sources"]["steam_reviews"], state["sources"]["twitch_vods_30d"]
+    assert reviews["status"] == "ok" and reviews["counts"] == {
+        "requested": 1, "found": 1, "unknown": 0, "skipped": 0, "rate_limited": 0}
+    assert vods["status"] == "partial" and "429" in vods["error"]
+    assert vods["counts"] == {"requested": 2, "found": 1, "unknown": 1, "skipped": 0, "rate_limited": 1}
+    assert _trend(state, "jeu beta")["series"]["twitch_vods_fr"]["status"] == "unavailable"
+    assert _trend(state, "jeu beta")["series"]["twitch_vods_fr"]["reason"] == "HTTP 429 Helix"
+
+
+def test_six_named_series_and_trend_envelope(tmp_path):
+    state, _ = _trend_state(tmp_path)
+    trend = _trend(state)
+    assert trend["days"] == 30 and trend["since"] == SINCE
+    assert list(trend["series"]) == ["steam_reviews", "twitch_vods_fr", "twitch_viewers_fr", "steam_players_peak",
+                                     "steam_players_now", "steam_followers"]
+    for serie in trend["series"].values():
+        assert set(serie) == {"status", "reason", "since", "points", "summary"}
+
+
+def test_own_series_read_history_files_with_holes_and_never_fill_them(tmp_path):
+    _write_full_history(tmp_path, "2026-10-01", twitch=600, steam=3000, steam_now=900, followers=18000)
+    _write_full_history(tmp_path, "2026-10-05", twitch=800, steam=4000, steam_now=1000, followers=19000)
+    state, _ = _trend_state(tmp_path)
+    series = _trend(state)["series"]
+    assert series["twitch_viewers_fr"]["points"] == [
+        {"date": "2026-10-01", "value": 600}, {"date": "2026-10-05", "value": 800}, {"date": "2026-10-06", "value": 1000}]
+    assert [p["value"] for p in series["steam_players_peak"]["points"]] == [3000, 4000, 5000]
+    assert [p["value"] for p in series["steam_players_now"]["points"]] == [900, 1000, 1200]
+    assert [p["value"] for p in series["steam_followers"]["points"]] == [18000, 19000, 20000]
+    assert series["steam_followers"]["status"] == "ok" and series["steam_followers"]["since"] == SINCE
+
+
+def test_a_day_absent_from_every_source_is_absent_from_the_points_and_no_empty_week_is_zero(tmp_path):
+    _write_full_history(tmp_path, "2026-10-05", twitch=800, steam=4000, steam_now=1000, followers=19000)
+    state, _ = _trend_state(tmp_path)
+    for serie in _trend(state)["series"].values():
+        dates = [p["date"] for p in serie["points"]]
+        assert "2026-10-02" not in dates and "2026-09-20" not in dates
+        assert 0 not in serie["summary"]["weeks"]
+    peak = _trend(state)["series"]["steam_players_peak"]["summary"]
+    assert peak["weeks"] == [None, None, None, 4500]  # s1 = J-6..J0 : 4000 et 5000
+    assert peak["measured_days"] == 2
+
+
+def _alpha_reviews_summary(tmp_path, points):
+    collectors = _trend_collectors(reviews={"42": points})
+    state, _ = _trend_state(tmp_path, collectors)
+    return _trend(state)["series"]["steam_reviews"]
+
+
+def test_summary_weeks_peak_last_and_percentages_are_exact(tmp_path):
+    points = [_pt("2026-09-09", 10), _pt("2026-09-10", 20), _pt("2026-09-16", 5), _pt("2026-09-23", 40),
+              _pt("2026-09-24", 41), _pt("2026-09-25", 41), _pt("2026-09-30", 100), _pt("2026-10-05", 50)]
+    serie = _alpha_reviews_summary(tmp_path, points)
+    assert serie["points"] == points and serie["status"] == "ok" and serie["since"] == SINCE
+    assert serie["summary"] == {
+        "weeks": [15, 5, 41, 75], "peak": {"date": "2026-09-30", "value": 100},
+        "last": {"date": "2026-10-05", "value": 50}, "last_vs_peak_pct": -50, "s1_vs_s2_pct": 83,
+        "measured_days": 8, "window_days": 30}
+
+
+@pytest.mark.parametrize("day, week", [("2026-09-09", 0), ("2026-09-15", 0), ("2026-09-16", 1), ("2026-09-22", 1),
+                                       ("2026-09-23", 2), ("2026-09-29", 2), ("2026-09-30", 3), ("2026-10-06", 3)])
+def test_summary_week_boundaries_are_j27_j21_j20_j14_j13_j7_j6_j0(tmp_path, day, week):
+    serie = _alpha_reviews_summary(tmp_path, [_pt(day, 8)])
+    assert serie["summary"]["weeks"] == [8 if i == week else None for i in range(4)]
+
+
+def test_summary_days_before_j27_count_for_peak_but_not_for_weeks_and_days_outside_the_window_are_dropped(tmp_path):
+    serie = _alpha_reviews_summary(tmp_path, [_pt("2026-09-01", 999), _pt("2026-09-08", 70), _pt("2026-10-06", 7)])
+    assert [p["date"] for p in serie["points"]] == ["2026-09-08", "2026-10-06"]  # 09-01 est avant la fenêtre
+    assert serie["summary"]["weeks"] == [None, None, None, 7]
+    assert serie["summary"]["peak"] == {"date": "2026-09-08", "value": 70}
+
+
+def test_summary_s1_vs_s2_is_null_when_s2_is_missing_or_zero_and_peak_zero_gives_null(tmp_path):
+    assert _alpha_reviews_summary(tmp_path, [_pt("2026-10-05", 9)])["summary"]["s1_vs_s2_pct"] is None
+    zero_s2 = _alpha_reviews_summary(tmp_path, [_pt("2026-09-25", 0), _pt("2026-10-05", 9)])["summary"]
+    assert zero_s2["weeks"] == [None, None, 0, 9] and zero_s2["s1_vs_s2_pct"] is None
+    flat = _alpha_reviews_summary(tmp_path, [_pt("2026-10-04", 0), _pt("2026-10-05", 0)])["summary"]
+    assert flat["peak"]["value"] == 0 and flat["last_vs_peak_pct"] is None
+
+
+def test_summary_without_any_point_is_an_ok_series_with_null_figures(tmp_path):
+    serie = _alpha_reviews_summary(tmp_path, [])
+    assert serie["status"] == "ok" and serie["points"] == []
+    assert serie["summary"] == {"weeks": [None] * 4, "peak": None, "last": None, "last_vs_peak_pct": None,
+                                "s1_vs_s2_pct": None, "measured_days": 0, "window_days": 30}
+
+
+def test_twitch_vods_series_summary_is_on_vods_and_views_stay_in_the_points(tmp_path):
+    points = [_vpt("2026-09-30", 1, 100), _vpt("2026-10-01", 3, 120), _vpt("2026-10-02", 0, 0)]
+    collectors = _trend_collectors(vods={"1": {"since": SINCE, "points": points}, "2": None})
+    state, _ = _trend_state(tmp_path, collectors)
+    serie = _trend(state)["series"]["twitch_vods_fr"]
+    assert serie["points"] == points
+    assert serie["summary"]["weeks"] == [None, None, None, 1]  # moyenne de 1, 3 et 0 = 1,33 -> 1
+    assert serie["summary"]["peak"] == {"date": "2026-10-01", "value": 3}
+    assert serie["summary"]["last"] == {"date": "2026-10-02", "value": 0}
+
+
+def test_twitch_capped_series_since_is_kept_and_marks_the_series_partial(tmp_path):
+    points = [_vpt("2026-10-04", 2, 10)]
+    collectors = _trend_collectors(vods={"1": {"since": "2026-10-04", "points": points}, "2": None})
+    state, _ = _trend_state(tmp_path, collectors)
+    serie = _trend(state)["series"]["twitch_vods_fr"]
+    assert serie["since"] == "2026-10-04" and serie["status"] == "partial" and "500" in serie["reason"]
+
+
+def test_unavailable_series_say_why(tmp_path):
+    state, _ = _trend_state(tmp_path)
+    beta = _trend(state, "jeu beta")["series"]  # ni appid Steam
+    for name in ("steam_reviews", "steam_players_peak", "steam_players_now", "steam_followers"):
+        assert beta[name]["status"] == "unavailable" and beta[name]["reason"] == "hors Steam"
+        assert beta[name]["points"] == [] and beta[name]["summary"] is None and beta[name]["since"] is None
+    assert beta["twitch_viewers_fr"]["status"] == "ok"
+
+
+def test_game_without_twitch_id_has_unavailable_twitch_series(tmp_path):
+    collectors = _trend_collectors()
+    collectors["twitch"].result["games"][0].pop("twitch_id")
+    state, _ = _trend_state(tmp_path, collectors)
+    alpha = _trend(state)["series"]
+    assert alpha["twitch_vods_fr"]["reason"] == "hors Twitch FR" and alpha["twitch_vods_fr"]["status"] == "unavailable"
+    assert collectors["twitch_vods_30d"].calls == [["2"]]
+
+
+def test_source_error_makes_its_series_unavailable_with_the_message_and_others_continue(tmp_path):
+    error = veille_sources.SourceError("histogramme des avis Steam : format inattendu (endpoint non documenté) : x")
+    state, collectors = _trend_state(tmp_path, _trend_collectors(reviews_error=error))
+    assert state["sources"]["steam_reviews"]["status"] == "error"
+    serie = _trend(state)["series"]["steam_reviews"]
+    assert serie["status"] == "unavailable" and "format inattendu (endpoint non documenté)" in serie["reason"]
+    assert _trend(state)["series"]["twitch_vods_fr"]["status"] == "ok"
+    assert state["sources"]["twitch_vods_30d"]["status"] == "ok"
+
+
+def test_twitch_vods_not_called_when_the_twitch_source_is_in_error(tmp_path):
+    collectors = _trend_collectors(twitch_error=veille_sources.SourceError("HTTP 500"))
+    collectors["youtube"] = Collector({"videos": [{**_vod("y1", game=None), "title": "Soirée Jeu Alpha"}]})
+    collectors["steam"] = Collector({"games": [_steam_row("42", "Jeu Alpha", 5000, 1200, rank=1, last_week_rank=0)]})
+    state, _ = _trend_state(tmp_path, collectors)
+    assert collectors["twitch_vods_30d"].calls == []
+    assert collectors["steam_reviews"].calls == [["42"]]
+    assert _trend(state)["series"]["twitch_vods_fr"]["reason"] == "source Twitch en erreur"
+    assert _trend(state)["series"]["twitch_vods_fr"]["status"] == "unavailable"
+
+
+def test_trend_series_are_written_in_the_day_file_and_no_game_rule_exists(tmp_path):
+    _trend_state(tmp_path)
+    day = _day(tmp_path)
+    assert day["games"][0]["trend_30d"]["series"]["steam_reviews"]["status"] == "ok"
+    assert "steam_reviews" in day["sources"] and "twitch_vods_30d" in day["sources"]
+
+
+# --- R27 : lignes tendance_30j du prompt -----------------------------------------------------
+
+
+def _serie(*, weeks=(15, 5, 41, 75), peak=("2026-09-30", 100), last=("2026-10-05", 50), lvp=-50, s1s2=83, measured=8,
+           since=SINCE, status="ok", reason=None):
+    return {"status": status, "reason": reason, "since": since, "points": [], "summary": {
+        "weeks": list(weeks), "peak": {"date": peak[0], "value": peak[1]} if peak else None,
+        "last": {"date": last[0], "value": last[1]} if last else None, "last_vs_peak_pct": lvp, "s1_vs_s2_pct": s1s2,
+        "measured_days": measured, "window_days": 30}}
+
+
+def _gone(reason):
+    return {"status": "unavailable", "reason": reason, "since": None, "points": [], "summary": None}
+
+
+def _trend_prompt(tmp_path, series, *, trend=True):
+    state = _day_state("twitch:AAA")
+    state["games"][0]["trend_30d"] = {"days": 30, "since": SINCE, "series": series} if trend else None
+    state["games"].append({"key": "jeu beta", "name": "Jeu Beta", "twitch_fr_viewers": 5, "twitch_delta_pct": None,
+                           "steam_delta_pct": None, "trend_30d": None})
+    return _decide_prompt(tmp_path, state)
+
+
+def _lines(prompt):
+    return [line for line in prompt.splitlines() if line.startswith("  tendance_30j ")]
+
+
+def test_prompt_trend_lines_exact_form_one_per_series_in_order_under_the_followed_game(tmp_path):
+    series = {
+        "steam_reviews": _serie(),
+        "twitch_vods_fr": _serie(weeks=(1, 2, 3, 4), peak=("2026-10-04", 3), last=("2026-10-06", 2), lvp=-33, s1s2=33,
+                                 measured=30),
+        "twitch_viewers_fr": _serie(weeks=(None, 5, 41, 75), peak=None, last=None, lvp=None, s1s2=None, measured=0),
+        "steam_players_peak": _serie(since="2026-10-04", measured=3),
+        "steam_players_now": _gone("hors Steam"),
+        "steam_followers": _gone("HTTP 429 Steam"),
+    }
+    series["twitch_vods_fr"]["points"] = [_vpt("2026-10-04", 3, 120), _vpt("2026-10-06", 2, 77)]
+    prompt = _trend_prompt(tmp_path, series)
+    assert _lines(prompt) == [
+        "  tendance_30j avis_steam_par_jour : semaines=[15, 5, 41, 75] pic=2026-09-30 (100) dernier=2026-10-05 (50) "
+        "dernier_vs_pic=-50% s1_vs_s2=83% jours_mesurés=8/30",
+        "  tendance_30j vod_twitch_fr_par_jour : semaines=[1, 2, 3, 4] pic=2026-10-04 (3 VOD (120 vues)) "
+        "dernier=2026-10-06 (2 VOD (77 vues)) dernier_vs_pic=-33% s1_vs_s2=33% jours_mesurés=30/30",
+        "  tendance_30j viewers_twitch_fr : semaines=[?, 5, 41, 75] pic=inconnu dernier=inconnu "
+        "dernier_vs_pic=inconnu s1_vs_s2=inconnu jours_mesurés=0/30",
+        "  tendance_30j joueurs_steam_pic : semaines=[15, 5, 41, 75] pic=2026-09-30 (100) dernier=2026-10-05 (50) "
+        "dernier_vs_pic=-50% s1_vs_s2=83% jours_mesurés=3/30 depuis=2026-10-04 (plafond Twitch 500 VOD)",
+        "  tendance_30j joueurs_steam_instantane : indisponible (hors Steam)",
+        "  tendance_30j abonnes_steam : indisponible (HTTP 429 Steam)",
+    ]
+    lines = prompt.splitlines()
+    alpha = next(i for i, line in enumerate(lines) if line.startswith("- Jeu Alpha :"))
+    assert lines[alpha + 1: alpha + 7] == _lines(prompt)  # juste sous la ligne du jeu, dans l'ordre
+    beta = next(i for i, line in enumerate(lines) if line.startswith("- Jeu Beta :"))
+    assert not lines[beta + 1].startswith("  tendance_30j")  # jeu non suivi : aucune ligne
+
+
+def test_prompt_game_without_trend_has_no_trend_line(tmp_path):
+    assert _lines(_trend_prompt(tmp_path, {}, trend=False)) == []
+
+
+def test_prompt_header_has_the_trend_legend_and_the_instruction(tmp_path):
+    prompt = _trend_prompt(tmp_path, {name: _serie() for name in ("steam_reviews", "twitch_vods_fr", "twitch_viewers_fr", "steam_players_peak", "steam_players_now", "steam_followers")})
+    assert ("tendance_30j : pour chaque jeu suivi, moyennes par jour sur 4 semaines pleines, s4 la plus ancienne → s1 "
+            "les 7 derniers jours, ? = aucune mesure cette semaine ; jours_mesurés = jours avec une mesure sur la "
+            "fenêtre ; un jour sans mesure est inconnu, pas zéro. avis_steam_par_jour = avis Steam écrits par jour "
+            "(activité des joueurs) ; vod_twitch_fr_par_jour = VOD FR encore en ligne publiées ce jour (vues cumulées "
+            "entre parenthèses).") in prompt
+    assert ("Un jeu dont la tendance monte ou tient (s1 ≥ s2, dernier proche du pic) vaut mieux qu'un pic de sortie "
+            "déjà retombé (dernier bien sous le pic, s1 < s2) ; une sortie récente sans courbe en montée n'est pas "
+            "« ce qui monte ».") in prompt
+    assert prompt.index("tendance_30j : pour chaque") < prompt.index("- Jeu Alpha :")
