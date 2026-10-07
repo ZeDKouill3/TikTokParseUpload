@@ -1325,9 +1325,10 @@ def test_proposed_cards_come_before_the_decided_ones_which_fold_into_deja_decide
     ])
     open_part, folded = html.split("<details", 1)
     assert _ids(open_part) == ["first", "late"]  # l'ordre de Claude (rang) gardé dans le groupe
-    assert "Déjà décidées" in folded.split("</summary>")[0] and "(2)" in folded.split("</summary>")[0]
-    assert _ids(folded) == ["old", "nope"]  # rang de Claude gardé aussi dans le groupe des décidées
-    assert 'data-live-state="ignored"' in folded  # l'ignorée est lisible dans la section repliée
+    assert "Déjà décidées" in folded.split("</summary>")[0] and "(1)" in folded.split("</summary>")[0]
+    assert _ids(folded) == ["old"]  # seules les mises en file sont repliées
+    assert "nope" not in html  # SPEC-bdd9 R10 : une ignorée disparaît...
+    assert "1 proposition ignorée aujourd'hui" in open_part  # ...seul leur nombre reste
     assert "open" not in folded.split(">", 1)[0]  # repliée par défaut
 
 

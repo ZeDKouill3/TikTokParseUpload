@@ -203,32 +203,31 @@ function veilleProposal(p, game, channels) {
   </article>`;
 }
 
-/* À décider (proposed) d'abord, dans l'ordre de Claude ; les déjà décidées (queued / ignored) dans une section repliée. */
+/* À décider (proposed) d'abord, dans l'ordre de Claude ; les mises en file (queued) dans une section repliée ;
+   une ignorée disparaît (SPEC-bdd9 R10), seul leur nombre reste affiché. */
 function veilleProposalGroups(proposals) {
   const byRank = (a, b) => a.rank - b.rank;
   return {
     pending: proposals.filter((p) => p.status === "proposed").sort(byRank),
-    decided: proposals.filter((p) => p.status !== "proposed").sort(byRank),
+    decided: proposals.filter((p) => p.status === "queued").sort(byRank),
+    ignored: proposals.filter((p) => p.status === "ignored").length,
   };
-}
-
-function veilleIgnoredRow(p) {
-  return `<div class="arch-row" data-veille-prop="${esc(p.candidate_id)}"><span class="t muted">${esc(p.candidate.title)} · <span class="chip" data-live-state="ignored">ignorée</span> : ne sera plus proposée.</span></div>`;
 }
 
 function veilleProposals(data, channels) {
   const day = data.day;
   const games = Object.fromEntries((day.games || []).map((g) => [g.key, g]));
-  const { pending, decided } = veilleProposalGroups(day.proposals);
-  const card = (p) => (p.status === "ignored" ? veilleIgnoredRow(p) : veilleProposal(p, games[p.candidate.game_key], channels));
+  const { pending, decided, ignored } = veilleProposalGroups(day.proposals);
+  const card = (p) => veilleProposal(p, games[p.candidate.game_key], channels);
   const empty = day.llm && day.llm.status === "error" ? "Claude n'a rien proposé : voir l'erreur ci-dessus."
     : decided.length ? "Plus rien à décider : les propositions du jour sont dans « Déjà décidées » ci-dessous."
     : "Aucune VOD proposée aujourd'hui.";
   const note = day.skipped_note ? `<div class="arch-row"><span class="t muted">${esc(day.skipped_note)}</span></div>` : "";
+  const dropped = ignored ? `<div class="arch-row" data-veille-ignored><span class="t muted">${esc(ignored)} proposition${ignored > 1 ? "s" : ""} ignorée${ignored > 1 ? "s" : ""} aujourd'hui : elle${ignored > 1 ? "s ne seront" : " ne sera"} plus proposée${ignored > 1 ? "s" : ""}.</span></div>` : "";
   const folded = decided.length ? `<details class="archived" data-veille-decided><summary>${icon("check", "i-xs")}Déjà décidées (${esc(decided.length)})</summary>${decided.map(card).join("")}</details>` : "";
   return `<section data-veille-proposals><div class="panel">
     ${pending.length ? pending.map(card).join("") : `<div class="list-item muted">${esc(empty)}</div>`}
-    ${note}${folded}</div></section>`;
+    ${note}${dropped}${folded}</div></section>`;
 }
 
 function veilleClipTitle(c) {
