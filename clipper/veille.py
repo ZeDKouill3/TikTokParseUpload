@@ -89,8 +89,10 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "igdb_pages_max": 4,
     "youtube_game_min_chars": 5,
     "steam_players_lookups_max": 30,
-    "steam_followers_lookups_max": 200,
-    "steam_followers_pause_s": 1.0,
+    "steam_followers_lookups_max": 50,
+    "steam_followers_pause_s": 3.0,
+    "steam_followers_retry_max": 3,
+    "steam_followers_retry_wait_max_s": 60.0,
     "community_min_steam_players": 1000,
     "community_min_steam_followers": 10000,
     "community_min_twitch_viewers": 200,
@@ -145,15 +147,19 @@ def settings(config: Config) -> dict[str, object]:
         value = table[key]
         if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
             raise VeilleError(f"[veille] {key} doit être un entier >= {minimum} (reçu {value!r})")
-    for key, minimum in (("steam_players_lookups_max", 0), ("steam_followers_lookups_max", 0),
-                         ("community_min_steam_players", 0), ("community_min_steam_followers", 0),
+    for key, minimum in (("steam_players_lookups_max", 0), ("community_min_steam_players", 0), ("community_min_steam_followers", 0),
                          ("community_min_twitch_viewers", 0), ("community_min_hypes", 0), ("max_vods_per_game", 1)):
         value = table[key]
         if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
             raise VeilleError(f"[veille] {key} doit être un entier >= {minimum} (reçu {value!r})")
-    pause = table["steam_followers_pause_s"]
-    if not isinstance(pause, (int, float)) or isinstance(pause, bool) or pause < 0.2:
-        raise VeilleError(f"[veille] steam_followers_pause_s doit être un nombre >= 0.2 (reçu {pause!r})")
+    for key, low, high in (("steam_followers_lookups_max", 0, 60), ("steam_followers_retry_max", 0, 10)):
+        value = table[key]
+        if not isinstance(value, int) or isinstance(value, bool) or not low <= value <= high:
+            raise VeilleError(f"[veille] {key} doit être un entier entre {low} et {high} (reçu {value!r})")
+    for key, low, high in (("steam_followers_pause_s", 0.2, 60.0), ("steam_followers_retry_wait_max_s", 1.0, 600.0)):
+        value = table[key]
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not low <= value <= high:
+            raise VeilleError(f"[veille] {key} doit être un nombre entre {low} et {high} (reçu {value!r})")
     min_chars = table["youtube_game_min_chars"]
     if not isinstance(min_chars, int) or isinstance(min_chars, bool) or min_chars < 1:
         raise VeilleError(f"[veille] youtube_game_min_chars doit être un entier >= 1 (reçu {min_chars!r})")
@@ -531,6 +537,10 @@ def _run_lookup(source: str, appids: list[str], collectors: dict[str, Collector]
         found = sum(v is not None for v in values.values())
         status["counts"] = {"requested": len(kept), "found": found, "unknown": len(kept) - found,
                             "skipped": cut + int(result.get("skipped", 0))}
+        limited = int(result.get("rate_limited", 0))
+        if limited:  # ADR-ad2e : jamais « ok » muet, la lecture partielle se voit sur l'écran Veille
+            status.update(status="partial", error=f"HTTP 429 (limite de Steam) : {limited} appid(s) non relevé(s) sur {len(kept)}")
+            status["counts"]["rate_limited"] = limited
     except Exception as exc:  # une source en erreur ne bloque pas les autres, jamais avalée
         status.update(status="error", error=_error_text(exc), counts={})
         return status, {}

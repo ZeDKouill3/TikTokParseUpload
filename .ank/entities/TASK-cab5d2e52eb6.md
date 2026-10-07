@@ -5,7 +5,7 @@ slug: veille-les-lectures-d-abonn-s-steam-memberslistx
 title: "Veille : les lectures d'abonnés Steam (memberslistxml) ne doivent plus dépasser la limite de Steam (HTTP 429)"
 created: 2026-10-07T12:07:08Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/veille_sources.py
   - clipper/veille.py
@@ -18,8 +18,15 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/629f5b36cad5@2507c65
+    tree: scope/983dd3863d69
+    criteria: bf8c418a416b
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---
 
 Relevé réel 07/10/2026 12:31, écran Veille : « Steam (abonnés) : erreur HTTP 429 ». ADR-05a4 autorise memberslistxml avec plafond et pause réglables.

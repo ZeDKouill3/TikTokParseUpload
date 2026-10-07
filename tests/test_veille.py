@@ -120,7 +120,8 @@ def test_config_defaults_are_exactly_r1():
         "steam_rank_gain_min": 5, "steam_risers_max": 10, "steam_sellers_top": 50,
         "upcoming_days": 14, "release_window_days": 15, "igdb_min_hypes": 5, "igdb_recent_max": 12,
         "igdb_upcoming_max": 20, "igdb_pages_max": 4, "youtube_game_min_chars": 5,
-        "steam_players_lookups_max": 30, "steam_followers_lookups_max": 200, "steam_followers_pause_s": 1.0,
+        "steam_players_lookups_max": 30, "steam_followers_lookups_max": 50, "steam_followers_pause_s": 3.0,
+        "steam_followers_retry_max": 3, "steam_followers_retry_wait_max_s": 60.0,
         "community_min_steam_players": 1000, "community_min_steam_followers": 10000,
         "community_min_twitch_viewers": 200, "community_min_hypes": 50, "max_vods_per_game": 1,
     }
@@ -148,6 +149,12 @@ def test_load_config_accepts_veille_table(tmp_path):
     ({"steam_players_lookups_max": -1}, "steam_players_lookups_max"),
     ({"steam_followers_lookups_max": -1}, "steam_followers_lookups_max"),
     ({"steam_followers_pause_s": 0.1}, "steam_followers_pause_s"),
+    ({"steam_followers_lookups_max": 61}, "steam_followers_lookups_max"),
+    ({"steam_followers_pause_s": 61}, "steam_followers_pause_s"),
+    ({"steam_followers_retry_max": -1}, "steam_followers_retry_max"),
+    ({"steam_followers_retry_max": 11}, "steam_followers_retry_max"),
+    ({"steam_followers_retry_wait_max_s": 0}, "steam_followers_retry_wait_max_s"),
+    ({"steam_followers_retry_wait_max_s": 601}, "steam_followers_retry_wait_max_s"),
     ({"max_vods_per_game": 0}, "max_vods_per_game"),
 ])
 def test_invalid_settings_raise_naming_the_key(tmp_path, table, key):
@@ -1455,8 +1462,9 @@ def test_no_llm_call_for_the_deduction(tmp_path):
 class Lookup:
     """Collecteur par appid : garde les appids de chaque appel et rend ``results`` (ou lève ``error``)."""
 
-    def __init__(self, key, results=None, error=None, skipped=0):
+    def __init__(self, key, results=None, error=None, skipped=0, rate_limited=0):
         self.key, self.results, self.error, self.skipped = key, results or {}, error, skipped
+        self.rate_limited = rate_limited
         self.calls: list[list[str]] = []
         self.settings: list[dict] = []
 
@@ -1465,7 +1473,10 @@ class Lookup:
         self.settings.append(settings)
         if self.error is not None:
             raise self.error
-        return {self.key: {a: self.results.get(a) for a in appids}, "skipped": self.skipped}
+        out = {self.key: {a: self.results.get(a) for a in appids}, "skipped": self.skipped}
+        if self.rate_limited:
+            out["rate_limited"] = self.rate_limited
+        return out
 
 
 def _steam_row(appid, name, players, concurrent=None, **extra):
@@ -1620,6 +1631,23 @@ def test_steam_followers_error_sets_no_follower_and_the_rest_continues(tmp_path)
     assert all(g["steam_followers"] is None for g in state["games"])
     assert _read(_sdir(tmp_path) / "history" / f"{TODAY}.json")["steam_followers"] == {}
     assert state["sources"]["steam_players"]["status"] == "ok" and state["sources"]["igdb"]["status"] == "ok"
+
+
+def test_steam_followers_rate_limited_is_a_visible_partial_status_and_the_rest_continues(tmp_path):
+    collectors = _community_collectors(releases=[_rel(1, "Hytale", "2026-10-05", hypes=80, steam_appid="60")])
+    collectors["steam_followers"] = Lookup("followers", {"42": 120000}, rate_limited=2)
+    state = veille.collect(NOW, collectors=collectors, config=_make_config(tmp_path))
+    source = state["sources"]["steam_followers"]
+    assert source["status"] == "partial" and "429" in source["error"]
+    assert source["counts"]["rate_limited"] == 2 and source["counts"]["found"] == 1
+    assert _game_of(state, "jeu alpha")["steam_followers"] == 120000  # les abonnés lus sont gardés
+    assert state["sources"]["steam_players"]["status"] == "ok" and state["sources"]["igdb"]["status"] == "ok"
+
+
+def test_steam_followers_without_rate_limit_stays_ok_with_no_rate_limited_count(tmp_path):
+    state, _ = _scenario(tmp_path)
+    assert state["sources"]["steam_followers"]["status"] == "ok"
+    assert "rate_limited" not in state["sources"]["steam_followers"]["counts"]
 
 
 def test_followers_gain_7d_from_the_exact_day_file_else_null(tmp_path):
