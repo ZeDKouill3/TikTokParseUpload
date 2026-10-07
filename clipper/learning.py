@@ -32,6 +32,8 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "min_account_posts": 10,  # posts murs a vues > 0 pour qu'un compte entre dans l'apprentissage
     "coach_min_new_cases": 10,  # clips scored nouveaux depuis le dernier passage du coach pour en declencher un
     "coach_min_interval_days": 7,  # jours minimaux entre deux passages du coach (ADR-c260 : cout borne)
+    "veille_report_days": 30,  # fenetre (jours) des VOD mises en file que reprend state/veille/bilan.json
+    "veille_report_max": 20,  # nombre maximal d entrees du bilan, les plus recentes d abord
 }
 
 REASONS = ("none", "ambiguous")
@@ -61,6 +63,10 @@ def _settings(config: Config | None) -> dict[str, Any]:
     interval = settings["coach_min_interval_days"]
     if isinstance(interval, bool) or not isinstance(interval, (int, float)) or interval < 0:
         raise LearningError(f"[learning] coach_min_interval_days invalide : {interval!r} (un nombre de jours >= 0 est attendu)")
+    for key in ("veille_report_days", "veille_report_max"):
+        value = settings[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise LearningError(f"[learning] {key} invalide : {value!r} (un entier >= 1 est attendu)")
     if not isinstance(settings["enabled"], bool):
         raise LearningError(f"[learning] enabled invalide : {settings['enabled']!r} (true ou false attendu)")
     return settings
@@ -457,6 +463,11 @@ def run_if_due(now: datetime, *, config: Config | None = None) -> dict[str, Any]
             if not hasattr(exc, "where"):
                 exc.where = "sync"  # type: ignore[attr-defined]
             raise
+        try:
+            write_veille_report(now, config=config)
+        except Exception as exc:
+            exc.where = "veille_report"  # type: ignore[attr-defined]
+            raise
     try:
         coached = coach_if_due(now, config=config)
     except (jury_coach.CoachError, jury.JuryError, llm.LLMError) as exc:
@@ -656,3 +667,73 @@ def status(config: Config | None) -> dict[str, Any]:
         raise LearningError(f"poids du jury illisibles ({weights_path}) : {exc}") from exc
     return {"enabled": settings["enabled"], "links": _read_links(settings), "sync": _read_sync(settings),
             "weights": weights, "coach": proposals(config)}
+
+
+# ---------------------------------------------------------------- bilan des VOD de veille (SPEC-00db R8)
+
+
+def _read_state_json(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise LearningError(f"fichier d'état de la veille illisible : {path.name} ({path}) : {exc}") from exc
+
+
+def _vod_missing(clips: int, published: int, mature: int, excluded: list[dict[str, Any]]) -> str | None:
+    if mature:
+        return None
+    if clips == 0:
+        return "no_clips"
+    if published == 0:
+        return "not_published"
+    return "account_below_min" if any(e.get("reason") == "account_below_min" for e in excluded) else "immature"
+
+
+def write_veille_report(now: datetime, *, config: Config | None = None) -> dict[str, Any]:
+    """Écrit ``<[veille] state_dir>/bilan.json`` (SPEC-00db R8) : pour les VOD mises en file (``seen.json``) dans les
+    ``veille_report_days`` derniers jours, au plus ``veille_report_max``, les plus récentes d'abord : clips publiés,
+    clips mûrs, rang moyen et vues max à maturité lus dans les entrées ``stats`` du journal (jamais recalculés), ou
+    ``missing`` (la raison) et des chiffres ``null``. Le fichier est le contrat avec ``clipper.veille`` (qui ne
+    l'importe pas) ; déterministe hors ``computed_at``. Rend le contenu écrit."""
+    settings = _settings(config)
+    sdir = Path(config.section("veille")["state_dir"] if config is not None else "state/veille")
+    journal_path = (config.section("outcomes") if config is not None else outcomes.CONFIG_DEFAULTS)["journal_path"]
+    seen = _read_state_json(sdir / "seen.json", {"queued": []})
+    since = now - timedelta(days=int(settings["veille_report_days"]))
+    queued = [q for q in seen.get("queued", []) if _aware(q["at"]) >= since]
+    queued.sort(key=lambda q: _aware(q["at"]), reverse=True)
+    queued = queued[:int(settings["veille_report_max"])]
+    sidecars: dict[str, list[dict[str, Any]]] = {}
+    for path, sidecar in _read_sidecars(config):
+        sidecars.setdefault(path.parent.name, []).append(sidecar)
+    stats: dict[str, list[dict[str, Any]]] = {}
+    for entry in outcomes.read(journal_path):
+        if entry.get("kind") == "stats" and entry.get("video_id"):
+            stats.setdefault(entry["video_id"], []).append(entry["stats"])
+    excluded = _read_sync(settings)["excluded"]
+    entries = []
+    for item in queued:
+        video = item["video_id"]
+        day = _read_state_json(sdir / "days" / f"{item['date']}.json", {"proposals": []})
+        proposal = next((p for p in day.get("proposals", []) if p.get("candidate_id") == item["candidate_id"]), None)
+        candidate = (proposal or {}).get("candidate") or {}
+        clips = sidecars.get(video, [])
+        published = sum(1 for s in clips if isinstance(s.get("tiktok_post"), dict))
+        rows = stats.get(video, [])
+        ranks = [r["views_percentile"] for r in rows if r.get("views_percentile") is not None]
+        views = [r["views_at_maturity"] for r in rows if r.get("views_at_maturity") is not None]
+        entries.append({
+            "picked_on": item["date"], "candidate_id": item["candidate_id"], "source": candidate.get("source"),
+            "game_name": candidate.get("game_name"), "channel_name": candidate.get("channel_name"),
+            "title": candidate.get("title"), "video_id": video, "clips_published": published, "clips_mature": len(rows),
+            "views_percentile_mean": sum(ranks) / len(ranks) if ranks else None,
+            "views_at_maturity_max": max(views) if views else None,
+            "missing": _vod_missing(len(clips), published, len(rows), [e for e in excluded if e.get("video_id") == video]),
+        })
+    report = {"computed_at": _now_iso(now), "days": settings["veille_report_days"], "entries": entries}
+    target = sdir / "bilan.json"
+    with channel_mod.file_lock(target):
+        channel_mod.atomic_write_json(target, report)
+    return report

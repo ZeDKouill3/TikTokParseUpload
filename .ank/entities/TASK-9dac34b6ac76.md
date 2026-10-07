@@ -5,7 +5,7 @@ slug: apprentissage-4-4-bilan-des-vod-choisies-par-la
 title: "Apprentissage (4/4) : bilan des VOD choisies par la veille (state/veille/bilan.json écrit par learning après chaque versement : clips publiés, vues et rang à maturité, raison si absent) donné à Claude dans le prompt du choix des VOD (SPEC R8)"
 created: 2026-10-07T10:27:52Z
 author: w-learnplan
-status: open
+status: done
 scope:
   - clipper/learning.py
   - clipper/veille.py
@@ -17,8 +17,15 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/e7acf61bd25c@fa9a672
+    tree: scope/76df250ff4e3
+    criteria: 98b162e508b9
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---
 
 ADR-c260 point 8 et SPEC associée R8 : la veille (ADR-ca9a, SPEC-bdd9 R6) fait choisir les VOD par Claude sans jamais lui dire ce que ses choix précédents ont donné. Mesure du 2026-10-07 : 2 jours d'état, 6 propositions dont 4 mises en file (`state/veille/seen.json`, clé `queued`, avec `candidate_id`, `video_id`, `url`), aucun clip de ces VOD encore publié : le premier bilan dira `missing` partout, ce qui est la réponse honnête.
