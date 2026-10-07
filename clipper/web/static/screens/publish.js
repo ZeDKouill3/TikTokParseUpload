@@ -1206,7 +1206,7 @@ function pubAccountField(c) {
   const accounts = (pubUi.data && pubUi.data.accounts) || [];
   const locked = c.publish_status === "published" || c.missing;
   const options = accounts.filter((a) => a.ready_to_publish || a.id === c.account)
-    .map((a) => `<option value="${esc(a.id)}"${a.id === c.account ? " selected" : ""}${a.ready_to_publish ? "" : " disabled"}>${esc(pubAccountText(a))}${a.ready_to_publish ? "" : " (non prêt à publier)"}</option>`);
+    .map((a) => `<option value="${esc(a.id)}"${a.id === c.account ? " selected" : ""}${a.ready_to_publish ? "" : " disabled"}>${esc(pubAccountText(a))}${a.ready_to_publish ? "" : a.paused_at ? " (en pause)" : " (non prêt à publier)"}</option>`);
   if (!c.account) options.unshift(`<option value="" selected>Aucun compte</option>`);
   return `<div class="field"><label for="pub-account">Compte de publication</label>
     <select class="input" id="pub-account" data-pub-account${locked ? " disabled" : ""}>${options.join("")}</select>

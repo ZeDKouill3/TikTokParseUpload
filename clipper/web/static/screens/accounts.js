@@ -199,14 +199,17 @@ function accLoginState(a) {
   return `<div class="li-sub" data-acc-login><span class="chip ${s.cls}">${esc(ACC_SERVICES[accService(a)])} : ${esc(s.label)}</span><span class="muted">${when}</span></div>${channel}${err}`;
 }
 
-/* « Prêt à publier » est un état (SPEC-e500 R3) : case en lecture seule, jamais cochée à la main. Cliquer
-   dessus quand le compte n'est pas prêt lance « Se connecter » ; après un arrêt R4, « J'ai réglé le problème »
-   revérifie la connexion et efface l'arrêt. */
+/* « Prêt à publier » est un état (SPEC-e500 R3), jamais coché à la main, mais cliquable (SPEC-f348 R5) :
+   cochée, le clic met le compte en pause ; en pause, il le reprend ; sinon il lance « Se connecter ». Après un
+   arrêt R4, « J'ai réglé le problème » revérifie la connexion et efface l'arrêt. */
 function accReadyBox(a) {
   const reason = !a.ready_to_publish ? a.ready_blocked_reason : "";
   const state = a.ready_to_publish ? `Prêt à publier : connexion ${ACC_SERVICES[accService(a)]} vérifiée` : "Pas prêt à publier";
+  const action = a.ready_to_publish ? "clique pour mettre le compte en pause"
+    : a.paused_at ? "clique pour reprendre le compte" : "clique pour te connecter";
   return `<div class="li-sub acc-ready" data-acc-ready-cell>
-    <label class="acc-check"><input type="checkbox" data-acc-ready="${esc(a.id)}" aria-readonly="true"${a.ready_to_publish ? " checked" : ""} title="${esc(state)}${a.ready_to_publish ? "" : " : clique pour te connecter"}"> Prêt à publier</label>
+    <label class="acc-check"><input type="checkbox" data-acc-ready="${esc(a.id)}"${a.ready_to_publish ? " checked" : ""} title="${esc(state)} : ${esc(action)}"> Prêt à publier</label>
+    ${a.paused_at ? `<span class="chip pending" data-acc-paused>En pause (manuel) depuis le ${esc(accFmtDate(a.paused_at))}</span>` : ""}
     ${reason ? `<span class="muted" data-acc-ready-reason>${esc(reason)}</span>` : ""}
     ${a.ready_note ? `<span class="bad" data-acc-ready-note>${esc(a.ready_note)}</span>` : ""}
     ${a.r4_halt ? `<button type="button" class="btn btn-xs" data-acc-resolve="${esc(a.id)}">${icon("check", "i-xs")}J'ai réglé le problème</button>` : ""}</div>`;
@@ -255,6 +258,27 @@ async function accResolve(account, button) {
             body: out.ready_to_publish ? account.label : `${account.label} : ${out.ready_note || "connexion à refaire (Se connecter)"}` });
   } catch (err) {
     toastError("Vérification impossible", err);
+  }
+  await accLoad();
+}
+
+async function accPause(account) {
+  try {
+    await api(`/api/accounts/${encodeURIComponent(account.id)}/pause`, jsonBody("POST", {}));
+    toast({ kind: "ok", title: "Compte en pause", body: account.label });
+  } catch (err) {
+    toastError("Pause impossible", err);
+  }
+  await accLoad();
+}
+
+async function accResume(account) {
+  try {
+    const out = await api(`/api/accounts/${encodeURIComponent(account.id)}/resume`, jsonBody("POST", {}));
+    toast({ kind: out.ready_to_publish ? "ok" : "warn", title: out.ready_to_publish ? "Compte prêt à publier" : "Toujours pas prêt",
+            body: out.ready_to_publish ? account.label : `${account.label} : ${out.ready_blocked_reason || out.ready_note || "connexion à refaire (Se connecter)"}` });
+  } catch (err) {
+    toastError("Reprise impossible", err);
   }
   await accLoad();
 }
@@ -345,9 +369,11 @@ function accWireList(body) {
   $$("[data-acc-verify]", body).forEach((b) => (b.onclick = () => accVerifyYoutube(find(b.dataset.accVerify), b)));
   $$("[data-acc-stats]", body).forEach((b) => (b.onclick = () => accRefreshStats(find(b.dataset.accStats), b)));
   $$("[data-acc-ready]", body).forEach((b) => (b.onclick = (e) => {
-    e.preventDefault();  // lecture seule : jamais de coche à la main
+    e.preventDefault();  // la coche suit l'état rendu par le serveur, jamais le clic
     const account = find(b.dataset.accReady);
-    if (!account.ready_to_publish) accBrowserLogin(account, b);
+    if (account.ready_to_publish) accPause(account);
+    else if (account.paused_at) accResume(account);
+    else accBrowserLogin(account, b);
   }));
   $$("[data-acc-resolve]", body).forEach((b) => (b.onclick = () => accResolve(find(b.dataset.accResolve), b)));
   $$("[data-acc-edit]", body).forEach((b) => (b.onclick = () => accOpenForm(find(b.dataset.accEdit))));

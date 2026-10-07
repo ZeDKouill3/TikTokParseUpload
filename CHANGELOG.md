@@ -34,6 +34,11 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
   libérés ; jamais un clip publié, programmé, en cours ou en attente de publication. Tout ou rien par série
   (une partie choisie entraîne toute sa série, refusée entière si une partie est bloquée) ; chaque refus
   est rendu avec sa raison et affiché dans le toast.
+- Comptes : pause manuelle d'un compte (SPEC-f348). La case « Prêt à publier » devient cliquable : cochée, un
+  clic met le compte en pause (« En pause (manuel) depuis le … », heure de Paris) ; en pause, un clic le
+  reprend (connexion revérifiée). Un compte en pause n'est jamais proposé dans Clips ni Publication, et une
+  publication existante affiche « (en pause) » ; ses entrées restent en attente avec la raison, les
+  publications déjà programmées côté plateforme ne sont pas touchées.
 - Jury action (6/6) : preuve de bout en bout et documentation (SPEC-b0f3 R15, R17, R18). Deux tests de
   `tests/test_pipeline.py` (FakeBackend, source synthétique) : un style gaming action enchaîne audio avant
   scenes (`peak_windows`), action avant moments, produit `action.json` puis un `moments.json` avec un moment de

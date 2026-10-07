@@ -302,6 +302,28 @@ jamais un tiret muet. Les actions qui ont un inverse (décision de revue,
 approbation) proposent « Annuler » pendant 5 secondes ; les autres (annuler un
 traitement, refuser une série, supprimer un style) demandent confirmation.
 
+### Pause et reprise d'un compte (écran Comptes)
+
+La case « Prêt à publier » d'un compte se clique (SPEC-f348). Cochée, un clic
+met le compte **en pause** : la case se décoche et l'écran affiche « En pause
+(manuel) depuis le <date> » (heure de Paris). Décochée parce que le compte est
+en pause, un clic le fait **reprendre** : la connexion est revérifiée puis la
+pause levée ; si le compte n'est toujours pas prêt, le message dit pourquoi.
+Décochée sans pause (jamais connecté, session expirée), le clic lance « Se
+connecter » comme avant.
+
+Effet d'une pause sur la file de publication :
+
+- les entrées de la file restent en attente avec la raison (« en pause ») ;
+  rien ne part sur un autre compte ;
+- les publications déjà programmées côté plateforme ne sont pas touchées ;
+- les clips et l'écran Publication ne proposent plus ce compte ; une
+  publication existante qui le vise l'affiche « (en pause) » ;
+- les statistiques du compte restent relevables.
+
+À la reprise, une publication immédiate dont le créneau est déjà passé part à
+la boucle suivante du worker.
+
 ### La file de traitement
 
 Ajouter une vidéo (écran Vidéos, ou VOD confirmée) l'inscrit dans

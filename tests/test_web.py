@@ -4541,6 +4541,42 @@ def test_clips_screen_labels_every_server_status_including_not_ready():
     assert "not_ready" in js
 
 
+def test_accounts_ready_box_is_clickable_and_drives_pause_and_resume():
+    js = (STATIC / "screens" / "accounts.js").read_text(encoding="utf-8")
+    box = js[js.index("function accReadyBox"):js.index("function accSlots")]
+    handler = js[js.index("$$(\"[data-acc-ready]\""):js.index("$$(\"[data-acc-resolve]\"")]
+
+    assert "aria-readonly" not in box and "aria-readonly" not in js
+    assert "En pause (manuel) depuis le" in box
+    assert "paused_at" in box and "accFmtDate(a.paused_at)" in box  # fmtParis via accFmtDate
+    assert "/pause" in js and "/resume" in js
+    assert "accPause(" in handler and "accResume(" in handler and "accBrowserLogin(" in handler
+    assert handler.index("ready_to_publish") < handler.index("paused_at") < handler.index("accBrowserLogin(")
+    assert "Compte en pause" in js and "Toujours pas prêt" in js and "Compte prêt à publier" in js
+
+
+def test_clips_and_publish_keep_ready_filter_and_label_paused_accounts():
+    clips = (STATIC / "screens" / "clips.js").read_text(encoding="utf-8")
+    publish = (STATIC / "screens" / "publish.js").read_text(encoding="utf-8")
+
+    assert clips.count("filter((a) => a.ready_to_publish)") >= 2
+    assert publish.count("filter((a) => a.ready_to_publish)") >= 2
+    assert "a.ready_to_publish || a.id === c.account" in publish
+    assert "(en pause)" in publish and "a.paused_at" in publish
+    assert "(non prêt à publier)" in publish
+
+
+def test_guide_and_changelog_describe_manual_account_pause():
+    guide = (Path(__file__).resolve().parent.parent / "docs" / "GUIDE.md").read_text(encoding="utf-8")
+    changelog = (Path(__file__).resolve().parent.parent / "CHANGELOG.md").read_text(encoding="utf-8")
+    unreleased = changelog[changelog.index("Non publié"):]
+    unreleased = unreleased[:unreleased.index("\n## ", 5)] if "\n## " in unreleased[5:] else unreleased
+
+    assert "pause" in guide.lower() and "reprise" in guide.lower() and "reprendre" in guide.lower()
+    assert "restent en attente" in guide and "côté plateforme" in guide and "boucle suivante" in guide
+    assert "pause manuelle" in unreleased.lower()
+
+
 def _serve_like_config(tmp_path, port):
     """Config lue dans config.toml puis surchargée comme le fait 'serve --port'."""
     import dataclasses
