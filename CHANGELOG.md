@@ -22,6 +22,11 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ### Ajouté
 
+- Jury action (2/6) : grille embarquée `builtin:gaming-action` (`[moments] rubric_path`, action 5,
+  émotion 3, `min_score` 50, clips de 20 à 90 s) et table optionnelle `[gate]` (seuil éliminatoire :
+  `criterion`, `min`, `unless_criterion`, `unless_min`) validée par `load_rubric` et appliquée par
+  l'étape moments avant `min_score`, y compris à la re-notation après vision. `builtin` et
+  `builtin:gaming` restent identiques octet pour octet ; une grille sans `[gate]` ne change rien.
 - Apprentissage (3/4) : le coach des prompts du jury passe tout seul dans le worker quand
   `[learning] coach_min_new_cases` (10) clips mûrs nouveaux existent et que `coach_min_interval_days`
   (7) jours se sont écoulés ; ses propositions sont consignées dans `state/learning/coach.json` et

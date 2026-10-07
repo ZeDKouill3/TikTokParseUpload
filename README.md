@@ -302,6 +302,20 @@ pèse l'émotion plus fort, retient des clips plus courts et abaisse le seuil de
 retenue. La grille standard reste le défaut (`builtin`) ; un chemin de fichier
 choisit une grille personnalisée.
 
+**Grille gaming action.** `builtin:gaming-action`
+(`clipper/assets/rubric-gaming-action.toml`) juge ce qui se passe *dans le jeu* :
+le critère `action` pèse 5, la réaction du streamer au jeu (`emotion`) 3, le
+seuil de retenue est 50 et les clips vont de 20 à 90 s. Elle porte aussi un
+**seuil éliminatoire** : la table optionnelle `[gate]` de toute grille
+(`criterion`, `min`, et `unless_criterion` avec `unless_min` qui vont
+ensemble, notes entières de 0 à 10). Un moment dont la note à `criterion` est
+inférieure à `min` est rejeté, avant le filtre `min_score`, avec la raison
+« action 3 < seuil éliminatoire 4 (grille) » et ses notes dans `rejected`,
+sauf si sa note à `unless_criterion` atteint `unless_min` (une réaction forte
+sauve un monologue). La re-notation après vision le réapplique. Sans `[gate]`,
+rien ne change : `builtin` et `builtin:gaming` n'en ont pas et restent
+identiques.
+
 **Appel à l'abonnement.** Il est **désactivé par défaut** ; sans configuration
 explicite, le rendu, le sidecar et la légende restent identiques. Pour
 l'activer dans un preset :

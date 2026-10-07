@@ -2075,3 +2075,240 @@ def test_rubric_info_of_the_gaming_rubric_names_its_file_and_weights():
     assert info["path"].endswith("rubric-gaming.toml")
     assert info["min_score"] == 45
     assert info["weights"]["emotion"] == 4
+
+# --------------------------------------------------------------------------
+# Grille builtin:gaming-action et seuil eliminatoire [gate] (SPEC-b0f3 R1-R3)
+# --------------------------------------------------------------------------
+
+# Empreintes des grilles livrees avant la grille d'action : "builtin" et
+# "builtin:gaming" ne changent pas d'un octet (SPEC-b0f3 R1).
+_STANDARD_SHA256 = "355050bfd24ff4cf28876d3c410ab1653a1a102026ad6ba8712b86d21e93e0bf"
+_GAMING_SHA256 = "682e451c2887ff9aa7afcf8dcb5b60c173f93ac6990939505709e3c9ad2c96a6"
+
+
+def test_builtin_and_builtin_gaming_stay_identical_byte_for_byte():
+    import hashlib
+
+    from clipper import moments
+
+    for value, digest in (("builtin", _STANDARD_SHA256), ("builtin:gaming", _GAMING_SHA256)):
+        data = moments.resolve_rubric_path(value).read_bytes()
+        assert hashlib.sha256(data).hexdigest() == digest, value
+
+
+def test_resolve_rubric_path_builtin_gaming_action_is_the_action_rubric():
+    from clipper import moments
+
+    resolved = moments.resolve_rubric_path("builtin:gaming-action")
+
+    expected = REPO / "clipper" / "assets" / "rubric-gaming-action.toml"
+    assert resolved.read_bytes() == expected.read_bytes()
+    assert moments.load_rubric(resolved)["min_score"] == 50
+
+
+def test_unknown_builtin_error_lists_the_three_rubrics():
+    from clipper import moments
+
+    with pytest.raises(moments.MomentsError) as excinfo:
+        moments.resolve_rubric_path("builtin:inconnue")
+
+    message = str(excinfo.value)
+    for name in ("builtin", "builtin:gaming", "builtin:gaming-action"):
+        assert f'"{name}"' in message, name
+
+
+def test_gaming_action_rubric_is_in_the_installed_package_data():
+    import importlib.resources
+    import tomllib
+
+    assert importlib.resources.files("clipper").joinpath("assets", "rubric-gaming-action.toml").is_file()
+    package_data = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))["tool"]["setuptools"]["package-data"]
+    package = REPO / "clipper"
+    covered = {path for pattern in package_data["clipper"] for path in package.glob(pattern)}
+    assert package / "assets" / "rubric-gaming-action.toml" in covered
+
+
+def test_gaming_action_rubric_has_exactly_the_r2_values():
+    from clipper import moments
+
+    gaming = moments.load_rubric(moments.resolve_rubric_path("builtin:gaming"))
+    action = moments.load_rubric(moments.resolve_rubric_path("builtin:gaming-action"))
+
+    assert action["min_score"] == 50
+    assert action["max_moments_per_hour"] == 6
+    assert action["always_keep_score"] == 70
+    assert action["min_moments_cap"] == 3
+    assert action["trend_keywords"] == []
+    assert {name: c["weight"] for name, c in action["criteria"].items()} == {
+        "action": 5, "emotion": 3, "hook": 2, "payoff": 2, "standalone": 1, "value": 0, "trend": 0,
+    }
+    assert action["criteria"]["action"]["question"] == (
+        "Se passe-t-il quelque chose DANS LE JEU pendant le clip : combat, clutch, mort, victoire ou "
+        "défaite, sursaut, retournement, moment de jeu spectaculaire ? 0-2 si rien ne se passe dans le "
+        "jeu (menu, chargement, le streamer commente, donne son avis ou raconte sa vie)."
+    )
+    assert action["criteria"]["emotion"]["question"] == (
+        "Réaction forte AU JEU : cri, rire, rage, peur, sursaut, soulagement, hurlement de victoire "
+        "ou de défaite ?"
+    )
+    for name in ("hook", "payoff", "standalone", "value", "trend"):
+        assert action["criteria"][name]["question"] == gaming["criteria"][name]["question"], name
+    d = action["durations"]
+    assert (d["single_min"], d["single_max"], d["part_min"], d["part_max"]) == (20, 90, 30, 90)
+    assert (d["min_parts"], d["max_parts"], d["tolerance"]) == (2, 12, 3)
+    for table in ("bonus", "exclusions"):
+        assert action[table] == gaming[table], table
+    assert action["gate"] == {"criterion": "action", "min": 4, "unless_criterion": "emotion", "unless_min": 8}
+
+
+def test_gaming_action_rubric_is_commented_in_french_without_real_names():
+    text = (REPO / "clipper" / "assets" / "rubric-gaming-action.toml").read_text(encoding="utf-8")
+
+    assert text.lstrip().startswith("#")
+    assert "grille" in text.lower()
+    for name in ("GTA", "Rockstar", "Lucia", "Jason"):
+        assert name not in text, name
+
+
+def test_standard_and_gaming_rubrics_have_no_gate():
+    from clipper import moments
+
+    for value in ("builtin", "builtin:gaming"):
+        assert "gate" not in moments.load_rubric(moments.resolve_rubric_path(value)), value
+
+
+# --- load_rubric : validation de [gate] -----------------------------------
+
+
+def _rubric_with_gate(tmp_path, gate_toml):
+    p = tmp_path / "gated.toml"
+    p.write_text(TEST_RUBRIC + "\n" + gate_toml, encoding="utf-8")
+    return p
+
+
+def test_load_rubric_without_gate_is_unchanged(rubric_path):
+    from clipper.moments import load_rubric
+
+    assert "gate" not in load_rubric(rubric_path)
+
+
+def test_load_rubric_accepts_a_valid_gate(tmp_path):
+    from clipper.moments import load_rubric
+
+    p = _rubric_with_gate(tmp_path, '[gate]\ncriterion = "hook"\nmin = 4\nunless_criterion = "emotion"\nunless_min = 8\n')
+    assert load_rubric(p)["gate"] == {"criterion": "hook", "min": 4, "unless_criterion": "emotion", "unless_min": 8}
+    p = _rubric_with_gate(tmp_path, '[gate]\ncriterion = "hook"\nmin = 0\n')
+    assert load_rubric(p)["gate"] == {"criterion": "hook", "min": 0}
+
+
+@pytest.mark.parametrize(
+    "gate_toml, key",
+    [
+        ('[gate]\nmin = 4\n', "criterion"),
+        ('[gate]\ncriterion = "inconnu"\nmin = 4\n', "criterion"),
+        ('[gate]\ncriterion = 3\nmin = 4\n', "criterion"),
+        ('[gate]\ncriterion = "hook"\n', "min"),
+        ('[gate]\ncriterion = "hook"\nmin = 11\n', "min"),
+        ('[gate]\ncriterion = "hook"\nmin = -1\n', "min"),
+        ('[gate]\ncriterion = "hook"\nmin = 4.5\n', "min"),
+        ('[gate]\ncriterion = "hook"\nmin = true\n', "min"),
+        ('[gate]\ncriterion = "hook"\nmin = "4"\n', "min"),
+        ('[gate]\ncriterion = "hook"\nmin = 4\nunless_criterion = "emotion"\n', "unless_min"),
+        ('[gate]\ncriterion = "hook"\nmin = 4\nunless_min = 8\n', "unless_criterion"),
+        ('[gate]\ncriterion = "hook"\nmin = 4\nunless_criterion = "inconnu"\nunless_min = 8\n', "unless_criterion"),
+        ('[gate]\ncriterion = "hook"\nmin = 4\nunless_criterion = "emotion"\nunless_min = 11\n', "unless_min"),
+        ('[gate]\ncriterion = "hook"\nmin = 4\nunless_criterion = "emotion"\nunless_min = 7.5\n', "unless_min"),
+    ],
+)
+def test_load_rubric_refuses_an_invalid_gate_naming_the_key(tmp_path, gate_toml, key):
+    from clipper.moments import MomentsError, load_rubric
+
+    with pytest.raises(MomentsError) as excinfo:
+        load_rubric(_rubric_with_gate(tmp_path, gate_toml))
+    assert f"[gate] {key}" in str(excinfo.value)
+
+
+# --- etape moments : application de [gate] --------------------------------
+
+GATE = '[gate]\ncriterion = "emotion"\nmin = 5\nunless_criterion = "value"\nunless_min = 8\n'
+# Notes qui donnent un bon score final (> min_score) mais une emotion de 3.
+LOW_EMOTION = {"hook": 9, "standalone": 9, "payoff": 9, "emotion": 3, "value": 5, "trend": 0}
+LOW_EMOTION_SAVED = {**LOW_EMOTION, "value": 9}
+GATE_REASON = "emotion 3 < seuil éliminatoire 5 (grille)"
+
+
+def test_gate_rejects_a_candidate_below_min_before_min_score(tmp_path, video_dir):
+    p = _rubric_with_gate(tmp_path, GATE)
+    responses = [{"moments": [moment(0.25, 29.65, LOW_EMOTION, why="il parle"), moment(50.25, 79.65, GOOD)]}]
+
+    run(tmp_path, p, responses)
+
+    data = read_moments(video_dir)
+    assert spans(data) == [(50.25, 79.65)]
+    (rej,) = data["rejected"]
+    assert (rej["start"], rej["end"]) == (0.25, 29.65)
+    assert rej["reason"] == GATE_REASON
+    assert rej["scores"] == LOW_EMOTION
+    assert rej["justification"] == "il parle"
+    assert rej["final_score"] >= 60  # aurait passe min_score : le seuil l'a rejete en premier
+
+
+def test_gate_is_waived_by_unless_criterion(tmp_path, video_dir):
+    p = _rubric_with_gate(tmp_path, GATE)
+
+    run(tmp_path, p, [{"moments": [moment(0.25, 29.65, LOW_EMOTION_SAVED)]}])
+
+    assert spans(read_moments(video_dir)) == [(0.25, 29.65)]
+
+
+def test_gate_without_unless_has_no_exemption(tmp_path, video_dir):
+    p = _rubric_with_gate(tmp_path, '[gate]\ncriterion = "emotion"\nmin = 5\n')
+
+    run(tmp_path, p, [{"moments": [moment(0.25, 29.65, LOW_EMOTION_SAVED)]}])
+
+    data = read_moments(video_dir)
+    assert data["moments"] == []
+    assert data["rejected"][0]["reason"] == GATE_REASON
+
+
+def test_gate_applies_to_the_aggregated_jury_score(tmp_path, video_dir):
+    p = _rubric_with_gate(tmp_path, GATE)
+    # proposeur : GOOD (emotion 6, passe) ; jury : emotion 3 -> rejete.
+    run(
+        tmp_path, p, with_jury({"moments": [moment(10.25, 44.65, scores=GOOD)]}, jury_notes({2: LOW_EMOTION})),
+        config=auto_config(tmp_path, p),
+    )
+
+    data = read_moments(video_dir)
+    assert data["moments"] == []
+    [r] = data["rejected"]
+    assert r["reason"] == GATE_REASON
+    assert r["scores"] == LOW_EMOTION
+    assert r["jury"]["proposer"]["scores"] == GOOD
+
+
+def test_rescore_reapplies_the_gate(tmp_path, video_dir):
+    from clipper import moments as m
+
+    p = _rubric_with_gate(tmp_path, GATE)
+    run(tmp_path, p, [{"moments": [moment(0.25, 29.65, GOOD)]}])
+    assert spans(read_moments(video_dir)) == [(0.25, 29.65)]
+    # la grille se durcit : la re-notation apres vision doit rejeter le moment
+    p.write_text(TEST_RUBRIC + '\n[gate]\ncriterion = "emotion"\nmin = 7\n', encoding="utf-8")
+    (video_dir / "vision.json").write_text(json.dumps({"frames": []}), encoding="utf-8")
+
+    m._rescore(video_dir, video_dir / "moments.json", {**m.CONFIG_DEFAULTS, "rubric_path": str(p)})
+
+    data = read_moments(video_dir)
+    assert data["moments"] == []
+    assert data["rejected"][0]["reason"] == "emotion 6 < seuil éliminatoire 7 (grille)"
+
+
+def test_rubric_without_gate_rejects_only_for_score(tmp_path, video_dir, rubric_path):
+    responses = [{"moments": [moment(0.25, 29.65, GOOD), moment(50.25, 79.65, WEAK), moment(100.25, 129.65, LOW_EMOTION)]}]
+
+    run(tmp_path, rubric_path, responses)
+
+    data = read_moments(video_dir)
+    assert sorted(spans(data)) == [(0.25, 29.65), (100.25, 129.65)]
+    assert [r["reason"] for r in data["rejected"]] == ["score 59.2 < min_score 60"]

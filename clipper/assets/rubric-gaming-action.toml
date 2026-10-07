@@ -1,0 +1,95 @@
+# Grille de notation « gaming action » (SPEC-b0f3), livrée avec le paquet à côté
+# de la grille standard (rubric.toml) et de la grille gaming (rubric-gaming.toml).
+# Choisie par chaîne dans le preset : [moments] rubric_path = "builtin:gaming-action".
+#
+# Même forme et même validation (load_rubric) que les autres grilles. Ce qui
+# change : ce qui se passe DANS LE JEU pèse le plus (action = 5), devant la
+# réaction du streamer au jeu (emotion = 3) ; les clips vont de 20 à 90 s ; le
+# seuil de retenue est de 50. Le reste (bonus, exclusions, questions de hook,
+# payoff, standalone, value et trend) est identique à la grille gaming.
+#
+# Score final 0-100 = moyenne des notes (0-10) pondérée par `weight` (un
+# critère à weight = 0 est noté mais hors moyenne), x10, plus un bonus de
+# signaux mesurés plafonné à [bonus] max_total.
+# Retenus : les moments dont le score final >= min_score, avec un plafond
+# souple : au plus max_moments_per_hour moments par heure de vidéo source
+# (plafond = arrondi supérieur de max_moments_per_hour x durée en heures),
+# jamais moins que min_moments_cap ; un moment dont le score atteint
+# always_keep_score est toujours retenu, même au-delà du plafond, et compte
+# dans le plafond.
+
+min_score = 50
+max_moments_per_hour = 6
+always_keep_score = 70
+min_moments_cap = 3
+
+# Mots-clés tendance (critère trend) : aucun pour le gaming, trend est à poids 0.
+trend_keywords = []
+
+# Chaque critère : poids dans la moyenne et question posée au LLM.
+[criteria.action]
+weight = 5
+question = "Se passe-t-il quelque chose DANS LE JEU pendant le clip : combat, clutch, mort, victoire ou défaite, sursaut, retournement, moment de jeu spectaculaire ? 0-2 si rien ne se passe dans le jeu (menu, chargement, le streamer commente, donne son avis ou raconte sa vie)."
+
+[criteria.emotion]
+weight = 3
+question = "Réaction forte AU JEU : cri, rire, rage, peur, sursaut, soulagement, hurlement de victoire ou de défaite ?"
+
+[criteria.hook]
+weight = 2
+question = "La 1re phrase du clip arrete-t-elle le scroll (affirmation choc, question, surprise, conflit, revelation) ?"
+
+[criteria.payoff]
+weight = 2
+question = "L'arc est-il complet, avec une fin sur punchline ou revelation ? En multi-parties, chaque partie finit-elle sur un suspense ?"
+
+[criteria.standalone]
+weight = 1
+question = "Le clip est-il comprehensible sans le reste de la video (pas de reference a ce qui precede) ?"
+
+[criteria.value]
+weight = 0
+question = "Le clip apporte-t-il une info, un leak, un avis tranche, une theorie ou une controverse ?"
+
+[criteria.trend]
+weight = 0
+question = "Le clip touche-t-il les mots-cles tendance listes ?"
+
+# Seuil éliminatoire : un moment dont la note `action` est strictement
+# inférieure à `min` est rejeté, quel que soit son score final, sauf si sa note
+# `emotion` atteint `unless_min` (la réaction forte qui sauve un monologue).
+[gate]
+criterion = "action"
+min = 4
+unless_criterion = "emotion"
+unless_min = 8
+
+# Durées en secondes : clips gaming courts, un peu plus que la grille gaming
+# pour un moment unique.
+[durations]
+# Histoire complète qui tient en un clip unique.
+single_min = 20
+single_max = 90
+# Long passage fort : série de min_parts à max_parts parties de part_min à
+# part_max qui se suivent.
+part_min = 30
+part_max = 90
+min_parts = 2
+max_parts = 12
+# Marge acceptée après recalage des bornes sur des frontières de phrase.
+tolerance = 3
+
+# Bonus des signaux mesurés, en points sur 100, plafonné à max_total.
+[bonus]
+max_total = 10
+# x valeur moyenne (0-1) de la courbe YouTube "most replayed" sur le moment.
+replayed = 5
+# x min(1, pics d'énergie audio dans le moment / audio_peaks_full).
+audio_peaks = 3
+audio_peaks_full = 3
+# Si une image clé du moment est marquée "striking" par l'étape vision.
+visual = 2
+
+# Segments exclus d'office.
+[exclusions]
+sponsorblock_categories = ["sponsor", "intro", "outro", "selfpromo"]
