@@ -254,25 +254,49 @@ def _transient_types() -> tuple[type[BaseException], ...]:
     return tuple(types)
 
 
-def is_transient(exc: BaseException) -> bool:
-    """Vrai si l'erreur (ou une erreur qu'elle enveloppe : cause, contexte,
-    ``exc_info`` de yt-dlp) peut disparaitre en reessayant plus tard."""
-    types = _transient_types()
+def _chain(exc: BaseException) -> list[BaseException]:
+    """``exc`` et toutes les erreurs qu'elle enveloppe (cause, contexte,
+    ``exc_info`` de yt-dlp), sans doublon."""
     seen: set[int] = set()
+    out: list[BaseException] = []
     todo: list[BaseException | None] = [exc]
     while todo:
         e = todo.pop()
         if e is None or id(e) in seen:
             continue
         seen.add(id(e))
-        if isinstance(e, llm.LLMError) and not isinstance(e, llm.TransientLLMError):
-            continue
-        if isinstance(e, types):
-            return True
+        out.append(e)
         wrapped = getattr(e, "exc_info", None)
         if isinstance(wrapped, tuple) and len(wrapped) > 1 and isinstance(wrapped[1], BaseException):
             todo.append(wrapped[1])
         todo += [e.__cause__, e.__context__]
+    return out
+
+
+def is_subscriber_only(exc: BaseException) -> bool:
+    """Vrai si la chaine contient l'``ExtractorError`` yt-dlp d'une VOD Twitch
+    reservee aux abonnes : reessayer ne changera rien (TASK-e2a1)."""
+    try:
+        from yt_dlp.utils import ExtractorError
+    except ImportError:
+        return False
+    return any(isinstance(e, ExtractorError) and "subscriber-only content" in str(e)
+               for e in _chain(exc))
+
+
+def is_transient(exc: BaseException) -> bool:
+    """Vrai si l'erreur (ou une erreur qu'elle enveloppe : cause, contexte,
+    ``exc_info`` de yt-dlp) peut disparaitre en reessayant plus tard. Une VOD
+    reservee aux abonnes ne l'est jamais, meme si la chaine contient aussi une
+    erreur reseau."""
+    if is_subscriber_only(exc):
+        return False
+    types = _transient_types()
+    for e in _chain(exc):
+        if isinstance(e, llm.LLMError) and not isinstance(e, llm.TransientLLMError):
+            continue
+        if isinstance(e, types):
+            return True
     return False
 
 
@@ -820,6 +844,8 @@ def _summary(run: _Run) -> list[dict[str, Any]]:
 def _fail(run: _Run, name: str, exc: BaseException) -> dict[str, Any]:
     state, config = run.state, run.config
     reason = f"{type(exc).__name__}: {exc}"
+    if is_subscriber_only(exc):
+        reason = f"VOD reservee aux abonnes (echec definitif, aucun re-essai) : {reason}"
     step = state["steps"][name]
     step.update(status="failed", reason=reason, finished_at=_iso(_now()))
     step["progress"] = None

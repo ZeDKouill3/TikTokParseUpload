@@ -1927,3 +1927,81 @@ def test_set_channel_refuses_when_the_style_file_already_has_an_entry_of_the_vid
     assert pipeline.load_state(VIDEO_ID, config=config)["channel"] is None
     assert publish.list_entries(publish.NO_CHANNEL, state_dir=state_dir) == no_style
     assert publish.list_entries("ma_chaine", state_dir=state_dir) == styled
+
+
+# --------------------------------------------------------------------------
+# TASK-e2a1 : une VOD Twitch reservee aux abonnes est un echec definitif,
+# jamais un echec transitoire reessaye (message releve le 07/10/2026 sur
+# twitch:2893381733).
+# --------------------------------------------------------------------------
+
+SUB_ONLY_MSG = ("[twitch:vod] 2893381733: You must be logged into an account that has "
+                "access to this subscriber-only content")
+
+
+from clipper import pipeline  # noqa: E402
+
+
+def _sub_only_download_error(*, cause: BaseException | None = None):
+    from yt_dlp.utils import DownloadError, ExtractorError
+
+    inner = ExtractorError(SUB_ONLY_MSG, expected=True)
+    if cause is not None:
+        inner.__cause__ = cause
+    return DownloadError(f"ERROR: {SUB_ONLY_MSG}", (ExtractorError, inner, None))
+
+
+def _transport_error():
+    from yt_dlp.networking.exceptions import TransportError
+
+    return TransportError("Connection reset by peer (usher.ttvnw.net)")
+
+
+def _http_403():
+    from io import BytesIO
+
+    from yt_dlp.networking.exceptions import HTTPError
+    from yt_dlp.networking._urllib import UrllibResponseAdapter
+    from urllib.response import addinfourl
+
+    raw = addinfourl(BytesIO(b""), {}, "https://usher.ttvnw.net/vod/2893381733.m3u8", 403)
+    return HTTPError(UrllibResponseAdapter(raw))
+
+
+def test_subscriber_only_vod_is_not_transient():
+    assert pipeline.is_transient(_sub_only_download_error()) is False
+
+
+def test_subscriber_only_vod_is_not_transient_even_with_transport_error_in_chain():
+    assert pipeline.is_transient(_sub_only_download_error(cause=_transport_error())) is False
+
+
+def test_subscriber_only_vod_is_not_transient_even_with_http_403_in_chain():
+    assert pipeline.is_transient(_sub_only_download_error(cause=_http_403())) is False
+
+
+def test_subscriber_only_access_message_variant_is_not_transient():
+    from yt_dlp.utils import ExtractorError
+
+    exc = ExtractorError("Your account does not have access to this subscriber-only content",
+                         expected=True)
+    exc.__cause__ = _transport_error()
+    assert pipeline.is_transient(exc) is False
+
+
+def test_plain_transport_error_stays_transient():
+    assert pipeline.is_transient(_transport_error()) is True
+
+
+def test_download_failing_on_subscriber_only_vod_fails_definitively_in_auto(tmp_path, caplog):
+    config = Config(mode="auto", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output")
+    state = pipeline.new_state(VIDEO_ID, URL, "auto")
+    run = pipeline._start(state, config, False, None)
+
+    with caplog.at_level(logging.WARNING):
+        result = pipeline._fail(run, "download", _sub_only_download_error(cause=_transport_error()))
+
+    assert result["status"] == "failed"
+    assert result["retry_at"] is None
+    assert "reservee aux abonnes" in result["reason"]
+    assert "echec transitoire" not in caplog.text
