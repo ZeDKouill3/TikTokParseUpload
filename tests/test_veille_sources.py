@@ -1239,3 +1239,128 @@ def test_twitch_vods_30d_persistent_429_makes_the_game_unknown_and_stops_reading
 def test_real_steam_reviews_histogram_has_recent_days(tmp_path):
     recent = veille_sources.default_collectors()["steam_reviews"](_settings(tmp_path), ["570"])["histograms"]["570"]
     assert recent and recent[-1]["value"] > 0
+
+
+# --- TASK-1d82 (SPEC-85a0 R29) : échéance globale `deadline` des collecteurs réels ---------------------------
+
+
+class Budget:
+    """``deadline`` injectée : secondes restantes, qu'un test épuise quand il veut (``spend``)."""
+
+    def __init__(self, left=100.0):
+        self.left = left
+
+    def __call__(self):
+        return self.left
+
+    def spend(self):
+        self.left = 0.0
+
+
+def _after(budget, http, n):
+    """Transport qui épuise le budget dès la ``n``-ième requête a répondu."""
+    def wrapped(*args, **kwargs):
+        reply = http(*args, **kwargs)
+        if len(http.calls) >= n:
+            budget.spend()
+        return reply
+    wrapped.calls = http.calls
+    wrapped.to = http.to
+    return wrapped
+
+
+def test_steam_followers_stops_between_two_appids_without_request_or_pause_and_counts_what_is_left(tmp_path):
+    budget, sleeps = Budget(), []
+    http = FakeHttp(_followers_routes({str(i): _members(i) for i in range(1, 5)}))
+    collectors = veille_sources.default_collectors(_after(budget, http, 2), sleep=sleeps.append)
+    result = collectors["steam_followers"](_settings(tmp_path), ["1", "2", "3", "4"], deadline=budget)
+    assert result == {"followers": {"1": 1, "2": 2}, "skipped": 0, "rate_limited": 0, "deadline_stopped": 2}
+    assert len(http.calls) == 2
+    assert sleeps == [3.0]  # seule la pause entre 1 et 2 : plus de pause une fois l'échéance passée
+
+
+def test_steam_followers_deadline_during_a_429_wait_stops_before_sleeping(tmp_path):
+    budget, sleeps = Budget(), []
+    http = FakeHttp(_followers_routes({"1": (429, ""), "2": _members(2)}))
+    collectors = veille_sources.default_collectors(_after(budget, http, 1), sleep=sleeps.append)
+    result = collectors["steam_followers"](_settings(tmp_path), ["1", "2"], deadline=budget)
+    assert result["followers"] == {} and result["deadline_stopped"] == 2
+    assert len(http.calls) == 1 and sleeps == []
+
+
+def test_steam_players_stops_between_two_appids(tmp_path):
+    budget = Budget()
+    http = FakeHttp(_players_routes({"1": 10, "2": 20, "3": 30}))
+    collectors = veille_sources.default_collectors(_after(budget, http, 1))
+    result = collectors["steam_players"](_settings(tmp_path), ["1", "2", "3"], deadline=budget)
+    assert result == {"players": {"1": 10}, "skipped": 0, "deadline_stopped": 2}
+    assert len(http.calls) == 1
+
+
+def test_steam_reviews_stops_between_two_appids_without_request_or_pause(tmp_path):
+    budget, sleeps = Budget(), []
+    http = FakeHttp(_reviews_routes({a: [_histogram()] for a in "1234"}))
+    collectors = veille_sources.default_collectors(_after(budget, http, 2), clock=lambda: NOW, sleep=sleeps.append)
+    result = collectors["steam_reviews"](_settings(tmp_path), ["1", "2", "3", "4"], deadline=budget)
+    assert result == {"histograms": {"1": [], "2": []}, "skipped": 0, "rate_limited": 0, "deadline_stopped": 2}
+    assert len(http.calls) == 2 and sleeps == [2.0]
+
+
+def test_twitch_vods_30d_stops_between_two_pages_and_drops_the_game_it_was_reading(tmp_path):
+    budget = Budget()
+    http = FakeHttp(_vod_routes([(200, {"data": [_hvideo(6, 100)], "pagination": {"cursor": "c1"}}),
+                                 (200, {"data": [_hvideo(5, 1)], "pagination": {}})]))
+    collectors = veille_sources.default_collectors(_after(budget, http, 2), clock=lambda: NOW, sleep=lambda s: None)
+    result = collectors["twitch_vods_30d"](_settings(tmp_path), ["1", "2"], deadline=budget)
+    assert result == {"vods": {}, "skipped": 0, "rate_limited": 0, "deadline_stopped": 2}  # jamais une série à demi lue
+    assert len(http.to("/helix/videos")) == 1
+
+
+def test_twitch_vods_30d_keeps_the_games_finished_before_the_deadline(tmp_path):
+    budget = Budget()
+    http = FakeHttp(_vod_routes([(200, {"data": [_hvideo(6, 100)], "pagination": {}}),
+                                 (200, {"data": [_hvideo(5, 1)], "pagination": {}})]))
+    collectors = veille_sources.default_collectors(_after(budget, http, 2), clock=lambda: NOW, sleep=lambda s: None)
+    result = collectors["twitch_vods_30d"](_settings(tmp_path), ["1", "2", "3"], deadline=budget)
+    assert sorted(result["vods"]) == ["1"] and result["deadline_stopped"] == 2
+    assert len(http.to("/helix/videos")) == 1
+
+
+def test_igdb_stops_before_the_next_page_and_before_its_pause(tmp_path):
+    budget, clock = Budget(), FakeClock()
+    full = [_game(i, f"G{i}") for i in range(1, 501)]
+    http = FakeHttp({("POST", "/oauth2/token"): [_token()], ("POST", "/v4/games"): [(200, full)]})
+    collectors = veille_sources.default_collectors(_after(budget, http, 2), clock=clock, sleep=clock.sleep)
+    result = collectors["igdb"](_settings(tmp_path), deadline=budget)  # 1 appel jeton + 1 page, puis plus rien
+    assert len(http.to("/v4/games")) == 1 and result["deadline_stopped"] == 1 and len(result["games"]) == 500
+    assert clock.now == NOW  # pas d'attente d'espacement une fois l'échéance passée
+
+
+def _expired():
+    return Budget(0.0)
+
+
+@pytest.mark.parametrize("source, args", [
+    ("twitch", ()), ("youtube", ()), ("steam", ()), ("steam_fr", ()), ("igdb", ()),
+    ("steam_players", (["1", "2"],)), ("steam_followers", (["1", "2"],)), ("steam_reviews", (["1", "2"],)),
+    ("twitch_vods_30d", (["1", "2"],))])
+def test_every_real_collector_makes_no_request_once_the_deadline_has_passed(tmp_path, source, args):
+    http = FakeHttp({})  # toute requête fait échouer (route inattendue)
+    collectors = veille_sources.default_collectors(http, clock=lambda: NOW, sleep=lambda s: None)
+    result = collectors[source](_settings(tmp_path), *args, deadline=_expired())
+    assert http.calls == []
+    assert result["deadline_stopped"] >= 1
+
+
+def test_twitch_stops_before_the_vod_requests_and_counts_the_games_not_read(tmp_path):
+    budget = Budget()
+    http = FakeHttp(_twitch_routes())
+    collectors = veille_sources.default_collectors(_after(budget, http, 3), clock=lambda: NOW)  # jeton + 2 pages + top = 4
+    result = collectors["twitch"](_settings(tmp_path), deadline=budget)
+    assert http.to("/helix/videos") == []
+    assert result["deadline_stopped"] >= 1 and result["vods"] == []
+
+
+def test_collectors_without_deadline_still_return_the_exact_documented_shape(tmp_path):
+    http = FakeHttp(_followers_routes({"7": _members(5)}))
+    assert _followers(tmp_path, http, ["7"]) == {"followers": {"7": 5}, "skipped": 0, "rate_limited": 0}

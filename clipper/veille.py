@@ -39,13 +39,21 @@ en cours n'est pas une VOD : le collecteur ne le rend pas. Un collecteur qui
 lève, ou dont la réponse est inexploitable, met sa source en ``error`` ; les
 autres continuent (ADR-ad2e : aucun chiffre inventé, une donnée absente est
 ``null``). Sans collecteurs injectés, ``clipper.veille_sources`` fournit les réels.
+
+Un relevé tourne par voies parallèles, une par hôte, en trois phases séparées par une barrière (SPEC-85a0 R29), sous
+l'échéance globale ``veille_deadline_s``. Un collecteur dont la signature accepte ``deadline`` (argument nommé,
+callable rendant les secondes restantes) la reçoit et s'arrête avant sa prochaine requête, pause ou essai : il rend
+alors en plus ``"deadline_stopped": k`` (éléments non relevés, clé absente sinon) et ``collect`` marque sa source
+``partial``. Un collecteur sans ``deadline`` est appelé comme avant.
 """
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import re
+import threading
 import time
 import unicodedata
 from datetime import date, datetime, timedelta, timezone
@@ -112,6 +120,7 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "twitch_history_pages_max": 5,
     "twitch_history_retry_max": 2,
     "twitch_history_retry_wait_max_s": 60.0,
+    "veille_deadline_s": 480,
 }
 
 # Clés retirées qu'un config.toml peut encore porter : ignorées à la lecture (clipper.config).
@@ -127,6 +136,10 @@ SOURCES = ("twitch", "youtube", "steam", "steam_fr", "igdb", "steam_players", "s
 LOOKUP_SOURCES = ("steam_players", "steam_followers", "steam_reviews", "twitch_vods_30d")  # appelés après les autres
 _APPID_SOURCES = ("steam_players", "steam_followers")  # par appid, avant le filtre de communauté (R18, R21)
 Collector = Callable[[dict[str, object]], dict[str, Any]]
+_NOT_STARTED = "échéance atteinte avant le début"  # erreur d'une source dont la phase n'avait pas commencé (R29)
+_UNITS = {"twitch": "requête(s)", "youtube": "requête(s)", "steam": "jeu(x)", "steam_fr": "requête(s)",
+          "igdb": "page(s)", "steam_players": "appid(s)", "steam_followers": "appid(s)", "steam_reviews": "appid(s)",
+          "twitch_vods_30d": "jeu(x)"}  # ce que ``deadline_stopped`` compte, par source
 
 # Clés exigées par source (steam n'en demande aucune).
 _REQUIRED_KEYS = {
@@ -172,7 +185,8 @@ def settings(config: Config) -> dict[str, object]:
             raise VeilleError(f"[veille] {key} doit être un entier >= {minimum} (reçu {value!r})")
     for key, low, high in (("steam_followers_lookups_max", 0, 60), ("steam_followers_retry_max", 0, 10),
                            ("trend_days", 7, 90), ("steam_reviews_retry_max", 0, 10), ("twitch_history_pages_max", 1, 5),
-                           ("twitch_history_retry_max", 0, 10), ("twitch_access_attempts", 1, 10)):
+                           ("twitch_history_retry_max", 0, 10), ("twitch_access_attempts", 1, 10),
+                           ("veille_deadline_s", 60, 3600)):
         value = table[key]
         if not isinstance(value, int) or isinstance(value, bool) or not low <= value <= high:
             raise VeilleError(f"[veille] {key} doit être un entier entre {low} et {high} (reçu {value!r})")
@@ -545,7 +559,7 @@ def _error_text(exc: Exception) -> str:
 
 
 def _run_lookup(source: str, appids: list[str], collectors: dict[str, Collector], table: dict[str, object],
-                now: datetime) -> tuple[dict[str, Any], dict[str, int | None]]:
+                now: datetime, deadline: Callable[[], float] | None = None) -> tuple[dict[str, Any], dict[str, int | None]]:
     """Source par appid (``steam_players``, ``steam_followers``) : la liste est coupée au plafond (le reste compté
     ``skipped``) ; plafond 0 ou rien à relever : ``skipped`` sans appel ; erreur : ``error``, aucune valeur."""
     status: dict[str, Any] = {"status": "ok", "at": now.isoformat(), "error": None, "counts": {}}
@@ -554,19 +568,23 @@ def _run_lookup(source: str, appids: list[str], collectors: dict[str, Collector]
     if not kept:
         status.update(status="skipped", counts={"requested": 0, "found": 0, "unknown": 0, "skipped": cut})
         return status, {}
+    if deadline is not None and deadline() <= 0:
+        return _not_started(now), {}
     key = "players" if source == "steam_players" else "followers"
     try:
-        result = _run_source(source, collectors, table, kept)
+        result = _run_source(source, collectors, table, kept, deadline=deadline)
         values = {str(a): v for a, v in result[key].items()}
         if any(v is not None and not _is_int(v) for v in values.values()):
             raise VeilleError(f"{source} : valeur non entière dans la réponse")
         found = sum(v is not None for v in values.values())
-        status["counts"] = {"requested": len(kept), "found": found, "unknown": len(kept) - found,
+        stopped = int(result.get("deadline_stopped") or 0)
+        status["counts"] = {"requested": len(kept), "found": found, "unknown": len(kept) - found - stopped,
                             "skipped": cut + int(result.get("skipped", 0))}
         limited = int(result.get("rate_limited", 0))
         if limited:  # ADR-ad2e : jamais « ok » muet, la lecture partielle se voit sur l'écran Veille
             status.update(status="partial", error=f"HTTP 429 (limite de Steam) : {limited} appid(s) non relevé(s) sur {len(kept)}")
             status["counts"]["rate_limited"] = limited
+        _mark_deadline(status, source, result, table)
     except Exception as exc:  # une source en erreur ne bloque pas les autres, jamais avalée
         status.update(status="error", error=_error_text(exc), counts={})
         return status, {}
@@ -699,7 +717,8 @@ def _check_vods(values: dict[str, Any]) -> None:
 
 
 def _run_trend_source(source: str, ids: list[str], cut: int, collectors: dict[str, Collector], table: dict[str, object],
-                      now: datetime, *, twitch_error: bool) -> tuple[dict[str, Any], dict[str, Any]]:
+                      now: datetime, *, twitch_error: bool,
+                      deadline: Callable[[], float] | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
     """Source de tendance (R24, R25) : ``ids`` = appids (``steam_reviews``) ou ``game_id`` Twitch (``twitch_vods_30d``)
     des jeux suivis. Rien à relever (plafond 0, aucun id) : ``skipped`` sans appel ; source Twitch en erreur : jamais
     appelée ; collecteur en erreur : ``error``, aucune valeur ; 429 persistant : ``partial``."""
@@ -711,19 +730,23 @@ def _run_trend_source(source: str, ids: list[str], cut: int, collectors: dict[st
     if not ids:
         status.update(status="skipped", counts=empty)
         return status, {}
+    if deadline is not None and deadline() <= 0:
+        return _not_started(now), {}
     key, check = ("histograms", _check_reviews) if source == "steam_reviews" else ("vods", _check_vods)
     try:
-        result = _run_source(source, collectors, table, ids)
+        result = _run_source(source, collectors, table, ids, deadline=deadline)
         values = {str(k): v for k, v in result[key].items()}
         check(values)
         found = sum(v is not None for v in values.values())
         limited = int(result.get("rate_limited", 0))
-        status["counts"] = {"requested": len(ids), "found": found, "unknown": len(ids) - found,
+        stopped = int(result.get("deadline_stopped") or 0)
+        status["counts"] = {"requested": len(ids), "found": found, "unknown": len(ids) - found - stopped,
                             "skipped": cut + int(result.get("skipped", 0)), "rate_limited": limited}
         if limited:  # ADR-ad2e : jamais « ok » muet
             unit = "appid(s)" if source == "steam_reviews" else "jeu(x)"
             host = "Steam" if source == "steam_reviews" else "Helix"
             status.update(status="partial", error=f"HTTP 429 ({host}) : {limited} {unit} non relevé(s) sur {len(ids)}")
+        _mark_deadline(status, source, result, table)
     except Exception as exc:  # une source en erreur ne bloque pas les autres, jamais avalée
         status.update(status="error", error=_error_text(exc), counts={})
         return status, {}
@@ -741,21 +764,15 @@ def _history_window(sdir: Path, today: date, days: int) -> dict[str, dict[str, A
     return found
 
 
-def _collect_trend(games: list[dict[str, Any]], followed: list[dict[str, Any]], cut: int, collectors: dict[str, Collector],
-                   table: dict[str, object], now: datetime, sources: dict[str, dict[str, Any]], sdir: Path, today: date,
-                   twitch_hist: dict[str, dict[str, Any]]) -> None:
-    """Relève les deux sources de tendance pour les jeux suivis et pose ``trend_30d`` sur chacun (R23) ; les autres
+def _build_trend(games: list[dict[str, Any]], followed: list[dict[str, Any]], reviews: dict[str, Any],
+                 vods: dict[str, Any], table: dict[str, object], sources: dict[str, dict[str, Any]], sdir: Path,
+                 today: date, twitch_hist: dict[str, dict[str, Any]]) -> None:
+    """Pose ``trend_30d`` sur les jeux suivis (R23) d'après les deux sources de tendance déjà relevées ; les autres
     jeux gardent ``None``. Un jour sans mesure est absent des points, jamais zéro ni interpolé."""
     days = int(table["trend_days"])  # type: ignore[call-overload]
     first = (today - timedelta(days=days - 1)).isoformat()
     last_day = today.isoformat()
     twitch_error = sources["twitch"]["status"] == "error"
-    appids = [str(g["steam_appid"]) for g in followed if g.get("steam_appid")]
-    twitch_ids = [str(g["twitch_id"]) for g in followed if g.get("twitch_id")]
-    sources["steam_reviews"], reviews = _run_trend_source(
-        "steam_reviews", list(dict.fromkeys(appids)), cut, collectors, table, now, twitch_error=twitch_error)
-    sources["twitch_vods_30d"], vods = _run_trend_source(
-        "twitch_vods_30d", list(dict.fromkeys(twitch_ids)), cut, collectors, table, now, twitch_error=twitch_error)
     history = _history_window(sdir, today, days)
 
     def in_window(points: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -773,9 +790,11 @@ def _collect_trend(games: list[dict[str, Any]], followed: list[dict[str, Any]], 
         series: dict[str, dict[str, Any]] = {}
         if appid is None:
             series["steam_reviews"] = _unavailable("hors Steam")
-        elif sources["steam_reviews"]["status"] == "error":
+        elif sources["steam_reviews"]["status"] in ("error", "skipped"):
             series["steam_reviews"] = _unavailable(str(sources["steam_reviews"]["error"]))
-        elif reviews.get(appid) is None:
+        elif appid not in reviews:
+            series["steam_reviews"] = _unavailable("échéance atteinte avant le relevé de cet appid")
+        elif reviews[appid] is None:
             series["steam_reviews"] = _unavailable("HTTP 429 Steam")
         else:
             series["steam_reviews"] = _serie("ok", None, first, in_window(reviews[appid]), "value", today, days)
@@ -784,9 +803,11 @@ def _collect_trend(games: list[dict[str, Any]], followed: list[dict[str, Any]], 
         elif not gid:
             series["twitch_vods_fr"] = series["twitch_viewers_fr"] = _unavailable("hors Twitch FR")
         else:
-            if sources["twitch_vods_30d"]["status"] == "error":
+            if sources["twitch_vods_30d"]["status"] in ("error", "skipped"):
                 series["twitch_vods_fr"] = _unavailable(str(sources["twitch_vods_30d"]["error"]))
-            elif vods.get(str(gid)) is None:
+            elif str(gid) not in vods:
+                series["twitch_vods_fr"] = _unavailable("échéance atteinte avant le relevé de ce jeu")
+            elif vods[str(gid)] is None:
                 series["twitch_vods_fr"] = _unavailable("HTTP 429 Helix")
             else:
                 entry = vods[str(gid)]
@@ -811,15 +832,79 @@ def _collect_trend(games: list[dict[str, Any]], followed: list[dict[str, Any]], 
 # --------------------------------------------------------------------------
 
 
-def _run_source(source: str, collectors: dict[str, Collector], table: dict[str, object], *args: Any) -> dict[str, Any]:
+def _accepts_deadline(collector: Callable[..., Any]) -> bool:
+    """Le collecteur déclare ``deadline`` (ou ``**kwargs``) : un faux collecteur sans lui reste appelable tel quel."""
+    try:
+        parameters = inspect.signature(collector).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD or (
+        p.name == "deadline" and p.kind in (inspect.Parameter.KEYWORD_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD))
+        for p in parameters)
+
+
+def _run_source(source: str, collectors: dict[str, Collector], table: dict[str, object], *args: Any,
+                deadline: Callable[[], float] | None = None) -> dict[str, Any]:
     """Résultat brut d'un collecteur (``args`` : liste d'appids des sources par appid) ; lève ``VeilleError``
-    (clé absente) ou l'erreur du collecteur."""
+    (clé absente) ou l'erreur du collecteur. ``deadline`` (secondes restantes) n'est passée qu'à un collecteur qui
+    l'accepte (R29)."""
     for key in _REQUIRED_KEYS[source]:
         if not str(table[key]).strip():
             raise VeilleError(f"{key} absente : à saisir dans Réglages › Veille")
     if source not in collectors:
         raise VeilleError(f"aucun collecteur fourni pour la source {source}")
-    return collectors[source](table, *args)
+    collector = collectors[source]
+    if deadline is not None and _accepts_deadline(collector):
+        return collector(table, *args, deadline=deadline)  # type: ignore[call-arg]
+    return collector(table, *args)
+
+
+def _not_started(now: datetime) -> dict[str, Any]:
+    """Statut d'une source que l'échéance a empêchée de commencer : ``skipped``, jamais une valeur (R29)."""
+    return {"status": "skipped", "at": now.isoformat(), "error": _NOT_STARTED, "counts": {}}
+
+
+def _mark_deadline(status: dict[str, Any], source: str, result: dict[str, Any], table: dict[str, object]) -> int:
+    """Le collecteur s'est arrêté à l'échéance (``deadline_stopped`` = k > 0) : ``partial`` avec le compte de ce qui
+    manque, jamais ``ok`` muet. Rend k."""
+    stopped = int(result.get("deadline_stopped") or 0)
+    if stopped > 0:
+        message = f"échéance de {table['veille_deadline_s']} s atteinte : {stopped} {_UNITS[source]} non relevé(s)"
+        status["status"] = "partial"
+        status["error"] = f"{status['error']} ; {message}" if status.get("error") else message
+        status["counts"]["deadline"] = stopped
+    return stopped
+
+
+def _cut_by_deadline(entry: dict[str, Any]) -> bool:
+    return (entry["status"] == "skipped" and entry.get("error") == _NOT_STARTED) or (
+        int((entry.get("counts") or {}).get("deadline") or 0) > 0)
+
+
+def _run_lanes(*lanes: Callable[[], None]) -> None:
+    """Un fil par voie (SPEC-85a0 R29) ; rend la main quand toutes ont fini (barrière de phase). Une erreur de
+    source est déjà prise par la voie ; ce qui s'échappe d'un fil est un défaut du code, relevé ici, jamais avalé."""
+    failures: list[BaseException] = []
+
+    def guard(lane: Callable[[], None]) -> None:
+        try:
+            lane()
+        except BaseException as exc:  # noqa: BLE001 - relevé après la jonction
+            failures.append(exc)
+
+    threads = [threading.Thread(target=guard, args=(lane,), name="veille-lane", daemon=True) for lane in lanes]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    if failures:
+        raise failures[0]
+
+
+def _elapsed_clock(start: datetime) -> Callable[[], datetime]:
+    """Horloge par défaut d'un relevé : ``start`` (le ``now`` fourni) puis le temps réel écoulé."""
+    began = time.monotonic()
+    return lambda: start + timedelta(seconds=time.monotonic() - began)
 
 
 def _to_candidate(source: str, vod: dict[str, Any]) -> dict[str, Any]:
@@ -852,11 +937,15 @@ def _deduce_game(candidate: dict[str, Any], known: dict[str, str], min_chars: in
 def _access_attempts(
     candidate: dict[str, Any], attempts: int, pause_s: float, timeout_s: float,
     access_check: Callable[[str, float], None], sleep: Callable[[float], None],
+    deadline: Callable[[], float] | None = None,
 ) -> str:
     """Jusqu'à ``attempts`` essais séparés de ``pause_s`` (aucune pause après le dernier). Rend ``ok``,
-    ``restricted`` (réservée aux abonnés : aucun essai suivant) ou ``unreachable`` (dernière erreur journalisée)."""
+    ``restricted`` (réservée aux abonnés : aucun essai suivant), ``unreachable`` (dernière erreur journalisée) ou
+    ``deadline`` (échéance passée avant une pause ou un essai : ni pause ni essai de plus, R29)."""
     error: Exception | None = None
     for attempt in range(attempts):
+        if deadline is not None and deadline() <= 0:
+            return "deadline"
         if attempt:
             sleep(pause_s)
         try:
@@ -874,15 +963,18 @@ def _access_attempts(
 def _check_twitch_access(
     candidates: list[dict[str, Any]], games: list[dict[str, Any]], table: dict[str, object],
     access_check: Callable[[str, float], None], sleep: Callable[[float], None],
+    deadline: Callable[[], float] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     """Test d'accès par jeu (SPEC-85a0 R26) : dans l'ordre de ``games``, les VOD Twitch du jeu, des plus vues aux
     moins vues, jusqu'à ``max_vods_per_game`` accessibles ; les suivantes ne sont pas testées (``untested``).
-    Réservée aux abonnés ou injoignable : écartée, comptée. Rend (gardées, {restricted, unreachable, untested})."""
+    Réservée aux abonnés ou injoignable : écartée, comptée. Échéance passée (R29) : plus aucun essai, les VOD pas
+    encore testées sont écartées et comptées ``deadline``, jamais gardées « non vérifiées ».
+    Rend (gardées, {restricted, unreachable, untested, deadline})."""
     wanted = int(table["max_vods_per_game"])  # type: ignore[call-overload]
     attempts = int(table["twitch_access_attempts"])  # type: ignore[call-overload]
     pause_s = float(table["twitch_access_retry_pause_s"])  # type: ignore[arg-type]
     timeout_s = float(table["http_timeout_s"])  # type: ignore[arg-type]
-    counts = {"restricted": 0, "unreachable": 0, "untested": 0}
+    counts = {"restricted": 0, "unreachable": 0, "untested": 0, "deadline": 0}
     dropped: set[str] = set()
     for game in games:
         vods = [c for c in candidates if c["source"] == "twitch" and c["game_key"] == game["key"]]
@@ -893,7 +985,7 @@ def _check_twitch_access(
                 counts["untested"] += 1
                 dropped.add(candidate["id"])
                 continue
-            outcome = _access_attempts(candidate, attempts, pause_s, timeout_s, access_check, sleep)
+            outcome = _access_attempts(candidate, attempts, pause_s, timeout_s, access_check, sleep, deadline)
             if outcome == "ok":
                 accessible += 1
             else:
@@ -917,15 +1009,20 @@ def collect(
     finalize: bool = True,
     access_check: Callable[[str, float], None] | None = None,
     access_sleep: Callable[[float], None] | None = None,
+    clock: Callable[[], datetime] | None = None,
 ) -> dict[str, Any]:
-    """Un relevé (SPEC-bdd9 R2, R4, R5) : appelle les collecteurs injectés, écrit
+    """Un relevé (SPEC-bdd9 R2, R4, R5 ; SPEC-85a0 R29) : appelle les collecteurs injectés par voies parallèles, une
+    par hôte, en trois phases séparées par une barrière (1 : twitch puis igdb / youtube / steam puis steam_fr ;
+    2 : steam_players / steam_followers ; 3 : test d'accès / steam_reviews / twitch_vods_30d), écrit
     ``history/<date>.json`` et ``days/<date>.json`` et rend l'état du jour.
     Une source en erreur n'arrête pas les autres ; seuls un réglage invalide
     ou un fichier d'état illisible lèvent ``VeilleError``. ``finalize=False`` laisse
     ``finished_at`` à ``null`` (le choix de Claude suit, voir ``run_if_due``).
     ``access_check(url, timeout_s)`` teste l'accès des VOD Twitch (défaut :
     ``veille_sources.check_twitch_access``, yt-dlp sans téléchargement) : voir ``_check_twitch_access`` ;
-    ``access_sleep(s)`` fait l'attente entre deux essais (défaut ``time.sleep``)."""
+    ``access_sleep(s)`` fait l'attente entre deux essais (défaut ``time.sleep``).
+    L'échéance globale est ``now + veille_deadline_s`` sur ``clock`` (défaut : ``now`` puis le temps réel écoulé) :
+    ``deadline_at`` et ``deadline_hit`` sont écrits dans l'état du jour."""
     config = config or load_config()
     collectors = veille_sources.default_collectors() if collectors is None else collectors
     table = settings(config)
@@ -934,6 +1031,11 @@ def collect(
     today = local_now.date()
     day = today.isoformat()
     started_at = now.isoformat()
+    read_clock = clock or _elapsed_clock(now)
+    deadline_at = now + timedelta(seconds=int(table["veille_deadline_s"]))  # type: ignore[call-overload]
+
+    def remaining() -> float:
+        return (deadline_at - read_clock()).total_seconds()
 
     previous = [p for p in _load_history(sdir, today, int(table["baseline_days"]))]
     known = _seen_video_ids(sdir) | _queue_video_ids(config)
@@ -949,14 +1051,17 @@ def collect(
     igdb_games: list[dict[str, Any]] = []
     igdb_skipped = 0
     followers: dict[str, int | None] = {}
-    raw_vods: list[tuple[str, dict[str, Any]]] = []
+    source_vods: dict[str, list[dict[str, Any]]] = {}
 
-    for source in SOURCES:
-        if source in LOOKUP_SOURCES:
-            continue  # relevés par appid : après les autres sources, une fois les listes d'appids connues
+    def fetch(source: str) -> None:
+        """Une source de la phase 1 ; chaque source n'écrit que ses propres variables (voies sans partage)."""
+        nonlocal twitch_hist, twitch_igdb, igdb_games, igdb_skipped, steam_hist, steam_concurrent, sellers_hist, youtube_hist
+        if remaining() <= 0:  # une source qui n'a pas pu commencer : visible, jamais comblée
+            sources[source] = _not_started(now)
+            return
         status: dict[str, Any] = {"status": "ok", "at": now.isoformat(), "error": None, "counts": {}}
         try:
-            result = _run_source(source, collectors, table)
+            result = _run_source(source, collectors, table, deadline=remaining)
             if source == "twitch":
                 for game in result["games"]:
                     twitch_hist[normalize(game["name"])] = {
@@ -992,12 +1097,13 @@ def collect(
                 if result.get("unnamed"):
                     status["unnamed"] = list(result["unnamed"])
                     log.warning("veille steam : %d jeu(x) sans nom, ex. %s", len(status["unnamed"]), status["unnamed"][0]["reason"])
+            _mark_deadline(status, source, result, table)
             for vod in vods:
                 _parse_published(vod["published_at"])
                 vod["video_id"], vod["url"], vod["duration_s"]  # champs obligatoires
-            raw_vods.extend((source, vod) for vod in vods)
+            source_vods[source] = vods
         except Exception as exc:  # une source en erreur ne bloque pas les autres, jamais avalée
-            status.update(status="error", error=f"{type(exc).__name__} : {exc}" if not isinstance(exc, (VeilleError, veille_sources.SourceError)) else str(exc), counts={})
+            status.update(status="error", error=_error_text(exc), counts={})
             if source == "twitch":
                 twitch_hist, twitch_igdb = {}, {}
             elif source == "igdb":
@@ -1008,12 +1114,22 @@ def collect(
                 sellers_hist = {}
             else:
                 youtube_hist = {}
-            raw_vods = [(s, v) for s, v in raw_vods if s != source]
+            source_vods.pop(source, None)
         sources[source] = status
+
+    def sequence(*names: str) -> Callable[[], None]:
+        def lane() -> None:
+            for name in names:
+                fetch(name)
+        return lane
+
+    # Phase 1 : helix (twitch puis igdb), youtube, steam_api (steam puis steam_fr)
+    _run_lanes(sequence("twitch", "igdb"), sequence("youtube"), sequence("steam", "steam_fr"))
+    raw_vods: list[tuple[str, dict[str, Any]]] = [(src, vod) for src in SOURCES for vod in source_vods.get(src, [])]
 
     # Candidats (R5)
     excluded = {"too_short": 0, "too_old": 0, "already_known": 0, "no_community": 0,
-                "access_restricted": 0, "access_unreachable": 0, "access_untested": 0}
+                "access_restricted": 0, "access_unreachable": 0, "access_untested": 0, "access_deadline": 0}
     candidates: list[dict[str, Any]] = []
     max_age = timedelta(hours=float(table["vod_max_age_h"]))
     for source, vod in raw_vods:
@@ -1043,17 +1159,26 @@ def collect(
         game["twitch_id"] = twitch_hist.get(game["key"], {}).get("twitch_id")
         game["trend_30d"] = None
     releases = _group_releases(in_window, games, twitch_igdb, table)
-    if sources["igdb"]["status"] == "ok":
-        sources["igdb"]["counts"] = {"rows": len(igdb_games), "recent": len(releases["recent"]),
-                                     "upcoming": len(releases["upcoming"]), "skipped_rows": igdb_skipped}
+    if sources["igdb"]["status"] in ("ok", "partial"):
+        sources["igdb"]["counts"] |= {"rows": len(igdb_games), "recent": len(releases["recent"]),
+                                      "upcoming": len(releases["upcoming"]), "skipped_rows": igdb_skipped}
     for game in games:
         game["release"] = _release_marker(game, twitch_igdb.get(game["key"], ""), releases["recent"])
 
-    # Joueurs Steam à l'instant et abonnés par appid (R18, R21), puis communauté (R19)
+    # Phase 2 : joueurs Steam à l'instant (steam_api) et abonnés (steamcommunity) par appid (R18, R21), puis communauté (R19)
     snapshots: dict[str, int | None] = {a: v for a, v in steam_concurrent.items() if v is not None}
+    appid_lists = {source: _lookup_appids(games, steam_hist, steam_concurrent, releases, source=source)
+                   for source in _APPID_SOURCES}
+    lookups: dict[str, tuple[dict[str, Any], dict[str, int | None]]] = {}
+
+    def look(source: str) -> Callable[[], None]:
+        def lane() -> None:
+            lookups[source] = _run_lookup(source, appid_lists[source], collectors, table, now, remaining)
+        return lane
+
+    _run_lanes(*(look(source) for source in _APPID_SOURCES))
     for source in _APPID_SOURCES:
-        appids = _lookup_appids(games, steam_hist, steam_concurrent, releases, source=source)
-        sources[source], values = _run_lookup(source, appids, collectors, table, now)
+        sources[source], values = lookups[source]
         if source == "steam_players":
             snapshots.update({a: v for a, v in values.items() if v is not None})
         else:
@@ -1071,11 +1196,42 @@ def collect(
             excluded["no_community"] += 1
     candidates = kept
     followed_all = _followed_games(games, candidates)  # fixés avant le test d'accès (R23)
-    if sources["twitch"]["status"] == "ok":
-        candidates, access = _check_twitch_access(
-            candidates, games, table, access_check or veille_sources.check_twitch_access, access_sleep or time.sleep)
-        sources["twitch"]["counts"].update(access)
+    followed = followed_all[: int(table["trend_games_max"])]  # type: ignore[call-overload]
+    cut = len(followed_all) - len(followed)
+    twitch_error = sources["twitch"]["status"] == "error"
+    review_ids = list(dict.fromkeys(str(g["steam_appid"]) for g in followed if g.get("steam_appid")))
+    vod_ids = list(dict.fromkeys(str(g["twitch_id"]) for g in followed if g.get("twitch_id")))
+
+    # Phase 3 : usher (test d'accès par jeu), steam_store (avis), helix (VOD 30 jours)
+    checked: dict[str, tuple[list[dict[str, Any]], dict[str, int]]] = {}
+    trends: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+
+    def usher() -> None:
+        if sources["twitch"]["status"] in ("ok", "partial"):
+            checked["access"] = _check_twitch_access(
+                candidates, games, table, access_check or veille_sources.check_twitch_access, access_sleep or time.sleep,
+                remaining)
+
+    def trend(source: str, ids: list[str]) -> Callable[[], None]:
+        def lane() -> None:
+            trends[source] = _run_trend_source(source, ids, cut, collectors, table, now, twitch_error=twitch_error,
+                                               deadline=remaining)
+        return lane
+
+    _run_lanes(usher, trend("steam_reviews", review_ids), trend("twitch_vods_30d", vod_ids))
+    if "access" in checked:
+        candidates, access = checked["access"]
+        stopped = access["deadline"]
+        sources["twitch"]["counts"].update({k: v for k, v in access.items() if k != "deadline"})
+        if stopped:
+            message = f"échéance de {table['veille_deadline_s']} s atteinte : {stopped} VOD non testée(s)"
+            counts = sources["twitch"]["counts"]
+            counts["deadline"] = int(counts.get("deadline", 0)) + stopped
+            sources["twitch"].update(status="partial", error=(
+                f"{sources['twitch']['error']} ; {message}" if sources["twitch"]["error"] else message))
         excluded.update({f"access_{name}": number for name, number in access.items()})
+    sources["steam_reviews"], reviews = trends["steam_reviews"]
+    sources["twitch_vods_30d"], vods_30d = trends["twitch_vods_30d"]
     for game in games:
         game["vod_count"] = sum(1 for c in candidates if c["game_key"] == game["key"])
     for candidate in candidates:
@@ -1088,9 +1244,8 @@ def collect(
                                     "steam_rank_gain": game["steam_rank_gain"], "steam_new_in_top": game["steam_new_in_top"],
                                     "steam_sellers_gain": game["steam_sellers_gain"], "steam_sellers_new": game["steam_sellers_new"]}
 
-    followed = followed_all[: int(table["trend_games_max"])]  # type: ignore[call-overload]
-    _collect_trend(games, followed, len(followed_all) - len(followed), collectors, table, now, sources, sdir, today,
-                   twitch_hist)
+    sources = {name: sources[name] for name in SOURCES if name in sources}  # ordre stable, voies ou pas
+    _build_trend(games, followed, reviews, vods_30d, table, sources, sdir, today, twitch_hist)
 
     _write(sdir / "history" / f"{day}.json", {
         "date": day, "at": now.isoformat(), "twitch": twitch_hist, "steam": steam_hist, "steam_fr": sellers_hist, "youtube": youtube_hist,
@@ -1099,6 +1254,7 @@ def collect(
     state = {
         "date": day, "started_at": started_at, "finished_at": now.isoformat() if finalize else None, "sources": sources,
         "games": games, "candidates": candidates, "excluded": excluded, "releases": releases,
+        "deadline_at": deadline_at.isoformat(), "deadline_hit": any(_cut_by_deadline(e) for e in sources.values()),
         "llm": {"status": "skipped", "error": None, "model": None},
         "proposals": [], "skipped_note": "", "refresh_requested_at": None,
     }
@@ -1269,6 +1425,15 @@ def _trend_lines(trend: dict[str, Any] | None) -> list[str]:
     return lines
 
 
+def _incomplete_lines(day_state: dict[str, Any], table: dict[str, object]) -> list[str]:
+    """R29 : une ligne par source que l'échéance a coupée ou empêchée de commencer ; rien si le relevé est complet.
+    Ce qui manque est inconnu, jamais nul : Claude choisit avec ce qui est relevé."""
+    if not day_state.get("deadline_hit"):
+        return []
+    return [f"Relevé incomplet (échéance de {table['veille_deadline_s']} s) : {name} : {entry.get('error')}"
+            for name, entry in (day_state.get("sources") or {}).items() if _cut_by_deadline(entry)]
+
+
 def _prompt(day_state: dict[str, Any], table: dict[str, object]) -> str:
     taste = str(table["taste"]).strip() or "aucune préférence déclarée"
     lines = [
@@ -1279,6 +1444,7 @@ def _prompt(day_state: dict[str, Any], table: dict[str, object]) -> str:
         "goûts, en privilégiant ce qui monte, sans juger les personnes. Une donnée inconnue est inconnue : "
         "ne l'invente pas.",
         f"Au plus {table['max_vods_per_game']} VOD par jeu : varie les jeux.",
+        *_incomplete_lines(day_state, table),
         "",
         "Jeux (viewers Twitch FR, joueurs Steam, variation vs moyenne des jours précédents, gain de rang Steam vs semaine dernière, rang et gain dans le top des ventes Steam du pays) :",
         "Deux mesures de joueurs Steam, jamais comparées entre elles : steam_players = pic du jour du top 100 "
@@ -1392,6 +1558,7 @@ def run_if_due(
     now: datetime,
     config: Config,
     collectors: dict[str, Collector] | None = None,
+    clock: Callable[[], datetime] | None = None,
 ) -> dict[str, Any] | None:
     """Relevé + choix de Claude si dû (R7) ; rend l'état du jour, ``None`` si rien n'était dû.
     ``enabled`` faux : rien n'est lu ni écrit. ``refresh.json`` est consommé avant de commencer ;
@@ -1413,7 +1580,7 @@ def run_if_due(
     _write(_day_path(sdir, day), skeleton)  # l'écran voit « en cours » dès maintenant
     decided = [p for p in skeleton["proposals"] if p["status"] in _DECIDED]
 
-    state = collect(now, collectors=collectors, config=config, finalize=False)
+    state = collect(now, collectors=collectors, config=config, finalize=False, clock=clock)
     state["refresh_requested_at"] = requested_at
     state = decide(state, config)
     state["finished_at"] = now.isoformat()

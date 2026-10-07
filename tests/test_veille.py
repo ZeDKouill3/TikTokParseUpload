@@ -6,6 +6,8 @@ Collecteurs injectés, ``tmp_path`` pour ``state/`` : aucun test ne touche le r�
 from __future__ import annotations
 
 import json
+import threading
+import time
 from unittest import mock
 from datetime import datetime, timedelta, timezone
 
@@ -127,7 +129,7 @@ def test_config_defaults_are_exactly_r1():
         "community_min_twitch_viewers": 200, "community_min_hypes": 50, "max_vods_per_game": 1,
         "trend_days": 30, "trend_games_max": 40, "steam_reviews_pause_s": 2.0, "steam_reviews_retry_max": 3,
         "steam_reviews_retry_wait_max_s": 60.0, "twitch_history_pages_max": 5, "twitch_history_retry_max": 2,
-        "twitch_history_retry_wait_max_s": 60.0,
+        "twitch_history_retry_wait_max_s": 60.0, "veille_deadline_s": 480,
     }
 
 
@@ -176,6 +178,8 @@ def test_load_config_accepts_veille_table(tmp_path):
     ({"twitch_history_retry_max": 11}, "twitch_history_retry_max"),
     ({"twitch_history_retry_wait_max_s": 0}, "twitch_history_retry_wait_max_s"),
     ({"twitch_history_retry_wait_max_s": 601}, "twitch_history_retry_wait_max_s"),
+    ({"veille_deadline_s": 59}, "veille_deadline_s"),
+    ({"veille_deadline_s": 3601}, "veille_deadline_s"),
 ])
 def test_invalid_settings_raise_naming_the_key(tmp_path, table, key):
     config = _make_config(tmp_path, **table)
@@ -410,7 +414,8 @@ def test_candidates_filtered_and_counted(tmp_path, config):
     day = _read(_sdir(tmp_path) / "days" / f"{TODAY}.json")
     assert [c["id"] for c in day["candidates"]] == ["twitch:ok1"]
     assert day["excluded"] == {"too_short": 1, "too_old": 1, "already_known": 4, "no_community": 0,
-                                  "access_restricted": 0, "access_unreachable": 0, "access_untested": 0}
+                                  "access_restricted": 0, "access_unreachable": 0, "access_untested": 0,
+                                  "access_deadline": 0}
     candidate = day["candidates"][0]
     assert candidate["source"] == "twitch" and candidate["video_id"] == "ok1"
     assert candidate["game_key"] == "jeu alpha" and candidate["duration_s"] == 7200
@@ -987,7 +992,8 @@ def test_check_stops_after_one_accessible_vod_with_max_one(tmp_path):
     assert [c["video_id"] for c in day["candidates"]] == ["v0"]
     counts = day["sources"]["twitch"]["counts"]
     assert (counts["restricted"], counts["unreachable"], counts["untested"]) == (0, 0, 10)
-    assert _access_excluded(tmp_path) == {"access_restricted": 0, "access_unreachable": 0, "access_untested": 10}
+    assert _access_excluded(tmp_path) == {"access_restricted": 0, "access_unreachable": 0, "access_untested": 10,
+                                           "access_deadline": 0}
 
 
 def test_most_viewed_restricted_then_second_accessible(tmp_path):
@@ -999,7 +1005,8 @@ def test_most_viewed_restricted_then_second_accessible(tmp_path):
     assert [c["video_id"] for c in day["candidates"]] == ["v1"]
     counts = day["sources"]["twitch"]["counts"]
     assert (counts["restricted"], counts["unreachable"], counts["untested"]) == (1, 0, 9)
-    assert _access_excluded(tmp_path) == {"access_restricted": 1, "access_unreachable": 0, "access_untested": 9}
+    assert _access_excluded(tmp_path) == {"access_restricted": 1, "access_unreachable": 0, "access_untested": 9,
+                                           "access_deadline": 0}
 
 
 def test_check_stops_after_two_accessible_vods_with_max_two(tmp_path):
@@ -2434,3 +2441,387 @@ def test_prompt_header_has_the_trend_legend_and_the_instruction(tmp_path):
             "déjà retombé (dernier bien sous le pic, s1 < s2) ; une sortie récente sans courbe en montée n'est pas "
             "« ce qui monte ».") in prompt
     assert prompt.index("tendance_30j : pour chaque") < prompt.index("- Jeu Alpha :")
+
+
+# ==========================================================================
+# TASK-1d82 : voies parallèles par hôte, phases, échéance globale (SPEC-85a0 R29, R30)
+# ==========================================================================
+
+DEADLINE_S = 60  # plus petit veille_deadline_s admis
+
+
+class Clock:
+    """Horloge injectée : les collecteurs factices l'avancent, aucune attente réelle."""
+
+    def __init__(self, start=NOW):
+        self.now = start
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += timedelta(seconds=seconds)
+
+
+class Probe:
+    """Enveloppe un collecteur factice : journalise début/fin (liste partagée, ajout atomique), peut se donner
+    rendez-vous (``threading.Barrier``) avec les autres voies de sa phase, et rend ce que rend ``inner``."""
+
+    def __init__(self, name, inner, log, *, barrier=None, pause=0.0):
+        self.name, self.inner, self.log, self.barrier, self.pause = name, inner, log, barrier, pause
+
+    def __call__(self, settings, *args, **_ignored):
+        self.log.append(f"{self.name}:start")
+        if self.barrier is not None:
+            self.barrier.wait()  # BrokenBarrierError si l'autre voie ne tourne pas en même temps
+        if self.pause:
+            time.sleep(self.pause)
+        result = self.inner(settings, *args)
+        self.log.append(f"{self.name}:end")
+        return result
+
+
+def _barrier(parties):
+    return threading.Barrier(parties, timeout=3)
+
+
+def _probed(collectors, log, **options):
+    """``options`` : nom de source -> kwargs de ``Probe`` (barrier, pause)."""
+    for name, extra in options.items():
+        collectors[name] = Probe(name, collectors[name], log, **extra)
+    return collectors
+
+
+def _logging_access(log, barrier=None):
+    state = {"first": True}
+
+    def access(url, timeout_s):
+        log.append("usher:start")
+        if barrier is not None and state["first"]:
+            state["first"] = False
+            barrier.wait()
+
+    return access
+
+
+def _full_collectors():
+    """Les neuf sources, avec des jeux suivis (Alpha : appid 42, twitch_id 1) : toutes sont appelées."""
+    collectors = _trend_collectors()
+    collectors["igdb"] = Collector({"games": [], "skipped_rows": 0})
+    collectors["steam"] = Collector({"games": [_steam_row("42", "Jeu Alpha", 5000)]})  # instantané inconnu : steam_players relève
+    collectors["steam_players"] = Lookup("players", {})
+    collectors["steam_followers"] = Lookup("followers", {"42": 20000})
+    return collectors
+
+
+def _run(tmp_path, collectors, *, access=None, clock=None, **table):
+    return veille.collect(NOW, collectors=collectors, config=_make_config(tmp_path, **table),
+                          access_check=access or (lambda url, timeout_s: None), clock=clock)
+
+
+def _first(log, event):
+    return log.index(event)
+
+
+def test_veille_deadline_s_default_and_bounds(tmp_path):
+    assert veille.CONFIG_DEFAULTS["veille_deadline_s"] == 480
+    veille.settings(_make_config(tmp_path, veille_deadline_s=60))
+    veille.settings(_make_config(tmp_path, veille_deadline_s=3600))
+    for bad in (59, 3601, True, 480.5, "480"):
+        with pytest.raises(veille.VeilleError, match="veille_deadline_s"):
+            veille.settings(_make_config(tmp_path, veille_deadline_s=bad))
+
+
+def test_phase_one_lanes_helix_youtube_steam_api_overlap_but_each_lane_is_sequential(tmp_path):
+    log: list[str] = []
+    barrier = _barrier(3)  # un même rendez-vous à trois : sinon BrokenBarrierError = la source est en erreur
+    collectors = _probed(_full_collectors(), log, twitch={"barrier": barrier}, youtube={"barrier": barrier},
+                         steam={"barrier": barrier}, igdb={"pause": 0.02}, steam_fr={"pause": 0.02})
+    state = _run(tmp_path, collectors)
+    assert [state["sources"][s]["status"] for s in ("twitch", "youtube", "steam")] == ["ok", "ok", "ok"]
+    assert _first(log, "twitch:end") < _first(log, "igdb:start")  # même voie helix : jamais en parallèle
+    assert _first(log, "steam:end") < _first(log, "steam_fr:start")  # même voie steam_api
+
+
+def test_phase_two_steam_players_and_steam_followers_overlap(tmp_path):
+    log: list[str] = []
+    barrier = _barrier(2)
+    collectors = _probed(_full_collectors(), log, steam_players={"barrier": barrier}, steam_followers={"barrier": barrier})
+    state = _run(tmp_path, collectors)
+    assert state["sources"]["steam_players"]["status"] == "ok"
+    assert state["sources"]["steam_followers"]["status"] == "ok"
+
+
+def test_phase_three_access_test_steam_reviews_and_twitch_vods_overlap(tmp_path):
+    log: list[str] = []
+    barrier = _barrier(3)
+    collectors = _probed(_full_collectors(), log, steam_reviews={"barrier": barrier}, twitch_vods_30d={"barrier": barrier})
+    state = _run(tmp_path, collectors, access=_logging_access(log, barrier))
+    assert state["sources"]["steam_reviews"]["status"] == "ok"
+    assert state["sources"]["twitch_vods_30d"]["status"] == "ok"
+    assert "usher:start" in log
+
+
+def test_a_phase_starts_only_after_every_lane_of_the_previous_phase_has_ended(tmp_path):
+    log: list[str] = []
+    collectors = _probed(_full_collectors(), log, youtube={"pause": 0.15}, steam_fr={"pause": 0.05},
+                         steam_followers={"pause": 0.15}, twitch={}, igdb={}, steam={}, steam_players={},
+                         steam_reviews={}, twitch_vods_30d={})
+    _run(tmp_path, collectors, access=_logging_access(log))
+    phase1 = ("twitch:end", "igdb:end", "youtube:end", "steam:end", "steam_fr:end")
+    phase2 = ("steam_players:end", "steam_followers:end")
+    phase3_starts = ("usher:start", "steam_reviews:start", "twitch_vods_30d:start")
+    assert max(_first(log, e) for e in phase1) < min(_first(log, "steam_players:start"), _first(log, "steam_followers:start"))
+    assert max(_first(log, e) for e in phase2) < min(_first(log, e) for e in phase3_starts)
+
+
+def test_an_exception_in_one_lane_is_that_source_in_error_other_lanes_and_phases_go_on_and_claude_is_called(tmp_path):
+    collectors = _full_collectors()
+    collectors["steam_followers"] = Lookup("followers", error=RuntimeError("boom steamcommunity"))
+    collectors["twitch"] = Collector({"games": [{"name": "Jeu Alpha", "viewers_fr": 1000, "igdb_id": "", "twitch_id": "1"}],
+                                      "vods": [{**_vod("AAA"), "url": "https://youtu.be/AAA"}]})
+    config = _make_config(tmp_path, enabled=True)
+    fake = FakeBackend([_picks("twitch:AAA")])
+    with llm.use_backend(fake):
+        state = veille.run_if_due(AFTER_RUN_AT, config, collectors)
+    assert state["sources"]["steam_followers"]["status"] == "error"
+    assert "boom steamcommunity" in state["sources"]["steam_followers"]["error"]
+    for ok in ("twitch", "youtube", "steam", "steam_fr", "steam_players", "steam_reviews", "twitch_vods_30d"):
+        assert state["sources"][ok]["status"] == "ok", ok
+    assert len(fake.calls) == 1 and state["llm"]["status"] == "ok"
+
+
+# --- échéance ---------------------------------------------------------------
+
+
+class Deadlined:
+    """Collecteur par appid qui accepte ``deadline`` : note les secondes restantes vues, avance l'horloge, rend
+    ``deadline_stopped``."""
+
+    def __init__(self, key, clock, *, spend=0, stopped=0, values=None, extra=None):
+        self.key, self.clock, self.spend, self.stopped = key, clock, spend, stopped
+        self.values, self.extra = values or {}, extra or {}
+        self.left_seen: list[float] = []
+        self.calls: list[list[str]] = []
+
+    def __call__(self, settings, appids, *, deadline):
+        self.calls.append(list(appids))
+        self.left_seen.append(deadline())
+        self.clock.advance(self.spend)
+        result = {self.key: {a: v for a, v in self.values.items() if a in appids}, "skipped": 0, **self.extra}
+        if self.stopped:
+            result["deadline_stopped"] = self.stopped
+        return result
+
+
+def test_deadline_is_started_at_plus_veille_deadline_s_on_the_injected_clock_and_collectors_receive_it(tmp_path):
+    clock = Clock()
+    followers = Deadlined("followers", clock, spend=25, values={"42": 20000})
+    collectors = _full_collectors()
+    collectors["steam_followers"] = followers
+    state = _run(tmp_path, collectors, clock=clock, veille_deadline_s=DEADLINE_S)
+    assert followers.left_seen == [60.0]  # horloge au départ : toute l'échéance reste
+    assert state["deadline_at"] == (NOW + timedelta(seconds=DEADLINE_S)).isoformat()
+    assert state["deadline_hit"] is False
+    assert _day(tmp_path)["deadline_at"] == state["deadline_at"] and _day(tmp_path)["deadline_hit"] is False
+
+
+def test_a_remaining_figure_follows_the_clock(tmp_path):
+    clock = Clock()
+    reviews = Deadlined("histograms", clock, values={"42": []})
+    collectors = _full_collectors()
+    collectors["steam_followers"] = Deadlined("followers", clock, spend=25, values={"42": 20000})
+    collectors["steam_reviews"] = reviews
+    _run(tmp_path, collectors, clock=clock, veille_deadline_s=DEADLINE_S)
+    assert reviews.left_seen == [35.0]  # 60 s - les 25 s dépensés avant la phase 3
+
+
+def test_collectors_that_do_not_accept_deadline_are_called_as_before(tmp_path):
+    class Plain:
+        calls = 0
+
+        def __call__(self, settings, appids):
+            Plain.calls += 1
+            return {"followers": {"42": 20000}, "skipped": 0}
+
+    collectors = _full_collectors()
+    collectors["steam_followers"] = Plain()
+    state = _run(tmp_path, collectors)
+    assert Plain.calls == 1 and state["sources"]["steam_followers"]["status"] == "ok"
+
+
+def test_a_collector_with_var_keywords_receives_deadline(tmp_path):
+    seen = {}
+
+    def youtube(settings, **kwargs):
+        seen.update(kwargs)
+        return {"videos": []}
+
+    collectors = _full_collectors()
+    collectors["youtube"] = youtube
+    _run(tmp_path, collectors, veille_deadline_s=DEADLINE_S)
+    assert callable(seen["deadline"]) and 0 < seen["deadline"]() <= DEADLINE_S
+
+
+@pytest.mark.parametrize("source, key, unit, stopped", [
+    ("steam_followers", "followers", "appid(s)", 3),
+    ("steam_players", "players", "appid(s)", 2),
+    ("steam_reviews", "histograms", "appid(s)", 1),
+    ("twitch_vods_30d", "vods", "jeu(x)", 4)])
+def test_a_collector_stopped_by_the_deadline_is_partial_with_the_exact_message_and_count(tmp_path, source, key, unit, stopped):
+    clock = Clock()
+    collectors = _full_collectors()
+    collectors[source] = Deadlined(key, clock, stopped=stopped)
+    state = _run(tmp_path, collectors, clock=clock, veille_deadline_s=DEADLINE_S)
+    entry = state["sources"][source]
+    assert entry["status"] == "partial"
+    assert entry["error"] == f"échéance de 60 s atteinte : {stopped} {unit} non relevé(s)"
+    assert entry["counts"]["deadline"] == stopped
+    assert state["deadline_hit"] is True
+    assert _day(tmp_path)["sources"][source]["status"] == "partial"
+
+
+def test_stopped_trend_games_have_an_unavailable_series_saying_why_and_never_a_value(tmp_path):
+    clock = Clock()
+    collectors = _full_collectors()
+    collectors["steam_reviews"] = Deadlined("histograms", clock, stopped=1)  # l'appid 42 n'a pas été relevé
+    collectors["twitch_vods_30d"] = Deadlined("vods", clock, stopped=2)
+    state = _run(tmp_path, collectors, clock=clock, veille_deadline_s=DEADLINE_S)
+    series = _trend(state)["series"]
+    assert series["steam_reviews"]["status"] == "unavailable" and series["steam_reviews"]["points"] == []
+    assert "échéance" in series["steam_reviews"]["reason"]
+    assert series["twitch_vods_fr"]["status"] == "unavailable" and "échéance" in series["twitch_vods_fr"]["reason"]
+
+
+def test_a_source_whose_phase_never_started_is_skipped_and_not_called(tmp_path):
+    clock = Clock()
+    collectors = _full_collectors()
+    inner = collectors["steam"]
+
+    def slow_steam(settings, **_):
+        clock.advance(100)  # l'échéance (60 s) passe pendant la phase 1
+        return inner(settings)
+
+    collectors["steam"] = slow_steam
+    followers, players = collectors["steam_followers"], collectors["steam_players"]
+    state = _run(tmp_path, collectors, clock=clock, veille_deadline_s=DEADLINE_S)
+    for source in ("steam_players", "steam_followers", "steam_reviews", "twitch_vods_30d"):
+        assert state["sources"][source]["status"] == "skipped", source
+        assert state["sources"][source]["error"] == "échéance atteinte avant le début", source
+    assert players.calls == [] and followers.calls == []
+    assert collectors["steam_reviews"].calls == [] and collectors["twitch_vods_30d"].calls == []
+    assert state["deadline_hit"] is True
+
+
+def test_access_test_cut_by_the_deadline_drops_the_remaining_vods_as_access_deadline_and_never_keeps_them(tmp_path):
+    clock = Clock()
+    asked = []
+
+    def access(url, timeout_s):
+        asked.append(url)
+        clock.advance(100)  # le premier essai dépasse l'échéance
+
+    config_table = dict(max_vods_per_game=3, veille_deadline_s=DEADLINE_S)
+    collectors = _collectors(vods=_game_vods(4))
+    state = _run(tmp_path, collectors, access=access, clock=clock, **config_table)
+    assert len(asked) == 1  # plus aucun essai une fois l'échéance passée
+    assert [c["video_id"] for c in state["candidates"]] == ["v0"]  # v0 était testée et accessible
+    assert state["excluded"]["access_deadline"] == 3
+    assert state["excluded"]["access_untested"] == 0  # distinct de « non testée parce que le jeu est servi »
+    assert state["sources"]["twitch"]["counts"]["deadline"] == 3
+    assert state["deadline_hit"] is True
+    assert state["sources"]["twitch"]["status"] == "partial"
+    assert "3 VOD non testée(s)" in state["sources"]["twitch"]["error"]
+
+
+def test_a_failing_attempt_after_the_deadline_makes_no_new_attempt_and_no_pause(tmp_path):
+    clock = Clock()
+    asked, slept = [], []
+
+    def access(url, timeout_s):
+        asked.append(url)
+        clock.advance(100)
+        raise OSError("connexion fermée")
+
+    state = veille.collect(NOW, collectors=_collectors(vods=_game_vods(2)),
+                           config=_make_config(tmp_path, max_vods_per_game=1, twitch_access_attempts=5,
+                                               veille_deadline_s=DEADLINE_S),
+                           access_check=access, access_sleep=slept.append, clock=clock)
+    assert len(asked) == 1 and slept == []
+    assert state["candidates"] == []
+    assert state["excluded"]["access_unreachable"] == 0  # interrompue, pas injoignable
+    assert state["excluded"]["access_deadline"] == 2  # la VOD interrompue et la suivante
+
+
+def test_the_access_test_checks_the_deadline_before_every_vod_even_after_a_restricted_one(tmp_path):
+    clock = Clock()
+    asked = []
+
+    def access(url, timeout_s):
+        asked.append(url)
+        clock.advance(100)
+        raise veille_sources.AccessRestricted("subscriber-only")
+
+    state = _run(tmp_path, _collectors(vods=_game_vods(3)), access=access, clock=clock, max_vods_per_game=1,
+                 veille_deadline_s=DEADLINE_S)
+    assert len(asked) == 1 and state["excluded"]["access_restricted"] == 1 and state["excluded"]["access_deadline"] == 2
+
+
+def test_a_survey_finished_before_the_deadline_has_no_deadline_hit_and_no_partial(tmp_path):
+    clock = Clock()
+    collectors = _full_collectors()
+    collectors["steam_followers"] = Deadlined("followers", clock, spend=5, values={"42": 20000})
+    state = _run(tmp_path, collectors, clock=clock, veille_deadline_s=DEADLINE_S)
+    assert state["deadline_hit"] is False
+    assert all(s["status"] != "partial" for s in state["sources"].values())
+    assert state["excluded"]["access_deadline"] == 0
+
+
+def _incomplete_run(tmp_path, collectors=None):
+    clock = Clock(AFTER_RUN_AT)
+    collectors = collectors or _full_collectors()
+    collectors["steam_followers"] = Deadlined("followers", clock, stopped=3, values={"42": 20000})
+    collectors["twitch"] = Collector({"games": [{"name": "Jeu Alpha", "viewers_fr": 1000, "igdb_id": "", "twitch_id": "1"}],
+                                      "vods": [{**_vod("AAA"), "url": "https://youtu.be/AAA"}]})
+    config = _make_config(tmp_path, enabled=True, veille_deadline_s=DEADLINE_S)
+    fake = FakeBackend([_picks("twitch:AAA")])
+    with llm.use_backend(fake):
+        state = veille.run_if_due(AFTER_RUN_AT, config, collectors, clock=clock)
+    return state, fake
+
+
+def test_prompt_names_the_incomplete_sources_with_their_error_and_claude_is_still_called(tmp_path):
+    state, fake = _incomplete_run(tmp_path)
+    assert len(fake.calls) == 1 and state["llm"]["status"] == "ok"
+    prompt = fake.calls[0].prompt
+    assert ("Relevé incomplet (échéance de 60 s) : steam_followers : "
+            "échéance de 60 s atteinte : 3 appid(s) non relevé(s)") in prompt
+    assert state["deadline_hit"] is True and state["finished_at"]
+
+
+def test_prompt_has_no_incomplete_notice_when_the_survey_is_complete(tmp_path):
+    clock = Clock(AFTER_RUN_AT)
+    collectors = _full_collectors()
+    collectors["twitch"] = Collector({"games": [{"name": "Jeu Alpha", "viewers_fr": 1000, "igdb_id": "", "twitch_id": "1"}],
+                                      "vods": [{**_vod("AAA"), "url": "https://youtu.be/AAA"}]})
+    fake = FakeBackend([_picks("twitch:AAA")])
+    with llm.use_backend(fake):
+        veille.run_if_due(AFTER_RUN_AT, _make_config(tmp_path, enabled=True), collectors, clock=clock)
+    assert "Relevé incomplet" not in fake.calls[0].prompt
+
+
+def test_prompt_lists_a_skipped_source_and_a_cut_access_test(tmp_path):
+    state = _day_state("twitch:AAA")
+    state.update(deadline_hit=True, deadline_at=NOW.isoformat(), sources={
+        "steam_reviews": {"status": "skipped", "error": "échéance atteinte avant le début", "counts": {}},
+        "twitch": {"status": "partial", "error": "échéance de 60 s atteinte : 5 VOD non testée(s)", "counts": {"deadline": 5}},
+        "steam": {"status": "ok", "error": None, "counts": {}}})
+    prompt = _decide_prompt(tmp_path, state, veille_deadline_s=DEADLINE_S)
+    assert "Relevé incomplet (échéance de 60 s) : steam_reviews : échéance atteinte avant le début" in prompt
+    assert "Relevé incomplet (échéance de 60 s) : twitch : échéance de 60 s atteinte : 5 VOD non testée(s)" in prompt
+    assert "(échéance de 60 s) : steam :" not in prompt
+
+
+def test_default_clock_never_trips_the_deadline_for_a_fixed_past_now(tmp_path):
+    state = _run(tmp_path, _full_collectors())  # NOW est dans le passé : l'horloge par défaut part de ``now``
+    assert state["deadline_hit"] is False and state["deadline_at"] == (NOW + timedelta(seconds=480)).isoformat()

@@ -5,7 +5,7 @@ slug: veille-historique-4-5-relev-par-voies-parall-les
 title: "Veille historique (4/5) : relevé par voies parallèles par hôte (helix, youtube, steam_api, steam_store, steamcommunity, usher) en trois phases puis Claude, échéance globale veille_deadline_s passée aux collecteurs et au test d'accès, sources partial/skipped visibles, prompt « Relevé incomplet » (SPEC-85a0 R29, R30)"
 created: 2026-10-07T13:14:45Z
 author: w-histplan
-status: open
+status: done
 scope:
   - clipper/veille.py
   - clipper/veille_sources.py
@@ -17,8 +17,15 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/1e3f6a289f5c@56f5943
+    tree: scope/7f1c62e9304f
+    criteria: 5d74fb2386d7
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 2
+version: 4
 ---
 
 Exigence utilisateur 07/10/2026 : relevé complet < 10 min ; mesuré ~4 min le 07/10 (14:35-14:39) dont steam_followers 50 × 3 s. Budget par étape et chemin critique (≈ 6,5 min nominal) dans SPEC-85a0 R30. Voies fixées par hôte dans le code, pas de réglage de parallélisme. Les collecteurs partagent le jeton Twitch par fichier verrouillé (twitch_token.json) : twitch, igdb et twitch_vods_30d restent dans la même voie helix. deadline = callable (secondes restantes) sur la même horloge injectée que les collecteurs ; signature inspectée par _run_source pour ne pas casser les faux collecteurs des tests existants.
