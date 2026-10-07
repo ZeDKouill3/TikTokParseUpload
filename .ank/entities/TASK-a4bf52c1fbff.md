@@ -5,7 +5,7 @@ slug: veille-historique-1-5-le-relev-de-veille-run-if
 title: "Veille historique (1/5) : le relevé de veille (run_if_due) tourne dans un fil d'arrière-plan du processus worker, un seul à la fois, erreur capturée puis journalisée par la boucle ; publications et vidéos continuent pendant le relevé (SPEC-85a0 R26 bis, ADR-6e21 §7)"
 created: 2026-10-07T13:14:44Z
 author: w-histplan
-status: open
+status: done
 scope:
   - clipper/worker.py
   - tests/test_worker.py
@@ -15,8 +15,15 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/29ae458b94a3@1e0fab8
+    tree: scope/2561f1270c55
+    criteria: cba3f999e549
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---
 
 Constat 07/10/2026 : Worker.tick appelle veille.run_if_due en synchrone ; pendant un relevé (~4 min mesurées, plus avec les sources nouvelles) aucune publication ni vidéo ne démarre. L'utilisateur refuse tout blocage. Précédent dans le même fichier : fil daemon thumbnail-fetch (_start_thumbnail_fetch). Compatible ADR-ca9a (toujours le processus worker) ; processus enfant non retenu (ADR-35b7 réserve les enfants aux vidéos ; collecteurs injectés des tests). Tests existants à adapter : test_tick_calls_veille_run_if_due_with_the_injected_collectors, test_tick_logs_a_veille_error_once_and_keeps_going (joindre le fil avant d'asserter).

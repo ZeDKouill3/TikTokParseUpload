@@ -456,6 +456,7 @@ class Worker:
         self._logged_watch_errors: set[str] = set()
         self.veille_collectors = veille_collectors  # None : les collecteurs reels de clipper.veille_sources
         self._logged_veille_errors: set[str] = set()
+        self._veille_thread: threading.Thread | None = None  # releve en cours (un seul a la fois)
         self.publisher = publisher or tiktok.publish
         self.youtube_publisher = youtube_publisher or youtube.publish  # compte YouTube (SPEC-5e50 R2)
         self._logged_publish_errors: set[str] = set()
@@ -614,13 +615,29 @@ class Worker:
 
     def _veille_due(self) -> None:
         """Releve quotidien ou « Rafraichir » de la veille (SPEC-bdd9 R7), dans ce processus seulement.
-        Une erreur de reglage ou d'etat est journalisee une fois et n'arrete pas le worker."""
+        Le releve tourne dans un fil daemon, un seul a la fois, et ne bloque jamais la boucle
+        (SPEC-85a0 R26 bis, ADR-6e21) : tant qu'il vit, ce tick ne fait rien ; fini, il est rejoint
+        ici puis un nouveau peut partir."""
+        thread = self._veille_thread
+        if thread is not None:
+            if thread.is_alive():
+                return
+            thread.join()
+            self._veille_thread = None
+        self._veille_thread = threading.Thread(target=self._veille_run, name="veille", daemon=True)
+        self._veille_thread.start()
+
+    def _veille_run(self) -> None:
+        """Corps du fil : une erreur de reglage ou d'etat est journalisee une fois, toute autre
+        avec sa trace (ADR-ad2e : jamais avalee) ; dans les deux cas le worker continue."""
         from clipper import veille
 
         try:
             veille.run_if_due(datetime.now(timezone.utc), self.config, self.veille_collectors)
         except (veille.VeilleError, ConfigError) as exc:
             self._log_veille_error(exc)
+        except Exception:  # noqa: BLE001 - jamais un fil de releve qui meurt en silence
+            log.exception("releve de veille interrompu par une erreur inattendue")
 
     def _veille_select_best(self) -> None:
         """Apres chaque fin de processus enfant : recalcule les meilleurs clips du jour (SPEC-bdd9 R7)."""
