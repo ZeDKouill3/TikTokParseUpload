@@ -21,6 +21,9 @@ chacun un callable ``collector(settings) -> dict`` (``settings`` = la table
              "unnamed": [{"appid", "reason"}]}  (optionnel : jeux sans nom, avec leur raison)
     steam_fr {"games": [{"appid", "name", "rank", "last_week_rank"}]}  (top des ventes du pays ``region`` ;
              ``last_week_rank`` 0 = absent du top la semaine dernière)
+    igdb    {"releases": [{"igdb_id", "name", "slug", "url", "hypes" | None, "first_release_date", "date" (YYYY-MM-DD),
+             "human", "platform", "region", "status", "date_format"}], "skipped_rows": n}  (SPEC-4efa R12 ;
+             un jeu Twitch porte en plus ``igdb_id``, chaîne vide si Twitch ne l'a pas)
 
 avec ``VOD = {video_id, url, title, channel_name, game_name | None,
 duration_s, published_at (ISO 8601), view_count, views_per_hour}``. Un direct
@@ -74,11 +77,16 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "http_timeout_s": 20,
     "steam_rank_gain_min": 5,
     "steam_risers_max": 10,
+    "upcoming_days": 14,
+    "release_window_days": 15,
+    "igdb_min_hypes": 0,
+    "igdb_releases_max": 30,
+    "igdb_pages_max": 4,
 }
 
 log = logging.getLogger(__name__)
 
-SOURCES = ("twitch", "youtube", "steam", "steam_fr")
+SOURCES = ("twitch", "youtube", "steam", "steam_fr", "igdb")
 Collector = Callable[[dict[str, object]], dict[str, Any]]
 
 # Clés exigées par source (steam n'en demande aucune).
@@ -87,6 +95,7 @@ _REQUIRED_KEYS = {
     "youtube": ("youtube_api_key",),
     "steam": (),
     "steam_fr": (),
+    "igdb": ("twitch_client_id", "twitch_client_secret"),  # même jeton d'app que Twitch (ADR-798c)
 }
 _RUN_AT = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 _DATE_FILE = re.compile(r"^\d{4}-\d{2}-\d{2}\.json$")
@@ -111,6 +120,11 @@ def settings(config: Config) -> dict[str, object]:
     access_max = table["twitch_access_check_max"]
     if not isinstance(access_max, int) or isinstance(access_max, bool) or access_max < 0:
         raise VeilleError(f"[veille] twitch_access_check_max doit être un entier >= 0 (reçu {access_max!r})")
+    for key, minimum in (("upcoming_days", 1), ("release_window_days", 0), ("igdb_min_hypes", 0),
+                         ("igdb_releases_max", 1), ("igdb_pages_max", 1)):
+        value = table[key]
+        if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+            raise VeilleError(f"[veille] {key} doit être un entier >= {minimum} (reçu {value!r})")
     history_days = table["history_days"]
     if not isinstance(history_days, int) or isinstance(history_days, bool) or history_days < table["baseline_days"]:
         raise VeilleError(
@@ -341,6 +355,66 @@ def _steam_risers(
 
 
 # --------------------------------------------------------------------------
+# Sorties de jeux IGDB (SPEC-4efa R13, R14)
+# --------------------------------------------------------------------------
+
+
+def _empty_releases() -> dict[str, Any]:
+    return {"recent": [], "upcoming": [], "excluded_low_hypes": 0, "truncated": {"recent": 0, "upcoming": 0}}
+
+
+def _hypes_desc(entry: dict[str, Any]) -> float:
+    return -entry["hypes"] if entry["hypes"] is not None else float("inf")  # null en dernier
+
+
+def _group_releases(rows: list[dict[str, Any]], today: date, table: dict[str, object]) -> dict[str, Any]:
+    """Regroupe les lignes IGDB par ``igdb_id`` (date la plus ancienne, listes uniques) puis classe en
+    ``recent`` (J-``release_window_days`` à J0) et ``upcoming`` (J+1 à J+``upcoming_days``)."""
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault(row["igdb_id"], []).append(row)
+    window = int(table["release_window_days"])  # type: ignore[call-overload]
+    horizon = int(table["upcoming_days"])  # type: ignore[call-overload]
+    min_hypes = int(table["igdb_min_hypes"])  # type: ignore[call-overload]
+    cap = int(table["igdb_releases_max"])  # type: ignore[call-overload]
+    recent: list[dict[str, Any]] = []
+    upcoming: list[dict[str, Any]] = []
+    excluded = 0
+    for igdb_id, lines in grouped.items():
+        first = min(lines, key=lambda r: r["date"])
+        days = (date.fromisoformat(first["date"]) - today).days
+        if not -window <= days <= horizon:
+            continue
+        known = [r["hypes"] for r in lines if r["hypes"] is not None]
+        hypes = max(known) if known else None
+        if min_hypes > 0 and (hypes is None or hypes < min_hypes):
+            excluded += 1
+            continue
+        entry = {
+            "igdb_id": igdb_id, "name": first["name"], "key": normalize(first["name"]), "slug": first.get("slug"),
+            "url": first.get("url"), "hypes": hypes, "date": first["date"], "human": first.get("human"),
+            "platforms": sorted({r["platform"] for r in lines if r.get("platform")}),
+            "regions": sorted({r["region"] for r in lines if r.get("region")}),
+            "statuses": sorted({r["status"] for r in lines if r.get("status")}), "days": days,
+        }
+        (recent if days <= 0 else upcoming).append(entry)
+    recent.sort(key=lambda e: (-e["days"], _hypes_desc(e), e["name"]))
+    upcoming.sort(key=lambda e: (e["date"], _hypes_desc(e), e["name"]))
+    return {"recent": recent[:cap], "upcoming": upcoming[:cap], "excluded_low_hypes": excluded,
+            "truncated": {"recent": max(0, len(recent) - cap), "upcoming": max(0, len(upcoming) - cap)}}
+
+
+def _release_marker(game: dict[str, Any], igdb_id: str, recent: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Repère de sortie d'un jeu : par ``igdb_id`` d'abord, sinon par clé normalisée ; sorties récentes seulement."""
+    match = next((e for e in recent if igdb_id and e["igdb_id"] == igdb_id), None) \
+        or next((e for e in recent if e["key"] == game["key"]), None)
+    if match is None:
+        return None
+    return {"igdb_id": match["igdb_id"], "name": match["name"], "date": match["date"],
+            "days_since": -match["days"], "hypes": match["hypes"]}
+
+
+# --------------------------------------------------------------------------
 # Collecte
 # --------------------------------------------------------------------------
 
@@ -432,6 +506,9 @@ def collect(
     steam_hist: dict[str, dict[str, Any]] = {}
     sellers_hist: dict[str, dict[str, Any]] = {}
     youtube_hist: dict[str, dict[str, Any]] = {}
+    twitch_igdb: dict[str, str] = {}  # clé de jeu -> igdb_id fourni par Twitch (hors historique)
+    igdb_rows: list[dict[str, Any]] = []
+    igdb_skipped = 0
     raw_vods: list[tuple[str, dict[str, Any]]] = []
 
     for source in SOURCES:
@@ -441,6 +518,7 @@ def collect(
             if source == "twitch":
                 for game in result["games"]:
                     twitch_hist[normalize(game["name"])] = {"name": game["name"], "viewers_fr": game["viewers_fr"]}
+                    twitch_igdb[normalize(game["name"])] = str(game.get("igdb_id") or "")
                 vods = list(result["vods"])
                 status["counts"] = {"games": len(twitch_hist), "vods": len(vods), "private": int(result.get("private_vods", 0))}
             elif source == "youtube":
@@ -450,6 +528,10 @@ def collect(
                         entry = youtube_hist.setdefault(normalize(vod["game_name"]), {"views_per_hour_sum": 0})
                         entry["views_per_hour_sum"] += vod["views_per_hour"]
                 status["counts"] = {"videos": len(vods)}
+            elif source == "igdb":
+                igdb_rows = list(result["releases"])
+                igdb_skipped = int(result.get("skipped_rows", 0))
+                vods = []
             elif source == "steam_fr":
                 for game in result["games"]:
                     sellers_hist[str(game["appid"])] = {"name": game["name"], "rank": game["rank"],
@@ -472,7 +554,9 @@ def collect(
         except Exception as exc:  # une source en erreur ne bloque pas les autres, jamais avalée
             status.update(status="error", error=f"{type(exc).__name__} : {exc}" if not isinstance(exc, (VeilleError, veille_sources.SourceError)) else str(exc), counts={})
             if source == "twitch":
-                twitch_hist = {}
+                twitch_hist, twitch_igdb = {}, {}
+            elif source == "igdb":
+                igdb_rows, igdb_skipped = [], 0
             elif source == "steam":
                 steam_hist = {}
             elif source == "steam_fr":
@@ -506,11 +590,18 @@ def collect(
             vod_counts[candidate["game_key"]] = vod_counts.get(candidate["game_key"], 0) + 1
 
     games = _build_games(twitch_hist, steam_hist, youtube_hist, vod_counts, previous, table, sellers_hist)
+    releases = _group_releases(igdb_rows, today, table)
+    if sources["igdb"]["status"] == "ok":
+        sources["igdb"]["counts"] = {"rows": len(igdb_rows), "recent": len(releases["recent"]),
+                                     "upcoming": len(releases["upcoming"]), "skipped_rows": igdb_skipped}
+    for game in games:
+        game["release"] = _release_marker(game, twitch_igdb.get(game["key"], ""), releases["recent"])
     by_key = {g["key"]: g for g in games}
     for candidate in candidates:
         game = by_key.get(candidate["game_key"])
+        candidate["signals"] = {"release_days_since": game["release"]["days_since"] if game and game["release"] else None}
         if game:
-            candidate["signals"] = {"twitch_delta_pct": game["twitch_delta_pct"], "steam_delta_pct": game["steam_delta_pct"],
+            candidate["signals"] |= {"twitch_delta_pct": game["twitch_delta_pct"], "steam_delta_pct": game["steam_delta_pct"],
                                     "steam_rank_gain": game["steam_rank_gain"], "steam_new_in_top": game["steam_new_in_top"],
                                     "steam_sellers_gain": game["steam_sellers_gain"], "steam_sellers_new": game["steam_sellers_new"]}
 
@@ -519,7 +610,7 @@ def collect(
     })
     state = {
         "date": day, "started_at": started_at, "finished_at": now.isoformat() if finalize else None, "sources": sources,
-        "games": games, "candidates": candidates, "excluded": excluded,
+        "games": games, "candidates": candidates, "excluded": excluded, "releases": releases,
         "llm": {"status": "skipped", "error": None, "model": None},
         "proposals": [], "skipped_note": "", "refresh_requested_at": None,
     }
@@ -574,6 +665,28 @@ def _fmt(value: Any) -> str:
     return "inconnu" if value is None else str(value)
 
 
+def _release_line(entry: dict[str, Any], *, upcoming: bool) -> str:
+    when = f"{entry['date']} J-{entry['days']}" if upcoming else f"J+{-entry['days']}"
+    return f"- {entry['name']} : {when} hypes={_fmt(entry.get('hypes'))} plateformes={', '.join(entry.get('platforms') or [])}"
+
+
+def _releases_block(day_state: dict[str, Any], table: dict[str, object]) -> list[str]:
+    """Bloc « Sorties de jeux (IGDB) » du prompt (R15) ; source en erreur : indisponible avec l'erreur."""
+    igdb = (day_state.get("sources") or {}).get("igdb")
+    if not igdb or igdb.get("status") != "ok":
+        reason = igdb["error"] if igdb else "relevé sans source IGDB"
+        return ["", f"Sorties de jeux : indisponibles ({reason})"]
+    releases = day_state.get("releases") or _empty_releases()
+    lines = ["", "Sorties de jeux (IGDB) :", "Sorties récentes :"]
+    lines += [_release_line(e, upcoming=False) for e in releases["recent"]] or ["- aucune"]
+    lines += ["Sorties à venir :"]
+    lines += [_release_line(e, upcoming=True) for e in releases["upcoming"]] or ["- aucune"]
+    lines.append(
+        f"Un jeu sorti depuis 0 à {table['release_window_days']} jours est dans sa fenêtre de sortie : à qualité de "
+        "gameplay égale, propose d'abord ses VOD ; une sortie à venir n'est pas un motif de choix aujourd'hui.")
+    return lines
+
+
 def _prompt(day_state: dict[str, Any], table: dict[str, object]) -> str:
     taste = str(table["taste"]).strip() or "aucune préférence déclarée"
     lines = [
@@ -597,7 +710,10 @@ def _prompt(day_state: dict[str, Any], table: dict[str, object]) -> str:
             f"ventes_fr_rang={_fmt(game.get('steam_sellers_rank'))} "
             f"ventes_fr_gain_vs_semaine_derniere={_fmt(game.get('steam_sellers_gain'))} "
             f"ventes_fr_nouveau={_fmt(game.get('steam_sellers_new'))} "
-            f"youtube_views_per_hour={_fmt(game.get('youtube_views_per_hour'))} vod_count={_fmt(game.get('vod_count'))}")
+            f"youtube_views_per_hour={_fmt(game.get('youtube_views_per_hour'))} vod_count={_fmt(game.get('vod_count'))} "
+            f"sortie_j_plus={_fmt((game.get('release') or {}).get('days_since'))} "
+            f"hypes_igdb={_fmt((game.get('release') or {}).get('hypes'))}")
+    lines += _releases_block(day_state, table)
     lines += ["", "Candidats (VOD) :"]
     for c in day_state["candidates"]:
         signals = c.get("signals") or {}
@@ -610,7 +726,8 @@ def _prompt(day_state: dict[str, Any], table: dict[str, object]) -> str:
             f"steam_rank_gain_vs_last_week={_fmt(signals.get('steam_rank_gain'))} "
             f"steam_new_in_top={_fmt(signals.get('steam_new_in_top'))} "
             f"ventes_fr_gain_vs_semaine_derniere={_fmt(signals.get('steam_sellers_gain'))} "
-            f"ventes_fr_nouveau={_fmt(signals.get('steam_sellers_new'))}")
+            f"ventes_fr_nouveau={_fmt(signals.get('steam_sellers_new'))} "
+            f"sortie_j_plus={_fmt(signals.get('release_days_since'))}")
     return "\n".join(lines)
 
 

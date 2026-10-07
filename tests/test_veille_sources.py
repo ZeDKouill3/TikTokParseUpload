@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlparse
 
@@ -41,10 +42,10 @@ class FakeHttp:
         self.routes = {k: (list(v) if isinstance(v, list) else v) for k, v in routes.items()}
         self.calls: list[dict] = []
 
-    def __call__(self, method, url, *, params=None, headers=None, timeout_s=20):
+    def __call__(self, method, url, *, params=None, headers=None, timeout_s=20, content=None):
         path = urlparse(url).path
         self.calls.append({"method": method, "url": url, "path": path, "params": dict(params or {}),
-                           "headers": dict(headers or {}), "timeout_s": timeout_s})
+                           "headers": dict(headers or {}), "timeout_s": timeout_s, "content": content})
         for (m, suffix), reply in self.routes.items():
             if m == method and path.endswith(suffix):
                 if callable(reply):
@@ -75,7 +76,7 @@ def _twitch_routes(over=None):
                    "pagination": {"cursor": "c1"}}),
             (200, {"data": [_stream("1", "Jeu Alpha", 30), _stream("", "", 999)], "pagination": {}}),
         ],
-        ("GET", "/helix/games/top"): [(200, {"data": [{"id": "1", "name": "Jeu Alpha"}]})],
+        ("GET", "/helix/games/top"): [(200, {"data": [{"id": "1", "name": "Jeu Alpha", "igdb_id": "777"}]})],
         ("GET", "/helix/videos"): [(200, {"data": [{
             "id": "v10", "url": "https://www.twitch.tv/videos/10", "title": "Soirée", "user_name": "streamer_a",
             "duration": "3h2m1s", "published_at": "2026-10-06T05:00:00Z", "view_count": 600,
@@ -142,7 +143,7 @@ def test_token_renewed_after_401(tmp_path):
     result = _twitch(tmp_path, http)
     assert len(http.to("/oauth2/token")) == 2
     assert [c["headers"]["Authorization"] for c in http.to("/helix/streams")] == ["Bearer tok1", "Bearer tok2"]
-    assert result["games"] == [{"name": "Jeu Alpha", "viewers_fr": 10}]
+    assert result["games"] == [{"name": "Jeu Alpha", "viewers_fr": 10, "igdb_id": "777"}]
 
 
 def test_secret_in_no_file_and_no_error_message(tmp_path):
@@ -176,7 +177,8 @@ def test_secret_not_in_message_when_transport_raises(tmp_path):
 def test_viewers_fr_summed_over_cursor_pages(tmp_path):
     http = FakeHttp(_twitch_routes())
     result = _twitch(tmp_path, http)
-    assert result["games"] == [{"name": "Jeu Alpha", "viewers_fr": 130}, {"name": "Jeu Beta", "viewers_fr": 50}]
+    assert result["games"] == [{"name": "Jeu Alpha", "viewers_fr": 130, "igdb_id": "777"},
+                               {"name": "Jeu Beta", "viewers_fr": 50, "igdb_id": ""}]  # absent de games/top : chaîne vide
     pages = http.to("/helix/streams")
     assert [p["params"].get("after") for p in pages] == [None, "c1"]
     assert all(p["params"]["language"] == "fr" and p["params"]["first"] == 100 for p in pages)
@@ -399,6 +401,138 @@ def test_collect_integration_source_error_ranged_as_status_error(tmp_path, monke
         assert SECRET not in text and YKEY not in text
 
 
+# -- IGDB (TASK-9d01, SPEC-4efa R12) -----------------------------------------
+
+IGDB_URL = "https://api.igdb.com/v4/release_dates"
+WINDOW_START = 1789948800  # 2026-09-21T00:00Z = minuit UTC de J-15 (aujourd'hui Paris = 2026-10-06)
+WINDOW_END = 1792540800    # 2026-10-21T00:00Z = minuit UTC de J+14+1
+
+
+def _row(game_id, name, date, **over):
+    row = {"id": game_id * 10, "date": date, "human": "x", "platform": {"name": "PC"},
+           "release_region": {"region": "Worldwide"}, "status": {"name": "Released"},
+           "date_format": {"format": "YYYY-MM-DD"},
+           "game": {"id": game_id, "name": name, "slug": name.lower(), "url": f"https://igdb.test/{game_id}",
+                    "hypes": 12, "first_release_date": date}}
+    row.update(over)
+    return row
+
+
+class FakeClock:
+    """Horloge injectée : ``sleep`` la fait avancer."""
+
+    def __init__(self):
+        self.now = NOW
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += timedelta(seconds=seconds)
+
+
+def _igdb(tmp_path, http, clock=None, **over):
+    clock = clock or FakeClock()
+    collector = veille_sources.default_collectors(http, clock=clock, sleep=clock.sleep)["igdb"]
+    return collector(_settings(tmp_path, **over))
+
+
+def _igdb_routes(pages):
+    return {("POST", "/oauth2/token"): [_token()], ("POST", "/v4/release_dates"): [(200, p) for p in pages]}
+
+
+def test_igdb_request_shape_headers_and_body(tmp_path):
+    http = FakeHttp(_igdb_routes([[_row(1, "Hytale", 1791244800)]]))
+    _igdb(tmp_path, http)
+    (call,) = http.to("/v4/release_dates")
+    assert call["method"] == "POST" and call["url"] == IGDB_URL
+    assert call["headers"] == {"Client-ID": "cid", "Authorization": "Bearer tok1", "Accept": "application/json"}
+    body = call["content"]
+    assert "game.name" in body and "game.hypes" in body
+    assert f"where date >= {WINDOW_START} & date < {WINDOW_END}" in body
+    assert "sort date asc" in body and "limit 500" in body and "offset 0" in body
+
+
+def test_igdb_shares_the_twitch_token_cache(tmp_path):
+    http = FakeHttp({**_twitch_routes(), ("POST", "/v4/release_dates"): [(200, [])]})
+    _twitch(tmp_path, http)
+    _igdb(tmp_path, http)
+    assert len(http.to("/oauth2/token")) == 1  # même twitch_token.json
+    assert http.to("/v4/release_dates")[0]["headers"]["Authorization"] == "Bearer tok1"
+
+
+def test_igdb_renews_token_once_on_401(tmp_path):
+    http = FakeHttp({("POST", "/oauth2/token"): [_token("tok1"), _token("tok2")],
+                     ("POST", "/v4/release_dates"): [(401, {"message": "bad"}), (200, [_row(1, "Hytale", 1791244800)])]})
+    result = _igdb(tmp_path, http)
+    assert [c["headers"]["Authorization"] for c in http.to("/v4/release_dates")] == ["Bearer tok1", "Bearer tok2"]
+    assert len(result["releases"]) == 1
+
+
+def test_igdb_maps_rows_and_counts_skipped(tmp_path):
+    no_date = _row(5, "Sans Date", 1)
+    del no_date["date"]
+    rows = [
+        _row(1, "Hytale", 1791244800),                                    # 2026-10-06 UTC
+        _row(2, "Sans Hype", 1791331200 + 86399, game={"id": 2, "name": "Sans Hype", "slug": "s", "url": "u"}),
+        _row(3, "x", 1791244800, game=None),                              # sans game
+        _row(4, "x", 1791244800, game={"id": 4}),                         # sans game.name
+        no_date,                                                          # sans date
+    ]
+    result = _igdb(tmp_path, FakeHttp(_igdb_routes([rows])))
+    assert result["skipped_rows"] == 3
+    first, second = result["releases"]
+    assert first == {"igdb_id": "1", "name": "Hytale", "slug": "hytale", "url": "https://igdb.test/1", "hypes": 12,
+                     "first_release_date": 1791244800, "date": "2026-10-06", "human": "x", "platform": "PC",
+                     "region": "Worldwide", "status": "Released", "date_format": "YYYY-MM-DD"}
+    assert second["hypes"] is None and second["date"] == "2026-10-07"  # jour UTC, hypes absent = null (pas 0)
+
+
+def test_igdb_paginates_while_500_rows_and_caps_pages(tmp_path):
+    full = [_row(i, f"G{i}", 1791244800) for i in range(1, 501)]
+    http = FakeHttp(_igdb_routes([full, full, [_row(9999, "Dernier", 1791244800)]]))
+    result = _igdb(tmp_path, http)
+    calls = http.to("/v4/release_dates")
+    assert [f"offset {o};" in c["content"] for c, o in zip(calls, (0, 500, 1000))] == [True] * 3 and len(calls) == 3
+    assert len(result["releases"]) == 1001
+    capped = FakeHttp(_igdb_routes([full]))
+    _igdb(tmp_path, capped, igdb_pages_max=3)
+    assert len(capped.to("/v4/release_dates")) == 3  # toujours 500 lignes : arrêt au plafond
+    one = FakeHttp(_igdb_routes([full]))
+    _igdb(tmp_path, one, igdb_pages_max=1)
+    assert len(one.to("/v4/release_dates")) == 1
+
+
+def test_igdb_requests_are_spaced_by_250_ms(tmp_path):
+    clock = FakeClock()
+    full = [_row(i, f"G{i}", 1791244800) for i in range(1, 501)]
+    stamps = []
+
+    def reply(call):
+        stamps.append(clock())
+        return 200, full if len(stamps) < 3 else []
+
+    http = FakeHttp({("POST", "/oauth2/token"): [_token()], ("POST", "/v4/release_dates"): reply})
+    _igdb(tmp_path, http, clock)
+    assert len(stamps) == 3
+    assert all((b - a) >= timedelta(milliseconds=250) for a, b in zip(stamps, stamps[1:]))
+
+
+def test_igdb_429_names_the_rate_limit_without_secrets(tmp_path):
+    http = FakeHttp({**_igdb_routes([]), ("POST", "/v4/release_dates"): [(429, {"message": f"Too many {SECRET}"})]})
+    with pytest.raises(veille_sources.SourceError, match="4 requêtes/s") as err:
+        _igdb(tmp_path, http)
+    assert "429" in str(err.value) and SECRET not in str(err.value) and "tok1" not in str(err.value)
+    assert len(http.to("/v4/release_dates")) == 1  # pas de réessai
+
+
+def test_igdb_http_error_has_no_secret(tmp_path):
+    http = FakeHttp({**_igdb_routes([]), ("POST", "/v4/release_dates"): [(500, {"message": f"boom tok1 {SECRET}"})]})
+    with pytest.raises(veille_sources.SourceError) as err:
+        _igdb(tmp_path, http)
+    assert "HTTP 500" in str(err.value) and "tok1" not in str(err.value) and SECRET not in str(err.value)
+
+
 # -- (6) tests réels optionnels ---------------------------------------------
 
 _REAL = os.environ.get("CLIPPER_REAL_NETWORK") == "1"
@@ -599,3 +733,22 @@ def test_check_twitch_access_lets_other_errors_through(error):
     with pytest.raises(Exception) as caught:
         veille_sources.check_twitch_access("u", 5, ydl_factory=_ydl_with(error))
     assert not isinstance(caught.value, veille_sources.AccessRestricted)
+
+
+@real_only
+def test_real_igdb_release_dates_in_window(tmp_path):
+    settings = _real_settings(tmp_path)
+    if not settings["twitch_client_id"]:
+        pytest.skip("TWITCH_CLIENT_ID / TWITCH_CLIENT_SECRET absents")
+    captured = []
+
+    def spy(*args, **kwargs):
+        captured.append(kwargs.get("content"))
+        return veille_sources.default_http(*args, **kwargs)
+
+    result = veille_sources.default_collectors(spy)["igdb"](settings)
+    assert result["releases"], "IGDB doit rendre au moins une sortie sur la fenêtre du jour"
+    start, end = (int(x) for x in re.search(r"date >= (\d+) & date < (\d+)", captured[-1]).groups())
+    for release in result["releases"]:
+        day = datetime.fromisoformat(release["date"]).replace(tzinfo=timezone.utc).timestamp()
+        assert start - 86400 < day < end  # date en secondes Unix, dans la fenêtre demandée

@@ -116,6 +116,8 @@ def test_config_defaults_are_exactly_r1():
         "steam_name_lookups_max": 100, "twitch_access_check_max": 30, "twitch_client_id": "", "twitch_client_secret": "", "youtube_api_key": "",
         "state_dir": "state/veille", "http_timeout_s": 20,
         "steam_rank_gain_min": 5, "steam_risers_max": 10, "steam_sellers_top": 50,
+        "upcoming_days": 14, "release_window_days": 15, "igdb_min_hypes": 0, "igdb_releases_max": 30,
+        "igdb_pages_max": 4,
     }
 
 
@@ -945,3 +947,243 @@ def test_default_access_check_goes_through_veille_sources(tmp_path, config, monk
     monkeypatch.setattr(veille_sources, "check_twitch_access", lambda url, timeout_s: seen.append((url, timeout_s)))
     veille.collect(NOW, collectors=_collectors(vods=[_vod("ok")]), config=config)
     assert seen == [("https://example.test/ok", 20)]
+
+
+# ==========================================================================
+# TASK-9d01 : source IGDB, sorties du jour, repère J+N, prompt (SPEC-4efa R11 à R16)
+# ==========================================================================
+
+EMPTY_RELEASES = {"recent": [], "upcoming": [], "excluded_low_hypes": 0, "truncated": {"recent": 0, "upcoming": 0}}
+
+
+def _rel(igdb_id, name, date, *, hypes=10, platform="PC", region="Worldwide", status="Released"):
+    return {"igdb_id": str(igdb_id), "name": name, "slug": name.lower().replace(" ", "-"),
+            "url": f"https://igdb.test/{igdb_id}", "first_release_date": None, "date": date, "hypes": hypes,
+            "human": date, "platform": platform, "region": region, "status": status, "date_format": "YYYY-MM-DD"}
+
+
+def _with_igdb(releases, *, skipped=0, **kwargs):
+    collectors = _collectors(**kwargs)
+    collectors["igdb"] = Collector({"releases": list(releases), "skipped_rows": skipped})
+    return collectors
+
+
+def _day(tmp_path):
+    return _read(_sdir(tmp_path) / "days" / f"{TODAY}.json")
+
+
+@pytest.mark.parametrize("key, bad", [
+    ("upcoming_days", 0), ("release_window_days", -1), ("igdb_min_hypes", -1),
+    ("igdb_releases_max", 0), ("igdb_pages_max", 0), ("upcoming_days", True), ("igdb_pages_max", "4"),
+])
+def test_igdb_settings_out_of_bounds_raise_naming_the_key(tmp_path, key, bad):
+    config = _make_config(tmp_path, **{key: bad})
+    with pytest.raises(veille.VeilleError, match=key):
+        veille.collect(NOW, collectors=_collectors(), config=config)
+
+
+def test_release_window_zero_is_valid(tmp_path):
+    state = veille.collect(NOW, collectors=_with_igdb([_rel(1, "Pile Aujourdhui", TODAY)]),
+                           config=_make_config(tmp_path, release_window_days=0))
+    assert [r["name"] for r in state["releases"]["recent"]] == ["Pile Aujourdhui"]
+
+
+@pytest.mark.parametrize("empty_key", ["twitch_client_id", "twitch_client_secret"])
+def test_igdb_missing_twitch_keys_is_error_and_collector_not_called(tmp_path, empty_key):
+    config = _make_config(tmp_path, **{empty_key: ""})
+    collectors = _with_igdb([_rel(1, "Hytale", TODAY)])
+    state = veille.collect(NOW, collectors=collectors, config=config)
+    assert state["sources"]["igdb"]["status"] == "error"
+    assert state["sources"]["igdb"]["error"] == f"{empty_key} absente : à saisir dans Réglages › Veille"
+    assert collectors["igdb"].calls == 0
+    assert state["releases"] == EMPTY_RELEASES
+
+
+def test_failing_igdb_leaves_empty_releases_no_marker_other_sources_and_history_intact(tmp_path):
+    ok_dir, ko_dir = tmp_path / "ok", tmp_path / "ko"
+    vods = [_vod("v1")]
+    veille.collect(NOW, collectors=_with_igdb([_rel(1, "Jeu Alpha", TODAY)], vods=vods), config=_make_config(ok_dir))
+    broken = _collectors(vods=vods)
+    broken["igdb"] = Collector(error=veille_sources.SourceError("HTTP 500 igdb boom"))
+    state = veille.collect(NOW, collectors=broken, config=_make_config(ko_dir))
+    assert state["sources"]["igdb"]["status"] == "error" and "igdb boom" in state["sources"]["igdb"]["error"]
+    assert state["releases"] == EMPTY_RELEASES
+    assert all(g["release"] is None for g in state["games"])
+    assert all(c["signals"]["release_days_since"] is None for c in state["candidates"])
+    assert all(state["sources"][s]["status"] == "ok" for s in ("twitch", "youtube", "steam", "steam_fr"))
+    history = lambda base: _read(base / "state" / "veille" / "history" / f"{TODAY}.json")  # noqa: E731
+    assert history(ko_dir) == history(ok_dir)
+
+
+def test_igdb_groups_by_igdb_id_with_earliest_date_and_unique_sorted_lists(tmp_path):
+    rows = [
+        _rel(1, "Hytale", "2026-10-04", platform="PS5", region="Europe", status="Released"),
+        _rel(1, "Hytale", "2026-10-02", platform="PC", region="Worldwide", status="Early Access"),
+        _rel(1, "Hytale", "2026-10-04", platform="PC", region="Europe", status="Released"),
+    ]
+    state = veille.collect(NOW, collectors=_with_igdb(rows), config=_make_config(tmp_path))
+    (entry,) = state["releases"]["recent"]
+    assert entry == {"igdb_id": "1", "name": "Hytale", "key": "hytale", "slug": "hytale", "url": "https://igdb.test/1",
+                     "hypes": 10, "date": "2026-10-02", "human": "2026-10-02", "platforms": ["PC", "PS5"],
+                     "regions": ["Europe", "Worldwide"], "statuses": ["Early Access", "Released"], "days": -4}
+    assert state["releases"]["upcoming"] == []
+
+
+def test_igdb_window_bounds_recent_and_upcoming(tmp_path):
+    rows = [_rel(1, "Moins16", "2026-09-20"), _rel(2, "Moins15", "2026-09-21"), _rel(3, "Zero", "2026-10-06"),
+            _rel(4, "Plus1", "2026-10-07"), _rel(5, "Plus14", "2026-10-20"), _rel(6, "Plus15", "2026-10-21")]
+    state = veille.collect(NOW, collectors=_with_igdb(rows), config=_make_config(tmp_path))
+    releases = state["releases"]
+    assert sorted(r["name"] for r in releases["recent"]) == ["Moins15", "Zero"]
+    assert sorted(r["name"] for r in releases["upcoming"]) == ["Plus1", "Plus14"]
+    assert [r["days"] for r in releases["upcoming"]] == [1, 14]
+
+
+def test_igdb_sort_orders(tmp_path):
+    rows = [
+        _rel(1, "Vieux", "2026-10-01", hypes=500), _rel(2, "RecentBas", "2026-10-05", hypes=1),
+        _rel(3, "RecentHaut", "2026-10-05", hypes=50), _rel(4, "RecentNull", "2026-10-05", hypes=None),
+        _rel(5, "RecentB", "2026-10-05", hypes=None),
+        _rel(6, "TardHaut", "2026-10-12", hypes=90), _rel(7, "TotBas", "2026-10-08", hypes=1),
+        _rel(8, "TotHaut", "2026-10-08", hypes=9), _rel(9, "TotNull", "2026-10-08", hypes=None),
+    ]
+    state = veille.collect(NOW, collectors=_with_igdb(rows), config=_make_config(tmp_path))
+    # recent : days décroissant, puis hypes décroissant (null en dernier), puis nom
+    assert [r["name"] for r in state["releases"]["recent"]] == [
+        "RecentHaut", "RecentBas", "RecentB", "RecentNull", "Vieux"]
+    # upcoming : date croissante, puis hypes décroissant (null en dernier), puis nom
+    assert [r["name"] for r in state["releases"]["upcoming"]] == ["TotHaut", "TotBas", "TotNull", "TardHaut"]
+
+
+def test_igdb_min_hypes_drops_low_and_missing_and_counts(tmp_path):
+    rows = [_rel(1, "Gros", "2026-10-05", hypes=100), _rel(2, "Petit", "2026-10-05", hypes=3),
+            _rel(3, "Inconnu", "2026-10-05", hypes=None), _rel(4, "AVenirPetit", "2026-10-08", hypes=1),
+            _rel(5, "AVenirGros", "2026-10-08", hypes=5)]
+    state = veille.collect(NOW, collectors=_with_igdb(rows), config=_make_config(tmp_path, igdb_min_hypes=5))
+    assert [r["name"] for r in state["releases"]["recent"]] == ["Gros"]
+    assert [r["name"] for r in state["releases"]["upcoming"]] == ["AVenirGros"]
+    assert state["releases"]["excluded_low_hypes"] == 3
+
+
+def test_igdb_min_hypes_zero_keeps_unknown_hypes(tmp_path):
+    state = veille.collect(NOW, collectors=_with_igdb([_rel(1, "Inconnu", "2026-10-05", hypes=None)]),
+                           config=_make_config(tmp_path))
+    assert [r["name"] for r in state["releases"]["recent"]] == ["Inconnu"]
+    assert state["releases"]["excluded_low_hypes"] == 0
+
+
+def test_igdb_lists_truncated_to_max_with_counts_and_source_counts(tmp_path):
+    recent = [_rel(i, f"R{i}", "2026-10-05", hypes=100 - i) for i in range(1, 6)]
+    upcoming = [_rel(10 + i, f"U{i}", "2026-10-08", hypes=100 - i) for i in range(1, 4)]
+    state = veille.collect(NOW, collectors=_with_igdb(recent + upcoming, skipped=2),
+                           config=_make_config(tmp_path, igdb_releases_max=2))
+    assert [r["name"] for r in state["releases"]["recent"]] == ["R1", "R2"]
+    assert [r["name"] for r in state["releases"]["upcoming"]] == ["U1", "U2"]
+    assert state["releases"]["truncated"] == {"recent": 3, "upcoming": 1}
+    counts = state["sources"]["igdb"]["counts"]
+    assert counts == {"rows": 8, "recent": 2, "upcoming": 2, "skipped_rows": 2}
+    assert state["sources"]["igdb"]["status"] == "ok" and state["sources"]["igdb"]["error"] is None
+    assert _day(tmp_path)["releases"] == state["releases"]  # écrit dans days/<date>.json
+
+
+def _games_collectors(*, twitch_games, releases, vods=()):
+    collectors = _with_igdb(releases, vods=vods)
+    collectors["twitch"] = Collector({"games": twitch_games, "vods": list(vods)})
+    return collectors
+
+
+def test_game_release_marker_matches_by_igdb_id_first_then_by_key_only_for_recent(tmp_path):
+    games = [
+        {"name": "Nom Twitch Different", "viewers_fr": 900, "igdb_id": "42"},   # par igdb_id (noms différents)
+        {"name": "Hytale", "viewers_fr": 800, "igdb_id": ""},                   # par clé normalisée
+        {"name": "Jeu Alpha", "viewers_fr": 700, "igdb_id": "7"},               # l'id gagne sur la clé
+        {"name": "A Venir", "viewers_fr": 600, "igdb_id": "9"},                 # sortie à venir : pas de repère
+        {"name": "Sans Sortie", "viewers_fr": 500},                             # champ igdb_id absent, aucune sortie
+    ]
+    releases = [_rel(42, "Autre Nom IGDB", "2026-10-03", hypes=33), _rel(5, "Hytale", "2026-10-05", hypes=77),
+                _rel(7, "Pas Alpha", "2026-10-06", hypes=None), _rel(6, "Jeu Alpha", "2026-09-30"),
+                _rel(9, "A Venir", "2026-10-09")]
+    state = veille.collect(NOW, collectors=_games_collectors(twitch_games=games, releases=releases),
+                           config=_make_config(tmp_path))
+    by_name = {g["name"]: g for g in state["games"]}
+    assert by_name["Nom Twitch Different"]["release"] == {
+        "igdb_id": "42", "name": "Autre Nom IGDB", "date": "2026-10-03", "days_since": 3, "hypes": 33}
+    assert by_name["Hytale"]["release"] == {
+        "igdb_id": "5", "name": "Hytale", "date": "2026-10-05", "days_since": 1, "hypes": 77}
+    assert by_name["Jeu Alpha"]["release"] == {
+        "igdb_id": "7", "name": "Pas Alpha", "date": "2026-10-06", "days_since": 0, "hypes": None}
+    assert by_name["A Venir"]["release"] is None
+    assert by_name["Sans Sortie"]["release"] is None
+
+
+def test_candidates_copy_release_days_since_from_their_game(tmp_path):
+    games = [{"name": "Hytale", "viewers_fr": 800, "igdb_id": "5"}, {"name": "Jeu Alpha", "viewers_fr": 700, "igdb_id": ""}]
+    vods = [_vod("h1", game="Hytale"), _vod("a1", game="Jeu Alpha"), _vod("o1", game="Orphelin")]
+    state = veille.collect(NOW, collectors=_games_collectors(
+        twitch_games=games, vods=vods, releases=[_rel(5, "Hytale", "2026-10-03")]), config=_make_config(tmp_path))
+    days = {c["video_id"]: c["signals"]["release_days_since"] for c in state["candidates"]}
+    assert days == {"h1": 3, "a1": None, "o1": None}
+
+
+def _prompt_state(*, releases=None, igdb=None, game_release=None, days_since=None):
+    state = _day_state("twitch:AAA")
+    state["games"][0].update(release=game_release, steam_players=None)
+    state["candidates"][0]["signals"]["release_days_since"] = days_since
+    state["releases"] = releases if releases is not None else EMPTY_RELEASES
+    state["sources"] = {"igdb": igdb or {"status": "ok", "error": None, "counts": {}}}
+    return state
+
+
+def _decide_prompt(tmp_path, state, **table):
+    fake = FakeBackend([_picks()])
+    with llm.use_backend(fake):
+        veille.decide(state, _make_config(tmp_path, **table))
+    assert len(fake.calls) == 1  # un seul appel, comme avant
+    return fake.calls[0].prompt
+
+
+def test_prompt_carries_release_markers_on_game_and_candidate_lines(tmp_path):
+    state = _prompt_state(game_release={"igdb_id": "5", "name": "Jeu Alpha", "date": "2026-10-03", "days_since": 3,
+                                        "hypes": 77}, days_since=3)
+    prompt = _decide_prompt(tmp_path, state)
+    game_line = next(line for line in prompt.splitlines() if line.startswith("- Jeu Alpha :"))
+    assert "sortie_j_plus=3" in game_line and "hypes_igdb=77" in game_line
+    candidate_line = next(line for line in prompt.splitlines() if line.startswith("- id=twitch:AAA"))
+    assert "sortie_j_plus=3" in candidate_line
+
+
+def test_prompt_marks_unknown_release_as_inconnu(tmp_path):
+    prompt = _decide_prompt(tmp_path, _prompt_state())
+    game_line = next(line for line in prompt.splitlines() if line.startswith("- Jeu Alpha :"))
+    assert "sortie_j_plus=inconnu" in game_line and "hypes_igdb=inconnu" in game_line
+    candidate_line = next(line for line in prompt.splitlines() if line.startswith("- id=twitch:AAA"))
+    assert "sortie_j_plus=inconnu" in candidate_line
+
+
+def test_prompt_has_release_block_and_priority_instruction(tmp_path):
+    releases = {"recent": [{"igdb_id": "5", "name": "Hytale", "days": -3, "hypes": 77, "date": "2026-10-03",
+                            "platforms": ["PC", "PS5"]}],
+                "upcoming": [{"igdb_id": "6", "name": "Gros Jeu", "days": 4, "hypes": None, "date": "2026-10-10",
+                              "platforms": ["Xbox"]}],
+                "excluded_low_hypes": 0, "truncated": {"recent": 0, "upcoming": 0}}
+    prompt = _decide_prompt(tmp_path, _prompt_state(releases=releases), release_window_days=12)
+    assert "Sorties de jeux (IGDB)" in prompt
+    assert "Hytale" in prompt and "J+3" in prompt and "77" in prompt and "PC, PS5" in prompt
+    assert "Gros Jeu" in prompt and "2026-10-10" in prompt and "J-4" in prompt and "Xbox" in prompt
+    assert ("Un jeu sorti depuis 0 à 12 jours est dans sa fenêtre de sortie : à qualité de gameplay égale, "
+            "propose d'abord ses VOD ; une sortie à venir n'est pas un motif de choix aujourd'hui.") in prompt
+
+
+def test_prompt_says_releases_unavailable_with_the_error(tmp_path):
+    igdb = {"status": "error", "error": "HTTP 500 igdb boom", "counts": {}}
+    prompt = _decide_prompt(tmp_path, _prompt_state(igdb=igdb))
+    assert "Sorties de jeux : indisponibles (HTTP 500 igdb boom)" in prompt
+    assert "Sorties de jeux (IGDB)" not in prompt
+
+
+def test_decide_schema_check_and_call_count_unchanged_with_releases(tmp_path):
+    fake = FakeBackend([_picks("twitch:AAA")])
+    with llm.use_backend(fake):
+        state = veille.decide(_prompt_state(), _make_config(tmp_path))
+    assert len(fake.calls) == 1 and fake.calls[0].usage == "veille" and fake.calls[0].images == []
+    assert [p["candidate_id"] for p in state["proposals"]] == ["twitch:AAA"]
