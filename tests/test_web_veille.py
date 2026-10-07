@@ -1384,3 +1384,12 @@ def test_deja_decidees_lists_the_most_recent_decision_first(tmp_path):
         {**_prop("soir", "queued", 1, {"state": "running", "label": "en cours"}), "decided_at": "2026-10-07T20:50:00+00:00"},
     ])
     assert _ids(html.split("<details", 1)[1]) == ["soir", "matin"]
+
+
+def test_a_list_queued_in_the_same_minute_keeps_claudes_order(tmp_path):
+    html = proposals_html(tmp_path, [
+        {**_prop("deux", "queued", 2), "decided_at": "2026-10-07T20:51:40+00:00"},
+        {**_prop("un", "queued", 1), "decided_at": "2026-10-07T20:51:12+00:00"},
+        {**_prop("matin", "queued", 1), "decided_at": "2026-10-07T08:08:00+00:00"},
+    ])
+    assert _ids(html.split("<details", 1)[1]) == ["un", "deux", "matin"]

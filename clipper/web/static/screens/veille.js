@@ -209,9 +209,10 @@ function veilleProposalGroups(proposals) {
   const byRank = (a, b) => a.rank - b.rank;
   return {
     pending: proposals.filter((p) => p.status === "proposed").sort(byRank),
-    // Mises en file : la plus récemment décidée d'abord (un relevé rejoué garde les décisions des relevés d'avant).
+    // Mises en file : la décision la plus récente d'abord, à la minute près (une liste mise en file d'un coup reste
+    // dans l'ordre de Claude) ; un relevé rejoué garde les décisions des relevés d'avant (SPEC-bdd9).
     decided: proposals.filter((p) => p.status === "queued")
-      .sort((a, b) => String(b.decided_at || "").localeCompare(String(a.decided_at || "")) || byRank(a, b)),
+      .sort((a, b) => String(b.decided_at || "").slice(0, 16).localeCompare(String(a.decided_at || "").slice(0, 16)) || byRank(a, b)),
     ignored: proposals.filter((p) => p.status === "ignored").length,
   };
 }
