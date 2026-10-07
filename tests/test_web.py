@@ -9624,3 +9624,39 @@ def test_video_sheet_shows_the_moment_source_only_when_present():
     js = _static("screens", "jury-radar.js")
 
     assert "m.source" in js and "passage d'action" in js and "transcription" in js
+
+
+def test_clips_selection_bar_has_select_all_and_clear_buttons():
+    js = (STATIC / "screens" / "clips.js").read_text(encoding="utf-8")
+    assert "Tout sélectionner" in js and "data-clips-sel-all" in js
+    assert "Vider la sélection" in js and "data-clips-sel-clear" in js
+
+
+def test_clips_select_all_takes_every_filtered_clip_and_whole_series(tmp_path):
+    import shutil
+    import subprocess
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node absent du PATH")
+    harness = tmp_path / "h.js"
+    harness.write_text("""
+const fs = require("fs"), vm = require("vm");
+const ctx = vm.createContext({ console, location: { hash: "" }, document: { addEventListener() {} }, window: { addEventListener() {} }, Screens: {} });
+const src = fs.readFileSync(process.argv[2], "utf8").replace(/^const clipsUi = /m, "var clipsUi = ");
+vm.runInContext(src, ctx);
+const data = [
+  { video_id: "v1", clip_id: "00", parts_total: 1, part: 1, publish_status: "à valider", channel: "a" },
+  { video_id: "v1", clip_id: "01-p1", parts_total: 2, part: 1, publish_status: "à valider", channel: "a" },
+  { video_id: "v1", clip_id: "01-p2", parts_total: 2, part: 2, publish_status: "approuvé", channel: "a" },
+  { video_id: "v2", clip_id: "00", parts_total: 1, part: 1, publish_status: "à valider", channel: "b" },
+  { video_id: "v3", clip_id: "00", parts_total: 1, part: 1, publish_status: "publié", channel: "a" },
+];
+ctx.clipsUi.data = data;
+const keys = vm.runInContext("(d, ui) => Array.from(clipsAllKeys(d, ui)).sort()", ctx)(data, { filter: "à valider", channel: "a", video: "" });
+process.stdout.write(JSON.stringify(keys));
+""", encoding="utf-8")
+    done = subprocess.run([node, str(harness), str(STATIC / "screens" / "clips.js")], capture_output=True, text=True, encoding="utf-8")
+    assert done.returncode == 0, done.stderr
+    # filtre « à valider » + style a : 00 et 01-p1 ; 01-p2 (approuvé) vient avec sa série ; v2 (style b) et v3 (publié) exclus ;
+    # clipsAllKeys ne dépend pas de la page affichée (clipsUi.shown n'intervient pas).
+    assert json.loads(done.stdout) == ["v1/00", "v1/01-p1", "v1/01-p2"]

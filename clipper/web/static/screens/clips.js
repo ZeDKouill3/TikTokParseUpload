@@ -98,6 +98,8 @@ function clipsSelectionBarHtml() {
   return `<div class="sel-bar" id="clips-selbar">
     <span>${n} clip${n === 1 ? "" : "s"} sélectionné${n === 1 ? "" : "s"}</span>
     <select class="input" id="clips-sel-account" aria-label="Compte de publication"><option value="">Chargement…</option></select>
+    <button type="button" class="btn btn-xs" data-clips-sel-all>${icon("list-checks", "i-xs")}Tout sélectionner</button>
+    <button type="button" class="btn btn-xs btn-ghost" data-clips-sel-clear${n ? "" : " disabled"}>${icon("x", "i-xs")}Vider la sélection</button>
     <span class="grow"></span>
     <button type="button" class="btn btn-ghost" data-clips-sel-cancel>Annuler</button>
     <button type="button" class="btn btn-ok" data-clips-sel-approve${n ? "" : " disabled"}>${icon("check", "i-xs")}Approuver la sélection</button>
@@ -163,9 +165,22 @@ function clipsWire(body) {
   if (selBar) {
     clipsFillSelAccounts($("#clips-sel-account", selBar));
     $("[data-clips-sel-cancel]", selBar).onclick = () => { clipsUi.selecting = false; clipsUi.selected = new Set(); renderCurrent(); };
+    $("[data-clips-sel-all]", selBar).onclick = () => { clipsUi.selected = clipsAllKeys(clipsUi.data, clipsUi); renderCurrent(); };
+    $("[data-clips-sel-clear]", selBar).onclick = () => { clipsUi.selected = new Set(); renderCurrent(); };
     const approveBtn = $("[data-clips-sel-approve]", selBar);
     if (approveBtn) approveBtn.onclick = () => clipsApproveSelection($("#clips-sel-account", selBar).value);
   }
+}
+
+/* « Tout sélectionner » : tous les clips du filtre courant (statut, vidéo, style), pas seulement la page affichée ;
+   une série y est entière dès qu'une de ses parties passe le filtre (même règle que clipsToggleSelect). */
+function clipsAllKeys(all, ui) {
+  const keys = new Set();
+  clipsFiltered(all, ui).forEach((c) => {
+    const series = clipSeries(c);
+    (series.length ? series.map(clipKey) : [clipKey(c)]).forEach((k) => keys.add(k));
+  });
+  return keys;
 }
 
 /* Cocher une partie coche toute sa serie (TASK-e99b) : meme decision groupee que l'approbation groupee cote serveur. */
