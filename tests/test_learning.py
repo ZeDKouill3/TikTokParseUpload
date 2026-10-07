@@ -537,3 +537,216 @@ def test_sync_json_shape(tmp_path):
     assert sync["last_sync"] == NOW.isoformat() and sync["last_error"] is None
     assert sync["results"] == [f"{VIDEO}/03"] and sync["scored"] == [f"{VIDEO}/03"] and sync["excluded"] == []
     assert set(sync["calibration"]) == {"at", "clips", "untraced", "weights_path"}
+
+
+# ---------------------------------------------------------------- coach des prompts (TASK-c108, SPEC-00db R6)
+
+import re  # noqa: E402
+from datetime import timedelta  # noqa: E402
+
+from clipper import jury, jury_coach, llm  # noqa: E402
+from clipper.llm.fake import FakeBackend  # noqa: E402
+
+JUDGES = ("retention", "spectateur", "monteur", "avocat", "conformite")
+NEW_PERSPECTIVE = "NEUVE perspective de {judge} : {judge} juge la chute autant que l'accroche, avec nuance."
+
+
+def _coach_config(tmp_path, **learning_overrides) -> Config:
+    config = _config(tmp_path, **learning_overrides)
+    config._sections["moments"] = {"rubric_path": "builtin"}
+    config._sections["jury_coach"] = {"prompts_dir": str(tmp_path / "prompts")}
+    return config
+
+
+def _coach_world(config, n=12, *, traced=True, at=NOW - timedelta(days=1)) -> None:
+    """n clips scored (moments 1..n) : sidecar avec transcript, trace du jury, result et stats au journal."""
+    journal = config.section("outcomes")["journal_path"]
+    moments, scored = [], []
+    for k in range(1, n + 1):
+        clip_id = f"{k:02d}"
+        path = _sidecar(config, clip_id, post_id=f"70000000000001{k:02d}", state="published")
+        side = _read(path)
+        side.update(transcript=f"texte {k}", source_title="Titre source", screen_title=f"Titre ecran {k}")
+        path.write_text(json.dumps(side), encoding="utf-8")
+        outcomes.record(VIDEO, clip_id, k, qa={"status": "passed" if k % 2 == 0 else "rejected", "issues": []}, path=journal)
+        outcomes._append({"kind": "stats", "video_id": VIDEO, "clip_id": clip_id, "moment_id": k, "recorded_at": at.isoformat(),
+                          "stats": {"views_percentile": 0.5}}, journal)
+        wrong = 0 if k % 2 == 0 else 100  # note passee a l'envers du resultat reel
+        trace = {"rounds": [{"round": 1, "judges": {j: {"score": wrong, "argument": "..."} for j in JUDGES}}]}
+        moments.append({"id": k, "jury": {"trace": trace}} if traced else {"id": k})
+        scored.append(f"{VIDEO}/{clip_id}")
+    _moments(config, VIDEO, moments)
+    state = Path(config.section("learning")["state_dir"])
+    state.mkdir(parents=True, exist_ok=True)
+    (state / "sync.json").write_text(json.dumps({"last_sync": at.isoformat(), "scored": scored, "results": scored}), encoding="utf-8")
+
+
+def _coach_responder(request):
+    if request.usage == "coach":
+        judge = next(j for j in JUDGES if f"juge {j}" in request.prompt)
+        return {"perspective": NEW_PERSPECTIVE.format(judge=judge), "justification": "mieux sur les cas"}
+    k = int(re.search(r"texte (\d+)", request.prompt)[1])
+    good = (k % 2 == 0) == ("NEUVE" in request.prompt)
+    return {"scores": {name: 10 if good else 0 for name in request.schema["properties"]["scores"]["properties"]}}
+
+
+def _coach_file(config) -> dict:
+    return _read(Path(config.section("learning")["state_dir"]) / "coach.json")
+
+
+def test_coach_settings_declared():
+    assert learning.CONFIG_DEFAULTS["coach_min_new_cases"] == 10
+    assert learning.CONFIG_DEFAULTS["coach_min_interval_days"] == 7
+
+
+def test_coach_does_not_call_the_llm_below_the_new_cases_threshold(tmp_path):
+    config = _coach_config(tmp_path, coach_min_new_cases=13)
+    _coach_world(config, n=12)
+    fake = FakeBackend([_coach_responder])
+    with llm.use_backend(fake):
+        assert learning.coach_if_due(NOW, config=config) == []
+    assert fake.calls == [] and not (Path(config.section("learning")["state_dir"]) / "coach.json").exists()
+
+
+def test_coach_does_not_call_the_llm_before_the_interval(tmp_path):
+    config = _coach_config(tmp_path)
+    _coach_world(config, n=12, at=NOW - timedelta(days=1))
+    state = Path(config.section("learning")["state_dir"])
+    # 12 clips scored apres last_run : le seuil est atteint, seul l'intervalle (7 j) bloque
+    last = (NOW - timedelta(days=3)).isoformat()
+    (state / "coach.json").write_text(json.dumps({"last_run": last, "runs": []}), encoding="utf-8")
+    _coach_world(config, n=12, at=NOW - timedelta(days=1))
+    fake = FakeBackend([_coach_responder])
+    with llm.use_backend(fake):
+        assert learning.coach_if_due(NOW, config=config) == []
+    assert fake.calls == []
+
+
+def test_coach_counts_only_cases_newer_than_last_run(tmp_path):
+    config = _coach_config(tmp_path)
+    _coach_world(config, n=12, at=NOW - timedelta(days=20))  # tous anterieurs a last_run
+    state = Path(config.section("learning")["state_dir"])
+    (state / "coach.json").write_text(json.dumps({"last_run": (NOW - timedelta(days=10)).isoformat(), "runs": []}),
+                                      encoding="utf-8")
+    fake = FakeBackend([_coach_responder])
+    with llm.use_backend(fake):
+        assert learning.coach_if_due(NOW, config=config) == []
+    assert fake.calls == []
+
+
+def test_coach_records_every_entry_as_proposed_or_rejected_and_touches_nothing_else(tmp_path):
+    config = _coach_config(tmp_path)
+    _coach_world(config, n=12)
+    config_toml = tmp_path / "config.toml"
+    config_toml.write_text("mode = 'auto'\n", encoding="utf-8")
+    jury_py = Path(jury.__file__)
+    before = (config_toml.read_bytes(), jury_py.read_bytes())
+    fake = FakeBackend([_coach_responder])
+
+    with llm.use_backend(fake):
+        entries = learning.coach_if_due(NOW, config=config)
+
+    coach = _coach_file(config)
+    assert coach["last_run"] == NOW.isoformat() and len(coach["runs"]) == 1
+    run = coach["runs"][0]
+    assert run["at"] == NOW.isoformat() and run["cases"] == 12
+    assert {e["judge"] for e in run["judges"]} == set(JUDGES) - set(jury_coach.EXCLUDED_JUDGES)
+    assert run["judges"] == entries
+    for entry in run["judges"]:
+        assert entry["accepted"] is True and entry["status"] == "proposed"
+        assert entry["decided_at"] is None and entry["decided_by"] is None
+        assert entry["version"] == 1 and Path(entry["path"]).exists()
+        assert entry["metric"]["after"] < entry["metric"]["before"]
+        assert NEW_PERSPECTIVE.format(judge=entry["judge"]) in Path(entry["path"]).read_text(encoding="utf-8")
+    assert (config_toml.read_bytes(), jury_py.read_bytes()) == before
+    assert not (tmp_path / "jury_weights.json").exists()
+
+
+def test_coach_passes_the_documented_cases_to_propose(tmp_path, monkeypatch):
+    config = _coach_config(tmp_path)
+    _coach_world(config, n=12)
+    seen = {}
+
+    def spy(cases, rubric, judges, **kw):
+        seen.update(cases=cases, judges=judges)
+        return [{"judge": "retention", "accepted": False, "reason": "pas assez de cas connus", "version": None,
+                 "path": None, "metric": None}]
+
+    monkeypatch.setattr(jury_coach, "propose", spy)
+    entries = learning.coach_if_due(NOW, config=config)
+
+    first = seen["cases"][0]
+    assert set(first) == {"video_id", "moment_id", "text", "context", "trace"}
+    assert first["video_id"] == VIDEO and first["moment_id"] == 1 and first["text"] == "texte 1"
+    assert first["context"] == "Titre source — Titre ecran 1" and "rounds" in first["trace"]
+    assert len(seen["cases"]) == 12
+    assert set(seen["judges"]) == set(JUDGES)  # perspectives actives du jury, defauts de clipper.jury
+    assert seen["judges"]["retention"] == jury.CONFIG_DEFAULTS["judges"]["retention"]["perspective"]
+    assert entries[0]["status"] == "rejected" and entries[0]["reason"] == "pas assez de cas connus"
+
+
+def test_coach_skips_clips_without_trace(tmp_path):
+    config = _coach_config(tmp_path)
+    _coach_world(config, n=12, traced=False)
+    fake = FakeBackend([_coach_responder])
+    with llm.use_backend(fake):
+        assert learning.coach_if_due(NOW, config=config) == []
+    assert fake.calls == []
+
+
+def test_coach_disabled_does_nothing(tmp_path):
+    config = _coach_config(tmp_path, enabled=False)
+    _coach_world(config, n=12)
+    fake = FakeBackend([_coach_responder])
+    with llm.use_backend(fake):
+        assert learning.coach_if_due(NOW, config=config) == []
+    assert fake.calls == []
+
+
+def test_run_if_due_chains_the_coach_after_the_calibration(tmp_path, monkeypatch):
+    config = _coach_config(tmp_path)
+    order = []
+    monkeypatch.setattr(learning, "link_if_due", lambda *a, **k: order.append("link") or [])
+    monkeypatch.setattr(learning, "_snapshot_newer_than_sync", lambda *a, **k: True)
+    monkeypatch.setattr(learning, "sync", lambda *a, **k: order.append("sync"))
+    monkeypatch.setattr(learning, "coach_if_due", lambda *a, **k: order.append("coach") or [])
+
+    result = learning.run_if_due(NOW, config=config)
+
+    assert order == ["link", "sync", "coach"] and result["synced"] is True
+
+
+def test_run_if_due_writes_a_coach_error_in_sync_json_and_logs_it_once(tmp_path, monkeypatch, caplog):
+    config = _coach_config(tmp_path)
+    monkeypatch.setattr(learning, "link_if_due", lambda *a, **k: [])
+    monkeypatch.setattr(learning, "_snapshot_newer_than_sync", lambda *a, **k: False)
+
+    def boom(*a, **k):
+        raise jury_coach.CoachError("statut qa inconnu 'x' (clip '01')")
+
+    monkeypatch.setattr(learning, "coach_if_due", boom)
+    learning._logged_coach_errors.clear()
+    with caplog.at_level("ERROR", logger="clipper.learning"):
+        learning.run_if_due(NOW, config=config)
+        learning.run_if_due(NOW, config=config)
+
+    error = _read(Path(config.section("learning")["state_dir"]) / "sync.json")["last_error"]
+    assert error["where"] == "coach" and "statut qa inconnu" in error["message"] and error["at"] == NOW.isoformat()
+    assert len([r for r in caplog.records if "statut qa inconnu" in r.getMessage()]) == 1
+
+
+def test_decide_proposal_marks_it_once_and_unknown_is_404(tmp_path):
+    config = _coach_config(tmp_path)
+    _coach_world(config, n=12)
+    with llm.use_backend(FakeBackend([_coach_responder])):
+        learning.coach_if_due(NOW, config=config)
+
+    entry = learning.decide_proposal(config, "retention", 1, "adopted", by="web", now=NOW)
+    assert entry["status"] == "adopted" and entry["decided_by"] == "web" and entry["decided_at"] == NOW.isoformat()
+    assert learning.proposal_perspective(entry["path"]) == NEW_PERSPECTIVE.format(judge="retention")
+    with pytest.raises(learning.ProposalError) as again:
+        learning.decide_proposal(config, "retention", 1, "refused", by="web")
+    assert again.value.status == 409
+    with pytest.raises(learning.ProposalError) as unknown:
+        learning.decide_proposal(config, "retention", 9, "refused", by="web")
+    assert unknown.value.status == 404

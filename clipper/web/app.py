@@ -42,6 +42,7 @@ from clipper import network as network_mod
 from clipper import channel as channel_mod
 from clipper import gpu as gpu_mod
 from clipper import journal as journal_mod
+from clipper import learning as learning_mod
 from clipper import moments as moments_mod
 from clipper import pipeline
 from clipper import publish as publish_mod
@@ -3306,6 +3307,54 @@ def create_app(config: Config | None = None) -> FastAPI:
     def delete_channel_letterbox_layout(name: str) -> dict[str, Any]:
         _letterbox_write(name, None)
         return _letterbox_view(name)
+    # ----------------------------------------------------------------
+    # Apprentissage (ADR-c260, SPEC-00db R6-R7) : lecture de l'etat et decision humaine sur le coach.
+    # Aucune route ne calcule ni n'appelle un LLM : le worker seul verse, recalibre et coache (ADR-09ad).
+    # ----------------------------------------------------------------
+
+    @app.get("/api/learning")
+    def get_learning() -> dict[str, Any]:
+        try:
+            return learning_mod.status(config)
+        except learning_mod.LearningError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    def _learning_decide(judge: str, version: int, status: str) -> dict[str, Any]:
+        nonlocal config
+        try:
+            if judge in learning_mod.EXCLUDED_JUDGES:
+                raise learning_mod.ProposalError(f"le juge {judge} n'est jamais coaché", 409)
+            proposal = learning_mod.find_proposal(config, judge, version)
+            if proposal["status"] != "proposed":
+                raise learning_mod.ProposalError(f"proposition {judge} v{version} déjà {proposal['status']}", 409)
+            comments_lost = False
+            if status == "adopted":
+                perspective = learning_mod.proposal_perspective(proposal["path"])
+                raw, _exists, text = _settings_read_raw()
+                comments_lost = _settings_has_comments(text)
+                data = dict(raw)
+                jury_table = dict(data.get("jury") or {})
+                judges = dict(jury_table.get("judges") or {})
+                judges[judge] = {**(judges.get(judge) or {}), "perspective": perspective}
+                data["jury"] = {**jury_table, "judges": judges}
+                write_config(_BASE_CONFIG, data)
+                config = load_config(_BASE_CONFIG)  # les prochains jugements lisent la perspective adoptee
+                app.state.config = config
+            decided = learning_mod.decide_proposal(config, judge, version, status, by="web")
+        except learning_mod.ProposalError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        except (learning_mod.LearningError, ConfigError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {**decided, "comments_lost": comments_lost}
+
+    @app.post("/api/learning/coach/{judge}/{version}/adopt")
+    def adopt_coach_proposal(judge: str, version: int) -> dict[str, Any]:
+        return _learning_decide(judge, version, "adopted")
+
+    @app.post("/api/learning/coach/{judge}/{version}/refuse")
+    def refuse_coach_proposal(judge: str, version: int) -> dict[str, Any]:
+        return _learning_decide(judge, version, "refused")
+
     # ----------------------------------------------------------------
     # Statistiques (SPEC-c100 E7)
     # ----------------------------------------------------------------

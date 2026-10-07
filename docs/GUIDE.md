@@ -278,7 +278,8 @@ La navigation (barre latérale, onglets en bas sur téléphone) donne :
    TikTok.
 7. **Statistiques** : par clip (résultats importés, décisions humaines, QA),
    coûts LLM par vidéo, usage et période, durée par étape, import CSV des
-   statistiques de la plateforme.
+   statistiques de la plateforme. Une section **Apprentissage** (voir plus bas)
+   montre ce que la boucle a appris des résultats réels.
 8. **Réglages** : `config.toml` en formulaire (mode global, dossiers, backend
    et modèle LLM par usage, surveillance), écriture validée avant d'être
    enregistrée ; section « Accès » (hôte, jeton masqué) en lecture seule avec
@@ -343,9 +344,40 @@ mémoire seule (un redémarrage reprend où l'on en était) :
   confirmation, dernière erreur) ;
 - `state/publish/<chaine>.json` : file de publication et créneaux pris ;
 - `state/veille/` : la veille des sujets chauds (voir plus bas).
+- `state/learning/` : la boucle d'apprentissage (`links.json`, `sync.json`, `coach.json`).
 
 Chemins réglables dans `[worker]`, `[watch]`, `[publish]` et `[veille]`. Les vidéos
 elles-mêmes restent sous `workspace/<video_id>/` et `output/<video_id>/`.
+
+### Apprentissage : la section de l'écran Statistiques
+
+Sous les statistiques TikTok, la section **Apprentissage** (ADR-c260) lit
+`GET /api/learning` ; elle ne lance aucun calcul ni appel à Claude, le worker
+seul verse, recalibre et coache. Trois blocs :
+
+- **État de la boucle** : date du dernier versement, dernière erreur (en
+  rouge, avec l'étape en cause), clips reliés à leur post TikTok et non
+  reliés (avec la raison : aucun post ne correspond, plusieurs posts
+  correspondent), clips exclus de l'apprentissage avec leur raison (trop
+  récent, compte sous le minimum de posts à vues, absent du relevé, service
+  sans statistiques) ;
+- **Poids par juge** : poids, accord avec les résultats réels, nombre de cas
+  et raison quand le poids reste à 1 (`state/jury_weights.json`) ;
+- **Coach des prompts** : quand `coach_min_new_cases` clips mûrs nouveaux
+  existent (10 par défaut) et que `coach_min_interval_days` jours se sont
+  écoulés depuis le dernier passage (7 par défaut, réglages de `[learning]`),
+  le worker demande à Claude une retouche de perspective par juge (sauf
+  `conformite`, jamais coaché), la rejoue sur des cas passés et consigne le
+  résultat dans `state/learning/coach.json`. Chaque proposition affiche la
+  métrique avant → après (erreur moyenne de prédiction, plus bas est mieux),
+  la perspective en place et la perspective proposée.
+
+**Le coach ne s'applique jamais seul.** Tu décides : **Adopter** écrit la
+perspective proposée dans `[jury.judges.<juge>] perspective` de `config.toml`
+(comme l'écran Réglages : les commentaires du fichier sont perdus, un
+avertissement le signale), **Refuser** la met de côté ; dans les deux cas la
+proposition est marquée avec la date et `web`, et ne peut plus être décidée
+une seconde fois. Rien n'est modifié dans `clipper/jury.py` ni dans les poids.
 
 ### Surveillance des VOD
 

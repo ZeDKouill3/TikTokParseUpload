@@ -5,7 +5,7 @@ slug: apprentissage-3-4-coach-des-prompts-sur-d-clench
 title: "Apprentissage (3/4) : coach des prompts sur déclencheur (coach_min_new_cases, coach_min_interval_days) consigné dans state/learning/coach.json, jamais appliqué seul ; GET /api/learning, Adopter (écrit la perspective dans config.toml) / Refuser, section « Apprentissage » de l'écran Statistiques, GUIDE et CHANGELOG (SPEC R6-R7)"
 created: 2026-10-07T10:27:51Z
 author: w-learnplan
-status: open
+status: done
 scope:
   - clipper/learning.py
   - clipper/web/app.py
@@ -20,8 +20,15 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/14c77c29ab12@c1d31c1
+    tree: scope/05db98de0194
+    criteria: 8828bb1d6651
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---
 
 ADR-c260 point 7 et SPEC associée R6-R7. `clipper/jury_coach.py` (TASK-6595) existe, n'est appelé de nulle part, écrit ses propositions adoptables dans `prompts/jury/<juge>/vN.md` et dit lui-même que « l'adoption réelle du prompt reste un acte séparé » : cette tâche est cet acte, humain, dans l'interface. Les perspectives des juges viennent de `clipper/jury.py` (défauts `_RETENTION`, `_SPECTATEUR`, `_MONTEUR`, `_AVOCAT`, `_CONFORMITE`) surchargées par `[jury.judges.<nom>].perspective` dans `config.toml` : adopter = écrire cette clé, par `config.write_config` comme `PUT /api/settings` (`clipper/web/app.py`, `_settings_merge`, préservation des commentaires).
