@@ -12,6 +12,10 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ### Ajouté
 
+- Veille : écran « Sorties de jeux » (IGDB) entre les propositions et les meilleurs clips : sorties récentes
+  (badge J+N) et à venir (badge J-N) avec hypes, plateformes et lien ; badge « Sortie J+N » sur les
+  propositions et dans « Ce qui monte » ; source « IGDB (sorties) » dans le bandeau. Réglages › Veille :
+  `upcoming_days`, `release_window_days`, `igdb_min_hypes`, validés à l'enregistrement (400 hors bornes).
 - Veille : une VOD YouTube sans jeu reçoit son jeu si son titre ou ses tags contiennent, en mot(s)
   entier(s), le nom d'un jeu déjà relevé aujourd'hui (Twitch, Steam, IGDB). Plusieurs jeux : le nom le
   plus long gagne s'il contient les autres, sinon aucun jeu. Aucune devinette, aucun appel à Claude pour

@@ -257,11 +257,11 @@ function setVeilleKey(key, label) {
 }
 
 function setVeille() {
-  const shown = ["enabled", "run_at", "max_vods_per_day", "best_clips_per_day", "language", "region", "rise_min_pct", "baseline_days"];
+  const shown = ["enabled", "run_at", "max_vods_per_day", "best_clips_per_day", "language", "region", "rise_min_pct", "baseline_days", "upcoming_days", "release_window_days", "igdb_min_hypes"];
   const hidden = [...shown, "taste", "state_dir", ...SET_VEILLE_KEYS.map(([k]) => k)];
   const taste = setEffective(["veille", "taste"]);
   return `<section class="panel" id="set-veille"><div class="panel-head"><h2>Veille</h2><span class="muted mono">[veille]</span></div><div class="panel-pad">
-    <p class="muted set-note">Chaque jour, Claude propose des VOD à clipper d'après Twitch, YouTube et Steam. Rien ne tourne tant que « enabled » est faux. Les clés se créent dans les consoles Twitch et Google Cloud (docs/GUIDE.md) ; Steam n'en demande aucune.</p>
+    <p class="muted set-note">Chaque jour, Claude propose des VOD à clipper d'après Twitch, YouTube et Steam, et liste les sorties de jeux d'IGDB (mêmes clés Twitch). Rien ne tourne tant que « enabled » est faux. Les clés se créent dans les consoles Twitch et Google Cloud (docs/GUIDE.md) ; Steam n'en demande aucune.</p>
     <div class="form-grid">
       ${shown.map((k) => setField(["veille", k], k, (setUi.data.defaults.veille[k] || {}).comment)).join("")}
       <div class="field set-field full" data-fpath="veille.taste"><label for="set-veille-taste" class="mono">taste</label>

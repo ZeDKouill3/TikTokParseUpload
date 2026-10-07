@@ -385,6 +385,19 @@ limite.
 
 **Steam** n'a besoin d'aucune clé (API publique des joueurs connectés).
 
+**IGDB (sorties de jeux)** utilise les clés Twitch déjà saisies (IGDB appartient à
+Twitch, même jeton d'application) : rien de plus à créer. L'écran affiche une
+section **Sorties de jeux** entre les propositions et les meilleurs clips :
+« Sorties récentes » (badge `J+N`, hypes, plateformes, lien IGDB) puis « À venir »
+(date, badge `J-N`). Les propositions et les lignes de « Ce qui monte » dont le
+jeu vient de sortir portent un badge « Sortie J+N », et Claude donne la priorité
+aux jeux dans leur fenêtre de sortie. Trois réglages dans Réglages › Veille :
+`upcoming_days` (14, horizon des sorties à venir, >= 1), `release_window_days`
+(15, jours après la sortie où un jeu est « récent », >= 0) et `igdb_min_hypes`
+(0, hypes IGDB minimum pour apparaître, >= 0 ; 0 = pas de filtre). Une liste
+vide s'affiche « Aucune sortie dans la fenêtre » ; si IGDB répond en erreur,
+la cause est affichée en rouge et aucune liste n'est montrée.
+
 Les clés s'écrivent dans `config.toml` (`[veille]`), jamais ailleurs : l'écran
 Réglages ne les réaffiche jamais (il dit seulement « saisie » ou « absente »),
 un champ laissé vide garde la valeur actuelle, et elles sont masquées dans le

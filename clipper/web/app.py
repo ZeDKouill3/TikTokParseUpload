@@ -3247,7 +3247,14 @@ def create_app(config: Config | None = None) -> FastAPI:
         nonlocal config
         raw, _exists, _text = _settings_read_raw()
         try:
-            write_config(_BASE_CONFIG, _settings_merge(raw, body.settings))
+            merged = _settings_merge(raw, body.settings)
+            if "veille" in body.settings:  # mêmes bornes que la veille elle-même (VeilleError -> 400)
+                try:
+                    veille_mod.settings(Config(mode="review", workspace_dir=Path("."), output_dir=Path("."),
+                                               _sections={"veille": merged["veille"]}))
+                except veille_mod.VeilleError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+            write_config(_BASE_CONFIG, merged)
             config = load_config(_BASE_CONFIG)  # les entrees de file suivantes lisent le nouveau mode/backend
         except ConfigError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
