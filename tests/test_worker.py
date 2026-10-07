@@ -2921,35 +2921,105 @@ def test_a_select_best_error_is_logged_and_does_not_stop_the_worker(tmp_path, mo
     assert w._process is None
 
 
-# ---- rattachement post -> clip (TASK-32ae)
+# ---- apprentissage : rattachement puis versement (TASK-32ae, TASK-7136)
 
-def test_tick_calls_the_learning_linker_every_turn(tmp_path):
+def _learning_config(tmp_path):
+    config = _config(tmp_path)
+    config._sections.update({
+        "learning": {"state_dir": str(tmp_path / "learning")},
+        "tiktok": {"stats_dir": str(tmp_path / "stats")},
+        "outcomes": {"journal_path": str(tmp_path / "outcomes.jsonl")},
+        "jury_calibration": {"weights_path": str(tmp_path / "weights.json")},
+        "accounts": {"state_file": str(tmp_path / "accounts.json")},
+        "publish": {"state_dir": str(tmp_path / "pub")},
+    })
+    return config
+
+
+def _sync_json(config) -> dict:
+    return json.loads((Path(config.section("learning")["state_dir"]) / "sync.json").read_text(encoding="utf-8"))
+
+
+def test_tick_calls_run_if_due_every_turn_before_the_veille(tmp_path):
     calls = []
 
-    def linker(now, *, config):
-        calls.append(config)
-        return [{"video_id": VIDEO_A, "clip_id": "c1", "post_id": "1"}]
+    def runner(now, *, config):
+        calls.append("learning")
+        return {"linked": [{"video_id": VIDEO_A, "clip_id": "c1", "post_id": "1"}], "synced": False}
 
-    config = _config(tmp_path)
-    w = worker.Worker(config=config, spawner=FakeSpawner(), learning_linker=linker)
+    config = _learning_config(tmp_path)
+    w = worker.Worker(config=config, spawner=FakeSpawner(), learning_runner=runner)
+    w._veille_due = lambda: calls.append("veille")
     w.tick()
     w.tick()
-    assert calls == [config, config]
+    assert calls == ["learning", "veille", "learning", "veille"]
 
 
-def test_a_learning_error_is_logged_once_and_does_not_stop_the_worker(tmp_path, caplog):
-    import logging
-
+def test_the_default_runner_is_learning_run_if_due(tmp_path):
     from clipper import learning
 
-    def linker(now, *, config):
-        raise learning.LearningError("sidecar illisible (casse.json)")
+    assert worker.Worker(config=_learning_config(tmp_path), spawner=FakeSpawner()).learning_runner is learning.run_if_due
 
-    w = worker.Worker(config=_config(tmp_path), spawner=FakeSpawner(), learning_linker=linker)
+
+def test_run_if_due_links_then_syncs_only_when_a_snapshot_is_newer_than_the_last_sync(tmp_path, monkeypatch):
+    from clipper import learning, tiktok
+
+    config = _learning_config(tmp_path)
+    order = []
+    real_link, real_sync = learning.link_if_due, learning.sync
+    monkeypatch.setattr(learning, "link_if_due", lambda *a, **k: order.append("link") or real_link(*a, **k))
+    monkeypatch.setattr(learning, "sync", lambda *a, **k: order.append("sync") or real_sync(*a, **k))
+    tiktok.append_snapshot("acc", tiktok.get_settings(config), {
+        "account": "acc", "fetched_at": "2026-10-01T10:00:00+00:00", "source": "tiktok_studio", "origin": "full",
+        "overview": {}, "posts": []})
+    w = worker.Worker(config=config, spawner=FakeSpawner())
+
+    w.tick()
+    w.tick()  # rien de plus récent que last_sync : le rattachement repasse, pas le versement
+    assert order == ["link", "sync", "link"]
+    tiktok.append_snapshot("acc", tiktok.get_settings(config), {
+        "account": "acc", "fetched_at": "2999-01-01T00:00:00+00:00", "source": "tiktok_studio", "origin": "full",
+        "overview": {}, "posts": []})
+    w.tick()
+    assert order == ["link", "sync", "link", "link", "sync"]
+
+
+@pytest.mark.parametrize("error_name", ["LearningError", "CalibrationError"])
+def test_a_learning_or_calibration_error_is_written_and_logged_once_without_stopping_the_worker(tmp_path, caplog, error_name):
+    import logging
+
+    from clipper import jury_calibration, learning
+
+    error = {"LearningError": learning.LearningError, "CalibrationError": jury_calibration.CalibrationError}[error_name]
+
+    def runner(now, *, config):
+        exc = error("sidecar illisible (casse.json)")
+        exc.where = "sync"
+        raise exc
+
+    config = _learning_config(tmp_path)
+    w = worker.Worker(config=config, spawner=FakeSpawner(), learning_runner=runner)
     with caplog.at_level(logging.ERROR):
         w.tick()
         w.tick()
     assert caplog.text.count("casse.json") == 1
+    last_error = _sync_json(config)["last_error"]
+    assert set(last_error) == {"at", "where", "message"}
+    assert last_error["where"] == "sync" and "casse.json" in last_error["message"]
+
+
+def test_a_successful_sync_clears_last_error(tmp_path):
+    from clipper import learning, tiktok
+
+    config = _learning_config(tmp_path)
+    learning.record_error(config, "sync", learning.LearningError("avant"))
+    tiktok.append_snapshot("acc", tiktok.get_settings(config), {
+        "account": "acc", "fetched_at": "2026-10-01T10:00:00+00:00", "source": "tiktok_studio", "origin": "full",
+        "overview": {}, "posts": []})
+
+    worker.Worker(config=config, spawner=FakeSpawner()).tick()
+
+    assert _sync_json(config)["last_error"] is None
 
 
 def test_learning_disabled_does_nothing(tmp_path):
@@ -2957,5 +3027,5 @@ def test_learning_disabled_does_nothing(tmp_path):
     config = _config(tmp_path)
     config._sections["learning"] = {"enabled": False}
     worker.Worker(config=config, spawner=FakeSpawner(),
-                  learning_linker=lambda now, *, config: calls.append(1) or []).tick()
+                  learning_runner=lambda now, *, config: calls.append(1) or {}).tick()
     assert calls == []

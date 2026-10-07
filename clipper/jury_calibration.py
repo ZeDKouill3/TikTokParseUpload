@@ -23,10 +23,13 @@ fenetre ``window_days`` (sur ``recorded_at``) :
 - decision humaine : ``accepted``/``approved``/``adjusted`` 1, ``rejected``
   0 ; toute autre valeur est une CalibrationError ;
 - statistiques de plateforme : ``stats_metric`` (fraction 0-1, defaut
-  ``watched_full``).
+  ``views_percentile``) ; une statistique qui ne porte pas cette metrique
+  est ecartee, raison ``no_metric``, sans erreur.
 
-Les statistiques importees du CSV n'ont que ``clip_id`` (video_id et
-moment_id valent None). Elles sont reliees a un moment par les entrees
+Une entree ``stats`` qui porte ``video_id`` et ``moment_id`` (versee par
+clipper.learning) est reliee directement : le meme ``clip_id`` dans deux
+videos n'est plus ambigu. Les statistiques importees du CSV n'ont que
+``clip_id`` (video_id et moment_id valent None). Elles sont reliees a un moment par les entrees
 ``result`` du journal (tout le journal, pas seulement la fenetre) qui portent
 le meme ``clip_id`` avec leur ``video_id``/``moment_id``. Hypothese
 d'unicite : un ``clip_id`` du CSV designe un seul clip de tout le journal.
@@ -55,7 +58,7 @@ clipper.jury (mediane ponderee) :
      "bounds": [min, max], "smoothing", "stats_metric",
      "judges": {nom: {"weight", "agreement", "clips", "previous", "target",
                       "fixed", "reason"}},
-     "ignored_stats": [{"clip_id", "reason": "ambiguous" | "unlinked",
+     "ignored_stats": [{"clip_id", "reason": "ambiguous" | "unlinked" | "no_metric",
                         "matches": [[video_id, moment_id], ...]}]}
 """
 
@@ -86,8 +89,9 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "max_weight": 1.5,
     # Part du poids precedent conservee (0 : pas de lissage).
     "smoothing": 0.5,
-    # Statistique de plateforme retenue comme resultat (fraction 0-1).
-    "stats_metric": "watched_full",
+    # Statistique de plateforme retenue comme resultat (fraction 0-1) : rang des vues a maturite dans le compte
+    # (clipper.learning) ; une statistique qui ne la porte pas est ecartee (``no_metric``).
+    "stats_metric": "views_percentile",
 }
 
 # Jamais recalibres sur l'audience (ADR-1cf0 point 5), en plus des juges a veto.
@@ -124,10 +128,7 @@ def _previous(path: Path) -> dict[str, float]:
 
 def _signals(entry: Mapping[str, Any], metric: str) -> list[float]:
     if entry.get("kind") == "stats":
-        stats = entry.get("stats") or {}
-        if metric not in stats:
-            raise CalibrationError(f"statistique {metric!r} absente pour le clip {entry.get('clip_id')!r}")
-        return [float(stats[metric])]
+        return [float((entry.get("stats") or {})[metric])]  # presence verifiee par l'appelant (no_metric)
     values = []
     qa = entry.get("qa")
     if qa is not None:
@@ -160,13 +161,24 @@ def _outcomes(
         if e.get("kind") == "result":
             owners[e["clip_id"]].add((e["video_id"], e["moment_id"]))
 
+    def linked(e: Mapping[str, Any]) -> bool:
+        """Entree qui porte elle-meme son video_id et son moment_id : reliee sans chercher par clip_id."""
+        return e.get("video_id") is not None and e.get("moment_id") is not None
+
     values: dict[tuple[Any, Any], list[float]] = defaultdict(list)
     ignored: list[dict[str, Any]] = []
     for e in journal:
         if _at(e["recorded_at"]) < since:
             continue
         if e.get("kind") == "stats":
-            matches = sorted(owners.get(e["clip_id"], set()), key=repr)
+            if linked(e):
+                matches = [(e["video_id"], e["moment_id"])]
+            else:
+                matches = sorted(owners.get(e["clip_id"], set()), key=repr)
+            if (e.get("stats") or {}).get(metric) is None:
+                log.warning("statistique du clip %r ecartee de la calibration : no_metric (%s)", e["clip_id"], metric)
+                ignored.append({"clip_id": e["clip_id"], "reason": "no_metric", "matches": [list(m) for m in matches]})
+                continue
             if len(matches) != 1:
                 reason = "ambiguous" if matches else "unlinked"
                 log.warning("statistique du clip %r ecartee de la calibration : %s %s", e["clip_id"], reason, matches)

@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from clipper import learning, publish, tiktok
+from clipper import jury_calibration, learning, outcomes, publish, tiktok
 from clipper.config import Config
 
 ACCOUNT = "compte_a"
@@ -24,6 +24,9 @@ def _config(tmp_path, **learning_overrides) -> Config:
             "tiktok": {"stats_dir": str(tmp_path / "stats")},
             "publish": {"state_dir": str(tmp_path / "pub")},
             "learning": {"state_dir": str(tmp_path / "learning"), **learning_overrides},
+            "outcomes": {"journal_path": str(tmp_path / "outcomes.jsonl")},
+            "jury_calibration": {"weights_path": str(tmp_path / "jury_weights.json")},
+            "accounts": {"state_file": str(tmp_path / "accounts.json")},
         },
     )
 
@@ -257,3 +260,280 @@ def test_attach_post_refuses_to_overwrite_a_different_post_id(tmp_path):
 def test_attach_post_unknown_entry_is_an_error(tmp_path):
     with pytest.raises(publish.PublishError, match="absent"):
         publish.attach_post(VIDEO, "nope", "chaine", post_url="u", post_id="1", state_dir=tmp_path)
+
+
+def test_concurrent_link_passes_do_not_corrupt_links_json_nor_double_count(tmp_path):
+    """Plusieurs workers : deux link_posts simultanés ne se marchent pas dessus (verrou sur links.json)."""
+    import threading
+
+    config = _config(tmp_path)
+    posts = []
+    for n in range(6):
+        _sidecar(config, f"{n:02d}", caption=f"Clip numero {n}", hashtags=())
+        posts.append((f"70000000000000001{n:02d}", f"Clip numero {n}", "2026-10-07T09:00:00"))
+    _snapshot(config, "2026-10-07T10:00:00+00:00", *posts)
+    barrier, errors = threading.Barrier(4), []
+
+    def run():
+        barrier.wait()
+        try:
+            for _ in range(5):
+                learning.link_posts(ACCOUNT, config=config)
+        except Exception as exc:  # noqa: BLE001 : on veut voir toute erreur
+            errors.append(exc)
+
+    threads = [threading.Thread(target=run) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert errors == []
+    assert _links(config)["counts"][ACCOUNT]["linked"] == 6
+
+
+# ---- versement stats -> outcomes (TASK-7136)
+
+NOW = datetime(2026, 10, 10, 13, 0, tzinfo=timezone.utc)
+POST = "7000000000000000101"
+CLIP_POSTED = "2026-09-20T09:00:00"  # heure de Paris
+
+
+def _stats_snapshot(config, fetched_at, posts, account=ACCOUNT) -> None:
+    """posts : {post_id: (posted_at, views, extras)} ; les autres champs du relevé valent null."""
+    rows = []
+    for post_id, (posted_at, views, extras) in posts.items():
+        row = {"post_id": post_id, "post_url": f"https://www.tiktok.com/@x/video/{post_id}", "caption": f"Legende {post_id}",
+               "posted_at": posted_at, "views": views, "likes": None, "comments": None, "shares": None,
+               "avg_watch_s": None, "watched_full": None, "new_followers": None}
+        rows.append({**row, **extras})
+    tiktok.append_snapshot(account, tiktok.get_settings(config), {
+        "account": account, "fetched_at": fetched_at, "source": "tiktok_studio", "origin": "full", "overview": {},
+        "posts": rows})
+
+
+def _others(views_list):
+    return {f"60000000000000000{i:02d}": ("2026-09-15T10:00:00", v, {}) for i, v in enumerate(views_list)}
+
+
+def _linked_clip(config, clip_id="03", *, post_id=POST, account=ACCOUNT, video=VIDEO, qa=None):
+    path = _sidecar(config, clip_id, account=account, post_id=post_id, url=f"https://www.tiktok.com/@x/video/{post_id}",
+                    state="published", video=video)
+    side = _read(path)
+    side["qa"] = qa or {"status": "passed", "issues": []}
+    path.write_text(json.dumps(side), encoding="utf-8")
+    return path
+
+
+def _journal(config) -> list[dict]:
+    return outcomes.read(config.section("outcomes")["journal_path"])
+
+
+def _sync(config) -> dict:
+    learning.sync(NOW, config=config)
+    return _read(Path(config.section("learning")["state_dir"]) / "sync.json")
+
+
+def _scored_account(config, clip_views=750, others=(100, 200, 300, 400, 500, 600, 700, 800, 900, 1000), **extras):
+    """Un compte éligible (10 posts à vues) et un clip relié dont les vues évoluent : 10 à J+1, clip_views à J+4, 2000 à la fin."""
+    for fetched, own in (("2026-09-21T12:00:00+00:00", 10), ("2026-09-24T12:00:00+00:00", clip_views),
+                         ("2026-10-10T12:00:00+00:00", 2000)):
+        _stats_snapshot(config, fetched, {**_others(others), POST: (CLIP_POSTED, own, extras)})
+
+
+def test_new_settings_declared():
+    assert learning.CONFIG_DEFAULTS["maturity_days"] == 3
+    assert learning.CONFIG_DEFAULTS["window_days"] == 90
+    assert learning.CONFIG_DEFAULTS["min_account_posts"] == 10
+
+
+def test_sync_writes_one_result_and_one_stats_entry_per_mature_clip(tmp_path):
+    config = _config(tmp_path)
+    _linked_clip(config, "03", qa={"status": "passed", "issues": [{"type": "weak_hook"}]})
+    _scored_account(config, likes=42, new_followers=0)
+
+    learning.sync(NOW, config=config)
+
+    result, stats = _journal(config)
+    assert result["kind"] == "result" and result["qa"] == {"status": "passed", "issues": [{"type": "weak_hook"}]}
+    assert result["human_decision"] is None
+    assert (result["video_id"], result["clip_id"], result["moment_id"]) == (VIDEO, "03", 3)
+    assert stats["kind"] == "stats"
+    assert (stats["video_id"], stats["clip_id"], stats["moment_id"]) == (VIDEO, "03", 3)
+    assert (stats["post_id"], stats["account"], stats["posted_at"]) == (POST, ACCOUNT, CLIP_POSTED)
+    assert stats["fetched_at"] == "2026-09-24T12:00:00+00:00"
+    assert stats["age_days"] == pytest.approx(4.21, abs=0.01)
+    assert stats["stats"] == {"views": 2000, "views_at_maturity": 750, "views_percentile": 0.7, "likes": 42, "comments": None,
+                              "shares": None, "avg_watch_s": None, "watched_full": None, "new_followers": 0}
+
+
+def test_two_syncs_add_nothing_more(tmp_path):
+    config = _config(tmp_path)
+    _linked_clip(config)
+    _scored_account(config)
+    learning.sync(NOW, config=config)
+    before = _journal(config)
+
+    learning.sync(NOW, config=config)
+
+    assert _journal(config) == before and len(before) == 2
+
+
+def test_part_clip_id_gives_the_moment_id(tmp_path):
+    config = _config(tmp_path)
+    _linked_clip(config, "12-p2")
+    _scored_account(config)
+
+    learning.sync(NOW, config=config)
+
+    assert {e["moment_id"] for e in _journal(config)} == {12}
+
+
+def test_clip_id_of_another_form_is_a_learning_error(tmp_path):
+    config = _config(tmp_path)
+    _linked_clip(config, "clip-02")
+    _scored_account(config)
+
+    with pytest.raises(learning.LearningError, match="clip-02"):
+        learning.sync(NOW, config=config)
+
+
+def test_young_clip_is_excluded_immature_but_its_result_is_recorded(tmp_path):
+    config = _config(tmp_path)
+    _linked_clip(config)
+    _stats_snapshot(config, "2026-09-21T12:00:00+00:00", {**_others(range(100, 1100, 100)), POST: (CLIP_POSTED, 10, {})})
+
+    sync = _sync(config)
+
+    assert [e["kind"] for e in _journal(config)] == ["result"]
+    assert sync["excluded"] == [{"video_id": VIDEO, "clip_id": "03", "account": ACCOUNT, "reason": "immature"}]
+
+
+def test_maturity_keeps_the_first_snapshot_old_enough_with_views(tmp_path):
+    config = _config(tmp_path)
+    _linked_clip(config)
+    base = _others(range(100, 1100, 100))
+    _stats_snapshot(config, "2026-09-21T12:00:00+00:00", {**base, POST: (CLIP_POSTED, 5, {})})  # 1 j : trop jeune
+    _stats_snapshot(config, "2026-09-24T12:00:00+00:00", {**base, POST: (CLIP_POSTED, None, {})})  # mûr, vues non lues
+    _stats_snapshot(config, "2026-09-25T12:00:00+00:00", {**base, POST: (CLIP_POSTED, 777, {})})  # mûr avec vues
+
+    learning.sync(NOW, config=config)
+
+    stats = _journal(config)[1]
+    assert stats["stats"]["views_at_maturity"] == 777 and stats["stats"]["views"] == 777
+    assert stats["fetched_at"] == "2026-09-25T12:00:00+00:00"
+
+
+def test_percentile_ties_take_the_average_rank(tmp_path):
+    config = _config(tmp_path)
+    _linked_clip(config)
+    _scored_account(config, clip_views=100, others=[100] * 5 + [900] * 5)
+
+    learning.sync(NOW, config=config)
+
+    assert _journal(config)[1]["stats"]["views_percentile"] == 0.25  # 6 ex aequo : rang moyen 3,5 -> (3,5-1)/10
+
+
+def test_reference_is_limited_to_the_window(tmp_path):
+    config = _config(tmp_path, window_days=30)
+    _linked_clip(config)
+    old = {f"50000000000000000{i:02d}": ("2026-06-01T10:00:00", 99999, {}) for i in range(5)}
+    _stats_snapshot(config, "2026-09-24T12:00:00+00:00", {**_others(range(100, 1100, 100)), **old, POST: (CLIP_POSTED, 750, {})})
+
+    learning.sync(NOW, config=config)
+
+    assert _journal(config)[1]["stats"]["views_percentile"] == 0.7  # les 5 vieux posts hors fenêtre ne comptent pas
+
+
+def test_account_below_min_posts_has_no_stats_entry(tmp_path):
+    config = _config(tmp_path)
+    _linked_clip(config)
+    _scored_account(config, others=(100, 200, 0, 0, 0, 0, 0, 0, 0, 0))  # 2 posts à vues seulement
+
+    sync = _sync(config)
+
+    assert [e["kind"] for e in _journal(config)] == ["result"]
+    assert sync["excluded"] == [{"video_id": VIDEO, "clip_id": "03", "account": ACCOUNT, "reason": "account_below_min"}]
+    assert sync["accounts"][ACCOUNT]["eligible"] is False
+
+
+def test_eligible_account_is_reported(tmp_path):
+    config = _config(tmp_path)
+    _linked_clip(config)
+    _scored_account(config)
+
+    sync = _sync(config)
+
+    assert sync["accounts"][ACCOUNT] == {"mature_posts": 11, "viewed_posts": 11, "eligible": True}
+
+
+def test_youtube_account_is_excluded_without_stats(tmp_path):
+    config = _config(tmp_path)
+    Path(config.section("accounts")["state_file"]).write_text(json.dumps({"accounts": [
+        {"id": "yt1", "service": "youtube", "label": "Chaine", "platform": "youtube", "username": "u"}]}), encoding="utf-8")
+    _linked_clip(config, account="yt1")
+
+    sync = _sync(config)
+
+    assert _journal(config) == []
+    assert sync["excluded"] == [{"video_id": VIDEO, "clip_id": "03", "account": "yt1", "reason": "service_without_stats"}]
+
+
+def _moments(config, video, moments):
+    path = Path(config.workspace_dir) / video / "moments.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"video_id": video, "moments": moments}), encoding="utf-8")
+
+
+def _trace(score):
+    return {"rounds": [{"round": 1, "judges": {"retention": {"score": score}, "conformite": {"score": 50, "veto": False}}}]}
+
+
+def test_sync_calibrates_with_the_traces_and_counts_the_untraced(tmp_path, monkeypatch):
+    config = _config(tmp_path)
+    _linked_clip(config, "03")
+    _linked_clip(config, "04", post_id="7000000000000000102")  # moment 4 : pas de trace
+    _linked_clip(config, "05", post_id="7000000000000000103", video="WWWWWWWWWWW")  # pas de moments.json
+    _moments(config, VIDEO, [{"id": 3, "jury": {"trace": _trace(80)}, "exploration": True}, {"id": 4}])
+    for fetched in ("2026-09-24T12:00:00+00:00", "2026-10-10T12:00:00+00:00"):
+        _stats_snapshot(config, fetched, {**_others(range(100, 1100, 100)), POST: (CLIP_POSTED, 750, {}),
+                                          "7000000000000000102": (CLIP_POSTED, 300, {}),
+                                          "7000000000000000103": (CLIP_POSTED, 200, {})})
+    calls = []
+    real = jury_calibration.calibrate
+    monkeypatch.setattr(jury_calibration, "calibrate", lambda traces, **kw: calls.append(list(traces)) or real(traces, **kw))
+
+    sync = _sync(config)
+
+    assert calls == [[{"video_id": VIDEO, "moment_id": 3, "candidate": {"trace": _trace(80)}}]]
+    assert sync["calibration"]["clips"] == 1 and sync["calibration"]["untraced"] == 2
+    assert sync["calibration"]["weights_path"] == str(tmp_path / "jury_weights.json")
+    assert sync["calibration"]["at"] == NOW.isoformat()
+    assert (tmp_path / "jury_weights.json").exists()
+    stats = {e["clip_id"]: e for e in _journal(config) if e["kind"] == "stats"}
+    assert stats["03"]["exploration"] is True and "exploration" not in stats["04"]
+
+
+def test_no_calibration_when_nothing_was_added(tmp_path, monkeypatch):
+    config = _config(tmp_path)
+    _linked_clip(config)
+    _scored_account(config)
+    learning.sync(NOW, config=config)
+    calls = []
+    monkeypatch.setattr(jury_calibration, "calibrate", lambda *a, **k: calls.append(1))
+
+    learning.sync(NOW, config=config)
+
+    assert calls == []
+
+
+def test_sync_json_shape(tmp_path):
+    config = _config(tmp_path)
+    _linked_clip(config)
+    _scored_account(config)
+
+    sync = _sync(config)
+
+    assert sync["last_sync"] == NOW.isoformat() and sync["last_error"] is None
+    assert sync["results"] == [f"{VIDEO}/03"] and sync["scored"] == [f"{VIDEO}/03"] and sync["excluded"] == []
+    assert set(sync["calibration"]) == {"at", "clips", "untraced", "weights_path"}
