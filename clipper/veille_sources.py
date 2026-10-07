@@ -469,6 +469,7 @@ def _youtube_collector(http: Http, clock: Clock) -> Callable[[dict[str, object]]
                 "published_at": published_at, "view_count": view_count,
                 "thumbnail_url": _youtube_thumbnail(snippet.get("thumbnails")),
                 "views_per_hour": _views_per_hour(view_count, published_at, now),
+                "tags": [str(t) for t in snippet.get("tags") or []],
             })
         return {"videos": videos}
 

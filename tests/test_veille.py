@@ -117,7 +117,7 @@ def test_config_defaults_are_exactly_r1():
         "state_dir": "state/veille", "http_timeout_s": 20,
         "steam_rank_gain_min": 5, "steam_risers_max": 10, "steam_sellers_top": 50,
         "upcoming_days": 14, "release_window_days": 15, "igdb_min_hypes": 0, "igdb_releases_max": 30,
-        "igdb_pages_max": 4,
+        "igdb_pages_max": 4, "youtube_game_min_chars": 5,
     }
 
 
@@ -1187,3 +1187,110 @@ def test_decide_schema_check_and_call_count_unchanged_with_releases(tmp_path):
         state = veille.decide(_prompt_state(), _make_config(tmp_path))
     assert len(fake.calls) == 1 and fake.calls[0].usage == "veille" and fake.calls[0].images == []
     assert [p["candidate_id"] for p in state["proposals"]] == ["twitch:AAA"]
+
+
+# ==========================================================================
+# TASK-4e7c : jeu d'une VOD YouTube déduit du titre et des tags (correspondance stricte)
+# ==========================================================================
+
+
+def _yt_game(video_id, title, *, tags=None):
+    vod = _vod(video_id, game=None, source="youtube")
+    vod["title"] = title
+    if tags is not None:
+        vod["tags"] = tags
+    return vod
+
+
+def _deduce(tmp_path, videos, *, steam=(), igdb=(), **table):
+    collectors = _with_igdb(igdb, videos=videos) if igdb else _collectors(videos=videos)
+    collectors["steam"] = Collector({"games": [
+        {"appid": str(100 + i), "name": n, "players": 10} for i, n in enumerate(steam)]})
+    veille.collect(NOW, collectors=collectors, config=_make_config(tmp_path, **table))
+    return {c["video_id"]: c for c in _day(tmp_path)["candidates"]}
+
+
+def test_title_with_known_game_gives_game_and_source(tmp_path):
+    cands = _deduce(tmp_path, [_yt_game("y1", "JE FINIS jeu ALPHA en 1h !!")])
+    assert cands["y1"]["game_name"] == "Jeu Alpha" and cands["y1"]["game_key"] == "jeu alpha"
+    assert cands["y1"]["game_source"] == "titre"
+
+
+def test_tags_are_searched_too(tmp_path):
+    cands = _deduce(tmp_path, [_yt_game("y1", "Ma soirée", tags=["gaming", "Jéu  Alpha"])])
+    assert cands["y1"]["game_name"] == "Jeu Alpha" and cands["y1"]["game_source"] == "titre"
+
+
+def test_steam_only_game_is_known(tmp_path):
+    cands = _deduce(tmp_path, [_yt_game("y1", "Gros run sur Hollow Quest")], steam=["Hollow Quest"])
+    assert cands["y1"]["game_name"] == "Hollow Quest"
+
+
+def test_igdb_game_is_known(tmp_path):
+    cands = _deduce(tmp_path, [_yt_game("y1", "Premier avis Starfall Online")],
+                    igdb=[_rel(7, "Starfall Online", "2026-10-05")])
+    assert cands["y1"]["game_name"] == "Starfall Online"
+    assert cands["y1"]["signals"]["release_days_since"] == 1
+
+
+def test_no_match_keeps_game_unidentified(tmp_path):
+    cands = _deduce(tmp_path, [_yt_game("y1", "Vlog du dimanche")])
+    assert cands["y1"]["game_name"] is None and cands["y1"]["game_key"] is None
+    assert cands["y1"]["game_source"] is None
+
+
+def test_whole_words_only(tmp_path):
+    cands = _deduce(tmp_path, [_yt_game("y1", "Les jeux alphabet pour enfants")])
+    assert cands["y1"]["game_name"] is None
+
+
+def test_longest_name_wins_when_it_contains_the_others(tmp_path):
+    cands = _deduce(tmp_path, [_yt_game("y1", "Minecraft Dungeons II : le test")],
+                    steam=["Minecraft", "Minecraft Dungeons II"])
+    assert cands["y1"]["game_name"] == "Minecraft Dungeons II"
+
+
+def test_shorter_name_alone_still_matches(tmp_path):
+    cands = _deduce(tmp_path, [_yt_game("y1", "Minecraft hardcore")], steam=["Minecraft", "Minecraft Dungeons II"])
+    assert cands["y1"]["game_name"] == "Minecraft"
+
+
+def test_ambiguity_gives_no_game(tmp_path):
+    cands = _deduce(tmp_path, [_yt_game("y1", "Hollow Quest contre Starfall Online")],
+                    steam=["Hollow Quest", "Starfall Online"])
+    assert cands["y1"]["game_name"] is None and cands["y1"]["game_source"] is None
+
+
+def test_short_names_ignored_and_threshold_is_a_setting(tmp_path):
+    video = [_yt_game("y1", "Run de Rust ce soir")]
+    assert _deduce(tmp_path, video, steam=["Rust"])["y1"]["game_name"] is None
+    assert _deduce(tmp_path, video, steam=["Rust"], youtube_game_min_chars=4)["y1"]["game_name"] == "Rust"
+
+
+def test_vod_with_a_game_is_untouched_and_twitch_never_deduced(tmp_path):
+    yt = _vod("y1", game="Autre Jeu", source="youtube")
+    yt["title"] = "Jeu Alpha"
+    tw = _vod("t1", game=None)
+    tw["title"] = "Jeu Alpha"
+    cands = _deduce(tmp_path, [yt])
+    assert cands["y1"]["game_name"] == "Autre Jeu" and cands["y1"]["game_source"] is None
+    collectors = _collectors(vods=[tw])
+    veille.collect(NOW, collectors=collectors, config=_make_config(tmp_path))
+    twitch = {c["video_id"]: c for c in _day(tmp_path)["candidates"]}
+    assert twitch["t1"]["game_name"] is None
+
+
+def test_deduced_game_carries_trend_signals_and_reaches_claude(tmp_path):
+    cands = _deduce(tmp_path, [_yt_game("y1", "Jeu Alpha tout le run")])
+    assert "twitch_delta_pct" in cands["y1"]["signals"] and "steam_delta_pct" in cands["y1"]["signals"]
+    state = _day(tmp_path)
+    assert next(g for g in state["games"] if g["key"] == "jeu alpha")["vod_count"] == 1
+    prompt = veille._prompt(state, veille.settings(_make_config(tmp_path)))
+    assert "jeu=Jeu Alpha (déduit du titre)" in prompt
+
+
+def test_no_llm_call_for_the_deduction(tmp_path):
+    fake = FakeBackend([])
+    with llm.use_backend(fake):
+        _deduce(tmp_path, [_yt_game("y1", "Jeu Alpha")])
+    assert fake.calls == []

@@ -232,7 +232,14 @@ def test_youtube_single_videos_list_call_and_fields(tmp_path):
     assert result == {"videos": [{
         "video_id": "y1", "url": "https://www.youtube.com/watch?v=y1", "title": "T", "channel_name": "chaine_a",
         "game_name": None, "duration_s": 3723, "published_at": "2026-10-06T04:00:00Z", "view_count": 3000,
-        "thumbnail_url": None, "views_per_hour": 750.0}]}  # 4 h depuis la publication
+        "thumbnail_url": None, "views_per_hour": 750.0, "tags": []}]}  # 4 h depuis la publication
+
+
+def test_youtube_tags_are_relayed_as_found(tmp_path):
+    http = FakeHttp({("GET", "/youtube/v3/videos"): [(200, {"items": [
+        _yt_item("a", tags=["Minecraft", "survie"]), _yt_item("b")]})]})
+    videos = _youtube(tmp_path, http)["videos"]
+    assert [v["tags"] for v in videos] == [["Minecraft", "survie"], []]
 
 
 def test_youtube_views_per_hour_floors_hours_at_one(tmp_path):
