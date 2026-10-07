@@ -5,15 +5,19 @@ slug: veille-igdb-api-officielle-propri-t-de-twitch-co
 title: "Veille : IGDB (API officielle, propriété de Twitch) comme source des dates de sortie et de la hype des jeux, avec le même jeton d'app Twitch que Helix"
 created: 2026-10-06T19:34:11Z
 author: w-igdb
-status: proposed
+status: accepted
 scope:
   - clipper/veille.py
   - clipper/veille_sources.py
 constraint: |
   La veille peut lire l'API officielle IGDB (https://api.igdb.com/v4, propriété de Twitch) avec le même jeton d'app Twitch (client_credentials) et le même cache que Helix, par un collecteur et un transport injectables, pour les dates de sortie et la hype des jeux seulement ; requêtes séquentielles (jamais en parallèle, au plus 4 par seconde), jamais de scraping ; une source IGDB sans clé ou en erreur est une erreur nommée et visible, jamais une date ni un chiffre inventé.
 amends: [ADR-ca9a5792739c]
+ratified: addb5586dc80
+verified:
+  - by: nicoc@zedk_ordi
+    at: 2026-10-07T06:51:40Z
 schema: 4
-version: 1
+version: 2
 ---
 
 ## Contexte
