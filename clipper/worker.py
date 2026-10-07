@@ -684,7 +684,9 @@ class Worker:
             wait = timedelta(hours=float(settings["stats_interval_h"]))
             for found in accounts_mod.list_accounts(self.config):
                 account = found["id"]
-                if not found["ready_to_publish"] or found.get("service") == "youtube":
+                relevable = found["ready_to_publish"] or (
+                    found.get("paused_at") and accounts_mod.connection_blocked_reason(found) is None)  # SPEC-f348 R7.5
+                if not relevable or found.get("service") == "youtube":
                     continue  # les statistiques YouTube viennent d'une autre tache : jamais releves par la page TikTok
                 tried = self._stats_attempts.get(account)
                 if tried is not None and now - tried < wait:
@@ -927,6 +929,10 @@ class Worker:
         found = known.get(account)
         if found is None:
             reason = f"compte {account} introuvable dans l'écran Comptes : choisis un autre compte pour cette publication"
+        elif found.get("paused_at"):
+            label = found["label"] or account
+            reason = (f"compte {label} en pause (manuel) depuis le {accounts_mod.paused_since(found)} : recoche "
+                      "« Prêt à publier » dans Comptes pour reprendre, ou choisis un autre compte")
         elif not found["ready_to_publish"]:
             why = f" ({found['ready_note']})" if found.get("ready_note") else ""
             label = found["label"] or account

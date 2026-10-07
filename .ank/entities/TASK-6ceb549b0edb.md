@@ -5,7 +5,7 @@ slug: comptes-pause-manuelle-d-un-compte-tat-paused-at
 title: "Comptes : pause manuelle d'un compte, état paused_at, routes pause/resume, compte en pause jamais tenté ni proposé, stats encore relevables (SPEC-f348 R3 c, R7.1-R7.5)"
 created: 2026-10-07T21:01:18Z
 author: w-pauseplan
-status: open
+status: done
 scope:
   - clipper/accounts.py
   - clipper/worker.py
@@ -19,8 +19,15 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/de8344ee0421@f73d0e3
+    tree: scope/ea23505a19a3
+    criteria: 15751eeda47c
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---
 
 Implémente R3 (c), R7.1 à R7.5 et la partie serveur de R7.6 de SPEC-f348954318c1 (proposée, successeur de SPEC-e500 : la pause manuelle d'un compte, demande utilisateur du 2026-10-07). Les écrans (accounts.js, clips.js, publish.js) sont la tâche suivante, bloquée par celle-ci.

@@ -5920,8 +5920,10 @@ def test_publish_accounts_lists_every_account_with_its_flag_and_no_default(tmp_p
 
     assert "default" not in data  # un style n'a plus de compte par defaut (SPEC-6076 R2) : chaque publication choisit
     assert data["accounts"] == [
-        {"id": READY, "label": "Compte exemple", "ready_to_publish": True, "service": "tiktok", "service_label": "TikTok"},
-        {"id": SPARE, "label": "Autre compte", "ready_to_publish": False, "service": "tiktok", "service_label": "TikTok"}]
+        {"id": READY, "label": "Compte exemple", "ready_to_publish": True, "paused_at": None, "service": "tiktok",
+         "service_label": "TikTok"},
+        {"id": SPARE, "label": "Autre compte", "ready_to_publish": False, "paused_at": None, "service": "tiktok",
+         "service_label": "TikTok"}]
 
 
 def test_publish_accounts_never_carry_a_secret_and_work_from_a_remote_console(tmp_path, isolated_cwd):
@@ -5932,7 +5934,7 @@ def test_publish_accounts_never_carry_a_secret_and_work_from_a_remote_console(tm
     resp = remote.get("/api/publish/accounts", params={"channel": "ma_chaine"})
 
     assert resp.status_code == 200
-    assert set(resp.json()["accounts"][0]) == {"id", "label", "ready_to_publish", "service", "service_label"}
+    assert set(resp.json()["accounts"][0]) == {"id", "label", "ready_to_publish", "paused_at", "service", "service_label"}
 
 
 def test_approve_with_a_ready_account_records_it_in_the_publication_entry(tmp_path, isolated_cwd):
@@ -9624,3 +9626,102 @@ def test_video_sheet_shows_the_moment_source_only_when_present():
     js = _static("screens", "jury-radar.js")
 
     assert "m.source" in js and "passage d'action" in js and "transcription" in js
+
+
+# --------------------------------------------------------------------------
+# Pause manuelle d'un compte (SPEC-f348 R3 c, R7.3-R7.5)
+# --------------------------------------------------------------------------
+
+PAUSED_AT = "2026-10-07T09:30:00+00:00"
+
+
+def _pause_in_file(tmp_path, account_id, *, connected=True):
+    """Pose une pause manuelle dans state/accounts.json (la case est decochee, la connexion reste verifiee)."""
+    path = tmp_path / "state" / "accounts.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    for row in data["accounts"]:
+        if row["id"] == account_id:
+            row.update(paused_at=PAUSED_AT, ready_to_publish=False)
+            row["login"] = {"state": "connected" if connected else "expired",
+                            "checked_at": "2026-10-07T08:00:00+00:00", "expires_at": None}
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
+def test_publish_accounts_expose_paused_at_and_a_paused_account_is_not_ready(tmp_path, isolated_cwd):
+    _publish_setup(tmp_path)
+    _accounts_state(tmp_path, ready=(READY, SPARE))
+    _pause_in_file(tmp_path, SPARE)
+
+    rows = {a["id"]: a for a in client(tmp_path).get("/api/publish/accounts").json()["accounts"]}
+
+    assert rows[SPARE]["paused_at"] == PAUSED_AT and rows[SPARE]["ready_to_publish"] is False
+    assert rows[READY]["paused_at"] is None and rows[READY]["ready_to_publish"] is True
+
+
+def test_approving_with_a_paused_account_is_a_409_saying_paused_and_approves_nothing(tmp_path, isolated_cwd):
+    _publish_setup(tmp_path)
+    _accounts_state(tmp_path, ready=(READY, SPARE))
+    _pause_in_file(tmp_path, SPARE)
+
+    resp = client(tmp_path).post(f"/api/clips/{CLIPS_VIDEO}/01/approve", json={"account": SPARE})
+
+    assert resp.status_code == 409 and "en pause" in resp.json()["detail"]
+    assert json.loads((tmp_path / "state" / "publish" / "ma_chaine.json").read_text(encoding="utf-8")) == []
+
+
+def test_changing_the_account_of_a_publication_to_a_paused_one_is_a_409(tmp_path, isolated_cwd):
+    _publish_setup(tmp_path, [_entry("01", "scheduled", slot_at=PUB_THU, account=READY)])
+    _accounts_state(tmp_path, ready=(READY, SPARE))
+    _pause_in_file(tmp_path, SPARE)
+    c = client(tmp_path)
+
+    moved = c.post(f"/api/publish/{CLIPS_VIDEO}/01/account", json={"account": SPARE})
+    patched = c.patch(f"/api/publications/{CLIPS_VIDEO}/01", json={"account": SPARE})
+
+    assert moved.status_code == 409 and "en pause" in moved.json()["detail"]
+    assert patched.status_code == 409 and "en pause" in patched.json()["detail"]
+    entries = json.loads((tmp_path / "state" / "publish" / "ma_chaine.json").read_text(encoding="utf-8"))
+    assert entries[0]["account"] == READY
+
+
+def test_scheduling_a_post_or_a_series_with_a_paused_account_is_a_409(tmp_path, isolated_cwd):
+    config = _series_client(tmp_path)
+    _pause_in_file(tmp_path, READY)
+    c = TestClient(create_app(config=config))
+
+    post = c.post("/api/publications", json={"video_id": CLIPS_VIDEO, "clip_id": "01", "account": READY,
+                                              "mode": "immediate"})
+    series = c.post("/api/publications/series", json={
+        "mode": "auto", "account": READY, "interval_hours": 2, "start_at": _soon(hours=1), "count": 2})
+
+    assert post.status_code == 409 and "en pause" in post.json()["detail"]
+    assert series.status_code == 409 and "en pause" in series.json()["detail"]
+    entries = json.loads((tmp_path / "state" / "publish" / "ma_chaine.json").read_text(encoding="utf-8"))
+    assert {e["status"] for e in entries} == {"approved"}  # rien de programmé
+
+
+def test_a_paused_connected_account_is_still_fetched_for_stats(tmp_path, isolated_cwd, monkeypatch):
+    _tt_accounts(tmp_path, ready=(TT_ACCOUNT, TT_OTHER))
+    _pause_in_file(tmp_path, TT_ACCOUNT)
+    fetch = FakeFetch()
+    monkeypatch.setattr(tiktok_mod, "fetch_stats", fetch)
+    c = client(tmp_path)
+
+    listed = {a["account"]: a for a in c.get("/api/stats/tiktok").json()["accounts"]}
+    one = c.post("/api/stats/tiktok/refresh", json={"account": TT_ACCOUNT})
+    everyone = c.post("/api/stats/tiktok/refresh")
+
+    assert listed[TT_ACCOUNT]["ready"] is True and listed[TT_ACCOUNT]["paused_at"] == PAUSED_AT
+    assert one.status_code == 200, one.text
+    assert everyone.status_code == 200 and fetch.calls == [TT_ACCOUNT, TT_ACCOUNT, TT_OTHER]
+
+
+def test_a_paused_account_with_an_expired_connection_is_not_fetched_for_stats(tmp_path, isolated_cwd, monkeypatch):
+    _tt_accounts(tmp_path, ready=(TT_ACCOUNT, TT_OTHER))
+    _pause_in_file(tmp_path, TT_ACCOUNT, connected=False)
+    fetch = FakeFetch()
+    monkeypatch.setattr(tiktok_mod, "fetch_stats", fetch)
+
+    resp = client(tmp_path).post("/api/stats/tiktok/refresh", json={"account": TT_ACCOUNT})
+
+    assert resp.status_code == 409 and "expirée" in resp.json()["detail"] and fetch.calls == []
