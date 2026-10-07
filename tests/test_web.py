@@ -9839,8 +9839,89 @@ def test_clips_delete_removes_chosen_clips_and_reports_freed_bytes(tmp_path, iso
     assert (out / "02-p1.mp4").is_file() and (out / "02-p1.json").is_file()
 
 
-@pytest.mark.parametrize("status", ["published", "scheduled", "approved"])
-def test_clips_delete_refuses_published_scheduled_or_pending_clips_with_reason(tmp_path, isolated_cwd, status):
+def test_clips_delete_published_clip_keeps_its_sidecar_and_reports_video_deleted(tmp_path, isolated_cwd):
+    out = _purge_clip(tmp_path, clip_id="02-p1")
+    (out / "02-p1.jpg").write_bytes(b"z" * 10)
+    sidecar = (out / "02-p1.json").read_bytes()
+    _delete_publish(tmp_path, [{"video_id": "aaaaaaaaaaa", "clip_id": "02-p1", "status": "published"}])
+
+    resp = client(tmp_path).post("/api/clips/delete", json=_delete_body(("aaaaaaaaaaa", "02-p1")))
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["deleted"] == [] and body["refused"] == []
+    assert body["video_deleted"] == [{"video_id": "aaaaaaaaaaa", "clip_id": "02-p1"}]
+    assert body["freed_bytes"] == 60
+    assert [p.name for p in out.iterdir()] == ["02-p1.json"] and (out / "02-p1.json").read_bytes() == sidecar
+
+
+def test_clips_delete_mixed_series_reports_each_part_in_its_own_list(tmp_path, isolated_cwd):
+    for n in (1, 2):
+        _delete_part(tmp_path, f"01-p{n}", n, 2)
+    _delete_publish(tmp_path, [{"video_id": "aaaaaaaaaaa", "clip_id": "01-p2", "status": "published"}])
+
+    body = client(tmp_path).post("/api/clips/delete", json=_delete_body(("aaaaaaaaaaa", "01-p1"))).json()
+
+    assert body["deleted"] == [{"video_id": "aaaaaaaaaaa", "clip_id": "01-p1"}]
+    assert body["video_deleted"] == [{"video_id": "aaaaaaaaaaa", "clip_id": "01-p2"}]
+    assert [p.name for p in (tmp_path / "output" / "aaaaaaaaaaa").iterdir()] == ["01-p2.json"]
+
+
+def _published_without_video(tmp_path):
+    _clips_setup(tmp_path)
+    _write_publish(tmp_path, "ma_chaine", [
+        _entry("01", "published", published_at="2026-10-02T18:00:00+00:00", post_id="123",
+               post_url="https://tiktok.example/123"),
+        _entry("03", "failed", error="quota depasse"),
+    ])
+    (tmp_path / "output" / CLIPS_VIDEO / "01.mp4").unlink()
+
+
+def test_get_clips_marks_a_published_clip_whose_video_was_deleted(tmp_path, isolated_cwd):
+    _published_without_video(tmp_path)
+
+    resp = client(tmp_path).get("/api/clips", params={"video_id": CLIPS_VIDEO})
+
+    assert resp.status_code == 200
+    clips = {c["clip_id"]: c for c in resp.json()}
+    assert clips["01"]["video_deleted"] is True and clips["01"]["publish_status"] == "published"
+    assert clips["01"]["post_id"] == "123"
+    assert clips["02"]["video_deleted"] is False
+
+
+def test_media_of_a_clip_without_video_is_a_clean_404(tmp_path, isolated_cwd):
+    _published_without_video(tmp_path)
+    c = client(tmp_path)
+
+    assert c.get(f"/media/clip/{CLIPS_VIDEO}/01").status_code == 404
+    assert c.get(f"/media/clip/{CLIPS_VIDEO}/01/thumbnail").status_code == 404
+
+
+def test_publication_screens_survive_a_published_clip_without_video(tmp_path, isolated_cwd):
+    _published_without_video(tmp_path)
+    c = client(tmp_path)
+
+    for url in ("/api/publish", "/api/stats/tiktok"):
+        assert c.get(url).status_code == 200, url
+
+
+def test_rerender_and_approve_of_a_clip_without_video_are_refused_clearly(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import worker
+
+    _published_without_video(tmp_path)
+    monkeypatch.setattr(worker, "enqueue", lambda *a, **kw: pytest.fail("rerender ne doit pas etre mis en file"))
+    c = client(tmp_path)
+
+    rerender = c.post(f"/api/clips/{CLIPS_VIDEO}/01/rerender")
+    approve = c.post(f"/api/clips/{CLIPS_VIDEO}/01/approve", json={"account": "ab12cd"})
+    retitle = c.patch(f"/api/clips/{CLIPS_VIDEO}/01", json={"screen_title": "Autre", "confirm": True})
+
+    for resp in (rerender, approve, retitle):
+        assert resp.status_code == 409 and "vidéo supprimée" in resp.json()["detail"]
+
+
+@pytest.mark.parametrize("status", ["scheduled", "approved"])
+def test_clips_delete_refuses_scheduled_or_pending_clips_with_reason(tmp_path, isolated_cwd, status):
     out = _purge_clip(tmp_path, clip_id="02-p1")
     _delete_publish(tmp_path, [{"video_id": "aaaaaaaaaaa", "clip_id": "02-p1", "status": status}])
 
@@ -9900,3 +9981,9 @@ def test_clips_selection_bar_has_a_danger_delete_button_with_confirmation_and_to
     assert "Supprimer la sélection" in js and "data-clips-sel-delete" in js and "btn-bad" in js
     assert "/api/clips/delete" in js
     assert "Irréversible" in js and "confirmDialog" in js
+
+
+def test_clips_js_explains_published_clips_keep_their_stats_and_handles_video_deleted():
+    js = (STATIC / "screens" / "clips.js").read_text(encoding="utf-8")
+    assert "Les clips publiés gardent leurs infos (stats), seule la vidéo est supprimée." in js
+    assert "video_deleted" in js and "Vidéo supprimée" in js

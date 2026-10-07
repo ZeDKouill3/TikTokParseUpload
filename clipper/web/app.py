@@ -844,9 +844,21 @@ def _tiktok_fields(entry: dict[str, Any] | None, video_id: str, clip_id: str) ->
     }
 
 
+def _clip_video_deleted(config: Config, video_id: str, clip_id: str) -> bool:
+    """Vrai si le .mp4 du clip n'existe plus (clip publie dont la video a ete supprimee, TASK-f909)."""
+    return not (Path(config.output_dir) / video_id / f"{clip_id}.mp4").is_file()
+
+
+def _require_clip_video(config: Config, video_id: str, clip_id: str) -> None:
+    if _clip_video_deleted(config, video_id, clip_id):
+        raise HTTPException(status_code=409, detail=f"vidéo supprimée : le clip {video_id}/{clip_id} n'a plus son "
+                            "fichier vidéo (seules ses infos et ses stats sont gardées)")
+
+
 def _clip_view(sidecar: dict[str, Any], channel: str | None, entry: dict[str, Any] | None,
-               jury: dict[Any, tuple[Any, Any]] | None = None) -> dict[str, Any]:
-    """``jury`` : moment_id -> confiance du jury (voir _moments_jury_confidences)."""
+               jury: dict[Any, tuple[Any, Any]] | None = None, *, video_deleted: bool = False) -> dict[str, Any]:
+    """``jury`` : moment_id -> confiance du jury (voir _moments_jury_confidences) ; ``video_deleted`` : le .mp4
+    a ete supprime (clip publie), le sidecar reste."""
     qa = sidecar.get("qa") or {}
     jury_confidence, jury_judges = (jury or {}).get(sidecar.get("moment_id"), (None, None))
     video_id, clip_id = sidecar["video_id"], sidecar["clip_id"]
@@ -856,6 +868,7 @@ def _clip_view(sidecar: dict[str, Any], channel: str | None, entry: dict[str, An
         "description": sidecar.get("caption"),
         "video_url": f"/media/clip/{video_id}/{clip_id}",
         "thumbnail_url": f"/media/clip/{video_id}/{clip_id}/thumbnail",
+        "video_deleted": video_deleted,
         "qa_status": qa.get("status"),
         "issues": qa.get("issues"),
         "publish_status": _clip_publish_status(sidecar, entry),
@@ -908,7 +921,8 @@ def _list_clip_views(config: Config, channel: str | None, video_id: str | None,
     for video, video_channel, sidecar, entry in _iter_clips(config, channel, video_id):
         if video not in jury_by_video:
             jury_by_video[video] = _moments_jury_confidences(config, video)
-        clip = _clip_view(sidecar, video_channel, entry, jury_by_video[video])
+        clip = _clip_view(sidecar, video_channel, entry, jury_by_video[video],
+                          video_deleted=_clip_video_deleted(config, video, sidecar["clip_id"]))
         clip["veille"] = veille_status.get((video, clip["clip_id"]))
         if clip["veille"] and clip["veille"]["status"] == "archived" and not archived:
             continue
@@ -2705,6 +2719,7 @@ def create_app(config: Config | None = None) -> FastAPI:
         if body is None or body.account is None:
             raise HTTPException(status_code=409, detail="compte de publication manquant : choisis un compte prêt à publier "
                                 "(un style n'a plus de compte associé)")
+        _require_clip_video(config, video_id, clip_id)
         account = _require_ready_account(config, body.account)
         return _decide(video_id, clip_id, "approve", account=account, schedule=_account_schedule(config, account))
 
@@ -2798,11 +2813,13 @@ def create_app(config: Config | None = None) -> FastAPI:
     def delete_clips_bulk(body: BulkApproveBody) -> dict[str, Any]:
         """Supprime les clips choisis (bouton « Supprimer la sélection » de l'écran Clips, TASK-2322) : simple
         suppression de fichiers par clipper.workspace.delete_clips (ADR-09ad). Tout ou rien PAR série : une partie
-        choisie entraîne toute sa série, et une série dont une partie est publiée, programmée, en cours ou en
-        attente est refusée entière (``refused`` : le clip choisi et la raison, jamais d'erreur silencieuse)."""
+        choisie entraîne toute sa série, et une série dont une partie est programmée, en cours ou en attente est
+        refusée entière (``refused`` : le clip choisi et la raison, jamais d'erreur silencieuse). Un clip publié
+        garde son sidecar : seule sa vidéo est supprimée (``video_deleted``, TASK-f909)."""
         if not body.clips:
             raise HTTPException(status_code=400, detail="sélection vide : choisis au moins un clip")
         deleted: list[dict[str, str]] = []
+        video_deleted: list[dict[str, str]] = []
         refused: list[dict[str, Any]] = []
         done: set[tuple[str, str]] = set()
         freed = 0
@@ -2820,14 +2837,19 @@ def create_app(config: Config | None = None) -> FastAPI:
             for clip_id in result["deleted"]:
                 done.add((item.video_id, clip_id))
                 deleted.append({"video_id": item.video_id, "clip_id": clip_id})
-        logger.info("suppression de clips : %d supprime(s), %d refuse(s), %d octets liberes", len(deleted), len(refused), freed)
-        return {"deleted": deleted, "refused": refused, "freed_bytes": freed}
+            for clip_id in result["video_deleted"]:
+                done.add((item.video_id, clip_id))
+                video_deleted.append({"video_id": item.video_id, "clip_id": clip_id})
+        logger.info("suppression de clips : %d supprime(s), %d video(s) seule(s), %d refuse(s), %d octets liberes",
+                    len(deleted), len(video_deleted), len(refused), freed)
+        return {"deleted": deleted, "video_deleted": video_deleted, "refused": refused, "freed_bytes": freed}
 
     @app.post("/api/clips/{video_id}/{clip_id}/rerender", status_code=202)
     def rerender_clip(video_id: str, clip_id: str) -> JSONResponse:
         _validate_video_id(video_id)
         _validate_clip_id(clip_id)
         _read_clip_sidecar(config, video_id, clip_id)
+        _require_clip_video(config, video_id, clip_id)
         return JSONResponse(_enqueue_clip_render(video_id, config), status_code=202)
 
     @app.patch("/api/clips/{video_id}/{clip_id}")
@@ -2845,6 +2867,8 @@ def create_app(config: Config | None = None) -> FastAPI:
                 status_code=409,
                 detail="confirmation requise (confirm: true) : changer le titre d'écran relance render puis qa pour ce clip",
             )
+        if retitle:
+            _require_clip_video(config, video_id, clip_id)
         channel = _require_channel(video_id, clip_id, config)
         if body.description is not None or body.hashtags is not None:
             description = body.description if body.description is not None else sidecar.get("caption")
@@ -2857,7 +2881,8 @@ def create_app(config: Config | None = None) -> FastAPI:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
         entry = _enqueue_clip_render(video_id, config) if retitle else None
         clip = _clip_view(sidecar, channel, _publish_entries(config, channel).get((video_id, clip_id)),
-                          _moments_jury_confidences(config, video_id))
+                          _moments_jury_confidences(config, video_id),
+                          video_deleted=_clip_video_deleted(config, video_id, clip_id))
         return JSONResponse({"clip": clip, "rerender": entry}, status_code=202 if retitle else 200)
 
     # ----------------------------------------------------------------
@@ -2962,7 +2987,7 @@ def create_app(config: Config | None = None) -> FastAPI:
         video_id, clip_id = entry["video_id"], entry["clip_id"]
         video_channel = None if channel == publish_mod.NO_CHANNEL else channel
         sidecar = _read_clip_sidecar(config, video_id, clip_id)
-        return _clip_view(sidecar, video_channel, entry)
+        return _clip_view(sidecar, video_channel, entry, video_deleted=_clip_video_deleted(config, video_id, clip_id))
 
     @app.get("/api/publications")
     def list_publications() -> dict[str, Any]:

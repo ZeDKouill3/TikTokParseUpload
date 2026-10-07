@@ -75,15 +75,16 @@ function clipCaptionText(c) {
 function clipCard(c) {
   const s = clipStatus(c);
   const warn = c.qa_status === "rejected" ? "bad" : (c.issues && c.issues.length ? "warn" : "");
-  const sel = clipsUi.selecting;
+  const gone = !!c.video_deleted; // clip publié dont la vidéo a été supprimée (TASK-f909) : ni sélectionnable ni lisible
+  const sel = clipsUi.selecting && !gone;
   const checked = sel && clipsUi.selected.has(clipKey(c));
   const label = sel
     ? `${checked ? "Désélectionner" : "Sélectionner"} ${esc(c.screen_title || c.clip_id)}`
     : `Ouvrir le clip ${esc(c.screen_title || c.clip_id)}`;
-  return `<div class="clip${sel ? " selecting" : ""}${checked ? " checked" : ""}" data-clip="${esc(clipKey(c))}" tabindex="0" role="${sel ? "checkbox" : "button"}"${sel ? ` aria-checked="${checked}"` : ""} aria-label="${label}">
-    <div class="clip-poster"><img loading="lazy" decoding="async" width="270" height="480" src="${esc(c.thumbnail_url)}" alt="" tabindex="-1"><div class="shade"></div>
-      <div class="top">${sel ? `<span class="clip-check${checked ? " on" : ""}">${checked ? icon("check", "i-xs") : ""}</span>` : `<span class="pill-dark ${s.cls}">${esc(s.label)}</span>`}${c.parts_total > 1 ? `<span class="pill-dark">${esc(c.part)}/${esc(c.parts_total)}</span>` : ""}</div>
-      <span class="play">${icon("play")}</span>
+  return `<div class="clip${gone ? " gone" : ""}${sel ? " selecting" : ""}${checked ? " checked" : ""}" data-clip="${esc(clipKey(c))}" tabindex="0" role="${sel ? "checkbox" : "button"}"${sel ? ` aria-checked="${checked}"` : ""} aria-label="${label}">
+    <div class="clip-poster">${gone ? "" : `<img loading="lazy" decoding="async" width="270" height="480" src="${esc(c.thumbnail_url)}" alt="" tabindex="-1">`}<div class="shade"></div>
+      <div class="top">${sel ? `<span class="clip-check${checked ? " on" : ""}">${checked ? icon("check", "i-xs") : ""}</span>` : `<span class="pill-dark ${s.cls}">${esc(s.label)}</span>`}${gone ? `<span class="pill-dark warn">Vidéo supprimée</span>` : ""}${c.parts_total > 1 ? `<span class="pill-dark">${esc(c.part)}/${esc(c.parts_total)}</span>` : ""}</div>
+      ${gone ? "" : `<span class="play">${icon("play")}</span>`}
       <div class="bottom"><span class="num">${c.duration != null ? esc(clipSeconds(c.duration)) : ""}</span><span class="grow"></span>
         ${warn ? `<span class="pill-dark ${warn}">${icon("triangle-alert", "i-xs")}QA</span>` : ""}${c.score != null ? `<span class="pill-dark">${esc(fr(c.score))}</span>` : ""}</div>
     </div>
@@ -156,7 +157,7 @@ function clipsWire(body) {
   const more = $("[data-clips-more]", body);
   if (more) more.onclick = () => { clipsUi.shown += CLIPS_PAGE_SIZE; renderCurrent(); };
   $$("[data-clip]", body).forEach((el) => {
-    const act = () => (clipsUi.selecting ? clipsToggleSelect(el.dataset.clip) : openClipDrawer(el.dataset.clip));
+    const act = () => (clipsUi.selecting && !el.classList.contains("gone") ? clipsToggleSelect(el.dataset.clip) : openClipDrawer(el.dataset.clip));
     el.onclick = act;
     el.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); act(); } };
   });
@@ -179,7 +180,7 @@ function clipsWire(body) {
    une série y est entière dès qu'une de ses parties passe le filtre (même règle que clipsToggleSelect). */
 function clipsAllKeys(all, ui) {
   const keys = new Set();
-  clipsFiltered(all, ui).forEach((c) => {
+  clipsFiltered(all, ui).filter((c) => !c.video_deleted).forEach((c) => {
     const series = clipSeries(c);
     (series.length ? series.map(clipKey) : [clipKey(c)]).forEach((k) => keys.add(k));
   });
@@ -189,7 +190,7 @@ function clipsAllKeys(all, ui) {
 /* Cocher une partie coche toute sa serie (TASK-e99b) : meme decision groupee que l'approbation groupee cote serveur. */
 function clipsToggleSelect(key) {
   const c = clipsUi.data.find((o) => clipKey(o) === key);
-  if (!c) return;
+  if (!c || c.video_deleted) return;
   const series = clipSeries(c);
   const group = series.length ? series.map(clipKey) : [key];
   const adding = !clipsUi.selected.has(key);
@@ -235,8 +236,9 @@ async function clipsApproveSelection(account) {
   }
 }
 
-/* Suppression groupee (TASK-2322) : confirmation, puis le serveur supprime ce qui est permis (jamais un clip publie,
-   programme, en cours ou en attente ; tout ou rien par serie) et dit pourquoi le reste est refuse. */
+/* Suppression groupee (TASK-2322, TASK-f909) : confirmation, puis le serveur supprime ce qui est permis (jamais un
+   clip programme, en cours ou en attente ; tout ou rien par serie ; un clip publie perd sa video mais garde ses
+   infos et ses stats) et dit pourquoi le reste est refuse. */
 async function clipsDeleteSelection() {
   const clips = Array.from(clipsUi.selected).map((key) => {
     const [video_id, clip_id] = key.split("/");
@@ -244,14 +246,14 @@ async function clipsDeleteSelection() {
   });
   if (!clips.length) return;
   const n = clips.length;
-  if (!(await confirmDialog({ title: `Supprimer ${n} clip${n === 1 ? "" : "s"} ?`, body: `Supprimer ${n} clip${n === 1 ? "" : "s"} ? Irréversible. Une partie de série entraîne toute sa série.`, confirmLabel: "Supprimer" }))) return;
+  if (!(await confirmDialog({ title: `Supprimer ${n} clip${n === 1 ? "" : "s"} ?`, body: `Supprimer ${n} clip${n === 1 ? "" : "s"} ? Irréversible. Une partie de série entraîne toute sa série. Les clips publiés gardent leurs infos (stats), seule la vidéo est supprimée.`, confirmLabel: "Supprimer" }))) return;
   if (!(await netGuard())) return;
   try {
     const out = await api("/api/clips/delete", jsonBody("POST", { clips }));
     clipsUi.selected = new Set();
     renderCurrent();
-    const d = out.deleted.length, r = out.refused.length;
-    const body = `${d} clip${d === 1 ? "" : "s"} supprimé${d === 1 ? "" : "s"}${r ? `, ${r} refusé${r === 1 ? "" : "s"} : ${out.refused.map((o) => `${o.clip.video_id}/${o.clip.clip_id} (${o.reason})`).join(" ; ")}` : ""}.`;
+    const d = out.deleted.length, v = (out.video_deleted || []).length, r = out.refused.length;
+    const body = `${d} clip${d === 1 ? "" : "s"} supprimé${d === 1 ? "" : "s"}, ${v} vidéo${v === 1 ? "" : "s"} supprimée${v === 1 ? "" : "s"} (infos et stats gardées)${r ? `, ${r} refusé${r === 1 ? "" : "s"} : ${out.refused.map((o) => `${o.clip.video_id}/${o.clip.clip_id} (${o.reason})`).join(" ; ")}` : ""}.`;
     toast({ kind: r ? "warn" : "ok", title: r ? "Suppression partielle" : "Clips supprimés", body });
     clipsUi.at = 0;
     loadClips();
@@ -281,6 +283,7 @@ function clipDrawerHtml(c) {
   const s = clipStatus(c);
   const locked = CLIP_LOCKED.includes(c.publish_status);
   const series = clipSeries(c);
+  const gone = !!c.video_deleted;
   const lockHint = locked ? `<span class="hint">Statut « ${esc(s.label.toLowerCase())} » : l'édition demande de repasser le clip en « approuvé ».</span>` : "";
   const sidecar = JSON.stringify(c, null, 2);
   return `
@@ -291,7 +294,7 @@ function clipDrawerHtml(c) {
     </div>
     <div class="drawer-body">
       <div>
-        <div class="phone"><video src="${esc(c.video_url)}" controls playsinline preload="metadata"></video></div>
+        <div class="phone">${gone ? `<p class="reason warn">Vidéo supprimée : ce clip publié garde ses infos et ses stats, mais plus son fichier.</p>` : `<video src="${esc(c.video_url)}" controls playsinline preload="metadata"></video>`}</div>
         ${series.length ? `<div class="parts-label muted">Parties</div><div class="parts">${series.map((p) => `<button type="button" class="part ${p.clip_id === c.clip_id ? "on" : ""}" data-part="${esc(clipKey(p))}" title="Partie ${esc(p.part)}" aria-label="Partie ${esc(p.part)}">${esc(p.part)}</button>`).join("")}</div>` : ""}
         <div class="row" style="justify-content:center;margin-top:16px;gap:16px;font-size:13px">
           ${c.duration != null ? `<span class="mono">${esc(clipSeconds(c.duration))}</span><span class="muted">·</span>` : ""}<span class="mono">1080×1920</span>${c.score != null ? `<span class="muted">·</span><span>score <b class="num" style="font-size:16px">${esc(fr(c.score))}</b></span>` : ""}
@@ -300,9 +303,9 @@ function clipDrawerHtml(c) {
       <div class="stack" style="gap:24px">
         <div class="row wrap muted" style="font-size:13px;gap:8px"><span class="mono">${esc(c.video_id)}</span>${c.channel ? `<span class="tag">${esc(c.channel)}</span>` : ""}${c.parts_total > 1 ? `<span>·</span><span>partie ${esc(c.part)}/${esc(c.parts_total)}</span>` : ""}${c.slot_at ? `<span>·</span><span>créneau ${esc(fmtParis(c.slot_at, { weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }))}</span>` : ""}</div>
         ${c.publish_error ? `<p class="reason bad">Publication en échec : ${esc(c.publish_error)}</p>` : ""}
-        <div class="field"><label for="clip-title">Titre d'écran</label><input class="input" id="clip-title" value="${esc(c.screen_title)}"${locked ? " disabled" : ""}>
+        <div class="field"><label for="clip-title">Titre d'écran</label><input class="input" id="clip-title" value="${esc(c.screen_title)}"${locked || gone ? " disabled" : ""}>
           <span class="hint">Affiché en haut du clip. Le modifier relance le rendu puis le contrôle qualité de ce clip.</span>
-          <div><button type="button" class="btn btn-xs" data-save-title${locked ? " disabled" : ""}>${icon("refresh-cw", "i-xs")}Enregistrer et re-rendre</button></div></div>
+          <div><button type="button" class="btn btn-xs" data-save-title${locked || gone ? " disabled" : ""}>${icon("refresh-cw", "i-xs")}Enregistrer et re-rendre</button></div></div>
         <div class="field"><label for="clip-desc">Description</label><textarea class="input" id="clip-desc" rows="4"${locked ? " disabled" : ""}>${esc(c.description)}</textarea></div>
         <div class="field"><label for="clip-tags">Hashtags</label><input class="input" id="clip-tags" value="${esc((c.hashtags || []).join(" "))}"${locked ? " disabled" : ""}>
           <span class="hint">Séparés par des espaces.</span></div>
@@ -317,13 +320,13 @@ function clipDrawerHtml(c) {
       </div>
     </div>
     <div class="drawer-foot">
-      ${c.publish_status === "à valider" || c.publish_status === "approved" ? `<button type="button" class="btn btn-primary" data-publish-now>${icon("send")}Publier maintenant</button>` : ""}
-      ${c.publish_status === "à valider" || c.publish_status === "approved" ? `<button type="button" class="btn btn-ok" data-approve>${icon("check")}Approuver</button>` : ""}
+      ${!gone && (c.publish_status === "à valider" || c.publish_status === "approved") ? `<button type="button" class="btn btn-primary" data-publish-now>${icon("send")}Publier maintenant</button>` : ""}
+      ${!gone && (c.publish_status === "à valider" || c.publish_status === "approved") ? `<button type="button" class="btn btn-ok" data-approve>${icon("check")}Approuver</button>` : ""}
       <button type="button" class="btn btn-bad" data-reject>${icon("x")}Refuser</button>
-      <button type="button" class="btn" data-rerender>${icon("refresh-cw")}Re-rendre</button>
+      ${gone ? "" : `<button type="button" class="btn" data-rerender>${icon("refresh-cw")}Re-rendre</button>`}
       <span class="grow"></span>
       <button type="button" class="btn btn-ghost" data-copy>${icon("copy")}Copier la description</button>
-      <a class="btn btn-ghost" href="${esc(c.video_url)}" download="${esc(c.clip_id)}.mp4">${icon("download")}Télécharger</a>
+      ${gone ? "" : `<a class="btn btn-ghost" href="${esc(c.video_url)}" download="${esc(c.clip_id)}.mp4">${icon("download")}Télécharger</a>`}
     </div>`;
 }
 
@@ -417,7 +420,8 @@ async function openClipDrawer(key) {
         loadClips();
       } catch (err) { toastError("Impossible de refuser le clip", err); }
     };
-    $("[data-rerender]", d).onclick = async () => {
+    const rerenderBtn = $("[data-rerender]", d);
+    if (rerenderBtn) rerenderBtn.onclick = async () => {
       if (!(await confirmDialog({ title: "Re-rendre ce clip ?", body: "Le rendu puis le contrôle qualité de ce clip sont relancés ; le fichier vidéo sera remplacé.", confirmLabel: "Re-rendre", danger: false }))) return;
       try {
         await api(clipUrl(c, "/rerender"), { method: "POST" });

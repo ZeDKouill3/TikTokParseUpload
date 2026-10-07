@@ -213,11 +213,14 @@ def series_clip_ids(video_id: str, clip_id: str, output_root: str | Path = "outp
     return [cid for _, cid in sorted(members)]
 
 
-def _undeletable_clips(video_id: str, clip_ids: list[str], publish_dir: str | Path | None) -> dict[str, str]:
-    """clip_id -> raison, pour les clips a publication programmee, en cours, en attente ou deja publiee."""
+def _clip_publication_state(video_id: str, clip_ids: list[str],
+                            publish_dir: str | Path | None) -> tuple[dict[str, str], set[str]]:
+    """(clip_id -> raison, clips publies) : les premiers ont une publication programmee, en cours ou en attente
+    (jamais supprimables) ; les seconds sont deja publies (leur sidecar est garde pour les stats)."""
     reasons: dict[str, str] = {}
+    published: set[str] = set()
     if publish_dir is None or not Path(publish_dir).is_dir():
-        return reasons
+        return reasons, published
     wanted = set(clip_ids)
     for path in sorted(Path(publish_dir).glob("*.json")):
         for entry in _read_list(path):
@@ -228,28 +231,37 @@ def _undeletable_clips(video_id: str, clip_ids: list[str], publish_dir: str | Pa
             elif entry.get("status") in _BLOCKING_STATUSES:
                 reasons.setdefault(entry["clip_id"], "publication programmee ou en attente")
             elif entry.get("status") == "published":
-                reasons.setdefault(entry["clip_id"], "deja publie (historique des stats)")
-    return reasons
+                published.add(entry["clip_id"])
+    return reasons, published - set(reasons)
 
 
 def delete_clips(video_id: str, clip_ids: list[str], output_root: str | Path = "output",
                  publish_dir: str | Path | None = None) -> dict:
-    """Supprime des clips de output/<video_id>/ (mp4, sidecar, annexes), serie entiere comprise ; tout ou rien :
-    ``PurgeRefused`` (nommant le clip) si un clip de l'ensemble est programme, en cours, en attente ou publie."""
+    """Supprime des clips de output/<video_id>/, serie entiere comprise ; tout ou rien : ``PurgeRefused`` (nommant le
+    clip) si un clip de l'ensemble est programme, en cours ou en attente. Un clip jamais publie est supprime
+    entierement (``deleted``) ; un clip deja publie perd son .mp4 et ses annexes mais garde son sidecar .json
+    (lien post -> clip, stats, jury) (``video_deleted``)."""
     expanded: list[str] = []
     for clip_id in clip_ids:
         for member in series_clip_ids(video_id, clip_id, output_root):
             if member not in expanded:
                 expanded.append(member)
-    blocked = _undeletable_clips(video_id, expanded, publish_dir)
+    blocked, published = _clip_publication_state(video_id, expanded, publish_dir)
     if blocked:
         first = next(c for c in expanded if c in blocked)
         raise PurgeRefused(f"clip {first} garde : {blocked[first]}"
                            + (f" (et {len(blocked) - 1} autre(s) de la serie)" if len(blocked) > 1 else ""))
     freed = 0
+    deleted: list[str] = []
+    video_deleted: list[str] = []
     for clip_id in expanded:
+        keep_sidecar = clip_id in published
         for path in _clip_files(video_id, clip_id, output_root):
+            if keep_sidecar and path.name == f"{clip_id}.json":
+                continue
             freed += path.stat().st_size
             path.unlink()
-    log.info("suppression des clips %s de %s : %d octets liberes", ", ".join(expanded), video_id, freed)
-    return {"deleted": expanded, "freed_bytes": freed}
+        (video_deleted if keep_sidecar else deleted).append(clip_id)
+    log.info("suppression de clips de %s : %s supprime(s), video seule supprimee pour %s, %d octets liberes",
+             video_id, ", ".join(deleted) or "aucun", ", ".join(video_deleted) or "aucun", freed)
+    return {"deleted": deleted, "video_deleted": video_deleted, "freed_bytes": freed}
