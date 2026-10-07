@@ -10,6 +10,21 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ## [Non publié]
 
+## [0.5.2] - 2026-10-07
+
+Petite version de correction autour de la publication TikTok et de la veille. Le zip
+s'appelle `Clipper-portable-0.5.2.zip` ; la mise à jour se fait en relançant
+`Installer.bat` depuis ce zip, tes données ne sont pas touchées. Seul nouveau réglage :
+`[veille] twitch_access_check_max` ; la veille reste désactivée par défaut.
+
+### Ajouté
+
+- TikTok : une vérification de contenu bloquée (« Vérification en cours » sans résultat après
+  `[tiktok] content_check_retrigger_s`, 120 s) est relancée en décochant puis recochant l'interrupteur ;
+  l'erreur rouge « Une erreur est survenue » est relancée par « Réessayer ». Au plus
+  `content_check_retriggers` relances (3), toujours dans `content_check_timeout_s` ; erreur persistante
+  après les relances : arrêt `content_check` avec le message de TikTok.
+
 ### Corrigé
 
 - Veille : les VOD Twitch réservées aux abonnés (que Helix annonce pourtant `public`) ne sont plus
@@ -871,7 +886,8 @@ verticaux sous-titrés, en local.
 - Aucune publication automatique sur TikTok : le dépôt produit les clips
   et leurs métadonnées, la mise en ligne reste manuelle.
 
-[Non publié]: https://github.com/ZeDKouill3/TiktokClipper/compare/v0.5.1...HEAD
+[Non publié]: https://github.com/ZeDKouill3/TiktokClipper/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/ZeDKouill3/TiktokClipper/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/ZeDKouill3/TiktokClipper/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/ZeDKouill3/TiktokClipper/compare/v0.4.2...v0.5.0
 [0.4.2]: https://github.com/ZeDKouill3/TiktokClipper/compare/v0.4.1...v0.4.2

@@ -255,8 +255,8 @@ def test_versions_row_for_the_current_version_names_the_release_headline():
 
 
 REQUIRED_CHANGELOG_TERMS = (
-    f"Clipper-portable-{VERSION}.zip", "Installer.bat", "mise à jour", "Veille", "miniature",
-    "viewable", "abonnés", "Steam",
+    f"Clipper-portable-{VERSION}.zip", "Installer.bat", "mise à jour", "Veille", "TikTok",
+    "vérification de contenu", "yt-dlp", "abonnés", "twitch_access_check_max",
 )
 
 
@@ -266,12 +266,10 @@ def test_changelog_current_version_covers_the_release_changes(term):
     assert term in body, f"{term!r} absent de la section [{VERSION}]"
 
 
-def test_changelog_current_version_does_not_claim_subscriber_vods_are_excluded():
-    # L'API Twitch renvoie viewable=public pour une VOD abonnés : seules les VOD privées sont écartées.
+def test_changelog_current_version_does_not_announce_igdb():
+    # IGDB (ADR-798c, SPEC-4efa) n'est que proposé : aucun code, donc rien à annoncer.
     body = _changelog_section(_read(CHANGELOG), rf"\[{ESC_VERSION}\]")
-    flat = " ".join(body.split())
-    assert "viewable = public" in flat
-    assert "ne sont pas détectées" in flat
+    assert "IGDB" not in body
 
 
 def test_changelog_current_version_has_no_separate_release_notes_file():
