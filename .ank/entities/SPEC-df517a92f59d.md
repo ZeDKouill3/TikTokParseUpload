@@ -5,7 +5,7 @@ slug: veille-calendrier-des-sorties-de-jeux-igdb-colle
 title: "Veille : calendrier des sorties de jeux (IGDB) : collecte par /games sur la fenêtre J-15..J+14 triée par hypes, jeux en tendance gardés, étiquette « Portage », jaquettes, écran calendrier (bandeau récents, frise 14 jours, téléphone, panneau détail) ; Steam officiel à la place de SteamDB (joueurs simultanés et pic du jour, joueurs par appid hors top 100, abonnés, gain 7 j et tendance depuis l'historique), filtre de communauté (Steam joueurs ou abonnés, Twitch FR ou hypes), au plus N VOD par jeu (succède à SPEC-4efa)"
 created: 2026-10-07T08:20:49Z
 author: w-calplan
-status: proposed
+status: accepted
 scope:
   - clipper/veille.py
   - clipper/veille_sources.py
@@ -17,8 +17,12 @@ scope:
   - CHANGELOG.md
 references: [ADR-0944f6d2110d, ADR-798cf21fddd6, SPEC-bdd9e0db8905, ADR-ca9a5792739c, ADR-ad2e562b1810, ADR-b1c17749b528, ADR-09ad233678f2, SPEC-c1001cb7cbdb, ADR-05a42b76906f]
 supersedes: SPEC-4efa50cc6b8c
+ratified: a8573e43317e
+verified:
+  - by: nicoc@zedk_ordi
+    at: 2026-10-07T08:40:38Z
 schema: 4
-version: 6
+version: 7
 ---
 
 ## Objet

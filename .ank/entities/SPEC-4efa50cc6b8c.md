@@ -5,7 +5,7 @@ slug: veille-source-igdb-sorties-de-jeux-section-sorti
 title: "Veille : source IGDB (sorties de jeux), section « Sorties » (récentes J+N, à venir 14 j), repère J+N sur les jeux et les VOD, priorité donnée à Claude à la fenêtre de sortie (J0 à J+15), réglages [veille], tests sans réseau (complète SPEC-bdd9)"
 created: 2026-10-06T19:36:37Z
 author: w-igdb
-status: accepted
+status: superseded
 scope:
   - clipper/veille.py
   - clipper/veille_sources.py
@@ -20,7 +20,7 @@ verified:
   - by: nicoc@zedk_ordi
     at: 2026-10-07T06:51:53Z
 schema: 4
-version: 2
+version: 3
 ---
 
 ## Objet
