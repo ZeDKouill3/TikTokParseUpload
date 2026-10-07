@@ -117,6 +117,8 @@ CONFIG_DEFAULTS: dict[str, object] = {
     # Grille de notation (SPEC-0eec), relative au dossier courant. "builtin"
     # : grille standard embarquée dans le paquet (clipper/assets/rubric.toml),
     # "builtin:gaming" : grille gaming embarquée (rubric-gaming.toml, SPEC-9216 ;
+    # "builtin:gaming-action" : grille d'action avec seuil éliminatoire [gate]
+    # (rubric-gaming-action.toml, SPEC-b0f3 ;
     # un "builtin:<nom>" inconnu est une erreur), utile
     # sans fichier local (ex. juste après installation de la wheel, avant
     # 'clipper init'). Toute autre valeur est un chemin utilisé tel quel ;
@@ -182,6 +184,7 @@ def _number(value: Any) -> bool:
 _BUILTIN_RUBRICS = {
     "builtin": "rubric.toml",
     "builtin:gaming": "rubric-gaming.toml",
+    "builtin:gaming-action": "rubric-gaming-action.toml",
 }
 
 
@@ -245,7 +248,38 @@ def load_rubric(path: str | Path) -> dict[str, Any]:
     categories = rubric.get("exclusions", {}).get("sponsorblock_categories")
     if not isinstance(categories, list):
         raise MomentsError(f"{path} : [exclusions] sponsorblock_categories manquant")
+    if "gate" in rubric:
+        _check_gate(path, rubric["gate"], criteria)
     return rubric
+
+
+def _gate_note(path: Path, gate: dict[str, Any], key: str) -> None:
+    value = gate[key]
+    if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= 10:
+        raise MomentsError(f"{path} : [gate] {key} invalide (attendu : entier de 0 a 10)")
+
+
+def _check_gate(path: Path, gate: Any, criteria: dict[str, Any]) -> None:
+    """Valide la table optionnelle [gate] (SPEC-b0f3 R3) : ``criterion`` (et
+    ``unless_criterion``) nomme un critere de [criteria], ``min`` (et
+    ``unless_min``) est un entier de 0 a 10, et les deux ``unless_*`` vont
+    ensemble."""
+    if not isinstance(gate, dict):
+        raise MomentsError(f"{path} : [gate] doit etre une table")
+    if gate.get("criterion") not in criteria:
+        raise MomentsError(f"{path} : [gate] criterion manquant ou absent de [criteria] (criteres : {', '.join(criteria)})")
+    if "min" not in gate:
+        raise MomentsError(f"{path} : [gate] min manquant")
+    _gate_note(path, gate, "min")
+    if ("unless_criterion" in gate) != ("unless_min" in gate):
+        missing = "unless_min" if "unless_criterion" in gate else "unless_criterion"
+        raise MomentsError(f"{path} : [gate] {missing} manquant (unless_criterion et unless_min vont ensemble)")
+    if "unless_criterion" in gate:
+        if gate["unless_criterion"] not in criteria:
+            raise MomentsError(
+                f"{path} : [gate] unless_criterion absent de [criteria] (criteres : {', '.join(criteria)})"
+            )
+        _gate_note(path, gate, "unless_min")
 
 
 # --------------------------------------------------------------------------
@@ -777,6 +811,21 @@ def _cap(rubric: dict[str, Any], meta: dict[str, Any]) -> int:
     return max(rubric["min_moments_cap"], math.ceil(rubric["max_moments_per_hour"] * hours - 1e-9))
 
 
+def _gate_rejection(c: dict[str, Any], rubric: dict[str, Any]) -> str | None:
+    """Raison du rejet par le seuil eliminatoire [gate] (SPEC-b0f3 R3), ou
+    None : grille sans [gate], note au critere >= ``min``, ou note a
+    ``unless_criterion`` >= ``unless_min``."""
+    gate = rubric.get("gate")
+    if gate is None:
+        return None
+    note = c["scores"][gate["criterion"]]
+    if note >= gate["min"]:
+        return None
+    if "unless_criterion" in gate and c["scores"][gate["unless_criterion"]] >= gate["unless_min"]:
+        return None
+    return f"{gate['criterion']} {_num(note)} < seuil éliminatoire {gate['min']} (grille)"
+
+
 def _select(
     candidates: list[dict[str, Any]], rubric: dict[str, Any], meta: dict[str, Any],
     exploration: tuple[float, int] | None = None,
@@ -794,6 +843,10 @@ def _select(
     kept: list[dict[str, Any]] = []
     rejected: list[tuple[dict[str, Any], str]] = []
     for c in sorted(candidates, key=lambda c: (c["format"] != "multipart", -c["final_score"], c["_start"])):
+        gate_reason = _gate_rejection(c, rubric)
+        if gate_reason is not None:
+            rejected.append((c, gate_reason))
+            continue
         if c["final_score"] < rubric["min_score"]:
             rejected.append((c, f"score {c['final_score']} < min_score {rubric['min_score']}"))
             continue
