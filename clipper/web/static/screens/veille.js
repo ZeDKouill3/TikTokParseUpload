@@ -137,7 +137,7 @@ function veilleProposal(p, game, channels) {
   const actions = queued
     ? `<span class="chip queued">en file</span><span class="note">Mise en file à ${esc(veilleWhen(p.decided_at))}${p.channel ? ` avec le style <b class="mono">${esc(p.channel)}</b>` : ""} · ne sera plus proposée.</span><span class="spacer"></span><a class="btn btn-sm btn-ghost" href="#/videos">Voir dans Vidéos</a>`
     : `<a class="btn btn-sm btn-ghost" href="${esc(c.url)}" target="_blank" rel="noopener">Voir la VOD</a><span class="spacer"></span>${styleSelect}<button class="btn btn-sm btn-primary" type="button" data-veille-clip>Clipper</button><button class="btn btn-sm btn-ghost" type="button" data-veille-ignore>Ignorer</button>`;
-  const meta = [c.channel_name, c.game_name, c.published_at ? `publié le ${veilleDay(c.published_at)}` : "", c.view_count != null ? `${fr(c.view_count)} vues` : ""].filter(Boolean).map(esc).join(" · ");
+  const meta = [c.channel_name, c.game_name ? (c.game_source === "titre" ? `${c.game_name} (jeu déduit du titre)` : c.game_name) : "", c.published_at ? `publié le ${veilleDay(c.published_at)}` : "", c.view_count != null ? `${fr(c.view_count)} vues` : ""].filter(Boolean).map(esc).join(" · ");
   return `<article class="prop${queued ? " queued" : ""}" data-veille-prop="${esc(p.candidate_id)}">
     <div class="prop-thumb"><span class="rank">${esc(p.rank)}</span><div class="art">${c.thumbnail_url ? `<img loading="lazy" alt="" src="${esc(c.thumbnail_url)}" style="width:100%;height:100%;object-fit:cover;display:block" onerror="this.remove()">` : ""}</div><span class="dur">${esc(veilleDuration(c.duration_s))}</span></div>
     <div class="prop-main">

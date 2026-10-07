@@ -82,6 +82,7 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "igdb_min_hypes": 0,
     "igdb_releases_max": 30,
     "igdb_pages_max": 4,
+    "youtube_game_min_chars": 5,
 }
 
 log = logging.getLogger(__name__)
@@ -125,6 +126,9 @@ def settings(config: Config) -> dict[str, object]:
         value = table[key]
         if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
             raise VeilleError(f"[veille] {key} doit être un entier >= {minimum} (reçu {value!r})")
+    min_chars = table["youtube_game_min_chars"]
+    if not isinstance(min_chars, int) or isinstance(min_chars, bool) or min_chars < 1:
+        raise VeilleError(f"[veille] youtube_game_min_chars doit être un entier >= 1 (reçu {min_chars!r})")
     history_days = table["history_days"]
     if not isinstance(history_days, int) or isinstance(history_days, bool) or history_days < table["baseline_days"]:
         raise VeilleError(
@@ -437,8 +441,23 @@ def _to_candidate(source: str, vod: dict[str, Any]) -> dict[str, Any]:
         "game_key": normalize(game_name) if game_name else None, "game_name": game_name,
         "duration_s": vod["duration_s"], "published_at": vod["published_at"],
         "view_count": vod.get("view_count"), "thumbnail_url": vod.get("thumbnail_url"), "views_per_hour": vod.get("views_per_hour"),
-        "signals": {}, "access_unverified": None,
+        "signals": {}, "access_unverified": None, "game_source": None,
+        "tags": [str(t) for t in vod.get("tags") or []],
     }
+
+
+def _deduce_game(candidate: dict[str, Any], known: dict[str, str], min_chars: int) -> None:
+    """Jeu d'une VOD YouTube sans jeu : un nom de jeu connu du jour présent en mot(s) entier(s) dans le titre
+    ou les tags. Plusieurs trouvés : le plus long gagne s'il contient tous les autres, sinon ambiguïté = aucun jeu.
+    Aucun appel LLM, aucun nom inventé."""
+    text = f" {' '.join(normalize(t) for t in [candidate.get('title') or '', *candidate['tags']])} "
+    found = [key for key in known if len(key) >= min_chars and f" {key} " in text]
+    if not found:
+        return
+    best = max(found, key=len)
+    if any(f" {key} " not in f" {best} " for key in found):
+        return
+    candidate["game_key"], candidate["game_name"], candidate["game_source"] = best, known[best], "titre"
 
 
 def _check_twitch_access(
@@ -581,6 +600,16 @@ def collect(
         else:
             candidates.append(_to_candidate(source, vod))
 
+    known_games: dict[str, str] = {k: g["name"] for k, g in twitch_hist.items()}
+    for entry in (*steam_hist.values(), *sellers_hist.values()):
+        known_games.setdefault(normalize(entry["name"]), entry["name"])
+    releases = _group_releases(igdb_rows, today, table)
+    for entry in (*releases["recent"], *releases["upcoming"]):
+        known_games.setdefault(entry["key"], entry["name"])
+    for candidate in candidates:
+        if candidate["source"] == "youtube" and not candidate["game_key"]:
+            _deduce_game(candidate, known_games, int(table["youtube_game_min_chars"]))  # type: ignore[call-overload]
+
     if sources["twitch"]["status"] == "ok":
         candidates, restricted = _check_twitch_access(candidates, table, access_check or veille_sources.check_twitch_access)
         sources["twitch"]["counts"]["restricted"] = restricted
@@ -590,7 +619,6 @@ def collect(
             vod_counts[candidate["game_key"]] = vod_counts.get(candidate["game_key"], 0) + 1
 
     games = _build_games(twitch_hist, steam_hist, youtube_hist, vod_counts, previous, table, sellers_hist)
-    releases = _group_releases(igdb_rows, today, table)
     if sources["igdb"]["status"] == "ok":
         sources["igdb"]["counts"] = {"rows": len(igdb_rows), "recent": len(releases["recent"]),
                                      "upcoming": len(releases["upcoming"]), "skipped_rows": igdb_skipped}
@@ -599,7 +627,9 @@ def collect(
     by_key = {g["key"]: g for g in games}
     for candidate in candidates:
         game = by_key.get(candidate["game_key"])
-        candidate["signals"] = {"release_days_since": game["release"]["days_since"] if game and game["release"] else None}
+        release = game["release"] if game else (
+            _release_marker({"key": candidate["game_key"]}, "", releases["recent"]) if candidate["game_key"] else None)
+        candidate["signals"] = {"release_days_since": release["days_since"] if release else None}
         if game:
             candidate["signals"] |= {"twitch_delta_pct": game["twitch_delta_pct"], "steam_delta_pct": game["steam_delta_pct"],
                                     "steam_rank_gain": game["steam_rank_gain"], "steam_new_in_top": game["steam_new_in_top"],
@@ -719,7 +749,7 @@ def _prompt(day_state: dict[str, Any], table: dict[str, object]) -> str:
         signals = c.get("signals") or {}
         lines.append(
             f"- id={c['id']} source={c['source']} titre={c.get('title')!r} chaîne={c.get('channel_name')!r} "
-            f"jeu={_fmt(c.get('game_name'))} durée_s={c['duration_s']} publiée={c['published_at']} "
+            f"jeu={_fmt(c.get('game_name'))}{' (déduit du titre)' if c.get('game_source') == 'titre' else ''} durée_s={c['duration_s']} publiée={c['published_at']} "
             f"vues={_fmt(c.get('view_count'))} vues_par_heure={_fmt(c.get('views_per_hour'))} "
             f"twitch_delta_pct={_fmt(signals.get('twitch_delta_pct'))} "
             f"steam_delta_pct={_fmt(signals.get('steam_delta_pct'))} "

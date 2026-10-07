@@ -10,6 +10,14 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ## [Non publié]
 
+### Ajouté
+
+- Veille : une VOD YouTube sans jeu reçoit son jeu si son titre ou ses tags contiennent, en mot(s)
+  entier(s), le nom d'un jeu déjà relevé aujourd'hui (Twitch, Steam, IGDB). Plusieurs jeux : le nom le
+  plus long gagne s'il contient les autres, sinon aucun jeu. Aucune devinette, aucun appel à Claude pour
+  ce choix. La carte affiche « jeu déduit du titre » et Claude reçoit les signaux de tendance du jeu.
+  Nouveau réglage `[veille] youtube_game_min_chars` (défaut 5) : les noms plus courts sont ignorés.
+
 ## [0.5.2] - 2026-10-07
 
 Petite version de correction autour de la publication TikTok et de la veille. Le zip
