@@ -22,6 +22,14 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ### Ajouté
 
+- Jury action (6/6) : preuve de bout en bout et documentation (SPEC-b0f3 R15, R17, R18). Deux tests de
+  `tests/test_pipeline.py` (FakeBackend, source synthétique) : un style gaming action enchaîne audio avant
+  scenes (`peak_windows`), action avant moments, produit `action.json` puis un `moments.json` avec un moment de
+  source « action » et le monologue rejeté par le seuil éliminatoire ; le style témoin (`builtin`,
+  `transcript`) garde `scenes.json` identique octet pour octet, un `action.json` vide, aucun appel `action`.
+  `tests/test_action_real.py` : test réel optionnel sur un extrait de VOD (`CLIPPER_ACTION_REAL=1`,
+  `CLIPPER_ACTION_REAL_VIDEO`), jamais lancé par défaut. README (étape `action`, réglages `[action]`,
+  `candidates`, clés des deux presets), AGENTS.md et GUIDE (13 étapes) à jour.
 - Jury action (5/6) : la console gère les styles gaming action (SPEC-b0f3 R16). Grille « Gaming action »
   (`builtin:gaming-action`, reconnue aussi pour un fichier au contenu identique) dans le choix de grille ;
   `[moments] candidates` (transcript / transcript+action) et `action_snap_seconds` dans le formulaire ; section
