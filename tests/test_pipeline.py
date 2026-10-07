@@ -2005,3 +2005,16 @@ def test_download_failing_on_subscriber_only_vod_fails_definitively_in_auto(tmp_
     assert result["retry_at"] is None
     assert "reservee aux abonnes" in result["reason"]
     assert "echec transitoire" not in caplog.text
+
+
+def test_permanent_llm_error_raised_inside_connection_error_context_is_not_transient():
+    """Une LLMError definitive n'est jamais transitoire, meme levee dans un
+    ``except ConnectionError`` (le contexte reseau dessous ne doit pas compter)."""
+    try:
+        try:
+            raise ConnectionError("reset")
+        except ConnectionError:
+            raise llm.LLMError("reponse invalide")
+    except llm.LLMError as exc:
+        assert isinstance(exc.__context__, ConnectionError)
+        assert pipeline.is_transient(exc) is False

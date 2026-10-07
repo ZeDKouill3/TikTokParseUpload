@@ -256,7 +256,8 @@ def _transient_types() -> tuple[type[BaseException], ...]:
 
 def _chain(exc: BaseException) -> list[BaseException]:
     """``exc`` et toutes les erreurs qu'elle enveloppe (cause, contexte,
-    ``exc_info`` de yt-dlp), sans doublon."""
+    ``exc_info`` de yt-dlp), sans doublon ; on ne descend pas sous une
+    ``LLMError`` non transitoire."""
     seen: set[int] = set()
     out: list[BaseException] = []
     todo: list[BaseException | None] = [exc]
@@ -266,6 +267,8 @@ def _chain(exc: BaseException) -> list[BaseException]:
             continue
         seen.add(id(e))
         out.append(e)
+        if isinstance(e, llm.LLMError) and not isinstance(e, llm.TransientLLMError):
+            continue  # erreur LLM definitive : ce qu'elle enveloppe ne compte jamais (ADR-ad2e)
         wrapped = getattr(e, "exc_info", None)
         if isinstance(wrapped, tuple) and len(wrapped) > 1 and isinstance(wrapped[1], BaseException):
             todo.append(wrapped[1])
