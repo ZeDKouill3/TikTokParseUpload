@@ -6,6 +6,7 @@ Collecteurs injectés, ``tmp_path`` pour ``state/`` : aucun test ne touche le r�
 from __future__ import annotations
 
 import json
+from unittest import mock
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -23,6 +24,7 @@ def _make_config(tmp_path, **veille_table) -> Config:
         "twitch_client_id": "cid",
         "twitch_client_secret": "csecret",
         "youtube_api_key": "ykey",
+        "max_vods_per_game": 3,  # les tests d'avant R20 choisissent plusieurs VOD d'un même jeu ; R20 fixe 1 explicitement
         **veille_table,
     }
     return Config(
@@ -118,6 +120,9 @@ def test_config_defaults_are_exactly_r1():
         "steam_rank_gain_min": 5, "steam_risers_max": 10, "steam_sellers_top": 50,
         "upcoming_days": 14, "release_window_days": 15, "igdb_min_hypes": 5, "igdb_recent_max": 12,
         "igdb_upcoming_max": 20, "igdb_pages_max": 4, "youtube_game_min_chars": 5,
+        "steam_players_lookups_max": 30, "steam_followers_lookups_max": 200, "steam_followers_pause_s": 1.0,
+        "community_min_steam_players": 1000, "community_min_steam_followers": 10000,
+        "community_min_twitch_viewers": 200, "community_min_hypes": 50, "max_vods_per_game": 1,
     }
 
 
@@ -136,6 +141,14 @@ def test_load_config_accepts_veille_table(tmp_path):
     ({"baseline_days": 10, "history_days": 9}, "history_days"),
     ({"run_at": "7h00"}, "run_at"),
     ({"run_at": "25:00"}, "run_at"),
+    ({"community_min_steam_players": -1}, "community_min_steam_players"),
+    ({"community_min_steam_followers": -1}, "community_min_steam_followers"),
+    ({"community_min_twitch_viewers": -1}, "community_min_twitch_viewers"),
+    ({"community_min_hypes": -1}, "community_min_hypes"),
+    ({"steam_players_lookups_max": -1}, "steam_players_lookups_max"),
+    ({"steam_followers_lookups_max": -1}, "steam_followers_lookups_max"),
+    ({"steam_followers_pause_s": 0.1}, "steam_followers_pause_s"),
+    ({"max_vods_per_game": 0}, "max_vods_per_game"),
 ])
 def test_invalid_settings_raise_naming_the_key(tmp_path, table, key):
     config = _make_config(tmp_path, **table)
@@ -363,7 +376,7 @@ def test_candidates_filtered_and_counted(tmp_path, config):
     veille.collect(NOW, collectors=_collectors(vods=vods), config=config)
     day = _read(_sdir(tmp_path) / "days" / f"{TODAY}.json")
     assert [c["id"] for c in day["candidates"]] == ["twitch:ok1"]
-    assert day["excluded"] == {"too_short": 1, "too_old": 1, "already_known": 4}
+    assert day["excluded"] == {"too_short": 1, "too_old": 1, "already_known": 4, "no_community": 0}
     candidate = day["candidates"][0]
     assert candidate["source"] == "twitch" and candidate["video_id"] == "ok1"
     assert candidate["game_key"] == "jeu alpha" and candidate["duration_s"] == 7200
@@ -1054,7 +1067,8 @@ def test_igdb_entry_has_every_field_and_dates_come_from_the_window_only(tmp_path
         "igdb_id": "1", "name": "Hytale", "key": "hytale", "slug": "hytale", "url": "https://igdb.test/1",
         "hypes": 42, "cover_image_id": "abc123", "steam_appid": "620", "first_release_date": 1788220800,
         "date": "2026-10-02", "human": "2026-10-02", "days": -4, "platforms": ["PC", "PS5"],
-        "regions": ["Europe", "Worldwide"], "statuses": ["Early Access", "Released"], "portage": True, "trend": None}
+        "regions": ["Europe", "Worldwide"], "statuses": ["Early Access", "Released"], "portage": True, "trend": None,
+        "steam_players_now": None, "steam_followers": None}  # sans jeu dans le relevé : chiffres sur la sortie (R18, R21)
     assert state["releases"]["upcoming"] == []
 
 
@@ -1182,7 +1196,8 @@ def test_igdb_trend_matched_by_normalized_key_and_carries_exactly_the_documented
     (entry,) = state["releases"]["recent"]
     game = next(g for g in state["games"] if g["key"] == "hytale")
     fields = ("key", "name", "twitch_fr_viewers", "twitch_delta_pct", "steam_players", "steam_rank", "steam_rank_gain",
-              "steam_new_in_top", "steam_sellers_rank", "steam_sellers_gain", "steam_sellers_new")
+              "steam_new_in_top", "steam_sellers_rank", "steam_sellers_gain", "steam_sellers_new",
+              "steam_players_now", "steam_followers", "steam_followers_gain_7d", "community")
     assert entry["trend"] == {k: game[k] for k in fields}
     assert entry["trend"]["twitch_fr_viewers"] == 800 and entry["trend"]["steam_players"] == 5000
     assert entry["trend"]["steam_sellers_rank"] == 3 and entry["trend"]["steam_new_in_top"] is True
@@ -1230,7 +1245,8 @@ def test_candidates_copy_release_days_since_from_their_game(tmp_path):
     state = veille.collect(NOW, collectors=_games_collectors(
         twitch_games=games, vods=vods, releases=[_rel(5, "Hytale", "2026-10-03")]), config=_make_config(tmp_path))
     days = {c["video_id"]: c["signals"]["release_days_since"] for c in state["candidates"]}
-    assert days == {"h1": 3, "a1": None, "o1": None}
+    assert days == {"h1": 3, "a1": None}  # « Orphelin » n'a pas de jeu connu : écarté (R19)
+    assert state["excluded"]["no_community"] == 1
 
 
 def _prompt_state(*, releases=None, igdb=None, game_release=None, days_since=None):
@@ -1325,11 +1341,22 @@ def _yt_game(video_id, title, *, tags=None):
 
 
 def _deduce(tmp_path, videos, *, steam=(), igdb=(), **table):
+    """Candidats construits (jeu déduit compris), y compris ceux que la communauté écarte ensuite (R19) : un jeu
+    Steam « nouveau dans le top » a des joueurs, donc une communauté ; les autres sont lus avant l'écart."""
     collectors = _with_igdb(igdb, videos=videos) if igdb else _collectors(videos=videos)
     collectors["steam"] = Collector({"games": [
-        {"appid": str(100 + i), "name": n, "players": 10} for i, n in enumerate(steam)]})
-    veille.collect(NOW, collectors=collectors, config=_make_config(tmp_path, **table))
-    return {c["video_id"]: c for c in _day(tmp_path)["candidates"]}
+        {"appid": str(100 + i), "name": n, "players": 2000, "rank": 1 + i, "last_week_rank": 0}
+        for i, n in enumerate(steam)]})
+    built: list[dict] = []
+    real = veille._to_candidate
+
+    def spy(source, vod):
+        built.append(real(source, vod))
+        return built[-1]
+
+    with mock.patch.object(veille, "_to_candidate", spy):
+        veille.collect(NOW, collectors=collectors, config=_make_config(tmp_path, **table))
+    return {c["video_id"]: c for c in built}
 
 
 def test_title_with_known_game_gives_game_and_source(tmp_path):
@@ -1349,7 +1376,7 @@ def test_steam_only_game_is_known(tmp_path):
 
 
 def test_igdb_game_is_known(tmp_path):
-    cands = _deduce(tmp_path, [_yt_game("y1", "Premier avis Starfall Online")],
+    cands = _deduce(tmp_path, [_yt_game("y1", "Premier avis Starfall Online")], steam=["Starfall Online"],
                     igdb=[_rel(7, "Starfall Online", "2026-10-05")])
     assert cands["y1"]["game_name"] == "Starfall Online"
     assert cands["y1"]["signals"]["release_days_since"] == 1
@@ -1397,9 +1424,11 @@ def test_vod_with_a_game_is_untouched_and_twitch_never_deduced(tmp_path):
     cands = _deduce(tmp_path, [yt])
     assert cands["y1"]["game_name"] == "Autre Jeu" and cands["y1"]["game_source"] is None
     collectors = _collectors(vods=[tw])
-    veille.collect(NOW, collectors=collectors, config=_make_config(tmp_path))
-    twitch = {c["video_id"]: c for c in _day(tmp_path)["candidates"]}
-    assert twitch["t1"]["game_name"] is None
+    built: list[dict] = []
+    real = veille._to_candidate
+    with mock.patch.object(veille, "_to_candidate", lambda source, vod: built.append(real(source, vod)) or built[-1]):
+        veille.collect(NOW, collectors=collectors, config=_make_config(tmp_path))
+    assert [c["game_name"] for c in built] == [None]  # écartée ensuite (R19), mais jamais déduite
 
 
 def test_deduced_game_carries_trend_signals_and_reaches_claude(tmp_path):
@@ -1416,3 +1445,394 @@ def test_no_llm_call_for_the_deduction(tmp_path):
     with llm.use_backend(fake):
         _deduce(tmp_path, [_yt_game("y1", "Jeu Alpha")])
     assert fake.calls == []
+
+
+# ==========================================================================
+# TASK-82da : Steam officiel, communauté, diversité (SPEC-df51 R11, R15, R18 à R21)
+# ==========================================================================
+
+
+class Lookup:
+    """Collecteur par appid : garde les appids de chaque appel et rend ``results`` (ou lève ``error``)."""
+
+    def __init__(self, key, results=None, error=None, skipped=0):
+        self.key, self.results, self.error, self.skipped = key, results or {}, error, skipped
+        self.calls: list[list[str]] = []
+        self.settings: list[dict] = []
+
+    def __call__(self, settings, appids):
+        self.calls.append(list(appids))
+        self.settings.append(settings)
+        if self.error is not None:
+            raise self.error
+        return {self.key: {a: self.results.get(a) for a in appids}, "skipped": self.skipped}
+
+
+def _steam_row(appid, name, players, concurrent=None, **extra):
+    return {"appid": appid, "name": name, "players": players, "concurrent": concurrent, **extra}
+
+
+def _community_collectors(*, players=None, followers=None, releases=(), twitch=(("Jeu Alpha", 1000),), steam=None,
+                          sellers=(), players_error=None, followers_error=None):
+    """Scénario R18 : Twitch + top 100 Steam + ventes FR + IGDB, collecteurs par appid injectés."""
+    collectors = _with_igdb(releases)
+    collectors["twitch"] = Collector({"games": [{"name": n, "viewers_fr": v, "igdb_id": ""} for n, v in twitch], "vods": []})
+    collectors["steam"] = Collector({"games": steam if steam is not None else [
+        _steam_row("42", "Jeu Alpha", 5000, 1200), _steam_row("43", "Top Sans Live", 3000),
+        _steam_row("44", "Autre Top", 2000, 800)]})
+    collectors["steam_fr"] = Collector({"games": list(sellers)})
+    collectors["steam_players"] = Lookup("players", players or {}, players_error)
+    collectors["steam_followers"] = Lookup("followers", followers or {}, followers_error)
+    return collectors
+
+
+SELLER_50 = {"appid": "50", "name": "Vente Hors Top", "rank": 2, "last_week_rank": 0}
+
+
+def _scenario(tmp_path, **over):
+    kwargs = dict(
+        players={"43": 2500, "50": None, "60": 777},
+        followers={"42": 120000, "43": 5, "60": 9000, "70": 321, "44": 44000},
+        twitch=(("Jeu Alpha", 1000), ("Top Sans Live", 500)), sellers=[SELLER_50],
+        releases=[_rel(1, "Hytale", "2026-10-05", hypes=80, steam_appid="60"),
+                  _rel(2, "Jeu Alpha", "2026-10-06", hypes=20, steam_appid="42"),
+                  _rel(3, "Futur", "2026-10-09", hypes=30, steam_appid="70")])
+    table = over.pop("table", {})
+    kwargs.update(over)
+    collectors = _community_collectors(**kwargs)
+    state = veille.collect(NOW, collectors=collectors, config=_make_config(tmp_path, **table))
+    return state, collectors
+
+
+def _game_of(state, key):
+    return next(g for g in state["games"] if g["key"] == key)
+
+
+def test_steam_players_collector_called_last_with_ordered_unique_unknown_snapshot_appids(tmp_path):
+    state, collectors = _scenario(tmp_path)
+    # jeux de games sans instantané (top 100 sans concurrent, puis ventes FR hors top), puis sortie récente sans jeu
+    assert collectors["steam_players"].calls == [["43", "50", "60"]]
+    assert state["sources"]["steam_players"]["status"] == "ok" and state["sources"]["steam_players"]["error"] is None
+    assert state["sources"]["steam_players"]["counts"] == {"requested": 3, "found": 2, "unknown": 1, "skipped": 0}
+    assert collectors["steam_players"].settings[0]["steam_players_lookups_max"] == 30
+    assert list(state["sources"]) == list(veille.SOURCES)
+
+
+def test_steam_players_now_is_snapshot_and_peak_stays_the_peak(tmp_path):
+    state, _ = _scenario(tmp_path)
+    alpha, tsl, vente = _game_of(state, "jeu alpha"), _game_of(state, "top sans live"), _game_of(state, "vente hors top")
+    assert (alpha["steam_players"], alpha["steam_players_now"]) == (5000, 1200)   # concurrent du top 100, jamais relevé
+    assert (tsl["steam_players"], tsl["steam_players_now"]) == (3000, 2500)       # pic du top 100 + instantané relevé
+    assert (vente["steam_players"], vente["steam_players_now"]) == (None, None)   # 404 : inconnu, pas 0
+
+
+def test_steam_players_now_on_trend_and_on_release_without_game(tmp_path):
+    state, _ = _scenario(tmp_path)
+    recent = {e["name"]: e for e in state["releases"]["recent"]}
+    assert recent["Jeu Alpha"]["trend"]["steam_players_now"] == 1200
+    assert recent["Hytale"]["trend"] is None and recent["Hytale"]["steam_players_now"] == 777
+    assert state["releases"]["upcoming"][0]["steam_players_now"] is None  # « Futur » : pas relevé (sortie à venir)
+
+
+def test_steam_players_source_error_sets_no_now_and_the_rest_continues(tmp_path):
+    state, _ = _scenario(tmp_path, players_error=veille_sources.SourceError("HTTP 500 sur steam players"))
+    assert state["sources"]["steam_players"]["status"] == "error" and "HTTP 500" in state["sources"]["steam_players"]["error"]
+    assert _game_of(state, "top sans live")["steam_players_now"] is None
+    assert state["releases"]["recent"][0]["steam_players_now"] is None
+    assert all(state["sources"][s]["status"] == "ok" for s in ("twitch", "steam", "igdb", "steam_followers"))
+    assert state["games"]
+
+
+def test_steam_players_lookups_max_zero_is_skipped_without_call(tmp_path):
+    state, collectors = _scenario(tmp_path, table={"steam_players_lookups_max": 0})
+    assert collectors["steam_players"].calls == []
+    assert state["sources"]["steam_players"]["status"] == "skipped" and state["sources"]["steam_players"]["error"] is None
+
+
+def test_steam_players_list_is_cut_at_lookups_max_and_the_rest_counted_skipped(tmp_path):
+    state, collectors = _scenario(tmp_path, table={"steam_players_lookups_max": 2}, players={"43": 2500, "50": 9})
+    assert collectors["steam_players"].calls == [["43", "50"]]
+    assert state["sources"]["steam_players"]["counts"] == {"requested": 2, "found": 2, "unknown": 0, "skipped": 1}
+
+
+def _write_day(tmp_path, date, **sections):
+    path = _sdir(tmp_path) / "history" / f"{date}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"date": date, "at": f"{date}T08:00:00+00:00", "twitch": {}, "steam": {}, "youtube": {},
+                                **sections}), encoding="utf-8")
+
+
+def test_history_file_keeps_every_snapshot_and_follower_count_of_the_day(tmp_path):
+    _scenario(tmp_path)
+    history = _read(_sdir(tmp_path) / "history" / f"{TODAY}.json")
+    assert history["steam_now"] == {"42": 1200, "44": 800, "43": 2500, "60": 777}  # null jamais écrit
+    assert history["steam_followers"] == {"42": 120000, "43": 5, "60": 9000, "70": 321, "44": 44000}
+    assert history["steam"]["42"]["players"] == 5000 and "concurrent" not in history["steam"]["42"]
+
+
+def test_players_history_and_now_trend_come_from_the_daily_files_without_interpolation(tmp_path):
+    _write_day(tmp_path, "2026-10-03", steam={"42": {"name": "Jeu Alpha", "players": 1000}}, steam_now={"42": 300})
+    _write_day(tmp_path, "2026-10-04", steam={"42": {"name": "Jeu Alpha", "players": 2000}}, steam_now={"42": 500})
+    _write_day(tmp_path, "2026-10-05", steam={"42": {"name": "Jeu Alpha", "players": 3000}})
+    state, _ = _scenario(tmp_path)
+    alpha = _game_of(state, "jeu alpha")
+    assert alpha["steam_players_history"] == [
+        {"date": "2026-10-03", "kind": "peak", "players": 1000}, {"date": "2026-10-03", "kind": "now", "players": 300},
+        {"date": "2026-10-04", "kind": "peak", "players": 2000}, {"date": "2026-10-04", "kind": "now", "players": 500},
+        {"date": "2026-10-05", "kind": "peak", "players": 3000},
+        {"date": TODAY, "kind": "peak", "players": 5000}, {"date": TODAY, "kind": "now", "players": 1200}]
+    assert alpha["steam_avg"] == 2000 and alpha["steam_delta_pct"] == 150          # pics seulement
+    assert alpha["steam_now_avg"] == 400 and alpha["steam_now_delta_pct"] == 200    # instantanés seulement : (1200-400)/400
+
+
+def test_now_trend_is_null_without_previous_snapshot_day(tmp_path):
+    _write_day(tmp_path, "2026-10-05", steam={"42": {"name": "Jeu Alpha", "players": 3000}})
+    state, _ = _scenario(tmp_path)
+    alpha = _game_of(state, "jeu alpha")
+    assert alpha["steam_now_avg"] is None and alpha["steam_now_delta_pct"] is None
+    assert [p["date"] for p in alpha["steam_players_history"]] == ["2026-10-05", TODAY, TODAY]
+
+
+def test_steam_followers_collector_gets_ordered_unique_appids_and_values_land_everywhere(tmp_path):
+    state, collectors = _scenario(tmp_path)
+    # games (Jeu Alpha, Top Sans Live, Vente Hors Top), sorties recent puis upcoming hors games, reste du top 100
+    assert collectors["steam_followers"].calls == [["42", "43", "50", "60", "70", "44"]]
+    assert state["sources"]["steam_followers"]["counts"] == {"requested": 6, "found": 5, "unknown": 1, "skipped": 0}
+    assert _game_of(state, "jeu alpha")["steam_followers"] == 120000
+    assert _game_of(state, "vente hors top")["steam_followers"] is None
+    recent = {e["name"]: e for e in state["releases"]["recent"]}
+    assert recent["Jeu Alpha"]["trend"]["steam_followers"] == 120000
+    assert recent["Hytale"]["steam_followers"] == 9000 and recent["Hytale"]["trend"] is None
+    assert state["releases"]["upcoming"][0]["steam_followers"] == 321
+
+
+def test_steam_followers_list_is_cut_at_lookups_max_and_zero_is_skipped(tmp_path):
+    state, collectors = _scenario(tmp_path, table={"steam_followers_lookups_max": 4})
+    assert collectors["steam_followers"].calls == [["42", "43", "50", "60"]]
+    assert state["sources"]["steam_followers"]["counts"]["skipped"] == 2
+    state, collectors = _scenario(tmp_path / "zero", table={"steam_followers_lookups_max": 0})
+    assert collectors["steam_followers"].calls == [] and state["sources"]["steam_followers"]["status"] == "skipped"
+
+
+def test_steam_followers_error_sets_no_follower_and_the_rest_continues(tmp_path):
+    state, _ = _scenario(tmp_path, followers_error=veille_sources.SourceError("HTTP 503 memberslistxml"))
+    assert state["sources"]["steam_followers"]["status"] == "error"
+    assert all(g["steam_followers"] is None for g in state["games"])
+    assert _read(_sdir(tmp_path) / "history" / f"{TODAY}.json")["steam_followers"] == {}
+    assert state["sources"]["steam_players"]["status"] == "ok" and state["sources"]["igdb"]["status"] == "ok"
+
+
+def test_followers_gain_7d_from_the_exact_day_file_else_null(tmp_path):
+    _write_day(tmp_path, "2026-09-29", steam_followers={"42": 100000})
+    _write_day(tmp_path, "2026-10-02", steam_followers={"42": 110000, "43": 1})
+    state, _ = _scenario(tmp_path)
+    alpha = _game_of(state, "jeu alpha")
+    assert alpha["steam_followers_gain_7d"] == 20000
+    assert alpha["steam_followers_history"] == [
+        {"date": "2026-09-29", "followers": 100000}, {"date": "2026-10-02", "followers": 110000},
+        {"date": TODAY, "followers": 120000}]
+    assert _game_of(state, "top sans live")["steam_followers_gain_7d"] is None  # appid absent du fichier J-7
+    assert _game_of(state, "vente hors top")["steam_followers_gain_7d"] is None  # abonnés d'aujourd'hui null
+
+
+@pytest.mark.parametrize("day", [None, "2026-09-30"])
+def test_followers_gain_7d_is_null_without_the_exact_file(tmp_path, day):
+    if day:
+        _write_day(tmp_path, day, steam_followers={"42": 100000})  # J-6 seulement
+    state, _ = _scenario(tmp_path)
+    assert _game_of(state, "jeu alpha")["steam_followers_gain_7d"] is None
+
+
+def test_followers_gain_7d_is_on_trend_too(tmp_path):
+    _write_day(tmp_path, "2026-09-29", steam_followers={"42": 100000})
+    state, _ = _scenario(tmp_path)
+    recent = {e["name"]: e for e in state["releases"]["recent"]}
+    assert recent["Jeu Alpha"]["trend"]["steam_followers_gain_7d"] == 20000
+    assert recent["Jeu Alpha"]["trend"]["community"]["ok"] is True
+
+
+# --- R19 : communauté -----------------------------------------------------
+
+
+def _community_of(tmp_path, *, viewers=10, peak=10, followers=10, hypes=1, table=None):
+    """Communauté du jeu « Jeu Alpha » : un seul chiffre à la fois dépasse un seuil."""
+    steam = [_steam_row("42", "Jeu Alpha", peak, 5)]
+    collectors = _community_collectors(
+        twitch=(("Jeu Alpha", viewers),), steam=steam, followers={"42": followers},
+        releases=[_rel(1, "Jeu Alpha", "2026-10-05", hypes=hypes)])
+    state = veille.collect(NOW, collectors=collectors, config=_make_config(tmp_path, **(table or {})))
+    return _game_of(state, "jeu alpha")["community"]
+
+
+@pytest.mark.parametrize("over, met", [
+    ({"peak": 1000}, ["steam"]), ({"followers": 10000}, ["followers"]),
+    ({"viewers": 200}, ["twitch"]), ({"hypes": 50}, ["hypes"]),
+    ({"peak": 999, "followers": 9999, "viewers": 199, "hypes": 49}, []),
+    ({"peak": 1000, "followers": 10000, "viewers": 200, "hypes": 50}, ["steam", "followers", "twitch", "hypes"]),
+])
+def test_community_ok_when_any_single_threshold_is_reached(tmp_path, over, met):
+    community = _community_of(tmp_path, **over)
+    assert community["met"] == met and community["ok"] is bool(met)
+
+
+def test_community_carries_the_figures_and_the_kind_of_steam_number(tmp_path):
+    assert _community_of(tmp_path, peak=1500, followers=20000, viewers=300, hypes=60) == {
+        "ok": True, "steam_players": 1500, "steam_kind": "peak", "steam_followers": 20000, "twitch_fr_viewers": 300,
+        "hypes": 60, "met": ["steam", "followers", "twitch", "hypes"]}
+
+
+def test_community_uses_the_snapshot_when_the_peak_is_unknown(tmp_path):
+    state, _ = _scenario(tmp_path, players={"50": 1500})
+    vente = _game_of(state, "vente hors top")["community"]
+    assert (vente["steam_players"], vente["steam_kind"], vente["ok"], vente["met"]) == (1500, "now", True, ["steam"])
+
+
+def test_community_all_unknown_is_not_ok_even_with_zero_thresholds(tmp_path):
+    zero = {f"community_min_{k}": 0 for k in ("steam_players", "steam_followers", "twitch_viewers", "hypes")}
+    state, _ = _scenario(tmp_path, table=zero)
+    assert _game_of(state, "vente hors top")["community"] == {
+        "ok": False, "steam_players": None, "steam_kind": None, "steam_followers": None, "twitch_fr_viewers": None,
+        "hypes": None, "met": []}
+    assert _game_of(state, "jeu alpha")["community"]["ok"] is True  # un seuil à 0 est atteint par toute valeur connue
+
+
+def test_community_zero_threshold_is_reached_by_a_known_zero(tmp_path):
+    community = _community_of(tmp_path, viewers=0, peak=0, followers=0, hypes=0, table={
+        "community_min_steam_players": 0, "community_min_steam_followers": 0, "community_min_twitch_viewers": 0,
+        "community_min_hypes": 0, "igdb_min_hypes": 1})
+    assert community["ok"] is True and "twitch" in community["met"]
+
+
+# --- R19 : candidats sans communauté ---------------------------------------
+
+
+def _vod_collectors(vods):
+    collectors = _community_collectors(steam=[], releases=[])
+    collectors["twitch"] = Collector({"games": [{"name": "Jeu Alpha", "viewers_fr": 1000, "igdb_id": ""},
+                                                {"name": "Jeu Froid", "viewers_fr": 5, "igdb_id": ""}], "vods": vods})
+    return collectors
+
+
+def test_candidates_of_a_game_without_community_or_without_game_are_dropped_and_counted(tmp_path):
+    vods = [_vod("hot1", game="Jeu Alpha"), _vod("cold1", game="Jeu Froid"), _vod("cold2", game="Jeu Froid"),
+            _vod("orphan", game="Orphelin")]
+    state = veille.collect(NOW, collectors=_vod_collectors(vods), config=_make_config(tmp_path))
+    assert [c["video_id"] for c in state["candidates"]] == ["hot1"]
+    assert state["excluded"]["no_community"] == 3
+    assert {g["key"] for g in state["games"]} == {"jeu alpha", "jeu froid"}  # tous les jeux restent
+    assert _game_of(state, "jeu froid")["community"]["ok"] is False
+
+
+def test_dropped_candidates_are_not_in_the_prompt_nor_access_tested(tmp_path):
+    access = FakeAccess()
+    vods = [_vod("hot1", game="Jeu Alpha"), _vod("cold1", game="Jeu Froid")]
+    config = _make_config(tmp_path)
+    state = veille.collect(NOW, collectors=_vod_collectors(vods), config=config, access_check=access)
+    assert [u.rsplit("/", 1)[-1] for u in access.urls] == ["hot1"]
+    fake = FakeBackend([_picks()])
+    with llm.use_backend(fake):
+        veille.decide(state, config)
+    assert "twitch:hot1" in fake.calls[0].prompt and "cold1" not in fake.calls[0].prompt
+
+
+# --- R15 : prompt ----------------------------------------------------------
+
+
+def _hot_state(tmp_path, **table):
+    _write_day(tmp_path, "2026-10-04", steam={"42": {"name": "Jeu Alpha", "players": 2000}}, steam_now={"42": 500})
+    _write_day(tmp_path, "2026-10-05", steam={"42": {"name": "Jeu Alpha", "players": 3000}}, steam_now={"42": 300})
+    _write_day(tmp_path, "2026-09-29", steam_followers={"42": 100000})
+    collectors = _community_collectors(
+        followers={"42": 120000}, releases=[_rel(2, "Jeu Alpha", "2026-10-06", hypes=20, steam_appid="42")])
+    collectors["twitch"] = Collector({"games": [{"name": "Jeu Alpha", "viewers_fr": 1000, "igdb_id": ""}],
+                                      "vods": [_vod("hot1", game="Jeu Alpha")]})
+    config = _make_config(tmp_path, **table)
+    return veille.collect(NOW, collectors=collectors, config=config), config
+
+
+def _prompt_of(state, config):
+    fake = FakeBackend([_picks()])
+    with llm.use_backend(fake):
+        veille.decide(state, config)
+    return fake.calls[0].prompt
+
+
+def test_prompt_names_both_measures_and_gives_game_figures(tmp_path):
+    state, config = _hot_state(tmp_path)
+    prompt = _prompt_of(state, config)
+    assert "pic du jour du top 100" in prompt and "instantané à l'heure du relevé" in prompt
+    game_line = next(line for line in prompt.splitlines() if line.startswith("- Jeu Alpha :"))
+    for text in ("steam_players=5000", "steam_players_now=1200", "steam_now_delta_pct=200", "steam_abonnes=120000",
+                 "steam_abonnes_gain_7j=20000", "communaute=ok"):
+        assert text in game_line
+
+
+def test_prompt_says_insufficient_history_instead_of_a_figure(tmp_path):
+    state, config = _hot_state(tmp_path)
+    for game in state["games"]:
+        game.update(steam_now_delta_pct=None, steam_followers_gain_7d=None, steam_players_now=None, steam_followers=None)
+    game_line = next(line for line in _prompt_of(state, config).splitlines() if line.startswith("- Jeu Alpha :"))
+    assert "steam_now_delta_pct=historique insuffisant" in game_line
+    assert "steam_abonnes_gain_7j=historique insuffisant" in game_line
+    assert "steam_players_now=inconnu" in game_line and "steam_abonnes=inconnu" in game_line
+
+
+def test_prompt_candidate_line_has_community_figures_and_diversity_instruction(tmp_path):
+    state, config = _hot_state(tmp_path, max_vods_per_game=1)
+    prompt = _prompt_of(state, config)
+    candidate_line = next(line for line in prompt.splitlines() if line.startswith("- id=twitch:hot1"))
+    for text in ("steam_players=5000 (pic)", "steam_abonnes=120000", "twitch_fr_viewers=1000", "hypes_igdb=20"):
+        assert text in candidate_line
+    assert "Au plus 1 VOD par jeu : varie les jeux." in prompt
+    state, config = _hot_state(tmp_path / "b", max_vods_per_game=2)
+    assert "Au plus 2 VOD par jeu : varie les jeux." in _prompt_of(state, config)
+
+
+def test_prompt_candidate_steam_players_says_snapshot_when_the_peak_is_unknown(tmp_path):
+    state, config = _hot_state(tmp_path)
+    for game in state["games"]:
+        game["community"] = {**game["community"], "steam_players": 1200, "steam_kind": "now"}
+    candidate_line = next(line for line in _prompt_of(state, config).splitlines() if line.startswith("- id=twitch:hot1"))
+    assert "steam_players=1200 (instantané)" in candidate_line
+
+
+# --- R20 : au plus max_vods_per_game VOD par jeu ----------------------------
+
+
+def _three_vod_state():
+    state = _day_state("twitch:AAA", "twitch:BBB", "twitch:CCC")
+    state["candidates"][2].update(game_key="jeu beta", game_name="Jeu Beta")
+    return state
+
+
+def test_two_picks_of_the_same_game_are_refused_with_one_per_game_naming_the_game(tmp_path):
+    config = _make_config(tmp_path, max_vods_per_day=3, max_vods_per_game=1)
+    fake = FakeBackend([_picks("twitch:AAA", "twitch:BBB")])
+    with llm.use_backend(fake):
+        state = veille.decide(_three_vod_state(), config)
+    assert state["llm"]["status"] == "error" and "Jeu Alpha" in state["llm"]["error"]
+    assert state["proposals"] == []
+    reference = FakeBackend([_picks("twitch:ZZZ")])  # refus classique (id inconnu) : même nombre d'appels
+    with llm.use_backend(reference):
+        veille.decide(_three_vod_state(), config)
+    assert len(fake.calls) == len(reference.calls)
+
+
+def test_picks_under_the_game_cap_are_accepted(tmp_path):
+    config = _make_config(tmp_path, max_vods_per_day=3, max_vods_per_game=1)
+    with llm.use_backend(FakeBackend([_picks("twitch:AAA", "twitch:CCC")])):
+        state = veille.decide(_three_vod_state(), config)
+    assert state["llm"]["status"] == "ok" and len(state["proposals"]) == 2
+    config = _make_config(tmp_path, max_vods_per_day=3, max_vods_per_game=2)
+    with llm.use_backend(FakeBackend([_picks("twitch:AAA", "twitch:BBB")])):
+        state = veille.decide(_three_vod_state(), config)
+    assert state["llm"]["status"] == "ok" and len(state["proposals"]) == 2
+
+
+def test_picks_without_a_game_key_share_no_game_cap(tmp_path):
+    state = _three_vod_state()
+    for candidate in state["candidates"]:
+        candidate.update(game_key=None, game_name=None)
+    with llm.use_backend(FakeBackend([_picks("twitch:AAA", "twitch:BBB", "twitch:CCC")])):
+        out = veille.decide(state, _make_config(tmp_path, max_vods_per_day=3, max_vods_per_game=1))
+    assert out["llm"]["status"] == "ok" and len(out["proposals"]) == 3

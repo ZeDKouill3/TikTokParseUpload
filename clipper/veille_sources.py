@@ -47,6 +47,11 @@ STEAM_API = "https://api.steampowered.com"
 STEAM_SELLERS_URL = f"{STEAM_API}/IStoreTopSellersService/GetWeeklyTopSellers/v1/"
 # Code de langue [veille] language -> nom de langue attendu par l'API magasin (autres valeurs passées telles quelles).
 _STEAM_LANGUAGES = {"fr": "french", "en": "english", "de": "german", "es": "spanish", "it": "italian", "pt": "portuguese"}
+STEAM_CONCURRENT_URL = f"{STEAM_API}/ISteamChartsService/GetGamesByConcurrentPlayers/v1/"
+STEAM_PLAYERS_URL = f"{STEAM_API}/ISteamUserStats/GetNumberOfCurrentPlayers/v1/"
+STEAM_MEMBERS_URL = "https://steamcommunity.com/games/{appid}/memberslistxml/?xml=1"
+STEAM_USER_AGENT = "Clipper/1.0 (veille ; lit seulement memberCount)"
+_MEMBER_COUNT = re.compile(r"<memberCount>\s*(\d+)\s*</memberCount>")
 STEAM_APPDETAILS_URL = "https://store.steampowered.com/api/appdetails"  # GetAppList v2 retiré par Valve (404)
 
 STREAM_PAGES_MAX = 5
@@ -128,8 +133,10 @@ class _Client:
 
     def request(self, method: str, url: str, params: dict[str, Any] | None = None,
                 headers: dict[str, str] | None = None, *, accept_401: bool = False,
-                content: str | None = None, on_429: str | None = None) -> tuple[int, Any]:
-        """``(status, body JSON)`` ; 401 rendu tel quel seulement si ``accept_401`` ; 429 : ``SourceError(on_429)``."""
+                content: str | None = None, on_429: str | None = None, accept: tuple[int, ...] = (),
+                text: bool = False) -> tuple[int, Any]:
+        """``(status, body JSON)`` ; 401 rendu tel quel seulement si ``accept_401`` ; 429 : ``SourceError(on_429)`` ;
+        un statut de ``accept`` est rendu tel quel ; ``text`` : le corps est un texte non vide (XML), pas du JSON."""
         shown = _safe_url(url, params)
         extra = {"content": content} if content is not None else {}  # un transport sans corps n'a rien à recevoir
         try:
@@ -144,8 +151,14 @@ class _Client:
         if on_429 and status == 429:
             raise SourceError(on_429)
         snippet = _redact(str(body)[:_SNIPPET_CHARS], self.secrets)
+        if status in accept:
+            return status, body
         if not 200 <= status < 300:
             raise SourceError(f"HTTP {status} sur {shown} : {snippet}")
+        if text:
+            if not isinstance(body, str) or not body.strip():
+                raise SourceError(f"HTTP {status} sur {shown} : corps vide ou illisible : {snippet}")
+            return status, body
         if not isinstance(body, (dict, list)):
             raise SourceError(f"HTTP {status} sur {shown} : réponse JSON illisible : {snippet}")
         return status, body
@@ -522,6 +535,11 @@ def _steam_collector(http: Http, clock: Clock) -> Callable[[dict[str, object]], 
         url = f"{STEAM_API}/ISteamChartsService/GetMostPlayedGames/v1/"
         _, body = client.request("GET", url, {})
         ranks = _field(client, url, {}, body, "response", "ranks")
+        _, live = client.request("GET", STEAM_CONCURRENT_URL, {})  # joueurs simultanés (ADR-05a4)
+        concurrent: dict[str, int | None] = {}
+        for row in _field(client, STEAM_CONCURRENT_URL, {}, live, "response", "ranks"):
+            now = _field(client, STEAM_CONCURRENT_URL, {}, row, "concurrent_in_game")
+            concurrent[str(_field(client, STEAM_CONCURRENT_URL, {}, row, "appid"))] =                 now if isinstance(now, int) and not isinstance(now, bool) else None
         path = _sdir(settings) / "steam_names.json"  # un nom connu ne se redemande jamais
         cached = _read_json(path)
         names: dict[str, str] = dict(cached["names"]) if isinstance(cached, dict) and isinstance(cached.get("names"), dict) else {}
@@ -546,6 +564,7 @@ def _steam_collector(http: Http, clock: Clock) -> Callable[[dict[str, object]], 
                     unnamed.append({"appid": appid, "reason": str(exc)})
                     continue
             games.append({"appid": appid, "name": names[appid], "players": players,
+                          "concurrent": concurrent.get(appid),
                           "rank": place if isinstance(place, int) else None,
                           "last_week_rank": last_week if isinstance(last_week, int) else None})
         if learned:
@@ -588,11 +607,55 @@ def current_players(settings: dict[str, object], appid: str | int, *, http: Http
     return int(_field(client, url, params, body, "response", "player_count"))
 
 
+def _steam_players_collector(http: Http) -> Callable[[dict[str, object], list[str]], dict[str, Any]]:
+    """Joueurs à l'instant par appid (``GetNumberOfCurrentPlayers``, sans clé), un appel par appid, dans l'ordre reçu,
+    au plus ``steam_players_lookups_max`` ; 404 = appid inconnu = ``None`` ; autre échec = ``SourceError`` (R18)."""
+    def collect(settings: dict[str, object], appids: list[str]) -> dict[str, Any]:
+        client = _client(settings, http, ())
+        cap = int(settings["steam_players_lookups_max"])  # type: ignore[call-overload]
+        players: dict[str, int | None] = {}
+        for appid in appids[:cap]:
+            params = {"appid": appid}
+            status, body = client.request("GET", STEAM_PLAYERS_URL, params, accept=(404,))
+            if status == 404:
+                players[appid] = None
+                continue
+            count = _field(client, STEAM_PLAYERS_URL, params, body, "response", "player_count")
+            if isinstance(count, bool) or not isinstance(count, int):
+                raise client.fail(STEAM_PLAYERS_URL, params, body, "response.player_count (entier)")
+            players[appid] = count
+        return {"players": players, "skipped": max(0, len(appids) - cap)}
+
+    return collect
+
+
+def _steam_followers_collector(http: Http, sleep: Callable[[float], None]) -> Callable[[dict[str, object], list[str]], dict[str, Any]]:
+    """Abonnés Steam par appid : ``<memberCount>`` de la page XML publique ``memberslistxml`` et rien d'autre ; un appel
+    par appid, séquentiel, ``steam_followers_pause_s`` entre deux ; page sans la balise = ``None`` (R21)."""
+    def collect(settings: dict[str, object], appids: list[str]) -> dict[str, Any]:
+        client = _client(settings, http, ())
+        cap = int(settings["steam_followers_lookups_max"])  # type: ignore[call-overload]
+        pause = float(settings["steam_followers_pause_s"])  # type: ignore[arg-type]
+        followers: dict[str, int | None] = {}
+        for index, appid in enumerate(appids[:cap]):
+            if index:
+                sleep(pause)
+            _, body = client.request("GET", STEAM_MEMBERS_URL.format(appid=appid), None,
+                                     {"User-Agent": STEAM_USER_AGENT}, text=True)
+            found = _MEMBER_COUNT.search(body)
+            followers[appid] = int(found.group(1)) if found else None
+        return {"followers": followers, "skipped": max(0, len(appids) - cap)}
+
+    return collect
+
+
 def default_collectors(http: Http | None = None, clock: Clock | None = None,
-                       sleep: Callable[[float], None] | None = None) -> dict[str, Callable[[dict[str, object]], dict[str, Any]]]:
+                       sleep: Callable[[float], None] | None = None) -> dict[str, Callable[..., dict[str, Any]]]:
     """Les collecteurs réels, sur le transport (l'horloge et l'attente) donnés."""
     http = http or default_http
     clock = clock or _now
     return {"twitch": _twitch_collector(http, clock), "youtube": _youtube_collector(http, clock),
             "steam": _steam_collector(http, clock), "steam_fr": _steam_sellers_collector(http, clock),
-            "igdb": _igdb_collector(http, clock, sleep or time.sleep)}
+            "igdb": _igdb_collector(http, clock, sleep or time.sleep),
+            "steam_players": _steam_players_collector(http),
+            "steam_followers": _steam_followers_collector(http, sleep or time.sleep)}
