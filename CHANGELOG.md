@@ -18,6 +18,14 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
   ce choix. La carte affiche « jeu déduit du titre » et Claude reçoit les signaux de tendance du jeu.
   Nouveau réglage `[veille] youtube_game_min_chars` (défaut 5) : les noms plus courts sont ignorés.
 
+### Corrigé
+
+- Download : une coupure réseau (connexion fermée par l'hôte distant, WinError 10054 sur `usher.ttvnw.net`,
+  « Failed to download m3u8 information ») est réessayée aussitôt, jusqu'à `[download] network_retries`
+  fois (15) avec `[download] network_retry_pause_s` (5 s) de pause, chaque essai journalisé ; essais
+  épuisés, l'erreur d'origine remonte comme avant. Les autres erreurs (abonnés, privé, format) échouent
+  au premier essai.
+
 ## [0.5.2] - 2026-10-07
 
 Petite version de correction autour de la publication TikTok et de la veille. Le zip
@@ -32,6 +40,7 @@ s'appelle `Clipper-portable-0.5.2.zip` ; la mise à jour se fait en relançant
   l'erreur rouge « Une erreur est survenue » est relancée par « Réessayer ». Au plus
   `content_check_retriggers` relances (3), toujours dans `content_check_timeout_s` ; erreur persistante
   après les relances : arrêt `content_check` avec le message de TikTok.
+
 
 ### Corrigé
 
@@ -61,6 +70,7 @@ réglage : la veille reste désactivée par défaut (`[veille] enabled = false`)
   ou si la VOD Twitch est encore en cours de traitement).
 - Veille : le détail de la source Twitch indique combien de VOD privées ont été
   écartées.
+
 
 ### Corrigé
 
@@ -174,6 +184,7 @@ désactivée par défaut (`[veille] enabled = false`) et les clips courts aussi
 - **Dépôt GitHub renommé en TiktokClipper** : les liens de la documentation et
   du changelog pointent vers le nouveau nom.
 
+
 ### Corrigé
 
 - **Statistiques TikTok : le relevé ne s'arrête plus sur `viewers_card`**
@@ -269,6 +280,7 @@ cette version : cette section du changelog suffit. Le zip s'appelle
 - Le contrôle de la webcam par clip a été remplacé par le choix par période
   (voir Ajouté) : une webcam avec visage et cadre n'est plus évincée.
 
+
 ### Corrigé
 
 - TikTok : la vérification de contenu est lue sur le texte **visible** ; un
@@ -362,6 +374,7 @@ séparé pour cette version : cette section du changelog suffit.
   est retirée, sept colonnes de jours.
 - Le critère n°1 de la v1.0.0 (`docs/versions.md`) porte sur le zip portable
   de la Release.
+
 
 ### Corrigé
 
@@ -506,6 +519,7 @@ cette version : cette section du changelog suffit.
   l'annulation, et aucune publication en cours n'est mise en échec par un
   arrêt du serveur.
 
+
 ### Corrigé
 
 - **YouTube** : l'envoi d'une vidéo s'ouvre désormais par « Créer » ->
@@ -603,6 +617,7 @@ migrer : [`docs/releases/v0.3.0.md`](docs/releases/v0.3.0.md).
   `/api/channels`).
 - Console, Publication : les cartes du calendrier tiennent sur deux lignes et
   le titre complet s'affiche en info-bulle.
+
 
 ### Corrigé
 
@@ -775,6 +790,7 @@ détaillées et marche à suivre pour migrer :
 - **Dépendances** : `playwright`, `keyring`, `tomli-w`, et `tzdata` sous
   Windows ; `pytest-xdist` pour les tests (`-n 6` par défaut).
 - Le dépôt suit le versionnage sémantique (`docs/versions.md`).
+
 
 ### Corrigé
 
