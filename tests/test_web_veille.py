@@ -342,6 +342,84 @@ def test_put_settings_writes_the_veille_keys_when_given_and_keeps_them_otherwise
     assert "nouvelle-cle" not in new.text and SENTINEL_SECRET not in new.text
 
 
+def test_get_veille_exposes_the_three_igdb_settings(tmp_path, isolated_cwd):
+    data = client(tmp_path, enabled=True, upcoming_days=9, release_window_days=4, igdb_min_hypes=7).get("/api/veille").json()
+    assert (data["settings"]["upcoming_days"], data["settings"]["release_window_days"],
+            data["settings"]["igdb_min_hypes"]) == (9, 4, 7)
+
+
+def test_put_settings_writes_the_igdb_settings(tmp_path, isolated_cwd):
+    write_config(tmp_path, SETTINGS_TOML)
+    resp = sclient(tmp_path).put("/api/settings", json={"settings": {"veille": {
+        "upcoming_days": 21, "release_window_days": 0, "igdb_min_hypes": 12}}})
+    assert resp.status_code == 200, resp.text
+    table = tomllib.loads((tmp_path / "config.toml").read_text(encoding="utf-8"))["veille"]
+    assert (table["upcoming_days"], table["release_window_days"], table["igdb_min_hypes"]) == (21, 0, 12)
+
+
+@pytest.mark.parametrize("key,value,message", [
+    ("upcoming_days", 0, "[veille] upcoming_days doit être un entier >= 1 (reçu 0)"),
+    ("release_window_days", -1, "[veille] release_window_days doit être un entier >= 0 (reçu -1)"),
+    ("igdb_min_hypes", -5, "[veille] igdb_min_hypes doit être un entier >= 0 (reçu -5)"),
+])
+def test_put_settings_refuses_an_out_of_range_igdb_setting_with_the_veille_message(
+        tmp_path, isolated_cwd, key, value, message):
+    write_config(tmp_path, SETTINGS_TOML)
+    before = (tmp_path / "config.toml").read_text(encoding="utf-8")
+    resp = sclient(tmp_path).put("/api/settings", json={"settings": {"veille": {key: value}}})
+    assert resp.status_code == 400
+    assert message in resp.json()["detail"]
+    assert (tmp_path / "config.toml").read_text(encoding="utf-8") == before
+
+
+RELEASES = {
+    "recent": [{"igdb_id": "1", "name": "Jeu Sorti", "key": "jeu sorti", "slug": "jeu-sorti",
+                "url": "https://www.igdb.com/games/jeu-sorti", "hypes": 40, "date": "2026-10-04", "human": "4 Oct",
+                "platforms": ["PC"], "regions": [], "statuses": [], "days": -3}],
+    "upcoming": [{"igdb_id": "2", "name": "Jeu A Venir", "key": "jeu a venir", "slug": "jeu-a-venir",
+                  "url": "https://www.igdb.com/games/jeu-a-venir", "hypes": None, "date": "2026-10-12",
+                  "human": "12 Oct", "platforms": ["PC", "PS5"], "regions": [], "statuses": [], "days": 5}],
+    "excluded_low_hypes": 3, "truncated": {"recent": 2, "upcoming": 0},
+}
+
+
+def test_get_veille_returns_releases_and_igdb_source_as_written(tmp_path, isolated_cwd):
+    state = day_state(today())
+    state["releases"] = RELEASES
+    state["sources"]["igdb"] = {"status": "error", "at": f"{today()}T05:00:00+00:00", "error": "IGDB 401", "counts": {}}
+    write_json(tmp_path / "state" / "veille" / "days" / f"{today()}.json", state)
+    write_json(tmp_path / "state" / "veille" / "days" / f"{yesterday()}.json", state)
+    c = client(tmp_path, enabled=True)
+    for data in (c.get("/api/veille").json(), c.get(f"/api/veille/{yesterday()}").json()):
+        assert data["day"]["releases"] == RELEASES
+        assert data["day"]["sources"]["igdb"]["error"] == "IGDB 401"
+
+
+def test_veille_screen_has_the_releases_section_between_proposals_and_best_clips():
+    js = read_static("screens/veille.js")
+    for needle in ("Sorties de jeux", "Sorties récentes", "À venir (", "Aucune sortie dans la fenêtre", "autres",
+                   "data-veille-releases", "IGDB (sorties)", "igdb:", "excluded_low_hypes"):
+        assert needle in js, needle
+    view = js[js.index("function veilleView"):]
+    assert view.index("veilleProposals(data") < view.index("veilleReleases(data") < view.index("veilleBest(data")
+
+
+def test_veille_screen_shows_release_badges_on_proposals_and_rising_rows():
+    js = read_static("screens/veille.js")
+    assert "release_days_since" in js[js.index("function veilleProposal"):js.index("function veilleProposals")]
+    assert "Sortie J+" in js
+    assert "g.release" in js[js.index("function veilleRising"):js.index("function veilleSettings")]
+    assert "upcoming_days" in js[js.index("function veilleSettings"):]
+
+
+def test_settings_screen_edits_the_three_igdb_settings():
+    js = read_static("screens/settings.js")
+    shown = js[js.index("function setVeille()"):].split("\n")[1]
+    assert shown.lstrip().startswith("const shown")  # les champs montrés d'emblée, pas « autres réglages »
+    for key in ("upcoming_days", "release_window_days", "igdb_min_hypes"):
+        assert key in shown, key
+
+
 def test_mask_secrets_masks_the_veille_keys():
     masked = journal.mask_secrets({"veille": {"twitch_client_secret": "s", "youtube_api_key": "k",
                                               "twitch_client_id": "i", "taste": "ok"}})
