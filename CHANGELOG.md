@@ -10,6 +10,36 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ## [Non publié]
 
+### Ajouté
+
+- Veille : calendrier des sorties (SPEC-df51). La section « Sorties de jeux » devient un calendrier :
+  bandeau des sorties récentes en cartes à jaquette (pastille « Aujourd'hui » / « Sortie J+N »,
+  « Tendance », plateformes, « Portage », hypes, ligne de tendance, puce « Communauté » ou
+  « Peu de monde »), frise « À venir » d'une colonne par jour, liste par jour sur téléphone et panneau
+  de détail (toutes les plateformes, tendance, courbe des joueurs, lien « Voir sur IGDB »). Les
+  jaquettes sont chargées par le navigateur depuis `images.igdb.com` ; Clipper ne les télécharge ni ne
+  les stocke. Réglages › Veille : `igdb_recent_max`, `igdb_upcoming_max` et les réglages de
+  communauté et de diversité ci-dessous.
+- Veille : « Ce qui monte » gagne les colonnes « Abonnés Steam » (avec le gain sur 7 jours ou
+  « historique insuffisant ») et « Communauté » (« ok » ou « insuffisante »), nomme le chiffre Steam
+  « pic du jour » ou « à l'instant », et dessine une mini-courbe des joueurs par jeu (pic du jour et
+  instantané en deux couleurs ; « 1 jour de mesure » tant qu'il n'y a pas d'historique). Le bandeau
+  des sources montre « Steam (joueurs hors top) » et « Steam (abonnés) », et les KPI du jour comptent
+  les VOD écartées pour communauté insuffisante ou jeu inconnu.
+- Veille : Steam officiel à la place de SteamDB, filtre de communauté et diversité (TASK-82da). Les
+  joueurs simultanés et le pic du jour viennent de l'API Steam officielle (top 100, puis un appel par jeu
+  hors top, plafonné), les abonnés de la page publique `memberslistxml` (appels espacés). Une VOD n'est
+  proposée que si son jeu atteint l'un des quatre seuils de communauté (joueurs Steam, abonnés Steam,
+  viewers Twitch FR, hypes IGDB), et au plus `max_vods_per_game` VOD par jeu. Nouveaux réglages
+  `[veille]` : `steam_players_lookups_max`, `steam_followers_lookups_max`, `steam_followers_pause_s`,
+  `community_min_steam_players`, `community_min_steam_followers`, `community_min_twitch_viewers`,
+  `community_min_hypes`, `max_vods_per_game`, tous validés à l'enregistrement (400 hors bornes).
+
+### Modifié
+
+- Veille : `igdb_min_hypes` vaut 5 par défaut et doit être >= 1 ; `igdb_releases_max` est ignoré s'il
+  reste dans `config.toml`.
+
 ## [0.5.3] - 2026-10-07
 
 Version autour de la veille (sorties de jeux IGDB, jeu des VOD YouTube) et de la fiabilité

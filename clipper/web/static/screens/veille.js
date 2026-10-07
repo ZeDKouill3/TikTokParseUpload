@@ -7,10 +7,10 @@
 "use strict";
 
 const VEILLE_STALE_MS = 4000;
-const SOURCE_LABELS = { twitch: "Twitch", youtube: "YouTube", steam: "Steam", steam_fr: "Ventes Steam FR", igdb: "IGDB (sorties)" };
-const COUNT_LABELS = { rows: "lignes", recent: "récentes", upcoming: "à venir", skipped_rows: "lignes ignorées", games: "jeux", vods: "VOD", videos: "vidéos", private: "VOD réservées écartées", restricted: "VOD abonnés écartées" };
+const SOURCE_LABELS = { twitch: "Twitch", youtube: "YouTube", steam: "Steam", steam_fr: "Ventes Steam FR", igdb: "IGDB (sorties)", steam_players: "Steam (joueurs hors top)", steam_followers: "Steam (abonnés)" };
+const COUNT_LABELS = { rows: "lignes", recent: "récentes", upcoming: "à venir", skipped_rows: "lignes ignorées", games: "jeux", vods: "VOD", videos: "vidéos", private: "VOD réservées écartées", restricted: "VOD abonnés écartées", requested: "demandés", found: "trouvés", unknown: "inconnus", skipped: "coupés au plafond" };
 
-const veilleUi = { data: null, clips: [], error: null, loading: null, dirty: false, at: 0, style: {}, busy: false, html: "" };
+const veilleUi = { data: null, clips: [], error: null, loading: null, dirty: false, at: 0, style: {}, busy: false, html: "", sheet: null };
 
 function loadVeille() {
   if (veilleUi.loading) { veilleUi.dirty = true; return veilleUi.loading; }
@@ -61,9 +61,13 @@ const veilleSrcIcon = (source) => `<span class="src-ico src-${esc(source)}" titl
 /* Δ 7 j d'un jeu : « +80 % », ou la raison de l'absence (jamais un chiffre inventé). */
 function veilleDelta(game, kind) {
   if (!game) return `<span class="muted">jeu non relevé</span>`;
-  if (kind === "steam" && !game.steam_match) return game.steam_sellers_rank != null ? veilleSellers(game) : `<span class="muted">hors Steam</span>`;
+  if (kind === "steam" && !game.steam_match && game.steam_players_now == null) return game.steam_sellers_rank != null ? veilleSellers(game) : `<span class="muted">hors Steam</span>`;
   if (kind === "twitch" && game.twitch_match === false) return `<span class="muted">hors Twitch FR</span>`;
   const value = game[`${kind}_delta_pct`];
+  if (value == null && kind === "steam" && game.steam_now_delta_pct != null) {
+    const now = game.steam_now_delta_pct;
+    return `<b class="${now >= 0 ? "ok" : "bad"}">${now > 0 ? "+" : ""}${esc(fr(now))} % (à l'instant)</b>`;
+  }
   if (value == null && kind === "steam" && game.steam_new_in_top) return `<b class="ok">Nouveau dans le top Steam</b>`;
   if (value == null && kind === "steam" && game.steam_rank_gain != null) return `<b class="${game.steam_rank_gain >= 0 ? "ok" : "bad"}">${game.steam_rank_gain > 0 ? "+" : ""}${esc(fr(game.steam_rank_gain))} places</b>`;
   if (value == null) return `<span class="muted">pas assez d'historique (${esc(game.baseline_days_available)} j)</span>`;
@@ -119,7 +123,7 @@ function veilleKpis(data) {
   const kpi = (label, value, foot, cls) => `<div class="kpi${cls ? ` ${cls}` : ""}"><div class="kpi-label">${esc(label)}</div><div class="kpi-value">${value}</div><div class="kpi-foot">${esc(foot)}</div></div>`;
   return `<div class="kpis kpis-4" data-veille-kpi>
     ${kpi("Jeux qui montent", esc(rising), `sur ${(day.games || []).length} relevés (≥ ${cfg.rise_min_pct ?? 50} % ou ≥ ${cfg.steam_rank_gain_min ?? 5} places Steam)`, "accent")}
-    ${kpi("VOD proposées", `${esc(proposed)}<small>/ ${esc(cfg.max_vods_per_day ?? "?")}</small>`, day.excluded ? `${day.excluded.already_known || 0} déjà connues, ${day.excluded.too_short || 0} trop courtes` : "")}
+    ${kpi("VOD proposées", `${esc(proposed)}<small>/ ${esc(cfg.max_vods_per_day ?? "?")}</small>`, day.excluded ? `${day.excluded.already_known || 0} déjà connues, ${day.excluded.too_short || 0} trop courtes${day.excluded.no_community != null ? `, ${day.excluded.no_community} VOD écartées : communauté insuffisante ou jeu inconnu` : ""}` : "")}
     ${kpi("Clips gardés", `${esc(kept)}<small>/ ${esc(rendered)} rendus</small>`, `${cfg.best_clips_per_day ?? "?"} meilleurs par jour`)}
     ${kpi("Prochain relevé", data.next_run_at ? esc(veilleWhen(data.next_run_at, true)) : "—", data.enabled ? `à ${cfg.run_at || "?"} (${cfg.timezone || "Europe/Paris"})` : "veille désactivée")}
   </div>`;
@@ -195,20 +199,138 @@ function veilleBest(data) {
   </div></section>`;
 }
 
-/* « Sorties de jeux » (SPEC-4efa R17) : tel qu'écrit dans days/<date>.json, aucun recalcul. */
-function veilleReleaseRow(e, upcoming) {
-  const badge = upcoming ? `<span class="chip plain">J-${esc(e.days)}</span>` : veilleReleaseBadge(-e.days);
-  const when = upcoming ? `<span class="mono">${esc(e.date)}</span>` : "";
-  const name = e.url ? `<a href="${esc(e.url)}" target="_blank" rel="noopener">${esc(e.name)}</a>` : esc(e.name);
-  const hypes = e.hypes != null ? `${esc(fr(e.hypes))} hypes` : "hypes inconnues";
-  const platforms = (e.platforms || []).length ? esc(e.platforms.join(", ")) : "plateformes inconnues";
-  return `<div class="list-item"><b>${name}</b> ${when} ${badge}<span class="muted"> · ${hypes} · ${platforms}</span></div>`;
+/* « Sorties de jeux » (SPEC-df51 R17, maquette research/maquettes/calendrier-sorties.html) : tel qu'écrit dans
+   days/<date>.json, aucun recalcul (l'ordre des tableaux est celui de la collecte). Les jaquettes sont chargées par le
+   navigateur depuis images.igdb.com (ADR-0944) : le serveur ne les télécharge, ne les relaie ni ne les stocke. */
+const IGDB_COVER_URL = "https://images.igdb.com/igdb/image/upload/t_cover_big/";
+const VEILLE_DATE_LONG = { weekday: "long", day: "numeric", month: "long", year: "numeric" };
+const VEILLE_FRISE_MAX = 5;
+const VEILLE_PLATFORMS_CARD = 3;
+
+const veilleDate = (iso, opts) => new Date(`${iso}T12:00:00Z`).toLocaleDateString("fr-FR", Object.assign({ timeZone: CLIPPER_TZ }, opts));
+const veilleAddDays = (iso, n) => new Date(Date.parse(`${iso}T12:00:00Z`) + n * 864e5).toISOString().slice(0, 10);
+const veilleSigned = (n) => `${n > 0 ? "+" : ""}${fr(n)}`;
+const veilleHypes = (e) => (e.hypes != null ? `${fr(e.hypes)} hypes` : "hypes inconnues");
+
+/* Jaquette : image IGDB, ou vignette portant le nom (cover_image_id nul ou image en erreur, aucune autre adresse). */
+function veilleCover(e, extra) {
+  const img = e.cover_image_id
+    ? `<img loading="lazy" src="${IGDB_COVER_URL}${esc(e.cover_image_id)}.jpg" alt="Jaquette de ${esc(e.name)}" onerror="this.parentNode.classList.add('err')">` : "";
+  return `<span class="cover${e.cover_image_id ? "" : " err"}">${img}<span class="ph">${esc(e.name)}</span>${extra || ""}</span>`;
 }
 
-function veilleReleaseList(title, entries, upcoming, truncated) {
-  const rows = entries.map((e) => veilleReleaseRow(e, upcoming)).join("");
-  const more = truncated > 0 ? `<div class="arch-row"><span class="t muted">+${esc(truncated)} autres</span></div>` : "";
-  return `<h3>${esc(title)}</h3>${rows || `<div class="list-item muted">Aucune sortie dans la fenêtre</div>`}${more}`;
+function veillePlatforms(e, max) {
+  const all = e.platforms || [];
+  const shown = max ? all.slice(0, max) : all;
+  const more = max && all.length > max ? `<span class="tag">+${all.length - max}</span>` : "";
+  return shown.map((p) => `<span class="tag">${esc(p)}</span>`).join("") + more;
+}
+
+/* « Sortie J+3 », « Aujourd'hui » (jour même) ou « J-5 » (à venir). */
+const veilleDaysLabel = (days) => (days === 0 ? "Aujourd'hui" : days < 0 ? `Sortie J+${-days}` : `J-${days}`);
+
+/* La ligne tendance : seulement les champs non nuls de trend, chacun avec sa provenance. */
+function veilleTrendParts(t) {
+  if (!t) return [];
+  const parts = [];
+  if (t.steam_sellers_new) parts.push("nouveau dans le top ventes Steam FR");
+  else if (t.steam_sellers_rank != null) parts.push(`n°${fr(t.steam_sellers_rank)} des ventes Steam FR${t.steam_sellers_gain != null ? ` (${veilleSigned(t.steam_sellers_gain)} places)` : ""}`);
+  if (t.steam_new_in_top) parts.push("nouveau dans le top Steam");
+  else if (t.steam_rank != null) parts.push(`n°${fr(t.steam_rank)} du top Steam${t.steam_rank_gain != null ? ` (${veilleSigned(t.steam_rank_gain)} places)` : ""}`);
+  if (t.twitch_fr_viewers != null) parts.push(`${fr(t.twitch_fr_viewers)} viewers Twitch FR`);
+  if (t.steam_players != null) parts.push(`${fr(t.steam_players)} joueurs Steam (pic du jour)`);
+  else if (t.steam_players_now != null) parts.push(`${fr(t.steam_players_now)} joueurs Steam (à l'instant du relevé)`);
+  if (t.steam_followers != null) parts.push(`${fr(t.steam_followers)} abonnés Steam${t.steam_followers_gain_7d != null ? ` (${veilleSigned(t.steam_followers_gain_7d)} en 7 j)` : ""}`);
+  return parts;
+}
+
+const veilleCommunityChip = (t) => (!t ? "" : t.community && t.community.ok ? `<span class="chip ok plain">Communauté</span>` : `<span class="chip plain">Peu de monde</span>`);
+
+/* Mini-courbe SVG en ligne (sans bibliothèque) des joueurs Steam : un point par mesure, « pic du jour » (peak) et
+   « à l'instant » (now) de couleurs distinctes, reliés par type. Moins de 2 points : pas de courbe. */
+function veilleSpark(history) {
+  const pts = (history || []).filter((p) => p && p.players != null);
+  if (!pts.length) return `<span class="muted">aucune mesure</span>`;
+  if (pts.length < 2) return `<span class="muted">1 jour de mesure</span>`;
+  const dates = [...new Set(pts.map((p) => p.date))].sort();
+  const values = pts.map((p) => p.players);
+  const lo = Math.min(...values), hi = Math.max(...values);
+  const W = 96, H = 28, PAD = 4;
+  const x = (d) => (dates.length === 1 ? W / 2 : PAD + (dates.indexOf(d) * (W - 2 * PAD)) / (dates.length - 1));
+  const y = (v) => (hi === lo ? H / 2 : H - PAD - ((v - lo) * (H - 2 * PAD)) / (hi - lo));
+  const kinds = [["peak", "pk"], ["now", "nw"]];
+  const lines = kinds.map(([kind, cls]) => {
+    const own = pts.filter((p) => p.kind === kind).sort((a, b) => (a.date < b.date ? -1 : 1));
+    return own.length > 1 ? `<polyline class="ln ${cls}" fill="none" points="${own.map((p) => `${x(p.date).toFixed(1)},${y(p.players).toFixed(1)}`).join(" ")}"/>` : "";
+  }).join("");
+  const dots = pts.map((p) => `<circle class="${p.kind === "peak" ? "pk" : "nw"}" cx="${x(p.date).toFixed(1)}" cy="${y(p.players).toFixed(1)}" r="2.4"><title>${esc(p.kind === "peak" ? "pic du jour" : "à l'instant")} ${esc(p.date)} : ${esc(fr(p.players))}</title></circle>`).join("");
+  return `<span class="spark-wrap" data-veille-spark><svg class="spark" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img" aria-label="Joueurs Steam du ${esc(dates[0])} au ${esc(dates[dates.length - 1])}, de ${esc(fr(lo))} à ${esc(fr(hi))}">${lines}${dots}</svg><span class="spark-key"><i class="pk"></i>pic du jour <i class="nw"></i>à l'instant</span></span>`;
+}
+
+function veilleRecentCard(e) {
+  const hot = e.trend ? `<span class="hot">${icon("trending-up", "i-xs")}Tendance</span>` : "";
+  const trend = veilleTrendParts(e.trend);
+  return `<article class="rc"><button type="button" class="pick" data-veille-open="${esc(e.igdb_id)}" aria-label="Détail de ${esc(e.name)}">${veilleCover(e, `<span class="jn">${esc(veilleDaysLabel(e.days))}</span>${hot}`)}</button>
+    <div class="nm">${esc(e.name)}</div>
+    <div class="meta">${veillePlatforms(e, VEILLE_PLATFORMS_CARD)}${e.portage ? `<span class="chip plain">Portage</span>` : ""}</div>
+    <div class="stat">${esc(veilleHypes(e))}</div>
+    ${trend.length ? `<div class="trend">${icon("trending-up", "i-xs")}<span>${esc(trend.join(" · "))}</span></div>` : ""}
+    ${veilleCommunityChip(e.trend)}</article>`;
+}
+
+function veilleDayHead(iso, offset) {
+  const weekday = veilleDate(iso, { weekday: "long" });
+  return `<div class="dh"><span class="wd">${offset === 0 ? "Aujourd'hui" : esc(weekday)}</span><span class="dt">${esc(veilleDate(iso, { day: "numeric", month: "short" }))}<span class="jn">${offset === 0 ? esc(weekday) : `J-${offset}`}</span></span></div>`;
+}
+
+/* Les sorties d'un jour de la frise : aujourd'hui = recent à days = 0, les autres = upcoming du jour, dans l'ordre du tableau. */
+const veilleDayEntries = (rel, offset) => (offset === 0 ? rel.recent.filter((e) => e.days === 0) : rel.upcoming.filter((e) => e.days === offset));
+
+function veilleFriseColumn(rel, iso, offset) {
+  const list = veilleDayEntries(rel, offset);
+  const shown = list.slice(0, VEILLE_FRISE_MAX), rest = list.length - shown.length;
+  const weekend = [0, 6].includes(new Date(`${iso}T12:00:00Z`).getUTCDay());
+  const cls = ["day", offset === 0 ? "today" : "", list.length ? "" : "empty", weekend ? "we" : ""].filter(Boolean).join(" ");
+  const cells = shown.map((e, k) => `<button type="button" class="pick${k === 0 ? " big" : ""}" data-veille-open="${esc(e.igdb_id)}" aria-label="Détail de ${esc(e.name)}">${veilleCover(e, e.trend ? `<span class="hot">${icon("trending-up", "i-xs")}</span>` : "")}<span class="t">${esc(e.name)}${k === 0 ? `<br><span class="mono hy">${esc(veilleHypes(e))}</span>` : ""}</span></button>`).join("");
+  return `<div class="${cls}">${veilleDayHead(iso, offset)}${list.length
+    ? `<div class="dstack">${cells}${rest > 0 ? `<span class="cal-more">+${rest} autre${rest > 1 ? "s" : ""}</span>` : ""}</div>`
+    : `<span class="none">Aucune sortie notable</span>`}</div>`;
+}
+
+/* La même chose pour le téléphone : seulement les jours avec sortie, et « N jours sans sortie notable » entre deux. */
+function veilleMobileList(rel, today, span) {
+  let html = "", gap = 0, started = false;
+  for (let offset = 0; offset <= span; offset += 1) {
+    const list = veilleDayEntries(rel, offset);
+    if (!list.length) { gap += 1; continue; }
+    if (started && gap) html += `<div class="mgap">${gap} jour${gap > 1 ? "s" : ""} sans sortie notable</div>`;
+    gap = 0;
+    started = true;
+    const iso = veilleAddDays(today, offset);
+    const rows = list.slice(0, VEILLE_FRISE_MAX).map((e, k) => `<button type="button" class="mrow${k === 0 ? " bigr" : ""}" data-veille-open="${esc(e.igdb_id)}">${veilleCover(e)}<span><span class="nm${k ? " small" : ""}">${esc(e.name)}</span><span class="sub2">${veillePlatforms(e, VEILLE_PLATFORMS_CARD)}${e.trend ? `<span class="chip info plain">Tendance</span>` : ""}</span></span><span class="mono muted hyp">${esc(veilleHypes(e))}</span></button>`).join("");
+    html += `<div class="mday${offset === 0 ? " today" : ""}">${veilleDayHead(iso, offset)}${rows}${list.length > VEILLE_FRISE_MAX ? `<div class="mgap more-gap">+${list.length - VEILLE_FRISE_MAX} autres</div>` : ""}</div>`;
+  }
+  return html;
+}
+
+/* Panneau détail d'une sortie : jaquette, nom, date, plateformes, hypes, tendance, portage, lien IGDB. */
+function veilleSheet(rel, id) {
+  if (id == null) return "";
+  const e = [...rel.recent, ...rel.upcoming].find((x) => String(x.igdb_id) === String(id));
+  if (!e) return "";
+  const trend = veilleTrendParts(e.trend);
+  const history = e.trend && e.trend.steam_players_history;
+  const rows = [
+    `<dt>Date</dt><dd>${esc(veilleDate(e.date, VEILLE_DATE_LONG))} <span class="chip${e.days <= 0 ? " ok" : ""} plain">${esc(veilleDaysLabel(e.days))}</span></dd>`,
+    `<dt>Plateformes</dt><dd class="plats">${veillePlatforms(e) || `<span class="muted">plateformes inconnues</span>`}</dd>`,
+    `<dt>Hypes</dt><dd>${e.hypes != null ? esc(fr(e.hypes)) : `<span class="muted">inconnues</span>`}</dd>`,
+    e.trend ? `<dt>Tendance</dt><dd class="trend-dd">${trend.length ? esc(trend.join(" · ")) : `<span class="muted">aucun chiffre relevé</span>`} ${veilleCommunityChip(e.trend)}${history && history.length ? `<div>${veilleSpark(history)}</div>` : ""}</dd>` : "",
+    e.portage ? `<dt>Type</dt><dd>Portage sur nouvelle plateforme</dd>` : "",
+  ].join("");
+  const link = e.url ? `<a class="btn" href="${esc(e.url)}" target="_blank" rel="noopener">Voir sur IGDB</a>` : "";
+  return `<div class="scrim open" data-veille-scrim role="dialog" aria-modal="true" aria-labelledby="veille-sheet-name"><div class="sheet">
+    <button type="button" class="x" aria-label="Fermer" data-veille-close>${icon("x")}</button>${veilleCover(e)}
+    <div><h3 id="veille-sheet-name">${esc(e.name)}</h3><dl>${rows}</dl><div class="acts">${link}</div></div></div></div>`;
 }
 
 function veilleReleases(data) {
@@ -218,11 +340,45 @@ function veilleReleases(data) {
     return `<section data-veille-releases>${head}<div class="panel"><p class="reason bad" role="alert"><b>${esc(SOURCE_LABELS.igdb)} :</b> ${esc(igdb.error)}</p></div></section>`;
   }
   const rel = day.releases || { recent: [], upcoming: [], excluded_low_hypes: 0, truncated: { recent: 0, upcoming: 0 } };
-  const excluded = rel.excluded_low_hypes > 0 ? `<div class="arch-row"><span class="t muted">${esc(rel.excluded_low_hypes)} sortie${rel.excluded_low_hypes > 1 ? "s" : ""} écartée${rel.excluded_low_hypes > 1 ? "s" : ""} (moins de ${esc(cfg.igdb_min_hypes ?? 0)} hypes)</span></div>` : "";
-  return `<section data-veille-releases>${head}<div class="panel">
-    ${veilleReleaseList("Sorties récentes", rel.recent, false, rel.truncated.recent)}
-    ${veilleReleaseList(`À venir (${cfg.upcoming_days ?? "?"} j)`, rel.upcoming, true, rel.truncated.upcoming)}
-    ${excluded}</div></section>`;
+  const span = Number(cfg.upcoming_days) || 14;
+  const more = (n) => (n > 0 ? `<div class="more-line muted">+${esc(n)} autres</div>` : "");
+  const excluded = rel.excluded_low_hypes > 0 ? `<p class="cal-note">${esc(rel.excluded_low_hypes)} sortie${rel.excluded_low_hypes > 1 ? "s" : ""} écartée${rel.excluded_low_hypes > 1 ? "s" : ""} (moins de ${esc(cfg.igdb_min_hypes ?? 0)} hypes)</p>` : "";
+  const chips = `<span class="chip plain">${rel.recent.length} récentes</span><span class="chip plain">${rel.upcoming.length} à venir</span><span class="chip info plain">Source : IGDB</span>`;
+  const title = `<div class="panel-head"><h2>Calendrier du ${esc(veilleDate(day.date, VEILLE_DATE_LONG))}</h2><div class="right">${chips}</div></div>`;
+  if (!rel.recent.length && !rel.upcoming.length) {
+    return `<section data-veille-releases>${head}<div class="panel">${title}<div class="panel-body"><div class="list-item muted">Aucune sortie dans la fenêtre</div>${excluded}</div></div></section>`;
+  }
+  const recent = rel.recent.length ? `<div class="recent">${rel.recent.map(veilleRecentCard).join("")}</div>` : `<div class="list-item muted">Aucune sortie récente</div>`;
+  const columns = Array.from({ length: span + 1 }, (_, offset) => veilleFriseColumn(rel, veilleAddDays(day.date, offset), offset)).join("");
+  return `<section data-veille-releases>${head}<div class="panel">${title}<div class="panel-body">
+    <div class="cal-sub"><b>Sorties récentes</b>les plus attendues d'abord</div>${recent}${more(rel.truncated.recent)}
+    <div class="cal-sub cal-sub-next"><b>À venir (${esc(span)} j)</b>une colonne par jour, la plus attendue en grand</div>
+    <div class="cal-frise">${columns}</div><div class="mlist">${veilleMobileList(rel, day.date, span)}</div>${more(rel.truncated.upcoming)}
+    <div class="legend"><span><i class="lg-today"></i>Aujourd'hui</span><span><i class="lg-trend"></i>En tendance dans le relevé du jour</span></div>
+    ${excluded}<p class="cal-note">Dates en Europe/Paris. Jaquettes chargées par ton navigateur depuis images.igdb.com.</p></div></div>${veilleSheet(rel, veilleUi.sheet)}</section>`;
+}
+
+/* Cellule Steam de « Ce qui monte » : pic du jour, à défaut instantané nommé, puis la courbe construite par la veille. */
+function veilleSteamCell(g) {
+  let value;
+  if (g.steam_players != null) value = esc(fr(g.steam_players));
+  else if (g.steam_players_now != null) value = `${esc(fr(g.steam_players_now))} à l'instant`;
+  else if (g.steam_match) value = `<span class="muted">pas relevé</span>`;
+  else value = g.steam_sellers_rank != null ? `<span class="muted">ventes FR #${esc(g.steam_sellers_rank)}</span>` : `<span class="muted">hors Steam</span>`;
+  const curve = g.steam_players_history && (g.steam_match || g.steam_players_now != null || g.steam_players_history.length) ? `<div>${veilleSpark(g.steam_players_history)}</div>` : "";
+  return `${value}${curve}`;
+}
+
+const COMMUNITY_LABELS = { steam: "joueurs Steam", followers: "abonnés Steam", twitch: "viewers Twitch FR", hypes: "hypes IGDB" };
+function veilleCommunityCell(g) {
+  if (!g.community) return `<span class="muted">non relevée</span>`;
+  if (!g.community.ok) return `<span class="muted">insuffisante</span>`;
+  return `<b class="ok">ok</b> <span class="muted">(${esc((g.community.met || []).map((m) => COMMUNITY_LABELS[m] || m).join(", "))})</span>`;
+}
+
+function veilleFollowersCell(g) {
+  const gain = g.steam_followers_gain_7d != null ? `${veilleSigned(g.steam_followers_gain_7d)} (7 j)` : "historique insuffisant";
+  return `${g.steam_followers != null ? esc(fr(g.steam_followers)) : `<span class="muted">inconnu</span>`}<div class="muted">${esc(gain)}</div>`;
 }
 
 function veilleRising(data) {
@@ -231,11 +387,12 @@ function veilleRising(data) {
   const rows = games.map((g) => `<tr>
     <td>${esc(g.name)} ${g.release ? veilleReleaseBadge(g.release.days_since) : ""}</td>
     <td class="r">${g.twitch_match === false ? `<span class="muted">hors Twitch FR</span>` : num(g.twitch_fr_viewers, "pas relevé")}</td><td class="r">${veilleDelta(g, "twitch")}</td>
-    <td class="r">${g.steam_match ? num(g.steam_players, "pas relevé") : g.steam_sellers_rank != null ? `<span class="muted">ventes FR #${esc(g.steam_sellers_rank)}</span>` : `<span class="muted">hors Steam</span>`}</td><td class="r">${veilleDelta(g, "steam")}</td><td class="r">${veilleSellers(g)}</td>
+    <td class="r">${veilleSteamCell(g)}</td><td class="r">${veilleDelta(g, "steam")}</td><td class="r">${veilleFollowersCell(g)}</td><td class="r">${veilleSellers(g)}</td>
+    <td class="r">${veilleCommunityCell(g)}</td>
     <td class="r">${num(g.youtube_views_per_hour == null ? null : Math.round(g.youtube_views_per_hour), "clé absente ou pas de vidéo")}</td>
     <td class="r">${esc(g.vod_count)}</td></tr>`).join("");
   return `<section data-veille-rising><div class="section-title">${icon("trending-up")}Ce qui monte</div><div class="panel">
-    ${rows ? `<div class="table-wrap"><table class="table"><thead><tr><th>Jeu</th><th class="r">Twitch FR (viewers)</th><th class="r">Δ 7 j</th><th class="r">Steam (joueurs)</th><th class="r">Δ 7 j</th><th class="r">Ventes FR</th><th class="r">YouTube FR (vues/h)</th><th class="r">VOD FR</th></tr></thead><tbody>${rows}</tbody></table></div>`
+    ${rows ? `<div class="table-wrap"><table class="table"><thead><tr><th>Jeu</th><th class="r">Twitch FR (viewers)</th><th class="r">Δ 7 j</th><th class="r">Steam (pic du jour / à l'instant)</th><th class="r">Δ 7 j</th><th class="r">Abonnés Steam</th><th class="r">Ventes FR</th><th class="r">Communauté</th><th class="r">YouTube FR (vues/h)</th><th class="r">VOD FR</th></tr></thead><tbody>${rows}</tbody></table></div>`
       : `<div class="list-item muted">Aucun jeu relevé : vérifie les sources ci-dessus.</div>`}
     <div class="arch-row"><span class="t muted">Un jeu sans correspondance Steam ou hors du top ventes FR l'indique ; une donnée absente est expliquée, aucune valeur n'est inventée.</span></div>
   </div></section>`;
@@ -243,14 +400,18 @@ function veilleRising(data) {
 
 function veilleSettings(data) {
   const cfg = data.settings || {};
-  const field = (label, value) => `<div class="field"><label>${esc(label)}</label><input class="input" value="${esc(value)}" readonly></div>`;
+  const field = (label, value, key) => `<div class="field"${key ? ` data-veille-setting="${key}"` : ""}><label>${esc(label)}</label><input class="input" value="${esc(value)}" readonly></div>`;
   const key = (label, set, source) => `<div class="key">${veilleSrcIcon(source)}<span>${esc(label)}</span><span class="chip ${set ? "ok" : "bad"} plain">${set ? "saisie" : "absente"}</span></div>`;
   return `<section data-veille-settings><div class="panel panel-pad stack">
     <div class="form-grid">
       <div class="field full"><label>Mes goûts (texte libre, lu par Claude)</label><textarea class="input" rows="2" readonly>${esc(cfg.taste || "")}</textarea></div>
       ${field("VOD proposées par jour (max)", cfg.max_vods_per_day)}${field("Meilleurs clips gardés par jour", cfg.best_clips_per_day)}
       ${field(`Heure du relevé (${cfg.timezone || "Europe/Paris"})`, cfg.run_at)}${field("Langue des streams / région", `${cfg.language} / ${cfg.region}`)}
-      ${field("Sorties à venir (jours)", cfg.upcoming_days)}${field("Fenêtre de sortie (jours)", cfg.release_window_days)}${field("Hypes IGDB minimum", cfg.igdb_min_hypes)}
+      ${field("Sorties à venir (jours)", cfg.upcoming_days, "upcoming_days")}${field("Fenêtre de sortie (jours)", cfg.release_window_days, "release_window_days")}${field("Hypes IGDB minimum", cfg.igdb_min_hypes, "igdb_min_hypes")}
+      ${field("Sorties récentes affichées (max)", cfg.igdb_recent_max, "igdb_recent_max")}${field("Sorties à venir affichées (max)", cfg.igdb_upcoming_max, "igdb_upcoming_max")}
+      ${field("Joueurs Steam hors top : appels (max)", cfg.steam_players_lookups_max, "steam_players_lookups_max")}${field("Abonnés Steam : appels (max)", cfg.steam_followers_lookups_max, "steam_followers_lookups_max")}${field("Abonnés Steam : pause entre appels (s)", cfg.steam_followers_pause_s, "steam_followers_pause_s")}
+      ${field("Communauté : joueurs Steam min.", cfg.community_min_steam_players, "community_min_steam_players")}${field("Communauté : abonnés Steam min.", cfg.community_min_steam_followers, "community_min_steam_followers")}${field("Communauté : viewers Twitch FR min.", cfg.community_min_twitch_viewers, "community_min_twitch_viewers")}${field("Communauté : hypes IGDB min.", cfg.community_min_hypes, "community_min_hypes")}
+      ${field("VOD par jeu (max)", cfg.max_vods_per_game, "max_vods_per_game")}
     </div>
     <div class="keys">${key("Twitch (client id + secret)", data.twitch_client_id_set && data.twitch_client_secret_set, "twitch")}${key("YouTube (clé API)", data.youtube_api_key_set, "youtube")}
       <div class="key">${veilleSrcIcon("steam")}<span>Steam</span><span class="chip ok plain">sans clé</span></div></div>
@@ -319,12 +480,32 @@ function veilleWire(body) {
     if (!(await confirmDialog({ title: "Ignorer cette VOD ?", body: "Elle ne sera plus jamais proposée.", confirmLabel: "Ignorer" }))) return;
     await veilleCall(`/api/veille/${encodeURIComponent(dayDate())}/${encodeURIComponent(id)}/ignore`, "POST", undefined, null, "Impossible d'ignorer cette VOD");
   }));
+  $$("[data-veille-open]", body).forEach((b) => (b.onclick = () => { veilleUi.sheet = b.dataset.veilleOpen; veilleUi.focusSheet = true; renderCurrent(); }));
+  $$("[data-veille-close]", body).forEach((b) => (b.onclick = veilleCloseSheet));
+  const scrim = body.querySelector("[data-veille-scrim]");
+  if (scrim) {
+    scrim.onclick = (e) => { if (e.target === scrim) veilleCloseSheet(); };
+    if (veilleUi.focusSheet) { veilleUi.focusSheet = false; const x = scrim.querySelector("[data-veille-close]"); if (x) x.focus(); }
+  }
   $$("[data-veille-restore]", body).forEach((b) => (b.onclick = async () => {
     const [video, clip] = b.closest("[data-veille-archived]").dataset.veilleArchived.split("/");
     b.disabled = true;
     await veilleCall(`/api/veille/clips/${encodeURIComponent(video)}/${encodeURIComponent(clip)}/restore`, "POST", undefined, "Clip restauré", "Impossible de restaurer le clip");
   }));
 }
+
+/* Ferme le panneau détail et rend le focus à la jaquette qui l'avait ouvert. */
+function veilleCloseSheet() {
+  const opened = veilleUi.sheet;
+  veilleUi.sheet = null;
+  renderCurrent();
+  const opener = opened == null ? null : document.querySelector(`[data-veille-open="${opened}"]`);
+  if (opener) opener.focus();
+}
+
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && veilleUi.sheet != null && currentScreen === "veille") veilleCloseSheet();
+});
 
 Screens.veille = {
   render(body) {
