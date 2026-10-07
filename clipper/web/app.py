@@ -427,6 +427,7 @@ def _jury_view(config: Config, video_id: str) -> dict[str, Any]:
             "rounds": _jury_rounds(jury),
             "reason_kind": kind, "reason": reason,
             "justification": m.get("justification"), "hook_text": m.get("hook_text"),
+            **({"source": m["source"]} if "source" in m else {}),
             **({"cut_rejected": cut_reason} if cut_reason is not None else {}),
         })
     return {
@@ -1069,7 +1070,7 @@ def _enqueue_clip_render(video_id: str, config: Config) -> dict[str, Any]:
 _BASE_CONFIG = "config.toml"
 # Sections du formulaire : [channel], agencement, titre/CTA/badge, sous-titres,
 # moments/grille. Les autres tables d'un preset sont conservees telles quelles.
-_CHANNEL_FORM_SECTIONS = ("channel", "reframe", "render", "subtitles", "moments")
+_CHANNEL_FORM_SECTIONS = ("channel", "reframe", "render", "subtitles", "moments", "action")
 _NEXT_SLOTS = 10
 _LOGO_MAX_BYTES = 5 * _MIB
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
@@ -1207,7 +1208,7 @@ def _channel_detail(name: str) -> dict[str, Any]:
 
 def _rubric_info(value: str) -> dict[str, str]:
     """Libelle de la grille designee par une valeur de [moments] rubric_path :
-    « Standard (<valeur>) » ou « Gaming (<valeur>) » pour une grille embarquee
+    « Standard (<valeur>) », « Gaming (<valeur>) » ou « Gaming action (<valeur>) » pour une grille embarquee
     ou un fichier dont le contenu est identique a celle-ci, sinon « Fichier
     personnalise (<valeur>) » (kind « custom ») ; une valeur « builtin:... »
     inconnue est « invalid », jamais ramenee a la grille standard (ADR-ad2e)."""
@@ -1216,18 +1217,18 @@ def _rubric_info(value: str) -> dict[str, str]:
     except moments_mod.MomentsError as exc:
         return {"value": value, "kind": "invalid", "label": str(exc)}
     if value in moments_mod._BUILTIN_RUBRICS:
-        kind = "gaming" if value == "builtin:gaming" else "standard"
+        kind = {"builtin:gaming": "gaming", "builtin:gaming-action": "gaming-action"}.get(value, "standard")
     else:
         try:
             content = path.read_bytes().replace(b"\r\n", b"\n")
         except OSError:
             return {"value": value, "kind": "custom", "label": f"Fichier personnalisé ({value}) : fichier introuvable"}
         kind = next(
-            (name for name, builtin in (("standard", "builtin"), ("gaming", "builtin:gaming"))
+            (name for name, builtin in (("standard", "builtin"), ("gaming", "builtin:gaming"), ("gaming-action", "builtin:gaming-action"))
              if moments_mod.resolve_rubric_path(builtin).read_bytes().replace(b"\r\n", b"\n") == content),
             "custom",
         )
-    names = {"standard": "Standard", "gaming": "Gaming", "custom": "Fichier personnalisé"}
+    names = {"standard": "Standard", "gaming": "Gaming", "gaming-action": "Gaming action", "custom": "Fichier personnalisé"}
     return {"value": value, "kind": kind, "label": f"{names[kind]} ({value})"}
 
 

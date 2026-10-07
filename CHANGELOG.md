@@ -22,6 +22,12 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ### Ajouté
 
+- Jury action (5/6) : la console gère les styles gaming action (SPEC-b0f3 R16). Grille « Gaming action »
+  (`builtin:gaming-action`, reconnue aussi pour un fichier au contenu identique) dans le choix de grille ;
+  `[moments] candidates` (transcript / transcript+action) et `action_snap_seconds` dans le formulaire ; section
+  « Action (passages de jeu) » pour la table `[action]` (aide tirée de `CONFIG_DEFAULTS`), enregistrée sans perdre
+  de clé ; la fiche vidéo (jury par moment) indique la source de chaque moment (transcription ou passage d'action)
+  quand `moments.json` la porte, inchangée sinon. Aucune logique de traitement dans `clipper/web`.
 - Jury action (1/6) : la planche d'images légendée de `vision.py` devient la bibliothèque
   `clipper/montage.py` (`montage(...)`, `LABEL_HEIGHT`, `MontageError` nommant le fichier), réutilisable par
   l'étape action sans qu'une étape en importe une autre (ADR-b16b, SPEC-b0f3 R8). `vision` l'importe, rendu

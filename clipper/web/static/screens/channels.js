@@ -15,11 +15,14 @@ const CHAN_SECTIONS = [
   { section: "render", title: "Titre, appel à l'abonnement et badge", sub: "Titre d'écran, carte de fin, badge de style", only: /^(title_|hook_|cta_|badge_|part_|emoji_)/ },
   { section: "subtitles", title: "Sous-titres", sub: "Police, couleurs, position" },
   { section: "moments", title: "Grille de notation et moments", sub: "Sélection des moments, grille et jury" },
+  { section: "action", title: "Action (passages de jeu)", sub: "Pics audio, densité de plans et images décrites, pour les VOD gaming" },
 ];
+// Origine des candidats de moments (SPEC-b0f3 R10) : valeur de [moments] candidates -> libellé.
+const CHAN_CANDIDATES = [["transcript", "transcript (la transcription seule)"], ["transcript+action", "transcript+action (transcription et passages d'action)"]];
 const CHAN_MODES = [["review", "review (tu valides les moments)"], ["auto", "auto (le jury décide)"]];
 // Grilles de notation embarquées (SPEC-9216 R4) : valeur de [moments] rubric_path -> libellé.
 // Toute autre valeur est un chemin de fichier (« Fichier personnalisé »).
-const CHAN_RUBRICS = [["builtin", "Standard"], ["builtin:gaming", "Gaming"]];
+const CHAN_RUBRICS = [["builtin", "Standard"], ["builtin:gaming", "Gaming"], ["builtin:gaming-action", "Gaming action"]];
 const CHAN_RUBRIC_CUSTOM = "custom";
 // Modèles proposés à la création d'un style. « Standard » n'écrit rien de plus que [channel] ;
 // « Stream gaming » écrit la grille gaming et l'agencement stream (webcam en haut, jeu en bas).
@@ -145,6 +148,7 @@ function chOpenNew() {
 function chKind(key, section, def) {
   if (section === "channel" && key === "mode") return "mode";
   if (section === "moments" && key === "rubric_path") return "rubric";
+  if (section === "moments" && key === "candidates") return "candidates";
   if (typeof def === "boolean") return "bool";
   if (typeof def === "number") return "number";
   if (typeof def === "string") return "text";
@@ -169,7 +173,7 @@ function chRubricRefresh(field, value) {
       if (!now || !field.isConnected || (chRubricValue(field) !== value)) return;
       now.textContent = `Grille en vigueur : ${info.label}`;
       const custom = $(`[data-rubric-select] option[value="${CHAN_RUBRIC_CUSTOM}"]`, field);
-      if (custom) custom.textContent = info.kind === "standard" || info.kind === "gaming" ? info.label : "Fichier personnalisé";
+      if (custom) custom.textContent = ["standard", "gaming", "gaming-action"].includes(info.kind) ? info.label : "Fichier personnalisé";
     } catch (err) {
       const now = $("[data-rubric-now]", field);
       if (now) now.textContent = `Grille en vigueur : ${chRubricLabel(value)} (libellé indisponible : ${err.message})`;
@@ -185,7 +189,7 @@ function chRubricValue(field) {
 function chRubricEditor(id, value, dis, info) {
   const known = CHAN_RUBRICS.some(([k]) => k === value);
   const shown = info && info.value === value ? info : null;
-  const customLabel = shown && (shown.kind === "standard" || shown.kind === "gaming") ? shown.label : "Fichier personnalisé";
+  const customLabel = shown && ["standard", "gaming", "gaming-action"].includes(shown.kind) ? shown.label : "Fichier personnalisé";
   const options = [...CHAN_RUBRICS, [CHAN_RUBRIC_CUSTOM, customLabel]]
     .map(([k, l]) => `<option value="${k}"${(known ? k === value : k === CHAN_RUBRIC_CUSTOM) ? " selected" : ""}>${esc(l)}</option>`).join("");
   return `<div class="chan-rubric">
@@ -198,6 +202,7 @@ function chControl(id, kind, value, locked, rubric) {
   const dis = locked ? " disabled" : "";
   switch (kind) {
     case "rubric": return chRubricEditor(id, value, dis, rubric);
+    case "candidates": return `<select class="input" id="${id}"${dis}>${CHAN_CANDIDATES.map(([k, l]) => `<option value="${k}"${k === value ? " selected" : ""}>${esc(l)}</option>`).join("")}</select>`;
     case "mode": return `<select class="input" id="${id}"${dis}>${CHAN_MODES.map(([k, l]) => `<option value="${k}"${k === value ? " selected" : ""}>${esc(l)}</option>`).join("")}</select>`;
     case "bool": return `<label class="switch"><input type="checkbox" id="${id}"${value ? " checked" : ""}${dis}><span></span></label>`;
     case "number": return `<input class="input mono" id="${id}" type="number" step="any" value="${esc(value)}"${dis}>`;

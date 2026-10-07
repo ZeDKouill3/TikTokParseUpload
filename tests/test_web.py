@@ -9470,3 +9470,157 @@ def test_the_stats_screen_reads_learning_and_wires_adopt_and_refuse():
     js = _static("screens", "stats.js")
     assert '"/api/learning"' in js and "/api/learning/coach/" in js
     assert "data-learning-adopt" in js and "data-learning-refuse" in js and "statsLearningSection()" in js
+
+
+# --------------------------------------------------------------------------
+# Jury action 5/6 (SPEC-b0f3 R16) : grille « Gaming action », [moments] candidates,
+# table [action], source de chaque moment dans la fiche vidéo
+# --------------------------------------------------------------------------
+
+
+def test_channels_form_offers_the_gaming_action_rubric():
+    js = _static("screens", "channels.js")
+
+    assert '["builtin:gaming-action", "Gaming action"]' in js
+    for label in ("Standard", "Gaming", "Fichier personnalisé"):
+        assert label in js, label
+    assert 'info.kind' in js and '"gaming-action"]' in js    # libellé serveur repris pour un fichier identique
+
+
+def test_rubric_label_for_the_builtin_gaming_action_value(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path)
+
+    info = client(tmp_path).get("/api/rubric-label", params={"path": "builtin:gaming-action"}).json()
+
+    assert info["kind"] == "gaming-action"
+    assert info["label"] == "Gaming action (builtin:gaming-action)"
+
+
+def test_channel_rubric_label_for_a_file_identical_to_the_gaming_action_grid(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path, preset=_CH_PRESET + '\n[moments]\nrubric_path = "ma_grille.toml"\n')
+    (tmp_path / "ma_grille.toml").write_bytes(_rubric_asset("rubric-gaming-action.toml"))
+
+    rubric = client(tmp_path).get(f"/api/channels/{CH}").json()["rubric"]
+
+    assert rubric == {"value": "ma_grille.toml", "kind": "gaming-action", "label": "Gaming action (ma_grille.toml)"}
+
+
+def test_standard_and_gaming_rubric_labels_are_unchanged(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path)
+    c = client(tmp_path)
+
+    assert c.get("/api/rubric-label", params={"path": "builtin"}).json()["label"] == "Standard (builtin)"
+    gaming = c.get("/api/rubric-label", params={"path": "builtin:gaming"}).json()
+    assert (gaming["kind"], gaming["label"]) == ("gaming", "Gaming (builtin:gaming)")
+
+
+def test_channel_detail_documents_candidates_snap_and_the_action_section(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path)
+
+    body = client(tmp_path).get(f"/api/channels/{CH}").json()
+
+    moments = body["defaults"]["moments"]
+    assert moments["candidates"]["default"] == "transcript"
+    assert moments["action_snap_seconds"]["default"] == 3
+    action = body["defaults"]["action"]
+    assert action["enabled"]["default"] is False
+    assert action["window_seconds"]["default"] == 30 and action["window_seconds"]["comment"]
+    assert body["effective"]["action"]["enabled"] is False
+
+
+def test_channels_form_has_the_action_section_and_the_candidates_choice():
+    js = _static("screens", "channels.js")
+
+    assert 'section: "action"' in js and "Action (passages de jeu)" in js
+    assert '"transcript+action"' in js and '"transcript"' in js
+    assert 'key === "candidates"' in js
+
+
+def test_put_channel_writes_moments_candidates_and_action_enabled_then_get_reads_them(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path)
+    c = client(tmp_path)
+
+    resp = c.put(f"/api/channels/{CH}", json={"preset": {
+        "channel": {"display_name": "Ma chaîne"},
+        "moments": {"rubric_path": "builtin:gaming-action", "candidates": "transcript+action", "action_snap_seconds": 5},
+        "action": {"enabled": True},
+    }})
+
+    assert resp.status_code == 200, resp.text
+    saved = (tmp_path / "presets" / f"{CH}.toml").read_text(encoding="utf-8")
+    assert 'candidates = "transcript+action"' in saved and "enabled = true" in saved
+    body = c.get(f"/api/channels/{CH}").json()
+    assert body["raw"]["moments"] == {
+        "rubric_path": "builtin:gaming-action", "candidates": "transcript+action", "action_snap_seconds": 5}
+    assert body["raw"]["action"] == {"enabled": True}
+    assert body["effective"]["action"]["enabled"] is True
+    assert body["rubric"]["kind"] == "gaming-action"
+
+
+def test_saving_from_the_console_keeps_every_key_of_the_moments_and_action_tables(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path, preset=_CH_PRESET + (
+        '\n[moments]\ncandidates = "transcript+action"\naction_snap_seconds = 2\n'
+        '\n[action]\nenabled = true\nwindow_seconds = 20\nmin_score = 0.5\n'))
+    c = client(tmp_path)
+    raw = c.get(f"/api/channels/{CH}").json()["raw"]
+
+    # la console renvoie le brut relu (sections du formulaire = brouillon issu du brut)
+    assert c.put(f"/api/channels/{CH}", json={"preset": raw}).status_code == 200
+
+    again = c.get(f"/api/channels/{CH}").json()["raw"]
+    assert again["moments"] == {"candidates": "transcript+action", "action_snap_seconds": 2}
+    assert again["action"] == {"enabled": True, "window_seconds": 20, "min_score": 0.5}
+
+
+def test_put_channel_refuses_a_bad_action_value_naming_the_field(tmp_path, isolated_cwd):
+    _channels_setup(tmp_path)
+
+    resp = client(tmp_path).put(f"/api/channels/{CH}", json={"preset": {
+        "channel": {"display_name": "Ma chaîne"}, "action": {"enabled": "oui"}}})
+
+    assert resp.status_code == 422
+    assert "[action] enabled" in resp.text
+
+
+def test_channel_form_sections_include_action():
+    from clipper.web import app as web_app
+
+    assert "action" in web_app._CHANNEL_FORM_SECTIONS
+
+
+def _jury_moment(i, source=None):
+    jury = {"score": 70, "confidence": 80, "debated": False, "proposer": {"scores": {"emotion": 7}},
+            "trace": {"rounds": [{"round": 1, "judges": {"a": {"scores": {"emotion": 7}, "confidence": 80}}}]}}
+    return {"id": i, "start": 10.0 * i, "end": 10.0 * i + 30, "format": "letterbox", "scores": {"emotion": 7},
+            "final_score": 70, "justification": "j", "hook_text": "h", "jury": jury,
+            **({"source": source} if source else {})}
+
+
+def test_video_jury_view_carries_the_source_of_each_moment_when_moments_json_has_it(tmp_path, isolated_cwd):
+    _write_state(tmp_path, VIDEO_ID, status="done", steps={})
+    _write_json(tmp_path / "workspace" / VIDEO_ID / "moments.json", {
+        "video_id": VIDEO_ID, "selection": "jury", "jury": {"judges": ["a"]},
+        "rubric": {"path": "r.toml", "weights": {"emotion": 4}, "min_score": 45},
+        "moments": [_jury_moment(1, "transcript"), _jury_moment(2, "action")], "rejected": []})
+
+    moments = client(tmp_path).get(f"/api/videos/{VIDEO_ID}/jury").json()["moments"]
+
+    assert [m["source"] for m in moments] == ["transcript", "action"]
+
+
+def test_video_jury_view_has_no_source_key_for_an_old_moments_json(tmp_path, isolated_cwd):
+    _write_state(tmp_path, VIDEO_ID, status="done", steps={})
+    _write_json(tmp_path / "workspace" / VIDEO_ID / "moments.json", {
+        "video_id": VIDEO_ID, "selection": "jury", "jury": {"judges": ["a"]},
+        "rubric": {"path": "r.toml", "weights": {"emotion": 4}, "min_score": 45},
+        "moments": [_jury_moment(1)], "rejected": []})
+
+    moments = client(tmp_path).get(f"/api/videos/{VIDEO_ID}/jury").json()["moments"]
+
+    assert "source" not in moments[0]
+
+
+def test_video_sheet_shows_the_moment_source_only_when_present():
+    js = _static("screens", "jury-radar.js")
+
+    assert "m.source" in js and "passage d'action" in js and "transcription" in js
