@@ -24,6 +24,9 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ### Corrigé
 
+- Download : une VOD Twitch réservée aux abonnés (yt-dlp « subscriber-only content ») est un échec
+  définitif avec un message lisible, jamais un échec transitoire réessayé, même si la chaîne d'erreurs
+  contient aussi une erreur réseau ou un 403 ; une coupure réseau seule reste réessayée (TASK-e2a1).
 - Download : une coupure réseau (connexion fermée par l'hôte distant, WinError 10054 sur `usher.ttvnw.net`,
   « Failed to download m3u8 information ») est réessayée aussitôt, jusqu'à `[download] network_retries`
   fois (15) avec `[download] network_retry_pause_s` (5 s) de pause, chaque essai journalisé ; essais
