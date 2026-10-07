@@ -383,20 +383,91 @@ Saisis-la dans `youtube_api_key`. Le quota par défaut est de 10 000 unités par
 jour ; un relevé coûte 1 unité (un appel `videos.list`), donc très loin de la
 limite.
 
-**Steam** n'a besoin d'aucune clé (API publique des joueurs connectés).
+**Steam** n'a besoin d'aucune clé : le relevé interroge les API publiques de Steam
+(`ISteamChartsService` pour le top des joueurs et le **pic du jour**,
+`ISteamUserStats` pour les joueurs **à l'instant** d'un jeu précis, et la page
+publique `steamcommunity.com/games/<appid>/memberslistxml` pour les **abonnés**
+du groupe Steam d'un jeu). Les appels par jeu sont plafonnés et espacés (voir
+les réglages ci-dessous) ; une source qui échoue est signalée en rouge dans le
+bandeau des sources (« Steam (joueurs hors top) », « Steam (abonnés) »).
 
 **IGDB (sorties de jeux)** utilise les clés Twitch déjà saisies (IGDB appartient à
 Twitch, même jeton d'application) : rien de plus à créer. L'écran affiche une
-section **Sorties de jeux** entre les propositions et les meilleurs clips :
-« Sorties récentes » (badge `J+N`, hypes, plateformes, lien IGDB) puis « À venir »
-(date, badge `J-N`). Les propositions et les lignes de « Ce qui monte » dont le
-jeu vient de sortir portent un badge « Sortie J+N », et Claude donne la priorité
-aux jeux dans leur fenêtre de sortie. Trois réglages dans Réglages › Veille :
-`upcoming_days` (14, horizon des sorties à venir, >= 1), `release_window_days`
-(15, jours après la sortie où un jeu est « récent », >= 0) et `igdb_min_hypes`
-(0, hypes IGDB minimum pour apparaître, >= 0 ; 0 = pas de filtre). Une liste
-vide s'affiche « Aucune sortie dans la fenêtre » ; si IGDB répond en erreur,
-la cause est affichée en rouge et aucune liste n'est montrée.
+section **Sorties de jeux** entre les propositions et les meilleurs clips, sous
+la forme d'un **calendrier** :
+
+- **En-tête** « Calendrier du <date> » avec les puces « N récentes », « N à venir »
+  et « Source : IGDB ».
+- **Bandeau « Sorties récentes »** : une carte par jeu, dans l'ordre de la collecte
+  (les plus attendus d'abord), avec la jaquette, la pastille « Aujourd'hui » ou
+  « Sortie J+N », « Tendance » si le jeu est dans le relevé du jour, le nom, trois
+  plateformes au plus puis « +n », « Portage » (un jeu déjà sorti ailleurs qui arrive
+  sur une nouvelle plateforme), le nombre d'hypes IGDB et, quand il y en a, la ligne
+  de tendance (ventes Steam FR, viewers Twitch FR, joueurs Steam, abonnés Steam) et
+  la puce « Communauté » ou « Peu de monde ».
+- **Frise « À venir (N j) »** : une colonne par jour d'aujourd'hui à J+`upcoming_days`
+  (la colonne d'aujourd'hui est mise en avant et montre les sorties du jour), la
+  première jaquette en grand avec ses hypes, cinq au plus puis « +n autres »,
+  « Aucune sortie notable » pour un jour vide.
+- **Téléphone** (écran de 760 px ou moins) : la frise laisse la place à une liste par
+  jour, qui ne montre que les jours avec sortie et « N jours sans sortie notable »
+  entre deux.
+- **Détail** : un clic (ou un toucher) sur une jaquette ouvre un panneau avec la
+  jaquette, le nom, la date en toutes lettres, J+N / J-N / Aujourd'hui, toutes les
+  plateformes, les hypes, la tendance (avec la courbe des joueurs quand la veille en
+  a une), « Portage sur nouvelle plateforme » et le lien « Voir sur IGDB » (nouvel
+  onglet). Il se ferme par la croix, la touche Échap ou un clic à côté.
+
+Les **jaquettes sont chargées par ton navigateur** depuis `images.igdb.com`
+(adresse directe, `t_cover_big`) : Clipper ne les télécharge, ne les relaie et ne
+les stocke jamais. Sans jaquette (ou si l'image ne charge pas), la vignette porte le
+nom du jeu. Si tu n'as pas accès à `images.igdb.com`, le calendrier reste complet,
+avec des vignettes à nom.
+
+« +n autres » sous une liste veut dire que la collecte a coupé au plafond
+(`igdb_recent_max`, `igdb_upcoming_max`) ; « n sorties écartées (moins de N hypes) »
+compte les jeux sous `igdb_min_hypes` qui n'étaient pas en tendance. Une fenêtre
+sans sortie s'affiche « Aucune sortie dans la fenêtre » ; si IGDB répond en erreur,
+la cause est affichée en rouge et aucun calendrier n'est montré. Les propositions et
+les lignes de « Ce qui monte » dont le jeu vient de sortir portent un badge
+« Sortie J+N », et Claude donne la priorité aux jeux dans leur fenêtre de sortie.
+
+**Filtre de communauté.** Une VOD n'est proposée que si son jeu a une communauté
+suffisante : il suffit qu'**un seul** des quatre seuils soit atteint (ils sont reliés
+par « ou ») : `community_min_steam_players` joueurs Steam (1000), `community_min_steam_followers`
+abonnés Steam (10 000), `community_min_twitch_viewers` viewers Twitch FR (200) ou
+`community_min_hypes` hypes IGDB (50). Un chiffre inconnu n'atteint aucun seuil : un
+jeu inconnu de toutes les sources est écarté (compté dans « n VOD écartées :
+communauté insuffisante ou jeu inconnu »). Les joueurs Steam comptent le **pic du jour**
+quand le jeu est dans le top Steam, sinon le chiffre **à l'instant du relevé** (nommé
+comme tel partout : « Steam (pic du jour / à l'instant) » dans « Ce qui monte »,
+« à l'instant du relevé » dans le calendrier) ; les abonnés viennent de la page
+`memberslistxml` du jeu, les viewers de Twitch FR, les hypes d'IGDB. La colonne
+« Communauté » de « Ce qui monte » dit « ok » (avec le critère atteint) ou
+« insuffisante ».
+
+**Courbe et gain d'abonnés.** Les courbes de joueurs Steam (une par jeu dans « Ce qui
+monte », et dans le détail d'une sortie en tendance) et le gain d'abonnés « +G (7 j) »
+sont construits depuis l'**historique des relevés de la veille** : ils n'existent pas
+tant que la veille n'a pas tourné plusieurs jours. Le premier jour, la courbe dit « 1 jour
+de mesure » et le gain « historique insuffisant » ; aucune valeur n'est inventée. Les
+points « pic du jour » et « à l'instant » ont deux couleurs.
+
+**Diversité.** `max_vods_per_game` (1) limite le nombre de VOD proposées par jeu :
+Claude doit varier les jeux, et un choix qui dépasse le plafond est refusé.
+
+**Les treize réglages** de Réglages › Veille liés au calendrier, à la communauté et à
+la diversité : `upcoming_days` (14, horizon des sorties à venir, >= 1),
+`release_window_days` (15, jours après la sortie où un jeu est « récent », >= 0),
+`igdb_min_hypes` (5, hypes IGDB minimum, >= 1), `igdb_recent_max` (12) et
+`igdb_upcoming_max` (20) (plafonds d'affichage, >= 1), `steam_players_lookups_max` (30)
+et `steam_followers_lookups_max` (200) (jeux interrogés par relevé, >= 0),
+`steam_followers_pause_s` (1.0 s entre deux appels, >= 0,2), `community_min_steam_players`,
+`community_min_steam_followers`, `community_min_twitch_viewers` et `community_min_hypes`
+(seuils ci-dessus, >= 0) et `max_vods_per_game` (>= 1). Une valeur hors bornes est refusée
+à l'enregistrement avec le message de la veille. L'ancien réglage `igdb_releases_max`
+est **ignoré** s'il traîne dans `config.toml` : il est remplacé par `igdb_recent_max` et
+`igdb_upcoming_max`.
 
 Les clés s'écrivent dans `config.toml` (`[veille]`), jamais ailleurs : l'écran
 Réglages ne les réaffiche jamais (il dit seulement « saisie » ou « absente »),
