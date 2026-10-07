@@ -1580,10 +1580,11 @@ def run_if_due(
     _write(_day_path(sdir, day), skeleton)  # l'écran voit « en cours » dès maintenant
     decided = [p for p in skeleton["proposals"] if p["status"] in _DECIDED]
 
-    state = collect(now, collectors=collectors, config=config, finalize=False, clock=clock)
+    read_clock = clock or _elapsed_clock(now)  # la même horloge pour l'échéance et pour l'heure de fin
+    state = collect(now, collectors=collectors, config=config, finalize=False, clock=read_clock)
     state["refresh_requested_at"] = requested_at
     state = decide(state, config)
-    state["finished_at"] = now.isoformat()
+    state["finished_at"] = read_clock().isoformat()  # vraie heure de fin, jamais celle du départ
     with channel_mod.file_lock(_state_lock(sdir)):
         ids = {p["candidate_id"] for p in decided}
         state["proposals"] = decided + [p for p in state["proposals"] if p["candidate_id"] not in ids]

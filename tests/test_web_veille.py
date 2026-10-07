@@ -573,7 +573,7 @@ const ctx = { console, document: { addEventListener() {} }, esc, CLIPPER_TZ: "Eu
   api: async () => ({}), emptyState: (i, t) => `<div>${t}</div>` };
 vm.createContext(ctx);
 const jobs = JSON.parse(fs.readFileSync(input, "utf8"));
-const run = vm.runInContext(fs.readFileSync(src, "utf8") + "\n;(function (jobs) { return jobs.map(([fn, ...args]) => { if (fn === 'ui') { Object.assign(veilleUi, args[0]); return null; } return ({ veilleReleases, veilleSources, veilleKpis, veilleRising, veilleSettings, veilleProposal, veilleIncomplete })[fn](...args); }); })", ctx);
+const run = vm.runInContext(fs.readFileSync(src, "utf8") + "\n;(function (jobs) { return jobs.map(([fn, ...args]) => { if (fn === 'ui') { Object.assign(veilleUi, args[0]); return null; } return ({ veilleReleases, veilleSources, veilleKpis, veilleRising, veilleSettings, veilleProposal, veilleProposals, veilleIncomplete })[fn](...args); }); })", ctx);
 process.stdout.write(JSON.stringify(run(jobs)));
 """
 
@@ -1194,3 +1194,162 @@ def test_veille_screen_preview_shows_the_seven_trend_settings(tmp_path):
     html = run_js(tmp_path, ["veilleSettings", cal_data(cfg={k: 200 + i for i, k in enumerate(TREND_SETTINGS)})])[0]
     for i, key in enumerate(TREND_SETTINGS):
         assert f'data-veille-setting="{key}"' in html and f'value="{200 + i}"' in html, key
+
+
+# --------------------------------------------------------------------------
+# TASK-3f90 : état réel d'une proposition mise en file (GET /api/veille, lecture seule)
+# --------------------------------------------------------------------------
+
+
+def _queued_day(tmp_path, video_id="v1"):
+    put_day(tmp_path, today(), proposals=[proposal(video_id, status="queued")])
+
+
+def _put_queue(tmp_path, entries):
+    write_json(tmp_path / "state" / "queue.json", entries)
+
+
+def _put_pipeline(tmp_path, video_id, status, reason=None):
+    write_json(tmp_path / "workspace" / video_id / "pipeline.json",
+               {"video_id": video_id, "status": status, "reason": reason, "steps": {}})
+
+
+def _live(tmp_path):
+    day = client(tmp_path, enabled=True).get("/api/veille").json()["day"]
+    return day["proposals"][0]["live"]
+
+
+def _entry(video_id, status):
+    return {"id": "e1", "video_id": video_id, "url": f"https://www.twitch.tv/videos/{video_id}", "channel": None,
+            "action": "run", "force_steps": [], "status": status, "pid": None}
+
+
+def test_queued_proposal_still_in_the_queue_is_en_file(tmp_path, isolated_cwd):
+    _queued_day(tmp_path)
+    _put_queue(tmp_path, [_entry("v1", "waiting")])
+    assert _live(tmp_path) == {"state": "queued", "label": "en file"}
+
+
+def test_queued_proposal_running_in_the_queue_is_en_cours(tmp_path, isolated_cwd):
+    _queued_day(tmp_path)
+    _put_queue(tmp_path, [_entry("v1", "running")])
+    _put_pipeline(tmp_path, "v1", "running")
+    assert _live(tmp_path) == {"state": "running", "label": "en cours"}
+
+
+def test_queued_proposal_whose_pipeline_is_done_is_traitee(tmp_path, isolated_cwd):
+    _queued_day(tmp_path)
+    _put_queue(tmp_path, [])
+    _put_pipeline(tmp_path, "v1", "done")
+    assert _live(tmp_path) == {"state": "done", "label": "traitée"}
+
+
+def test_queued_proposal_cancelled_by_the_user_is_annulee(tmp_path, isolated_cwd):
+    _queued_day(tmp_path)
+    _put_queue(tmp_path, [])
+    _put_pipeline(tmp_path, "v1", "failed", reason=worker._CANCEL_REASON)
+    assert _live(tmp_path) == {"state": "cancelled", "label": "annulée"}
+
+
+def test_queued_proposal_neither_in_the_queue_nor_in_a_pipeline_is_retiree_never_en_file(tmp_path, isolated_cwd):
+    _queued_day(tmp_path)
+    _put_queue(tmp_path, [])  # DELETE /api/queue : la file est vide, aucun pipeline.json
+    assert _live(tmp_path) == {"state": "withdrawn", "label": "retirée de la file"}
+
+
+def test_queued_proposal_with_a_waiting_pipeline_but_no_queue_entry_is_retiree(tmp_path, isolated_cwd):
+    _queued_day(tmp_path)
+    _put_queue(tmp_path, [_entry("autre", "waiting")])
+    _put_pipeline(tmp_path, "v1", "queued")
+    assert _live(tmp_path)["state"] == "withdrawn"
+
+
+def test_queued_proposal_without_queue_file_is_retiree(tmp_path, isolated_cwd):
+    _queued_day(tmp_path)
+    assert _live(tmp_path)["state"] == "withdrawn"
+
+
+def test_queued_proposal_whose_pipeline_failed_for_another_reason_says_so(tmp_path, isolated_cwd):
+    _queued_day(tmp_path)
+    _put_queue(tmp_path, [])
+    _put_pipeline(tmp_path, "v1", "failed", reason="ffmpeg a planté")
+    assert _live(tmp_path) == {"state": "failed", "label": "échouée"}
+
+
+def test_queued_proposal_awaiting_review_is_a_la_relecture(tmp_path, isolated_cwd):
+    _queued_day(tmp_path)
+    _put_queue(tmp_path, [])
+    _put_pipeline(tmp_path, "v1", "awaiting_review")
+    assert _live(tmp_path) == {"state": "awaiting_review", "label": "à relire"}
+
+
+def test_only_queued_proposals_carry_a_live_state_and_nothing_is_written(tmp_path, isolated_cwd):
+    put_day(tmp_path, today(), proposals=[proposal("v1", status="proposed"), proposal("v2", status="ignored", rank=2),
+                                          proposal("v3", status="queued", rank=3)])
+    before = (tmp_path / "state" / "veille" / "days" / f"{today()}.json").read_text(encoding="utf-8")
+    props = client(tmp_path, enabled=True).get("/api/veille").json()["day"]["proposals"]
+    assert ["live" in p for p in props] == [False, False, True]
+    assert (tmp_path / "state" / "veille" / "days" / f"{today()}.json").read_text(encoding="utf-8") == before
+    assert not (tmp_path / "state" / "queue.json").exists()
+
+
+def test_live_state_is_also_on_the_by_date_view(tmp_path, isolated_cwd):
+    _queued_day(tmp_path)
+    _put_queue(tmp_path, [_entry("v1", "waiting")])
+    day = client(tmp_path, enabled=True).get(f"/api/veille/{today()}").json()["day"]
+    assert day["proposals"][0]["live"]["state"] == "queued"
+
+
+# --- TASK-3f90 : propositions à décider d'abord, déjà décidées repliées ---------
+
+
+def _prop(video_id, status, rank, live=None):
+    return {**proposal(video_id, status=status, rank=rank), **({"live": live} if live else {})}
+
+
+def proposals_html(tmp_path, props):
+    data = {"day": {"date": "2026-10-07", "proposals": props, "games": [], "llm": {"status": "ok"}, "skipped_note": ""}}
+    return run_js(tmp_path, ["veilleProposals", data, []])[0]
+
+
+def _ids(html):
+    return re.findall(r'data-veille-prop="twitch:([^"]+)"', html)
+
+
+def test_proposed_cards_come_before_the_decided_ones_which_fold_into_deja_decidees(tmp_path):
+    html = proposals_html(tmp_path, [
+        _prop("old", "queued", 1, {"state": "queued", "label": "en file"}),
+        _prop("late", "proposed", 3),
+        _prop("first", "proposed", 2),
+        _prop("nope", "ignored", 4),
+    ])
+    open_part, folded = html.split("<details", 1)
+    assert _ids(open_part) == ["first", "late"]  # l'ordre de Claude (rang) gardé dans le groupe
+    assert "Déjà décidées" in folded.split("</summary>")[0] and "(2)" in folded.split("</summary>")[0]
+    assert _ids(folded) == ["old", "nope"]  # rang de Claude gardé aussi dans le groupe des décidées
+    assert 'data-live-state="ignored"' in folded  # l'ignorée est lisible dans la section repliée
+    assert "open" not in folded.split(">", 1)[0]  # repliée par défaut
+
+
+def test_a_decided_card_shows_its_real_state_label_never_a_hardcoded_en_file(tmp_path):
+    for live, label in (({"state": "withdrawn", "label": "retirée de la file"}, "retirée de la file"),
+                        ({"state": "cancelled", "label": "annulée"}, "annulée"),
+                        ({"state": "done", "label": "traitée"}, "traitée")):
+        html = proposals_html(tmp_path, [_prop("a", "queued", 1, live)])
+        assert f'>{label}</span>' in html and "en file</span>" not in html.replace("retirée de la file</span>", "")
+        assert f'data-live-state="{live["state"]}"' in html
+
+
+def test_a_queued_card_without_live_state_says_unknown_instead_of_en_file(tmp_path):
+    html = proposals_html(tmp_path, [_prop("a", "queued", 1)])
+    assert "état inconnu" in html and "en file</span>" not in html
+
+
+def test_without_pending_proposal_the_screen_says_nothing_is_left_to_decide(tmp_path):
+    html = proposals_html(tmp_path, [_prop("a", "queued", 1, {"state": "queued", "label": "en file"})])
+    assert "Plus rien à décider" in html and "Déjà décidées" in html
+
+
+def test_without_any_decided_proposal_there_is_no_folded_section(tmp_path):
+    html = proposals_html(tmp_path, [_prop("a", "proposed", 1)])
+    assert "<details" not in html and "Déjà décidées" not in html and _ids(html) == ["a"]
