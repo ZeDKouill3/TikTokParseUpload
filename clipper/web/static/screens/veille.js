@@ -209,7 +209,9 @@ function veilleProposalGroups(proposals) {
   const byRank = (a, b) => a.rank - b.rank;
   return {
     pending: proposals.filter((p) => p.status === "proposed").sort(byRank),
-    decided: proposals.filter((p) => p.status === "queued").sort(byRank),
+    // Mises en file : la plus récemment décidée d'abord (un relevé rejoué garde les décisions des relevés d'avant).
+    decided: proposals.filter((p) => p.status === "queued")
+      .sort((a, b) => String(b.decided_at || "").localeCompare(String(a.decided_at || "")) || byRank(a, b)),
     ignored: proposals.filter((p) => p.status === "ignored").length,
   };
 }

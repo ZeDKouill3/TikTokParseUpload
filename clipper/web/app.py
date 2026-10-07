@@ -967,13 +967,22 @@ def _veille_next_run_at(table: dict[str, Any], sdir: Path) -> str | None:
     return slot.isoformat()
 
 
-def _veille_live_state(video_id: str, queue: list[dict[str, Any]], config: Config) -> dict[str, str]:
+def _veille_live_state(proposal: dict[str, Any], queue: list[dict[str, Any]], config: Config) -> dict[str, str]:
     """État réel d'une proposition mise en file, lu de state/queue.json et de workspace/<id>/pipeline.json
-    (lecture seule, TASK-3f90) : jamais « en file » quand la vidéo n'est plus dans la file."""
-    entry = next((e for e in queue if e.get("video_id") == video_id), None)
+    (lecture seule, TASK-3f90) : jamais « en file » quand la vidéo n'est plus dans la file. Le candidat porte
+    l'id de la source (Twitch : « 2894103366 ») et la file / le workspace l'id Clipper (« v2894103366 ») :
+    l'entrée est retrouvée par ``queue_entry_id``, sinon par l'une des deux formes."""
+    raw = str(proposal["candidate"]["video_id"])
+    ids = (raw, raw if raw.startswith("v") else f"v{raw}")
+    entry_id = proposal.get("queue_entry_id")
+    entry = next((e for e in queue if entry_id and e.get("id") == entry_id), None) \
+        or next((e for e in queue if e.get("video_id") in ids), None)
     if entry is not None:
-        return {"state": "running", "label": "en cours"} if entry.get("status") == "running"             else {"state": "queued", "label": "en file"}
-    state = _veille_json(Path(config.workspace_dir) / video_id / pipeline.STATE_FILE, None)
+        return {"state": "running", "label": "en cours"} if entry.get("status") == "running" \
+            else {"state": "queued", "label": "en file"}
+    workspace = Path(config.workspace_dir)
+    video_id = next((i for i in reversed(ids) if (workspace / i / pipeline.STATE_FILE).exists()), raw)
+    state = _veille_json(workspace / video_id / pipeline.STATE_FILE, None)
     status = state.get("status") if isinstance(state, dict) else None
     if status == "done":
         return {"state": "done", "label": "traitée"}
@@ -997,7 +1006,7 @@ def _veille_with_live_states(day: dict[str, Any] | None, config: Config) -> dict
     if not day or not any(p.get("status") == "queued" for p in day.get("proposals", [])):
         return day
     queue = _veille_json(_queue_path(config), [])
-    proposals = [{**p, "live": _veille_live_state(p["candidate"]["video_id"], queue, config)} if p.get("status") == "queued" else p
+    proposals = [{**p, "live": _veille_live_state(p, queue, config)} if p.get("status") == "queued" else p
                  for p in day["proposals"]]
     return {**day, "proposals": proposals}
 

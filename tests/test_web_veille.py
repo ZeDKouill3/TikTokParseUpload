@@ -1354,3 +1354,33 @@ def test_without_pending_proposal_the_screen_says_nothing_is_left_to_decide(tmp_
 def test_without_any_decided_proposal_there_is_no_folded_section(tmp_path):
     html = proposals_html(tmp_path, [_prop("a", "proposed", 1)])
     assert "<details" not in html and "Déjà décidées" not in html and _ids(html) == ["a"]
+
+
+# --- Bug réel 2026-10-07 : le candidat Twitch porte « 2894103366 », la file et le workspace « v2894103366 » --------
+
+
+def test_raw_twitch_id_is_matched_to_the_v_prefixed_queue_entry(tmp_path, isolated_cwd):
+    _queued_day(tmp_path, video_id="2894103366")
+    _put_queue(tmp_path, [_entry("v2894103366", "running")])
+    assert _live(tmp_path) == {"state": "running", "label": "en cours"}
+
+
+def test_raw_twitch_id_reads_the_v_prefixed_workspace_once_out_of_the_queue(tmp_path, isolated_cwd):
+    _queued_day(tmp_path, video_id="2894103366")
+    _put_queue(tmp_path, [])
+    _put_pipeline(tmp_path, "v2894103366", "done")
+    assert _live(tmp_path) == {"state": "done", "label": "traitée"}
+
+
+def test_queue_entry_id_wins_over_the_video_id(tmp_path, isolated_cwd):
+    put_day(tmp_path, today(), proposals=[{**proposal("x9", status="queued"), "queue_entry_id": "e1"}])
+    _put_queue(tmp_path, [_entry("v-autre-forme", "waiting")])
+    assert _live(tmp_path) == {"state": "queued", "label": "en file"}
+
+
+def test_deja_decidees_lists_the_most_recent_decision_first(tmp_path):
+    html = proposals_html(tmp_path, [
+        {**_prop("matin", "queued", 1, {"state": "withdrawn", "label": "retirée de la file"}), "decided_at": "2026-10-07T08:08:00+00:00"},
+        {**_prop("soir", "queued", 1, {"state": "running", "label": "en cours"}), "decided_at": "2026-10-07T20:50:00+00:00"},
+    ])
+    assert _ids(html.split("<details", 1)[1]) == ["soir", "matin"]
