@@ -22,6 +22,14 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ### Ajouté
 
+- Veille : historique de tendance sur 30 jours dès le premier relevé pour chaque jeu suivi (SPEC-85a0). Deux
+  nouvelles sources, « Steam (avis 30 j) » (histogramme des avis, endpoint non documenté) et « Twitch (VOD 30 j) »
+  (Helix *Get Videos*, plafond 500 VOD donc jours anciens inconnus), et des courbes par jeu : colonne « 30 j » de
+  « Ce qui monte » et carte de proposition (ligne SVG sans bibliothèque, un trou pour un jour sans mesure, « n j
+  mesurés / 30 », « pic <date> », résumé « s4 → s1 »). Onze réglages `[veille]` (`trend_days`, `trend_games_max`,
+  `steam_reviews_*`, `twitch_history_*`, `twitch_access_attempts`, `twitch_access_retry_pause_s`,
+  `veille_deadline_s`), les sept principaux dans le formulaire des réglages et l'aperçu de l'écran Veille.
+
 - Jury action (1/6) : la planche d'images légendée de `vision.py` devient la bibliothèque
   `clipper/montage.py` (`montage(...)`, `LABEL_HEIGHT`, `MontageError` nommant le fichier), réutilisable par
   l'étape action sans qu'une étape en importe une autre (ADR-b16b, SPEC-b0f3 R8). `vision` l'importe, rendu
@@ -80,6 +88,16 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
   `community_min_hypes`, `max_vods_per_game`, tous validés à l'enregistrement (400 hors bornes).
 
 ### Modifié
+
+- Veille : le test d'accès des VOD Twitch se fait par jeu, avec `twitch_access_attempts` essais par VOD, et
+  s'arrête dès `max_vods_per_game` VOD accessibles. Les VOD réservées aux abonnés, injoignables, non testées (jeu
+  déjà servi) ou non testées à l'échéance sont **écartées et comptées par raison** (bandeau des sources et KPI) :
+  plus de « Accès non vérifié ». Le réglage `twitch_access_check_max` est retiré (ignoré s'il reste dans
+  `config.toml`).
+- Veille : le relevé tourne dans un fil d'arrière-plan du worker qui ne bloque plus la boucle, par voies
+  parallèles (une par hôte) en trois phases, sous une échéance globale `veille_deadline_s` (480 s). À l'échéance, les
+  sources coupées sont « incomplètes » en orange avec leur message, un bandeau « Relevé incomplet » s'affiche et
+  Claude choisit avec ce qui est relevé.
 
 - Veille : `igdb_min_hypes` vaut 5 par défaut et doit être >= 1 ; `igdb_releases_max` est ignoré s'il
   reste dans `config.toml`.

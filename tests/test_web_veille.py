@@ -558,11 +558,6 @@ def test_veille_source_detail_labels_the_restricted_vod_counter():
     assert "restricted:" in js[js.index("const COUNT_LABELS"):].split("\n")[0]
 
 
-def test_veille_card_shows_the_unverified_access_reason():
-    js = (STATIC / "screens" / "veille.js").read_text(encoding="utf-8")
-    assert "access_unverified" in js[js.index("function veilleProposal"):]
-
-
 # --- TASK-4944 : calendrier des sorties (SPEC-df51 R17) ---------------------
 #
 # Les fonctions de veille.js tournent pour de vrai sous node (vm, esc/fr/icon factices) : on lit le HTML qu'elles
@@ -578,7 +573,7 @@ const ctx = { console, document: { addEventListener() {} }, esc, CLIPPER_TZ: "Eu
   api: async () => ({}), emptyState: (i, t) => `<div>${t}</div>` };
 vm.createContext(ctx);
 const jobs = JSON.parse(fs.readFileSync(input, "utf8"));
-const run = vm.runInContext(fs.readFileSync(src, "utf8") + "\n;(function (jobs) { return jobs.map(([fn, ...args]) => { if (fn === 'ui') { Object.assign(veilleUi, args[0]); return null; } return ({ veilleReleases, veilleSources, veilleKpis, veilleRising, veilleSettings })[fn](...args); }); })", ctx);
+const run = vm.runInContext(fs.readFileSync(src, "utf8") + "\n;(function (jobs) { return jobs.map(([fn, ...args]) => { if (fn === 'ui') { Object.assign(veilleUi, args[0]); return null; } return ({ veilleReleases, veilleSources, veilleKpis, veilleRising, veilleSettings, veilleProposal, veilleIncomplete })[fn](...args); }); })", ctx);
 process.stdout.write(JSON.stringify(run(jobs)));
 """
 
@@ -931,3 +926,271 @@ def test_the_web_server_never_fetches_stores_or_relays_an_igdb_image():
     routes = {getattr(r, "path", "") for r in app.routes}
     assert not any(word in route for route in routes if "veille" in route for word in ("cover", "igdb", "image"))
     assert read_static("screens/veille.js").count("https://images.igdb.com/igdb/image/upload/") == 1  # une seule adresse, lue par le navigateur
+
+
+# --- TASK-db2b : historique 30 j (SPEC-85a0 R27) -----------------------------------------------------------------
+
+R22_KEYS = {"trend_days": 14, "trend_games_max": 5, "steam_reviews_pause_s": 0.5, "steam_reviews_retry_max": 1,
+            "steam_reviews_retry_wait_max_s": 30.0, "twitch_history_pages_max": 2, "twitch_history_retry_max": 1,
+            "twitch_history_retry_wait_max_s": 20.0, "twitch_access_attempts": 3, "twitch_access_retry_pause_s": 1.5,
+            "veille_deadline_s": 120}
+
+
+def serie(points, field="value", status="ok", reason=None, since="2026-09-08", summary=True):
+    pts = [{"date": d, field: v} for d, v in points]
+    last = pts[-1] if pts else None
+    peak = max(pts, key=lambda p: p[field]) if pts else None
+    return {"status": status, "reason": reason, "since": since, "points": pts,
+            "summary": {"weeks": [100, 120, 150, 90], "peak": peak and {"date": peak["date"], "value": peak[field]},
+                        "last": last and {"date": last["date"], "value": last[field]}, "last_vs_peak_pct": -40,
+                        "s1_vs_s2_pct": -40, "measured_days": len(pts), "window_days": 30} if summary else None}
+
+
+def trend(**series):
+    return {"days": 30, "since": "2026-09-08", "series": series}
+
+
+STEAM_PTS = [("2026-09-20", 100), ("2026-09-21", 140), ("2026-09-22", 90), ("2026-10-05", 300), ("2026-10-06", 250)]
+VODS_PTS = [("2026-10-04", 3), ("2026-10-05", 5), ("2026-10-06", 4)]
+
+
+def followed_game(**extra):
+    return {**GAME, "trend_30d": trend(
+        steam_reviews=serie(STEAM_PTS),
+        twitch_vods_fr=serie(VODS_PTS, "vods", status="partial",
+                             reason="plafond Twitch 500 VOD : jours avant 2026-10-01 inconnus"),
+        twitch_viewers_fr=serie([("2026-10-05", 300), ("2026-10-06", 280)]),
+        steam_players_peak=serie([("2026-10-06", 900)]),
+        steam_players_now=serie([], status="unavailable", reason="hors Steam", summary=False)), **extra}
+
+
+def test_get_veille_renders_trend_sources_and_access_exclusions_as_written(tmp_path, isolated_cwd):
+    game = followed_game()
+    sources = {s: {"status": "ok", "at": "x", "error": None, "counts": {}} for s in veille.SOURCES}
+    sources["steam_reviews"] = {"status": "partial", "at": "x", "error": "échéance de 120 s atteinte : 2 appid(s) non relevé(s)",
+                                "counts": {"requested": 5, "found": 3, "unknown": 0, "skipped": 0, "rate_limited": 0, "deadline": 2}}
+    sources["twitch"] = {"status": "ok", "at": "x", "error": None,
+                         "counts": {"restricted": 4, "unreachable": 2, "untested": 9, "deadline": 1}}
+    day = day_state(today(), sources=sources)
+    day.update(games=[game], deadline_hit=True, deadline_at=f"{today()}T05:08:00+00:00",
+               excluded={"too_short": 0, "too_old": 0, "already_known": 0, "access_restricted": 4,
+                         "access_unreachable": 2, "access_untested": 9, "access_deadline": 1})
+    write_json(tmp_path / "state" / "veille" / "days" / f"{today()}.json", day)
+    for url in ("/api/veille", f"/api/veille/{today()}"):
+        got = client(tmp_path, enabled=True).get(url).json()["day"]
+        assert got["games"][0]["trend_30d"] == game["trend_30d"], url
+        assert got["sources"]["steam_reviews"] == sources["steam_reviews"]
+        assert got["sources"]["twitch_vods_30d"]["status"] == "ok"
+        assert {k: v for k, v in got["excluded"].items() if k.startswith("access_")} == {
+            "access_restricted": 4, "access_unreachable": 2, "access_untested": 9, "access_deadline": 1}
+        assert got["deadline_hit"] is True and got["deadline_at"] == day["deadline_at"]
+
+
+def test_get_veille_settings_expose_the_eleven_r22_keys(tmp_path, isolated_cwd):
+    data = client(tmp_path, enabled=True, **R22_KEYS).get("/api/veille").json()
+    assert data["settings"].items() >= R22_KEYS.items()
+    assert "twitch_access_check_max" not in data["settings"]
+
+
+def test_put_settings_writes_the_eleven_r22_keys(tmp_path, isolated_cwd):
+    write_config(tmp_path, SETTINGS_TOML)
+    resp = sclient(tmp_path).put("/api/settings", json={"settings": {"veille": R22_KEYS}})
+    assert resp.status_code == 200, resp.text
+    table = tomllib.loads((tmp_path / "config.toml").read_text(encoding="utf-8"))["veille"]
+    assert {k: table[k] for k in R22_KEYS} == R22_KEYS
+
+
+@pytest.mark.parametrize("key,value,message", [
+    ("trend_days", 3, "[veille] trend_days doit être un entier entre 7 et 90 (reçu 3)"),
+    ("veille_deadline_s", 10, "[veille] veille_deadline_s doit être un entier entre 60 et 3600 (reçu 10)"),
+    ("twitch_access_attempts", 0, "[veille] twitch_access_attempts doit être un entier entre 1 et 10 (reçu 0)"),
+    ("steam_reviews_pause_s", 0.0, "[veille] steam_reviews_pause_s doit être un nombre entre 0.2 et 60.0 (reçu 0.0)"),
+    ("twitch_history_pages_max", 9, "[veille] twitch_history_pages_max doit être un entier entre 1 et 5 (reçu 9)"),
+])
+def test_put_settings_refuses_out_of_range_trend_settings_with_the_veille_message(
+        tmp_path, isolated_cwd, key, value, message):
+    write_config(tmp_path, SETTINGS_TOML)
+    resp = sclient(tmp_path).put("/api/settings", json={"settings": {"veille": {key: value}}})
+    assert resp.status_code == 400 and message in resp.json()["detail"]
+
+
+def test_put_settings_accepts_the_removed_twitch_access_check_max_and_ignores_it(tmp_path, isolated_cwd):
+    write_config(tmp_path, SETTINGS_TOML.rstrip("\n") + "\ntwitch_access_check_max = 12\n")
+    c = sclient(tmp_path)
+    assert "twitch_access_check_max" not in c.get("/api/veille").json()["settings"]
+    resp = c.put("/api/settings", json={"settings": {"veille": {"twitch_access_check_max": 20, "run_at": "09:15"}}})
+    assert resp.status_code == 200, resp.text
+    assert sclient(tmp_path).get("/api/veille").json()["settings"]["run_at"] == "09:15"
+
+
+def sources_html(tmp_path, sources, **day):
+    data = cal_data()
+    data["day"].update(sources=sources, llm={"status": "ok"}, finished_at="2026-10-07T05:00:00+00:00", **day)
+    return run_js(tmp_path, ["veilleSources", data])[0]
+
+
+def ok(**counts):
+    return {"status": "ok", "at": "x", "error": None, "counts": counts}
+
+
+def test_sources_strip_names_the_two_history_sources_and_their_counters(tmp_path):
+    html = sources_html(tmp_path, {
+        "steam_reviews": ok(requested=5, found=3, unknown=1, skipped=2, rate_limited=1),
+        "twitch_vods_30d": ok(requested=4, found=4)})
+    assert "Steam (avis 30 j)" in html and "Twitch (VOD 30 j)" in html
+    assert "5 demandés" in html and "3 trouvés" in html and "1 inconnus" in html and "2 coupés au plafond" in html
+    assert "1 non relevés (limite)" in html
+
+
+def test_sources_strip_counts_the_twitch_access_exclusions_by_reason(tmp_path):
+    html = sources_html(tmp_path, {"twitch": ok(restricted=4, unreachable=2, untested=9, deadline=1)})
+    for text in ("4 VOD abonnés écartées", "2 VOD injoignables écartées", "9 VOD non testées (jeu déjà servi)",
+                 "1 VOD non testées (échéance)"):
+        assert text in html, text
+
+
+def test_a_partial_or_skipped_source_cut_by_the_deadline_is_orange_with_its_message_not_red(tmp_path):
+    cut = {"status": "partial", "at": "x", "counts": {"deadline": 2},
+           "error": "échéance de 120 s atteinte : 2 appid(s) non relevé(s)"}
+    never = {"status": "skipped", "at": "x", "counts": {}, "error": "échéance atteinte avant le début"}
+    html = sources_html(tmp_path, {"steam_reviews": cut, "twitch_vods_30d": never})
+    assert "échéance de 120 s atteinte : 2 appid(s) non relevé(s)" in html
+    assert "échéance atteinte avant le début" in html
+    assert 'class="reason bad"' not in html and "src-pill bad" not in html
+    assert html.count('class="reason warn"') == 2 and html.count("src-pill warn") == 2
+    assert "VOD non testées (échéance)" not in html  # le compteur « échéance » d'une source de tendance ne parle pas de VOD
+
+
+def test_incomplete_banner_names_the_deadline_and_the_hour_only_when_the_deadline_hit(tmp_path):
+    data = cal_data(cfg={"veille_deadline_s": 480})
+    data["day"].update(deadline_hit=True, deadline_at="2026-10-07T05:08:00+00:00")
+    banner = run_js(tmp_path, ["veilleIncomplete", data])[0]
+    assert "Relevé incomplet : échéance de 480 s atteinte à 07:08" in banner  # 05:08 UTC = 07:08 Paris
+    data["day"]["deadline_hit"] = False
+    assert run_js(tmp_path, ["veilleIncomplete", data])[0] == ""
+
+
+def test_sources_strip_shows_the_incomplete_banner_when_the_deadline_hit(tmp_path):
+    html = sources_html(tmp_path, {"twitch": ok()}, deadline_hit=True, deadline_at="2026-10-07T05:08:00+00:00")
+    assert "Relevé incomplet : échéance de" in html
+    assert "Relevé incomplet" not in sources_html(tmp_path, {"twitch": ok()}, deadline_hit=False)
+
+
+def kpis(tmp_path, excluded, **cfg):
+    data = cal_data(cfg=cfg)
+    data["day"].update(proposals=[], excluded={"already_known": 0, "too_short": 0, **excluded})
+    return run_js(tmp_path, ["veilleKpis", data])[0]
+
+
+def test_kpi_states_the_access_exclusions_with_their_settings(tmp_path):
+    html = kpis(tmp_path, {"access_restricted": 4, "access_unreachable": 2, "access_untested": 9, "access_deadline": 1,
+                           "no_community": 6}, twitch_access_attempts=5, max_vods_per_game=2)
+    assert "4 VOD écartées : réservées aux abonnés" in html
+    assert "2 VOD écartées : injoignables après 5 essais" in html
+    assert "9 VOD non testées : jeu déjà servi (2 VOD accessibles par jeu)" in html
+    assert "1 VOD non testées : échéance" in html
+    assert "6 VOD écartées : communauté insuffisante ou jeu inconnu" in html
+
+
+def test_kpi_omits_the_access_exclusions_that_are_not_in_the_state(tmp_path):
+    html = kpis(tmp_path, {})
+    assert "réservées aux abonnés" not in html and "injoignables" not in html and "jeu déjà servi" not in html
+
+
+def trend_cell(tmp_path, game):
+    html = rising(tmp_path, game)
+    cell = html[html.index("data-veille-trend"):]
+    return cell[:cell.index("</td>")]
+
+
+def test_rising_table_has_the_30_day_column_with_one_svg_line_per_available_series(tmp_path):
+    assert ">30 j<" in rising(tmp_path, followed_game())
+    cell = trend_cell(tmp_path, followed_game())
+    svg = cell[cell.index("<svg"):cell.index("</svg>")]
+    assert re.findall(r'data-series="([a-z_]+)"', svg) == ["steam_reviews", "twitch_vods_fr", "twitch_viewers_fr"]
+    colors = re.findall(r'<polyline[^>]*stroke="([^"]+)"', svg)
+    assert len(set(colors)) == 3
+    for legend in ("avis Steam", "VOD Twitch FR", "viewers Twitch FR"):
+        assert legend in cell, legend
+    assert "5 j mesurés / 30" in cell and "pic 2026-10-05" in cell
+    assert "steam_players" not in cell
+
+
+def test_rising_trend_gaps_are_not_joined(tmp_path):
+    cell = trend_cell(tmp_path, followed_game())
+    steam = cell[cell.index('data-series="steam_reviews"'):]
+    steam = steam[:steam.index("</g>")]
+    lines = re.findall(r'<polyline[^>]*points="([^"]+)"', steam)  # 20-22 sept. reliés, 5-6 oct. reliés, rien entre
+    assert [len(line.split()) for line in lines] == [3, 2]
+
+
+def test_rising_trend_series_with_one_point_says_one_day_of_measure_and_unavailable_gives_its_reason(tmp_path):
+    one = {**GAME, "trend_30d": trend(
+        steam_reviews=serie([("2026-10-06", 50)]),
+        twitch_vods_fr=serie([], "vods", status="unavailable", reason="hors Twitch FR", summary=False),
+        twitch_viewers_fr=serie([], status="unavailable", reason="hors Twitch FR", summary=False))}
+    cell = trend_cell(tmp_path, one)
+    assert "1 jour de mesure" in cell and "<polyline" not in cell
+    assert "hors Twitch FR" in cell
+
+
+def test_rising_trend_of_an_untracked_game_says_so(tmp_path):
+    for game in ({**GAME, "trend_30d": None}, GAME):  # null, ou aucun champ trend_30d
+        cell = trend_cell(tmp_path, game)
+        assert "jeu non suivi" in cell and "<polyline" not in cell and "<svg" not in cell
+
+
+def test_the_screen_never_computes_a_series_summary_itself():
+    js = read_static("screens/veille.js")
+    body = js[js.index("const TREND_SERIES"):js.index("function veilleRising")]
+    assert "summary" in body  # elle lit le résumé du serveur
+    for forbidden in ("reduce(", "weeks.map", "/ 7", "toFixed(0)"):
+        assert forbidden not in body, forbidden
+
+
+def prop_html(tmp_path, game):
+    return run_js(tmp_path, ["veilleProposal", proposal(), game, []])[0]
+
+
+def test_proposal_card_shows_the_game_curve_and_the_weekly_summary_of_steam_reviews(tmp_path):
+    html = prop_html(tmp_path, followed_game())
+    assert "data-veille-trend" in html and "<polyline" in html
+    assert "s4 → s1 : 100 → 90" in html and "avis Steam" in html.split("s4 → s1")[1][:40]
+
+
+def test_proposal_card_summary_falls_back_on_twitch_vods_then_says_nothing_else(tmp_path):
+    no_steam = followed_game()
+    no_steam["trend_30d"]["series"]["steam_reviews"] = serie([], status="unavailable", reason="hors Steam", summary=False)
+    html = prop_html(tmp_path, no_steam)
+    assert "s4 → s1 : 100 → 90" in html and "VOD Twitch FR" in html.split("s4 → s1")[1][:40]
+    assert "s4 → s1" not in prop_html(tmp_path, {**GAME, "trend_30d": None})
+    assert "data-veille-trend" not in prop_html(tmp_path, None)
+
+
+def test_proposal_card_has_no_unverified_access_mention_anymore(tmp_path):
+    cand = proposal()
+    cand["candidate"]["access_unverified"] = "WinError 10054"
+    html = run_js(tmp_path, ["veilleProposal", cand, None, []])[0]
+    assert "Accès non vérifié" not in html and "WinError" not in html
+    js = read_static("screens/veille.js")
+    assert "Accès non vérifié" not in js and "access_unverified" not in js
+
+
+TREND_SETTINGS = ["trend_days", "trend_games_max", "veille_deadline_s", "twitch_access_attempts",
+                  "twitch_access_retry_pause_s", "steam_reviews_pause_s", "twitch_history_pages_max"]
+
+
+def test_settings_screen_edits_the_seven_trend_settings_and_leaves_the_rest_to_other_settings():
+    js = read_static("screens/settings.js")
+    shown = js[js.index("function setVeille()"):].split("\n")[1]
+    for key in TREND_SETTINGS:
+        assert key in shown, key
+    for key in ("steam_reviews_retry_max", "steam_reviews_retry_wait_max_s", "twitch_history_retry_max",
+                "twitch_history_retry_wait_max_s"):
+        assert key not in shown, key  # restent dans « autres réglages » (setSectionFields)
+
+
+def test_veille_screen_preview_shows_the_seven_trend_settings(tmp_path):
+    html = run_js(tmp_path, ["veilleSettings", cal_data(cfg={k: 200 + i for i, k in enumerate(TREND_SETTINGS)})])[0]
+    for i, key in enumerate(TREND_SETTINGS):
+        assert f'data-veille-setting="{key}"' in html and f'value="{200 + i}"' in html, key

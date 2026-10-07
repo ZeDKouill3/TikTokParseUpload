@@ -501,6 +501,81 @@ et `steam_followers_lookups_max` (200) (jeux interrogés par relevé, >= 0),
 est **ignoré** s'il traîne dans `config.toml` : il est remplacé par `igdb_recent_max` et
 `igdb_upcoming_max`.
 
+**Historique de 30 jours (courbes).** Dès le premier relevé, chaque jeu **suivi** (communauté
+suffisante et au moins une VOD candidate, au plus `trend_games_max` jeux par relevé) reçoit
+une courbe de `trend_days` jours (30), sans attendre que la veille ait tourné un mois. La
+colonne « 30 j » de « Ce qui monte » et la carte de chaque proposition la dessinent
+(une ligne par série, une couleur par série, légende, « n j mesurés / 30 », « pic <date> »,
+et pour la carte le résumé « s4 → s1 », la moyenne par jour de la plus ancienne à la plus
+récente des quatre dernières semaines). Un jeu non suivi dit « jeu non suivi ». D'où vient
+chaque courbe :
+
+- **Avis Steam par jour** (« Steam (avis 30 j) ») : l'histogramme des avis de la page
+  du jeu, `store.steampowered.com/appreviewhistogram/<appid>`. C'est un **endpoint non
+  documenté** de Steam, utilisé seul, plafonné et espacé (`steam_reviews_pause_s`). S'il
+  change de forme, la source « Steam (avis 30 j) » passe en erreur avec l'URL et le détail,
+  les courbes d'avis disent « indisponible », et **tout le reste continue** (les autres
+  courbes, le test d'accès, le choix de Claude).
+- **VOD FR Twitch par jour** (« Twitch (VOD 30 j) ») : les VOD (`archive`) en français encore
+  en ligne, publiées chaque jour, lues par Helix *Get Videos* sur un mois. Twitch ne rend
+  que **500 vidéos** par jeu : pour un très gros jeu les jours anciens sont **inconnus**
+  (la légende l'écrit : « plafond Twitch 500 VOD »), jamais comblés.
+- **Viewers Twitch FR** : relevés propres de la veille elle-même (`history/<date>.json`),
+  un point par jour où la veille a tourné.
+
+Un jour sans mesure n'est **jamais** un zéro ni une valeur lissée : la courbe a un trou (les
+deux jours voisins ne sont reliés que s'ils se suivent), et une série à un seul point dit
+« 1 jour de mesure ». **Ce que Claude reçoit** : pour chaque jeu suivi, une ligne par série
+avec les quatre moyennes hebdomadaires, le pic, le dernier jour, « dernier vs pic » et
+« s1 vs s2 » ; il conclut lui-même (un pic de sortie retombé vaut moins qu'un jeu qui
+monte ou qui tient). L'écran ne recalcule rien : il dessine les points et le résumé écrits
+par la veille.
+
+**Test d'accès des VOD Twitch, par jeu.** Une VOD n'est proposée que si son accès a été
+vérifié (yt-dlp, sans rien télécharger). Le test se fait jeu par jeu, des VOD les plus vues
+aux moins vues, et **s'arrête dès que `max_vods_per_game` VOD accessibles sont trouvées**
+pour ce jeu. Chaque VOD a jusqu'à `twitch_access_attempts` essais (5), séparés de
+`twitch_access_retry_pause_s` (3 s) : une VOD réservée aux abonnés est écartée tout de
+suite (« n VOD écartées : réservées aux abonnés »), une VOD qui échoue à **tous** ses essais
+(coupure réseau, connexion fermée) est écartée (« n VOD écartées : injoignables après N
+essais »), et les VOD d'un jeu déjà servi ne sont pas testées (« n VOD non testées : jeu
+déjà servi (M VOD accessibles par jeu) »). Plus aucune VOD n'est proposée « non vérifiée » :
+la mention « Accès non vérifié » n'existe plus, et un jeu dont toutes les VOD sont écartées
+garde sa courbe. Le réglage `twitch_access_check_max` est **retiré** : s'il traîne dans
+`config.toml`, il est ignoré.
+
+**Un relevé qui ne bloque plus le worker.** Le relevé quotidien (et « Rafraîchir ») tourne
+dans un fil d'arrière-plan du worker : publications, statistiques, surveillance et vidéos
+continuent pendant ce temps, et un seul relevé tourne à la fois (une demande « Rafraîchir »
+reçue pendant un relevé est prise au tour suivant). Une erreur dans ce fil est journalisée,
+jamais avalée. Un relevé interrompu par l'arrêt du worker est repris au démarrage suivant.
+
+**Voies parallèles et échéance.** Les sources sont interrogées en parallèle, **une voie par
+hôte** (Twitch/IGDB, YouTube, API Steam, store Steam, steamcommunity, usher), en trois
+phases séparées par une barrière : 1) Twitch puis IGDB, YouTube, Steam puis ventes FR ;
+2) joueurs et abonnés Steam, puis le filtre de communauté et les jeux suivis ; 3) test
+d'accès, avis Steam et VOD Twitch sur un mois ; puis Claude choisit. Le budget visé est un
+relevé complet (sources, test d'accès, choix de Claude) en **moins de 10 minutes**
+(environ 5 min mesurées, 6,5 min au pire nominal ; le poste le plus lourd, les abonnés
+Steam, vient de la pause de 3 s imposée par Steam : baisse `steam_followers_lookups_max`
+avant de toucher à la pause). `veille_deadline_s` (480 s) est l'**échéance globale** des
+trois phases : quand elle tombe, tout ce qui n'est pas fini **s'arrête**, la source est
+marquée « incomplète » en orange avec son message (« échéance de N s atteinte : k … non
+relevé(s) »), une source qui n'avait pas commencé est « échéance atteinte avant le début »,
+les VOD non encore testées sont écartées (« n VOD non testées (échéance) »), le bandeau
+**« Relevé incomplet : échéance de N s atteinte à <heure> »** apparaît, et Claude choisit
+avec ce qui est relevé, une donnée manquante restant « inconnue ».
+
+**Les onze réglages** de cet historique, dans Réglages › Veille : `trend_days` (30, jours de
+courbe, 7 à 90, et `history_days` doit être au moins égal), `trend_games_max` (40, jeux suivis
+au plus par relevé, 0 = aucune source de tendance appelée), `veille_deadline_s` (480, 60 à
+3600), `twitch_access_attempts` (5, 1 à 10), `twitch_access_retry_pause_s` (3,0 s, 0 à 60),
+`steam_reviews_pause_s` (2,0 s, 0,2 à 60), `twitch_history_pages_max` (5, 1 à 5) — ces sept
+sont dans le formulaire — et, sous « autres réglages », `steam_reviews_retry_max` (3),
+`steam_reviews_retry_wait_max_s` (60), `twitch_history_retry_max` (2) et
+`twitch_history_retry_wait_max_s` (60) pour les réessais sur HTTP 429. Une valeur hors bornes
+est refusée à l'enregistrement avec le message de la veille.
+
 Les clés s'écrivent dans `config.toml` (`[veille]`), jamais ailleurs : l'écran
 Réglages ne les réaffiche jamais (il dit seulement « saisie » ou « absente »),
 un champ laissé vide garde la valeur actuelle, et elles sont masquées dans le
