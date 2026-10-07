@@ -102,6 +102,7 @@ function clipsSelectionBarHtml() {
     <button type="button" class="btn btn-xs btn-ghost" data-clips-sel-clear${n ? "" : " disabled"}>${icon("x", "i-xs")}Vider la sélection</button>
     <span class="grow"></span>
     <button type="button" class="btn btn-ghost" data-clips-sel-cancel>Annuler</button>
+    <button type="button" class="btn btn-bad" data-clips-sel-delete${n ? "" : " disabled"}>${icon("trash-2", "i-xs")}Supprimer la sélection</button>
     <button type="button" class="btn btn-ok" data-clips-sel-approve${n ? "" : " disabled"}>${icon("check", "i-xs")}Approuver la sélection</button>
   </div>`;
 }
@@ -167,6 +168,8 @@ function clipsWire(body) {
     $("[data-clips-sel-cancel]", selBar).onclick = () => { clipsUi.selecting = false; clipsUi.selected = new Set(); renderCurrent(); };
     $("[data-clips-sel-all]", selBar).onclick = () => { clipsUi.selected = clipsAllKeys(clipsUi.data, clipsUi); renderCurrent(); };
     $("[data-clips-sel-clear]", selBar).onclick = () => { clipsUi.selected = new Set(); renderCurrent(); };
+    const deleteBtn = $("[data-clips-sel-delete]", selBar);
+    if (deleteBtn) deleteBtn.onclick = () => clipsDeleteSelection();
     const approveBtn = $("[data-clips-sel-approve]", selBar);
     if (approveBtn) approveBtn.onclick = () => clipsApproveSelection($("#clips-sel-account", selBar).value);
   }
@@ -229,6 +232,31 @@ async function clipsApproveSelection(account) {
   } catch (err) {
     const refused = err.body && Array.isArray(err.body.refused) ? err.body.refused : null;
     toastError("Approbation impossible", refused ? Object.assign(new Error(`${err.message} : ${refused.join(" ; ")}`), { body: err.body }) : err);
+  }
+}
+
+/* Suppression groupee (TASK-2322) : confirmation, puis le serveur supprime ce qui est permis (jamais un clip publie,
+   programme, en cours ou en attente ; tout ou rien par serie) et dit pourquoi le reste est refuse. */
+async function clipsDeleteSelection() {
+  const clips = Array.from(clipsUi.selected).map((key) => {
+    const [video_id, clip_id] = key.split("/");
+    return { video_id, clip_id };
+  });
+  if (!clips.length) return;
+  const n = clips.length;
+  if (!(await confirmDialog({ title: `Supprimer ${n} clip${n === 1 ? "" : "s"} ?`, body: `Supprimer ${n} clip${n === 1 ? "" : "s"} ? Irréversible. Une partie de série entraîne toute sa série.`, confirmLabel: "Supprimer" }))) return;
+  if (!(await netGuard())) return;
+  try {
+    const out = await api("/api/clips/delete", jsonBody("POST", { clips }));
+    clipsUi.selected = new Set();
+    renderCurrent();
+    const d = out.deleted.length, r = out.refused.length;
+    const body = `${d} clip${d === 1 ? "" : "s"} supprimé${d === 1 ? "" : "s"}${r ? `, ${r} refusé${r === 1 ? "" : "s"} : ${out.refused.map((o) => `${o.clip.video_id}/${o.clip.clip_id} (${o.reason})`).join(" ; ")}` : ""}.`;
+    toast({ kind: r ? "warn" : "ok", title: r ? "Suppression partielle" : "Clips supprimés", body });
+    clipsUi.at = 0;
+    loadClips();
+  } catch (err) {
+    toastError("Suppression impossible", err);
   }
 }
 

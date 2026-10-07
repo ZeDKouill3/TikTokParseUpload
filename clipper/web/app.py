@@ -2756,6 +2756,35 @@ def create_app(config: Config | None = None) -> FastAPI:
                                     detail=f"{exc.detail} ; déjà approuvés avant cet échec : {done}") from exc
         return approved
 
+    @app.post("/api/clips/delete")
+    def delete_clips_bulk(body: BulkApproveBody) -> dict[str, Any]:
+        """Supprime les clips choisis (bouton « Supprimer la sélection » de l'écran Clips, TASK-2322) : simple
+        suppression de fichiers par clipper.workspace.delete_clips (ADR-09ad). Tout ou rien PAR série : une partie
+        choisie entraîne toute sa série, et une série dont une partie est publiée, programmée, en cours ou en
+        attente est refusée entière (``refused`` : le clip choisi et la raison, jamais d'erreur silencieuse)."""
+        if not body.clips:
+            raise HTTPException(status_code=400, detail="sélection vide : choisis au moins un clip")
+        deleted: list[dict[str, str]] = []
+        refused: list[dict[str, Any]] = []
+        done: set[tuple[str, str]] = set()
+        freed = 0
+        for item in body.clips:
+            _validate_video_id(item.video_id)
+            _validate_clip_id(item.clip_id)
+            if (item.video_id, item.clip_id) in done:
+                continue  # deja supprime avec sa serie
+            try:
+                result = workspace_mod.delete_clips(item.video_id, [item.clip_id], config.output_dir, _publish_dir(config))
+            except workspace_mod.PurgeRefused as exc:
+                refused.append({"clip": {"video_id": item.video_id, "clip_id": item.clip_id}, "reason": str(exc)})
+                continue
+            freed += result["freed_bytes"]
+            for clip_id in result["deleted"]:
+                done.add((item.video_id, clip_id))
+                deleted.append({"video_id": item.video_id, "clip_id": clip_id})
+        logger.info("suppression de clips : %d supprime(s), %d refuse(s), %d octets liberes", len(deleted), len(refused), freed)
+        return {"deleted": deleted, "refused": refused, "freed_bytes": freed}
+
     @app.post("/api/clips/{video_id}/{clip_id}/rerender", status_code=202)
     def rerender_clip(video_id: str, clip_id: str) -> JSONResponse:
         _validate_video_id(video_id)

@@ -28,6 +28,12 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ### Ajouté
 
+- Clips : bouton « Supprimer la sélection » (style danger) dans la barre de sélection, après confirmation
+  (« Supprimer N clips ? Irréversible. »). `POST /api/clips/delete` supprime via
+  `clipper.workspace.delete_clips` le `.mp4`, le sidecar `.json` et les annexes du clip, rend les octets
+  libérés ; jamais un clip publié, programmé, en cours ou en attente de publication. Tout ou rien par série
+  (une partie choisie entraîne toute sa série, refusée entière si une partie est bloquée) ; chaque refus
+  est rendu avec sa raison et affiché dans le toast.
 - Jury action (6/6) : preuve de bout en bout et documentation (SPEC-b0f3 R15, R17, R18). Deux tests de
   `tests/test_pipeline.py` (FakeBackend, source synthétique) : un style gaming action enchaîne audio avant
   scenes (`peak_windows`), action avant moments, produit `action.json` puis un `moments.json` avec un moment de
