@@ -967,6 +967,41 @@ def _veille_next_run_at(table: dict[str, Any], sdir: Path) -> str | None:
     return slot.isoformat()
 
 
+def _veille_live_state(video_id: str, queue: list[dict[str, Any]], config: Config) -> dict[str, str]:
+    """État réel d'une proposition mise en file, lu de state/queue.json et de workspace/<id>/pipeline.json
+    (lecture seule, TASK-3f90) : jamais « en file » quand la vidéo n'est plus dans la file."""
+    entry = next((e for e in queue if e.get("video_id") == video_id), None)
+    if entry is not None:
+        return {"state": "running", "label": "en cours"} if entry.get("status") == "running"             else {"state": "queued", "label": "en file"}
+    state = _veille_json(Path(config.workspace_dir) / video_id / pipeline.STATE_FILE, None)
+    status = state.get("status") if isinstance(state, dict) else None
+    if status == "done":
+        return {"state": "done", "label": "traitée"}
+    if status == "awaiting_review":
+        return {"state": "awaiting_review", "label": "à relire"}
+    if status == "running":  # sans entrée de file : le worker la reprend lui-même, ou elle est orpheline
+        try:
+            interrupted = worker_mod.is_interrupted(state, config)
+        except worker_mod.WorkerError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        return {"state": "interrupted", "label": "interrompue"} if interrupted else {"state": "running", "label": "en cours"}
+    if status == "failed":
+        if str(state.get("reason") or "").startswith(worker_mod._CANCEL_REASON):
+            return {"state": "cancelled", "label": "annulée"}
+        return {"state": "failed", "label": "échouée"}
+    return {"state": "withdrawn", "label": "retirée de la file"}  # ni dans la file, ni traitée
+
+
+def _veille_with_live_states(day: dict[str, Any] | None, config: Config) -> dict[str, Any] | None:
+    """Copie du relevé où chaque proposition ``queued`` porte ``live`` ; le fichier du jour n'est pas touché."""
+    if not day or not any(p.get("status") == "queued" for p in day.get("proposals", [])):
+        return day
+    queue = _veille_json(_queue_path(config), [])
+    proposals = [{**p, "live": _veille_live_state(p["candidate"]["video_id"], queue, config)} if p.get("status") == "queued" else p
+                 for p in day["proposals"]]
+    return {**day, "proposals": proposals}
+
+
 def _veille_view(config: Config, date_: str | None) -> dict[str, Any]:
     table = _veille_table(config)
     sdir = Path(str(table["state_dir"]))
@@ -977,7 +1012,7 @@ def _veille_view(config: Config, date_: str | None) -> dict[str, Any]:
     day = _veille_json(sdir / "days" / f"{date_}.json", None) if date_ else None
     selection = _veille_json(sdir / "selection" / f"{date_}.json", None) if date_ else None
     return {
-        "date": date_, "day": day, "selection": selection, "enabled": bool(table["enabled"]),
+        "date": date_, "day": _veille_with_live_states(day, config), "selection": selection, "enabled": bool(table["enabled"]),
         "running": bool(day and day.get("started_at") and not day.get("finished_at")),
         "next_run_at": _veille_next_run_at(table, sdir),
         "settings": {k: v for k, v in table.items() if k not in _VEILLE_SECRETS},

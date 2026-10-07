@@ -12,6 +12,12 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ### Corrigé
 
+- Veille (relevé réel du 07/10 à 16:56) : les propositions encore à décider s'affichent d'abord, dans l'ordre
+  de Claude ; les déjà décidées (mises en file, ignorées) passent dans une section repliée « Déjà décidées ».
+  Une proposition mise en file montre son état réel, lu en lecture seule par `GET /api/veille` dans
+  `state/queue.json` et `workspace/<video_id>/pipeline.json` : en file, en cours, traitée, à relire, annulée,
+  échouée, interrompue ou « retirée de la file » ; plus jamais « en file » quand la vidéo n'y est plus.
+  `finished_at` du relevé est la vraie heure de fin (la durée se lit), et non plus l'heure de départ.
 - Veille : les abonnés Steam (`memberslistxml`) ne plantent plus toute la source sur un HTTP 429 (relevé
   réel du 07/10 : « HTTP 429 », aucun abonné lu). Le collecteur attend (pause, doublée à chaque essai,
   `Retry-After` s'il est plus long, plafonnée par `steam_followers_retry_wait_max_s`), réessaie le même

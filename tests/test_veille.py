@@ -2825,3 +2825,37 @@ def test_prompt_lists_a_skipped_source_and_a_cut_access_test(tmp_path):
 def test_default_clock_never_trips_the_deadline_for_a_fixed_past_now(tmp_path):
     state = _run(tmp_path, _full_collectors())  # NOW est dans le passé : l'horloge par défaut part de ``now``
     assert state["deadline_hit"] is False and state["deadline_at"] == (NOW + timedelta(seconds=480)).isoformat()
+
+
+# --- finished_at = vraie heure de fin du relevé (TASK-3f90) -------------------
+
+
+def test_run_if_due_finished_at_is_the_real_end_of_the_survey_not_its_start(tmp_path):
+    clock = Clock(AFTER_RUN_AT)
+    collectors = _full_collectors()
+    collectors["steam_followers"] = Deadlined("followers", clock, spend=25, values={"42": 20000})
+    collectors["twitch"] = Collector({"games": [{"name": "Jeu Alpha", "viewers_fr": 1000, "igdb_id": "", "twitch_id": "1"}],
+                                      "vods": [{**_vod("AAA"), "url": "https://youtu.be/AAA"}]})
+    config = _make_config(tmp_path, enabled=True, veille_deadline_s=DEADLINE_S)
+    with llm.use_backend(FakeBackend([_picks("twitch:AAA")])):
+        state = veille.run_if_due(AFTER_RUN_AT, config, collectors, clock=clock)
+    assert state["started_at"] == AFTER_RUN_AT.isoformat()
+    assert state["finished_at"] == (AFTER_RUN_AT + timedelta(seconds=25)).isoformat()
+    saved = _read(_sdir(tmp_path) / "days" / f"{TODAY}.json")
+    assert saved["finished_at"] == state["finished_at"] and saved["started_at"] == state["started_at"]
+
+
+def test_run_if_due_without_injected_clock_uses_the_elapsed_real_time(tmp_path):
+    config = _make_config(tmp_path, enabled=True)
+    called = []
+
+    def twitch(settings):
+        called.append(True)
+        threading.Event().wait(0.2)  # time.sleep est neutralisé par la fixture autouse
+        return {"games": [], "vods": []}
+
+    collectors = {**_run_collectors(), "twitch": twitch}
+    with llm.use_backend(FakeBackend([_picks()])):
+        state = veille.run_if_due(AFTER_RUN_AT, config, collectors)
+    elapsed = datetime.fromisoformat(state["finished_at"]) - datetime.fromisoformat(state["started_at"])
+    assert called and elapsed >= timedelta(seconds=0.1)
