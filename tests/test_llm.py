@@ -1148,3 +1148,7 @@ def test_integration_real_claude_cli_imposes_array_schema_on_image(monkeypatch, 
 def test_veille_usage_is_declared_on_the_strong_model():
     # TASK-3225 : choix des VOD de la veille (SPEC-bdd9 R6), jugement lourd -> modele fort
     assert make_config().section("llm")["usages"]["veille"] == {"model": "strong"}
+
+def test_action_usage_is_declared_on_the_fast_model():
+    # SPEC-b0f3 R8 : description des planches d'images de l'etape action, modele rapide
+    assert make_config().section("llm")["usages"]["action"] == {"model": "fast"}

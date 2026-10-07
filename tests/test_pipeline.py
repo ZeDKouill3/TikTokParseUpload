@@ -315,7 +315,7 @@ def assert_valid_clip(json_path):
     return clip
 
 
-PRE_REVIEW = ("download", "transcribe", "scenes", "audio", "moments", "vision", "parts")
+PRE_REVIEW = ("download", "transcribe", "audio", "scenes", "action", "moments", "vision", "parts")
 POST_REVIEW = ("captions", "reframe", "subtitles", "render", "qa")
 
 
@@ -1290,7 +1290,7 @@ def test_a_step_already_done_keeps_its_first_run_timestamps(tmp_path, monkeypatc
     result = pipeline._advance(pipeline._start(pipeline.load_state(VIDEO_ID, config=config), config, False, None),
                                through_review=False)
 
-    assert calls[:3] == ["download", "transcribe", "scenes"]  # le module decide lui-meme de sauter
+    assert calls[:3] == ["download", "transcribe", "audio"]  # le module decide lui-meme de sauter
     saved = pipeline.load_state(VIDEO_ID, config=config)
     for name in ("download", "transcribe"):
         step = saved["steps"][name]
@@ -1347,7 +1347,7 @@ def test_process_queue_stops_a_video_at_awaiting_review_instead_of_raising_and_s
             # b est deja passee par la revue (captions deja "done") et
             # reprend d'un echec transitoire plus tardif (ex. render) : elle
             # doit continuer jusqu'au bout, pas s'arreter en revue a nouveau.
-            for name in ("download", "transcribe", "scenes", "audio", "moments", "vision", "parts", "captions"):
+            for name in ("download", "transcribe", "audio", "scenes", "action", "moments", "vision", "parts", "captions"):
                 state["steps"][name].update(status="done", started_at=past, finished_at=past)
         state.update(status="queued", attempts=1, retry_at=past)
         pipeline.save_state(state, config=config)
@@ -1489,6 +1489,7 @@ def test_attempts_resets_to_zero_right_after_a_step_completes(tmp_path, monkeypa
 
     monkeypatch.setattr(pipeline._Run, "download", lambda self: None)
     monkeypatch.setattr(pipeline._Run, "transcribe", lambda self: None)  # reussit
+    monkeypatch.setattr(pipeline._Run, "audio", lambda self: None)  # audio tourne avant scenes
 
     def boom(self):
         raise llm.TransientLLMError("surcharge")
@@ -2018,3 +2019,79 @@ def test_permanent_llm_error_raised_inside_connection_error_context_is_not_trans
     except llm.LLMError as exc:
         assert isinstance(exc.__context__, ConnectionError)
         assert pipeline.is_transient(exc) is False
+
+
+# --------------------------------------------------------------------------
+# Etape action (SPEC-b0f3 R4, R4bis) : ordre des etapes, peak_windows
+# --------------------------------------------------------------------------
+
+
+def test_steps_run_audio_before_scenes_and_action_between_scenes_and_moments():
+    from clipper import pipeline
+
+    assert pipeline.STEPS == (
+        "download", "transcribe", "audio", "scenes", "action", "moments", "vision", "parts",
+        "captions", "reframe", "subtitles", "render", "qa",
+    )
+    assert tuple(pipeline.new_state(VIDEO_ID, URL, "auto")["steps"]) == pipeline.STEPS
+
+
+def test_steps_are_called_in_that_order(tmp_path, monkeypatch):
+    from clipper import pipeline
+
+    config = Config(mode="auto", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output")
+    calls: list[str] = []
+    _all_steps_stubbed(monkeypatch, calls)
+    pipeline.save_state(pipeline.new_state(VIDEO_ID, URL, "auto"), config=config)
+
+    pipeline._advance(pipeline._start(pipeline.load_state(VIDEO_ID, config=config), config, False, None),
+                      through_review=False)
+
+    assert calls == list(pipeline.STEPS)
+
+
+@pytest.mark.parametrize("sections, expected", [({}, False), ({"action": {"enabled": True}}, True),
+                                                ({"action": {"enabled": False}}, False)])
+def test_scenes_receives_peak_windows_from_action_enabled(tmp_path, monkeypatch, sections, expected):
+    from clipper import pipeline
+
+    config = Config(mode="auto", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output",
+                    _sections=sections)
+    seen = {}
+    monkeypatch.setattr(pipeline.scenes, "detect_scenes", lambda *args, **kw: seen.update(kw))
+    run = pipeline._start(pipeline.new_state(VIDEO_ID, URL, "auto"), config, False, None)
+
+    run.scenes()
+
+    assert seen["peak_windows"] is expected
+
+
+def test_action_step_calls_the_action_module_with_config_and_force(tmp_path, monkeypatch):
+    from clipper import pipeline
+
+    config = Config(mode="auto", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output")
+    seen = {}
+    monkeypatch.setattr(pipeline.action, "run",
+                        lambda video_id, workspace, **kw: seen.update(video_id=video_id, workspace=workspace, **kw))
+    run = pipeline._start(pipeline.new_state(VIDEO_ID, URL, "auto"), config, True, None)
+
+    run.action()
+
+    assert (seen["video_id"], seen["config"], seen["force"]) == (VIDEO_ID, config, True)
+
+
+def test_a_pipeline_json_without_the_action_step_is_read_back_as_pending(tmp_path):
+    from clipper import pipeline
+
+    config = Config(mode="auto", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output")
+    old = pipeline.new_state(VIDEO_ID, URL, "auto")
+    for name in old["steps"]:
+        old["steps"][name].update(status="done")
+    del old["steps"]["action"]
+    pipeline.save_state(old, config=config)
+
+    state = pipeline.load_state(VIDEO_ID, config=config)
+
+    assert state["steps"]["action"]["status"] == "pending"
+    assert list(state["steps"]) == list(pipeline.STEPS)
+    assert state["steps"]["scenes"]["status"] == "done"

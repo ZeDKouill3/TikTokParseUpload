@@ -31,6 +31,16 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
   `criterion`, `min`, `unless_criterion`, `unless_min`) validée par `load_rubric` et appliquée par
   l'étape moments avant `min_score`, y compris à la re-notation après vision. `builtin` et
   `builtin:gaming` restent identiques octet pour octet ; une grille sans `[gate]` ne change rien.
+- Jury action (3/6) : nouvelle étape `action` (`clipper/action.py`, table `[action]`, désactivée par défaut) entre
+  `scenes` et `moments`. Elle détecte sans LLM des passages d'action (pics audio + densité de changements de plan
+  par fenêtres de 30 s, fusion, coupe à `max_passage_seconds`, plafond par heure), choisit
+  `frames_per_passage` images déjà extraites par `scenes` (aucun ffmpeg), les fait décrire par planches
+  (usage `action`, modèle rapide, plafond `max_images_per_hour`, reprise par `action_partial.json`) et écrit
+  `action.json`. `audio` tourne désormais AVANT `scenes` (`pipeline.STEPS`) ; `scenes` reçoit `peak_windows`
+  (positionné par le pipeline d'après `[action] enabled`) : à `false`, `audio.json` est ignoré et `scenes.json`
+  reste identique octet pour octet ; à `true`, il élargit les fenêtres décodées aux pics hors parole et porte
+  `"peak_windows": true`. Un `pipeline.json` antérieur sans l'étape `action` est relu (étape en attente).
+  Activer `[action]` sur une vidéo déjà analysée demande `--force` sur `scenes` (erreur explicite sinon).
 - Apprentissage (3/4) : le coach des prompts du jury passe tout seul dans le worker quand
   `[learning] coach_min_new_cases` (10) clips mûrs nouveaux existent et que `coach_min_interval_days`
   (7) jours se sont écoulés ; ses propositions sont consignées dans `state/learning/coach.json` et

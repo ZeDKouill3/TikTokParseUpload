@@ -653,24 +653,72 @@ def test_detect_scenes_merges_speech_windows_that_overlap_once_widened(
     assert float(cmd[cmd.index("-t") + 1]) == pytest.approx(4.0)
 
 
-def test_detect_scenes_adds_a_window_around_an_audio_peak_when_audio_json_exists(
+def test_detect_scenes_widens_windows_around_an_audio_peak_with_peak_windows(
     isolated_cwd, three_scene_video, recorded_ffmpeg_commands
 ):
-    """audio.json n'existe normalement pas encore quand scenes tourne
-    (clipper.pipeline.STEPS l'enchaine apres) ; s'il existe deja (rejeu avec
-    --force), ses pics hors parole deviennent eux aussi des fenetres."""
+    """SPEC-b0f3 R4bis : avec peak_windows=True, les pics hors parole
+    d'audio.json (qui tourne avant scenes) deviennent eux aussi des fenetres."""
     from clipper.scenes import detect_scenes
 
     workspace_dir = isolated_cwd / "workspace"
     _write_transcript(workspace_dir, "vid1", [{"start": 0.0, "end": 0.5}])
     _write_audio(workspace_dir, "vid1", [{"timecode": 5.5, "relative_db": 12.0}])
 
-    detect_scenes(three_scene_video, workspace_dir, "vid1", speech_margin_seconds=0.5)
+    result = detect_scenes(
+        three_scene_video, workspace_dir, "vid1", speech_margin_seconds=0.5, peak_windows=True
+    )
 
     decode_commands = _decode_commands(recorded_ffmpeg_commands)
     ss_values = sorted(float(cmd[cmd.index("-ss") + 1]) for cmd in decode_commands)
     assert ss_values == pytest.approx([0.0, 5.0])
+    assert result["peak_windows"] is True
+    saved = json.loads((workspace_dir / "vid1" / "scenes.json").read_text(encoding="utf-8"))
+    assert saved["peak_windows"] is True
 
+
+def test_detect_scenes_with_peak_windows_requires_audio_json(isolated_cwd, three_scene_video):
+    from clipper.scenes import ScenesError, detect_scenes
+
+    workspace_dir = isolated_cwd / "workspace"
+    _write_transcript(workspace_dir, "vid1", [{"start": 0.0, "end": 0.5}])
+
+    with pytest.raises(ScenesError, match="audio.json"):
+        detect_scenes(three_scene_video, workspace_dir, "vid1", peak_windows=True)
+    assert not (workspace_dir / "vid1" / "scenes.json").exists()
+
+
+def test_detect_scenes_ignores_audio_json_without_peak_windows_byte_for_byte(
+    isolated_cwd, three_scene_video, monkeypatch
+):
+    """R4bis : peak_windows=False (defaut) ignore audio.json meme present :
+    scenes.json identique octet pour octet et memes commandes ffmpeg que sans
+    audio.json, aucune cle ajoutee."""
+    import clipper.scenes as scenes_module
+    from clipper.scenes import detect_scenes
+
+    commands: list[list[str]] = []
+    real_popen = subprocess.Popen
+
+    def recording_popen(cmd, *args, **kwargs):
+        commands.append(list(cmd))
+        return real_popen(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(scenes_module.subprocess, "Popen", recording_popen)
+
+    without = isolated_cwd / "without"
+    with_audio = isolated_cwd / "with_audio"
+    for workspace_dir in (without, with_audio):
+        _write_transcript(workspace_dir, "vid1", [{"start": 0.0, "end": 0.5}])
+    _write_audio(with_audio, "vid1", [{"timecode": 5.5, "relative_db": 12.0}])
+
+    detect_scenes(three_scene_video, without, "vid1", speech_margin_seconds=0.5)
+    commands_without = list(commands)
+    commands.clear()
+    detect_scenes(three_scene_video, with_audio, "vid1", speech_margin_seconds=0.5, peak_windows=False)
+
+    assert commands == commands_without
+    assert (with_audio / "vid1" / "scenes.json").read_bytes() == (without / "vid1" / "scenes.json").read_bytes()
+    assert "peak_windows" not in json.loads((without / "vid1" / "scenes.json").read_text(encoding="utf-8"))
 
 def test_detect_scenes_ignores_audio_json_when_absent(
     isolated_cwd, three_scene_video, recorded_ffmpeg_commands

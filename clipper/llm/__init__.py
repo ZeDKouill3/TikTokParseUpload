@@ -106,6 +106,8 @@ CONFIG_DEFAULTS: dict[str, object] = {
         "facecam": {"model": "fast"},
         # Choix des VOD de la veille des sujets chauds (SPEC-bdd9 R6).
         "veille": {"model": "strong"},
+        # Description des planches d'images de l'etape action (SPEC-b0f3 R8).
+        "action": {"model": "fast"},
     },
     "claude_cli": {
         "command": "claude",
