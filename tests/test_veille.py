@@ -47,6 +47,7 @@ def config(tmp_path):
 def _no_real_access_check(monkeypatch):
     """Aucun test ne lance yt-dlp : le test d'accès par défaut est neutralisé (sauf test dédié)."""
     monkeypatch.setattr(veille_sources, "check_twitch_access", lambda url, timeout_s: None)
+    monkeypatch.setattr(veille.time, "sleep", lambda s: None)  # jamais d'attente réelle entre deux essais
 
 
 def _sdir(tmp_path):
@@ -115,7 +116,7 @@ def test_config_defaults_are_exactly_r1():
         "baseline_days": 7, "history_days": 90, "rise_min_pct": 50, "vod_min_duration_s": 1800,
         "vod_max_age_h": 36, "twitch_top_games": 20, "twitch_vods_per_game": 10,
         "youtube_max_results": 50, "youtube_min_duration_s": 600, "steam_top": 100,
-        "steam_name_lookups_max": 100, "twitch_access_check_max": 30, "twitch_client_id": "", "twitch_client_secret": "", "youtube_api_key": "",
+        "steam_name_lookups_max": 100, "twitch_access_attempts": 5, "twitch_access_retry_pause_s": 3.0, "twitch_client_id": "", "twitch_client_secret": "", "youtube_api_key": "",
         "state_dir": "state/veille", "http_timeout_s": 20,
         "steam_rank_gain_min": 5, "steam_risers_max": 10, "steam_sellers_top": 50,
         "upcoming_days": 14, "release_window_days": 15, "igdb_min_hypes": 5, "igdb_recent_max": 12,
@@ -408,7 +409,8 @@ def test_candidates_filtered_and_counted(tmp_path, config):
     veille.collect(NOW, collectors=_collectors(vods=vods), config=config)
     day = _read(_sdir(tmp_path) / "days" / f"{TODAY}.json")
     assert [c["id"] for c in day["candidates"]] == ["twitch:ok1"]
-    assert day["excluded"] == {"too_short": 1, "too_old": 1, "already_known": 4, "no_community": 0}
+    assert day["excluded"] == {"too_short": 1, "too_old": 1, "already_known": 4, "no_community": 0,
+                                  "access_restricted": 0, "access_unreachable": 0, "access_untested": 0}
     candidate = day["candidates"][0]
     assert candidate["source"] == "twitch" and candidate["video_id"] == "ok1"
     assert candidate["game_key"] == "jeu alpha" and candidate["duration_s"] == 7200
@@ -894,7 +896,7 @@ def test_private_vod_count_is_shown_in_the_twitch_source_detail(tmp_path, config
     collectors["twitch"].result["private_vods"] = 3
     veille.collect(NOW, collectors=collectors, config=config)
     day = _read(_sdir(tmp_path) / "days" / f"{TODAY}.json")
-    assert day["sources"]["twitch"]["counts"] == {"games": 1, "vods": 1, "private": 3, "restricted": 0}
+    assert day["sources"]["twitch"]["counts"] == {"games": 1, "vods": 1, "private": 3, "restricted": 0, "unreachable": 0, "untested": 0}
 
 
 def test_candidate_carries_the_thumbnail_url_or_none(tmp_path, config):
@@ -925,8 +927,24 @@ def _day(tmp_path):
     return _read(_sdir(tmp_path) / "days" / f"{TODAY}.json")
 
 
-def test_access_check_max_default_is_30():
-    assert veille.CONFIG_DEFAULTS["twitch_access_check_max"] == 30
+def test_access_settings_defaults_and_legacy_key():
+    assert veille.CONFIG_DEFAULTS["twitch_access_attempts"] == 5
+    assert veille.CONFIG_DEFAULTS["twitch_access_retry_pause_s"] == 3.0
+    assert "twitch_access_check_max" not in veille.CONFIG_DEFAULTS
+    assert "twitch_access_check_max" in veille.LEGACY_KEYS
+
+
+@pytest.mark.parametrize("key, value", [
+    ("twitch_access_attempts", 0), ("twitch_access_attempts", 11), ("twitch_access_attempts", True),
+    ("twitch_access_retry_pause_s", -0.1), ("twitch_access_retry_pause_s", 60.5)])
+def test_access_settings_bounds_name_the_key(tmp_path, key, value):
+    with pytest.raises(veille.VeilleError, match=key):
+        veille.settings(_make_config(tmp_path, **{key: value}))
+
+
+def test_access_settings_accept_the_bounds(tmp_path):
+    veille.settings(_make_config(tmp_path, twitch_access_attempts=1, twitch_access_retry_pause_s=0))
+    veille.settings(_make_config(tmp_path, twitch_access_attempts=10, twitch_access_retry_pause_s=60))
 
 
 def test_subscriber_only_vod_is_dropped_and_counted(tmp_path, config):
@@ -939,31 +957,140 @@ def test_subscriber_only_vod_is_dropped_and_counted(tmp_path, config):
     assert day["sources"]["twitch"]["counts"]["private"] == 0
 
 
-def test_accessible_vod_is_kept_without_unverified_mark(tmp_path, config):
+def test_accessible_vod_is_kept_and_has_no_unverified_field(tmp_path, config):
     veille.collect(NOW, collectors=_collectors(vods=[_vod("ok")]), config=config, access_check=FakeAccess())
     cand = _day(tmp_path)["candidates"][0]
-    assert cand["access_unverified"] is None
-    assert _day(tmp_path)["sources"]["twitch"]["counts"]["restricted"] == 0
+    assert "access_unverified" not in cand
+    counts = _day(tmp_path)["sources"]["twitch"]["counts"]
+    assert (counts["restricted"], counts["unreachable"], counts["untested"]) == (0, 0, 0)
 
 
-def test_other_error_keeps_candidate_marked_unverified_with_reason(tmp_path, config):
-    access = FakeAccess({"net": ConnectionResetError("WinError 10054 connexion fermée")})
-    veille.collect(NOW, collectors=_collectors(vods=[_vod("net")]), config=config, access_check=access)
-    day = _day(tmp_path)
-    assert [c["video_id"] for c in day["candidates"]] == ["net"]
-    assert "WinError 10054" in day["candidates"][0]["access_unverified"]
-    assert day["sources"]["twitch"]["counts"]["restricted"] == 0
+def _game_vods(n, game="Jeu Alpha"):
+    """n VOD d'un même jeu, v0 la plus vue (vues décroissantes) : v0 est la première testée."""
+    return [{**_vod(f"v{i}", game=game), "view_count": 1000 - i} for i in range(n)]
 
 
-def test_cap_checks_most_viewed_first_and_marks_the_rest_unverified(tmp_path):
-    config = _make_config(tmp_path, twitch_access_check_max=2)
-    vods = [{**_vod(f"v{i}"), "view_count": views} for i, views in enumerate([10, 500, 300, 5])]
+def _ids(access):
+    return [u.rsplit("/", 1)[-1] for u in access.urls]
+
+
+def _access_excluded(tmp_path):
+    return {k: v for k, v in _day(tmp_path)["excluded"].items() if k.startswith("access_")}
+
+
+def test_check_stops_after_one_accessible_vod_with_max_one(tmp_path):
+    config = _make_config(tmp_path, max_vods_per_game=1)
     access = FakeAccess()
+    veille.collect(NOW, collectors=_collectors(vods=_game_vods(11)), config=config, access_check=access)
+    assert _ids(access) == ["v0"]
+    day = _day(tmp_path)
+    assert [c["video_id"] for c in day["candidates"]] == ["v0"]
+    counts = day["sources"]["twitch"]["counts"]
+    assert (counts["restricted"], counts["unreachable"], counts["untested"]) == (0, 0, 10)
+    assert _access_excluded(tmp_path) == {"access_restricted": 0, "access_unreachable": 0, "access_untested": 10}
+
+
+def test_most_viewed_restricted_then_second_accessible(tmp_path):
+    config = _make_config(tmp_path, max_vods_per_game=1)
+    access = FakeAccess({"v0": veille_sources.AccessRestricted("subscriber-only")})
+    veille.collect(NOW, collectors=_collectors(vods=_game_vods(11)), config=config, access_check=access)
+    assert _ids(access) == ["v0", "v1"]
+    day = _day(tmp_path)
+    assert [c["video_id"] for c in day["candidates"]] == ["v1"]
+    counts = day["sources"]["twitch"]["counts"]
+    assert (counts["restricted"], counts["unreachable"], counts["untested"]) == (1, 0, 9)
+    assert _access_excluded(tmp_path) == {"access_restricted": 1, "access_unreachable": 0, "access_untested": 9}
+
+
+def test_check_stops_after_two_accessible_vods_with_max_two(tmp_path):
+    config = _make_config(tmp_path, max_vods_per_game=2)
+    access = FakeAccess()
+    veille.collect(NOW, collectors=_collectors(vods=_game_vods(11)), config=config, access_check=access)
+    assert _ids(access) == ["v0", "v1"]
+    assert [c["video_id"] for c in _day(tmp_path)["candidates"]] == ["v0", "v1"]
+    assert _day(tmp_path)["sources"]["twitch"]["counts"]["untested"] == 9
+
+
+def test_all_vods_dropped_means_all_tested_and_none_untested(tmp_path):
+    config = _make_config(tmp_path, max_vods_per_game=1)
+    err = veille_sources.AccessRestricted("subscriber-only")
+    access = FakeAccess({f"v{i}": err for i in range(11)})
+    veille.collect(NOW, collectors=_collectors(vods=_game_vods(11)), config=config, access_check=access)
+    assert len(access.urls) == 11
+    day = _day(tmp_path)
+    assert day["candidates"] == []
+    counts = day["sources"]["twitch"]["counts"]
+    assert (counts["restricted"], counts["unreachable"], counts["untested"]) == (11, 0, 0)
+
+
+def test_equal_views_keep_the_source_order(tmp_path):
+    config = _make_config(tmp_path, max_vods_per_game=1)
+    vods = [_vod("a"), _vod("b"), {**_vod("c"), "view_count": 5000}]
+    access = FakeAccess({"c": veille_sources.AccessRestricted("sub")})
     veille.collect(NOW, collectors=_collectors(vods=vods), config=config, access_check=access)
-    assert sorted(u.rsplit("/", 1)[-1] for u in access.urls) == ["v1", "v2"]
-    marks = {c["video_id"]: c["access_unverified"] for c in _day(tmp_path)["candidates"]}
-    assert marks["v1"] is None and marks["v2"] is None
-    assert marks["v0"] and marks["v3"]  # raison non vide : au-delà du plafond
+    assert _ids(access) == ["c", "a"]
+
+
+def test_games_are_tested_in_games_order(tmp_path):
+    config = _make_config(tmp_path, max_vods_per_game=1)
+    vods = [_vod("b1", game="Jeu Beta"), _vod("a1", game="Jeu Alpha")]
+    collectors = _collectors(vods=vods)
+    collectors["twitch"].result["games"] = [{"name": "Jeu Alpha", "viewers_fr": 1000}, {"name": "Jeu Beta", "viewers_fr": 900}]
+    collectors["steam"].result["games"].append({"appid": "43", "name": "Jeu Beta", "players": 5000})
+    access = FakeAccess()
+    veille.collect(NOW, collectors=collectors, config=config, access_check=access)
+    assert [g["key"] for g in _day(tmp_path)["games"]][:2] == ["jeu alpha", "jeu beta"]
+    assert _ids(access) == ["a1", "b1"]
+
+
+def test_unreachable_after_all_attempts_is_dropped_logged_and_next_vod_tested(tmp_path, caplog):
+    config = _make_config(tmp_path, max_vods_per_game=1, twitch_access_attempts=3, twitch_access_retry_pause_s=7.0)
+    access = FakeAccess({"v0": ConnectionResetError("WinError 10054 " + "x" * 500)})
+    pauses = []
+    with caplog.at_level("WARNING", logger="clipper.veille"):
+        veille.collect(NOW, collectors=_collectors(vods=_game_vods(2)), config=config, access_check=access,
+                       access_sleep=pauses.append)
+    assert _ids(access) == ["v0", "v0", "v0", "v1"]
+    assert pauses == [7.0, 7.0]  # N-1 pauses au plus par VOD, rien après le dernier essai
+    day = _day(tmp_path)
+    assert [c["video_id"] for c in day["candidates"]] == ["v1"]
+    counts = day["sources"]["twitch"]["counts"]
+    assert (counts["restricted"], counts["unreachable"], counts["untested"]) == (0, 1, 0)
+    assert _access_excluded(tmp_path)["access_unreachable"] == 1
+    message = next(r.getMessage() for r in caplog.records if "https://example.test/v0" in r.getMessage())
+    assert "WinError 10054" in message and "x" * 300 not in message  # raison tronquée à 300 caractères
+
+
+def test_restricted_stops_the_attempts_at_once(tmp_path):
+    config = _make_config(tmp_path, max_vods_per_game=1, twitch_access_attempts=5)
+    access = FakeAccess({"v0": veille_sources.AccessRestricted("sub")})
+    pauses = []
+    veille.collect(NOW, collectors=_collectors(vods=_game_vods(2)), config=config, access_check=access,
+                   access_sleep=pauses.append)
+    assert _ids(access) == ["v0", "v1"] and pauses == []
+
+
+def test_k_failures_then_success_keeps_the_vod(tmp_path):
+    config = _make_config(tmp_path, max_vods_per_game=1, twitch_access_attempts=4)
+    calls = []
+
+    def flaky(url, timeout_s):
+        calls.append(url)
+        if len(calls) <= 2:
+            raise ConnectionResetError("WinError 10054")
+
+    pauses = []
+    veille.collect(NOW, collectors=_collectors(vods=_game_vods(2)), config=config, access_check=flaky,
+                   access_sleep=pauses.append)
+    assert len(calls) == 3 and len(pauses) == 2
+    day = _day(tmp_path)
+    assert [c["video_id"] for c in day["candidates"]] == ["v0"]
+    counts = day["sources"]["twitch"]["counts"]
+    assert (counts["restricted"], counts["unreachable"], counts["untested"]) == (0, 0, 1)
+
+
+def test_legacy_access_check_max_in_config_is_accepted(tmp_path):
+    veille.settings(_make_config(tmp_path, twitch_access_check_max=30))
 
 
 def test_filtered_out_vods_are_not_tested(tmp_path, config):
@@ -984,7 +1111,7 @@ def test_youtube_candidates_are_not_access_tested(tmp_path, config):
     access = FakeAccess()
     veille.collect(NOW, collectors=_collectors(videos=[_vod("yt1", source="youtube")]), config=config, access_check=access)
     assert access.urls == []
-    assert _day(tmp_path)["candidates"][0]["access_unverified"] is None
+    assert "access_unverified" not in _day(tmp_path)["candidates"][0]
 
 
 def test_default_access_check_goes_through_veille_sources(tmp_path, config, monkeypatch):
