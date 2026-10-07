@@ -526,6 +526,36 @@ def mark_published(
     return entry
 
 
+def attach_post(
+    video_id: str,
+    clip_id: str,
+    channel: str,
+    *,
+    post_url: str | None,
+    post_id: str,
+    state_dir: str | Path | None = None,
+) -> dict[str, Any]:
+    """Rattache apres coup un post TikTok a l'entree de publication d'un clip (releve des Publications) :
+    ecrit ``post_url`` / ``post_id``. Refuse (``PublishError``) d'ecraser un ``post_id`` deja renseigne et
+    different ; le statut de l'entree ne change pas."""
+    path = _state_path(channel, state_dir)
+    with _locked(path):
+        entries = _load_entries(path)
+        entry = _find_entry(entries, video_id, clip_id)
+        if entry is None:
+            raise PublishError(f"clip absent de la file de publication : {video_id}/{clip_id}")
+        known = entry.get("post_id")
+        if known and str(known) != str(post_id):
+            raise PublishError(
+                f"rattachement refusé pour {video_id}/{clip_id} : l'entrée porte déjà le post {known} (reçu {post_id})")
+        entry = dict(entry)
+        entry["post_id"] = str(post_id)
+        entry["post_url"] = post_url
+        _upsert_entry(entries, entry)
+        _save_entries(path, entries)
+    return entry
+
+
 def mark_failed(
     video_id: str,
     clip_id: str,

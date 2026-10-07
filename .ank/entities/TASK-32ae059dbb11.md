@@ -5,7 +5,7 @@ slug: apprentissage-1-4-rattacher-apr-s-relev-les-post
 title: "Apprentissage (1/4) : rattacher après relevé les posts TikTok aux clips Clipper sans id de post (programmés, lien introuvable) : clipper/learning.py (link_posts, link_if_due), publish.attach_post, appel par le worker, raisons visibles dans state/learning/links.json"
 created: 2026-10-07T10:24:36Z
 author: w-learnplan
-status: open
+status: done
 scope:
   - clipper/learning.py
   - clipper/publish.py
@@ -19,8 +19,15 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/44be637a5dcf@c18fb09
+    tree: scope/3c87854ee0c0
+    criteria: ce9d0e46f436
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---
 
 Prérequis de toute la boucle d'apprentissage (ADR proposé « Boucle d'apprentissage branchée sur les relevés réels », SPEC associée R1) : sans lien post → clip, aucune statistique n'est exploitable.
