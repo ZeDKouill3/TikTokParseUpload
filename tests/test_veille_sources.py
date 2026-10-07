@@ -275,6 +275,9 @@ def _steam_routes(applist_calls=None):
             {"rank": 2, "appid": 20, "last_week_rank": 0, "peak_in_game": 500},
             {"rank": 3, "appid": 30, "last_week_rank": 3, "peak_in_game": 100},
             {"rank": 4, "appid": 99, "last_week_rank": 1, "peak_in_game": 50}]}})],
+        ("GET", "/GetGamesByConcurrentPlayers/v1/"): [(200, {"response": {"ranks": [
+            {"rank": 1, "appid": 10, "concurrent_in_game": 400, "peak_in_game": 900},
+            {"rank": 2, "appid": 30, "concurrent_in_game": 60, "peak_in_game": 100}]}})],
         # GetAppList a été retiré par Valve : 404 s'il est appelé (défaut du 2026-10-06).
         ("GET", "/GetAppList/v2/"): [(404, "Method 'GetAppList' not found in interface 'ISteamApps'")],
         ("GET", "/api/appdetails"): _appdetails({"10": "Jeu Alpha", "20": "Jeu Beta", "30": "Gamma"}),
@@ -299,9 +302,9 @@ def test_steam_top_names_and_no_key_sent(tmp_path):
     http = FakeHttp(_steam_routes())
     result = _steam(tmp_path, http, steam_top=3)
     assert result == {"games": [
-        {"appid": "10", "name": "Jeu Alpha", "players": 900, "rank": 1, "last_week_rank": 4},
-        {"appid": "20", "name": "Jeu Beta", "players": 500, "rank": 2, "last_week_rank": 0},
-        {"appid": "30", "name": "Gamma", "players": 100, "rank": 3, "last_week_rank": 3}], "unnamed": []}
+        {"appid": "10", "name": "Jeu Alpha", "players": 900, "concurrent": 400, "rank": 1, "last_week_rank": 4},
+        {"appid": "20", "name": "Jeu Beta", "players": 500, "concurrent": None, "rank": 2, "last_week_rank": 0},
+        {"appid": "30", "name": "Gamma", "players": 100, "concurrent": 60, "rank": 3, "last_week_rank": 3}], "unnamed": []}
     for call in http.calls:
         assert "key" not in call["params"] and "Authorization" not in call["headers"]
 
@@ -811,3 +814,138 @@ def test_real_igdb_games_in_window(tmp_path):
     assert any(g["cover_image_id"] for g in result["games"])
     for game in result["games"]:
         assert any(start <= d["ts"] < end for d in game["release_dates"])  # une date (secondes Unix) dans la fenêtre
+
+
+# -- (8) TASK-82da : Steam officiel, joueurs simultanés, abonnés (SPEC-df51 R18, R21) ----------
+
+
+def test_steam_second_call_reads_concurrent_ranking_without_changing_players(tmp_path):
+    http = FakeHttp(_steam_routes())
+    result = _steam(tmp_path, http, steam_top=3)
+    assert len(http.to("/GetGamesByConcurrentPlayers/v1/")) == 1
+    assert http.to("/GetGamesByConcurrentPlayers/v1/")[0]["url"] == (
+        "https://api.steampowered.com/ISteamChartsService/GetGamesByConcurrentPlayers/v1/")
+    assert [(g["appid"], g["players"], g["concurrent"]) for g in result["games"]] == [
+        ("10", 900, 400), ("20", 500, None), ("30", 100, 60)]
+
+
+def test_steam_concurrent_ranking_error_is_a_source_error(tmp_path):
+    routes = _steam_routes()
+    routes[("GET", "/GetGamesByConcurrentPlayers/v1/")] = [(500, "boom")]
+    with pytest.raises(veille_sources.SourceError, match="HTTP 500.*GetGamesByConcurrentPlayers"):
+        _steam(tmp_path, FakeHttp(routes), steam_top=3)
+
+
+def _players_routes(counts):
+    """GetNumberOfCurrentPlayers : counts[appid] = entier, None = 404, tuple = (statut, corps)."""
+    def reply(call):
+        value = counts[call["params"]["appid"]]
+        if value is None:
+            return 404, "Not Found"
+        if isinstance(value, tuple):
+            return value
+        return 200, {"response": {"player_count": value, "result": 1}}
+    return {("GET", "/GetNumberOfCurrentPlayers/v1/"): reply}
+
+
+def _players(tmp_path, http, appids, **over):
+    return veille_sources.default_collectors(http)["steam_players"](_settings(tmp_path, **over), appids)
+
+
+def test_steam_players_one_get_per_appid_in_order_with_documented_params(tmp_path):
+    http = FakeHttp(_players_routes({"3": 30, "1": 10, "2": 20}))
+    result = _players(tmp_path, http, ["3", "1", "2"])
+    assert result == {"players": {"3": 30, "1": 10, "2": 20}, "skipped": 0}
+    assert [c["params"] for c in http.calls] == [{"appid": "3"}, {"appid": "1"}, {"appid": "2"}]
+    assert all(c["url"] == "https://api.steampowered.com/ISteamUserStats/GetNumberOfCurrentPlayers/v1/"
+               for c in http.calls)
+
+
+def test_steam_players_cap_counts_the_rest_as_skipped(tmp_path):
+    http = FakeHttp(_players_routes({"1": 10, "2": 20, "3": 30}))
+    result = _players(tmp_path, http, ["1", "2", "3"], steam_players_lookups_max=2)
+    assert result == {"players": {"1": 10, "2": 20}, "skipped": 1}
+    assert len(http.calls) == 2
+
+
+def test_steam_players_cap_zero_makes_no_call(tmp_path):
+    http = FakeHttp(_players_routes({"1": 10}))
+    assert _players(tmp_path, http, ["1"], steam_players_lookups_max=0) == {"players": {}, "skipped": 1}
+    assert http.calls == []
+
+
+def test_steam_players_404_is_null_not_an_error(tmp_path):
+    http = FakeHttp(_players_routes({"1": None, "2": 20}))
+    assert _players(tmp_path, http, ["1", "2"]) == {"players": {"1": None, "2": 20}, "skipped": 0}
+
+
+@pytest.mark.parametrize("reply", [(500, "boom"), (200, "<html>pas du json</html>"), (200, {"response": {"result": 1}}),
+                                   (200, {"response": {"player_count": "beaucoup"}})])
+def test_steam_players_other_failures_are_source_errors(tmp_path, reply):
+    http = FakeHttp(_players_routes({"1": reply}))
+    with pytest.raises(veille_sources.SourceError):
+        _players(tmp_path, http, ["1"])
+
+
+def _members(count):
+    return ('<?xml version="1.0" encoding="UTF-8"?><memberList><groupID64>1</groupID64>'
+            f"<memberCount>{count}</memberCount><members><steamID64>76561198000000001</steamID64></members></memberList>")
+
+
+def _followers_routes(bodies):
+    def reply(call):
+        value = bodies[re.search(r"/games/(\d+)/", call["url"]).group(1)]
+        return value if isinstance(value, tuple) else (200, value)
+    return {("GET", "/memberslistxml/"): reply}
+
+
+def _followers(tmp_path, http, appids, sleeps=None, **over):
+    collectors = veille_sources.default_collectors(http, sleep=(sleeps.append if sleeps is not None else lambda s: None))
+    return collectors["steam_followers"](_settings(tmp_path, **over), appids)
+
+
+def test_steam_followers_reads_member_count_only_with_user_agent_and_pause(tmp_path):
+    http = FakeHttp(_followers_routes({"7": _members(124547), "8": _members(38763)}))
+    sleeps: list[float] = []
+    result = _followers(tmp_path, http, ["7", "8"], sleeps, steam_followers_pause_s=1.5)
+    assert result == {"followers": {"7": 124547, "8": 38763}, "skipped": 0}
+    assert [c["url"] for c in http.calls] == [
+        "https://steamcommunity.com/games/7/memberslistxml/?xml=1", "https://steamcommunity.com/games/8/memberslistxml/?xml=1"]
+    assert all("Clipper" in c["headers"]["User-Agent"] for c in http.calls)
+    assert sleeps == [1.5]  # entre deux appels seulement
+
+
+def test_steam_followers_page_without_tag_is_null(tmp_path):
+    http = FakeHttp(_followers_routes({"7": "<!DOCTYPE html><html><title>Steam Community :: Error</title></html>"}))
+    assert _followers(tmp_path, http, ["7"]) == {"followers": {"7": None}, "skipped": 0}
+
+
+def test_steam_followers_cap_and_zero(tmp_path):
+    http = FakeHttp(_followers_routes({"1": _members(1), "2": _members(2), "3": _members(3)}))
+    assert _followers(tmp_path, http, ["1", "2", "3"], steam_followers_lookups_max=2) == {
+        "followers": {"1": 1, "2": 2}, "skipped": 1}
+    assert len(http.calls) == 2
+    http = FakeHttp(_followers_routes({"1": _members(1)}))
+    assert _followers(tmp_path, http, ["1"], steam_followers_lookups_max=0) == {"followers": {}, "skipped": 1}
+    assert http.calls == []
+
+
+@pytest.mark.parametrize("reply", [(503, "indisponible"), (404, "nope"), (200, "")])
+def test_steam_followers_http_error_or_empty_body_is_a_source_error(tmp_path, reply):
+    http = FakeHttp(_followers_routes({"1": reply}))
+    with pytest.raises(veille_sources.SourceError):
+        _followers(tmp_path, http, ["1"])
+
+
+@real_only
+def test_real_steam_players_ranking_and_followers(tmp_path):
+    import httpx
+
+    collectors = veille_sources.default_collectors()
+    players = collectors["steam_players"](_settings(tmp_path), ["570"])["players"]["570"]
+    assert isinstance(players, int) and players > 0
+    url = "https://api.steampowered.com/ISteamChartsService/GetGamesByConcurrentPlayers/v1/"
+    first = httpx.get(url, timeout=20).json()["response"]["ranks"][0]
+    assert isinstance(first["concurrent_in_game"], int) and isinstance(first["peak_in_game"], int)
+    followers = collectors["steam_followers"](_settings(tmp_path), ["570"])["followers"]["570"]
+    assert isinstance(followers, int) and followers > 0

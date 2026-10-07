@@ -17,8 +17,11 @@ chacun un callable ``collector(settings) -> dict`` (``settings`` = la table
     twitch  {"games": [{"name", "viewers_fr"}],
              "vods":  [VOD]}
     youtube {"videos": [VOD]}
-    steam   {"games": [{"appid", "name", "players", "rank", "last_week_rank"}],
+    steam   {"games": [{"appid", "name", "players" (pic du jour), "concurrent" (instantané | None), "rank",
+             "last_week_rank"}],
              "unnamed": [{"appid", "reason"}]}  (optionnel : jeux sans nom, avec leur raison)
+    steam_players   (settings, appids) -> {"players": {appid: int | None}, "skipped": n}  (SPEC-df51 R18, appelé après les autres)
+    steam_followers (settings, appids) -> {"followers": {appid: int | None}, "skipped": n}  (SPEC-df51 R21)
     steam_fr {"games": [{"appid", "name", "rank", "last_week_rank"}]}  (top des ventes du pays ``region`` ;
              ``last_week_rank`` 0 = absent du top la semaine dernière)
     igdb    {"games": [{"igdb_id", "name", "slug", "url", "hypes" (entier), "first_release_date" | None,
@@ -85,6 +88,14 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "igdb_upcoming_max": 20,
     "igdb_pages_max": 4,
     "youtube_game_min_chars": 5,
+    "steam_players_lookups_max": 30,
+    "steam_followers_lookups_max": 200,
+    "steam_followers_pause_s": 1.0,
+    "community_min_steam_players": 1000,
+    "community_min_steam_followers": 10000,
+    "community_min_twitch_viewers": 200,
+    "community_min_hypes": 50,
+    "max_vods_per_game": 1,
 }
 
 # Clés retirées qu'un config.toml peut encore porter : ignorées à la lecture (clipper.config).
@@ -92,7 +103,8 @@ LEGACY_KEYS = ("igdb_releases_max",)  # SPEC-4efa, remplacée par igdb_recent_ma
 
 log = logging.getLogger(__name__)
 
-SOURCES = ("twitch", "youtube", "steam", "steam_fr", "igdb")
+SOURCES = ("twitch", "youtube", "steam", "steam_fr", "igdb", "steam_players", "steam_followers")
+LOOKUP_SOURCES = ("steam_players", "steam_followers")  # relevés par appid, appelés après les autres (R18, R21)
 Collector = Callable[[dict[str, object]], dict[str, Any]]
 
 # Clés exigées par source (steam n'en demande aucune).
@@ -102,6 +114,8 @@ _REQUIRED_KEYS = {
     "steam": (),
     "steam_fr": (),
     "igdb": ("twitch_client_id", "twitch_client_secret"),  # même jeton d'app que Twitch (ADR-798c)
+    "steam_players": (),
+    "steam_followers": (),
 }
 _RUN_AT = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 _DATE_FILE = re.compile(r"^\d{4}-\d{2}-\d{2}\.json$")
@@ -131,6 +145,15 @@ def settings(config: Config) -> dict[str, object]:
         value = table[key]
         if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
             raise VeilleError(f"[veille] {key} doit être un entier >= {minimum} (reçu {value!r})")
+    for key, minimum in (("steam_players_lookups_max", 0), ("steam_followers_lookups_max", 0),
+                         ("community_min_steam_players", 0), ("community_min_steam_followers", 0),
+                         ("community_min_twitch_viewers", 0), ("community_min_hypes", 0), ("max_vods_per_game", 1)):
+        value = table[key]
+        if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+            raise VeilleError(f"[veille] {key} doit être un entier >= {minimum} (reçu {value!r})")
+    pause = table["steam_followers_pause_s"]
+    if not isinstance(pause, (int, float)) or isinstance(pause, bool) or pause < 0.2:
+        raise VeilleError(f"[veille] steam_followers_pause_s doit être un nombre >= 0.2 (reçu {pause!r})")
     min_chars = table["youtube_game_min_chars"]
     if not isinstance(min_chars, int) or isinstance(min_chars, bool) or min_chars < 1:
         raise VeilleError(f"[veille] youtube_game_min_chars doit être un entier >= 1 (reçu {min_chars!r})")
@@ -373,7 +396,14 @@ def _empty_releases() -> dict[str, Any]:
 
 
 _TREND_FIELDS = ("key", "name", "twitch_fr_viewers", "twitch_delta_pct", "steam_players", "steam_rank",
-                 "steam_rank_gain", "steam_new_in_top", "steam_sellers_rank", "steam_sellers_gain", "steam_sellers_new")
+                 "steam_rank_gain", "steam_new_in_top", "steam_sellers_rank", "steam_sellers_gain", "steam_sellers_new",
+                 "steam_players_now", "steam_followers", "steam_followers_gain_7d", "community")
+
+
+def _index_games(games: list[dict[str, Any]], twitch_igdb: dict[str, str]) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    """``(par clé, par igdb_id fourni par Twitch)`` : l'appariement d'une sortie avec un jeu du relevé."""
+    by_key = {g["key"]: g for g in games}
+    return by_key, {igdb_id: by_key[key] for key, igdb_id in twitch_igdb.items() if igdb_id and key in by_key}
 
 
 def _classify_releases(games: list[dict[str, Any]], today: date, table: dict[str, object]) -> list[dict[str, Any]]:
@@ -409,8 +439,7 @@ def _group_releases(entries: list[dict[str, Any]], games: list[dict[str, Any]], 
     """Attache la tendance (jeu du relevé du jour apparié par ``igdb_id`` Twitch puis par clé), écarte les jeux sous
     ``igdb_min_hypes`` sans tendance, trie par hypes et coupe : ``recent`` (days <= 0, ``igdb_recent_max``) et
     ``upcoming`` (days >= 1, ``igdb_upcoming_max``) (R13)."""
-    by_key = {g["key"]: g for g in games}
-    by_igdb = {igdb_id: by_key[key] for key, igdb_id in twitch_igdb.items() if igdb_id and key in by_key}
+    by_key, by_igdb = _index_games(games, twitch_igdb)
     min_hypes = int(table["igdb_min_hypes"])  # type: ignore[call-overload]
     recent: list[dict[str, Any]] = []
     upcoming: list[dict[str, Any]] = []
@@ -440,18 +469,150 @@ def _release_marker(game: dict[str, Any], igdb_id: str, recent: list[dict[str, A
 
 
 # --------------------------------------------------------------------------
+# Joueurs et abonnés Steam, communauté (SPEC-df51 R18, R19, R21)
+# --------------------------------------------------------------------------
+
+
+def _is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _history_days(sdir: Path, today: date, baseline_days: int) -> list[tuple[str, dict[str, Any]]]:
+    """Les fichiers d'historique datés de J-``baseline_days`` à J-1 qui existent (plus ancien d'abord) :
+    un jour sans fichier est absent, jamais comblé."""
+    days: list[tuple[str, dict[str, Any]]] = []
+    for offset in range(baseline_days, 0, -1):
+        day = (today - timedelta(days=offset)).isoformat()
+        data = _read_json(sdir / "history" / f"{day}.json", None)
+        if isinstance(data, dict):
+            days.append((day, data))
+    return days
+
+
+def _lookup_appids(games: list[dict[str, Any]], steam_hist: dict[str, dict[str, Any]], snapshots: dict[str, int | None],
+                   releases: dict[str, Any], *, source: str) -> list[str]:
+    """Appids à relever, ordonnés et sans doublon (R18 pour ``steam_players``, R21 pour ``steam_followers``)."""
+    game_appids = [str(g["steam_appid"]) for g in games if g.get("steam_appid")]
+    ordered: list[str] = []
+    if source == "steam_players":
+        ordered = [a for a in game_appids if snapshots.get(a) is None]
+        entries = releases["recent"]
+    else:
+        ordered = list(game_appids)
+        entries = releases["recent"] + releases["upcoming"]
+    ordered += [str(e["steam_appid"]) for e in entries if e.get("steam_appid") and str(e["steam_appid"]) not in game_appids]
+    if source == "steam_followers":
+        ordered += list(steam_hist)
+    return list(dict.fromkeys(ordered))
+
+
+def _error_text(exc: Exception) -> str:
+    if isinstance(exc, (VeilleError, veille_sources.SourceError)):
+        return str(exc)
+    return f"{type(exc).__name__} : {exc}"
+
+
+def _run_lookup(source: str, appids: list[str], collectors: dict[str, Collector], table: dict[str, object],
+                now: datetime) -> tuple[dict[str, Any], dict[str, int | None]]:
+    """Source par appid (``steam_players``, ``steam_followers``) : la liste est coupée au plafond (le reste compté
+    ``skipped``) ; plafond 0 ou rien à relever : ``skipped`` sans appel ; erreur : ``error``, aucune valeur."""
+    status: dict[str, Any] = {"status": "ok", "at": now.isoformat(), "error": None, "counts": {}}
+    cap = int(table["steam_players_lookups_max" if source == "steam_players" else "steam_followers_lookups_max"])  # type: ignore[call-overload]
+    kept, cut = appids[:cap], max(0, len(appids) - cap)
+    if not kept:
+        status.update(status="skipped", counts={"requested": 0, "found": 0, "unknown": 0, "skipped": cut})
+        return status, {}
+    key = "players" if source == "steam_players" else "followers"
+    try:
+        result = _run_source(source, collectors, table, kept)
+        values = {str(a): v for a, v in result[key].items()}
+        if any(v is not None and not _is_int(v) for v in values.values()):
+            raise VeilleError(f"{source} : valeur non entière dans la réponse")
+        found = sum(v is not None for v in values.values())
+        status["counts"] = {"requested": len(kept), "found": found, "unknown": len(kept) - found,
+                            "skipped": cut + int(result.get("skipped", 0))}
+    except Exception as exc:  # une source en erreur ne bloque pas les autres, jamais avalée
+        status.update(status="error", error=_error_text(exc), counts={})
+        return status, {}
+    return status, values
+
+
+def _community(game: dict[str, Any], table: dict[str, object]) -> dict[str, Any]:
+    """R19 : un jeu a une communauté dès qu'un seul seuil est atteint ; ``null`` n'atteint aucun seuil."""
+    peak, now = game.get("steam_players"), game.get("steam_players_now")
+    steam, kind = (peak, "peak") if peak is not None else ((now, "now") if now is not None else (None, None))
+    values = {"steam": steam, "followers": game.get("steam_followers"), "twitch": game.get("twitch_fr_viewers"),
+              "hypes": (game.get("release") or {}).get("hypes")}
+    limits = {"steam": table["community_min_steam_players"], "followers": table["community_min_steam_followers"],
+              "twitch": table["community_min_twitch_viewers"], "hypes": table["community_min_hypes"]}
+    met = [name for name, value in values.items() if value is not None and value >= limits[name]]  # type: ignore[operator]
+    return {"ok": bool(met), "steam_players": steam, "steam_kind": kind, "steam_followers": values["followers"],
+            "twitch_fr_viewers": values["twitch"], "hypes": values["hypes"], "met": met}
+
+
+def _enrich_games(games: list[dict[str, Any]], *, today: date, sdir: Path, previous: list[dict[str, Any]],
+                  table: dict[str, object], snapshots: dict[str, int | None], followers: dict[str, int | None]) -> None:
+    """Pose sur chaque jeu : instantané Steam, tendance des instantanés, abonnés, courbes tirées de l'historique,
+    gain d'abonnés sur ``baseline_days`` jours et ``community`` (R18, R19, R21). Rien n'est estimé : un jour sans
+    mesure reste absent, un dérivé sans base reste ``None``."""
+    baseline = int(table["baseline_days"])  # type: ignore[call-overload]
+    days = _history_days(sdir, today, baseline)
+    then = next((data for day, data in days if day == (today - timedelta(days=baseline)).isoformat()), None)
+    day = today.isoformat()
+    for game in games:
+        appid = str(game["steam_appid"]) if game.get("steam_appid") else None
+        now = snapshots.get(appid) if appid else None
+        game["steam_players_now"] = now
+        now_values = [p["steam_now"][appid] for p in previous if appid and appid in (p.get("steam_now") or {})]
+        game["steam_now_avg"], game["steam_now_delta_pct"] = _delta(now, now_values) if now is not None else (None, None)
+        peak_history: list[dict[str, Any]] = []
+        for when, data in [*days, (day, None)]:
+            point_peak = game["steam_players"] if data is None else ((data.get("steam") or {}).get(appid) or {}).get("players")
+            point_now = now if data is None else (data.get("steam_now") or {}).get(appid)
+            for kind, value in (("peak", point_peak), ("now", point_now)):
+                if appid and _is_int(value):
+                    peak_history.append({"date": when, "kind": kind, "players": value})
+        game["steam_players_history"] = peak_history
+        count = followers.get(appid) if appid else None
+        game["steam_followers"] = count
+        before = ((then or {}).get("steam_followers") or {}).get(appid) if appid else None
+        game["steam_followers_gain_7d"] = count - before if _is_int(count) and _is_int(before) else None
+        game["steam_followers_history"] = [
+            {"date": when, "followers": value} for when, value in
+            [*((d, (data.get("steam_followers") or {}).get(appid)) for d, data in days), (day, count)]
+            if appid and _is_int(value)]
+        game["community"] = _community(game, table)
+
+
+def _refresh_releases(releases: dict[str, Any], games: list[dict[str, Any]], twitch_igdb: dict[str, str],
+                      snapshots: dict[str, int | None], followers: dict[str, int | None]) -> None:
+    """Après les relevés par appid : ``trend`` reprend les champs des jeux enrichis ; une sortie sans jeu porte
+    ``steam_players_now`` et ``steam_followers`` elle-même (R18, R21)."""
+    by_key, by_igdb = _index_games(games, twitch_igdb)
+    for entry in releases["recent"] + releases["upcoming"]:
+        game = by_igdb.get(entry["igdb_id"]) or by_key.get(entry["key"])
+        if game is not None:
+            entry["trend"] = {k: game.get(k) for k in _TREND_FIELDS}
+        else:
+            appid = str(entry["steam_appid"]) if entry.get("steam_appid") else None
+            entry["steam_players_now"] = snapshots.get(appid) if appid else None
+            entry["steam_followers"] = followers.get(appid) if appid else None
+
+
+# --------------------------------------------------------------------------
 # Collecte
 # --------------------------------------------------------------------------
 
 
-def _run_source(source: str, collectors: dict[str, Collector], table: dict[str, object]) -> dict[str, Any]:
-    """Résultat brut d'un collecteur ; lève ``VeilleError`` (clé absente) ou l'erreur du collecteur."""
+def _run_source(source: str, collectors: dict[str, Collector], table: dict[str, object], *args: Any) -> dict[str, Any]:
+    """Résultat brut d'un collecteur (``args`` : liste d'appids des sources par appid) ; lève ``VeilleError``
+    (clé absente) ou l'erreur du collecteur."""
     for key in _REQUIRED_KEYS[source]:
         if not str(table[key]).strip():
             raise VeilleError(f"{key} absente : à saisir dans Réglages › Veille")
     if source not in collectors:
         raise VeilleError(f"aucun collecteur fourni pour la source {source}")
-    return collectors[source](table)
+    return collectors[source](table, *args)
 
 
 def _to_candidate(source: str, vod: dict[str, Any]) -> dict[str, Any]:
@@ -544,14 +705,18 @@ def collect(
     sources: dict[str, dict[str, Any]] = {}
     twitch_hist: dict[str, dict[str, Any]] = {}
     steam_hist: dict[str, dict[str, Any]] = {}
+    steam_concurrent: dict[str, int | None] = {}  # instantané du top 100 (R18), hors historique "steam"
     sellers_hist: dict[str, dict[str, Any]] = {}
     youtube_hist: dict[str, dict[str, Any]] = {}
     twitch_igdb: dict[str, str] = {}  # clé de jeu -> igdb_id fourni par Twitch (hors historique)
     igdb_games: list[dict[str, Any]] = []
     igdb_skipped = 0
+    followers: dict[str, int | None] = {}
     raw_vods: list[tuple[str, dict[str, Any]]] = []
 
     for source in SOURCES:
+        if source in LOOKUP_SOURCES:
+            continue  # relevés par appid : après les autres sources, une fois les listes d'appids connues
         status: dict[str, Any] = {"status": "ok", "at": now.isoformat(), "error": None, "counts": {}}
         try:
             result = _run_source(source, collectors, table)
@@ -582,6 +747,7 @@ def collect(
                 for game in result["games"]:
                     steam_hist[str(game["appid"])] = {"name": game["name"], "players": game["players"],
                                                       "rank": game.get("rank"), "last_week_rank": game.get("last_week_rank")}
+                    steam_concurrent[str(game["appid"])] = game.get("concurrent")
                 vods = []
                 status["counts"] = {"games": len(steam_hist)}
                 if result.get("unnamed"):
@@ -598,7 +764,7 @@ def collect(
             elif source == "igdb":
                 igdb_games, igdb_skipped = [], 0
             elif source == "steam":
-                steam_hist = {}
+                steam_hist, steam_concurrent = {}, {}
             elif source == "steam_fr":
                 sellers_hist = {}
             else:
@@ -607,7 +773,7 @@ def collect(
         sources[source] = status
 
     # Candidats (R5)
-    excluded = {"too_short": 0, "too_old": 0, "already_known": 0}
+    excluded = {"too_short": 0, "too_old": 0, "already_known": 0, "no_community": 0}
     candidates: list[dict[str, Any]] = []
     max_age = timedelta(hours=float(table["vod_max_age_h"]))
     for source, vod in raw_vods:
@@ -632,22 +798,40 @@ def collect(
         if candidate["source"] == "youtube" and not candidate["game_key"]:
             _deduce_game(candidate, known_games, int(table["youtube_game_min_chars"]))  # type: ignore[call-overload]
 
-    if sources["twitch"]["status"] == "ok":
-        candidates, restricted = _check_twitch_access(candidates, table, access_check or veille_sources.check_twitch_access)
-        sources["twitch"]["counts"]["restricted"] = restricted
-    vod_counts: dict[str, int] = {}
-    for candidate in candidates:
-        if candidate["game_key"]:
-            vod_counts[candidate["game_key"]] = vod_counts.get(candidate["game_key"], 0) + 1
-
-    games = _build_games(twitch_hist, steam_hist, youtube_hist, vod_counts, previous, table, sellers_hist)
+    games = _build_games(twitch_hist, steam_hist, youtube_hist, {}, previous, table, sellers_hist)
     releases = _group_releases(in_window, games, twitch_igdb, table)
     if sources["igdb"]["status"] == "ok":
         sources["igdb"]["counts"] = {"rows": len(igdb_games), "recent": len(releases["recent"]),
                                      "upcoming": len(releases["upcoming"]), "skipped_rows": igdb_skipped}
     for game in games:
         game["release"] = _release_marker(game, twitch_igdb.get(game["key"], ""), releases["recent"])
+
+    # Joueurs Steam à l'instant et abonnés par appid (R18, R21), puis communauté (R19)
+    snapshots: dict[str, int | None] = {a: v for a, v in steam_concurrent.items() if v is not None}
+    for source in LOOKUP_SOURCES:
+        appids = _lookup_appids(games, steam_hist, steam_concurrent, releases, source=source)
+        sources[source], values = _run_lookup(source, appids, collectors, table, now)
+        if source == "steam_players":
+            snapshots.update({a: v for a, v in values.items() if v is not None})
+        else:
+            followers = values
+    _enrich_games(games, today=today, sdir=sdir, previous=previous, table=table, snapshots=snapshots, followers=followers)
+    _refresh_releases(releases, games, twitch_igdb, snapshots, followers)
+
     by_key = {g["key"]: g for g in games}
+    kept: list[dict[str, Any]] = []
+    for candidate in candidates:  # un jeu sans monde, ou inconnu, n'a aucune VOD proposée (R19)
+        game = by_key.get(candidate["game_key"]) if candidate["game_key"] else None
+        if game is not None and game["community"]["ok"]:
+            kept.append(candidate)
+        else:
+            excluded["no_community"] += 1
+    candidates = kept
+    if sources["twitch"]["status"] == "ok":
+        candidates, restricted = _check_twitch_access(candidates, table, access_check or veille_sources.check_twitch_access)
+        sources["twitch"]["counts"]["restricted"] = restricted
+    for game in games:
+        game["vod_count"] = sum(1 for c in candidates if c["game_key"] == game["key"])
     for candidate in candidates:
         game = by_key.get(candidate["game_key"])
         release = game["release"] if game else (
@@ -660,6 +844,7 @@ def collect(
 
     _write(sdir / "history" / f"{day}.json", {
         "date": day, "at": now.isoformat(), "twitch": twitch_hist, "steam": steam_hist, "steam_fr": sellers_hist, "youtube": youtube_hist,
+        "steam_now": snapshots, "steam_followers": {a: v for a, v in followers.items() if v is not None},
     })
     state = {
         "date": day, "started_at": started_at, "finished_at": now.isoformat() if finalize else None, "sources": sources,
@@ -700,22 +885,45 @@ def _schema(max_picks: int) -> dict[str, Any]:
     }
 
 
-def _check_picks(candidate_ids: set[str]) -> Callable[[Any], None]:
+def _check_picks(candidates: list[dict[str, Any]], max_per_game: int) -> Callable[[Any], None]:
+    """Refuse un id inconnu ou en double, et plus de ``max_per_game`` picks d'un même jeu connu (R20)."""
+    by_id = {c["id"]: c for c in candidates}
+
     def check(value: Any) -> None:
         seen: set[str] = set()
+        per_game: dict[str, int] = {}
         for pick in value["picks"]:
             cid = pick["candidate_id"]
-            if cid not in candidate_ids:
+            if cid not in by_id:
                 raise llm.SchemaError(f"candidate_id inconnu : {cid!r}")
             if cid in seen:
                 raise llm.SchemaError(f"candidate_id en double : {cid!r}")
             seen.add(cid)
+            key = by_id[cid].get("game_key")
+            if key:
+                per_game[key] = per_game.get(key, 0) + 1
+                if per_game[key] > max_per_game:
+                    raise llm.SchemaError(
+                        f"plus de {max_per_game} VOD du jeu {by_id[cid].get('game_name') or key!r} (max_vods_per_game)")
 
     return check
 
 
 def _fmt(value: Any) -> str:
     return "inconnu" if value is None else str(value)
+
+
+def _or_insufficient(value: Any) -> str:
+    """Dérivé de l'historique : ``None`` = pas assez de jours mesurés, jamais un chiffre estimé."""
+    return "historique insuffisant" if value is None else str(value)
+
+
+def _steam_players_label(community: dict[str, Any]) -> str:
+    """Chiffre Steam d'un jeu et sa mesure : le pic du jour ou l'instantané (jamais mélangés)."""
+    value, kind = community.get("steam_players"), community.get("steam_kind")
+    if value is None or kind is None:
+        return "inconnu"
+    return f"{value} ({'pic' if kind == 'peak' else 'instantané'})"
 
 
 def _release_line(entry: dict[str, Any], *, upcoming: bool) -> str:
@@ -751,8 +959,12 @@ def _prompt(day_state: dict[str, Any], table: dict[str, object]) -> str:
         "Choisis les VOD dont le gameplay se prête à des clips courts compréhensibles seuls ET qui collent aux "
         "goûts, en privilégiant ce qui monte, sans juger les personnes. Une donnée inconnue est inconnue : "
         "ne l'invente pas.",
+        f"Au plus {table['max_vods_per_game']} VOD par jeu : varie les jeux.",
         "",
         "Jeux (viewers Twitch FR, joueurs Steam, variation vs moyenne des jours précédents, gain de rang Steam vs semaine dernière, rang et gain dans le top des ventes Steam du pays) :",
+        "Deux mesures de joueurs Steam, jamais comparées entre elles : steam_players = pic du jour du top 100 "
+        "(inconnu hors top 100) ; steam_players_now = instantané à l'heure du relevé. steam_abonnes = abonnés Steam ; "
+        "communaute = au moins un seuil de communauté atteint (joueurs, abonnés, viewers Twitch FR ou hypes IGDB).",
     ]
     for game in day_state["games"]:
         lines.append(
@@ -760,6 +972,11 @@ def _prompt(day_state: dict[str, Any], table: dict[str, object]) -> str:
             f"hors_twitch_fr={game.get('twitch_match') is False} "
             f"twitch_delta_pct={_fmt(game['twitch_delta_pct'])} steam_players={_fmt(game.get('steam_players'))} "
             f"steam_delta_pct={_fmt(game['steam_delta_pct'])} "
+            f"steam_players_now={_fmt(game.get('steam_players_now'))} "
+            f"steam_now_delta_pct={_or_insufficient(game.get('steam_now_delta_pct'))} "
+            f"steam_abonnes={_fmt(game.get('steam_followers'))} "
+            f"steam_abonnes_gain_7j={_or_insufficient(game.get('steam_followers_gain_7d'))} "
+            f"communaute={'ok' if (game.get('community') or {}).get('ok') else 'insuffisante'} "
             f"steam_rank_gain_vs_last_week={_fmt(game.get('steam_rank_gain'))} "
             f"steam_new_in_top={_fmt(game.get('steam_new_in_top'))} "
             f"ventes_fr_rang={_fmt(game.get('steam_sellers_rank'))} "
@@ -770,8 +987,10 @@ def _prompt(day_state: dict[str, Any], table: dict[str, object]) -> str:
             f"hypes_igdb={_fmt((game.get('release') or {}).get('hypes'))}")
     lines += _releases_block(day_state, table)
     lines += ["", "Candidats (VOD) :"]
+    games_by_key = {g["key"]: g for g in day_state["games"]}
     for c in day_state["candidates"]:
         signals = c.get("signals") or {}
+        community = (games_by_key.get(c.get("game_key")) or {}).get("community") or {}
         lines.append(
             f"- id={c['id']} source={c['source']} titre={c.get('title')!r} chaîne={c.get('channel_name')!r} "
             f"jeu={_fmt(c.get('game_name'))}{' (déduit du titre)' if c.get('game_source') == 'titre' else ''} durée_s={c['duration_s']} publiée={c['published_at']} "
@@ -782,7 +1001,9 @@ def _prompt(day_state: dict[str, Any], table: dict[str, object]) -> str:
             f"steam_new_in_top={_fmt(signals.get('steam_new_in_top'))} "
             f"ventes_fr_gain_vs_semaine_derniere={_fmt(signals.get('steam_sellers_gain'))} "
             f"ventes_fr_nouveau={_fmt(signals.get('steam_sellers_new'))} "
-            f"sortie_j_plus={_fmt(signals.get('release_days_since'))}")
+            f"sortie_j_plus={_fmt(signals.get('release_days_since'))} "
+            f"steam_players={_steam_players_label(community)} steam_abonnes={_fmt(community.get('steam_followers'))} "
+            f"twitch_fr_viewers={_fmt(community.get('twitch_fr_viewers'))} hypes_igdb={_fmt(community.get('hypes'))}")
     return "\n".join(lines)
 
 
@@ -801,7 +1022,8 @@ def decide(day_state: dict[str, Any], config: Config) -> dict[str, Any]:
         return state
     try:
         answer = llm.ask("veille", _prompt(state, table), [], _schema(int(table["max_vods_per_day"])),
-                         config=config, check=_check_picks({c["id"] for c in candidates}))
+                         config=config,
+                         check=_check_picks(candidates, int(table["max_vods_per_game"])))  # type: ignore[call-overload]
     except llm.LLMError as exc:
         log.error("veille : choix de Claude refusé : %s", exc)
         state.update(llm={"status": "error", "error": str(exc), "model": model}, proposals=[], skipped_note="")
