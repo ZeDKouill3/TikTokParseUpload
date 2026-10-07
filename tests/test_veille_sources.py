@@ -908,7 +908,7 @@ def test_steam_followers_reads_member_count_only_with_user_agent_and_pause(tmp_p
     http = FakeHttp(_followers_routes({"7": _members(124547), "8": _members(38763)}))
     sleeps: list[float] = []
     result = _followers(tmp_path, http, ["7", "8"], sleeps, steam_followers_pause_s=1.5)
-    assert result == {"followers": {"7": 124547, "8": 38763}, "skipped": 0}
+    assert result == {"followers": {"7": 124547, "8": 38763}, "skipped": 0, "rate_limited": 0}
     assert [c["url"] for c in http.calls] == [
         "https://steamcommunity.com/games/7/memberslistxml/?xml=1", "https://steamcommunity.com/games/8/memberslistxml/?xml=1"]
     assert all("Clipper" in c["headers"]["User-Agent"] for c in http.calls)
@@ -917,16 +917,16 @@ def test_steam_followers_reads_member_count_only_with_user_agent_and_pause(tmp_p
 
 def test_steam_followers_page_without_tag_is_null(tmp_path):
     http = FakeHttp(_followers_routes({"7": "<!DOCTYPE html><html><title>Steam Community :: Error</title></html>"}))
-    assert _followers(tmp_path, http, ["7"]) == {"followers": {"7": None}, "skipped": 0}
+    assert _followers(tmp_path, http, ["7"]) == {"followers": {"7": None}, "skipped": 0, "rate_limited": 0}
 
 
 def test_steam_followers_cap_and_zero(tmp_path):
     http = FakeHttp(_followers_routes({"1": _members(1), "2": _members(2), "3": _members(3)}))
     assert _followers(tmp_path, http, ["1", "2", "3"], steam_followers_lookups_max=2) == {
-        "followers": {"1": 1, "2": 2}, "skipped": 1}
+        "followers": {"1": 1, "2": 2}, "skipped": 1, "rate_limited": 0}
     assert len(http.calls) == 2
     http = FakeHttp(_followers_routes({"1": _members(1)}))
-    assert _followers(tmp_path, http, ["1"], steam_followers_lookups_max=0) == {"followers": {}, "skipped": 1}
+    assert _followers(tmp_path, http, ["1"], steam_followers_lookups_max=0) == {"followers": {}, "skipped": 1, "rate_limited": 0}
     assert http.calls == []
 
 
@@ -949,3 +949,66 @@ def test_real_steam_players_ranking_and_followers(tmp_path):
     assert isinstance(first["concurrent_in_game"], int) and isinstance(first["peak_in_game"], int)
     followers = collectors["steam_followers"](_settings(tmp_path), ["570"])["followers"]["570"]
     assert isinstance(followers, int) and followers > 0
+
+
+# --- TASK-cab5 : HTTP 429 sur memberslistxml -------------------------------------------------
+
+
+def _seq_routes(replies):
+    """memberslistxml : réponses successives par appid (la dernière se répète)."""
+    seen: dict[str, int] = {}
+
+    def reply(call):
+        appid = re.search(r"/games/(\d+)/", call["url"]).group(1)
+        i = seen.get(appid, 0)
+        seen[appid] = i + 1
+        items = replies[appid]
+        value = items[min(i, len(items) - 1)]
+        return value if isinstance(value, tuple) else (200, value)
+    return {("GET", "/memberslistxml/"): reply}
+
+
+def test_steam_followers_429_then_200_retries_same_appid_with_growing_capped_wait(tmp_path, caplog):
+    http = FakeHttp(_seq_routes({"7": [(429, ""), (429, ""), _members(500)], "8": [_members(8)]}))
+    sleeps: list[float] = []
+    with caplog.at_level("WARNING"):
+        result = _followers(tmp_path, http, ["7", "8"], sleeps, steam_followers_pause_s=2.0,
+                            steam_followers_retry_max=3, steam_followers_retry_wait_max_s=30.0)
+    assert result == {"followers": {"7": 500, "8": 8}, "skipped": 0, "rate_limited": 0}
+    assert [c["url"].split("/")[4] for c in http.calls] == ["7", "7", "7", "8"]
+    assert sleeps == [2.0, 4.0, 2.0]  # attente 429 : pause puis doublée ; puis la pause normale entre appids
+    assert sum("429" in r.message for r in caplog.records) == 2  # chaque attente est journalisée
+
+
+def test_steam_followers_persistent_429_keeps_read_values_and_marks_the_rest_rate_limited(tmp_path):
+    http = FakeHttp(_seq_routes({"1": [_members(1)], "2": [(429, "")], "3": [_members(3)]}))
+    sleeps: list[float] = []
+    result = _followers(tmp_path, http, ["1", "2", "3"], sleeps, steam_followers_pause_s=2.0,
+                        steam_followers_retry_max=2, steam_followers_retry_wait_max_s=30.0)
+    assert result == {"followers": {"1": 1, "2": None, "3": None}, "skipped": 0, "rate_limited": 2}
+    assert [c["url"].split("/")[4] for c in http.calls] == ["1", "2", "2", "2"]  # 1 essai + 2 réessais, puis arrêt
+
+
+def test_steam_followers_retry_after_seconds_is_used_and_capped(tmp_path):
+    http = FakeHttp(_seq_routes({"1": [(429, "", {"Retry-After": "7"}), (429, "", {"Retry-After": "900"}), _members(9)]}))
+    sleeps: list[float] = []
+    result = _followers(tmp_path, http, ["1"], sleeps, steam_followers_pause_s=2.0,
+                        steam_followers_retry_max=3, steam_followers_retry_wait_max_s=30.0)
+    assert result["followers"] == {"1": 9}
+    assert sleeps == [7.0, 30.0]  # Retry-After lu ; plafonné au plafond d'attente
+
+
+def test_steam_followers_retry_after_http_date_uses_injected_clock(tmp_path):
+    from datetime import datetime, timezone
+    http = FakeHttp(_seq_routes({"1": [(429, "", {"Retry-After": "Wed, 07 Oct 2026 12:00:12 GMT"}), _members(9)]}))
+    sleeps: list[float] = []
+    now = datetime(2026, 10, 7, 12, 0, 0, tzinfo=timezone.utc)
+    collectors = veille_sources.default_collectors(http, clock=lambda: now, sleep=sleeps.append)
+    result = collectors["steam_followers"](_settings(tmp_path, steam_followers_pause_s=2.0), ["1"])
+    assert result["followers"] == {"1": 9}
+    assert sleeps == [12.0]
+
+
+def test_steam_followers_no_429_has_no_rate_limited_count(tmp_path):
+    http = FakeHttp(_followers_routes({"7": _members(5)}))
+    assert _followers(tmp_path, http, ["7"])["rate_limited"] == 0

@@ -20,9 +20,11 @@ message ni dans un fichier d'état (R3).
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlencode
@@ -33,6 +35,7 @@ import yt_dlp
 
 from clipper import channel as channel_mod
 
+log = logging.getLogger(__name__)
 Http = Callable[..., "tuple[int, Any]"]
 Clock = Callable[[], datetime]
 
@@ -65,6 +68,14 @@ _ISO_DURATION = re.compile(r"^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)
 
 class SourceError(Exception):
     """Une source n'a pas pu être relevée (HTTP, JSON, champ absent)."""
+
+
+class RateLimited(SourceError):
+    """HTTP 429 : ``retry_after`` est l'en-tête ``Retry-After`` brut (secondes ou date HTTP), ``None`` s'il manque."""
+
+    def __init__(self, message: str, retry_after: str | None = None):
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 class AccessRestricted(Exception):
@@ -100,7 +111,7 @@ def _now() -> datetime:
 
 def default_http(method: str, url: str, *, params: dict[str, Any] | None = None,
                  headers: dict[str, str] | None = None, timeout_s: float = 20,
-                 content: str | None = None) -> tuple[int, Any]:
+                 content: str | None = None) -> tuple[int, Any] | tuple[int, Any, dict[str, str]]:
     """Transport httpx. Une erreur réseau devient une ``SourceError`` sans paramètres.
     ``content`` : corps texte de la requête (IGDB, Apicalypse)."""
     try:
@@ -108,9 +119,13 @@ def default_http(method: str, url: str, *, params: dict[str, Any] | None = None,
     except httpx.HTTPError as exc:
         raise SourceError(f"requête impossible sur {url} ({type(exc).__name__})") from None
     try:
-        return response.status_code, response.json()
+        body: Any = response.json()
     except ValueError:
-        return response.status_code, response.text
+        body = response.text
+    retry_after = response.headers.get("Retry-After")
+    if response.status_code == 429 and retry_after:
+        return response.status_code, body, {"Retry-After": retry_after}  # en-têtes joints : seulement pour un 429
+    return response.status_code, body
 
 
 def _safe_url(url: str, params: dict[str, Any] | None) -> str:
@@ -140,7 +155,9 @@ class _Client:
         shown = _safe_url(url, params)
         extra = {"content": content} if content is not None else {}  # un transport sans corps n'a rien à recevoir
         try:
-            status, body = self.http(method, url, params=params, headers=headers, timeout_s=self.timeout_s, **extra)
+            reply = self.http(method, url, params=params, headers=headers, timeout_s=self.timeout_s, **extra)
+            status, body = reply[0], reply[1]
+            reply_headers = reply[2] if len(reply) > 2 else {}  # un transport peut joindre les en-têtes de réponse
         except SourceError:
             raise
         except Exception as exc:  # le transport injecté peut lever n'importe quoi
@@ -153,6 +170,9 @@ class _Client:
         snippet = _redact(str(body)[:_SNIPPET_CHARS], self.secrets)
         if status in accept:
             return status, body
+        if status == 429:
+            retry_after = next((v for k, v in reply_headers.items() if k.lower() == "retry-after"), None)
+            raise RateLimited(f"HTTP 429 sur {shown} : {snippet}", retry_after)
         if not 200 <= status < 300:
             raise SourceError(f"HTTP {status} sur {shown} : {snippet}")
         if text:
@@ -629,22 +649,59 @@ def _steam_players_collector(http: Http) -> Callable[[dict[str, object], list[st
     return collect
 
 
-def _steam_followers_collector(http: Http, sleep: Callable[[float], None]) -> Callable[[dict[str, object], list[str]], dict[str, Any]]:
+def _retry_after_s(raw: str | None, clock: Clock) -> float:
+    """``Retry-After`` en secondes (entier ou date HTTP) ; absent ou illisible : 0 (le délai croissant décide)."""
+    if not raw:
+        return 0.0
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        pass
+    try:
+        return max(0.0, (parsedate_to_datetime(raw) - clock()).total_seconds())
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _steam_followers_collector(http: Http, clock: Clock, sleep: Callable[[float], None]
+                               ) -> Callable[[dict[str, object], list[str]], dict[str, Any]]:
     """Abonnés Steam par appid : ``<memberCount>`` de la page XML publique ``memberslistxml`` et rien d'autre ; un appel
-    par appid, séquentiel, ``steam_followers_pause_s`` entre deux ; page sans la balise = ``None`` (R21)."""
+    par appid, séquentiel, ``steam_followers_pause_s`` entre deux ; page sans la balise = ``None`` (R21).
+    HTTP 429 : attente croissante (pause, doublée à chaque essai, ``Retry-After`` si plus long, plafonnée à
+    ``steam_followers_retry_wait_max_s``), au plus ``steam_followers_retry_max`` réessais du même appid, chaque attente
+    journalisée. Essais épuisés : on s'arrête, les appids restants valent ``None`` et sont comptés ``rate_limited``."""
     def collect(settings: dict[str, object], appids: list[str]) -> dict[str, Any]:
         client = _client(settings, http, ())
         cap = int(settings["steam_followers_lookups_max"])  # type: ignore[call-overload]
         pause = float(settings["steam_followers_pause_s"])  # type: ignore[arg-type]
+        retries = int(settings["steam_followers_retry_max"])  # type: ignore[call-overload]
+        wait_max = float(settings["steam_followers_retry_wait_max_s"])  # type: ignore[arg-type]
         followers: dict[str, int | None] = {}
-        for index, appid in enumerate(appids[:cap]):
+        kept = appids[:cap]
+        for index, appid in enumerate(kept):
             if index:
                 sleep(pause)
-            _, body = client.request("GET", STEAM_MEMBERS_URL.format(appid=appid), None,
-                                     {"User-Agent": STEAM_USER_AGENT}, text=True)
+            attempt = 0
+            while True:
+                try:
+                    _, body = client.request("GET", STEAM_MEMBERS_URL.format(appid=appid), None,
+                                             {"User-Agent": STEAM_USER_AGENT}, text=True)
+                    break
+                except RateLimited as exc:
+                    if attempt >= retries:
+                        rest = kept[index:]
+                        log.warning("veille steam_followers : HTTP 429 persistant sur l'appid %s après %d réessai(s) ; "
+                                    "%d appid(s) non relevé(s)", appid, retries, len(rest))
+                        followers.update({a: None for a in rest})
+                        return {"followers": followers, "skipped": max(0, len(appids) - cap), "rate_limited": len(rest)}
+                    wait = min(wait_max, max(pause * 2 ** attempt, _retry_after_s(exc.retry_after, clock)))
+                    attempt += 1
+                    log.warning("veille steam_followers : HTTP 429 sur l'appid %s, attente %.1f s (réessai %d/%d)",
+                                appid, wait, attempt, retries)
+                    sleep(wait)
             found = _MEMBER_COUNT.search(body)
             followers[appid] = int(found.group(1)) if found else None
-        return {"followers": followers, "skipped": max(0, len(appids) - cap)}
+        return {"followers": followers, "skipped": max(0, len(appids) - cap), "rate_limited": 0}
 
     return collect
 
@@ -658,4 +715,4 @@ def default_collectors(http: Http | None = None, clock: Clock | None = None,
             "steam": _steam_collector(http, clock), "steam_fr": _steam_sellers_collector(http, clock),
             "igdb": _igdb_collector(http, clock, sleep or time.sleep),
             "steam_players": _steam_players_collector(http),
-            "steam_followers": _steam_followers_collector(http, sleep or time.sleep)}
+            "steam_followers": _steam_followers_collector(http, clock, sleep or time.sleep)}

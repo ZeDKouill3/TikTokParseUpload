@@ -10,6 +10,16 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ## [Non publié]
 
+### Corrigé
+
+- Veille : les abonnés Steam (`memberslistxml`) ne plantent plus toute la source sur un HTTP 429 (relevé
+  réel du 07/10 : « HTTP 429 », aucun abonné lu). Le collecteur attend (pause, doublée à chaque essai,
+  `Retry-After` s'il est plus long, plafonnée par `steam_followers_retry_wait_max_s`), réessaie le même
+  appid au plus `steam_followers_retry_max` fois et journalise chaque attente. Essais épuisés : les
+  abonnés déjà lus sont gardés, le reste vaut `null` (`counts.rate_limited`) et la source passe en
+  statut `partial` visible, les autres sources continuent. Défauts plus prudents :
+  `steam_followers_pause_s` 3 s et `steam_followers_lookups_max` 50 (au plus 60).
+
 ### Ajouté
 
 - Veille : calendrier des sorties (SPEC-df51). La section « Sorties de jeux » devient un calendrier :
