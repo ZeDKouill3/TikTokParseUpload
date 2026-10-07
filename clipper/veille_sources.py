@@ -39,7 +39,8 @@ Clock = Callable[[], datetime]
 TWITCH_TOKEN_URL = "https://id.twitch.tv/oauth2/token"
 TWITCH_API = "https://api.twitch.tv/helix"
 YOUTUBE_VIDEOS_URL = "https://www.googleapis.com/youtube/v3/videos"
-IGDB_RELEASES_URL = "https://api.igdb.com/v4/release_dates"
+IGDB_GAMES_URL = "https://api.igdb.com/v4/games"
+IGDB_STEAM_SOURCE = 1  # external_games.external_game_source de Steam
 IGDB_PAGE_SIZE = 500
 IGDB_MIN_INTERVAL_S = 0.25  # 4 requêtes/s (doc IGDB #rate-limits)
 STEAM_API = "https://api.steampowered.com"
@@ -356,7 +357,7 @@ def _twitch_collector(http: Http, clock: Clock) -> Callable[[dict[str, object]],
 
 
 # --------------------------------------------------------------------------
-# IGDB (ADR-798c, SPEC-4efa R12)
+# IGDB (ADR-798c, ADR-0944, SPEC-df51 R12)
 # --------------------------------------------------------------------------
 
 
@@ -380,27 +381,46 @@ def _midnight_utc(day: Any) -> int:
     return int(datetime(day.year, day.month, day.day, tzinfo=timezone.utc).timestamp())
 
 
-def _igdb_release(client: _Client, row: Any) -> dict[str, Any] | None:
-    """Une entrée par ligne ``release_dates`` ; ``None`` si la ligne est ignorée (sans game, sans nom, sans date)."""
-    game = row.get("game") if isinstance(row, dict) else None
-    ts = row.get("date") if isinstance(row, dict) else None
-    if not isinstance(game, dict) or not game.get("name") or isinstance(ts, bool) or not isinstance(ts, (int, float)):
+def _igdb_dated(line: Any) -> dict[str, Any] | None:
+    """Une ligne ``release_dates`` d'un jeu ; ``None`` si elle n'a pas de date (ligne « TBD »)."""
+    ts = line.get("date") if isinstance(line, dict) else None
+    if isinstance(ts, bool) or not isinstance(ts, (int, float)):
         return None
-    if "id" not in game:
-        raise client.fail(IGDB_RELEASES_URL, None, row, "game.id")
 
     def sub(key: str, field: str) -> Any:
-        value = row.get(key)
+        value = line.get(key)
         return value.get(field) if isinstance(value, dict) else None
 
+    return {"date": datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d"), "ts": ts,
+            "human": line.get("human"), "platform": sub("platform", "name"), "region": sub("release_region", "region"),
+            "status": sub("status", "name"), "date_format": sub("date_format", "format")}
+
+
+def _steam_appid(game: dict[str, Any]) -> str | None:
+    """``uid`` de la première ``external_games`` dont la source vaut Steam (1) ; ``category`` n'est jamais lu."""
+    for external in game.get("external_games") or []:
+        if isinstance(external, dict) and external.get("external_game_source") == IGDB_STEAM_SOURCE \
+                and external.get("uid") not in (None, ""):
+            return str(external["uid"])
+    return None
+
+
+def _igdb_game(client: _Client, game: Any) -> dict[str, Any] | None:
+    """Un jeu IGDB ; ``None`` s'il est inexploitable (sans nom, sans hypes entier, sans ligne datée)."""
+    if not isinstance(game, dict):
+        return None
+    if "id" not in game:
+        raise client.fail(IGDB_GAMES_URL, None, game, "id")
     hypes = game.get("hypes")
+    dated = [d for d in (_igdb_dated(line) for line in game.get("release_dates") or []) if d is not None]
+    if not game.get("name") or isinstance(hypes, bool) or not isinstance(hypes, int) or not dated:
+        return None
+    cover = game.get("cover")
     return {
         "igdb_id": str(game["id"]), "name": game["name"], "slug": game.get("slug"), "url": game.get("url"),
-        "hypes": hypes if isinstance(hypes, int) and not isinstance(hypes, bool) else None,  # absent : null, jamais 0
-        "first_release_date": game.get("first_release_date"),
-        "date": datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d"),
-        "human": row.get("human"), "platform": sub("platform", "name"), "region": sub("release_region", "region"),
-        "status": sub("status", "name"), "date_format": sub("date_format", "format"),
+        "hypes": hypes, "first_release_date": game.get("first_release_date"),
+        "cover_image_id": cover.get("image_id") if isinstance(cover, dict) else None,
+        "steam_appid": _steam_appid(game), "release_dates": dated,
     }
 
 
@@ -413,27 +433,29 @@ def _igdb_collector(http: Http, clock: Clock, sleep: Callable[[float], None]) ->
         end = _midnight_utc(today + timedelta(days=int(settings["upcoming_days"]) + 1))  # type: ignore[call-overload]
         headers = {"Client-ID": api.client_id, "Accept": "application/json"}
         too_many = "IGDB : limite de 4 requêtes/s dépassée (HTTP 429)"
-        releases: list[dict[str, Any]] = []
+        games: list[dict[str, Any]] = []
         skipped = 0
         for page in range(int(settings["igdb_pages_max"])):  # type: ignore[call-overload]
             body = (
-                "fields game.name,game.slug,game.url,game.hypes,game.first_release_date,date,human,platform.name,"
-                f"release_region.region,status.name,date_format.format; where date >= {start} & date < {end} & "
-                f"game != null; sort date asc; limit {IGDB_PAGE_SIZE}; offset {page * IGDB_PAGE_SIZE};")
+                "fields name,slug,url,hypes,first_release_date,cover.image_id,external_games.uid,"
+                "external_games.external_game_source,release_dates.date,release_dates.human,release_dates.platform.name,"
+                "release_dates.release_region.region,release_dates.status.name,release_dates.date_format.format; "
+                f"where release_dates.date >= {start} & release_dates.date < {end} & hypes >= 1; sort hypes desc; "
+                f"limit {IGDB_PAGE_SIZE}; offset {page * IGDB_PAGE_SIZE};")
             pacer.wait()
-            rows = api.call("POST", IGDB_RELEASES_URL, None, headers, content=body, on_429=too_many)
+            rows = api.call("POST", IGDB_GAMES_URL, None, headers, content=body, on_429=too_many)
             pacer.mark()
             if not isinstance(rows, list):
-                raise api.client.fail(IGDB_RELEASES_URL, None, rows, "tableau JSON")
+                raise api.client.fail(IGDB_GAMES_URL, None, rows, "tableau JSON")
             for row in rows:
-                release = _igdb_release(api.client, row)
-                if release is None:
+                game = _igdb_game(api.client, row)
+                if game is None:
                     skipped += 1
                 else:
-                    releases.append(release)
+                    games.append(game)
             if len(rows) < IGDB_PAGE_SIZE:
                 break
-        return {"releases": releases, "skipped_rows": skipped}
+        return {"games": games, "skipped_rows": skipped}
 
     return collect
 
