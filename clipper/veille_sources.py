@@ -38,6 +38,7 @@ from clipper import channel as channel_mod
 log = logging.getLogger(__name__)
 Http = Callable[..., "tuple[int, Any]"]
 Clock = Callable[[], datetime]
+Deadline = Callable[[], float]  # secondes restantes avant l'échéance globale du relevé (SPEC-85a0 R29)
 
 TWITCH_TOKEN_URL = "https://id.twitch.tv/oauth2/token"
 TWITCH_API = "https://api.twitch.tv/helix"
@@ -106,6 +107,18 @@ def check_twitch_access(url: str, timeout_s: float, *, ydl_factory: Callable[[di
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _over(deadline: Deadline | None) -> bool:
+    """L'échéance globale est passée : le collecteur s'arrête avant sa prochaine requête, pause ou essai (R29)."""
+    return deadline is not None and deadline() <= 0
+
+
+def _stopped(result: dict[str, Any], count: int) -> dict[str, Any]:
+    """``deadline_stopped`` = éléments non relevés ; la clé n'existe que si l'échéance a coupé le relevé."""
+    if count > 0:
+        result["deadline_stopped"] = count
+    return result
 
 
 # --------------------------------------------------------------------------
@@ -331,15 +344,19 @@ class _Twitch:
         return body
 
 
-def _twitch_collector(http: Http, clock: Clock) -> Callable[[dict[str, object]], dict[str, Any]]:
-    def collect(settings: dict[str, object]) -> dict[str, Any]:
+def _twitch_collector(http: Http, clock: Clock) -> Callable[..., dict[str, Any]]:
+    def collect(settings: dict[str, object], *, deadline: Deadline | None = None) -> dict[str, Any]:
         api = _Twitch(settings, http, clock)
         language = str(settings["language"])
         now = clock()
+        stopped = 0  # éléments non relevés à l'échéance (une page ou un jeu chacun)
 
         viewers: dict[str, dict[str, Any]] = {}
         cursor: str | None = None
         for _ in range(STREAM_PAGES_MAX):
+            if _over(deadline):
+                stopped += 1  # au moins une page de plus restait à lire
+                break
             params: dict[str, Any] = {"language": language, "first": 100}
             if cursor:
                 params["after"] = cursor
@@ -355,9 +372,13 @@ def _twitch_collector(http: Http, clock: Clock) -> Callable[[dict[str, object]],
                 break
 
         top_params = {"first": int(settings["twitch_top_games"])}  # type: ignore[call-overload]
-        top = api.get("games/top", top_params)
-        top_games = [g for g in _field(api.client, f"{TWITCH_API}/games/top", top_params, top, "data")
-                     if "id" in g and "name" in g]
+        if _over(deadline):
+            stopped += 1
+            top_games: list[dict[str, Any]] = []
+        else:
+            top = api.get("games/top", top_params)
+            top_games = [g for g in _field(api.client, f"{TWITCH_API}/games/top", top_params, top, "data")
+                         if "id" in g and "name" in g]
         names = {str(g["id"]): g["name"] for g in top_games}
         igdb_ids = {str(g["id"]): str(g.get("igdb_id") or "") for g in top_games}  # vide : Twitch n'a pas l'id IGDB
         for game_id, entry in viewers.items():
@@ -367,7 +388,11 @@ def _twitch_collector(http: Http, clock: Clock) -> Callable[[dict[str, object]],
 
         vods: list[dict[str, Any]] = []
         private_vods = 0
-        for game_id, entry in ranked[: int(settings["twitch_top_games"])]:  # type: ignore[call-overload]
+        queried = ranked[: int(settings["twitch_top_games"])]  # type: ignore[call-overload]
+        for index, (game_id, entry) in enumerate(queried):
+            if _over(deadline):
+                stopped += len(queried) - index
+                break
             params = {"game_id": game_id, "language": language, "period": "day", "sort": "views",
                       "type": "archive", "first": int(settings["twitch_vods_per_game"])}  # type: ignore[call-overload]
             body = api.get("videos", params)
@@ -388,9 +413,9 @@ def _twitch_collector(http: Http, clock: Clock) -> Callable[[dict[str, object]],
                     "thumbnail_url": _twitch_thumbnail(video.get("thumbnail_url")),
                     "views_per_hour": _views_per_hour(view_count, video["published_at"], now),
                 })
-        return {"games": [{"name": e["name"], "viewers_fr": e["viewers_fr"], "igdb_id": igdb_ids.get(gid, ""),
-                           "twitch_id": gid} for gid, e in ranked], "vods": vods,
-                "private_vods": private_vods}
+        return _stopped({"games": [{"name": e["name"], "viewers_fr": e["viewers_fr"], "igdb_id": igdb_ids.get(gid, ""),
+                                    "twitch_id": gid} for gid, e in ranked], "vods": vods,
+                         "private_vods": private_vods}, stopped)
 
     return collect
 
@@ -463,8 +488,10 @@ def _igdb_game(client: _Client, game: Any) -> dict[str, Any] | None:
     }
 
 
-def _igdb_collector(http: Http, clock: Clock, sleep: Callable[[float], None]) -> Callable[[dict[str, object]], dict[str, Any]]:
-    def collect(settings: dict[str, object]) -> dict[str, Any]:
+def _igdb_collector(http: Http, clock: Clock, sleep: Callable[[float], None]) -> Callable[..., dict[str, Any]]:
+    def collect(settings: dict[str, object], *, deadline: Deadline | None = None) -> dict[str, Any]:
+        if _over(deadline):
+            return _stopped({"games": [], "skipped_rows": 0}, 1)  # aucune requête, pas même le jeton
         api = _Twitch(settings, http, clock)
         pacer = _Pacer(clock, sleep)
         today = clock().astimezone(ZoneInfo(str(settings["timezone"]))).date()
@@ -474,7 +501,11 @@ def _igdb_collector(http: Http, clock: Clock, sleep: Callable[[float], None]) ->
         too_many = "IGDB : limite de 4 requêtes/s dépassée (HTTP 429)"
         games: list[dict[str, Any]] = []
         skipped = 0
+        stopped = 0
         for page in range(int(settings["igdb_pages_max"])):  # type: ignore[call-overload]
+            if page and _over(deadline):
+                stopped += 1  # au moins une page de plus restait à lire
+                break
             body = (
                 "fields name,slug,url,hypes,first_release_date,cover.image_id,external_games.uid,"
                 "external_games.external_game_source,release_dates.date,release_dates.human,release_dates.platform.name,"
@@ -494,7 +525,7 @@ def _igdb_collector(http: Http, clock: Clock, sleep: Callable[[float], None]) ->
                     games.append(game)
             if len(rows) < IGDB_PAGE_SIZE:
                 break
-        return {"games": games, "skipped_rows": skipped}
+        return _stopped({"games": games, "skipped_rows": skipped}, stopped)
 
     return collect
 
@@ -504,8 +535,10 @@ def _igdb_collector(http: Http, clock: Clock, sleep: Callable[[float], None]) ->
 # --------------------------------------------------------------------------
 
 
-def _youtube_collector(http: Http, clock: Clock) -> Callable[[dict[str, object]], dict[str, Any]]:
-    def collect(settings: dict[str, object]) -> dict[str, Any]:
+def _youtube_collector(http: Http, clock: Clock) -> Callable[..., dict[str, Any]]:
+    def collect(settings: dict[str, object], *, deadline: Deadline | None = None) -> dict[str, Any]:
+        if _over(deadline):
+            return _stopped({"videos": []}, 1)
         api_key = str(settings["youtube_api_key"])
         client = _client(settings, http, (api_key,))
         params = {"chart": "mostPopular", "regionCode": str(settings["region"]), "videoCategoryId": "20",
@@ -555,12 +588,16 @@ def _steam_name(client: _Client, appid: str) -> str:
     return name
 
 
-def _steam_collector(http: Http, clock: Clock) -> Callable[[dict[str, object]], dict[str, Any]]:
-    def collect(settings: dict[str, object]) -> dict[str, Any]:
+def _steam_collector(http: Http, clock: Clock) -> Callable[..., dict[str, Any]]:
+    def collect(settings: dict[str, object], *, deadline: Deadline | None = None) -> dict[str, Any]:
+        if _over(deadline):
+            return _stopped({"games": [], "unnamed": []}, 1)
         client = _client(settings, http, ())
         url = f"{STEAM_API}/ISteamChartsService/GetMostPlayedGames/v1/"
         _, body = client.request("GET", url, {})
         ranks = _field(client, url, {}, body, "response", "ranks")
+        if _over(deadline):
+            return _stopped({"games": [], "unnamed": []}, 1)
         _, live = client.request("GET", STEAM_CONCURRENT_URL, {})  # joueurs simultanés (ADR-05a4)
         concurrent: dict[str, int | None] = {}
         for row in _field(client, STEAM_CONCURRENT_URL, {}, live, "response", "ranks"):
@@ -573,7 +610,9 @@ def _steam_collector(http: Http, clock: Clock) -> Callable[[dict[str, object]], 
         games: list[dict[str, Any]] = []
         unnamed: list[dict[str, str]] = []
         learned = False
-        for rank in ranks[: int(settings["steam_top"])]:  # type: ignore[call-overload]
+        stopped = 0
+        top = ranks[: int(settings["steam_top"])]  # type: ignore[call-overload]
+        for index, rank in enumerate(top):
             appid = str(_field(client, url, {}, rank, "appid"))
             players = _field(client, url, {}, rank, "peak_in_game")  # pic du jour : seul chiffre du classement
             place = rank.get("rank")
@@ -582,6 +621,9 @@ def _steam_collector(http: Http, clock: Clock) -> Callable[[dict[str, object]], 
                 if lookups_left <= 0:
                     unnamed.append({"appid": appid, "reason": f"nom non demandé : limite de {int(settings['steam_name_lookups_max'])} requêtes appdetails par relevé atteinte"})  # type: ignore[call-overload]
                     continue
+                if _over(deadline):
+                    stopped = len(top) - index  # le jeu courant et les suivants restent à relever
+                    break
                 lookups_left -= 1
                 try:
                     names[appid] = _steam_name(client, appid)
@@ -596,14 +638,16 @@ def _steam_collector(http: Http, clock: Clock) -> Callable[[dict[str, object]], 
         if learned:
             with channel_mod.file_lock(path):
                 channel_mod.atomic_write_json(path, {"names": names})
-        return {"games": games, "unnamed": unnamed}
+        return _stopped({"games": games, "unnamed": unnamed}, stopped)
 
     return collect
 
 
-def _steam_sellers_collector(http: Http, clock: Clock) -> Callable[[dict[str, object]], dict[str, Any]]:
+def _steam_sellers_collector(http: Http, clock: Clock) -> Callable[..., dict[str, Any]]:
     """Top des ventes de la semaine du pays ``[veille] region`` (sans clé) ; noms fournis par l'API elle-même."""
-    def collect(settings: dict[str, object]) -> dict[str, Any]:
+    def collect(settings: dict[str, object], *, deadline: Deadline | None = None) -> dict[str, Any]:
+        if _over(deadline):
+            return _stopped({"games": []}, 1)
         client = _client(settings, http, ())
         country = str(settings["region"]).upper()
         language = _STEAM_LANGUAGES.get(str(settings["language"]).lower(), str(settings["language"]))
@@ -633,14 +677,17 @@ def current_players(settings: dict[str, object], appid: str | int, *, http: Http
     return int(_field(client, url, params, body, "response", "player_count"))
 
 
-def _steam_players_collector(http: Http) -> Callable[[dict[str, object], list[str]], dict[str, Any]]:
+def _steam_players_collector(http: Http) -> Callable[..., dict[str, Any]]:
     """Joueurs à l'instant par appid (``GetNumberOfCurrentPlayers``, sans clé), un appel par appid, dans l'ordre reçu,
     au plus ``steam_players_lookups_max`` ; 404 = appid inconnu = ``None`` ; autre échec = ``SourceError`` (R18)."""
-    def collect(settings: dict[str, object], appids: list[str]) -> dict[str, Any]:
+    def collect(settings: dict[str, object], appids: list[str], *, deadline: Deadline | None = None) -> dict[str, Any]:
         client = _client(settings, http, ())
         cap = int(settings["steam_players_lookups_max"])  # type: ignore[call-overload]
         players: dict[str, int | None] = {}
-        for appid in appids[:cap]:
+        kept = appids[:cap]
+        for index, appid in enumerate(kept):
+            if _over(deadline):
+                return _stopped({"players": players, "skipped": max(0, len(appids) - cap)}, len(kept) - index)
             params = {"appid": appid}
             status, body = client.request("GET", STEAM_PLAYERS_URL, params, accept=(404,))
             if status == 404:
@@ -670,13 +717,13 @@ def _retry_after_s(raw: str | None, clock: Clock) -> float:
 
 
 def _steam_followers_collector(http: Http, clock: Clock, sleep: Callable[[float], None]
-                               ) -> Callable[[dict[str, object], list[str]], dict[str, Any]]:
+                               ) -> Callable[..., dict[str, Any]]:
     """Abonnés Steam par appid : ``<memberCount>`` de la page XML publique ``memberslistxml`` et rien d'autre ; un appel
     par appid, séquentiel, ``steam_followers_pause_s`` entre deux ; page sans la balise = ``None`` (R21).
     HTTP 429 : attente croissante (pause, doublée à chaque essai, ``Retry-After`` si plus long, plafonnée à
     ``steam_followers_retry_wait_max_s``), au plus ``steam_followers_retry_max`` réessais du même appid, chaque attente
     journalisée. Essais épuisés : on s'arrête, les appids restants valent ``None`` et sont comptés ``rate_limited``."""
-    def collect(settings: dict[str, object], appids: list[str]) -> dict[str, Any]:
+    def collect(settings: dict[str, object], appids: list[str], *, deadline: Deadline | None = None) -> dict[str, Any]:
         client = _client(settings, http, ())
         cap = int(settings["steam_followers_lookups_max"])  # type: ignore[call-overload]
         pause = float(settings["steam_followers_pause_s"])  # type: ignore[arg-type]
@@ -685,10 +732,16 @@ def _steam_followers_collector(http: Http, clock: Clock, sleep: Callable[[float]
         followers: dict[str, int | None] = {}
         kept = appids[:cap]
         for index, appid in enumerate(kept):
+            if _over(deadline):  # avant la pause comme avant la requête
+                return _stopped({"followers": followers, "skipped": max(0, len(appids) - cap), "rate_limited": 0},
+                                len(kept) - index)
             if index:
                 sleep(pause)
             attempt = 0
             while True:
+                if _over(deadline):
+                    return _stopped({"followers": followers, "skipped": max(0, len(appids) - cap), "rate_limited": 0},
+                                    len(kept) - index)
                 try:
                     _, body = client.request("GET", STEAM_MEMBERS_URL.format(appid=appid), None,
                                              {"User-Agent": STEAM_USER_AGENT}, text=True)
@@ -702,6 +755,9 @@ def _steam_followers_collector(http: Http, clock: Clock, sleep: Callable[[float]
                         return {"followers": followers, "skipped": max(0, len(appids) - cap), "rate_limited": len(rest)}
                     wait = min(wait_max, max(pause * 2 ** attempt, _retry_after_s(exc.retry_after, clock)))
                     attempt += 1
+                    if _over(deadline):  # jamais d'attente d'un 429 au-delà de l'échéance
+                        return _stopped({"followers": followers, "skipped": max(0, len(appids) - cap),
+                                         "rate_limited": 0}, len(kept) - index)
                     log.warning("veille steam_followers : HTTP 429 sur l'appid %s, attente %.1f s (réessai %d/%d)",
                                 appid, wait, attempt, retries)
                     sleep(wait)
@@ -739,12 +795,12 @@ def _review_points(body: Any, url: str, tz: ZoneInfo) -> list[dict[str, Any]]:
 
 
 def _steam_reviews_collector(http: Http, clock: Clock, sleep: Callable[[float], None]
-                             ) -> Callable[[dict[str, object], list[str]], dict[str, Any]]:
+                             ) -> Callable[..., dict[str, Any]]:
     """Histogramme des avis Steam par appid (``appreviewhistogram``, endpoint non documenté, lu strictement, SPEC-85a0
     R24) : un appel par appid, séquentiel, ``steam_reviews_pause_s`` entre deux ; ``results.recent`` seulement.
     HTTP 429 : attente croissante (``Retry-After`` si plus long, plafonnée), réessais bornés ; épuisés : les appids
     restants valent ``None``, comptés ``rate_limited``."""
-    def collect(settings: dict[str, object], appids: list[str]) -> dict[str, Any]:
+    def collect(settings: dict[str, object], appids: list[str], *, deadline: Deadline | None = None) -> dict[str, Any]:
         client = _client(settings, http, ())
         tz = ZoneInfo(str(settings["timezone"]))
         pause = float(settings["steam_reviews_pause_s"])  # type: ignore[arg-type]
@@ -752,12 +808,16 @@ def _steam_reviews_collector(http: Http, clock: Clock, sleep: Callable[[float], 
         wait_max = float(settings["steam_reviews_retry_wait_max_s"])  # type: ignore[arg-type]
         histograms: dict[str, list[dict[str, Any]] | None] = {}
         for index, appid in enumerate(appids):
+            if _over(deadline):  # avant la pause comme avant la requête
+                return _stopped({"histograms": histograms, "skipped": 0, "rate_limited": 0}, len(appids) - index)
             if index:
                 sleep(pause)
             url = STEAM_REVIEWS_URL.format(appid=appid)
             params = {"l": "english", "review_score_preference": 0}
             attempt = 0
             while True:
+                if _over(deadline):
+                    return _stopped({"histograms": histograms, "skipped": 0, "rate_limited": 0}, len(appids) - index)
                 try:
                     _, body = client.request("GET", url, params, {"User-Agent": STEAM_REVIEWS_USER_AGENT})
                     break
@@ -770,6 +830,8 @@ def _steam_reviews_collector(http: Http, clock: Clock, sleep: Callable[[float], 
                         return {"histograms": histograms, "skipped": 0, "rate_limited": len(rest)}
                     wait = min(wait_max, max(pause * 2 ** attempt, _retry_after_s(exc.retry_after, clock)))
                     attempt += 1
+                    if _over(deadline):  # jamais d'attente d'un 429 au-delà de l'échéance
+                        return _stopped({"histograms": histograms, "skipped": 0, "rate_limited": 0}, len(appids) - index)
                     log.warning("veille steam_reviews : HTTP 429 sur l'appid %s, attente %.1f s (réessai %d/%d)",
                                 appid, wait, attempt, retries)
                     sleep(wait)
@@ -794,13 +856,15 @@ def _helix_wait_s(exc: RateLimited, wait_max: float, clock: Clock) -> float:
 
 
 def _twitch_vods_collector(http: Http, clock: Clock, sleep: Callable[[float], None]
-                           ) -> Callable[[dict[str, object], list[str]], dict[str, Any]]:
+                           ) -> Callable[..., dict[str, Any]]:
     """VOD FR d'un mois par jeu (Helix Get Videos, ``period=month``, SPEC-85a0 R25) : par jour local, ``vods`` et
     ``views`` ; pages par curseur, au plus ``twitch_history_pages_max`` (Twitch coupe à 500 vidéos). ``since`` = jour de
     la plus ancienne vidéo rendue si un curseur reste (les jours antérieurs sont inconnus, absents), sinon le premier
     jour de la fenêtre (un jour sans VOD vaut alors 0 : mesuré). HTTP 429 : attente jusqu'à ``Ratelimit-Reset``,
     réessais bornés ; épuisés : le jeu et les suivants valent ``None``, comptés ``rate_limited``."""
-    def collect(settings: dict[str, object], game_ids: list[str]) -> dict[str, Any]:
+    def collect(settings: dict[str, object], game_ids: list[str], *, deadline: Deadline | None = None) -> dict[str, Any]:
+        if _over(deadline):
+            return _stopped({"vods": {}, "skipped": 0, "rate_limited": 0}, len(game_ids))
         api = _Twitch(settings, http, clock)
         tz = ZoneInfo(str(settings["timezone"]))
         today = clock().astimezone(tz).date()
@@ -815,6 +879,8 @@ def _twitch_vods_collector(http: Http, clock: Clock, sleep: Callable[[float], No
             oldest: date | None = None
             cursor: str | None = None
             for _ in range(pages_max):
+                if _over(deadline):  # le jeu en cours est à demi lu : écarté, jamais une série tronquée
+                    return _stopped({"vods": result, "skipped": 0, "rate_limited": 0}, len(game_ids) - index)
                 params: dict[str, Any] = {"game_id": game_id, "language": str(settings["language"]), "period": "month",
                                           "type": "archive", "sort": "time", "first": 100}
                 if cursor:
@@ -833,6 +899,8 @@ def _twitch_vods_collector(http: Http, clock: Clock, sleep: Callable[[float], No
                             return {"vods": result, "skipped": 0, "rate_limited": len(rest)}
                         wait = _helix_wait_s(exc, wait_max, clock)
                         attempt += 1
+                        if _over(deadline):
+                            return _stopped({"vods": result, "skipped": 0, "rate_limited": 0}, len(game_ids) - index)
                         log.warning("veille twitch_vods_30d : HTTP 429 sur le jeu %s, attente %.1f s (réessai %d/%d)",
                                     game_id, wait, attempt, retries)
                         sleep(wait)
