@@ -45,6 +45,26 @@ output_dir = "output"
 # stats_scroll_rounds = 10  # limite de securite du defilement de la liste des posts (atteinte : releve arrete, journalise)
 # stats_empty_wait_s = 8    # attente de la liste avant de conclure « aucun post » (compte neuf)
 
+# [action]  # etape action (SPEC-b0f3, ADR-4e57) : passages d'action des VOD gaming (pics audio, plans, images decrites par le LLM)
+# # Desactivee par defaut : action.json vide, aucun appel LLM, scenes.json inchange. Activee (style gaming
+# # action), elle pilote aussi les fenetres de pics hors parole de l'etape scenes ; relancer scenes --force.
+# enabled = false
+# window_seconds = 30          # fenetre d'analyse (s)
+# step_seconds = 15            # pas entre deux fenetres (0 < pas <= fenetre)
+# audio_weight = 1.0           # poids des pics audio dans le score d'une fenetre
+# audio_peaks_full = 3         # pics audio d'une fenetre qui valent un signal complet
+# audio_peak_min_db = 6.0      # un pic sous ce seuil (dB au-dessus du fond) ne compte pas
+# cuts_weight = 1.0            # poids de la densite de changements de plan
+# cuts_ratio_full = 3.0        # densite (multiple de la mediane de la video) qui vaut un signal complet
+# min_score = 0.6              # score minimal d'une fenetre pour entrer dans un passage (0 < score <= 1)
+# max_passage_seconds = 90     # un passage plus long est coupe (>= window_seconds)
+# max_passages_per_hour = 12   # plafond de passages par heure de VOD
+# frames_per_passage = 4       # images choisies par passage (jamais extraites ici : celles de scenes)
+# max_images_per_hour = 48     # plafond d'images envoyees au LLM par heure de VOD
+# batch_size = 8               # images par planche, un appel LLM par planche (usage « action », modele rapide)
+# max_width = 768              # largeur max de chaque image de la planche
+# parallel = 4                 # planches decrites en meme temps
+
 # [youtube]  # comptes YouTube (SPEC-5e50) : YouTube Studio dans un vrai Chrome, un seul compte pilote a la fois
 # max_posts_per_day = 3      # plafond de publications par compte et par jour
 # min_gap_minutes = 120      # ecart minimal entre deux publications d'un compte

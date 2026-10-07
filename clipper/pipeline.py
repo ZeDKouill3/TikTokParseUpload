@@ -3,8 +3,13 @@
 
 Enchainement, par video (``STEPS``, dans l'ordre d'execution) :
 
-    download, transcribe, scenes, audio, moments, vision, parts,
+    download, transcribe, audio, scenes, action, moments, vision, parts,
     captions, reframe, subtitles, render, qa
+
+- ``audio`` tourne avant ``scenes`` (SPEC-b0f3 R4) : ``scenes`` ne decode les
+  fenetres de pics hors parole que si ``[action] enabled`` (``peak_windows``,
+  positionne ici seul, ADR-4e57) ; ``action`` (desactivee par defaut : fichier
+  vide) detecte les passages d'action avant ``moments`` ;
 
 - chaque etape saute d'elle-meme ce qui est deja fait (resultat present sous
   workspace/<video_id>/ ou output/<video_id>/), sauf ``force`` ;
@@ -87,6 +92,7 @@ from pathlib import Path
 from typing import Any
 
 from clipper import (
+    action,
     audio,
     captions,
     channel as channel_mod,
@@ -117,7 +123,7 @@ CONFIG_DEFAULTS: dict[str, object] = {
 }
 
 STEPS = (
-    "download", "transcribe", "scenes", "audio", "moments", "vision", "parts",
+    "download", "transcribe", "audio", "scenes", "action", "moments", "vision", "parts",
     "captions", "reframe", "subtitles", "render", "qa",
 )
 STEP_STATUSES = ("pending", "running", "done", "failed")
@@ -221,7 +227,14 @@ def load_state(video_id: str, *, config: Config | None = None) -> dict[str, Any]
     path = _video_dir(video_id, config) / STATE_FILE
     if not path.exists():
         raise PipelineError(f"aucun etat pour la video {video_id} ({path}) : lancer d'abord 'run <url>'")
-    return json.loads(path.read_text(encoding="utf-8"))
+    state = json.loads(path.read_text(encoding="utf-8"))
+    steps = state.get("steps")
+    if isinstance(steps, dict) and any(name not in steps for name in STEPS):
+        # Etat ecrit avant l'ajout d'une etape (ex. action) : elle est simplement a faire.
+        pending = {"status": "pending", "reason": None, "started_at": None, "finished_at": None, "progress": None}
+        state["steps"] = {**{name: steps.get(name, dict(pending)) for name in STEPS},
+                          **{name: step for name, step in steps.items() if name not in STEPS}}
+    return state
 
 
 def _read_json(path: Path) -> Any:
@@ -406,14 +419,21 @@ class _Run:
 
     def scenes(self) -> None:
         settings = self.config.section("scenes")
+        # peak_windows : positionne ici seul, d'apres [action] enabled (SPEC-b0f3 R4bis).
+        peak_windows = bool(self.config.section("action")["enabled"])
         scenes.detect_scenes(self.dir / f"{self.video_id}.mp4", self.ws, self.video_id,
-                             force=self._forced("scenes"), **settings, **self.opts("scenes"))
+                             force=self._forced("scenes"), peak_windows=peak_windows,
+                             **settings, **self.opts("scenes"))
 
     def audio(self) -> None:
         s = self.config.section("audio")
         audio.run(self.video_id, self.ws, force=self._forced("audio"), sample_rate=s["sample_rate"],
                   window_seconds=s["window_seconds"], median_window_seconds=s["median_window_seconds"],
                   threshold_db=s["peak_threshold_db"], **self.opts("audio"))
+
+    def action(self) -> None:
+        action.run(self.video_id, self.ws, config=self.config, force=self._forced("action"),
+                   **self.opts("action"))
 
     def _moments(self, force: bool) -> None:
         k = int(self.config.section("pipeline")["feedback_examples"])

@@ -16,10 +16,15 @@ reframe coupe les plans de scenes.json exactement a [start, end] du moment ;
 decoder toute la video (jusqu'a 1 h 52 de silence sur une VOD de 3 h) est donc
 du temps perdu. ``detect_scenes`` ne decode que l'union des plages de parole
 de transcript.json (segments), elargies de ``speech_margin_seconds`` (ponts
-les silences courts entre deux lignes d'un meme moment), plus, si audio.json
-existe deja (l'etape audio tourne apres scenes dans clipper.pipeline.STEPS :
-le cas normal ne le voit jamais, seulement un ``--force`` rejoue apres coup),
-une fenetre de la meme marge autour de chaque pic hors parole. transcript.json
+les silences courts entre deux lignes d'un meme moment), plus, avec
+``peak_windows=True``, une fenetre de la meme marge autour de chaque pic hors
+parole d'audio.json (SPEC-b0f3 R4bis, ADR-4e57 : l'etape audio tourne AVANT
+scenes dans clipper.pipeline.STEPS, qui positionne seul ``peak_windows`` d'apres
+``[action] enabled`` ; scenes ne lit la config d'aucune autre etape). A False
+(defaut), audio.json est ignore meme present et scenes.json est identique
+octet pour octet a celui d'avant. A True, audio.json est une entree
+obligatoire (ScenesError s'il manque) et scenes.json porte
+``"peak_windows": true``. transcript.json
 est une entree obligatoire (comme scenes.json pour clipper.reframe) : absent,
 ou sans aucun segment de parole, l'etape echoue plutot que de decoder toute
 la video en silence (ADR-ad2e).
@@ -109,12 +114,6 @@ def _read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _read_json_optional(path: Path) -> Any:
-    if not path.exists():
-        return {}
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
 def _merge_windows(windows: list[tuple[float, float]]) -> list[tuple[float, float]]:
     """Sorted, overlapping or touching windows collapsed into one each."""
     if not windows:
@@ -133,7 +132,8 @@ def _speech_windows(
     transcript: dict[str, Any], audio: dict[str, Any], margin: float
 ) -> list[tuple[float, float]]:
     """Union of transcript.json speech segments, plus audio.json's out-of-speech
-    peaks when that file already exists, each widened by ``margin``."""
+    peaks (``audio`` is empty unless peak windows are on), each widened by
+    ``margin``."""
     windows: list[tuple[float, float]] = []
     for segment in transcript.get("segments") or []:
         windows.append((max(0.0, segment["start"] - margin), segment["end"] + margin))
@@ -283,6 +283,7 @@ def detect_scenes(
     decoder: str = "",
     extract_parallel: int = 4,
     speech_margin_seconds: float = 5.0,
+    peak_windows: bool = False,
     ffmpeg_bin: str = "ffmpeg",
     ffprobe_bin: str = "ffprobe",
     force: bool = False,
@@ -297,9 +298,11 @@ def detect_scenes(
     Only the union of transcript.json's speech segments (widened by
     ``speech_margin_seconds``) is decoded -- a moment can only come from a
     transcript line (clipper.moments), so nothing outside speech can ever be
-    cut into. audio.json's out-of-speech peaks are included too when that
-    file already exists (it normally does not: clipper.pipeline runs audio
-    after scenes). transcript.json is a required input, like scenes.json is
+    cut into. With ``peak_windows`` (set by clipper.pipeline alone, from
+    ``[action] enabled``), audio.json's out-of-speech peaks are included too:
+    audio runs before scenes and the file is then a required input (SPEC-b0f3
+    R4bis); without it audio.json is ignored even when present and scenes.json
+    is unchanged byte for byte. transcript.json is a required input, like scenes.json is
     for clipper.reframe: missing, or with no speech segment at all, the step
     fails rather than silently decoding the whole video (ADR-ad2e).
     """
@@ -316,7 +319,7 @@ def detect_scenes(
         return json.loads(scenes_file.read_text(encoding="utf-8"))
 
     transcript = _read_json(video_dir / "transcript.json")
-    audio = _read_json_optional(video_dir / "audio.json")
+    audio = _read_json(video_dir / "audio.json") if peak_windows else {}
     windows = _speech_windows(transcript, audio, speech_margin_seconds)
     if not windows:
         raise ScenesError(
@@ -359,5 +362,7 @@ def detect_scenes(
         "scenes": [{"start": start, "end": end} for start, end in scene_list],
         "frames": frames,
     }
+    if peak_windows:
+        result["peak_windows"] = True
     scenes_file.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     return result

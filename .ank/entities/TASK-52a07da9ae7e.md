@@ -5,7 +5,7 @@ slug: jury-action-3-6-tape-action-passages-d-action-pa
 title: "Jury action 3/6 : étape action (passages d'action par pics audio et densité de plans, images de scenes décrites par le LLM, coût plafonné), audio avant scenes dans pipeline.STEPS (SPEC-b0f3 R4-R9)"
 created: 2026-10-07T13:11:47Z
 author: w-juryplan
-status: open
+status: done
 scope:
   - clipper/action.py
   - clipper/pipeline.py
@@ -24,8 +24,15 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/945b2e99cf94@8bc9df6
+    tree: scope/a8113e2c376c
+    criteria: b7f45b93a8e9
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 2
+version: 4
 ---
 
 Implémente ADR-4e5789e22495 (ordre des étapes, nouvelle source de candidats) et R4-R9 de SPEC-b0f3d20f4191. Attend la bibliothèque montage (TASK-151c). Détection déterministe, LLM seulement pour décrire les planches ; aucune extraction d'image dans cette étape (scenes voit désormais audio.json). Les workspaces existants gardent leur scenes.json.

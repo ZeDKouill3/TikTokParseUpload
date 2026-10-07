@@ -399,3 +399,27 @@ def test_write_config_leaves_original_file_intact_on_config_error(isolated_cwd):
 
     assert path.read_text() == original
     assert not path.with_suffix(".toml.tmp").exists()
+
+
+def test_action_table_is_valid_and_refuses_unknown_keys(tmp_path):
+    from clipper.config import ConfigError, load_config
+
+    ok = tmp_path / "ok.toml"
+    ok.write_text('[action]\nenabled = true\nframes_per_passage = 2\n', encoding="utf-8")
+    assert load_config(ok).section("action")["frames_per_passage"] == 2
+    assert load_config(ok).section("action")["window_seconds"] == 30
+
+    bad = tmp_path / "bad.toml"
+    bad.write_text('[action]\nunknown_key = 1\n', encoding="utf-8")
+    with pytest.raises(ConfigError, match="unknown_key"):
+        load_config(bad)
+
+
+def test_config_example_documents_every_action_setting():
+    from clipper.action import CONFIG_DEFAULTS
+
+    for name in ("config.example.toml", "clipper/assets/config.example.toml"):
+        text = (REPO_ROOT / name).read_text(encoding="utf-8")
+        assert "[action]" in text, name
+        for key in CONFIG_DEFAULTS:
+            assert f"# {key} = " in text, (name, key)
