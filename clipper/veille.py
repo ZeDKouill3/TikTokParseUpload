@@ -960,6 +960,28 @@ def _releases_block(day_state: dict[str, Any], table: dict[str, object]) -> list
     return lines
 
 
+def _bilan_lines(table: dict[str, object]) -> list[str]:
+    """Bilan des VOD choisies (``bilan.json``, écrit par ``clipper.learning``, SPEC-00db R8) ; illisible = erreur."""
+    path = _state_dir(table) / "bilan.json"
+    report = _read_json(path, None)
+    if report is None:
+        entries: list[dict[str, Any]] = []
+    elif (isinstance(report, dict) and isinstance(report.get("entries"), list)
+          and all(isinstance(e, dict) for e in report["entries"])):
+        entries = report["entries"]
+    else:
+        raise VeilleError(f"fichier d'état de la veille illisible : {path.name} (objet avec une liste « entries » attendu)")
+    if not entries:
+        return ["", "Bilan des VOD choisies récemment : aucun (pas encore de résultats)"]
+    lines = ["", "Bilan des VOD choisies récemment (vues à maturité, rang 0-1 dans le compte) :"]
+    for e in entries:
+        result = (f"rang_moyen={_fmt(e.get('views_percentile_mean'))} vues_max={_fmt(e.get('views_at_maturity_max'))}"
+                  if not e.get("missing") else f"résultat inconnu ({e['missing']})")
+        lines.append(f"- {str(e.get('title'))[:80]!r} jeu={str(_fmt(e.get('game_name')))[:60]} "
+                     f"chaîne={str(_fmt(e.get('channel_name')))[:60]} clips_publiés={_fmt(e.get('clips_published'))} {result}")
+    return lines
+
+
 def _prompt(day_state: dict[str, Any], table: dict[str, object]) -> str:
     taste = str(table["taste"]).strip() or "aucune préférence déclarée"
     lines = [
@@ -996,6 +1018,7 @@ def _prompt(day_state: dict[str, Any], table: dict[str, object]) -> str:
             f"sortie_j_plus={_fmt((game.get('release') or {}).get('days_since'))} "
             f"hypes_igdb={_fmt((game.get('release') or {}).get('hypes'))}")
     lines += _releases_block(day_state, table)
+    lines += _bilan_lines(table)
     lines += ["", "Candidats (VOD) :"]
     games_by_key = {g["key"]: g for g in day_state["games"]}
     for c in day_state["candidates"]:

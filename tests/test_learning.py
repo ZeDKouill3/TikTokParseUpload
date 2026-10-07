@@ -750,3 +750,149 @@ def test_decide_proposal_marks_it_once_and_unknown_is_404(tmp_path):
     with pytest.raises(learning.ProposalError) as unknown:
         learning.decide_proposal(config, "retention", 9, "refused", by="web")
     assert unknown.value.status == 404
+
+
+# ---------------------------------------------------------------- bilan des VOD de veille (TASK-9dac, SPEC-00db R8)
+
+
+def _veille_dir(config) -> Path:
+    path = Path(config.section("veille")["state_dir"])
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _bilan_config(tmp_path, **learning_overrides) -> Config:
+    config = _config(tmp_path, **learning_overrides)
+    config._sections["veille"] = {"state_dir": str(tmp_path / "veille")}
+    return config
+
+
+def _queue_vod(config, video, *, day="2026-10-05", at="2026-10-05T08:00:00+00:00", title=None):
+    """Une VOD mise en file : seen.json (queued) + instantané du candidat dans days/<jour>.json."""
+    sdir = _veille_dir(config)
+    seen_path = sdir / "seen.json"
+    seen = _read(seen_path) if seen_path.exists() else {"queued": [], "ignored": []}
+    cid = f"twitch:{video}"
+    seen["queued"].append({"candidate_id": cid, "video_id": video, "url": f"https://x/{video}", "date": day,
+                           "channel": "chaine", "queue_entry_id": "q", "at": at})
+    seen_path.write_text(json.dumps(seen), encoding="utf-8")
+    day_path = sdir / "days" / f"{day}.json"
+    day_path.parent.mkdir(parents=True, exist_ok=True)
+    state = _read(day_path) if day_path.exists() else {"proposals": []}
+    state["proposals"].append({"candidate_id": cid, "candidate": {
+        "id": cid, "source": "twitch", "video_id": video, "title": title or f"Titre {video}",
+        "channel_name": "streamer_a", "game_name": "Jeu Alpha"}})
+    day_path.write_text(json.dumps(state), encoding="utf-8")
+
+
+def _bilan(config) -> dict:
+    return _read(Path(config.section("veille")["state_dir"]) / "bilan.json")
+
+
+def _by_video(bilan) -> dict:
+    return {e["video_id"]: e for e in bilan["entries"]}
+
+
+def test_veille_report_settings_declared():
+    assert learning.CONFIG_DEFAULTS["veille_report_days"] == 30
+    assert learning.CONFIG_DEFAULTS["veille_report_max"] == 20
+
+
+def test_veille_report_gives_figures_from_the_journal_and_a_reason_when_absent(tmp_path):
+    config = _bilan_config(tmp_path)
+    _linked_clip(config, "03")  # VIDEO : clip publie et mur, compte eligible
+    _scored_account(config, clip_views=750)
+    learning.sync(NOW, config=config)
+    _queue_vod(config, VIDEO, title="Un titre")
+    _queue_vod(config, "NOCLIPVIDEO")
+    _sidecar(config, "01", video="NOTPUBLISHED", post_id=None)  # sidecar sans tiktok_post renseigne : voir plus bas
+    path = Path(config.output_dir) / "NOTPUBLISHED" / "01.json"
+    path.write_text(json.dumps({"caption": "c"}), encoding="utf-8")
+    _queue_vod(config, "NOTPUBLISHED")
+
+    learning.write_veille_report(NOW, config=config)
+
+    bilan = _bilan(config)
+    assert bilan["days"] == 30 and bilan["computed_at"].startswith("2026-10-10")
+    entries = _by_video(bilan)
+    stats = [e for e in _journal(config) if e["kind"] == "stats"][0]["stats"]
+    assert entries[VIDEO] == {
+        "picked_on": "2026-10-05", "candidate_id": f"twitch:{VIDEO}", "source": "twitch", "game_name": "Jeu Alpha",
+        "channel_name": "streamer_a", "title": "Un titre", "video_id": VIDEO, "clips_published": 1, "clips_mature": 1,
+        "views_percentile_mean": stats["views_percentile"], "views_at_maturity_max": stats["views_at_maturity"],
+        "missing": None}
+    assert stats["views_at_maturity"] == 750
+    for video, reason, published in (("NOCLIPVIDEO", "no_clips", 0), ("NOTPUBLISHED", "not_published", 0)):
+        assert entries[video]["missing"] == reason and entries[video]["clips_published"] == published
+        assert entries[video]["views_percentile_mean"] is None and entries[video]["views_at_maturity_max"] is None
+        assert entries[video]["clips_mature"] == 0
+
+
+def test_veille_report_immature_and_account_below_min(tmp_path):
+    config = _bilan_config(tmp_path)
+    _linked_clip(config, "03")  # jeune : un seul releve recent
+    _stats_snapshot(config, "2026-10-09T12:00:00+00:00", {**_others(range(100, 1100, 100)), POST: ("2026-10-08T09:00:00", 5, {})})
+    _linked_clip(config, "01", post_id="7000000000000000202", account=OTHER, video="OTHERVIDEO")
+    _stats_snapshot(config, "2026-10-01T12:00:00+00:00", {"7000000000000000202": ("2026-09-20T09:00:00", 50, {})}, account=OTHER)
+    _queue_vod(config, VIDEO)
+    _queue_vod(config, "OTHERVIDEO")
+    learning.sync(NOW, config=config)
+
+    learning.write_veille_report(NOW, config=config)
+
+    entries = _by_video(_bilan(config))
+    assert entries[VIDEO]["missing"] == "immature" and entries[VIDEO]["clips_published"] == 1
+    assert entries["OTHERVIDEO"]["missing"] == "account_below_min"
+    assert entries[VIDEO]["views_at_maturity_max"] is None
+
+
+def test_veille_report_keeps_recent_vods_newest_first_within_the_cap(tmp_path):
+    config = _bilan_config(tmp_path, veille_report_days=10, veille_report_max=2)
+    _queue_vod(config, "OLDVIDEO", day="2026-09-20", at="2026-09-20T08:00:00+00:00")
+    _queue_vod(config, "VIDEOA", day="2026-10-03", at="2026-10-03T08:00:00+00:00")
+    _queue_vod(config, "VIDEOB", day="2026-10-09", at="2026-10-09T08:00:00+00:00")
+    _queue_vod(config, "VIDEOC", day="2026-10-06", at="2026-10-06T08:00:00+00:00")
+
+    learning.write_veille_report(NOW, config=config)
+
+    bilan = _bilan(config)
+    assert bilan["days"] == 10
+    assert [e["video_id"] for e in bilan["entries"]] == ["VIDEOB", "VIDEOC"]
+
+
+def test_veille_report_without_seen_file_writes_an_empty_report(tmp_path):
+    config = _bilan_config(tmp_path)
+    learning.write_veille_report(NOW, config=config)
+    assert _bilan(config)["entries"] == []
+
+
+def test_veille_report_twice_gives_the_same_content(tmp_path):
+    config = _bilan_config(tmp_path)
+    _queue_vod(config, VIDEO)
+    learning.write_veille_report(NOW, config=config)
+    first = _bilan(config)
+    learning.write_veille_report(NOW + timedelta(hours=1), config=config)
+    second = _bilan(config)
+    assert first["computed_at"] != second["computed_at"]
+    assert {**first, "computed_at": None} == {**second, "computed_at": None}
+
+
+def test_veille_report_unreadable_seen_is_an_error_naming_the_file(tmp_path):
+    config = _bilan_config(tmp_path)
+    (_veille_dir(config) / "seen.json").write_text("{pas du json", encoding="utf-8")
+    with pytest.raises(learning.LearningError, match="seen.json"):
+        learning.write_veille_report(NOW, config=config)
+
+
+def test_run_if_due_writes_the_veille_report_after_each_sync(tmp_path, monkeypatch):
+    config = _bilan_config(tmp_path)
+    order = []
+    monkeypatch.setattr(learning, "link_if_due", lambda *a, **k: [])
+    monkeypatch.setattr(learning, "_snapshot_newer_than_sync", lambda *a, **k: True)
+    monkeypatch.setattr(learning, "sync", lambda *a, **k: order.append("sync"))
+    monkeypatch.setattr(learning, "coach_if_due", lambda *a, **k: [])
+    monkeypatch.setattr(learning, "write_veille_report", lambda *a, **k: order.append("bilan"))
+
+    learning.run_if_due(NOW, config=config)
+
+    assert order == ["sync", "bilan"]

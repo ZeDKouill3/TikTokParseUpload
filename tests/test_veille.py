@@ -1864,3 +1864,86 @@ def test_picks_without_a_game_key_share_no_game_cap(tmp_path):
     with llm.use_backend(FakeBackend([_picks("twitch:AAA", "twitch:BBB", "twitch:CCC")])):
         out = veille.decide(state, _make_config(tmp_path, max_vods_per_day=3, max_vods_per_game=1))
     assert out["llm"]["status"] == "ok" and len(out["proposals"]) == 3
+
+
+# ==========================================================================
+# TASK-9dac : bilan des VOD choisies donné à Claude (SPEC-00db R8)
+# ==========================================================================
+
+_BILAN_HEADER = "Bilan des VOD choisies récemment (vues à maturité, rang 0-1 dans le compte)"
+_BILAN_NONE = "Bilan des VOD choisies récemment : aucun (pas encore de résultats)"
+
+
+def _bilan_entry(**over):
+    return {"picked_on": "2026-10-05", "candidate_id": "twitch:OLD1", "source": "twitch", "game_name": "Jeu Beta",
+            "channel_name": "streamer_b", "title": "Ancienne VOD", "video_id": "OLD1", "clips_published": 2,
+            "clips_mature": 2, "views_percentile_mean": 0.75, "views_at_maturity_max": 4200, "missing": None, **over}
+
+
+def _write_bilan(tmp_path, entries):
+    path = tmp_path / "state" / "veille" / "bilan.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"computed_at": NOW.isoformat(), "days": 30, "entries": entries}), encoding="utf-8")
+
+
+def _prompt_with_bilan(tmp_path):
+    fake = FakeBackend([_picks()])
+    with llm.use_backend(fake):
+        veille.decide(_day_state("twitch:AAA"), _make_config(tmp_path))
+    return fake.calls[0].prompt
+
+
+def test_prompt_carries_one_line_per_bilan_entry_before_the_candidates(tmp_path):
+    _write_bilan(tmp_path, [
+        _bilan_entry(),
+        _bilan_entry(candidate_id="twitch:NEW2", video_id="NEW2", title="Récente VOD", game_name="Jeu Gamma",
+                     channel_name="streamer_c", clips_published=1, clips_mature=0, views_percentile_mean=None,
+                     views_at_maturity_max=None, missing="immature")])
+    prompt = _prompt_with_bilan(tmp_path)
+    head, tail = prompt.split("Candidats (VOD) :")
+    assert _BILAN_HEADER in head and _BILAN_NONE not in prompt
+    block = head.split(_BILAN_HEADER, 1)[1].strip().splitlines()
+    lines = [line for line in block if line.startswith("- ")]
+    assert len(lines) == 2
+    for text in ("Ancienne VOD", "Jeu Beta", "streamer_b", "0.75", "4200"):
+        assert text in lines[0]
+    for text in ("Récente VOD", "Jeu Gamma", "streamer_c", "immature"):
+        assert text in lines[1]
+    assert "4200" not in lines[1] and "None" not in lines[1]
+
+
+def test_prompt_says_no_bilan_without_file(tmp_path):
+    prompt = _prompt_with_bilan(tmp_path)
+    assert _BILAN_NONE in prompt and _BILAN_HEADER not in prompt
+    assert prompt.index(_BILAN_NONE) < prompt.index("Candidats (VOD) :")
+
+
+def test_prompt_says_no_bilan_when_the_file_has_no_entry(tmp_path):
+    _write_bilan(tmp_path, [])
+    assert _BILAN_NONE in _prompt_with_bilan(tmp_path)
+
+
+def test_unreadable_bilan_is_a_veille_error_naming_the_file(tmp_path):
+    path = tmp_path / "state" / "veille" / "bilan.json"
+    path.parent.mkdir(parents=True)
+    path.write_text("{pas du json", encoding="utf-8")
+    fake = FakeBackend([_picks()])
+    with llm.use_backend(fake), pytest.raises(veille.VeilleError, match="bilan.json"):
+        veille.decide(_day_state("twitch:AAA"), _make_config(tmp_path))
+    assert fake.calls == []
+
+
+def test_bilan_without_entries_list_is_a_veille_error_naming_the_file(tmp_path):
+    path = tmp_path / "state" / "veille" / "bilan.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"computed_at": "x"}), encoding="utf-8")
+    with llm.use_backend(FakeBackend([_picks()])), pytest.raises(veille.VeilleError, match="bilan.json"):
+        veille.decide(_day_state("twitch:AAA"), _make_config(tmp_path))
+
+
+def test_bilan_block_size_is_bounded(tmp_path):
+    _write_bilan(tmp_path, [_bilan_entry(title="T" * 5000, game_name="G" * 5000, channel_name="C" * 5000)
+                            for _ in range(20)])
+    prompt = _prompt_with_bilan(tmp_path)
+    block = prompt.split(_BILAN_HEADER, 1)[1].split("Candidats (VOD) :")[0]
+    assert len(block) < 20 * 400
