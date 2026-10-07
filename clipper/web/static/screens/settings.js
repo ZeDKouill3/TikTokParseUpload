@@ -257,7 +257,7 @@ function setVeilleKey(key, label) {
 }
 
 function setVeille() {
-  const shown = ["enabled", "run_at", "max_vods_per_day", "best_clips_per_day", "language", "region", "rise_min_pct", "baseline_days", "upcoming_days", "release_window_days", "igdb_min_hypes", "igdb_recent_max", "igdb_upcoming_max", "steam_players_lookups_max", "steam_followers_lookups_max", "steam_followers_pause_s", "community_min_steam_players", "community_min_steam_followers", "community_min_twitch_viewers", "community_min_hypes", "max_vods_per_game"];
+  const shown = ["enabled", "run_at", "max_vods_per_day", "best_clips_per_day", "language", "region", "rise_min_pct", "baseline_days", "upcoming_days", "release_window_days", "igdb_min_hypes", "igdb_recent_max", "igdb_upcoming_max", "steam_players_lookups_max", "steam_followers_lookups_max", "steam_followers_pause_s", "community_min_steam_players", "community_min_steam_followers", "community_min_twitch_viewers", "community_min_hypes", "max_vods_per_game", "trend_days", "trend_games_max", "veille_deadline_s", "twitch_access_attempts", "twitch_access_retry_pause_s", "steam_reviews_pause_s", "twitch_history_pages_max"];
   const hidden = [...shown, "taste", "state_dir", ...SET_VEILLE_KEYS.map(([k]) => k)];
   const taste = setEffective(["veille", "taste"]);
   return `<section class="panel" id="set-veille"><div class="panel-head"><h2>Veille</h2><span class="muted mono">[veille]</span></div><div class="panel-pad">

@@ -5,7 +5,7 @@ slug: veille-historique-3-3-cran-veille-sources-steam
 title: "Veille historique (5/5) : écran Veille (sources « Steam (avis 30 j) » et « Twitch (VOD 30 j) », compteurs d'écartées par raison, relevé incomplet par échéance, courbe 30 j par jeu suivi, résumé sur les propositions, plus d'« Accès non vérifié »), /api/veille et réglages (onze clés R22, twitch_access_check_max ignorée), GUIDE, CHANGELOG (SPEC-85a0 R27)"
 created: 2026-10-07T13:02:17Z
 author: w-histplan
-status: open
+status: done
 scope:
   - clipper/web/app.py
   - clipper/web/static/screens/veille.js
@@ -19,8 +19,15 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/c2cc2b43a4bc@afdb822
+    tree: scope/c99b4fdc6466
+    criteria: 76dced0dcbcc
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 5
+version: 7
 ---
 
 Dépend des champs écrits par les tâches 1/3 et 2/3 (trend_30d, counts, excluded). Capture réelle de l'écran souhaitée dans le log de la tâche (état réel après un relevé), comme pour TASK-68b0.

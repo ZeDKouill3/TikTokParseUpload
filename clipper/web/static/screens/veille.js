@@ -7,8 +7,10 @@
 "use strict";
 
 const VEILLE_STALE_MS = 4000;
-const SOURCE_LABELS = { twitch: "Twitch", youtube: "YouTube", steam: "Steam", steam_fr: "Ventes Steam FR", igdb: "IGDB (sorties)", steam_players: "Steam (joueurs hors top)", steam_followers: "Steam (abonnés)" };
-const COUNT_LABELS = { rows: "lignes", recent: "récentes", upcoming: "à venir", skipped_rows: "lignes ignorées", games: "jeux", vods: "VOD", videos: "vidéos", private: "VOD réservées écartées", restricted: "VOD abonnés écartées", requested: "demandés", found: "trouvés", unknown: "inconnus", skipped: "coupés au plafond" };
+const SOURCE_LABELS = { twitch: "Twitch", youtube: "YouTube", steam: "Steam", steam_fr: "Ventes Steam FR", igdb: "IGDB (sorties)", steam_players: "Steam (joueurs hors top)", steam_followers: "Steam (abonnés)", steam_reviews: "Steam (avis 30 j)", twitch_vods_30d: "Twitch (VOD 30 j)" };
+const COUNT_LABELS = { rows: "lignes", recent: "récentes", upcoming: "à venir", skipped_rows: "lignes ignorées", games: "jeux", vods: "VOD", videos: "vidéos", private: "VOD réservées écartées", restricted: "VOD abonnés écartées", requested: "demandés", found: "trouvés", unknown: "inconnus", skipped: "coupés au plafond", rate_limited: "non relevés (limite)", unreachable: "VOD injoignables écartées", untested: "VOD non testées (jeu déjà servi)", deadline: "VOD non testées (échéance)" };
+/* Le compteur « échéance » d'une source de tendance compte des jeux ou des appid, pas des VOD. */
+const veilleCountLabel = (source, key) => (key === "deadline" && source !== "twitch" ? "non relevés (échéance)" : COUNT_LABELS[key] || key);
 
 const veilleUi = { data: null, clips: [], error: null, loading: null, dirty: false, at: 0, style: {}, busy: false, html: "", sheet: null };
 
@@ -93,24 +95,50 @@ const veilleReleaseBadge = (days) => (days == null ? "" : `<span class="chip acc
 
 /* ---------- sections ---------- */
 
+/* « Relevé incomplet » : seulement quand l'échéance globale a coupé quelque chose (deadline_hit écrit par la veille). */
+function veilleIncomplete(data) {
+  const day = data.day || {};
+  if (!day.deadline_hit) return "";
+  const cfg = data.settings || {};
+  return `<p class="reason warn" data-veille-incomplete role="status">Relevé incomplet : échéance de ${esc(cfg.veille_deadline_s ?? "?")} s atteinte à ${esc(veilleWhen(day.deadline_at))}</p>`;
+}
+
 function veilleSources(data) {
   const day = data.day;
+  const sources = day.sources || {};
   const pills = Object.keys(SOURCE_LABELS).map((name) => {
-    const s = (day.sources || {})[name];
+    const s = sources[name];
     if (!s) return `<span class="src-pill">${veilleSrcIcon(name)}${esc(SOURCE_LABELS[name])} : pas relevée</span>`;
     const bad = s.status === "error";
-    const counts = Object.entries(s.counts || {}).map(([k, v]) => `${v} ${COUNT_LABELS[k] || k}`).join(", ");
-    return `<span class="src-pill${bad ? " bad" : ""}">${veilleSrcIcon(name)}${esc(SOURCE_LABELS[name])}${bad ? " : erreur" : counts ? ` : ${esc(counts)}` : ""}</span>`;
+    const warn = s.status === "partial" || s.status === "skipped";
+    const counts = Object.entries(s.counts || {}).map(([k, v]) => `${v} ${veilleCountLabel(name, k)}`).join(", ");
+    const style = warn ? ` style="background:var(--warn-soft);color:var(--warn)"` : "";
+    return `<span class="src-pill${bad ? " bad" : warn ? " warn" : ""}"${style}>${veilleSrcIcon(name)}${esc(SOURCE_LABELS[name])}${bad ? " : erreur" : warn ? " : incomplète" : ""}${!bad && counts ? ` : ${esc(counts)}` : ""}</span>`;
   }).join("");
-  const errors = Object.keys(SOURCE_LABELS).filter((n) => (day.sources || {})[n] && day.sources[n].status === "error")
-    .map((n) => `<p class="reason bad" role="alert"><b>${esc(SOURCE_LABELS[n])} :</b> ${esc(day.sources[n].error)}</p>`).join("");
+  const named = Object.keys(SOURCE_LABELS).filter((n) => sources[n]);
+  const errors = named.filter((n) => sources[n].status === "error")
+    .map((n) => `<p class="reason bad" role="alert"><b>${esc(SOURCE_LABELS[n])} :</b> ${esc(sources[n].error)}</p>`).join("");
+  const warnings = named.filter((n) => (sources[n].status === "partial" || sources[n].status === "skipped") && sources[n].error)
+    .map((n) => `<p class="reason warn" role="status"><b>${esc(SOURCE_LABELS[n])} :</b> ${esc(sources[n].error)}</p>`).join("");
   const llm = day.llm || {};
   const llmChip = llm.status === "ok" ? `<span class="chip accent plain">Claude : ${esc(day.proposals.length)} proposition${day.proposals.length > 1 ? "s" : ""}</span>`
     : llm.status === "error" ? `<span class="chip bad plain">Claude : erreur</span>` : `<span class="chip plain">Claude : pas appelé</span>`;
   const llmError = llm.status === "error" ? `<p class="reason bad" role="alert"><b>Choix de Claude :</b> ${esc(llm.error)}</p>` : "";
   const when = data.running ? `<span class="chip running plain">Relevé en cours…</span>`
     : `<span>Relevé du <b class="mono">${esc(veilleWhen(day.finished_at || day.started_at, true))}</b></span>`;
-  return `<div data-veille-sources><div class="sources">${when}${pills}${llmChip}</div>${errors}${llmError}</div>`;
+  return `<div data-veille-sources><div class="sources">${when}${pills}${llmChip}</div>${veilleIncomplete(data)}${errors}${warnings}${llmError}</div>`;
+}
+
+/* Pied du KPI « VOD proposées » : ce qui a été écarté et pourquoi, chaque nombre tel qu'écrit par la veille. */
+function veilleExcludedFoot(ex, cfg) {
+  if (!ex) return "";
+  const parts = [`${ex.already_known || 0} déjà connues`, `${ex.too_short || 0} trop courtes`];
+  if (ex.no_community != null) parts.push(`${ex.no_community} VOD écartées : communauté insuffisante ou jeu inconnu`);
+  if (ex.access_restricted != null) parts.push(`${ex.access_restricted} VOD écartées : réservées aux abonnés`);
+  if (ex.access_unreachable != null) parts.push(`${ex.access_unreachable} VOD écartées : injoignables après ${cfg.twitch_access_attempts ?? "?"} essais`);
+  if (ex.access_untested != null) parts.push(`${ex.access_untested} VOD non testées : jeu déjà servi (${cfg.max_vods_per_game ?? "?"} VOD accessibles par jeu)`);
+  if (ex.access_deadline != null) parts.push(`${ex.access_deadline} VOD non testées : échéance`);
+  return parts.join(", ");
 }
 
 function veilleKpis(data) {
@@ -123,10 +151,20 @@ function veilleKpis(data) {
   const kpi = (label, value, foot, cls) => `<div class="kpi${cls ? ` ${cls}` : ""}"><div class="kpi-label">${esc(label)}</div><div class="kpi-value">${value}</div><div class="kpi-foot">${esc(foot)}</div></div>`;
   return `<div class="kpis kpis-4" data-veille-kpi>
     ${kpi("Jeux qui montent", esc(rising), `sur ${(day.games || []).length} relevés (≥ ${cfg.rise_min_pct ?? 50} % ou ≥ ${cfg.steam_rank_gain_min ?? 5} places Steam)`, "accent")}
-    ${kpi("VOD proposées", `${esc(proposed)}<small>/ ${esc(cfg.max_vods_per_day ?? "?")}</small>`, day.excluded ? `${day.excluded.already_known || 0} déjà connues, ${day.excluded.too_short || 0} trop courtes${day.excluded.no_community != null ? `, ${day.excluded.no_community} VOD écartées : communauté insuffisante ou jeu inconnu` : ""}` : "")}
+    ${kpi("VOD proposées", `${esc(proposed)}<small>/ ${esc(cfg.max_vods_per_day ?? "?")}</small>`, veilleExcludedFoot(day.excluded, cfg))}
     ${kpi("Clips gardés", `${esc(kept)}<small>/ ${esc(rendered)} rendus</small>`, `${cfg.best_clips_per_day ?? "?"} meilleurs par jour`)}
     ${kpi("Prochain relevé", data.next_run_at ? esc(veilleWhen(data.next_run_at, true)) : "—", data.enabled ? `à ${cfg.run_at || "?"} (${cfg.timezone || "Europe/Paris"})` : "veille désactivée")}
   </div>`;
+}
+
+/* Courbe 30 j du jeu de la proposition et résumé « s4 → s1 » (lu de summary, jamais recalculé ici). */
+function veilleProposalTrend(game) {
+  if (!game || !game.trend_30d) return "";
+  const pick = ["steam_reviews", "twitch_vods_fr"].map((name) => [name, game.trend_30d.series[name]])
+    .find(([, serie]) => serie && serie.summary && serie.summary.measured_days > 0);
+  const week = (v) => (v == null ? "?" : fr(v));
+  const line = pick ? `<p class="muted" data-veille-weeks>s4 → s1 : ${esc(week(pick[1].summary.weeks[0]))} → ${esc(week(pick[1].summary.weeks[3]))} ${esc(TREND_SERIES[pick[0]].unit)}</p>` : "";
+  return `<div data-veille-trend>${veilleTrendChartWithLegend(game.trend_30d)}</div>${line}`;
 }
 
 function veilleProposal(p, game, channels) {
@@ -152,7 +190,7 @@ function veilleProposal(p, game, channels) {
       <div class="prop-title">${esc(c.title)}</div>
       <div class="prop-meta">${veilleSrcIcon(c.source)}<span>${meta}</span></div>
       <div class="signals">${signals}</div>
-      ${c.access_unverified ? `<p class="reason"><b>Accès non vérifié :</b> ${esc(c.access_unverified)}</p>` : ""}
+      ${veilleProposalTrend(game)}
       <p class="reason"><b>Pourquoi :</b> ${esc(p.reason)}</p>
       <div class="prop-actions">${actions}</div>
     </div>
@@ -381,6 +419,63 @@ function veilleFollowersCell(g) {
   return `${g.steam_followers != null ? esc(fr(g.steam_followers)) : `<span class="muted">inconnu</span>`}<div class="muted">${esc(gain)}</div>`;
 }
 
+/* Courbes 30 j (SPEC-85a0 R27) : une ligne SVG en ligne, sans bibliothèque, par série disponible. Chaque série a sa
+   propre échelle (unités différentes). Un point par jour mesuré ; deux jours consécutifs sont reliés, un jour sans
+   mesure fait un trou (jamais zéro ni interpolé). Résumés, pics et nombres de jours viennent du serveur (summary). */
+const TREND_SERIES = {
+  steam_reviews: { label: "avis Steam", unit: "avis Steam/jour", field: "value", color: "var(--accent)" },
+  twitch_vods_fr: { label: "VOD Twitch FR", unit: "VOD Twitch FR/jour", field: "vods", color: "var(--info)" },
+  twitch_viewers_fr: { label: "viewers Twitch FR", unit: "viewers Twitch FR", field: "value", color: "var(--ok)" },
+};
+const VEILLE_DAY_MS = 864e5;
+
+function veilleTrendChart(trend) {
+  const W = 160, H = 44, PAD = 4;
+  const since = Date.parse(`${trend.since}T12:00:00Z`);
+  const dayIndex = (date) => Math.round((Date.parse(`${date}T12:00:00Z`) - since) / VEILLE_DAY_MS);
+  const x = (date) => PAD + (dayIndex(date) * (W - 2 * PAD)) / Math.max(1, trend.days - 1);
+  const groups = Object.entries(TREND_SERIES).map(([name, meta]) => {
+    const serie = trend.series[name];
+    const pts = serie && serie.status !== "unavailable" ? serie.points || [] : [];
+    if (pts.length < 2) return "";
+    const values = pts.map((p) => p[meta.field]);
+    const lo = Math.min(...values), hi = Math.max(...values);
+    const y = (v) => (hi === lo ? H / 2 : H - PAD - ((v - lo) * (H - 2 * PAD)) / (hi - lo));
+    const at = (p) => `${x(p.date).toFixed(1)},${y(p[meta.field]).toFixed(1)}`;
+    const runs = [];
+    pts.forEach((p, i) => {
+      if (i && dayIndex(p.date) - dayIndex(pts[i - 1].date) === 1) runs[runs.length - 1].push(p);
+      else runs.push([p]);
+    });
+    const lines = runs.filter((run) => run.length > 1)
+      .map((run) => `<polyline fill="none" stroke-width="1.5" stroke="${meta.color}" style="stroke:${meta.color}" points="${run.map(at).join(" ")}"/>`).join("");
+    const dots = pts.map((p) => `<circle r="1.8" fill="${meta.color}" style="fill:${meta.color}" cx="${x(p.date).toFixed(1)}" cy="${y(p[meta.field]).toFixed(1)}"><title>${esc(meta.label)} ${esc(p.date)} : ${esc(fr(p[meta.field]))}</title></circle>`).join("");
+    return `<g data-series="${name}">${lines}${dots}</g>`;
+  }).join("");
+  return groups ? `<svg class="spark" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img" aria-label="Courbes sur ${esc(trend.days)} jours depuis le ${esc(trend.since)}">${groups}</svg>` : "";
+}
+
+/* La légende : une ligne par série, sa couleur, ses jours mesurés (« n j mesurés / 30 »), son pic ; la raison quand elle est indisponible. */
+function veilleTrendLegend(trend) {
+  return Object.entries(TREND_SERIES).map(([name, meta]) => {
+    const serie = trend.series[name];
+    const swatch = `<i style="display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:4px;background:${meta.color}"></i>`;
+    if (!serie) return "";
+    if (serie.status === "unavailable") return `<div class="muted">${swatch}${esc(meta.label)} : indisponible (${esc(serie.reason)})</div>`;
+    const sum = serie.summary;
+    if (!sum || sum.measured_days < 2) return `<div class="muted">${swatch}${esc(meta.label)} : ${sum && sum.measured_days === 1 ? "1 jour de mesure" : "aucune mesure"}</div>`;
+    const note = serie.status === "partial" && serie.reason ? ` <span title="${esc(serie.reason)}">(${esc(serie.reason)})</span>` : "";
+    return `<div class="muted">${swatch}${esc(meta.label)} : ${esc(sum.measured_days)} j mesurés / ${esc(sum.window_days)}${sum.peak ? ` · pic ${esc(sum.peak.date)}` : ""}${note}</div>`;
+  }).join("");
+}
+
+const veilleTrendChartWithLegend = (trend) => `${veilleTrendChart(trend)}<div class="trend-legend">${veilleTrendLegend(trend)}</div>`;
+
+function veilleTrend(game) {
+  if (!game.trend_30d) return `<span class="muted">jeu non suivi</span>`;
+  return veilleTrendChartWithLegend(game.trend_30d);
+}
+
 function veilleRising(data) {
   const games = [...(data.day.games || [])].sort((a, b) => Math.max(b.twitch_delta_pct ?? -1e9, b.steam_delta_pct ?? -1e9) - Math.max(a.twitch_delta_pct ?? -1e9, a.steam_delta_pct ?? -1e9));
   const num = (v, reason) => (v == null ? `<span class="muted">${esc(reason)}</span>` : esc(fr(v)));
@@ -390,9 +485,9 @@ function veilleRising(data) {
     <td class="r">${veilleSteamCell(g)}</td><td class="r">${veilleDelta(g, "steam")}</td><td class="r">${veilleFollowersCell(g)}</td><td class="r">${veilleSellers(g)}</td>
     <td class="r">${veilleCommunityCell(g)}</td>
     <td class="r">${num(g.youtube_views_per_hour == null ? null : Math.round(g.youtube_views_per_hour), "clé absente ou pas de vidéo")}</td>
-    <td class="r">${esc(g.vod_count)}</td></tr>`).join("");
+    <td class="r">${esc(g.vod_count)}</td><td class="r" data-veille-trend>${veilleTrend(g)}</td></tr>`).join("");
   return `<section data-veille-rising><div class="section-title">${icon("trending-up")}Ce qui monte</div><div class="panel">
-    ${rows ? `<div class="table-wrap"><table class="table"><thead><tr><th>Jeu</th><th class="r">Twitch FR (viewers)</th><th class="r">Δ 7 j</th><th class="r">Steam (pic du jour / à l'instant)</th><th class="r">Δ 7 j</th><th class="r">Abonnés Steam</th><th class="r">Ventes FR</th><th class="r">Communauté</th><th class="r">YouTube FR (vues/h)</th><th class="r">VOD FR</th></tr></thead><tbody>${rows}</tbody></table></div>`
+    ${rows ? `<div class="table-wrap"><table class="table"><thead><tr><th>Jeu</th><th class="r">Twitch FR (viewers)</th><th class="r">Δ 7 j</th><th class="r">Steam (pic du jour / à l'instant)</th><th class="r">Δ 7 j</th><th class="r">Abonnés Steam</th><th class="r">Ventes FR</th><th class="r">Communauté</th><th class="r">YouTube FR (vues/h)</th><th class="r">VOD FR</th><th class="r">30 j</th></tr></thead><tbody>${rows}</tbody></table></div>`
       : `<div class="list-item muted">Aucun jeu relevé : vérifie les sources ci-dessus.</div>`}
     <div class="arch-row"><span class="t muted">Un jeu sans correspondance Steam ou hors du top ventes FR l'indique ; une donnée absente est expliquée, aucune valeur n'est inventée.</span></div>
   </div></section>`;
@@ -412,6 +507,9 @@ function veilleSettings(data) {
       ${field("Joueurs Steam hors top : appels (max)", cfg.steam_players_lookups_max, "steam_players_lookups_max")}${field("Abonnés Steam : appels (max)", cfg.steam_followers_lookups_max, "steam_followers_lookups_max")}${field("Abonnés Steam : pause entre appels (s)", cfg.steam_followers_pause_s, "steam_followers_pause_s")}
       ${field("Communauté : joueurs Steam min.", cfg.community_min_steam_players, "community_min_steam_players")}${field("Communauté : abonnés Steam min.", cfg.community_min_steam_followers, "community_min_steam_followers")}${field("Communauté : viewers Twitch FR min.", cfg.community_min_twitch_viewers, "community_min_twitch_viewers")}${field("Communauté : hypes IGDB min.", cfg.community_min_hypes, "community_min_hypes")}
       ${field("VOD par jeu (max)", cfg.max_vods_per_game, "max_vods_per_game")}
+      ${field("Courbe de tendance (jours)", cfg.trend_days, "trend_days")}${field("Jeux suivis (max)", cfg.trend_games_max, "trend_games_max")}${field("Échéance du relevé (s)", cfg.veille_deadline_s, "veille_deadline_s")}
+      ${field("Test d'accès : essais par VOD", cfg.twitch_access_attempts, "twitch_access_attempts")}${field("Test d'accès : pause entre essais (s)", cfg.twitch_access_retry_pause_s, "twitch_access_retry_pause_s")}
+      ${field("Avis Steam : pause entre appels (s)", cfg.steam_reviews_pause_s, "steam_reviews_pause_s")}${field("VOD Twitch : pages d'historique (max)", cfg.twitch_history_pages_max, "twitch_history_pages_max")}
     </div>
     <div class="keys">${key("Twitch (client id + secret)", data.twitch_client_id_set && data.twitch_client_secret_set, "twitch")}${key("YouTube (clé API)", data.youtube_api_key_set, "youtube")}
       <div class="key">${veilleSrcIcon("steam")}<span>Steam</span><span class="chip ok plain">sans clé</span></div></div>
