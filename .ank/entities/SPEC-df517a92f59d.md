@@ -2,7 +2,7 @@
 id: SPEC-df517a92f59d
 type: spec
 slug: veille-calendrier-des-sorties-de-jeux-igdb-colle
-title: "Veille : calendrier des sorties de jeux (IGDB) : collecte par /games sur la fenêtre J-15..J+14 triée par hypes, jeux en tendance gardés, étiquette « Portage », jaquettes, écran calendrier (bandeau récents, frise 14 jours, téléphone, panneau détail) ; joueurs Steam des jeux hors top 100 (pic du jour vs instantané, historique), filtre de communauté (Steam ou Twitch FR ou hypes), au plus N VOD par jeu (succède à SPEC-4efa)"
+title: "Veille : calendrier des sorties de jeux (IGDB) : collecte par /games sur la fenêtre J-15..J+14 triée par hypes, jeux en tendance gardés, étiquette « Portage », jaquettes, écran calendrier (bandeau récents, frise 14 jours, téléphone, panneau détail) ; Steam officiel à la place de SteamDB (joueurs simultanés et pic du jour, joueurs par appid hors top 100, abonnés, gain 7 j et tendance depuis l'historique), filtre de communauté (Steam joueurs ou abonnés, Twitch FR ou hypes), au plus N VOD par jeu (succède à SPEC-4efa)"
 created: 2026-10-07T08:20:49Z
 author: w-calplan
 status: proposed
@@ -15,10 +15,10 @@ scope:
   - tests/test_web_veille.py
   - docs/GUIDE.md
   - CHANGELOG.md
-references: [ADR-0944f6d2110d, ADR-798cf21fddd6, SPEC-bdd9e0db8905, ADR-ca9a5792739c, ADR-ad2e562b1810, ADR-b1c17749b528, ADR-09ad233678f2, SPEC-c1001cb7cbdb]
+references: [ADR-0944f6d2110d, ADR-798cf21fddd6, SPEC-bdd9e0db8905, ADR-ca9a5792739c, ADR-ad2e562b1810, ADR-b1c17749b528, ADR-09ad233678f2, SPEC-c1001cb7cbdb, ADR-05a42b76906f]
 supersedes: SPEC-4efa50cc6b8c
 schema: 4
-version: 3
+version: 6
 ---
 
 ## Objet
@@ -48,10 +48,21 @@ GET, paramètre `appid` (uint32, obligatoire), aucune clé, « Gets the total
 number of players currently active in the specified app on Steam », ne compte
 pas les joueurs hors ligne ; réponse `{"response": {"player_count": n,
 "result": 1}}`, vérifiée sur https://api.steampowered.com (Dota 2 : 559 193),
-appid inconnu → HTTP 404). D'où R18 (joueurs Steam des jeux en tendance hors
-top 100), R19 (filtre de communauté) et R20 (diversité : au plus N VOD par
-jeu). Ces appels Steam restent dans ADR-ca9a (Steam Web API officielle) :
-aucun ADR nouveau pour Steam ; l'appid Steam d'un jeu IGDB vient de
+appid inconnu → HTTP 404). Vérifié aussi le 07/10/2026 vers 10 h 45 Paris
+(ADR-05a4) : `ISteamChartsService/GetGamesByConcurrentPlayers/v1` rend
+`concurrent_in_game` **et** `peak_in_game` (CS2 707 830 / 1 144 557,
+identiques à SteamDB ; `peak_in_game` y est le même chiffre que dans
+`GetMostPlayedGames`, pic du jour ; 18 appids du top 100 « most played »
+manquent au classement par simultanés) ; les abonnés d'un jeu
+(« followers » SteamDB) = `<memberCount>` de la page XML publique
+`https://steamcommunity.com/games/<appid>/memberslistxml/?xml=1` (AION 2 =
+124 547, SteamDB 122 747 ; Galactic Racer = 38 763 ; appid sans groupe →
+HTTP 200 avec une page HTML sans la balise). SteamDB lui-même : 403
+Cloudflare et FAQ anti-scraping, interdit (ADR-ca9a). D'où R18 (joueurs
+Steam, pic et instantané), R21 (abonnés Steam, gain sur 7 jours, tendance
+joueurs depuis l'historique), R19 (filtre de communauté) et R20
+(diversité : au plus N VOD par jeu). Ces lectures Steam sont admises par
+ADR-05a4 (amende ADR-ca9a) ; l'appid Steam d'un jeu IGDB vient de
 `external_games` (ADR-0944).
 
 Doc IGDB lue le 07/10/2026 : `#game` (`hypes`, `first_release_date`, `cover`,
@@ -74,6 +85,9 @@ hypes desc;` rend 336 jeux sur la fenêtre du 07/10/2026 (une page).
 | `community_min_steam_players` | `1000` | joueurs Steam simultanés à partir desquels un jeu a une communauté (R19) (≥ 0) |
 | `community_min_twitch_viewers` | `200` | spectateurs Twitch FR à partir desquels un jeu a une communauté (R19) (≥ 0) |
 | `community_min_hypes` | `50` | hypes IGDB à partir desquelles un jeu a une communauté (R19) (≥ 0) |
+| `community_min_steam_followers` | `10000` | abonnés Steam (R21) à partir desquels un jeu a une communauté (R19) (≥ 0) |
+| `steam_followers_lookups_max` | `200` | pages `memberslistxml` lues au plus par relevé (R21) (≥ 0 ; 0 = aucune) |
+| `steam_followers_pause_s` | `1.0` | pause entre deux lectures `memberslistxml`, en secondes (R21) (≥ 0.2) |
 | `max_vods_per_game` | `1` | VOD proposées au plus par jeu dans un relevé (R20) (≥ 1) |
 `igdb_releases_max` (SPEC-4efa) est retirée : déclarée dans `LEGACY_KEYS` de
 `clipper/veille.py` (tolérée et ignorée dans un `config.toml` existant, cf.
@@ -174,10 +188,13 @@ Comme SPEC-4efa R15 (`sortie_j_plus=`, `hypes_igdb=`, bloc « Sorties de jeux
 - chaque ligne de jeu ajoute `steam_players_now=<n | inconnu>` (l'en-tête
   du bloc précise : `steam_players` = pic du jour du top 100,
   `steam_players_now` = instantané à l'heure du relevé) et
-  `communaute=<ok | insuffisante>` (R19) ; seuls les candidats dont le jeu a
-  une communauté sont listés (R19), donc chaque ligne de candidat porte
-  `steam_players=<n (pic) | n (instantané) | inconnu>`,
-  `twitch_fr_viewers=` et `hypes_igdb=` de son jeu ;
+  `steam_now_delta_pct=<n | historique insuffisant>`,
+  `steam_abonnes=<n | inconnu>`, `steam_abonnes_gain_7j=<n | historique
+  insuffisant>` (R21) et `communaute=<ok | insuffisante>` (R19) ; seuls les
+  candidats dont le jeu a une communauté sont listés (R19), donc chaque
+  ligne de candidat porte `steam_players=<n (pic) | n (instantané) |
+  inconnu>`, `steam_abonnes=`, `twitch_fr_viewers=` et `hypes_igdb=` de
+  son jeu ;
 - la consigne ajoute : « Au plus `max_vods_per_game` VOD par jeu : varie les
   jeux. » (R20).
 Nombre d'appels et comportement en erreur inchangés (R6) ; `check` complété
@@ -207,8 +224,20 @@ par R20. Aucun choix fait par le code à la place de Claude.
   `steam_now` ; `steam_players_history` rend les points `peak` et `now` des
   jours précédents (fichiers d'historique fabriqués sous `tmp_path`), sans
   jour interpolé ; `steam_avg` / `steam_delta_pct` ignorent `steam_now`.
-- R19 : `community.ok` vrai par chaque seuil séparément (Steam seul, Twitch
-  seul, hypes seuls), faux quand aucun n'est atteint et quand tout est
+- R18 top 100 : `concurrent` posé depuis le second classement, `null` pour
+  un appid absent de celui-ci (puis relevé par appid), `players` inchangé ;
+  second appel en erreur → source `steam` en erreur.
+- R21 : collecteur `steam_followers` injecté : ordre des appids, plafond,
+  pause (attente injectée), `<memberCount>` lu, page HTML sans balise →
+  `null` compté dans `unknown`, erreur HTTP → `SourceError` et source en
+  erreur pendant que les autres continuent, rien d'autre lu ;
+  `steam_followers` sur les jeux et les `trend` ; `history/<date>.json`
+  porte `steam_followers` ; `steam_followers_gain_7d` juste avec un fichier
+  J−7 fabriqué et `null` sans lui (ou avec J−6 seulement) ;
+  `steam_now_avg` / `steam_now_delta_pct` sur `steam_now` seulement ;
+  seuil `community_min_steam_followers` seul suffit à `community.ok`.
+- R19 : `community.ok` vrai par chaque seuil séparément (Steam seul,
+  abonnés seuls, Twitch seul, hypes seuls), faux quand aucun n'est atteint et quand tout est
   inconnu, seuil à 0 atteint par toute valeur connue mais pas par `null` ;
   candidat d'un jeu sans communauté ou sans jeu → `excluded.no_community`
   et absent du prompt ; chiffres dans le prompt.
@@ -226,10 +255,12 @@ par R20. Aucun choix fait par le code à la place de Claude.
   `sources.igdb` tels qu'écrits (aucun calcul) ; `settings` expose
   `upcoming_days`, `release_window_days`, `igdb_min_hypes`,
   `igdb_recent_max`, `igdb_upcoming_max`, `steam_players_lookups_max`,
-  `community_min_steam_players`, `community_min_twitch_viewers`,
-  `community_min_hypes`, `max_vods_per_game` ; `PUT /api/settings` les écrit
-  et refuse une valeur hors bornes (400, message de `VeilleError`). Aucune
-  route nouvelle, aucune route d'image.
+  `steam_followers_lookups_max`, `steam_followers_pause_s`,
+  `community_min_steam_players`, `community_min_steam_followers`,
+  `community_min_twitch_viewers`, `community_min_hypes`,
+  `max_vods_per_game` ; `PUT /api/settings` les écrit et refuse une valeur
+  hors bornes (400, message de `VeilleError`). Aucune route nouvelle,
+  aucune route d'image.
 - Section « Sorties de jeux » de l'écran Veille (même place : entre les
   propositions et les meilleurs clips), conforme à la maquette :
   - en-tête « Calendrier du <date longue en français> », puces « N
@@ -247,9 +278,11 @@ par R20. Aucun choix fait par le code à la place de Claude.
     Steam FR » ou « nouveau dans le top ventes Steam FR », « V viewers Twitch
     FR », « P joueurs Steam (pic du jour, top R) » si `steam_players` est
     connu, sinon « P joueurs Steam (à l'instant du relevé) » si
-    `steam_players_now` l'est ; séparateur « · » ; puce « Communauté »
-    (verte) si `trend.community.ok`, « Peu de monde » (grise) si `trend`
-    existe sans communauté ;
+    `steam_players_now` l'est, « A abonnés Steam » si `steam_followers`
+    est connu, suivi de « (+G en 7 j) » si `steam_followers_gain_7d` l'est ;
+    séparateur « · » ; puce « Communauté » (verte) si
+    `trend.community.ok`, « Peu de monde » (grise) si `trend` existe sans
+    communauté ;
   - **frise « À venir (N j) »** (sous-titre « une colonne par jour, la plus
     attendue en grand ») : une colonne par jour d'aujourd'hui à J+N ; colonne
     d'aujourd'hui marquée (accent, « Aujourd'hui ») et remplie des `recent` à
@@ -290,30 +323,48 @@ par R20. Aucun choix fait par le code à la place de Claude.
   `steam_players_history` (un point par jour, `peak` et `now` de couleurs
   distinctes, légende), dans « Ce qui monte » et dans le panneau détail
   d'une sortie en tendance ; moins de 2 points : pas de courbe, « 1 jour de
-  mesure ». Le bandeau des sources porte `steam_players` libellé « Steam
-  (joueurs hors top) ». Les KPI du jour affichent `excluded.no_community` :
+  mesure ». Colonne « Abonnés Steam » : `steam_followers` (ou « inconnu »)
+  et « +G (7 j) » ou « historique insuffisant » (R21) ; la colonne « Δ 7 j »
+  Steam montre `steam_delta_pct` (pics) ou, à défaut, `steam_now_delta_pct`
+  suffixé « (à l'instant) ». Le bandeau des sources porte `steam_players`
+  libellé « Steam (joueurs hors top) » et `steam_followers` libellé « Steam
+  (abonnés) ». Les KPI du jour affichent `excluded.no_community` :
   « n VOD écartées : communauté insuffisante ou jeu inconnu ».
 - Réglages › Veille : `upcoming_days`, `release_window_days`,
   `igdb_min_hypes`, `igdb_recent_max`, `igdb_upcoming_max`,
-  `steam_players_lookups_max`, `community_min_steam_players`,
-  `community_min_twitch_viewers`, `community_min_hypes`,
-  `max_vods_per_game` éditables ; l'aperçu des réglages de l'écran Veille
-  les montre.
+  `steam_players_lookups_max`, `steam_followers_lookups_max`,
+  `steam_followers_pause_s`, `community_min_steam_players`,
+  `community_min_steam_followers`, `community_min_twitch_viewers`,
+  `community_min_hypes`, `max_vods_per_game` éditables ; l'aperçu des
+  réglages de l'écran Veille les montre.
 - docs/GUIDE.md : le calendrier (bandeau, frise, téléphone, détail), les
   jaquettes chargées depuis images.igdb.com par le navigateur, le filtre de
-  communauté (les trois seuils, « ou » entre eux, d'où viennent les
-  chiffres), la diversité (`max_vods_per_game`), les dix réglages,
+  communauté (les quatre seuils, « ou » entre eux, d'où vient chaque
+  chiffre : pic du jour, instantané, abonnés, hypes), la courbe et le gain
+  d'abonnés construits depuis l'historique de la veille (absents les
+  premiers jours), la diversité (`max_vods_per_game`), les treize réglages,
   `igdb_releases_max` ignorée. CHANGELOG mis à jour.
 
-## R18. Joueurs Steam simultanés des jeux en tendance hors top 100
-- Source `steam_players` ajoutée à `SOURCES` (aucune clé exigée ; Steam
-  Web API, ADR-ca9a), collecteur injectable appelé **après** les autres
+## R18. Joueurs Steam : pic du jour et instantané, top 100 et jeux en tendance hors top 100
+- **Top 100 (source `steam`, SPEC-bdd9 R3 complétée).** Le collecteur
+  `steam` lit `GetMostPlayedGames` (rangs, `last_week_rank`,
+  `peak_in_game`, comme avant) **puis** `GetGamesByConcurrentPlayers/v1`
+  (ADR-05a4) et, pour chaque appid du top « most played » présent dans le
+  classement par simultanés, ajoute `concurrent` = `concurrent_in_game`
+  (sinon `null`) ; `players` reste `peak_in_game` (même chiffre dans les
+  deux classements, vérifié le 07/10/2026). Retour `games[]` =
+  `{appid, name, players, concurrent | null, rank, last_week_rank}`. Le
+  second appel en erreur → `SourceError` (source `steam` en erreur comme
+  pour le premier).
+- **Hors top 100 (source `steam_players`).** Ajoutée à `SOURCES` (aucune
+  clé exigée ; ADR-05a4), collecteur injectable appelé **après** les autres
   sources avec `(settings, appids)` : la liste ordonnée des appids à
   relever, construite par `collect` = appids des jeux de `games` dont
-  `steam_players` est inconnu (jeux « ventes FR » hors top 100 joueurs, dans
-  l'ordre de `games`), puis `steam_appid` des sorties `recent` (R13, dans
-  l'ordre de `recent`) absents de `games` et du top 100 ; sans doublon ;
-  coupée à `steam_players_lookups_max` (les appids au-delà sont comptés dans
+  l'instantané est inconnu (jeux du top 100 absents du classement par
+  simultanés, puis jeux « ventes FR » hors top 100, dans l'ordre de
+  `games`), puis `steam_appid` des sorties `recent` (R13, dans l'ordre de
+  `recent`) absents de `games` ; sans doublon ; coupée à
+  `steam_players_lookups_max` (les appids au-delà sont comptés dans
   `counts.skipped`).
 - Un appel par appid : `GET
   https://api.steampowered.com/ISteamUserStats/GetNumberOfCurrentPlayers/v1/`
@@ -323,26 +374,28 @@ par R20. Aucun choix fait par le code à la place de Claude.
   source) ; autre erreur HTTP ou JSON illisible → `SourceError` (source en
   erreur, aucun `steam_players_now` posé, les autres sources et le choix
   continuent). Retour : `{"players": {appid: int | null}, "skipped": n}`.
-- **Deux mesures, jamais mélangées, toujours nommées.** Un jeu du top 100
-  porte `steam_players` = **pic du jour** (`peak_in_game` du classement,
-  SPEC-bdd9 ; à privilégier pour comparer : AION 2 = 383 176 le 07/10) et
-  `steam_players_now = null`. Un jeu hors top 100 relevé par R18 porte
-  `steam_players = null` et `steam_players_now` = **instantané** à l'heure
-  du relevé quotidien (`run_at` ; AION 2 = 13 400 à 10 h 30 Paris le
-  07/10, Galactic Racer = 5 283). `collect` pose `steam_players_now`
-  (entier ou `null`) sur chaque jeu de `games` relevé et sur l'entrée
-  `trend` des sorties ; une sortie `recent` avec `steam_appid` relevé mais
-  sans jeu dans `games` ne crée pas de jeu : le chiffre vit dans
-  `releases.recent[].steam_players_now`.
+- **Deux mesures, jamais mélangées, toujours nommées.** `steam_players` =
+  **pic du jour** (`peak_in_game`, top 100 seulement ; à privilégier pour
+  comparer un jour à l'autre : AION 2 = 383 176 le 07/10), `null` hors top
+  100. `steam_players_now` = **instantané** à l'heure du relevé quotidien
+  (`run_at`) : `concurrent` du top 100 (AION 2 = 13 345 à 10 h 30 Paris le
+  07/10) ou `player_count` relevé par appid (Galactic Racer = 5 283) ;
+  `null` si ni l'un ni l'autre. `collect` pose `steam_players_now` sur
+  chaque jeu de `games` et sur l'entrée `trend` des sorties ; une sortie
+  `recent` avec `steam_appid` relevé mais sans jeu dans `games` ne crée pas
+  de jeu : le chiffre vit dans `releases.recent[].steam_players_now`.
 - **Historique quotidien (courbe type SteamDB).** `history/<date>.json`
-  (R2 de SPEC-bdd9) gagne `steam_now: {appid: joueurs}` pour les appids
-  relevés ce jour (le top 100 y est déjà sous `steam` avec son pic). Chaque
-  jeu de `games` porte `steam_players_history: [{date, kind: "peak" |
-  "now", players}]`, un point par jour sur les `baseline_days` derniers
-  jours plus aujourd'hui, pris dans l'historique (`steam` → `peak`,
-  `steam_now` → `now`), jours sans mesure absents, jamais interpolés ;
-  `steam_avg` / `steam_delta_pct` (R4) restent calculés sur les pics
-  seulement (un instantané n'est pas comparable à un pic).
+  (R2 de SPEC-bdd9) gagne `steam_now: {appid: joueurs}` pour tous les
+  instantanés du jour (top 100 et hors top) et `steam_followers: {appid:
+  abonnés}` (R21) ; le pic du top 100 y est déjà sous `steam`. Chaque jeu
+  de `games` porte `steam_players_history: [{date, kind: "peak" | "now",
+  players}]`, un point par mesure et par jour sur les `baseline_days`
+  derniers jours plus aujourd'hui, pris dans l'historique (`steam` →
+  `peak`, `steam_now` → `now`), jours sans mesure absents, jamais
+  interpolés. `steam_avg` / `steam_delta_pct` (R4) restent calculés sur les
+  pics ; `steam_now_avg` / `steam_now_delta_pct` (R21) sur les instantanés
+  des jours précédents (même heure de relevé) ; jamais un pic contre un
+  instantané.
 - `sources.steam_players` = `{status, at, error, counts: {requested,
   found, unknown, skipped}}` ; `steam_players_lookups_max` = 0 → source
   `skipped` (pas d'appel, pas d'erreur).
@@ -351,12 +404,14 @@ par R20. Aucun choix fait par le code à la place de Claude.
 - Chaque jeu de `games` porte `community = {ok: bool, steam_players:
   int | null, steam_kind: "peak" | "now" | null (le chiffre Steam
   disponible : le pic du jour s'il est connu, sinon l'instantané, et son
-  nom), twitch_fr_viewers: int | null, hypes: int | null (= release.hypes,
-  R14), met: [« steam » | « twitch » | « hypes »]}`. `ok` = au moins un
-  seuil atteint : `steam_players` ≥ `community_min_steam_players` **ou**
-  `twitch_fr_viewers` ≥ `community_min_twitch_viewers` **ou** `hypes` ≥
-  `community_min_hypes`. Une valeur `null` n'atteint aucun seuil, même à
-  0 ; tout inconnu → `ok` faux (ADR-ad2e : rien n'est présumé).
+  nom), steam_followers: int | null (R21), twitch_fr_viewers: int | null,
+  hypes: int | null (= release.hypes, R14), met: [« steam » | « followers »
+  | « twitch » | « hypes »]}`. `ok` = au moins un seuil atteint :
+  `steam_players` ≥ `community_min_steam_players` **ou** `steam_followers`
+  ≥ `community_min_steam_followers` **ou** `twitch_fr_viewers` ≥
+  `community_min_twitch_viewers` **ou** `hypes` ≥ `community_min_hypes`.
+  Une valeur `null` n'atteint aucun seuil, même à 0 ; tout inconnu → `ok`
+  faux (ADR-ad2e : rien n'est présumé).
 - Candidats (R5 de SPEC-bdd9, complété) : un candidat dont le jeu
   (`game_key`) a `community.ok` faux, ou qui n'a pas de jeu connu, est écarté
   et compté dans `excluded.no_community` ; il n'apparaît pas dans le prompt.
@@ -377,10 +432,51 @@ par R20. Aucun choix fait par le code à la place de Claude.
 - `max_vods_per_day` reste le plafond global ; avec `max_vods_per_game` = 1
   et 3 VOD par jour, les propositions couvrent 3 jeux différents ou moins.
 
+## R21. Abonnés Steam et dérivés depuis l'historique (gain sur 7 jours, tendance joueurs)
+- **Source `steam_followers`** (ajoutée à `SOURCES`, aucune clé ;
+  ADR-05a4), collecteur injectable appelé après les autres sources avec
+  `(settings, appids)`. Jeux suivis = appids, sans doublon, dans cet ordre :
+  jeux de `games` (ordre de `games` : top Twitch avec appid, jeux qui
+  montent, ventes FR), puis `steam_appid` des sorties `recent` puis
+  `upcoming` absents de `games`, puis le reste du top 100 joueurs ; coupée
+  à `steam_followers_lookups_max` (au-delà : `counts.skipped`).
+- Un appel par appid : `GET
+  https://steamcommunity.com/games/<appid>/memberslistxml/?xml=1`,
+  en-tête `User-Agent` nommant Clipper, séquentiel, pause
+  `steam_followers_pause_s` entre deux appels (horloge et attente
+  injectées) ; `<memberCount>n</memberCount>` → `followers[appid] = n` ;
+  réponse 200 sans la balise (page HTML : appid sans groupe) →
+  `followers[appid] = null`, compté dans `counts.unknown`, pas une erreur ;
+  erreur HTTP ou corps vide → `SourceError` (source en erreur, aucun
+  abonné posé, les autres sources et le choix continuent). Rien d'autre
+  n'est lu dans la page (pas de membres, pas de HTML). Retour :
+  `{"followers": {appid: int | null}, "skipped": n}` ;
+  `sources.steam_followers` = `{status, at, error, counts: {requested,
+  found, unknown, skipped}}` ; plafond 0 → source `skipped`.
+- `collect` pose `steam_followers` (entier ou `null`) sur chaque jeu de
+  `games` et sur `trend` des sorties, et `releases.*[].steam_followers`
+  pour une sortie sans jeu ; `history/<date>.json` garde
+  `steam_followers: {appid: n}` (R18).
+- **Dérivés, jamais estimés** (ADR-ad2e) :
+  - `steam_followers_gain_7d` = `steam_followers` − abonnés du fichier
+    d'historique daté d'il y a exactement `baseline_days` jours (7 par
+    défaut) ; `null` si ce fichier ou cet appid y manque, ou si l'un des
+    deux chiffres est `null` ; `steam_followers_history: [{date,
+    followers}]` sur `baseline_days` + 1 jours, jours absents non
+    interpolés ;
+  - `steam_now_avg` / `steam_now_delta_pct` = comme `steam_avg` /
+    `steam_delta_pct` (R4) mais sur `steam_now` des jours précédents, pour
+    `steam_players_now` ; `null` sans jour précédent ;
+  - l'écran et le prompt disent « historique insuffisant » quand un dérivé
+    est `null` faute de jours, jamais un chiffre.
+
 ## Hors périmètre (non retenu)
-- SteamDB (scraping interdit, ADR-ca9a) ; Steam Charts hors API officielle.
-- Moyenne et variation (R4) sur l'instantané : seuls les pics se comparent ;
-  la courbe (R18) montre les deux mesures nommées, sans les additionner.
+- SteamDB (403 Cloudflare, FAQ anti-scraping ; ADR-ca9a) : jamais, ni par
+  cache ni par capture ; tout vient des points Steam nommés par ADR-05a4.
+- Comparer un pic à un instantané : jamais ; chaque mesure se compare à
+  elle-même (R4 sur les pics, R21 sur les instantanés et les abonnés).
+- Autre lecture de steamcommunity.com (membres, avis, hub, HTML) : hors
+  ADR-05a4.
 - Recherche de VOD par jeu depuis le calendrier : pas de recherche de VOD
   dans l'application aujourd'hui ; une SPEC dédiée la définira.
 - Notes / `total_rating_count`, captures, vidéos IGDB : hors ADR-0944.
