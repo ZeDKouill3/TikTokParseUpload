@@ -9660,3 +9660,11 @@ process.stdout.write(JSON.stringify(keys));
     # filtre « à valider » + style a : 00 et 01-p1 ; 01-p2 (approuvé) vient avec sa série ; v2 (style b) et v3 (publié) exclus ;
     # clipsAllKeys ne dépend pas de la page affichée (clipsUi.shown n'intervient pas).
     assert json.loads(done.stdout) == ["v1/00", "v1/01-p1", "v1/01-p2"]
+
+
+def test_step_labels_follow_the_pipeline_order_and_name_every_step():
+    js = (STATIC / "screens.js").read_text(encoding="utf-8")
+    block = js[js.index("const STEP_LABELS = {"):js.index("};", js.index("const STEP_LABELS = {"))]
+    keys = re.findall(r"\b([a-z_]+): \"", block)
+    from clipper import pipeline
+    assert keys == list(pipeline.STEPS)  # videos.js affiche les étapes dans cet ordre

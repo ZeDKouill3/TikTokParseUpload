@@ -5,9 +5,10 @@
    dans les taches suivantes. */
 "use strict";
 
+// Ordre de clipper.pipeline.STEPS (videos.js en tire l'ordre affiché) : audio avant plans, puis action (SPEC-b0f3 R4).
 const STEP_LABELS = {
-  download: "Téléchargement", transcribe: "Transcription", scenes: "Plans",
-  audio: "Audio", moments: "Moments", vision: "Images", parts: "Découpage",
+  download: "Téléchargement", transcribe: "Transcription", audio: "Audio",
+  scenes: "Plans", action: "Action", moments: "Moments", vision: "Images", parts: "Découpage",
   captions: "Légendes", reframe: "Recadrage", subtitles: "Sous-titres",
   render: "Rendu", qa: "Contrôle qualité",
 };
