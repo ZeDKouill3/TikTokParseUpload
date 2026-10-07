@@ -12,6 +12,12 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ### Ajouté
 
+- Apprentissage (3/4) : le coach des prompts du jury passe tout seul dans le worker quand
+  `[learning] coach_min_new_cases` (10) clips mûrs nouveaux existent et que `coach_min_interval_days`
+  (7) jours se sont écoulés ; ses propositions sont consignées dans `state/learning/coach.json` et
+  ne s'appliquent jamais seules. L'écran Statistiques gagne une section « Apprentissage » (état de la
+  boucle, poids par juge, propositions avec boutons Adopter, qui écrit la perspective dans
+  `config.toml`, et Refuser) ; routes `GET /api/learning` et `POST /api/learning/coach/<juge>/<version>/adopt|refuse`.
 - Veille : calendrier des sorties (SPEC-df51). La section « Sorties de jeux » devient un calendrier :
   bandeau des sorties récentes en cartes à jaquette (pastille « Aujourd'hui » / « Sortie J+N »,
   « Tendance », plateformes, « Portage », hypes, ligne de tendance, puce « Communauté » ou

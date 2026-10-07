@@ -18,7 +18,7 @@ from typing import Any
 
 from clipper import accounts as accounts_mod
 from clipper import channel as channel_mod
-from clipper import jury_calibration, outcomes, publish, tiktok
+from clipper import jury, jury_calibration, jury_coach, llm, outcomes, publish, tiktok
 from clipper.config import Config
 
 log = logging.getLogger(__name__)
@@ -30,6 +30,8 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "maturity_days": 3,  # age minimal (jours depuis la publication) d'un releve pour que ses vues comptent
     "window_days": 90,  # fenetre des posts du compte qui servent de reference au rang des vues
     "min_account_posts": 10,  # posts murs a vues > 0 pour qu'un compte entre dans l'apprentissage
+    "coach_min_new_cases": 10,  # clips scored nouveaux depuis le dernier passage du coach pour en declencher un
+    "coach_min_interval_days": 7,  # jours minimaux entre deux passages du coach (ADR-c260 : cout borne)
 }
 
 REASONS = ("none", "ambiguous")
@@ -53,6 +55,12 @@ def _settings(config: Config | None) -> dict[str, Any]:
     minimum = settings["min_account_posts"]
     if isinstance(minimum, bool) or not isinstance(minimum, int) or minimum < 2:
         raise LearningError(f"[learning] min_account_posts invalide : {minimum!r} (un entier >= 2 est attendu)")
+    cases = settings["coach_min_new_cases"]
+    if isinstance(cases, bool) or not isinstance(cases, int) or cases < 1:
+        raise LearningError(f"[learning] coach_min_new_cases invalide : {cases!r} (un entier >= 1 est attendu)")
+    interval = settings["coach_min_interval_days"]
+    if isinstance(interval, bool) or not isinstance(interval, (int, float)) or interval < 0:
+        raise LearningError(f"[learning] coach_min_interval_days invalide : {interval!r} (un nombre de jours >= 0 est attendu)")
     if not isinstance(settings["enabled"], bool):
         raise LearningError(f"[learning] enabled invalide : {settings['enabled']!r} (true ou false attendu)")
     return settings
@@ -449,4 +457,202 @@ def run_if_due(now: datetime, *, config: Config | None = None) -> dict[str, Any]
             if not hasattr(exc, "where"):
                 exc.where = "sync"  # type: ignore[attr-defined]
             raise
-    return {"linked": linked, "synced": due}
+    try:
+        coached = coach_if_due(now, config=config)
+    except (jury_coach.CoachError, jury.JuryError, llm.LLMError) as exc:
+        message = str(exc)
+        record_error(config, "coach", exc, now)
+        if message not in _logged_coach_errors:
+            _logged_coach_errors.add(message)
+            log.error("coach des prompts impossible : %s", message)
+        coached = []
+    return {"linked": linked, "synced": due, "coached": coached}
+
+
+# ---------------------------------------------------------------- coach des prompts (SPEC-00db R6-R7)
+
+_logged_coach_errors: set[str] = set()
+EXCLUDED_JUDGES = jury_coach.EXCLUDED_JUDGES  # conformite : jamais coache, donc jamais adopte
+
+
+class ProposalError(LearningError):
+    """Proposition du coach introuvable (``status`` 404) ou deja decidee (409)."""
+
+    def __init__(self, message: str, status: int) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+def _coach_path(settings: dict[str, Any]) -> Path:
+    return Path(settings["state_dir"]) / "coach.json"
+
+
+def _read_coach(settings: dict[str, Any]) -> dict[str, Any]:
+    path = _coach_path(settings)
+    if not path.exists():
+        return {"last_run": None, "runs": []}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or not isinstance(data.get("runs", []), list):
+            raise ValueError("objet JSON avec une liste runs attendu")
+    except (OSError, ValueError) as exc:
+        raise LearningError(f"état du coach illisible ({path}) : {exc}") from exc
+    return {"last_run": None, "runs": [], **data}
+
+
+def read_coach(config: Config | None) -> dict[str, Any]:
+    """``state/learning/coach.json`` : ``{last_run, runs: [{at, cases, judges: [...]}]}`` (vide s'il n'existe pas)."""
+    return _read_coach(_settings(config))
+
+
+def _new_scored(scored: set[str], last_run: datetime | None, journal_path: str) -> int:
+    """Clips scored dont l'entree ``stats`` du journal date d'apres ``last_run`` (tous, s'il n'a jamais tourne)."""
+    if last_run is None:
+        return len(scored)
+    fresh = {f"{e['video_id']}/{e['clip_id']}" for e in outcomes.read(journal_path)
+             if e.get("kind") == "stats" and _aware(e["recorded_at"]) > last_run}
+    return len(scored & fresh)
+
+
+def _coach_cases(scored: set[str], config: Config) -> list[dict[str, Any]]:
+    sidecars = {f"{p.parent.name}/{p.stem}": d for p, d in _read_sidecars(config)}
+    cache: dict[str, Any] = {}
+    cases = []
+    for key in sorted(scored):
+        video_id, clip_id = key.split("/", 1)
+        sidecar = sidecars.get(key)
+        if sidecar is None:
+            continue
+        moment_id = _moment_id(video_id, clip_id)
+        trace = ((_moment(config, video_id, moment_id, cache) or {}).get("jury") or {}).get("trace")
+        if trace is None:
+            continue
+        context = " — ".join(str(sidecar[k]) for k in ("source_title", "screen_title") if sidecar.get(k))
+        cases.append({"video_id": video_id, "moment_id": moment_id, "text": str(sidecar.get("transcript") or ""),
+                      "context": context, "trace": trace})
+    return cases
+
+
+def active_perspectives(config: Config) -> dict[str, str]:
+    """Juge actif -> perspective en place (defauts de ``clipper.jury`` surcharges par ``[jury.judges.*]``)."""
+    merged = jury._deep_merge(jury.CONFIG_DEFAULTS, config.section("jury"))
+    return {j["name"]: j["perspective"] for j in jury._judges(merged)}
+
+
+def coach_if_due(now: datetime, *, config: Config | None = None) -> list[dict[str, Any]]:
+    """Passage du coach (R6) : au moins ``coach_min_new_cases`` clips scored nouveaux depuis ``last_run`` et
+    ``coach_min_interval_days`` ecoules, sinon aucun appel LLM. Sinon ``jury_coach.propose`` sur les clips scored
+    dont le moment porte une trace ; chaque entree rendue est consignee dans ``coach.json`` (``proposed`` si
+    acceptee, ``rejected`` sinon). Rien n'est applique : ni ``config.toml`` ni ``jury.py`` ni les poids ne bougent.
+    Rend les entrees consignees (liste vide si rien n'etait du)."""
+    settings = _settings(config)
+    if not settings["enabled"]:
+        return []
+    if config is None:
+        from clipper.config import load_config
+        config = load_config()
+    journal_path = config.section("outcomes")["journal_path"]
+    with channel_mod.file_lock(_coach_path(settings)):
+        coach = _read_coach(settings)
+        last_run = _aware(coach["last_run"]) if coach["last_run"] else None
+        if last_run is not None and now - last_run < timedelta(days=float(settings["coach_min_interval_days"])):
+            return []
+        scored = set(_read_sync(settings)["scored"])
+        if _new_scored(scored, last_run, journal_path) < settings["coach_min_new_cases"]:
+            return []
+        cases = _coach_cases(scored, config)
+        if not cases:
+            return []
+        from clipper import moments  # lazy : la grille est lue, aucune etape n'est lancee
+        try:
+            rubric = moments.load_rubric(moments.resolve_rubric_path(config.section("moments")["rubric_path"]))
+        except moments.MomentsError as exc:
+            raise jury_coach.CoachError(f"grille des moments illisible : {exc}") from exc
+        results = jury_coach.propose(cases, rubric, active_perspectives(config), config=config, now=now)
+        entries = [{**r, "status": "proposed" if r["accepted"] else "rejected", "decided_at": None, "decided_by": None}
+                   for r in results]
+        coach["runs"].append({"at": now.isoformat(), "cases": len(cases), "judges": entries})
+        coach["last_run"] = now.isoformat()
+        channel_mod.atomic_write_json(_coach_path(settings), coach)
+        return entries
+
+
+_VERSION_BODY = re.compile(r"\A# [^\n]*\n\n(.*?)\n\n## Justification\n", re.DOTALL)
+
+
+def proposal_perspective(path: str | Path) -> str:
+    """Perspective proposee, lue dans ``prompts/jury/<juge>/vN.md`` (entre le titre et « Justification »)."""
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise LearningError(f"proposition du coach illisible ({path}) : {exc}") from exc
+    found = _VERSION_BODY.match(text)
+    if not found or not found[1].strip():
+        raise LearningError(f"proposition du coach mal formée ({path}) : perspective introuvable")
+    return found[1].strip()
+
+
+def _find_entry(coach: dict[str, Any], judge: str, version: int) -> dict[str, Any]:
+    for run in coach["runs"]:
+        for entry in run["judges"]:
+            if entry.get("judge") == judge and entry.get("version") == version and entry.get("accepted"):
+                return entry
+    raise ProposalError(f"aucune proposition du coach pour {judge} v{version}", 404)
+
+
+def find_proposal(config: Config | None, judge: str, version: int) -> dict[str, Any]:
+    """Proposition acceptee par le coach pour ``judge`` ``version`` (``ProposalError`` 404 si inconnue)."""
+    return _find_entry(read_coach(config), judge, version)
+
+
+def decide_proposal(config: Config | None, judge: str, version: int, status: str, *, by: str,
+                    now: datetime | None = None) -> dict[str, Any]:
+    """Marque la proposition ``adopted`` ou ``refused`` (``decided_at``, ``decided_by``) ; deja decidee =
+    ``ProposalError`` 409. N'ecrit que ``coach.json`` : appliquer la perspective est l'affaire de l'appelant."""
+    if status not in ("adopted", "refused"):
+        raise LearningError(f"décision inconnue {status!r} (adopted ou refused attendu)")
+    settings = _settings(config)
+    with channel_mod.file_lock(_coach_path(settings)):
+        coach = _read_coach(settings)
+        entry = _find_entry(coach, judge, version)
+        if entry["status"] != "proposed":
+            raise ProposalError(f"proposition {judge} v{version} déjà {entry['status']}", 409)
+        entry.update(status=status, decided_at=_now_iso(now), decided_by=by)
+        channel_mod.atomic_write_json(_coach_path(settings), coach)
+        return entry
+
+
+def proposals(config: Config | None) -> list[dict[str, Any]]:
+    """Propositions du coach acceptees (proposed | adopted | refused), la plus recente d'abord, avec la perspective
+    proposee (lue dans ``prompts/jury/<juge>/vN.md``) et celle en place dans la config du jury. Lecture seule."""
+    coach = read_coach(config)
+    try:
+        current = active_perspectives(config) if config is not None else {}
+    except jury.JuryError:
+        current = {}
+    found = []
+    for run in reversed(coach["runs"]):
+        for entry in run["judges"]:
+            if not entry.get("accepted"):
+                continue
+            try:
+                proposed, error = proposal_perspective(entry["path"]), None
+            except LearningError as exc:
+                proposed, error = None, str(exc)
+            found.append({"judge": entry["judge"], "version": entry["version"], "metric": entry["metric"], "at": run["at"],
+                          "perspective_proposed": proposed, "perspective_current": current.get(entry["judge"]),
+                          "status": entry["status"], "decided_at": entry["decided_at"], "decided_by": entry["decided_by"],
+                          "error": error})
+    return found
+
+
+def status(config: Config | None) -> dict[str, Any]:
+    """Etat de la boucle pour l'ecran Statistiques (lecture seule : aucun calcul, aucun appel LLM)."""
+    settings = _settings(config)
+    weights_path = Path((config.section("jury_calibration") if config is not None else jury_calibration.CONFIG_DEFAULTS)["weights_path"])
+    try:
+        weights = json.loads(weights_path.read_text(encoding="utf-8")) if weights_path.exists() else None
+    except (OSError, ValueError) as exc:
+        raise LearningError(f"poids du jury illisibles ({weights_path}) : {exc}") from exc
+    return {"enabled": settings["enabled"], "links": _read_links(settings), "sync": _read_sync(settings),
+            "weights": weights, "coach": proposals(config)}

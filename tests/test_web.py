@@ -9229,3 +9229,244 @@ def test_series_preview_without_clip_dates_still_needs_the_start_and_the_interva
         "mode": "manual", "account": READY, "selection": [{"video_id": CLIPS_VIDEO, "clip_id": "02"}]})
 
     assert resp.status_code in (409, 422) and "début" in resp.text
+
+
+# --------------------------------------------------------------------------
+# Apprentissage (3/4) : GET /api/learning, Adopter / Refuser, section de l'ecran Statistiques (TASK-c108, SPEC-00db R6-R7)
+# --------------------------------------------------------------------------
+
+import tomllib  # noqa: E402
+
+_LEARN_TOML = (
+    '# commentaire a perdre\nmode = "review"\n'
+    '[web]\nport = 8123\ntoken = "secret-tres-long"\n'
+    '[render]\ncrf = 18\n'
+)
+_PROPOSED = "NEUVE perspective de {judge} : plus de nuance sur la chute."
+
+
+def _learning_state(tmp_path, *, toml=_LEARN_TOML) -> None:
+    """Etat du coach sous le cwd (isolated_cwd) : retention proposee, spectateur adoptee, avocat refusee, monteur rejetee."""
+    (tmp_path / "config.toml").write_text(toml, encoding="utf-8")
+    state = tmp_path / "state" / "learning"
+    state.mkdir(parents=True)
+    entries = []
+    for judge, version, status in (("retention", 1, "proposed"), ("spectateur", 1, "adopted"), ("avocat", 2, "refused")):
+        md = tmp_path / "prompts" / "jury" / judge / f"v{version}.md"
+        md.parent.mkdir(parents=True, exist_ok=True)
+        md.write_text(f"# {judge} v{version}\n\n{_PROPOSED.format(judge=judge)}\n\n## Justification\nmieux\n\n"
+                      "## Metrique (erreur)\n- avant : 0.5000\n- apres : 0.2000\n- cas rejoues : 5\n", encoding="utf-8")
+        entries.append({"judge": judge, "accepted": True, "reason": None, "version": version, "path": str(md),
+                        "metric": {"before": 0.5, "after": 0.2, "cases": 5}, "status": status,
+                        "decided_at": None if status == "proposed" else "2026-10-09T10:00:00+00:00",
+                        "decided_by": None if status == "proposed" else "web"})
+    entries.append({"judge": "monteur", "accepted": False, "reason": "ne predit pas mieux en rejeu", "version": None,
+                    "path": None, "metric": None, "status": "rejected", "decided_at": None, "decided_by": None})
+    (state / "coach.json").write_text(json.dumps({"last_run": "2026-10-08T10:00:00+00:00", "runs": [
+        {"at": "2026-10-08T10:00:00+00:00", "cases": 12, "judges": entries}]}), encoding="utf-8")
+    (state / "sync.json").write_text(json.dumps({
+        "last_sync": "2026-10-08T09:00:00+00:00", "last_error": {"at": "2026-10-08T09:30:00+00:00", "where": "coach", "message": "boom"},
+        "results": [], "scored": [], "excluded": [{"video_id": "V", "clip_id": "01", "account": "compte_a", "reason": "immature"}],
+        "accounts": {}, "calibration": None}), encoding="utf-8")
+    (state / "links.json").write_text(json.dumps({
+        "last_run": {}, "counts": {"compte_a": {"linked": 3, "none": 1, "ambiguous": 0}},
+        "unlinked": [{"video_id": "V", "clip_id": "02", "account": "compte_a", "reason": "none"}]}), encoding="utf-8")
+    (tmp_path / "state" / "jury_weights.json").write_text(json.dumps({"judges": {
+        "retention": {"weight": 1.2, "agreement": 0.4, "clips": 8, "reason": None}}}), encoding="utf-8")
+
+
+def _learning_client(tmp_path, monkeypatch):
+    """Serveur dont tout appel LLM ou calcul d'apprentissage ferait echouer le test (R7)."""
+    from clipper import jury_coach, learning, llm
+    from clipper.llm.fake import FakeBackend
+
+    fake = FakeBackend([{"unexpected": True}])
+    forbidden = []
+    for name in ("sync", "run_if_due", "coach_if_due", "link_posts", "link_if_due"):
+        monkeypatch.setattr(learning, name, lambda *a, _n=name, **k: forbidden.append(_n))
+    monkeypatch.setattr(jury_coach, "propose", lambda *a, **k: forbidden.append("propose"))
+    from clipper.config import load_config
+    app = create_app(config=load_config(tmp_path / "config.toml"))
+    return TestClient(app), fake, forbidden
+
+
+def test_get_learning_returns_state_weights_and_every_proposal_with_both_perspectives(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import jury, llm
+
+    _learning_state(tmp_path)
+    c, fake, forbidden = _learning_client(tmp_path, monkeypatch)
+    with llm.use_backend(fake):
+        data = c.get("/api/learning").json()
+
+    assert set(data) == {"enabled", "links", "sync", "weights", "coach"} and data["enabled"] is True
+    assert data["links"]["counts"]["compte_a"]["linked"] == 3 and data["sync"]["last_error"]["message"] == "boom"
+    assert data["weights"]["judges"]["retention"]["weight"] == 1.2
+    by_judge = {p["judge"]: p for p in data["coach"]}
+    assert set(by_judge) == {"retention", "spectateur", "avocat"}  # la proposition rejetee n'est pas adoptable
+    retention = by_judge["retention"]
+    assert retention["status"] == "proposed" and retention["version"] == 1 and retention["decided_at"] is None
+    assert retention["metric"] == {"before": 0.5, "after": 0.2, "cases": 5}
+    assert retention["perspective_proposed"] == _PROPOSED.format(judge="retention")
+    assert retention["perspective_current"] == jury.CONFIG_DEFAULTS["judges"]["retention"]["perspective"]
+    assert by_judge["spectateur"]["status"] == "adopted" and by_judge["avocat"]["status"] == "refused"
+    assert fake.calls == [] and forbidden == []
+
+
+def test_get_learning_without_any_state_is_empty(tmp_path, isolated_cwd, monkeypatch):
+    (tmp_path / "config.toml").write_text(_LEARN_TOML, encoding="utf-8")
+    c, fake, forbidden = _learning_client(tmp_path, monkeypatch)
+
+    data = c.get("/api/learning").json()
+
+    assert data["weights"] is None and data["coach"] == [] and data["sync"]["last_sync"] is None and forbidden == []
+
+
+def test_adopt_writes_the_perspective_in_config_toml_and_marks_the_proposal(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import config as config_mod
+    from clipper.web import app as web_app
+
+    _learning_state(tmp_path)
+    c, fake, forbidden = _learning_client(tmp_path, monkeypatch)
+    calls = []
+    real = config_mod.write_config
+    monkeypatch.setattr(web_app, "write_config", lambda *a, **k: (calls.append(a), real(*a, **k))[1])
+
+    resp = c.post("/api/learning/coach/retention/1/adopt")
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "adopted" and body["decided_by"] == "web" and body["decided_at"] and body["comments_lost"] is True
+    assert len(calls) == 1
+    written = tomllib.loads((tmp_path / "config.toml").read_text(encoding="utf-8"))
+    assert written["jury"]["judges"]["retention"]["perspective"] == _PROPOSED.format(judge="retention")
+    assert written["render"] == {"crf": 18} and written["web"]["token"] == "secret-tres-long" and written["mode"] == "review"
+    after = c.get("/api/learning").json()["coach"]
+    retention = next(p for p in after if p["judge"] == "retention")
+    assert retention["status"] == "adopted" and retention["perspective_current"] == _PROPOSED.format(judge="retention")
+    assert forbidden == []
+
+
+def test_adopt_keeps_the_other_keys_of_the_judge_table(tmp_path, isolated_cwd, monkeypatch):
+    _learning_state(tmp_path, toml=_LEARN_TOML + '[jury.judges.retention]\nmodel = "fast"\nperspective = "ancienne"\n')
+    c, _fake, _forbidden = _learning_client(tmp_path, monkeypatch)
+
+    assert c.post("/api/learning/coach/retention/1/adopt").status_code == 200
+
+    judge = tomllib.loads((tmp_path / "config.toml").read_text(encoding="utf-8"))["jury"]["judges"]["retention"]
+    assert judge == {"model": "fast", "perspective": _PROPOSED.format(judge="retention")}
+
+
+def test_refuse_marks_the_proposal_and_leaves_config_toml_alone(tmp_path, isolated_cwd, monkeypatch):
+    _learning_state(tmp_path)
+    c, _fake, _forbidden = _learning_client(tmp_path, monkeypatch)
+    before = (tmp_path / "config.toml").read_bytes()
+
+    resp = c.post("/api/learning/coach/retention/1/refuse")
+
+    assert resp.status_code == 200 and resp.json()["status"] == "refused" and resp.json()["decided_by"] == "web"
+    assert (tmp_path / "config.toml").read_bytes() == before
+
+
+@pytest.mark.parametrize("verb", ["adopt", "refuse"])
+def test_unknown_proposal_is_404(tmp_path, isolated_cwd, monkeypatch, verb):
+    _learning_state(tmp_path)
+    c, _fake, _forbidden = _learning_client(tmp_path, monkeypatch)
+    assert c.post(f"/api/learning/coach/retention/7/{verb}").status_code == 404
+    assert c.post(f"/api/learning/coach/inconnu/1/{verb}").status_code == 404
+
+
+@pytest.mark.parametrize("judge, version", [("spectateur", 1), ("avocat", 2)])
+def test_already_decided_proposal_is_409_and_config_toml_is_not_touched(tmp_path, isolated_cwd, monkeypatch, judge, version):
+    _learning_state(tmp_path)
+    c, _fake, _forbidden = _learning_client(tmp_path, monkeypatch)
+    before = (tmp_path / "config.toml").read_bytes()
+
+    assert c.post(f"/api/learning/coach/{judge}/{version}/adopt").status_code == 409
+    assert c.post(f"/api/learning/coach/{judge}/{version}/refuse").status_code == 409
+    assert (tmp_path / "config.toml").read_bytes() == before
+
+
+def test_the_conformity_judge_is_never_adopted(tmp_path, isolated_cwd, monkeypatch):
+    _learning_state(tmp_path)
+    c, _fake, _forbidden = _learning_client(tmp_path, monkeypatch)
+    assert c.post("/api/learning/coach/conformite/1/adopt").status_code == 409
+    assert c.post("/api/learning/coach/conformite/1/refuse").status_code == 409
+
+
+def test_adopting_twice_is_refused_the_second_time(tmp_path, isolated_cwd, monkeypatch):
+    _learning_state(tmp_path)
+    c, _fake, _forbidden = _learning_client(tmp_path, monkeypatch)
+    assert c.post("/api/learning/coach/retention/1/adopt").status_code == 200
+    assert c.post("/api/learning/coach/retention/1/adopt").status_code == 409
+
+
+def _learning_screen_run(expression: str, data: dict) -> object:
+    """Charge TOUT stats.js dans node (globales de l'interface simulees) puis evalue ``expression`` sur ``data``."""
+    script = (
+        'const fr = (n, d) => Number(n).toLocaleString("fr-FR", { minimumFractionDigits: d || 0, maximumFractionDigits: d || 0 });\n'
+        'const esc = (s) => String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;");\n'
+        'const fmtParis = (iso) => "PARIS " + iso;\nconst Screens = {};\nlet currentScreen = "";\n'
+        'const icon = () => "";\nconst $ = () => null;\nconst $$ = () => [];\nconst api = async () => ({});\n'
+        'const toast = () => {};\nconst toastError = () => {};\nconst confirmDialog = async () => true;\n'
+        'const emptyState = () => "";\nconst renderCurrent = () => {};\nconst location = { hash: "#/stats" };\n'
+        'const document = { addEventListener() {} };\nconst window = { addEventListener() {} };\n'
+        + _static("screens", "stats.js")
+        + '\nconst data = JSON.parse(process.argv[1]);\n'
+        + f"process.stdout.write(JSON.stringify({expression}));"
+    )
+    return json.loads(_node_run(script, json.dumps(data)))
+
+
+_FABRICATED = {
+    "enabled": True,
+    "links": {"counts": {"compte_a": {"linked": 3}}, "unlinked": [{"reason": "none"}, {"reason": "ambiguous"}, {"reason": "none"}]},
+    "sync": {"last_sync": "2026-10-08T09:00:00+00:00", "last_error": {"at": "2026-10-08T09:30:00+00:00", "where": "coach", "message": "boom <b>"},
+             "excluded": [{"account": "compte_b", "reason": "account_below_min"}, {"account": "compte_b", "reason": "account_below_min"}]},
+    "weights": {"judges": {"retention": {"weight": 1.2, "agreement": 0.4, "clips": 8, "reason": None},
+                           "conformite": {"weight": 1.0, "agreement": None, "clips": 8, "reason": "fixed"}}},
+    "coach": [
+        {"judge": "retention", "version": 1, "metric": {"before": 0.5, "after": 0.2, "cases": 5}, "status": "proposed",
+         "perspective_current": "PERSPECTIVE EN PLACE", "perspective_proposed": "PERSPECTIVE PROPOSEE", "decided_at": None, "error": None},
+        {"judge": "avocat", "version": 2, "metric": {"before": 0.4, "after": 0.3, "cases": 5}, "status": "refused",
+         "perspective_current": "A", "perspective_proposed": "B", "decided_at": "2026-10-09T10:00:00+00:00", "error": None},
+    ],
+}
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node absent du PATH")
+def test_the_stats_screen_renders_the_three_learning_blocks_on_a_fabricated_answer():
+    html = _learning_screen_run("(statsUi.learning = data, statsLearningSection())", _FABRICATED)
+
+    assert "Apprentissage" in html and "data-learning-state" in html and "data-learning-weights" in html and "data-learning-coach" in html
+    # etat : dernier versement, erreur en rouge (echappee), reliés / non reliés par raison, exclus avec la raison
+    assert "PARIS 2026-10-08T09:00:00+00:00" in html and 'class="reason bad" data-learning-error' in html and "boom &lt;b>" in html
+    assert "<strong>3</strong>" in html and "<strong>2</strong> · aucun post du relevé ne correspond" in html
+    assert "plusieurs posts correspondent" in html and "compte_b · compte sous le minimum de posts à vues" in html
+    # poids : accord, cas, raison
+    assert "retention" in html and "1,20" in html and "0,40" in html and "poids fixe" in html
+    # coach : metrique avant -> apres, les deux perspectives, boutons seulement sur « proposee »
+    assert "0,500 → 0,200 sur 5 cas" in html and "PERSPECTIVE EN PLACE" in html and "PERSPECTIVE PROPOSEE" in html
+    assert 'data-learning-adopt="retention/1"' in html and 'data-learning-refuse="retention/1"' in html
+    assert "data-learning-adopt=\"avocat/2\"" not in html and "Refusée" in html
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node absent du PATH")
+def test_the_learning_section_says_so_when_nothing_is_known_yet():
+    empty = {"enabled": False, "links": {"counts": {}, "unlinked": []}, "sync": {"last_sync": None, "last_error": None, "excluded": []},
+             "weights": None, "coach": []}
+    html = _learning_screen_run("(statsUi.learning = data, statsLearningSection())", empty)
+
+    assert "Apprentissage désactivé" in html and "jamais" in html and "Pas encore de poids" in html and "Aucune proposition" in html
+    assert "data-learning-error" not in html and "data-learning-adopt" not in html
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node absent du PATH")
+def test_a_failed_learning_read_is_shown_not_hidden():
+    html = _learning_screen_run('(statsUi.learningError = new Error("illisible"), statsLearningSection())', _FABRICATED)
+    assert "Lecture impossible" in html and "illisible" in html
+
+
+def test_the_stats_screen_reads_learning_and_wires_adopt_and_refuse():
+    js = _static("screens", "stats.js")
+    assert '"/api/learning"' in js and "/api/learning/coach/" in js
+    assert "data-learning-adopt" in js and "data-learning-refuse" in js and "statsLearningSection()" in js

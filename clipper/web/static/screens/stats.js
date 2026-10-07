@@ -33,7 +33,7 @@ const STATS_VIEWER_SECTIONS = [["types", "Types de spectateurs"], ["age", "Âge"
 const statsUi = {
   accounts: null, overview: null, videos: null, videosAccount: "", video: null, videoAccount: "", error: null, loading: null, dirty: false, at: 0, key: "",
   period: 28, metric: "views", sort: { key: "posted_at", dir: "desc" }, q: "", vtab: "overview", refreshing: false,
-  opened: {}, lastRender: 0, poll: null, wasRefreshing: {},
+  opened: {}, lastRender: 0, poll: null, wasRefreshing: {}, learning: null, learningError: null,
 };
 
 /* ---------- formats ---------- */
@@ -108,6 +108,7 @@ function statsLoad() {
   statsUi.loading = (async () => {
     try {
       statsUi.accounts = (await api("/api/stats/tiktok")).accounts;
+      try { statsUi.learning = await api("/api/learning"); statsUi.learningError = null; } catch (err) { statsUi.learningError = err; }
       const account = statsAccount();
       if (account) {
         const r = statsRoute();
@@ -438,6 +439,120 @@ function statsVideoSheet(account) {
       ${content}</div></div>`;
 }
 
+/* ---------- section « Apprentissage » (ADR-c260, SPEC-00db R6-R7) ---------- */
+
+/* Lecture seule de GET /api/learning (le worker verse, recalibre et coache : aucun calcul ici). Trois blocs : l'etat
+   de la boucle, les poids par juge, les propositions du coach que l'humain adopte ou refuse. */
+const LEARNING_REASONS = {
+  none: "aucun post du relevé ne correspond", ambiguous: "plusieurs posts correspondent",
+  immature: "trop récent pour compter", account_below_min: "compte sous le minimum de posts à vues",
+  not_in_stats: "absent du dernier relevé", service_without_stats: "service sans statistiques",
+};
+const LEARNING_WEIGHT_REASONS = { fixed: "poids fixe (jamais recalibré)", min_clips: "pas assez de clips", undefined_agreement: "accord indéfini" };
+const LEARNING_STATUS = { proposed: "À décider", adopted: "Adoptée", refused: "Refusée" };
+
+const learningWhen = (iso) => (iso ? statsWhen(iso) : "jamais");
+
+/* { raison: n } a partir d'une liste d'objets portant `reason`. */
+function learningCount(rows) {
+  const counts = {};
+  for (const row of rows || []) counts[row.reason] = (counts[row.reason] || 0) + 1;
+  return counts;
+}
+
+function learningReasonList(counts) {
+  const keys = Object.keys(counts);
+  if (!keys.length) return "<li>aucun</li>";
+  return keys.map((k) => `<li><strong>${fr(counts[k])}</strong> · ${esc(LEARNING_REASONS[k] || k)}</li>`).join("");
+}
+
+function learningStateBlock(data) {
+  const sync = data.sync || {}, links = data.links || {};
+  const perAccount = links["counts"] || {};
+  const linked = Object.values(perAccount).reduce((t, c) => t + (c.linked || 0), 0);
+  const error = sync.last_error
+    ? `<p class="reason bad" data-learning-error>Dernière erreur (${esc(sync.last_error.where)}) · ${esc(learningWhen(sync.last_error.at))} : ${esc(sync.last_error.message)}</p>` : "";
+  const excluded = {};
+  for (const row of sync.excluded || []) {
+    const key = `${row.account || "—"} · ${LEARNING_REASONS[row.reason] || row.reason}`;
+    excluded[key] = (excluded[key] || 0) + 1;
+  }
+  const excludedRows = Object.keys(excluded).map((k) => `<li><strong>${fr(excluded[k])}</strong> · ${esc(k)}</li>`).join("") || "<li>aucun</li>";
+  return `<div class="panel panel-pad" data-learning-state>
+    <h3>État de la boucle</h3>
+    ${data.enabled ? "" : `<p class="reason">Apprentissage désactivé ([learning] enabled = false) : le worker ne rattache ni ne verse rien.</p>`}
+    <p>Dernier versement : <strong>${esc(learningWhen(sync.last_sync))}</strong></p>
+    ${error}
+    <p>Clips reliés à leur post : <strong>${fr(linked)}</strong></p>
+    <p>Clips non reliés :</p><ul>${learningReasonList(learningCount(links.unlinked))}</ul>
+    <p>Clips exclus de l'apprentissage :</p><ul>${excludedRows}</ul>
+  </div>`;
+}
+
+function learningWeightsBlock(data) {
+  const judges = data.weights && data.weights.judges ? Object.keys(data.weights.judges) : [];
+  if (!judges.length) {
+    return `<div class="panel panel-pad" data-learning-weights><h3>Poids par juge</h3><p class="reason">Pas encore de poids calculés : il faut des clips mûrs sur un compte éligible.</p></div>`;
+  }
+  const rows = judges.map((name) => {
+    const j = data.weights.judges[name];
+    return `<tr><td>${esc(name)}</td><td>${fr(j.weight, 2)}</td><td>${j.agreement === null || j.agreement === undefined ? "—" : fr(j.agreement, 2)}</td><td>${fr(j.clips || 0)}</td><td>${esc(LEARNING_WEIGHT_REASONS[j.reason] || j.reason || "—")}</td></tr>`;
+  }).join("");
+  return `<div class="panel panel-pad" data-learning-weights><h3>Poids par juge</h3>
+    <div style="overflow-x:auto"><table class="table"><thead><tr><th>Juge</th><th>Poids</th><th>Accord</th><th>Cas</th><th>Raison</th></tr></thead><tbody>${rows}</tbody></table></div></div>`;
+}
+
+function learningMetric(metric) {
+  if (!metric) return "—";
+  return `erreur ${fr(metric.before, 3)} → ${fr(metric.after, 3)} sur ${fr(metric.cases)} cas`;
+}
+
+function learningProposal(p) {
+  const key = `${esc(p.judge)}/${p.version}`;
+  const decided = p.status === "proposed" ? "" : ` · ${esc(learningWhen(p.decided_at))}`;
+  const buttons = p.status === "proposed"
+    ? `<div class="right"><button class="btn btn-primary btn-sm" type="button" data-learning-adopt="${key}">Adopter</button><button class="btn btn-sm" type="button" data-learning-refuse="${key}">Refuser</button></div>` : "";
+  return `<div class="panel panel-pad" data-learning-proposal="${key}">
+    <h4>${esc(p.judge)} · v${fr(p.version)} <span class="chip plain">${esc(LEARNING_STATUS[p.status] || p.status)}${decided}</span></h4>
+    <p>Métrique : ${esc(learningMetric(p.metric))} (plus bas est mieux)</p>
+    ${p.error ? `<p class="reason bad">${esc(p.error)}</p>` : ""}
+    <p><strong>Perspective en place</strong></p><pre style="white-space:pre-wrap">${esc(p.perspective_current || "—")}</pre>
+    <p><strong>Perspective proposée</strong></p><pre style="white-space:pre-wrap">${esc(p.perspective_proposed || "—")}</pre>
+    ${buttons}
+  </div>`;
+}
+
+function learningCoachBlock(data) {
+  const items = data.coach || [];
+  const body = items.length ? items.map(learningProposal).join("")
+    : `<p class="reason">Aucune proposition : le coach passe seulement avec assez de clips mûrs nouveaux, et rien ne s'applique sans ton accord.</p>`;
+  return `<div data-learning-coach><h3>Coach des prompts</h3>${body}</div>`;
+}
+
+function statsLearningSection() {
+  if (statsUi.learningError) {
+    return `<section class="learning"><h2>Apprentissage</h2><p class="reason bad">Lecture impossible : ${esc(statsUi.learningError.message || statsUi.learningError)}</p></section>`;
+  }
+  if (!statsUi.learning) return "";
+  return `<section class="learning"><h2>Apprentissage</h2>${learningStateBlock(statsUi.learning)}${learningWeightsBlock(statsUi.learning)}${learningCoachBlock(statsUi.learning)}</section>`;
+}
+
+/* Adopter ecrit la perspective dans config.toml (le serveur), Refuser ne touche a rien ; l'humain decide, jamais le coach. */
+async function learningDecide(key, verb) {
+  const [judge, version] = key.split("/");
+  const adopt = verb === "adopt";
+  if (adopt && !(await confirmDialog({ title: "Adopter cette perspective ?", body: `La perspective proposée pour ${judge} remplace celle en place dans config.toml ([jury.judges.${judge}] perspective).`, confirmLabel: "Adopter", danger: false }))) return;
+  try {
+    const j = encodeURIComponent(judge), v = encodeURIComponent(version);
+    const done = adopt ? await api(`/api/learning/coach/${j}/${v}/adopt`, { method: "POST" }) : await api(`/api/learning/coach/${j}/${v}/refuse`, { method: "POST" });
+    toast({ kind: "ok", title: adopt ? "Perspective adoptée" : "Proposition refusée", body: `${judge} v${version}${adopt && done.comments_lost ? " · les commentaires de config.toml ont été perdus" : ""}.` });
+  } catch (err) {
+    toastError(adopt ? "Adoption impossible" : "Refus impossible", err);
+  }
+  statsUi.at = 0;
+  await statsLoad();
+}
+
 /* ---------- relevé a la demande ---------- */
 
 /* Ouvre le Chrome du profil sur ce PC (visible) ; un arret sur (captcha, connexion expiree, compte non pret) revient
@@ -497,6 +612,8 @@ function statsWire(body, account) {
     tr.onclick = open;
     tr.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); } };
   });
+  $$("[data-learning-adopt]", body).forEach((b) => (b.onclick = () => learningDecide(b.dataset.learningAdopt, "adopt")));
+  $$("[data-learning-refuse]", body).forEach((b) => (b.onclick = () => learningDecide(b.dataset.learningRefuse, "refuse")));
   $$("[data-stats-vtab]", body).forEach((b) => (b.onclick = () => { statsUi.vtab = b.dataset.statsVtab; renderCurrent(); }));
 }
 
@@ -523,7 +640,7 @@ Screens.stats = {
       const count = statsUi.videos && route.tab === "videos" ? statsUi.videos.length : null;
       pane = statsTabs(account, route.tab, count) + (route.tab === "videos" ? statsVideosList(account) : statsOverview(account));
     }
-    body.innerHTML = `${statsUi.error ? `<p class="reason bad">Actualisation impossible : ${esc(statsUi.error.message || statsUi.error)}</p>` : ""}${statsControls(account)}${pane}`;
+    body.innerHTML = `${statsUi.error ? `<p class="reason bad">Actualisation impossible : ${esc(statsUi.error.message || statsUi.error)}</p>` : ""}${statsControls(account)}${pane}${route.tab === "videos" && route.post ? "" : statsLearningSection()}`;
     statsWire(body, account);
   },
 };
