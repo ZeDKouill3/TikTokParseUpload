@@ -356,6 +356,8 @@ def test_config_section_download_resolves_via_clipper_config(isolated_cwd):
         "cookies_from_browser": None,
         "cookies_profile": "",
         "js_runtimes": "node",
+        "network_retries": 15,
+        "network_retry_pause_s": 5,
     }
 
 
@@ -563,3 +565,97 @@ def test_is_youtube_url():
     assert is_youtube_url("https://youtu.be/AAAAAAAAAAA")
     assert is_youtube_url("https://www.youtube.com/watch?v=AAAAAAAAAAA")
     assert not is_youtube_url("https://www.twitch.tv/videos/55")
+
+
+def _flaky_ydl(info: dict, errors: list, calls: list):
+    """YoutubeDL factice : leve les erreurs de `errors` une par une, puis reussit."""
+    ok = _make_fake_ydl(info, {})
+
+    class Flaky(ok):
+        def extract_info(self, url, download=True):
+            calls.append(url)
+            if errors:
+                raise errors.pop(0)
+            return super().extract_info(url, download)
+
+    return Flaky
+
+
+def test_network_retry_defaults_declared():
+    from clipper.download import CONFIG_DEFAULTS
+
+    assert CONFIG_DEFAULTS["network_retries"] == 15
+    assert CONFIG_DEFAULTS["network_retry_pause_s"] == 5
+
+
+def test_download_retries_on_connection_reset_then_succeeds(isolated_cwd, caplog):
+    import logging
+
+    from clipper.download import download
+
+    info = _load_fixture("info_dict_full.json")
+    errors = [
+        Exception("ERROR: Failed to download m3u8 information: [WinError 10054] Une connexion existante a ete fermee"),
+        Exception("Connection reset by peer"),
+    ]
+    calls: list = []
+    sleeps: list = []
+    with caplog.at_level(logging.INFO, logger="clipper.download"):
+        meta = download(
+            f"https://www.youtube.com/watch?v={info['id']}",
+            workspace_dir=isolated_cwd / "workspace",
+            ydl_factory=_flaky_ydl(info, errors, calls),
+            sleep=sleeps.append,
+            network_retries=15,
+            network_retry_pause_s=7,
+        )
+    assert meta["video_id"] == info["id"]
+    assert len(calls) == 3
+    assert sleeps == [7, 7]
+    assert "essai 1/15" in caplog.text and "essai 2/15" in caplog.text
+
+
+def test_download_network_retries_exhausted_raises_original_error(isolated_cwd):
+    from clipper.download import download
+
+    info = _load_fixture("info_dict_full.json")
+    original = Exception("[WinError 10054] connexion fermee")
+    errors = [original] * 10
+    calls: list = []
+    sleeps: list = []
+    with pytest.raises(Exception) as excinfo:
+        download(
+            f"https://www.youtube.com/watch?v={info['id']}",
+            workspace_dir=isolated_cwd / "workspace",
+            ydl_factory=_flaky_ydl(info, errors, calls),
+            sleep=sleeps.append,
+            network_retries=3,
+        )
+    assert excinfo.value is original
+    assert len(calls) == 4
+    assert len(sleeps) == 3
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "This video is only available to subscribers",
+        "Private video. Sign in if you've been granted access",
+        "Requested format is not available",
+    ],
+)
+def test_download_does_not_retry_other_errors(isolated_cwd, message):
+    from clipper.download import download
+
+    info = _load_fixture("info_dict_full.json")
+    calls: list = []
+    sleeps: list = []
+    with pytest.raises(Exception, match=message[:20]):
+        download(
+            f"https://www.youtube.com/watch?v={info['id']}",
+            workspace_dir=isolated_cwd / "workspace",
+            ydl_factory=_flaky_ydl(info, [Exception(message)], calls),
+            sleep=sleeps.append,
+        )
+    assert len(calls) == 1
+    assert sleeps == []

@@ -21,7 +21,20 @@ CONFIG_DEFAULTS: dict[str, object] = {
     # cookies.txt pour yt-dlp ; reglé, il remplace cookies_from_browser (SPEC-9225 R8).
     "cookies_profile": "",
     "js_runtimes": "node",
+    # Coupures reseau (WinError 10054 sur usher.ttvnw.net...) : essais rapproches avant d'echouer.
+    "network_retries": 15,
+    "network_retry_pause_s": 5,
 }
+
+# Marqueurs d'une erreur de transport reseau (connexion fermee/coupee), cherches dans le message
+# de l'erreur et de ses causes. Rien d'autre n'est reessaye ici (abonnes, prive, format...).
+_NETWORK_MARKERS = (
+    "10054",
+    "connection reset",
+    "connection aborted",
+    "forcibly closed",
+    "failed to download m3u8 information",
+)
 
 # meilleure qualite jusqu'a 1080p, conteneur mp4 (ADR-b16b: sortie normalisee
 # pour les etapes suivantes du pipeline).
@@ -212,6 +225,48 @@ def _ydl_opts(
     return opts
 
 
+def _is_network_error(exc: BaseException) -> bool:
+    """Vrai si l'erreur (ou l'une de ses causes) est une coupure de transport reseau."""
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, ConnectionError):
+            return True
+        text = str(cur).lower()
+        if any(marker in text for marker in _NETWORK_MARKERS):
+            return True
+        inner = getattr(cur, "exc_info", None)
+        nxt = inner[1] if isinstance(inner, tuple) and len(inner) > 1 else None
+        cur = cur.__cause__ or nxt or cur.__context__
+    return False
+
+
+def _extract_with_retries(
+    url: str,
+    opts: dict[str, Any],
+    ydl_factory: Callable[[dict[str, Any]], Any],
+    video_id: str,
+    retries: int,
+    pause_s: float,
+    sleep: Callable[[float], None],
+) -> dict[str, Any]:
+    """Telecharge ; sur coupure reseau, reessaie jusqu'a `retries` fois (pause `pause_s`),
+    puis laisse remonter l'erreur d'origine telle quelle."""
+    attempt = 0
+    while True:
+        try:
+            with ydl_factory(opts) as ydl:
+                return ydl.extract_info(url, download=True)
+        except Exception as exc:
+            if attempt >= retries or not _is_network_error(exc):
+                raise
+            attempt += 1
+            reason = " ".join(str(exc).split())[:120]
+            log.info("%s : coupure reseau, essai %d/%d : %s", video_id, attempt, retries, reason)
+            sleep(pause_s)
+
+
 def download(
     url: str,
     workspace_dir: str | Path = "workspace",
@@ -221,6 +276,9 @@ def download(
     cookies_profile: str | None = "",
     js_runtimes: str | None = "node",
     ydl_factory: Callable[[dict[str, Any]], Any] = yt_dlp.YoutubeDL,
+    network_retries: int = 15,
+    network_retry_pause_s: float = 5,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> dict[str, Any]:
     """Download a YouTube video and write its metadata (ADR-b16b: a step
     reads its inputs and writes workspace/<video_id>/ itself).
@@ -250,8 +308,9 @@ def download(
 
     video_dir.mkdir(parents=True, exist_ok=True)
     opts = _ydl_opts(video_dir, cookies_file, cookies_from_browser, js_runtimes, video_id)
-    with ydl_factory(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
+    info = _extract_with_retries(
+        url, opts, ydl_factory, video_id, network_retries, network_retry_pause_s, sleep
+    )
 
     meta = _build_meta(info, url)
     meta_file.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")

@@ -10,6 +10,14 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ## [Non publié]
 
+### Corrigé
+
+- Download : une coupure réseau (connexion fermée par l'hôte distant, WinError 10054 sur `usher.ttvnw.net`,
+  « Failed to download m3u8 information ») est réessayée aussitôt, jusqu'à `[download] network_retries`
+  fois (15) avec `[download] network_retry_pause_s` (5 s) de pause, chaque essai journalisé ; essais
+  épuisés, l'erreur d'origine remonte comme avant. Les autres erreurs (abonnés, privé, format) échouent
+  au premier essai.
+
 ## [0.5.2] - 2026-10-07
 
 Petite version de correction autour de la publication TikTok et de la veille. Le zip
