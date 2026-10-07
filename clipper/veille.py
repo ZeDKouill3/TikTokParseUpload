@@ -1267,8 +1267,6 @@ def collect(
 # Choix de Claude (R6)
 # --------------------------------------------------------------------------
 
-_DECIDED = ("queued", "ignored")
-
 
 def _schema(max_picks: int) -> dict[str, Any]:
     return {
@@ -1562,7 +1560,9 @@ def run_if_due(
 ) -> dict[str, Any] | None:
     """Relevé + choix de Claude si dû (R7) ; rend l'état du jour, ``None`` si rien n'était dû.
     ``enabled`` faux : rien n'est lu ni écrit. ``refresh.json`` est consommé avant de commencer ;
-    les propositions déjà ``queued``/``ignored`` survivent à un relevé rejoué."""
+    un relevé rejoué le même jour efface puis remplace toute la liste des propositions du jour, décidées
+    comprises (SPEC-8a45 R31) ; ``seen.json``, ``history/``, ``selection/``, ``bilan.json``, la file et les vidéos
+    restent intacts."""
     if not config.section("veille").get("enabled"):
         return None
     table = settings(config)
@@ -1573,12 +1573,11 @@ def run_if_due(
     refresh = _read_json(sdir / "refresh.json", None)
     (sdir / "refresh.json").unlink(missing_ok=True)
     requested_at = refresh.get("requested_at") if isinstance(refresh, dict) else None
-    skeleton = _read_day(sdir, day) or {
+    skeleton = {
         "date": day, "sources": {}, "games": [], "candidates": [], "excluded": {},
         "llm": {"status": "skipped", "error": None, "model": None}, "proposals": [], "skipped_note": ""}
     skeleton.update(started_at=now.isoformat(), finished_at=None, refresh_requested_at=requested_at)
     _write(_day_path(sdir, day), skeleton)  # l'écran voit « en cours » dès maintenant
-    decided = [p for p in skeleton["proposals"] if p["status"] in _DECIDED]
 
     read_clock = clock or _elapsed_clock(now)  # la même horloge pour l'échéance et pour l'heure de fin
     state = collect(now, collectors=collectors, config=config, finalize=False, clock=read_clock)
@@ -1586,10 +1585,13 @@ def run_if_due(
     state = decide(state, config)
     state["finished_at"] = read_clock().isoformat()  # vraie heure de fin, jamais celle du départ
     with channel_mod.file_lock(_state_lock(sdir)):
-        ids = {p["candidate_id"] for p in decided}
-        state["proposals"] = decided + [p for p in state["proposals"] if p["candidate_id"] not in ids]
         _write(_day_path(sdir, day), state)
     return state
+
+
+def _snapshot(candidate: dict[str, Any]) -> dict[str, Any]:
+    """Titre, jeu et chaîne gardés dans ``seen.json`` à la décision : le bilan les lit même si le jour est rejoué (R32)."""
+    return {key: candidate.get(key) for key in ("source", "title", "game_name", "channel_name")}
 
 
 def _update_proposal(
@@ -1635,7 +1637,8 @@ def clip(
         at = datetime.now(timezone.utc).isoformat()
         proposal.update(status="queued", decided_at=at, channel=channel, queue_entry_id=entry["id"])
         seen["queued"].append({"candidate_id": candidate_id, "video_id": entry["video_id"], "url": candidate["url"],
-                               "date": day, "channel": channel, "queue_entry_id": entry["id"], "at": at})
+                               "date": day, "channel": channel, "queue_entry_id": entry["id"], "at": at,
+                               **_snapshot(candidate)})
         result.update(entry)
 
     _update_proposal(config, day, candidate_id, update)
@@ -1650,7 +1653,7 @@ def ignore(day: str, candidate_id: str, config: Config | None = None) -> None:
         at = datetime.now(timezone.utc).isoformat()
         proposal.update(status="ignored", decided_at=at)
         seen["ignored"].append({"candidate_id": candidate_id, "video_id": proposal["candidate"]["video_id"],
-                                "date": day, "at": at})
+                                "date": day, "at": at, **_snapshot(proposal["candidate"])})
 
     _update_proposal(config, day, candidate_id, update)
 

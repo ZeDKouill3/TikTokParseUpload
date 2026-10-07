@@ -828,6 +828,60 @@ def test_veille_report_gives_figures_from_the_journal_and_a_reason_when_absent(t
         assert entries[video]["clips_mature"] == 0
 
 
+def _rewrite_seen(config, video, **fields):
+    """Complète l'entrée seen.queued de ``video`` (instantané écrit à la décision, SPEC-8a45 R32)."""
+    path = _veille_dir(config) / "seen.json"
+    seen = _read(path)
+    for entry in seen["queued"]:
+        if entry["video_id"] == video:
+            entry.update(fields)
+    path.write_text(json.dumps(seen), encoding="utf-8")
+
+
+def _drop_proposals(config, day="2026-10-05"):
+    path = _veille_dir(config) / "days" / f"{day}.json"
+    state = _read(path)
+    state["proposals"] = []
+    path.write_text(json.dumps(state), encoding="utf-8")
+
+
+def test_veille_report_reads_the_seen_snapshot_when_the_day_file_lost_the_proposal(tmp_path):
+    config = _bilan_config(tmp_path)
+    _queue_vod(config, "REPLAYED", title="Titre du fichier")
+    _rewrite_seen(config, "REPLAYED", source="youtube", title="Titre gardé", game_name="Jeu Beta",
+                  channel_name="streamer_b")
+    _drop_proposals(config)  # relevé rejoué : la proposition a disparu du jour
+
+    learning.write_veille_report(NOW, config=config)
+
+    entry = _by_video(_bilan(config))["REPLAYED"]
+    assert (entry["source"], entry["title"], entry["game_name"], entry["channel_name"]) == (
+        "youtube", "Titre gardé", "Jeu Beta", "streamer_b")
+    assert entry["clips_published"] == 0 and entry["missing"] == "no_clips"
+
+
+def test_veille_report_falls_back_to_the_day_file_for_an_entry_without_snapshot(tmp_path):
+    config = _bilan_config(tmp_path)
+    _queue_vod(config, "OLDENTRY", title="Titre du fichier")  # seen sans title (ancien format)
+
+    learning.write_veille_report(NOW, config=config)
+
+    entry = _by_video(_bilan(config))["OLDENTRY"]
+    assert (entry["source"], entry["title"], entry["game_name"], entry["channel_name"]) == (
+        "twitch", "Titre du fichier", "Jeu Alpha", "streamer_a")
+
+
+def test_veille_report_gives_null_when_neither_seen_nor_the_day_file_knows_the_vod(tmp_path):
+    config = _bilan_config(tmp_path)
+    _queue_vod(config, "LOSTENTRY")
+    _drop_proposals(config)
+
+    learning.write_veille_report(NOW, config=config)
+
+    entry = _by_video(_bilan(config))["LOSTENTRY"]
+    assert (entry["source"], entry["title"], entry["game_name"], entry["channel_name"]) == (None, None, None, None)
+
+
 def test_veille_report_immature_and_account_below_min(tmp_path):
     config = _bilan_config(tmp_path)
     _linked_clip(config, "03")  # jeune : un seul releve recent

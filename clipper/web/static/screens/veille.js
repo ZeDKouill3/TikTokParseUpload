@@ -210,7 +210,7 @@ function veilleProposalGroups(proposals) {
   return {
     pending: proposals.filter((p) => p.status === "proposed").sort(byRank),
     // Mises en file : la décision la plus récente d'abord, à la minute près (une liste mise en file d'un coup reste
-    // dans l'ordre de Claude) ; un relevé rejoué garde les décisions des relevés d'avant (SPEC-bdd9).
+    // dans l'ordre de Claude) ; un relevé rejoué efface toute la liste du jour, décidées comprises : « Déjà décidées » = le relevé courant (SPEC-8a45).
     decided: proposals.filter((p) => p.status === "queued")
       .sort((a, b) => String(b.decided_at || "").slice(0, 16).localeCompare(String(a.decided_at || "").slice(0, 16)) || byRank(a, b)),
     ignored: proposals.filter((p) => p.status === "ignored").length,
