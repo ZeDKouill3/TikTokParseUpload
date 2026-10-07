@@ -143,7 +143,7 @@ def test_token_renewed_after_401(tmp_path):
     result = _twitch(tmp_path, http)
     assert len(http.to("/oauth2/token")) == 2
     assert [c["headers"]["Authorization"] for c in http.to("/helix/streams")] == ["Bearer tok1", "Bearer tok2"]
-    assert result["games"] == [{"name": "Jeu Alpha", "viewers_fr": 10, "igdb_id": "777"}]
+    assert result["games"] == [{"name": "Jeu Alpha", "viewers_fr": 10, "igdb_id": "777", "twitch_id": "1"}]
 
 
 def test_secret_in_no_file_and_no_error_message(tmp_path):
@@ -177,8 +177,8 @@ def test_secret_not_in_message_when_transport_raises(tmp_path):
 def test_viewers_fr_summed_over_cursor_pages(tmp_path):
     http = FakeHttp(_twitch_routes())
     result = _twitch(tmp_path, http)
-    assert result["games"] == [{"name": "Jeu Alpha", "viewers_fr": 130, "igdb_id": "777"},
-                               {"name": "Jeu Beta", "viewers_fr": 50, "igdb_id": ""}]  # absent de games/top : chaîne vide
+    assert result["games"] == [{"name": "Jeu Alpha", "viewers_fr": 130, "igdb_id": "777", "twitch_id": "1"},
+                               {"name": "Jeu Beta", "viewers_fr": 50, "igdb_id": "", "twitch_id": "2"}]  # absent de games/top : chaîne vide
     pages = http.to("/helix/streams")
     assert [p["params"].get("after") for p in pages] == [None, "c1"]
     assert all(p["params"]["language"] == "fr" and p["params"]["first"] == 100 for p in pages)
@@ -1012,3 +1012,230 @@ def test_steam_followers_retry_after_http_date_uses_injected_clock(tmp_path):
 def test_steam_followers_no_429_has_no_rate_limited_count(tmp_path):
     http = FakeHttp(_followers_routes({"7": _members(5)}))
     assert _followers(tmp_path, http, ["7"])["rate_limited"] == 0
+
+
+# --- TASK-97b6 (SPEC-85a0 R24) : histogramme des avis Steam ----------------------------------
+
+
+def _ts(year, month, day, hour=12):
+    return int(datetime(year, month, day, hour, tzinfo=timezone.utc).timestamp())
+
+
+def _histogram(*recent, success=1):
+    return {"success": success, "results": {"start_date": 1, "end_date": 2, "weeks": [], "rollups": [],
+                                            "recent": list(recent)}}
+
+
+def _day(ts, up, down):
+    return {"date": ts, "recommendations_up": up, "recommendations_down": down}
+
+
+def _reviews_routes(replies):
+    """appreviewhistogram/<appid> : réponses successives par appid (la dernière se répète)."""
+    seen: dict[str, int] = {}
+
+    def reply(call):
+        appid = call["path"].rsplit("/", 1)[1]
+        i = seen.get(appid, 0)
+        seen[appid] = i + 1
+        items = replies[appid]
+        value = items[min(i, len(items) - 1)]
+        return value if isinstance(value, tuple) else (200, value)
+    return {("GET", ""): reply}
+
+
+def _reviews(tmp_path, http, appids, sleeps=None, **over):
+    collectors = veille_sources.default_collectors(
+        http, clock=lambda: NOW, sleep=(sleeps.append if sleeps is not None else lambda s: None))
+    return collectors["steam_reviews"](_settings(tmp_path, **over), appids)
+
+
+def test_steam_reviews_exact_url_params_user_agent_sequential_with_pause(tmp_path):
+    http = FakeHttp(_reviews_routes({"7": [_histogram(_day(_ts(2026, 10, 5), 10, 2))],
+                                     "8": [_histogram(_day(_ts(2026, 10, 5), 4, 1))]}))
+    sleeps: list[float] = []
+    result = _reviews(tmp_path, http, ["7", "8"], sleeps, steam_reviews_pause_s=1.5)
+    assert result == {"histograms": {"7": [{"date": "2026-10-05", "value": 12, "up": 10, "down": 2}],
+                                     "8": [{"date": "2026-10-05", "value": 5, "up": 4, "down": 1}]},
+                      "skipped": 0, "rate_limited": 0}
+    assert [c["url"] for c in http.calls] == ["https://store.steampowered.com/appreviewhistogram/7",
+                                              "https://store.steampowered.com/appreviewhistogram/8"]
+    assert all(c["params"] == {"l": "english", "review_score_preference": 0} for c in http.calls)
+    assert all("Clipper" in c["headers"]["User-Agent"] for c in http.calls)
+    assert sleeps == [1.5]  # entre deux appels seulement
+
+
+def test_steam_reviews_day_in_veille_timezone_and_same_day_entries_are_added(tmp_path):
+    late = _ts(2026, 10, 5, 23)  # 23:00 UTC = 01:00 le 6 à Paris
+    http = FakeHttp(_reviews_routes({"7": [_histogram(_day(late, 3, 1), _day(_ts(2026, 10, 6, 8), 2, 2),
+                                                      _day(_ts(2026, 10, 4, 10), 1, 0))]}))
+    points = _reviews(tmp_path, http, ["7"])["histograms"]["7"]
+    assert points == [{"date": "2026-10-04", "value": 1, "up": 1, "down": 0},
+                      {"date": "2026-10-06", "value": 8, "up": 5, "down": 3}]
+
+
+def test_steam_reviews_empty_recent_is_an_ok_series_without_point(tmp_path):
+    http = FakeHttp(_reviews_routes({"7": [_histogram()]}))
+    assert _reviews(tmp_path, http, ["7"])["histograms"] == {"7": []}
+
+
+@pytest.mark.parametrize("reply", [
+    (200, _histogram(success=2)), (200, {"success": 1, "results": {}}), (200, {"success": 1}),
+    (200, _histogram({"recommendations_up": 1, "recommendations_down": 1})),
+    (200, _histogram({"date": 1759665600, "recommendations_up": "1", "recommendations_down": 1})),
+    (200, _histogram({"date": 1759665600, "recommendations_up": 1, "recommendations_down": -1})),
+    (200, _histogram({"date": 1759665600.5, "recommendations_up": 1, "recommendations_down": 1})),
+    (200, "<html>pas du json</html>"), (500, "boom"), (404, {"success": 0})])
+def test_steam_reviews_any_other_shape_is_a_source_error_naming_the_undocumented_endpoint(tmp_path, reply):
+    http = FakeHttp(_reviews_routes({"7": [reply]}))
+    with pytest.raises(veille_sources.SourceError, match=r"format inattendu \(endpoint non documenté\)") as err:
+        _reviews(tmp_path, http, ["7"])
+    assert "appreviewhistogram/7" in str(err.value)
+
+
+def test_steam_reviews_429_then_200_waits_growing_capped_and_logs(tmp_path, caplog):
+    http = FakeHttp(_reviews_routes({"7": [(429, ""), (429, "", {"Retry-After": "900"}),
+                                           _histogram(_day(_ts(2026, 10, 5), 1, 1))],
+                                     "8": [_histogram()]}))
+    sleeps: list[float] = []
+    with caplog.at_level("WARNING"):
+        result = _reviews(tmp_path, http, ["7", "8"], sleeps, steam_reviews_pause_s=2.0,
+                          steam_reviews_retry_max=3, steam_reviews_retry_wait_max_s=30.0)
+    assert result == {"histograms": {"7": [{"date": "2026-10-05", "value": 2, "up": 1, "down": 1}], "8": []},
+                      "skipped": 0, "rate_limited": 0}
+    assert sleeps == [2.0, 30.0, 2.0]  # 2 x 2^0 ; Retry-After 900 plafonné à 30 ; puis la pause entre appids
+    assert sum("429" in r.message for r in caplog.records) == 2
+
+
+def test_steam_reviews_persistent_429_marks_the_rest_rate_limited(tmp_path):
+    http = FakeHttp(_reviews_routes({"7": [_histogram()], "8": [(429, "")], "9": [_histogram()]}))
+    result = _reviews(tmp_path, http, ["7", "8", "9"], steam_reviews_retry_max=2)
+    assert result == {"histograms": {"7": [], "8": None, "9": None}, "skipped": 0, "rate_limited": 2}
+    assert [c["url"].rsplit("/", 1)[1] for c in http.calls] == ["7", "8", "8", "8"]
+
+
+# --- TASK-97b6 (SPEC-85a0 R25) : twitch_id et VOD Twitch sur un mois -------------------------
+
+
+def test_twitch_collector_returns_the_helix_game_id(tmp_path):
+    http = FakeHttp(_twitch_routes())
+    result = _twitch(tmp_path, http)
+    assert result["games"][0] == {"name": "Jeu Alpha", "viewers_fr": 130, "igdb_id": "777", "twitch_id": "1"}
+    assert result["games"][1]["twitch_id"] == "2"
+
+
+def _hvideo(day, view_count, hour=12, **over):
+    video = {"id": f"v{day}-{hour}", "created_at": f"2026-10-{day:02d}T{hour:02d}:00:00Z", "view_count": view_count,
+             "type": "archive"}
+    video.update(over)
+    return video
+
+
+def _vod_routes(pages):
+    """helix/videos : pages successives (la dernière se répète) ; ``(status, body, headers)`` tels quels."""
+    seen = [0]
+
+    def reply(call):
+        item = pages[min(seen[0], len(pages) - 1)]
+        seen[0] += 1
+        return item
+    return {("POST", "/oauth2/token"): [_token()], ("GET", "/helix/videos"): reply}
+
+
+def _vods(tmp_path, http, game_ids, sleeps=None, **over):
+    collectors = veille_sources.default_collectors(
+        http, clock=lambda: NOW, sleep=(sleeps.append if sleeps is not None else lambda s: None))
+    return collectors["twitch_vods_30d"](_settings(tmp_path, **over), game_ids)
+
+
+def test_twitch_vods_30d_exact_params_cursor_pagination_and_daily_aggregation(tmp_path):
+    http = FakeHttp(_vod_routes([
+        (200, {"data": [_hvideo(6, 100), _hvideo(5, 40, hour=20), _hvideo(5, 60, hour=2)], "pagination": {"cursor": "c1"}}),
+        (200, {"data": [_hvideo(3, 7)], "pagination": {}})]))
+    result = _vods(tmp_path, http, ["1"], trend_days=7)  # fenêtre : 2026-09-30 .. 2026-10-06
+    calls = http.to("/helix/videos")
+    assert calls[0]["params"] == {"game_id": "1", "language": "fr", "period": "month", "type": "archive",
+                                  "sort": "time", "first": 100}
+    assert calls[1]["params"] == {**calls[0]["params"], "after": "c1"}
+    assert calls[0]["headers"] == {"Client-Id": "cid", "Authorization": "Bearer tok1"}
+    points = result["vods"]["1"]["points"]
+    assert result["vods"]["1"]["since"] == "2026-09-30"  # plus de curseur : toute la fenêtre est couverte
+    assert points == [
+        {"date": "2026-09-30", "vods": 0, "views": 0}, {"date": "2026-10-01", "vods": 0, "views": 0},
+        {"date": "2026-10-02", "vods": 0, "views": 0}, {"date": "2026-10-03", "vods": 1, "views": 7},
+        {"date": "2026-10-04", "vods": 0, "views": 0}, {"date": "2026-10-05", "vods": 2, "views": 100},
+        {"date": "2026-10-06", "vods": 1, "views": 100}]
+    assert result["skipped"] == 0 and result["rate_limited"] == 0
+
+
+def test_twitch_vods_30d_day_is_in_veille_timezone_and_older_videos_are_ignored(tmp_path):
+    http = FakeHttp(_vod_routes([(200, {"data": [
+        {"id": "a", "created_at": "2026-10-05T23:30:00Z", "view_count": 5},  # 01:30 le 6 à Paris
+        {"id": "b", "created_at": "2026-09-01T10:00:00Z", "view_count": 9}], "pagination": {}})]))
+    points = _vods(tmp_path, http, ["1"], trend_days=7)["vods"]["1"]["points"]
+    assert points[-1] == {"date": "2026-10-06", "vods": 1, "views": 5}
+    assert [p["date"] for p in points][0] == "2026-09-30" and sum(p["vods"] for p in points) == 1
+
+
+def test_twitch_vods_30d_cap_with_cursor_left_starts_at_the_oldest_video_and_leaves_older_days_absent(tmp_path):
+    http = FakeHttp(_vod_routes([(200, {"data": [_hvideo(6, 10), _hvideo(4, 20)], "pagination": {"cursor": "more"}})]))
+    result = _vods(tmp_path, http, ["1"], trend_days=7, twitch_history_pages_max=2)
+    assert len(http.to("/helix/videos")) == 2  # pages bornées
+    entry = result["vods"]["1"]
+    assert entry["since"] == "2026-10-04"
+    assert entry["points"] == [{"date": "2026-10-04", "vods": 2, "views": 40}, {"date": "2026-10-05", "vods": 0, "views": 0},
+                               {"date": "2026-10-06", "vods": 2, "views": 20}]
+
+
+def test_twitch_vods_30d_game_without_video_is_measured_zero_over_the_whole_window(tmp_path):
+    http = FakeHttp(_vod_routes([(200, {"data": [], "pagination": {}})]))
+    entry = _vods(tmp_path, http, ["1"], trend_days=7)["vods"]["1"]
+    assert entry["since"] == "2026-09-30" and len(entry["points"]) == 7
+    assert all(p["vods"] == 0 and p["views"] == 0 for p in entry["points"])
+
+
+@pytest.mark.parametrize("video", [{"id": "x", "view_count": 1}, {"id": "x", "created_at": "2026-10-05T10:00:00Z"},
+                                   {"id": "x", "created_at": "hier", "view_count": 1},
+                                   {"id": "x", "created_at": "2026-10-05T10:00:00Z", "view_count": "9"}])
+def test_twitch_vods_30d_missing_or_malformed_field_is_a_source_error(tmp_path, video):
+    http = FakeHttp(_vod_routes([(200, {"data": [video], "pagination": {}})]))
+    with pytest.raises(veille_sources.SourceError):
+        _vods(tmp_path, http, ["1"])
+
+
+def test_twitch_vods_30d_other_http_error_is_a_source_error(tmp_path):
+    http = FakeHttp(_vod_routes([(500, "boom")]))
+    with pytest.raises(veille_sources.SourceError):
+        _vods(tmp_path, http, ["1"])
+
+
+def test_twitch_vods_30d_429_waits_until_ratelimit_reset_then_retries_and_logs(tmp_path, caplog):
+    reset = str(int(NOW.timestamp()) + 12)
+    http = FakeHttp(_vod_routes([(429, "", {"Ratelimit-Reset": reset}), (200, {"data": [], "pagination": {}})]))
+    sleeps: list[float] = []
+    with caplog.at_level("WARNING"):
+        result = _vods(tmp_path, http, ["1"], sleeps)
+    assert sleeps == [12.0] and result["rate_limited"] == 0 and result["vods"]["1"] is not None
+    assert any("429" in r.message for r in caplog.records)
+
+
+def test_twitch_vods_30d_429_wait_falls_back_to_retry_after_then_one_second_and_is_capped(tmp_path):
+    http = FakeHttp(_vod_routes([(429, "", {"Retry-After": "5"}), (429, ""), (429, "", {"Ratelimit-Reset": "99999999999"}),
+                                 (200, {"data": [], "pagination": {}})]))
+    sleeps: list[float] = []
+    _vods(tmp_path, http, ["1"], sleeps, twitch_history_retry_max=3, twitch_history_retry_wait_max_s=30.0)
+    assert sleeps == [5.0, 1.0, 30.0]
+
+
+def test_twitch_vods_30d_persistent_429_makes_the_game_unknown_and_stops_reading_the_others(tmp_path):
+    http = FakeHttp(_vod_routes([(200, {"data": [], "pagination": {}}), (429, "")]))
+    result = _vods(tmp_path, http, ["1", "2", "3"], twitch_history_retry_max=2)
+    assert result["vods"]["1"] is not None and result["vods"]["2"] is None and result["vods"]["3"] is None
+    assert result["rate_limited"] == 2
+    assert [c["params"]["game_id"] for c in http.to("/helix/videos")] == ["1", "2", "2", "2"]
+
+
+@real_only
+def test_real_steam_reviews_histogram_has_recent_days(tmp_path):
+    recent = veille_sources.default_collectors()["steam_reviews"](_settings(tmp_path), ["570"])["histograms"]["570"]
+    assert recent and recent[-1]["value"] > 0

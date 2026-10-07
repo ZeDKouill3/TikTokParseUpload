@@ -23,7 +23,7 @@ import json
 import logging
 import re
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -55,6 +55,8 @@ STEAM_PLAYERS_URL = f"{STEAM_API}/ISteamUserStats/GetNumberOfCurrentPlayers/v1/"
 STEAM_MEMBERS_URL = "https://steamcommunity.com/games/{appid}/memberslistxml/?xml=1"
 STEAM_USER_AGENT = "Clipper/1.0 (veille ; lit seulement memberCount)"
 _MEMBER_COUNT = re.compile(r"<memberCount>\s*(\d+)\s*</memberCount>")
+STEAM_REVIEWS_URL = "https://store.steampowered.com/appreviewhistogram/{appid}"
+STEAM_REVIEWS_USER_AGENT = "Clipper/1.0 (veille ; lit seulement l'histogramme des avis)"
 STEAM_APPDETAILS_URL = "https://store.steampowered.com/api/appdetails"  # GetAppList v2 retiré par Valve (404)
 
 STREAM_PAGES_MAX = 5
@@ -71,11 +73,13 @@ class SourceError(Exception):
 
 
 class RateLimited(SourceError):
-    """HTTP 429 : ``retry_after`` est l'en-tête ``Retry-After`` brut (secondes ou date HTTP), ``None`` s'il manque."""
+    """HTTP 429 : ``retry_after`` est l'en-tête ``Retry-After`` brut (secondes ou date HTTP), ``reset`` l'en-tête
+    ``Ratelimit-Reset`` brut (Helix : instant Unix), ``None`` s'ils manquent."""
 
-    def __init__(self, message: str, retry_after: str | None = None):
+    def __init__(self, message: str, retry_after: str | None = None, reset: str | None = None):
         super().__init__(message)
         self.retry_after = retry_after
+        self.reset = reset
 
 
 class AccessRestricted(Exception):
@@ -122,9 +126,10 @@ def default_http(method: str, url: str, *, params: dict[str, Any] | None = None,
         body: Any = response.json()
     except ValueError:
         body = response.text
-    retry_after = response.headers.get("Retry-After")
-    if response.status_code == 429 and retry_after:
-        return response.status_code, body, {"Retry-After": retry_after}  # en-têtes joints : seulement pour un 429
+    if response.status_code == 429:  # en-têtes joints : seulement pour un 429
+        kept = {name: response.headers[name] for name in ("Retry-After", "Ratelimit-Reset") if response.headers.get(name)}
+        if kept:
+            return response.status_code, body, kept
     return response.status_code, body
 
 
@@ -172,7 +177,8 @@ class _Client:
             return status, body
         if status == 429:
             retry_after = next((v for k, v in reply_headers.items() if k.lower() == "retry-after"), None)
-            raise RateLimited(f"HTTP 429 sur {shown} : {snippet}", retry_after)
+            reset = next((v for k, v in reply_headers.items() if k.lower() == "ratelimit-reset"), None)
+            raise RateLimited(f"HTTP 429 sur {shown} : {snippet}", retry_after, reset)
         if not 200 <= status < 300:
             raise SourceError(f"HTTP {status} sur {shown} : {snippet}")
         if text:
@@ -382,8 +388,8 @@ def _twitch_collector(http: Http, clock: Clock) -> Callable[[dict[str, object]],
                     "thumbnail_url": _twitch_thumbnail(video.get("thumbnail_url")),
                     "views_per_hour": _views_per_hour(view_count, video["published_at"], now),
                 })
-        return {"games": [{"name": e["name"], "viewers_fr": e["viewers_fr"], "igdb_id": igdb_ids.get(gid, "")}
-                          for gid, e in ranked], "vods": vods,
+        return {"games": [{"name": e["name"], "viewers_fr": e["viewers_fr"], "igdb_id": igdb_ids.get(gid, ""),
+                           "twitch_id": gid} for gid, e in ranked], "vods": vods,
                 "private_vods": private_vods}
 
     return collect
@@ -706,6 +712,159 @@ def _steam_followers_collector(http: Http, clock: Clock, sleep: Callable[[float]
     return collect
 
 
+def _reviews_unexpected(detail: str, url: str) -> SourceError:
+    return SourceError(f"histogramme des avis Steam : format inattendu (endpoint non documenté) : {detail}, {url}")
+
+
+def _review_points(body: Any, url: str, tz: ZoneInfo) -> list[dict[str, Any]]:
+    """Points ``{date, value, up, down}`` de ``results.recent`` ; toute autre forme est une ``SourceError``."""
+    success = body.get("success") if isinstance(body, dict) else None
+    if isinstance(success, bool) or success != 1:
+        raise _reviews_unexpected(f"success != 1 ({str(body)[:_SNIPPET_CHARS]})", url)
+    results = body.get("results")
+    recent = results.get("recent") if isinstance(results, dict) else None
+    if not isinstance(recent, list):
+        raise _reviews_unexpected("results.recent absent", url)
+    days: dict[str, dict[str, int]] = {}
+    for entry in recent:
+        fields = [entry.get(k) if isinstance(entry, dict) else None
+                  for k in ("date", "recommendations_up", "recommendations_down")]
+        if any(isinstance(v, bool) or not isinstance(v, int) or v < 0 for v in fields):
+            raise _reviews_unexpected(f"entrée mal formée {str(entry)[:_SNIPPET_CHARS]}", url)
+        ts, up, down = fields
+        day = days.setdefault(datetime.fromtimestamp(ts, tz).date().isoformat(), {"up": 0, "down": 0})
+        day["up"] += up
+        day["down"] += down
+    return [{"date": d, "value": v["up"] + v["down"], "up": v["up"], "down": v["down"]} for d, v in sorted(days.items())]
+
+
+def _steam_reviews_collector(http: Http, clock: Clock, sleep: Callable[[float], None]
+                             ) -> Callable[[dict[str, object], list[str]], dict[str, Any]]:
+    """Histogramme des avis Steam par appid (``appreviewhistogram``, endpoint non documenté, lu strictement, SPEC-85a0
+    R24) : un appel par appid, séquentiel, ``steam_reviews_pause_s`` entre deux ; ``results.recent`` seulement.
+    HTTP 429 : attente croissante (``Retry-After`` si plus long, plafonnée), réessais bornés ; épuisés : les appids
+    restants valent ``None``, comptés ``rate_limited``."""
+    def collect(settings: dict[str, object], appids: list[str]) -> dict[str, Any]:
+        client = _client(settings, http, ())
+        tz = ZoneInfo(str(settings["timezone"]))
+        pause = float(settings["steam_reviews_pause_s"])  # type: ignore[arg-type]
+        retries = int(settings["steam_reviews_retry_max"])  # type: ignore[call-overload]
+        wait_max = float(settings["steam_reviews_retry_wait_max_s"])  # type: ignore[arg-type]
+        histograms: dict[str, list[dict[str, Any]] | None] = {}
+        for index, appid in enumerate(appids):
+            if index:
+                sleep(pause)
+            url = STEAM_REVIEWS_URL.format(appid=appid)
+            params = {"l": "english", "review_score_preference": 0}
+            attempt = 0
+            while True:
+                try:
+                    _, body = client.request("GET", url, params, {"User-Agent": STEAM_REVIEWS_USER_AGENT})
+                    break
+                except RateLimited as exc:
+                    if attempt >= retries:
+                        rest = appids[index:]
+                        log.warning("veille steam_reviews : HTTP 429 persistant sur l'appid %s après %d réessai(s) ; "
+                                    "%d appid(s) non relevé(s)", appid, retries, len(rest))
+                        histograms.update({a: None for a in rest})
+                        return {"histograms": histograms, "skipped": 0, "rate_limited": len(rest)}
+                    wait = min(wait_max, max(pause * 2 ** attempt, _retry_after_s(exc.retry_after, clock)))
+                    attempt += 1
+                    log.warning("veille steam_reviews : HTTP 429 sur l'appid %s, attente %.1f s (réessai %d/%d)",
+                                appid, wait, attempt, retries)
+                    sleep(wait)
+                except SourceError as exc:
+                    raise _reviews_unexpected(str(exc), url) from None
+            histograms[appid] = _review_points(body, f"{url}?{urlencode(params)}", tz)
+        return {"histograms": histograms, "skipped": 0, "rate_limited": 0}
+
+    return collect
+
+
+def _helix_wait_s(exc: RateLimited, wait_max: float, clock: Clock) -> float:
+    """Attente d'un 429 Helix : jusqu'à ``Ratelimit-Reset`` (instant Unix), sinon ``Retry-After``, sinon 1 s ; plafonnée."""
+    if exc.reset is not None:
+        try:
+            return min(wait_max, max(0.0, float(exc.reset) - clock().timestamp()))
+        except ValueError:
+            pass
+    if exc.retry_after is not None:
+        return min(wait_max, _retry_after_s(exc.retry_after, clock))
+    return min(wait_max, 1.0)
+
+
+def _twitch_vods_collector(http: Http, clock: Clock, sleep: Callable[[float], None]
+                           ) -> Callable[[dict[str, object], list[str]], dict[str, Any]]:
+    """VOD FR d'un mois par jeu (Helix Get Videos, ``period=month``, SPEC-85a0 R25) : par jour local, ``vods`` et
+    ``views`` ; pages par curseur, au plus ``twitch_history_pages_max`` (Twitch coupe à 500 vidéos). ``since`` = jour de
+    la plus ancienne vidéo rendue si un curseur reste (les jours antérieurs sont inconnus, absents), sinon le premier
+    jour de la fenêtre (un jour sans VOD vaut alors 0 : mesuré). HTTP 429 : attente jusqu'à ``Ratelimit-Reset``,
+    réessais bornés ; épuisés : le jeu et les suivants valent ``None``, comptés ``rate_limited``."""
+    def collect(settings: dict[str, object], game_ids: list[str]) -> dict[str, Any]:
+        api = _Twitch(settings, http, clock)
+        tz = ZoneInfo(str(settings["timezone"]))
+        today = clock().astimezone(tz).date()
+        first = today - timedelta(days=int(settings["trend_days"]) - 1)  # type: ignore[call-overload]
+        pages_max = int(settings["twitch_history_pages_max"])  # type: ignore[call-overload]
+        retries = int(settings["twitch_history_retry_max"])  # type: ignore[call-overload]
+        wait_max = float(settings["twitch_history_retry_wait_max_s"])  # type: ignore[arg-type]
+        url = f"{TWITCH_API}/videos"
+        result: dict[str, dict[str, Any] | None] = {}
+        for index, game_id in enumerate(game_ids):
+            days: dict[date, list[int]] = {}
+            oldest: date | None = None
+            cursor: str | None = None
+            for _ in range(pages_max):
+                params: dict[str, Any] = {"game_id": game_id, "language": str(settings["language"]), "period": "month",
+                                          "type": "archive", "sort": "time", "first": 100}
+                if cursor:
+                    params["after"] = cursor
+                attempt = 0
+                while True:
+                    try:
+                        body = api.get("videos", params)
+                        break
+                    except RateLimited as exc:
+                        if attempt >= retries:
+                            rest = game_ids[index:]
+                            log.warning("veille twitch_vods_30d : HTTP 429 persistant sur le jeu %s après %d réessai(s) ; "
+                                        "%d jeu(x) non relevé(s)", game_id, retries, len(rest))
+                            result.update({g: None for g in rest})
+                            return {"vods": result, "skipped": 0, "rate_limited": len(rest)}
+                        wait = _helix_wait_s(exc, wait_max, clock)
+                        attempt += 1
+                        log.warning("veille twitch_vods_30d : HTTP 429 sur le jeu %s, attente %.1f s (réessai %d/%d)",
+                                    game_id, wait, attempt, retries)
+                        sleep(wait)
+                for video in _field(api.client, url, params, body, "data"):
+                    created = _field(api.client, url, params, video, "created_at")
+                    views = _field(api.client, url, params, video, "view_count")
+                    try:
+                        day = datetime.fromisoformat(str(created)).astimezone(tz).date()
+                    except ValueError:
+                        raise api.client.fail(url, params, video, "created_at (RFC 3339)") from None
+                    if isinstance(views, bool) or not isinstance(views, int):
+                        raise api.client.fail(url, params, video, "view_count (entier)")
+                    oldest = day if oldest is None else min(oldest, day)
+                    if day >= first:
+                        count = days.setdefault(day, [0, 0])
+                        count[0] += 1
+                        count[1] += views
+                cursor = (body.get("pagination") or {}).get("cursor")
+                if not cursor:
+                    break
+            since = max(first, oldest) if cursor and oldest is not None else first
+            points = []
+            for offset in range((today - since).days + 1):
+                day = since + timedelta(days=offset)
+                vods, views = days.get(day, [0, 0])
+                points.append({"date": day.isoformat(), "vods": vods, "views": views})
+            result[game_id] = {"since": since.isoformat(), "points": points}
+        return {"vods": result, "skipped": 0, "rate_limited": 0}
+
+    return collect
+
+
 def default_collectors(http: Http | None = None, clock: Clock | None = None,
                        sleep: Callable[[float], None] | None = None) -> dict[str, Callable[..., dict[str, Any]]]:
     """Les collecteurs réels, sur le transport (l'horloge et l'attente) donnés."""
@@ -715,4 +874,6 @@ def default_collectors(http: Http | None = None, clock: Clock | None = None,
             "steam": _steam_collector(http, clock), "steam_fr": _steam_sellers_collector(http, clock),
             "igdb": _igdb_collector(http, clock, sleep or time.sleep),
             "steam_players": _steam_players_collector(http),
-            "steam_followers": _steam_followers_collector(http, clock, sleep or time.sleep)}
+            "steam_followers": _steam_followers_collector(http, clock, sleep or time.sleep),
+            "steam_reviews": _steam_reviews_collector(http, clock, sleep or time.sleep),
+            "twitch_vods_30d": _twitch_vods_collector(http, clock, sleep or time.sleep)}
