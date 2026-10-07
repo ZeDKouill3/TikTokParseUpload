@@ -12,6 +12,11 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ### Corrigé
 
+- Téléchargement : une VOD Twitch en mp4 fragmenté (fMP4 : 1 `moov` + des dizaines de milliers de `moof`/`mdat`,
+  aucun index) est remuxée sans réencodage en mp4 indexé (`ffmpeg -c copy -movflags +faststart`) avant l'écriture
+  de `meta.json`. Constat du 07/10 (v2894103366, 11 Go) : ~30 s par `-ss` avant `-i` contre 0,4 s après remux,
+  soit ~6 h pour l'étape scenes. Un mp4 déjà indexé n'est jamais touché ; un remux en échec (ffmpeg absent, code
+  non nul, sortie vide) lève `DownloadError`, laisse l'original et n'écrit pas `meta.json`. Réglage `ffmpeg_bin`.
 - Veille (relevé réel du 07/10 à 16:56) : les propositions encore à décider s'affichent d'abord, dans l'ordre
   de Claude ; les déjà décidées (mises en file, ignorées) passent dans une section repliée « Déjà décidées ».
   Une proposition mise en file montre son état réel, lu en lecture seule par `GET /api/veille` dans
