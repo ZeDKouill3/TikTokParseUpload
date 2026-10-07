@@ -716,9 +716,12 @@ def write_veille_report(now: datetime, *, config: Config | None = None) -> dict[
     entries = []
     for item in queued:
         video = item["video_id"]
-        day = _read_state_json(sdir / "days" / f"{item['date']}.json", {"proposals": []})
-        proposal = next((p for p in day.get("proposals", []) if p.get("candidate_id") == item["candidate_id"]), None)
-        candidate = (proposal or {}).get("candidate") or {}
+        if item.get("title"):  # instantané écrit à la décision (SPEC-8a45 R32) : survit au rejeu du jour
+            candidate = item
+        else:  # ancienne entrée : repli sur le fichier du jour, tout ou rien (R33)
+            day = _read_state_json(sdir / "days" / f"{item['date']}.json", {"proposals": []})
+            proposal = next((p for p in day.get("proposals", []) if p.get("candidate_id") == item["candidate_id"]), None)
+            candidate = (proposal or {}).get("candidate") or {}
         clips = sidecars.get(video, [])
         published = sum(1 for s in clips if isinstance(s.get("tiktok_post"), dict))
         rows = stats.get(video, [])

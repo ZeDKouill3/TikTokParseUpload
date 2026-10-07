@@ -594,26 +594,68 @@ def test_run_if_due_does_not_run_twice_the_same_day(tmp_path):
     assert collectors["steam"].calls == 1
 
 
-def test_run_if_due_refresh_replays_the_day_and_keeps_decided_proposals(tmp_path):
+def _frozen_files(tmp_path):
+    """Fichiers que le rejeu ne doit pas toucher (SPEC-8a45 R34) -> {chemin: octets}."""
+    sdir = _sdir(tmp_path)
+    other = (datetime.fromisoformat(TODAY) - timedelta(days=2)).date().isoformat()  # dans la fenêtre d'historique
+    for rel, body in ((f"history/{other}.json", '{"old": 1}'), (f"selection/{other}.json", '{"sel": 1}'),
+                      ("bilan.json", '{"entries": []}')):
+        (sdir / rel).parent.mkdir(parents=True, exist_ok=True)
+        (sdir / rel).write_text(body, encoding="utf-8")
+    paths = [sdir / "seen.json", sdir / "history" / f"{other}.json", sdir / "selection" / f"{other}.json",
+             sdir / "bilan.json", tmp_path / "state" / "queue.json"]
+    return {path: path.read_bytes() for path in paths}
+
+
+def test_run_if_due_refresh_erases_the_day_list_decided_included_and_keeps_the_rest(tmp_path):
     config = _make_config(tmp_path, enabled=True, max_vods_per_day=3)
     collectors = _run_collectors()
     with llm.use_backend(FakeBackend([_picks("twitch:AAA", "twitch:BBB")])):
         veille.run_if_due(AFTER_RUN_AT, config, collectors)
-    veille.ignore(TODAY, "twitch:AAA", config)
+    veille.clip(TODAY, "twitch:AAA", None, config=config)
+    veille.ignore(TODAY, "twitch:BBB", config)
+    before = _frozen_files(tmp_path)
     refresh = _sdir(tmp_path) / "refresh.json"
     refresh.write_text(json.dumps({"requested_at": AFTER_RUN_AT.isoformat()}), encoding="utf-8")
-    collectors["twitch"].result = {"games": [{"name": "Jeu Alpha", "viewers_fr": 1000}],
-                                   "vods": [_yt("AAA"), _yt("BBB"), _yt("CCC")]}
-    fake = FakeBackend([_picks("twitch:BBB", "twitch:CCC")])
-    with llm.use_backend(fake):
+    during = {}
+    result = {"games": [{"name": "Jeu Alpha", "viewers_fr": 1000}],
+              "vods": [_yt("AAA"), _yt("BBB"), _yt("CCC"), _yt("DDD")]}
+
+    def twitch(settings):
+        during["day"] = _read(_sdir(tmp_path) / "days" / f"{TODAY}.json")
+        return result
+
+    collectors["twitch"] = twitch
+    with llm.use_backend(FakeBackend([_picks("twitch:CCC", "twitch:DDD")])):
         veille.run_if_due(AFTER_RUN_AT + timedelta(minutes=5), config, collectors)
     assert not refresh.exists()
-    assert collectors["steam"].calls == 2
+    assert during["day"]["started_at"] and during["day"]["finished_at"] is None
+    assert during["day"]["proposals"] == [] and during["day"]["candidates"] == []
     state = _read(_sdir(tmp_path) / "days" / f"{TODAY}.json")
-    # AAA ignoré : plus candidat, conservé tel quel ; BBB et CCC remplacés par le nouveau choix
     assert [(p["candidate_id"], p["status"]) for p in state["proposals"]] == [
-        ("twitch:AAA", "ignored"), ("twitch:BBB", "proposed"), ("twitch:CCC", "proposed")]
-    assert "twitch:AAA" not in {c["id"] for c in state["candidates"]}
+        ("twitch:CCC", "proposed"), ("twitch:DDD", "proposed")]
+    assert {"twitch:AAA", "twitch:BBB"}.isdisjoint({c["id"] for c in state["candidates"]})
+    assert state["excluded"]["already_known"] == 2
+    assert {path: path.read_bytes() for path in before} == before
+    for candidate_id in ("twitch:AAA", "twitch:BBB"):
+        with pytest.raises(veille.VeilleError, match="candidat inconnu"):
+            veille.clip(TODAY, candidate_id, None, config=config)
+        with pytest.raises(veille.VeilleError, match="candidat inconnu"):
+            veille.ignore(TODAY, candidate_id, config)
+
+
+def test_run_if_due_run_at_replay_of_an_unfinished_day_erases_its_proposals(tmp_path):
+    config = _make_config(tmp_path, enabled=True)
+    with llm.use_backend(FakeBackend([_picks("twitch:AAA", "twitch:BBB")])):
+        veille.run_if_due(AFTER_RUN_AT, config, _run_collectors())
+    veille.clip(TODAY, "twitch:AAA", None, config=config)
+    day_path = _sdir(tmp_path) / "days" / f"{TODAY}.json"
+    state = _read(day_path)
+    state["finished_at"] = None  # relevé interrompu : repris par run_at
+    day_path.write_text(json.dumps(state), encoding="utf-8")
+    with llm.use_backend(FakeBackend([_picks("twitch:BBB")])):
+        veille.run_if_due(AFTER_RUN_AT + timedelta(minutes=5), config, _run_collectors())
+    assert [(p["candidate_id"], p["status"]) for p in _read(day_path)["proposals"]] == [("twitch:BBB", "proposed")]
 
 
 def test_run_if_due_refresh_works_even_before_run_at_and_with_an_existing_day(tmp_path):
@@ -649,6 +691,21 @@ def test_clip_enqueues_the_vod_and_records_it(tmp_path):
     seen = _read(_sdir(tmp_path) / "seen.json")
     assert [(q["candidate_id"], q["video_id"], q["channel"], q["queue_entry_id"]) for q in seen["queued"]] == [
         ("twitch:AAA", entry["video_id"], "ma_chaine", entry["id"])]
+
+
+def test_clip_and_ignore_copy_the_candidate_snapshot_into_seen(tmp_path):
+    config = _decided(tmp_path)
+    state = _read(_sdir(tmp_path) / "days" / f"{TODAY}.json")
+    candidates = {p["candidate_id"]: p["candidate"] for p in state["proposals"]}
+    veille.clip(TODAY, "twitch:AAA", None, config=config)
+    veille.ignore(TODAY, "twitch:BBB", config)
+    seen = _read(_sdir(tmp_path) / "seen.json")
+    for entry, candidate_id in ((seen["queued"][0], "twitch:AAA"), (seen["ignored"][0], "twitch:BBB")):
+        candidate = candidates[candidate_id]
+        assert entry["candidate_id"] == candidate_id and entry["date"] == TODAY
+        for field in ("source", "title", "game_name", "channel_name"):
+            assert field in candidate
+            assert entry[field] == candidate[field]
 
 
 def test_clip_twice_or_unknown_candidate_raises(tmp_path):

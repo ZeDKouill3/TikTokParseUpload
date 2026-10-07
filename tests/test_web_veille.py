@@ -1356,6 +1356,23 @@ def test_without_any_decided_proposal_there_is_no_folded_section(tmp_path):
     assert "<details" not in html and "Déjà décidées" not in html and _ids(html) == ["a"]
 
 
+def test_a_replayed_day_without_queued_nor_ignored_proposal_renders_no_decided_nor_ignored_block(tmp_path):
+    html = proposals_html(tmp_path, [_prop("a", "proposed", 1), _prop("b", "proposed", 2)])
+    assert "data-veille-decided" not in html and "data-veille-ignored" not in html and _ids(html) == ["a", "b"]
+
+
+def test_get_veille_never_reads_seen_json(tmp_path, isolated_cwd):
+    put_day(tmp_path, today())
+    seen = tmp_path / "state" / "veille" / "seen.json"
+    first = client(tmp_path, enabled=True).get("/api/veille")
+    seen.write_text("{pas du json", encoding="utf-8")  # illisible
+    illegible = client(tmp_path, enabled=True).get("/api/veille")
+    seen.write_text(json.dumps({"queued": [{"candidate_id": "twitch:v1"}], "ignored": []}), encoding="utf-8")
+    present = client(tmp_path, enabled=True).get("/api/veille")
+    assert first.status_code == illegible.status_code == present.status_code == 200
+    assert first.json() == illegible.json() == present.json()
+
+
 # --- Bug réel 2026-10-07 : le candidat Twitch porte « 2894103366 », la file et le workspace « v2894103366 » --------
 
 

@@ -109,6 +109,13 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ### Modifié
 
+- Veille : un relevé rejoué le même jour (Rafraîchir ou relevé quotidien repris) efface toute la liste des
+  propositions du jour, décidées comprises, puis la remplace par les choix de Claude de ce relevé ; « Déjà
+  décidées » ne montre plus que les décisions du relevé courant (SPEC-8a45, complète SPEC-bdd9). Conservés :
+  `seen.json` (les VOD déjà décidées restent exclues), `history/`, `selection/`, `bilan.json`, la file et les
+  vidéos. À la décision, `seen.json` garde aussi source, titre, jeu et chaîne de la VOD, lus par le bilan
+  des VOD même si le jour est rejoué.
+
 - Veille : le test d'accès des VOD Twitch se fait par jeu, avec `twitch_access_attempts` essais par VOD, et
   s'arrête dès `max_vods_per_game` VOD accessibles. Les VOD réservées aux abonnés, injoignables, non testées (jeu
   déjà servi) ou non testées à l'échéance sont **écartées et comptées par raison** (bandeau des sources et KPI) :
