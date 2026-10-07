@@ -22,6 +22,10 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ### Ajouté
 
+- Jury action (1/6) : la planche d'images légendée de `vision.py` devient la bibliothèque
+  `clipper/montage.py` (`montage(...)`, `LABEL_HEIGHT`, `MontageError` nommant le fichier), réutilisable par
+  l'étape action sans qu'une étape en importe une autre (ADR-b16b, SPEC-b0f3 R8). `vision` l'importe, rendu
+  identique, aucun changement de comportement.
 - Apprentissage (3/4) : le coach des prompts du jury passe tout seul dans le worker quand
   `[learning] coach_min_new_cases` (10) clips mûrs nouveaux existent et que `coach_min_interval_days`
   (7) jours se sont écoulés ; ses propositions sont consignées dans `state/learning/coach.json` et
