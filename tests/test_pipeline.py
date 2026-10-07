@@ -2095,3 +2095,130 @@ def test_a_pipeline_json_without_the_action_step_is_read_back_as_pending(tmp_pat
     assert state["steps"]["action"]["status"] == "pending"
     assert list(state["steps"]) == list(pipeline.STEPS)
     assert state["steps"]["scenes"]["status"] == "done"
+
+
+# --------------------------------------------------------------------------
+# TASK-c8df7a5a7cf3 (SPEC-b0f3 R15, R17, R18) : de bout en bout, les deux styles
+# gaming action (builtin:gaming-action, candidates transcript+action, [action]
+# enabled) contre les styles temoins (builtin, transcript, sans [action]).
+# --------------------------------------------------------------------------
+
+ACTION_RUN_STYLE = {
+    "moments": {"rubric_path": "builtin:gaming-action", "candidates": "transcript+action"},
+    # Pics audio seuls (cuts_weight = 0) : la source synthetique n'a aucun changement de plan.
+    "action": {"enabled": True, "cuts_weight": 0, "audio_peaks_full": 1, "frames_per_passage": 2},
+}
+CLASSIC_RUN_STYLE = {"moments": {"rubric_path": "builtin", "candidates": "transcript"}}
+
+
+def burst_audio_extractor(video_path, sample_rate):
+    """Fond calme de 80 s, avec une rafale bruyante d'une seconde toutes les 3 s de 40 s a 55 s."""
+    import numpy as np
+
+    samples = np.full(DURATION * sample_rate, 0.01, dtype=np.float32)
+    for t in (40, 43, 46, 49, 52, 55):
+        samples[t * sample_rate:(t + 1) * sample_rate] = 0.6
+    return samples
+
+
+def action_e2e_answer(request):
+    """``answer`` + usage ``action`` (une description par image) + un jury qui note un
+    candidat d'action (bloc « Signaux : ») au sommet et un monologue sans rien dans le jeu
+    (action 1, emotion 3) sous le seuil éliminatoire de la grille."""
+    if request.usage == "action":
+        n = request.schema["properties"]["frames"]["minItems"]
+        return {"frames": [{"index": i, "description": "un combat au corps a corps", "action_type": "combat",
+                            "intensity": 8} for i in range(n)]}
+    if request.usage.startswith("jury_"):
+        blocks = {m.group(1): m.group(0) for m in re.finditer(r"### (C\d+)\n.*?(?=\n### C|\Z)", request.prompt, re.S)}
+        item = request.schema["properties"]["candidates"]["items"]["properties"]
+        out = []
+        for ref in item["ref"]["enum"]:
+            grid = {k: 9 for k in item["scores"]["required"]}
+            if "Signaux :" not in blocks[ref]:
+                grid.update(action=1, emotion=3)
+            entry = {"ref": ref, "argument": f"{request.usage} sur {ref}", "scores": grid, "confidence": 80}
+            if "veto" in item:
+                entry.update(veto=False, veto_reason="")
+            out.append(entry)
+        return {"candidates": out}
+    if request.usage == "moments":
+        # Le proposeur note sur les criteres de la grille embarquee (action, emotion...).
+        scores = {k: 9 for k in request.schema["properties"]["moments"]["items"]["properties"]["scores"]["required"]}
+        return {"moments": [{"hook_text": "GTA six arrive vraiment.", "start": MOMENT["start"],
+                             "end": MOMENT["end"], "format": "single", "part_breaks": [],
+                             "justification": "Annonce forte", "scores": scores}]}
+    return answer(request)
+
+
+def run_style(tmp_path, source_video, mode, style, respond, *, audio_first=True):
+    from clipper import pipeline
+
+    config = make_fast_config(tmp_path, mode=mode, **style)
+    opts = step_options(source_video)
+    opts["audio"] = {"extractor": burst_audio_extractor}
+    fake = FakeBackend([respond] * 500)
+    with llm.use_backend(fake):
+        state = pipeline.run(URL, config=config, step_options=opts)
+    return state, fake, tmp_path / "workspace" / VIDEO_ID
+
+
+@no_ffmpeg
+def test_gaming_action_style_chains_audio_before_scenes_then_action_candidates_and_the_gate(
+        tmp_path, isolated_cwd, source_video):
+    from clipper import pipeline
+
+    state, fake, video_dir = run_style(tmp_path, source_video, "auto", ACTION_RUN_STYLE, action_e2e_answer)
+
+    assert state["status"] in ("done", "queued"), state["reason"]
+    steps = state["steps"]
+    for name in ("audio", "scenes", "action", "moments"):
+        assert steps[name]["status"] == "done", name
+    assert pipeline.STEPS.index("audio") < pipeline.STEPS.index("scenes") < pipeline.STEPS.index("action") \
+        < pipeline.STEPS.index("moments")
+    started = [steps[n]["started_at"] for n in ("audio", "scenes", "action", "moments")]
+    assert started == sorted(started)
+    scenes = json.loads((video_dir / "scenes.json").read_text(encoding="utf-8"))
+    assert scenes["peak_windows"] is True
+
+    action = json.loads((video_dir / "action.json").read_text(encoding="utf-8"))
+    assert action["enabled"] is True
+    assert action["passages"], "aucun passage d'action detecte sur les rafales audio"
+    assert action["images_sent"] >= 1 and action["llm_calls"] == sum(1 for c in fake.calls if c.usage == "action")
+    assert any(f["description"] for p in action["passages"] for f in p["frames"])
+
+    moments = json.loads((video_dir / "moments.json").read_text(encoding="utf-8"))
+    assert any(m["source"] == "action" for m in moments["moments"]), moments["moments"]
+    gated = [r for r in moments["rejected"] if r["source"] == "transcript"]
+    assert gated, "le monologue de la transcription n'est pas rejete"
+    assert any("seuil éliminatoire" in r["reason"] and r["reason"].startswith("action 1 <") for r in gated), gated
+
+
+@no_ffmpeg
+def test_classic_style_is_unchanged_by_the_action_feature(tmp_path, isolated_cwd, source_video):
+    from clipper import scenes
+
+    state, fake, video_dir = run_style(tmp_path, source_video, "review", CLASSIC_RUN_STYLE, answer)
+
+    assert state["status"] == "awaiting_review", state["reason"]
+    assert state["steps"]["audio"]["status"] == "done"
+    assert (video_dir / "audio.json").is_file()  # audio tourne avant scenes, mais scenes l'ignore
+    scenes_json = json.loads((video_dir / "scenes.json").read_text(encoding="utf-8"))
+    assert "peak_windows" not in scenes_json
+
+    # Meme scenes.json qu'un run sans etape audio prealable (aucun audio.json).
+    baseline = tmp_path / "baseline"
+    (baseline / VIDEO_ID).mkdir(parents=True)
+    for name in (f"{VIDEO_ID}.mp4", "transcript.json"):
+        shutil.copyfile(video_dir / name, baseline / VIDEO_ID / name)
+    config = make_fast_config(tmp_path, mode="review", **CLASSIC_RUN_STYLE)
+    scenes.detect_scenes(baseline / VIDEO_ID / f"{VIDEO_ID}.mp4", baseline, VIDEO_ID, **config.section("scenes"))
+    assert (video_dir / "scenes.json").read_bytes() == (baseline / VIDEO_ID / "scenes.json").read_bytes()
+
+    action = json.loads((video_dir / "action.json").read_text(encoding="utf-8"))
+    assert action == {"video_id": VIDEO_ID, "enabled": False, "passages": [], "rejected": [], "llm_calls": 0,
+                      "images_sent": 0}
+    assert not any(c.usage == "action" for c in fake.calls)
+    moments = json.loads((video_dir / "moments.json").read_text(encoding="utf-8"))
+    assert moments["moments"]
+    assert all(m.get("source", "transcript") != "action" for m in moments["moments"] + moments["rejected"])

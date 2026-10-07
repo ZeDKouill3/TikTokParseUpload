@@ -5,7 +5,7 @@ slug: jury-action-6-6-test-de-bout-en-bout-des-deux-st
 title: "Jury action 6/6 : test de bout en bout des deux styles gaming action vs témoins, test réel optionnel sur un extrait court (CLIPPER_ACTION_REAL), documentation (SPEC-b0f3 R15, R17, R18)"
 created: 2026-10-07T13:12:42Z
 author: w-juryplan
-status: open
+status: done
 scope:
   - tests/test_pipeline.py
   - tests/test_action_real.py
@@ -19,8 +19,15 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/88f4ee6733f1@80d7cf3
+    tree: scope/7bb8bb5bafca
+    criteria: 8c25c7424052
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 2
+version: 4
 ---
 
 Clôt SPEC-b0f3d20f4191 : preuve de bout en bout (FakeBackend) que les deux nouveaux styles produisent des candidats d'action et que les styles témoins ne changent pas, test réel optionnel jamais lancé par défaut (feedback utilisateur : preuves par tests unitaires, aucun run vidéo complet pour valider), documentation des clés des deux presets (R15) que l'orchestrateur crée localement. Ne touche à aucun fichier de clipper/ : tout le code est en amont.

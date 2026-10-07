@@ -5,34 +5,42 @@ commandes sont `python -m clipper <commande> ...` ; `--config chemin.toml`
 (défaut `config.toml`) et `-v`/`-vv` (journal détaillé des étapes, voir
 *Sortie détaillée* ci-dessous) marchent sur toutes.
 
-## Les 12 étapes du pipeline
+## Les 13 étapes du pipeline
 
-Une vidéo passe, dans l'ordre, par `download, transcribe, scenes, audio,
-moments, vision, parts, captions, reframe, subtitles, render, qa`. Chaque
-étape lit ses entrées sous `workspace/<video_id>/` et y écrit son résultat ;
-une étape dont le résultat existe déjà n'est pas relancée (sauf `--force`).
+Une vidéo passe, dans l'ordre, par `download, transcribe, audio, scenes,
+action, moments, vision, parts, captions, reframe, subtitles, render, qa`.
+Chaque étape lit ses entrées sous `workspace/<video_id>/` et y écrit son
+résultat ; une étape dont le résultat existe déjà n'est pas relancée (sauf
+`--force`).
 
 1. **download** — télécharge la vidéo (yt-dlp), au mieux en 1080p mp4.
 2. **transcribe** — transcrit l'audio mot par mot (faster-whisper), avec
    correction de la transcription et du vocabulaire de noms propres par LLM.
-3. **scenes** — détecte les changements de plan (scenedetect) et extrait des
-   images clés.
-4. **audio** — repère les pics sonores (rires, réactions...) pour aider à
-   noter les moments.
-5. **moments** — le LLM choisit les moments forts du transcript, notés selon
-   `rubric.toml` (SPEC-53f3).
-6. **vision** — regarde les images clés de chaque moment candidat et ajuste
+3. **audio** — repère les pics sonores (rires, réactions, cris...) ; tourne
+   avant `scenes`, qui s'en sert si l'étape `action` est activée.
+4. **scenes** — détecte les changements de plan (scenedetect) et extrait des
+   images clés ; avec `[action] enabled = true`, décode aussi les fenêtres
+   autour des pics sonores hors parole (`scenes.json` porte alors
+   `"peak_windows": true`).
+5. **action** — désactivée par défaut (`[action] enabled`). Repère sans LLM
+   les passages où il se passe quelque chose (pics audio, densité de plans),
+   puis fait décrire leurs images par le LLM : `action.json`.
+6. **moments** — le LLM choisit les moments forts du transcript, notés selon
+   `rubric.toml` (SPEC-53f3) ; avec `[moments] candidates =
+   "transcript+action"`, les passages d'`action.json` deviennent aussi des
+   candidats (source « action »).
+7. **vision** — regarde les images clés de chaque moment candidat et ajuste
    la note (bonus visuel), sans relancer le LLM de `moments`.
-7. **parts** — découpe un moment trop long en plusieurs parties (chacune une
+8. **parts** — découpe un moment trop long en plusieurs parties (chacune une
    vidéo séparée) si besoin.
-8. **captions** — génère titre, légende, hashtags et accroche par clip.
-9. **reframe** — calcule le plan de recadrage vertical (letterbox ou suivi de
-   visage selon la config, voir *Formats* ci-dessous).
-10. **subtitles** — génère les sous-titres (.ass), mot par mot, avec emphase
+9. **captions** — génère titre, légende, hashtags et accroche par clip.
+10. **reframe** — calcule le plan de recadrage vertical (letterbox ou suivi de
+    visage selon la config, voir *Formats* ci-dessous).
+11. **subtitles** — génère les sous-titres (.ass), mot par mot, avec emphase
     choisie par LLM.
-11. **render** — assemble tout avec ffmpeg (image, sous-titres, titre
+12. **render** — assemble tout avec ffmpeg (image, sous-titres, titre
     d'écran, audio normalisé) : `output/<video_id>/<clip_id>.mp4`.
-12. **qa** — contrôle qualité automatique (résolution, durée, silence de
+13. **qa** — contrôle qualité automatique (résolution, durée, silence de
     tête, image noire...) ; un clip n'est prêt que si `qa.is_ready` le dit.
 
 Un seul modèle lourd est en VRAM à la fois (ADR-fb9b) : les étapes tournent
@@ -683,12 +691,21 @@ small, medium, large-v3...), `language` (défaut détection auto),
 `[scenes]` — `threshold` = 27.0 (sensibilité scenedetect), `jpeg_quality` =
 95, `extract_parallel` = 4.
 
+`[action]` — voir *Candidats d'action* dans le README : `enabled` = false
+(défaut), `window_seconds` = 30, `step_seconds` = 15, `audio_weight` et
+`cuts_weight` = 1.0, `audio_peaks_full` = 3, `audio_peak_min_db` = 6.0,
+`cuts_ratio_full` = 3.0, `min_score` = 0.6, `max_passage_seconds` = 90,
+`max_passages_per_hour` = 12, `frames_per_passage` = 4,
+`max_images_per_hour` = 48, `batch_size` = 8, `max_width` = 768,
+`parallel` = 4.
+
 `[audio]` — `sample_rate` = 16000, `window_seconds` = 1.0,
 `median_window_seconds` = 15.0, `peak_threshold_db` = 6.0.
 
 `[moments]` — `selection` = `"single"` (ou `"jury"`, forcé en mode auto),
 `rubric_path` = `"rubric.toml"` (chemin utilisé tel quel ; `"builtin"` :
-grille embarquée dans le paquet, sans fichier local), `max_transcript_chars`,
+grille embarquée dans le paquet, sans fichier local), `candidates` = `"transcript"` (ou `"transcript+action"`, voir *action*),
+`action_snap_seconds` = 3, `max_transcript_chars`,
 `chunk_chars` (découpe les longues vidéos), `exploration_share` = 0.1 (part
 de candidats hors grille stricte, pour ne pas se figer sur les mêmes
 formats), `short_clips` = false (interrupteur « clips courts », voir

@@ -36,6 +36,18 @@ $env:CLIPPER_INSTALLER_REAL = "1"
 python -m pytest -q tests/test_installer_real.py
 ```
 
+Test réel optionnel des candidats d'action (SPEC-b0f3 R17) : copie un extrait
+de VOD (10 min au plus) dans un workspace temporaire et enchaîne transcribe,
+audio, scenes, action puis moments en « transcript+action » avec la config
+réelle (vrai whisper, vrai `claude`, quota consommé). Jamais par défaut ni en
+CI : sauté sans les deux variables d'environnement.
+
+```powershell
+$env:CLIPPER_ACTION_REAL = "1"
+$env:CLIPPER_ACTION_REAL_VIDEO = "C:\chemin\extrait.mp4"
+python -m pytest -q tests/test_action_real.py
+```
+
 ## Règles ank
 
 - CLI ank seulement : jamais lire ou écrire `.ank/` à la main, cet état est

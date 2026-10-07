@@ -316,6 +316,63 @@ sauve un monologue). La re-notation après vision le réapplique. Sans `[gate]`,
 rien ne change : `builtin` et `builtin:gaming` n'en ont pas et restent
 identiques.
 
+**Candidats d'action (étape `action`).** Pour un style gaming, les moments ne
+viennent pas que de la transcription : avec `[action] enabled = true`, l'étape
+`action` (entre `scenes` et `moments`) cherche sans LLM les passages de jeu
+(pics audio hors parole, densité de changements de plan), fait décrire leurs
+images par le LLM (planches d'images, `action.json`), et `[moments] candidates
+= "transcript+action"` les ajoute aux candidats de la transcription (source
+« action » dans `moments.json`), notés par le même jury et la même grille.
+Réglages de `[action]` (tous dans `CONFIG_DEFAULTS` de `clipper/action.py`) :
+`window_seconds` 30, `step_seconds` 15, `audio_weight` / `cuts_weight` 1.0,
+`audio_peaks_full` 3, `audio_peak_min_db` 6.0, `cuts_ratio_full` 3.0,
+`min_score` 0.6, `max_passage_seconds` 90, `max_passages_per_hour` 12,
+`frames_per_passage` 4, `max_images_per_hour` 48, `batch_size` 8,
+`max_width` 768, `parallel` 4. Le coût est borné par heure de VOD (au plus 6
+appels `action` aux défauts). `[action] enabled` pilote seul les fenêtres de
+pics de `scenes` : les styles sans `[action]` produisent les mêmes
+`scenes.json`, `moments.json` et clips qu'avant. Les styles `twitch` et
+`classic` servent de témoins pour comparer.
+
+Les deux styles gaming action (fichiers locaux `presets/<nom>.toml`, jamais
+commités) :
+
+```toml
+# Twitch gaming : format stream
+[channel]
+display_name = "ma_chaine"
+source_url = "https://www.twitch.tv/ma_chaine/videos"
+
+[reframe]
+layout = "stream_auto"
+stream_variant = "split"
+fallback = "blur"
+# + les tables split_webcam_dest, split_gameplay_dest, split_subtitle_dest et
+#   badge_dest du style twitch, et [render] comme le style twitch
+
+[moments]
+rubric_path = "builtin:gaming-action"
+candidates = "transcript+action"
+
+[action]
+enabled = true
+max_passage_seconds = 45    # avec short_clips = true : <= short_max, sinon rejet pour durée
+```
+
+```toml
+# Letterbox gaming : format letterbox (aucune table [reframe])
+[channel]
+display_name = "ma_chaine"
+source_url = "https://www.twitch.tv/ma_chaine/videos"
+
+[moments]
+rubric_path = "builtin:gaming-action"
+candidates = "transcript+action"
+
+[action]
+enabled = true
+```
+
 **Appel à l'abonnement.** Il est **désactivé par défaut** ; sans configuration
 explicite, le rendu, le sidecar et la légende restent identiques. Pour
 l'activer dans un preset :
@@ -544,6 +601,17 @@ Tout le pipeline doit tourner sur CPU pour les tests (ADR-fb9b) : aucun test
 n'a besoin d'un GPU pour passer. Ce qui a réellement besoin du réseau, d'un
 vrai modèle ou du vrai Claude est un test optionnel, sauté par défaut
 (`skipif`), jamais lancé en CI ni par défaut en local.
+
+**Test réel des candidats d'action** (optionnel, quota Claude consommé) :
+`tests/test_action_real.py` enchaîne transcribe, audio, scenes, action puis
+moments sur un extrait de VOD (10 min au plus) dans un workspace temporaire,
+avec le vrai whisper et le vrai `claude`. Sauté sans `CLIPPER_ACTION_REAL=1`.
+
+```powershell
+$env:CLIPPER_ACTION_REAL = "1"
+$env:CLIPPER_ACTION_REAL_VIDEO = "C:\chemin\extrait.mp4"
+python -m pytest -q tests/test_action_real.py
+```
 
 **Régénérer les captures et animations.** Les images de
 `docs/assets/readme/` viennent d'un script reproductible,
