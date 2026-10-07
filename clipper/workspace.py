@@ -169,3 +169,87 @@ def purge_clips(video_id: str, output_root: str | Path = "output", publish_dir: 
         shutil.rmtree(out)
     log.info("purge des clips de %s : %d octets liberes", video_id, freed)
     return freed
+
+
+# --------------------------------------------------------------------------
+# Suppression de clips choisis (TASK-2322)
+# --------------------------------------------------------------------------
+
+
+def _clip_files(video_id: str, clip_id: str, output_root: str | Path) -> list[Path]:
+    """Fichiers de ce clip seul : ``<clip_id>.<ext>`` (mp4, sidecar json, miniature...), jamais ``<clip_id>-p1.*``."""
+    folder = Path(output_root) / video_id
+    if not folder.is_dir():
+        return []
+    return sorted(p for p in folder.iterdir() if p.is_file() and p.name.startswith(f"{clip_id}."))
+
+
+def series_clip_ids(video_id: str, clip_id: str, output_root: str | Path = "output") -> list[str]:
+    """Tous les clip_id de la serie de ``clip_id`` (lui compris), par numero de partie ; ``[clip_id]`` hors serie.
+    Meme regle que publish.series_clip_ids (sidecar part/parts_total, base = id sans ``-pN``)."""
+    folder = Path(output_root) / video_id
+
+    def info(cid: str) -> tuple[str | None, int]:
+        path = folder / f"{cid}.json"
+        try:
+            sidecar = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise PurgeRefused(f"clip {cid} introuvable ou sidecar illisible : {exc}") from exc
+        part = sidecar.get("part")
+        if part is None or (sidecar.get("parts_total") or 1) <= 1:
+            return None, 0
+        return (cid.rsplit("-p", 1)[0] if "-p" in cid else cid), part
+
+    base, part = info(clip_id)
+    if base is None:
+        return [clip_id]
+    members = [(part, clip_id)]
+    for path in sorted(folder.glob("*.json")):
+        if path.stem == clip_id:
+            continue
+        other_base, other_part = info(path.stem)
+        if other_base == base:
+            members.append((other_part, path.stem))
+    return [cid for _, cid in sorted(members)]
+
+
+def _undeletable_clips(video_id: str, clip_ids: list[str], publish_dir: str | Path | None) -> dict[str, str]:
+    """clip_id -> raison, pour les clips a publication programmee, en cours, en attente ou deja publiee."""
+    reasons: dict[str, str] = {}
+    if publish_dir is None or not Path(publish_dir).is_dir():
+        return reasons
+    wanted = set(clip_ids)
+    for path in sorted(Path(publish_dir).glob("*.json")):
+        for entry in _read_list(path):
+            if not isinstance(entry, dict) or entry.get("video_id") != video_id or entry.get("clip_id") not in wanted:
+                continue
+            if entry.get("in_progress_since"):
+                reasons.setdefault(entry["clip_id"], "publication en cours")
+            elif entry.get("status") in _BLOCKING_STATUSES:
+                reasons.setdefault(entry["clip_id"], "publication programmee ou en attente")
+            elif entry.get("status") == "published":
+                reasons.setdefault(entry["clip_id"], "deja publie (historique des stats)")
+    return reasons
+
+
+def delete_clips(video_id: str, clip_ids: list[str], output_root: str | Path = "output",
+                 publish_dir: str | Path | None = None) -> dict:
+    """Supprime des clips de output/<video_id>/ (mp4, sidecar, annexes), serie entiere comprise ; tout ou rien :
+    ``PurgeRefused`` (nommant le clip) si un clip de l'ensemble est programme, en cours, en attente ou publie."""
+    expanded: list[str] = []
+    for clip_id in clip_ids:
+        for member in series_clip_ids(video_id, clip_id, output_root):
+            if member not in expanded:
+                expanded.append(member)
+    blocked = _undeletable_clips(video_id, expanded, publish_dir)
+    if blocked:
+        first = next(c for c in expanded if c in blocked)
+        raise PurgeRefused(f"clip {first} garde : {blocked[first]}"
+                           + (f" (et {len(blocked) - 1} autre(s) de la serie)" if len(blocked) > 1 else ""))
+    freed = 0
+    for clip_id in expanded:
+        for path in _clip_files(video_id, clip_id, output_root):
+            freed += path.stat().st_size
+            path.unlink()
+    log.info("suppression des clips %s de %s : %d octets liberes", ", ".join(expanded), video_id, freed)
+    return {"deleted": expanded, "freed_bytes": freed}

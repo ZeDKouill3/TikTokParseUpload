@@ -195,3 +195,126 @@ def test_log_records_a_purge(isolated_cwd, caplog):
     with caplog.at_level("INFO", logger="clipper.workspace"):
         _purge(isolated_cwd)
     assert any(VID in r.message and "1665" in r.message for r in caplog.records)
+
+
+# --------------------------------------------------------------------------
+# Suppression de clips choisis (TASK-2322)
+# --------------------------------------------------------------------------
+
+
+def _add_part(root, clip_id, part, total=3, video_id=VID):
+    out = root / "output" / video_id
+    out.mkdir(parents=True, exist_ok=True)
+    (out / f"{clip_id}.mp4").write_bytes(b"y" * 100)
+    (out / f"{clip_id}.json").write_text(json.dumps(
+        {"video_id": video_id, "clip_id": clip_id, "part": part, "parts_total": total}), encoding="utf-8")
+
+
+def _publish(root, entries):
+    pub = root / "publish"
+    pub.mkdir(exist_ok=True)
+    (pub / "style.json").write_text(json.dumps(entries), encoding="utf-8")
+    return pub
+
+
+def test_delete_clips_removes_clip_files_and_returns_freed_bytes(isolated_cwd):
+    _add_clip(isolated_cwd, "01-p1")
+    _add_clip(isolated_cwd, "02-p1")
+    out = isolated_cwd / "output" / VID
+    (out / "01-p1.jpg").write_bytes(b"z" * 40)
+    sidecar_size = (out / "01-p1.json").stat().st_size
+
+    result = ws_mod.delete_clips(VID, ["01-p1"], isolated_cwd / "output", isolated_cwd / "publish")
+
+    assert result["deleted"] == ["01-p1"]
+    assert result["freed_bytes"] == 500 + sidecar_size + 40
+    assert sorted(p.name for p in out.iterdir()) == ["02-p1.json", "02-p1.mp4"]
+
+
+def test_delete_clips_does_not_touch_a_clip_whose_id_is_a_prefix(isolated_cwd):
+    _add_clip(isolated_cwd, "01")
+    _add_clip(isolated_cwd, "01-p1")
+
+    ws_mod.delete_clips(VID, ["01"], isolated_cwd / "output", None)
+
+    assert (isolated_cwd / "output" / VID / "01-p1.mp4").is_file()
+    assert not (isolated_cwd / "output" / VID / "01.mp4").exists()
+
+
+@pytest.mark.parametrize("status", ["approved", "scheduled", "failed", "published"])
+def test_delete_clips_refuses_pending_or_published_and_names_the_clip(isolated_cwd, status):
+    _add_clip(isolated_cwd, "02-p2")
+    pub = _publish(isolated_cwd, [{"video_id": VID, "clip_id": "02-p2", "status": status}])
+
+    with pytest.raises(ws_mod.PurgeRefused, match="02-p2"):
+        ws_mod.delete_clips(VID, ["02-p2"], isolated_cwd / "output", pub)
+
+    assert (isolated_cwd / "output" / VID / "02-p2.mp4").is_file()
+    assert (isolated_cwd / "output" / VID / "02-p2.json").is_file()
+
+
+def test_delete_clips_refuses_an_in_progress_publication(isolated_cwd):
+    _add_clip(isolated_cwd, "02-p2")
+    pub = _publish(isolated_cwd, [{"video_id": VID, "clip_id": "02-p2", "status": "rejected",
+                                   "in_progress_since": "2026-01-01T00:00:00+00:00"}])
+
+    with pytest.raises(ws_mod.PurgeRefused, match="02-p2"):
+        ws_mod.delete_clips(VID, ["02-p2"], isolated_cwd / "output", pub)
+
+
+def test_delete_clips_allows_a_rejected_clip_and_ignores_other_videos_entries(isolated_cwd):
+    _add_clip(isolated_cwd, "01-p1")
+    pub = _publish(isolated_cwd, [{"video_id": VID, "clip_id": "01-p1", "status": "rejected"},
+                                  {"video_id": "other", "clip_id": "01-p1", "status": "published"}])
+
+    assert ws_mod.delete_clips(VID, ["01-p1"], isolated_cwd / "output", pub)["deleted"] == ["01-p1"]
+
+
+def test_delete_clips_removes_the_whole_series_when_one_part_is_chosen(isolated_cwd):
+    for n in (1, 2, 3):
+        _add_part(isolated_cwd, f"01-p{n}", n)
+    _add_clip(isolated_cwd, "05-p1")
+
+    result = ws_mod.delete_clips(VID, ["01-p2"], isolated_cwd / "output", None)
+
+    assert result["deleted"] == ["01-p1", "01-p2", "01-p3"]
+    assert sorted(p.name for p in (isolated_cwd / "output" / VID).iterdir()) == ["05-p1.json", "05-p1.mp4"]
+
+
+def test_delete_clips_refuses_the_whole_series_when_one_part_is_blocked(isolated_cwd):
+    for n in (1, 2, 3):
+        _add_part(isolated_cwd, f"01-p{n}", n)
+    pub = _publish(isolated_cwd, [{"video_id": VID, "clip_id": "01-p3", "status": "scheduled"}])
+
+    with pytest.raises(ws_mod.PurgeRefused, match="01-p3"):
+        ws_mod.delete_clips(VID, ["01-p1"], isolated_cwd / "output", pub)
+
+    assert len(list((isolated_cwd / "output" / VID).glob("*.mp4"))) == 3
+
+
+def test_delete_clips_unknown_clip_is_explicit(isolated_cwd):
+    _add_clip(isolated_cwd, "01-p1")
+
+    with pytest.raises(ws_mod.PurgeRefused, match="zz"):
+        ws_mod.delete_clips(VID, ["zz"], isolated_cwd / "output", None)
+
+
+def test_delete_clips_unreadable_publish_file_is_explicit(isolated_cwd):
+    _add_clip(isolated_cwd, "01-p1")
+    pub = isolated_cwd / "publish"
+    pub.mkdir()
+    (pub / "style.json").write_text("{pas du json", encoding="utf-8")
+
+    with pytest.raises(ws_mod.PurgeRefused, match="style.json"):
+        ws_mod.delete_clips(VID, ["01-p1"], isolated_cwd / "output", pub)
+
+    assert (isolated_cwd / "output" / VID / "01-p1.mp4").is_file()
+
+
+def test_series_clip_ids_groups_parts_and_leaves_single_clips_alone(isolated_cwd):
+    for n in (1, 2):
+        _add_part(isolated_cwd, f"01-p{n}", n, total=2)
+    _add_clip(isolated_cwd, "05-p1")
+
+    assert ws_mod.series_clip_ids(VID, "01-p2", isolated_cwd / "output") == ["01-p1", "01-p2"]
+    assert ws_mod.series_clip_ids(VID, "05-p1", isolated_cwd / "output") == ["05-p1"]

@@ -9767,3 +9767,100 @@ def test_a_paused_account_with_an_expired_connection_is_not_fetched_for_stats(tm
     resp = client(tmp_path).post("/api/stats/tiktok/refresh", json={"account": TT_ACCOUNT})
 
     assert resp.status_code == 409 and "expirée" in resp.json()["detail"] and fetch.calls == []
+# --------------------------------------------------------------------------
+# Suppression des clips sélectionnés (TASK-2322) : POST /api/clips/delete
+# --------------------------------------------------------------------------
+
+
+def _delete_part(tmp_path, clip_id, part, total, video_id="aaaaaaaaaaa"):
+    out = _purge_clip(tmp_path, video_id=video_id, clip_id=clip_id)
+    (out / f"{clip_id}.json").write_text(json.dumps(
+        {"video_id": video_id, "clip_id": clip_id, "part": part, "parts_total": total}), encoding="utf-8")
+
+
+def _delete_publish(tmp_path, entries):
+    pub = tmp_path / "state" / "publish"
+    pub.mkdir(parents=True, exist_ok=True)
+    (pub / "style.json").write_text(json.dumps(entries), encoding="utf-8")
+
+
+def _delete_body(*pairs):
+    return {"clips": [{"video_id": v, "clip_id": c} for v, c in pairs]}
+
+
+def test_clips_delete_removes_chosen_clips_and_reports_freed_bytes(tmp_path, isolated_cwd):
+    out = _purge_clip(tmp_path, clip_id="01-p1")
+    _purge_clip(tmp_path, clip_id="02-p1")
+
+    resp = client(tmp_path).post("/api/clips/delete", json=_delete_body(("aaaaaaaaaaa", "01-p1")))
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["deleted"] == [{"video_id": "aaaaaaaaaaa", "clip_id": "01-p1"}]
+    assert body["refused"] == []
+    assert body["freed_bytes"] > 50
+    assert not (out / "01-p1.mp4").exists() and not (out / "01-p1.json").exists()
+    assert (out / "02-p1.mp4").is_file() and (out / "02-p1.json").is_file()
+
+
+@pytest.mark.parametrize("status", ["published", "scheduled", "approved"])
+def test_clips_delete_refuses_published_scheduled_or_pending_clips_with_reason(tmp_path, isolated_cwd, status):
+    out = _purge_clip(tmp_path, clip_id="02-p1")
+    _delete_publish(tmp_path, [{"video_id": "aaaaaaaaaaa", "clip_id": "02-p1", "status": status}])
+
+    resp = client(tmp_path).post("/api/clips/delete", json=_delete_body(("aaaaaaaaaaa", "02-p1")))
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["deleted"] == [] and body["freed_bytes"] == 0
+    assert body["refused"][0]["clip"] == {"video_id": "aaaaaaaaaaa", "clip_id": "02-p1"}
+    assert "02-p1" in body["refused"][0]["reason"]
+    assert (out / "02-p1.mp4").is_file()
+
+
+def test_clips_delete_is_all_or_nothing_per_series_but_other_clips_still_go(tmp_path, isolated_cwd):
+    out = _purge_clip(tmp_path, clip_id="09-p1")
+    for n in (1, 2):
+        _delete_part(tmp_path, f"01-p{n}", n, 2)
+    _delete_publish(tmp_path, [{"video_id": "aaaaaaaaaaa", "clip_id": "01-p2", "status": "scheduled"}])
+
+    resp = client(tmp_path).post("/api/clips/delete", json=_delete_body(("aaaaaaaaaaa", "01-p1"), ("aaaaaaaaaaa", "09-p1")))
+
+    body = resp.json()
+    assert [c["clip_id"] for c in body["deleted"]] == ["09-p1"]
+    assert [r["clip"]["clip_id"] for r in body["refused"]] == ["01-p1"]
+    assert (out / "01-p1.mp4").is_file() and (out / "01-p2.mp4").is_file()
+    assert not (out / "09-p1.mp4").exists()
+
+
+def test_clips_delete_one_chosen_part_deletes_the_whole_series_once(tmp_path, isolated_cwd):
+    out = tmp_path / "output" / "aaaaaaaaaaa"
+    for n in (1, 2, 3):
+        _delete_part(tmp_path, f"01-p{n}", n, 3)
+
+    resp = client(tmp_path).post("/api/clips/delete", json=_delete_body(("aaaaaaaaaaa", "01-p2"), ("aaaaaaaaaaa", "01-p3")))
+
+    assert [c["clip_id"] for c in resp.json()["deleted"]] == ["01-p1", "01-p2", "01-p3"]
+    assert list(out.glob("*")) == []
+
+
+def test_clips_delete_unknown_clip_is_refused_explicitly_not_silently(tmp_path, isolated_cwd):
+    _purge_clip(tmp_path, clip_id="01-p1")
+
+    body = client(tmp_path).post("/api/clips/delete", json=_delete_body(("aaaaaaaaaaa", "zz"))).json()
+
+    assert body["deleted"] == [] and "zz" in body["refused"][0]["reason"]
+
+
+def test_clips_delete_empty_selection_and_bad_ids_are_400_or_422(tmp_path, isolated_cwd):
+    c = client(tmp_path)
+
+    assert c.post("/api/clips/delete", json={"clips": []}).status_code == 400
+    assert c.post("/api/clips/delete", json=_delete_body(("../x", "01"))).status_code in (400, 404, 422)
+
+
+def test_clips_selection_bar_has_a_danger_delete_button_with_confirmation_and_toast():
+    js = (STATIC / "screens" / "clips.js").read_text(encoding="utf-8")
+    assert "Supprimer la sélection" in js and "data-clips-sel-delete" in js and "btn-bad" in js
+    assert "/api/clips/delete" in js
+    assert "Irréversible" in js and "confirmDialog" in js
