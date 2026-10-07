@@ -48,31 +48,31 @@ from clipper import montage as montage_lib
 log = logging.getLogger(__name__)
 
 CONFIG_DEFAULTS: dict[str, object] = {
-    # Etape desactivee par defaut : action.json vide, scenes ignore audio.json.
+    # Étape désactivée par défaut : action.json vide, le découpage en plans ignore audio.json.
     "enabled": False,
-    # Fenetre d'analyse (s) et pas entre deux fenetres.
+    # Fenêtre d'analyse (s) et pas entre deux fenêtres.
     "window_seconds": 30,
     "step_seconds": 15,
-    # Poids des deux signaux dans le score d'une fenetre.
+    # Poids des deux signaux dans le score d'une fenêtre.
     "audio_weight": 1.0,
-    # Pics audio d'une fenetre qui valent un signal complet (1.0).
+    # Pics audio d'une fenêtre qui valent un signal complet (1.0).
     "audio_peaks_full": 3,
     # Seuil (dB au-dessus du fond) sous lequel un pic audio ne compte pas.
     "audio_peak_min_db": 6.0,
     "cuts_weight": 1.0,
-    # Densite de plans (multiple de la mediane de la video) qui vaut un signal complet.
+    # Densité de plans (multiple de la médiane de la vidéo) qui vaut un signal complet.
     "cuts_ratio_full": 3.0,
-    # Score minimal d'une fenetre pour entrer dans un passage.
+    # Score minimal d'une fenêtre pour entrer dans un passage.
     "min_score": 0.6,
     "max_passage_seconds": 90,
-    # Plafonds par heure de VOD : passages et images envoyees au LLM.
+    # Plafonds par heure de VOD : passages et images envoyées au LLM.
     "max_passages_per_hour": 12,
     "frames_per_passage": 4,
     "max_images_per_hour": 48,
     # Images par planche (un appel LLM par planche) et largeur max de chacune.
     "batch_size": 8,
     "max_width": 768,
-    # Lots traites en meme temps.
+    # Lots traités en même temps.
     "parallel": 4,
 }
 

@@ -90,12 +90,13 @@ function jrTable(data, moment, rnd) {
   return `<div class="jr-table-wrap"><table class="jr-table"><thead>${head}</thead><tbody>${rows}</tbody></table></div>`;
 }
 
+const JR_SOURCE_LABEL = { transcript: "transcription", action: "passage d'action" };
 const JR_KIND_LABEL = { retenu: "Retenu", decoupage: "Écarté au découpage", exploration: "Exploration", score: "Sous le seuil", plafond: "Plafond par heure", veto: "Veto", autre: "Rejeté" };
 
 function jrRow(m, selected) {
   const tone = m.reason_kind === "decoupage" ? "warn" : m.retained ? "ok" : m.reason_kind === "veto" ? "bad" : "pending";
   return `<button type="button" class="jr-item${m.key === selected ? " sel" : ""}" data-jr-pick="${jrEsc(m.key)}" aria-pressed="${m.key === selected}"${m.cut_rejected ? ` title="${jrEsc(`Retenu par le jury, écarté au découpage : ${m.cut_rejected}`)}"` : ""}>`
-    + `<span class="mono">${jrTime(m.start)}–${jrTime(m.end)}</span><span class="jr-item-hook">${jrEsc(m.hook_text || "sans phrase d'accroche")}</span>`
+    + `<span class="mono">${jrTime(m.start)}–${jrTime(m.end)}</span><span class="jr-item-hook"${m.source ? ` title="Origine du moment : ${jrEsc(JR_SOURCE_LABEL[m.source] || m.source)}"` : ""}>${m.source ? `<b>${jrEsc(JR_SOURCE_LABEL[m.source] || m.source)}</b> · ` : ""}${jrEsc(m.hook_text || "sans phrase d'accroche")}</span>`
     + `<span class="jr-item-score">${m.final_score != null ? jrEsc(jrNum(m.final_score)) : "–"}</span><span class="chip ${tone} plain">${jrEsc(JR_KIND_LABEL[m.reason_kind] || m.reason_kind)}</span></button>`;
 }
 
