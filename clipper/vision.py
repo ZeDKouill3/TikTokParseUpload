@@ -46,10 +46,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
-import cv2
-import numpy as np
-
 from clipper import llm
+from clipper import montage as montage_lib
 
 log = logging.getLogger(__name__)
 
@@ -64,12 +62,8 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "parallel": 4,
 }
 
-# Hauteur de la bande de legende (index, timecode) au-dessus de chaque image
-# de la planche ; fait partie du format de sortie, pas un detail interne.
-LABEL_HEIGHT = 28
-_LABEL_FONT = cv2.FONT_HERSHEY_SIMPLEX
-_LABEL_SCALE = 0.6
-_LABEL_COLOR = (255, 255, 255)
+# Re-exporte : la planche vit dans clipper.montage (SPEC-b0f3 R8).
+LABEL_HEIGHT = montage_lib.LABEL_HEIGHT
 
 
 class VisionError(Exception):
@@ -189,43 +183,11 @@ def _settings(config: Any) -> dict[str, Any]:
     return {**CONFIG_DEFAULTS, **config.section("vision")}
 
 
-def _labeled_cell(image: np.ndarray, index: int, timecode: float, target_h: int) -> np.ndarray:
-    h, w = image.shape[:2]
-    if h < target_h:
-        image = np.vstack([image, np.zeros((target_h - h, w, 3), dtype=image.dtype)])
-    label = np.zeros((LABEL_HEIGHT, w, 3), dtype=np.uint8)
-    cv2.putText(
-        label, f"Image {index} : {timecode:.1f} s", (4, LABEL_HEIGHT - 8),
-        _LABEL_FONT, _LABEL_SCALE, _LABEL_COLOR, 1, cv2.LINE_AA,
-    )
-    return np.vstack([label, image])
-
-
 def _montage(batch: list[dict[str, Any]], video_dir: Path, dest_dir: Path, max_width: int, index: int) -> Path:
-    """Assemble ``batch`` (deja trie par timecode) en une planche unique :
-    grille horizontale, chaque image reduite a ``max_width`` (jamais
-    agrandie) et legendee avec son index et son timecode."""
-    images = []
-    for f in batch:
-        path = video_dir / f["path"]
-        image = cv2.imread(str(path))
-        if image is None:
-            raise VisionError(f"image illisible : {path}")
-        h, w = image.shape[:2]
-        if w > max_width:
-            image = cv2.resize(image, (max_width, max(1, round(h * max_width / w))))
-        images.append(image)
-    target_h = max(image.shape[0] for image in images)
-    cells = [
-        _labeled_cell(image, n, f["timecode"], target_h)
-        for n, (image, f) in enumerate(zip(images, batch))
-    ]
-    montage = np.hstack(cells)
-    dest = dest_dir / f"{index:05d}_montage.jpg"
-    if not cv2.imwrite(str(dest), montage):
-        raise VisionError(f"ecriture impossible : {dest}")
-    return dest
-
+    try:
+        return montage_lib.montage(batch, video_dir, dest_dir, max_width, index)
+    except montage_lib.MontageError as exc:
+        raise VisionError(str(exc)) from exc
 
 def _load_partial(path: Path) -> dict[int, list[dict[str, Any]]]:
     if not path.exists():
