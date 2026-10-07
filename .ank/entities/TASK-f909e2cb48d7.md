@@ -5,7 +5,7 @@ slug: clips-supprimer-la-s-lection-lib-re-aussi-les-cl
 title: "Clips : « Supprimer la sélection » libère aussi les clips déjà publiés (mp4 et annexes lourdes supprimés, sidecar .json gardé pour les stats)"
 created: 2026-10-07T22:43:28Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/workspace.py
   - clipper/web/app.py
@@ -19,6 +19,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/df9a29fb6ebd@43cf8fa
+    tree: scope/52535cad35a8
+    criteria: 848e802e9d5a
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---

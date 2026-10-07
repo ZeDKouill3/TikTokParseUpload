@@ -35,10 +35,17 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 - Clips : bouton « Supprimer la sélection » (style danger) dans la barre de sélection, après confirmation
   (« Supprimer N clips ? Irréversible. »). `POST /api/clips/delete` supprime via
-  `clipper.workspace.delete_clips` le `.mp4`, le sidecar `.json` et les annexes du clip, rend les octets
-  libérés ; jamais un clip publié, programmé, en cours ou en attente de publication. Tout ou rien par série
-  (une partie choisie entraîne toute sa série, refusée entière si une partie est bloquée) ; chaque refus
-  est rendu avec sa raison et affiché dans le toast.
+  `clipper.workspace.delete_clips` le `.mp4`, le sidecar `.json` et les annexes d'un clip jamais publié, rend les
+  octets libérés. Un clip déjà publié n'est plus refusé : son `.mp4` et ses annexes lourdes sont supprimés,
+  son sidecar `.json` est gardé intact (lien post → clip, statistiques, apprentissage du jury) ; la réponse
+  distingue `deleted` (supprimés entièrement) et `video_deleted` (vidéo seule), le journal aussi. Un clip
+  programmé, en cours ou en attente reste refusé. Tout ou rien par série (une partie choisie entraîne toute sa
+  série, refusée entière si une partie est programmée, en cours ou en attente ; sinon chaque partie suit sa
+  propre règle) ; chaque refus est rendu avec sa raison. La confirmation dit « Les clips publiés gardent leurs
+  infos (stats), seule la vidéo est supprimée. » et le toast compte supprimés, vidéos supprimées et refusés.
+  Un clip publié sans vidéo (`video_deleted` dans `GET /api/clips`) reste listé, marqué « Vidéo supprimée »,
+  ni sélectionnable ni lisible ; sa fiche n'a plus ni lecteur, ni re-rendu, ni téléchargement, et
+  approve / re-rendu / changement de titre répondent 409 « vidéo supprimée » plutôt qu'une erreur 500.
 - Comptes : pause manuelle d'un compte (SPEC-f348). La case « Prêt à publier » devient cliquable : cochée, un
   clic met le compte en pause (« En pause (manuel) depuis le … », heure de Paris) ; en pause, un clic le
   reprend (connexion revérifiée). Un compte en pause n'est jamais proposé dans Clips ni Publication, et une
