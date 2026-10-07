@@ -21,10 +21,12 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlencode
+from zoneinfo import ZoneInfo
 
 import httpx
 import yt_dlp
@@ -37,6 +39,9 @@ Clock = Callable[[], datetime]
 TWITCH_TOKEN_URL = "https://id.twitch.tv/oauth2/token"
 TWITCH_API = "https://api.twitch.tv/helix"
 YOUTUBE_VIDEOS_URL = "https://www.googleapis.com/youtube/v3/videos"
+IGDB_RELEASES_URL = "https://api.igdb.com/v4/release_dates"
+IGDB_PAGE_SIZE = 500
+IGDB_MIN_INTERVAL_S = 0.25  # 4 requêtes/s (doc IGDB #rate-limits)
 STEAM_API = "https://api.steampowered.com"
 STEAM_SELLERS_URL = f"{STEAM_API}/IStoreTopSellersService/GetWeeklyTopSellers/v1/"
 # Code de langue [veille] language -> nom de langue attendu par l'API magasin (autres valeurs passées telles quelles).
@@ -88,10 +93,12 @@ def _now() -> datetime:
 
 
 def default_http(method: str, url: str, *, params: dict[str, Any] | None = None,
-                 headers: dict[str, str] | None = None, timeout_s: float = 20) -> tuple[int, Any]:
-    """Transport httpx. Une erreur réseau devient une ``SourceError`` sans paramètres."""
+                 headers: dict[str, str] | None = None, timeout_s: float = 20,
+                 content: str | None = None) -> tuple[int, Any]:
+    """Transport httpx. Une erreur réseau devient une ``SourceError`` sans paramètres.
+    ``content`` : corps texte de la requête (IGDB, Apicalypse)."""
     try:
-        response = httpx.request(method, url, params=params, headers=headers, timeout=timeout_s)
+        response = httpx.request(method, url, params=params, headers=headers, content=content, timeout=timeout_s)
     except httpx.HTTPError as exc:
         raise SourceError(f"requête impossible sur {url} ({type(exc).__name__})") from None
     try:
@@ -119,11 +126,13 @@ class _Client:
         self.http, self.timeout_s, self.secrets = http, timeout_s, secrets
 
     def request(self, method: str, url: str, params: dict[str, Any] | None = None,
-                headers: dict[str, str] | None = None, *, accept_401: bool = False) -> tuple[int, Any]:
-        """``(status, body JSON)`` ; 401 rendu tel quel seulement si ``accept_401``."""
+                headers: dict[str, str] | None = None, *, accept_401: bool = False,
+                content: str | None = None, on_429: str | None = None) -> tuple[int, Any]:
+        """``(status, body JSON)`` ; 401 rendu tel quel seulement si ``accept_401`` ; 429 : ``SourceError(on_429)``."""
         shown = _safe_url(url, params)
+        extra = {"content": content} if content is not None else {}  # un transport sans corps n'a rien à recevoir
         try:
-            status, body = self.http(method, url, params=params, headers=headers, timeout_s=self.timeout_s)
+            status, body = self.http(method, url, params=params, headers=headers, timeout_s=self.timeout_s, **extra)
         except SourceError:
             raise
         except Exception as exc:  # le transport injecté peut lever n'importe quoi
@@ -131,6 +140,8 @@ class _Client:
                                       self.secrets)) from None
         if accept_401 and status == 401:
             return status, body
+        if on_429 and status == 429:
+            raise SourceError(on_429)
         snippet = _redact(str(body)[:_SNIPPET_CHARS], self.secrets)
         if not 200 <= status < 300:
             raise SourceError(f"HTTP {status} sur {shown} : {snippet}")
@@ -259,15 +270,22 @@ class _Twitch:
             self.client.secrets += (self.token,)
         return self.token
 
-    def get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
-        url = f"{TWITCH_API}/{path}"
+    def call(self, method: str, url: str, params: dict[str, Any] | None, headers: dict[str, str],
+             **kwargs: Any) -> Any:
+        """Requête avec le jeton Twitch ; un 401 renouvelle le jeton une fois, puis on réessaie."""
         for attempt in (1, 2):
-            headers = {"Client-Id": self.client_id, "Authorization": f"Bearer {self.ensure_token()}"}
-            status, body = self.client.request("GET", url, params, headers, accept_401=attempt == 1)
+            status, body = self.client.request(
+                method, url, params, {**headers, "Authorization": f"Bearer {self.ensure_token()}"},
+                accept_401=attempt == 1, **kwargs)
             if status != 401:
                 break
-            self.token = None  # jeton refusé : un seul renouvellement, puis on réessaie
+            self.token = None  # jeton refusé : un seul renouvellement
             self.token_path.unlink(missing_ok=True)
+        return body
+
+    def get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
+        url = f"{TWITCH_API}/{path}"
+        body = self.call("GET", url, params, {"Client-Id": self.client_id})
         if not isinstance(body, dict):
             raise self.client.fail(url, params, body, "objet JSON")
         return body
@@ -298,8 +316,10 @@ def _twitch_collector(http: Http, clock: Clock) -> Callable[[dict[str, object]],
 
         top_params = {"first": int(settings["twitch_top_games"])}  # type: ignore[call-overload]
         top = api.get("games/top", top_params)
-        names = {str(g["id"]): g["name"] for g in _field(api.client, f"{TWITCH_API}/games/top", top_params, top, "data")
-                 if "id" in g and "name" in g}
+        top_games = [g for g in _field(api.client, f"{TWITCH_API}/games/top", top_params, top, "data")
+                     if "id" in g and "name" in g]
+        names = {str(g["id"]): g["name"] for g in top_games}
+        igdb_ids = {str(g["id"]): str(g.get("igdb_id") or "") for g in top_games}  # vide : Twitch n'a pas l'id IGDB
         for game_id, entry in viewers.items():
             entry["name"] = entry["name"] or names.get(game_id)
         named = {gid: e for gid, e in viewers.items() if e["name"]}  # un jeu sans nom n'est pas relevé
@@ -328,8 +348,92 @@ def _twitch_collector(http: Http, clock: Clock) -> Callable[[dict[str, object]],
                     "thumbnail_url": _twitch_thumbnail(video.get("thumbnail_url")),
                     "views_per_hour": _views_per_hour(view_count, video["published_at"], now),
                 })
-        return {"games": [{"name": e["name"], "viewers_fr": e["viewers_fr"]} for _, e in ranked], "vods": vods,
+        return {"games": [{"name": e["name"], "viewers_fr": e["viewers_fr"], "igdb_id": igdb_ids.get(gid, "")}
+                          for gid, e in ranked], "vods": vods,
                 "private_vods": private_vods}
+
+    return collect
+
+
+# --------------------------------------------------------------------------
+# IGDB (ADR-798c, SPEC-4efa R12)
+# --------------------------------------------------------------------------
+
+
+class _Pacer:
+    """Espace les requêtes IGDB d'au moins ``IGDB_MIN_INTERVAL_S`` (horloge et attente injectées)."""
+
+    def __init__(self, clock: Clock, sleep: Callable[[float], None]):
+        self.clock, self.sleep, self.last = clock, sleep, None
+
+    def wait(self) -> None:
+        if self.last is not None:
+            remaining = IGDB_MIN_INTERVAL_S - (self.clock() - self.last).total_seconds()
+            if remaining > 0:
+                self.sleep(remaining)
+
+    def mark(self) -> None:
+        self.last = self.clock()
+
+
+def _midnight_utc(day: Any) -> int:
+    return int(datetime(day.year, day.month, day.day, tzinfo=timezone.utc).timestamp())
+
+
+def _igdb_release(client: _Client, row: Any) -> dict[str, Any] | None:
+    """Une entrée par ligne ``release_dates`` ; ``None`` si la ligne est ignorée (sans game, sans nom, sans date)."""
+    game = row.get("game") if isinstance(row, dict) else None
+    ts = row.get("date") if isinstance(row, dict) else None
+    if not isinstance(game, dict) or not game.get("name") or isinstance(ts, bool) or not isinstance(ts, (int, float)):
+        return None
+    if "id" not in game:
+        raise client.fail(IGDB_RELEASES_URL, None, row, "game.id")
+
+    def sub(key: str, field: str) -> Any:
+        value = row.get(key)
+        return value.get(field) if isinstance(value, dict) else None
+
+    hypes = game.get("hypes")
+    return {
+        "igdb_id": str(game["id"]), "name": game["name"], "slug": game.get("slug"), "url": game.get("url"),
+        "hypes": hypes if isinstance(hypes, int) and not isinstance(hypes, bool) else None,  # absent : null, jamais 0
+        "first_release_date": game.get("first_release_date"),
+        "date": datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d"),
+        "human": row.get("human"), "platform": sub("platform", "name"), "region": sub("release_region", "region"),
+        "status": sub("status", "name"), "date_format": sub("date_format", "format"),
+    }
+
+
+def _igdb_collector(http: Http, clock: Clock, sleep: Callable[[float], None]) -> Callable[[dict[str, object]], dict[str, Any]]:
+    def collect(settings: dict[str, object]) -> dict[str, Any]:
+        api = _Twitch(settings, http, clock)
+        pacer = _Pacer(clock, sleep)
+        today = clock().astimezone(ZoneInfo(str(settings["timezone"]))).date()
+        start = _midnight_utc(today - timedelta(days=int(settings["release_window_days"])))  # type: ignore[call-overload]
+        end = _midnight_utc(today + timedelta(days=int(settings["upcoming_days"]) + 1))  # type: ignore[call-overload]
+        headers = {"Client-ID": api.client_id, "Accept": "application/json"}
+        too_many = "IGDB : limite de 4 requêtes/s dépassée (HTTP 429)"
+        releases: list[dict[str, Any]] = []
+        skipped = 0
+        for page in range(int(settings["igdb_pages_max"])):  # type: ignore[call-overload]
+            body = (
+                "fields game.name,game.slug,game.url,game.hypes,game.first_release_date,date,human,platform.name,"
+                f"release_region.region,status.name,date_format.format; where date >= {start} & date < {end} & "
+                f"game != null; sort date asc; limit {IGDB_PAGE_SIZE}; offset {page * IGDB_PAGE_SIZE};")
+            pacer.wait()
+            rows = api.call("POST", IGDB_RELEASES_URL, None, headers, content=body, on_429=too_many)
+            pacer.mark()
+            if not isinstance(rows, list):
+                raise api.client.fail(IGDB_RELEASES_URL, None, rows, "tableau JSON")
+            for row in rows:
+                release = _igdb_release(api.client, row)
+                if release is None:
+                    skipped += 1
+                else:
+                    releases.append(release)
+            if len(rows) < IGDB_PAGE_SIZE:
+                break
+        return {"releases": releases, "skipped_rows": skipped}
 
     return collect
 
@@ -461,9 +565,11 @@ def current_players(settings: dict[str, object], appid: str | int, *, http: Http
     return int(_field(client, url, params, body, "response", "player_count"))
 
 
-def default_collectors(http: Http | None = None, clock: Clock | None = None) -> dict[str, Callable[[dict[str, object]], dict[str, Any]]]:
-    """Les collecteurs réels, sur le transport (et l'horloge) donnés."""
+def default_collectors(http: Http | None = None, clock: Clock | None = None,
+                       sleep: Callable[[float], None] | None = None) -> dict[str, Callable[[dict[str, object]], dict[str, Any]]]:
+    """Les collecteurs réels, sur le transport (l'horloge et l'attente) donnés."""
     http = http or default_http
     clock = clock or _now
     return {"twitch": _twitch_collector(http, clock), "youtube": _youtube_collector(http, clock),
-            "steam": _steam_collector(http, clock), "steam_fr": _steam_sellers_collector(http, clock)}
+            "steam": _steam_collector(http, clock), "steam_fr": _steam_sellers_collector(http, clock),
+            "igdb": _igdb_collector(http, clock, sleep or time.sleep)}
