@@ -49,6 +49,13 @@ clip d'exploration. Ces clips portent ``exploration: true`` ; le bloc
 ``exploration`` dit combien etaient vises (``target``) et pris (``chosen``).
 Part 0 : aucune exploration, sortie inchangee.
 
+Candidats d'action (SPEC-b0f3 R10-R14) : avec [moments] candidates =
+"transcript+action", chaque passage de action.json devient un candidat de
+``source`` "action" (bornes recalees a moins de ``action_snap_seconds`` sur une
+frontiere de phrase), note par le meme jury ou, en selection single, par un
+appel de comparaison de plus ; moments.json porte alors ``source`` et le bloc
+``action`` de chaque moment et rejet note.
+
 Re-notation : si moments.json existe et que vision.json est plus recent,
 l'etape (sans ``force``) ne rappelle pas le LLM ; elle recalcule le bonus
 visuel, le score final, ``min_score`` et le non-chevauchement sur les
@@ -155,8 +162,13 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "short_min": 20,
     # Durée maximale d'un clip court, en secondes.
     "short_max": 45,
+    # Candidats des moments : "transcript" (la transcription seule) ou "transcript+action" (avec les passages d'action de la vidéo).
+    "candidates": "transcript",
+    # Distance maximale en secondes pour caler un passage d'action sur le début ou la fin d'une phrase.
+    "action_snap_seconds": 3,
 }
 
+CANDIDATES = ("transcript", "transcript+action")
 FORMATS = ("single", "multipart")
 SELECTIONS = ("single", "jury")
 _SENTENCE_END = (".", "!", "?", "…")
@@ -540,6 +552,7 @@ def _signals_text(
     vision: dict[str, Any] | None,
     rubric: dict[str, Any],
     settings: dict[str, Any],
+    action: list[dict[str, Any]] | None = None,
 ) -> str:
     excluded = set(rubric["exclusions"]["sponsorblock_categories"])
     chapters = "\n".join(
@@ -563,6 +576,15 @@ def _signals_text(
         for f in frames
         if f.get("description")
     ) or "(pas de description d'images)"
+    action_text = "" if action is None else (
+        "\nPassages d'action detectes (bornes, score, types d'action ; des moments a proposer aussi) :\n"
+        + ("\n".join(
+            f"- [{_span(p['start'], p['end'])}] score {p['score']:.2f} : "
+            + (", ".join(dict.fromkeys(f["action_type"] for f in p["frames"])) or "(aucune image)")
+            for p in action
+        ) or "(aucun)")
+        + "\n"
+    )
     return (
         "## Signaux mesures (des indices, pas des verites)\n"
         f"Chapitres :\n{chapters}\n\n"
@@ -570,6 +592,7 @@ def _signals_text(
         f"Pics d'energie audio (rires, cris, reactions ; timecode et hauteur au-dessus du fond) :\n{peaks_text}\n\n"
         f"Segments SponsorBlock :\n{sponsor}\n\n"
         f"Descriptions d'images cles :\n{vision_text}\n"
+        + action_text
     )
 
 
@@ -647,7 +670,10 @@ def _moments_prompt(
 
 def _text(c: dict[str, Any], sents: list[Sentence]) -> str:
     """Texte d'un candidat tel que le clip le dira : sa premiere phrase
-    commence a ``hook_text`` (connecteurs de tete retires)."""
+    commence a ``hook_text`` (connecteurs de tete retires). Un candidat
+    d'action porte sa matiere toute faite (SPEC-b0f3 R12)."""
+    if "_material" in c:
+        return c["_material"]
     return " ".join([c["hook_text"], *(s.text for s in sents[c["_first"] + 1 : c["_last"] + 1])])
 
 
@@ -677,6 +703,33 @@ def _comparison_prompt(context: str, rubric: dict[str, Any], candidates: list[di
 
 def _nearest(indices: range, target: float, key) -> int:
     return min(indices, key=lambda k: (abs(key(k) - target), k))
+
+
+def _bounds_rejection(
+    start: float, end: float, fmt: str, rubric: dict[str, Any], excluded: list[dict[str, Any]], cut: str = ""
+) -> str | None:
+    """Raison du rejet d'un candidat aux bornes finales : segment SponsorBlock
+    exclu chevauche ou duree hors bornes de la grille (regles 2 et 3), None sinon."""
+    for seg in excluded:
+        if start < seg["end_time"] and seg["start_time"] < end:
+            return (
+                f"chevauche un segment SponsorBlock {seg.get('category')} "
+                f"[{_span(seg['start_time'], seg['end_time'])}]"
+            )
+
+    d = rubric["durations"]
+    tol = d["tolerance"]
+    duration = end - start
+    if fmt == "single":
+        low, high = d["single_min"] - tol, d["single_max"] + tol
+        bounds = f"{_num(d['single_min'])}-{_num(d['single_max'])} s"
+    else:
+        shortest, longest = d["min_parts"] * d["part_min"], d["max_parts"] * d["part_max"]
+        low, high = shortest - tol, longest + tol
+        bounds = f"{_num(shortest)}-{_num(longest)} s"
+    if not low <= duration <= high:
+        return f"duree {duration:.1f} s hors bornes {fmt} ({bounds}){cut}"
+    return None
 
 
 def _normalize(
@@ -709,26 +762,9 @@ def _normalize(
         start, hook_text = words[k][0], "".join(w for _, w in words[k:]).strip()
         cut = f" apres retrait du connecteur {cut}"
 
-    for seg in excluded:
-        if start < seg["end_time"] and seg["start_time"] < end:
-            return reject(
-                f"chevauche un segment SponsorBlock {seg.get('category')} "
-                f"[{_span(seg['start_time'], seg['end_time'])}]",
-                start, end,
-            )
-
-    d = rubric["durations"]
-    tol = d["tolerance"]
-    duration = end - start
-    if raw["format"] == "single":
-        low, high = d["single_min"] - tol, d["single_max"] + tol
-        bounds = f"{_num(d['single_min'])}-{_num(d['single_max'])} s"
-    else:
-        shortest, longest = d["min_parts"] * d["part_min"], d["max_parts"] * d["part_max"]
-        low, high = shortest - tol, longest + tol
-        bounds = f"{_num(shortest)}-{_num(longest)} s"
-    if not low <= duration <= high:
-        return reject(f"duree {duration:.1f} s hors bornes {raw['format']} ({bounds}){cut}", start, end)
+    reason = _bounds_rejection(start, end, raw["format"], rubric, excluded, cut)
+    if reason is not None:
+        return reject(reason, start, end)
 
     parts: list[dict[str, float]] = []
     if raw["format"] == "multipart" and raw["part_breaks"] and last > first:
@@ -751,6 +787,115 @@ def _normalize(
         "justification": raw["justification"],
         "hook_text": hook_text,
     }, None
+
+
+def _action_material(
+    speech: str | None, signals: dict[str, Any], frames: list[dict[str, Any]]
+) -> str:
+    """Matiere d'un candidat d'action donnee aux noteurs (SPEC-b0f3 R12) :
+    parole, signaux mesures, images decrites."""
+    parole = f'Parole : "{speech}"' if speech else "Parole : (aucune)"
+    mesures = (
+        f"Signaux : {signals['audio_peaks']} pics audio (max +{signals['audio_peak_max_db']:.1f} dB), "
+        f"{signals['scene_cuts']} changements de plan (x {signals['scene_cuts_ratio']:.1f} la médiane de la vidéo), "
+        f"parole {signals['speech_ratio'] * 100:.0f} %"
+    )
+    images = " ; ".join(
+        f"{f['timecode']:.1f} s : {f['description']} ({f['action_type']}, intensité {f['intensity']}/10)"
+        for f in frames
+    ) or "(aucune)"
+    return f"{parole}\n{mesures}\nImages : {images}"
+
+
+def _action_candidate(
+    p: dict[str, Any], sents: list[Sentence], rubric: dict[str, Any], excluded: list[dict[str, Any]],
+    connectors: Connectors, snap: float,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """(candidat d'action, None) ou (None, rejet motive) pour un passage
+    d'action.json (SPEC-b0f3 R11) : bornes recalees sur la frontiere de phrase
+    la plus proche si elle est a moins de ``snap`` s, sinon gardees ; connecteurs
+    de tete retires ; SponsorBlock et duree comme pour un candidat de la
+    transcription. Aucun appel LLM."""
+    block = {
+        "id": p["id"], "score": p["score"], "signals": p["signals"],
+        "frames": [f["timecode"] for f in p["frames"]],
+    }
+    start, end = float(p["start"]), float(p["end"])
+
+    def reject(reason: str) -> tuple[None, dict[str, Any]]:
+        return None, {
+            "start": _round2(start), "end": _round2(end), "reason": reason, "source": "action", "action": block,
+        }
+
+    first = _nearest(range(len(sents)), start, lambda k: sents[k].start)
+    last = _nearest(range(len(sents)), end, lambda k: sents[k].end)
+    snapped_start = abs(sents[first].start - start) <= snap
+    if snapped_start:
+        start = sents[first].start
+    if abs(sents[last].end - end) <= snap:
+        end = sents[last].end
+    if end <= start:
+        return reject("bornes invalides (end <= start)")
+
+    included = [k for k in range(len(sents)) if sents[k].start >= start - 1e-6 and sents[k].end <= end + 1e-6]
+    hook_text, cut, speech = "", "", None
+    if included:
+        head = sents[included[0]]
+        hook_text = head.text
+        if snapped_start and included[0] == first:
+            found, k = _leading_connectors([w for _, w in head.words] or head.text.split(), connectors)
+            if found:
+                cut = " + ".join(f"« {c} »" for c in found)
+                if not head.words:
+                    return reject(f"commence sur le connecteur {cut}, sans horodatage des mots pour le retirer")
+                if k >= len(head.words):
+                    return reject(f"premiere phrase reduite au connecteur {cut}")
+                start, hook_text = head.words[k][0], "".join(w for _, w in head.words[k:]).strip()
+                cut = f" apres retrait du connecteur {cut}"
+        speech = " ".join([hook_text, *(sents[k].text for k in included[1:])])
+    elif p["frames"]:
+        hook_text = max(p["frames"], key=lambda f: (f["intensity"], -f["timecode"]))["description"]
+    else:
+        return reject("passage sans parole ni image decrite : pas d'accroche possible")
+
+    reason = _bounds_rejection(start, end, "single", rubric, excluded, cut)
+    if reason is not None:
+        return reject(reason)
+    return {
+        "_start": start,
+        "_end": end,
+        "_source": "action",
+        "_action": block,
+        "_material": _action_material(speech, p["signals"], p["frames"]),
+        "format": "single",
+        "parts": [],
+        "hook_text": hook_text,
+        "justification": f"Passage d'action {p['id']} (score de detection {p['score']})",
+    }, None
+
+
+def _action_passages(video_dir: Path, settings: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """Passages d'action.json si [moments] candidates = "transcript+action",
+    None si "transcript" ; valeur inconnue, fichier absent ou etape desactivee :
+    MomentsError (SPEC-b0f3 R10, jamais de repli sur la seule transcription)."""
+    value = settings["candidates"]
+    if value not in CANDIDATES:
+        raise MomentsError(f"[moments] candidates invalide : {value!r} (attendu : {' | '.join(CANDIDATES)})")
+    snap = settings["action_snap_seconds"]
+    if not _number(snap) or snap < 0:
+        raise MomentsError(f"[moments] action_snap_seconds invalide : {snap!r} (attendu : nombre >= 0)")
+    if value == "transcript":
+        return None
+    path = video_dir / "action.json"
+    if not path.exists():
+        raise MomentsError(f'[moments] candidates = "transcript+action" : {path} absent (lancer l\'etape action)')
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not data.get("enabled"):
+        raise MomentsError(
+            f'[moments] candidates = "transcript+action" : {path} produit avec [action] enabled = false '
+            "(activer [action] enabled et relancer l'etape action avec --force)"
+        )
+    return data["passages"]
 
 
 def _visual_bonus(start: float, end: float, vision: dict[str, Any] | None, rubric: dict[str, Any]) -> float:
@@ -921,6 +1066,14 @@ def _rubric_info(rubric_path: Path, rubric: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _origin(c: dict[str, Any]) -> dict[str, Any]:
+    """``source`` d'un candidat (SPEC-b0f3 R14), avec son bloc ``action`` s'il
+    vient d'un passage d'action ; vide hors [moments] candidates = "transcript+action"."""
+    if "_source" not in c:
+        return {}
+    return {"source": c["_source"], **({"action": c["_action"]} if c["_source"] == "action" else {})}
+
+
 def _public(c: dict[str, Any]) -> dict[str, Any]:
     return {
         "start": _round2(c["_start"]),
@@ -935,6 +1088,7 @@ def _public(c: dict[str, Any]) -> dict[str, Any]:
         "hook_text": c["hook_text"],
         **({"jury": c["jury"]} if "jury" in c else {}),
         **({"exploration": True} if c.get("exploration") else {}),
+        **_origin(c),
     }
 
 
@@ -995,7 +1149,8 @@ def _judge(
     vetoed: list[dict[str, Any]] = []
     for c, verdict in zip(candidates, result["candidates"], strict=True):
         c["jury"] = {
-            "proposer": {"scores": c["scores"], "justification": c["justification"]},
+            # Un candidat d'action n'a pas de note du proposeur (SPEC-b0f3 R13).
+            "proposer": {"scores": c["scores"], "justification": c["justification"]} if "scores" in c else None,
             **{k: verdict[k] for k in ("score", "confidence", "veto", "debated", "trace")},
         }
         c["scores"] = verdict["scores"]
@@ -1012,8 +1167,30 @@ def _judge(
             "justification": c["justification"],
             "scores": c["scores"],
             "jury": c["jury"],
+            **_origin(c),
         })
     return {k: v for k, v in result.items() if k != "candidates"}, kept, vetoed
+
+
+def _compare(
+    candidates: list[dict[str, Any]], sents: list[Sentence], rubric: dict[str, Any], context: str, config: Any
+) -> None:
+    """Tour de comparaison : un appel ``moments`` qui note ensemble les
+    candidats (notes et justification remplacees)."""
+    answer = llm.ask(
+        "moments",
+        _comparison_prompt(context, rubric, candidates, sents),
+        [],
+        comparison_schema(rubric, len(candidates)),
+        config=config,
+    )
+    ids = [m["id"] for m in answer["moments"]]
+    missing = sorted(set(range(len(candidates))) - set(ids))
+    if missing or len(ids) != len(set(ids)):
+        raise llm.SchemaError(f"tour de comparaison : ids manquants {missing} ou en double dans {ids}")
+    for m in answer["moments"]:
+        candidates[m["id"]]["scores"] = m["scores"]
+        candidates[m["id"]]["justification"] = m["justification"]
 
 
 # --------------------------------------------------------------------------
@@ -1136,6 +1313,7 @@ def run(
     audio = _read_json(video_dir / "audio.json")
     vision = _read_json(video_dir / "vision.json", optional=True)
     settings = _settings(config)
+    action_passages = _action_passages(video_dir, settings)
     selection = _selection(config, settings)
     exploration = _exploration(settings) if selection == "jury" else None
     connectors = _connectors(settings)
@@ -1156,7 +1334,7 @@ def run(
     excluded_categories = set(rubric["exclusions"]["sponsorblock_categories"])
     excluded = [s for s in meta.get("sponsorblock_segments") or [] if s.get("category") in excluded_categories]
 
-    context = _signals_text(meta, audio, vision, rubric, settings) + "\n" + _examples_text(examples) + "\n" + _video_text(meta)
+    context = _signals_text(meta, audio, vision, rubric, settings, action_passages) + "\n" + _examples_text(examples) + "\n" + _video_text(meta)
     schema = response_schema(rubric)
     lines = [_line(s) for s in sents]
     chunked = sum(len(line) + 1 for line in lines) > int(settings["max_transcript_chars"])
@@ -1180,29 +1358,40 @@ def run(
             seen.add((candidate["_first"], candidate["_last"]))
             candidates.append(candidate)
     candidates.sort(key=lambda c: c["_start"])
-    scored_count = len(candidates)
+    action_candidates: list[dict[str, Any]] = []
+    if action_passages is not None:
+        for c in candidates:
+            c["_source"] = "transcript"
+        for r in rejected:
+            r["source"] = "transcript"
+        taken = {(_round2(c["_start"]), _round2(c["_end"])) for c in candidates}
+        snap = float(settings["action_snap_seconds"])
+        for p in action_passages:
+            candidate, rejection = _action_candidate(p, sents, rubric, excluded, connectors, snap)
+            if rejection is not None:
+                rejected.append(rejection)
+                continue
+            key = (_round2(candidate["_start"]), _round2(candidate["_end"]))
+            if key not in taken:
+                taken.add(key)
+                action_candidates.append(candidate)
+    scored_count = len(candidates) + len(action_candidates)
 
     jury_info = None
     vetoed: list[dict[str, Any]] = []
     if selection == "jury":
-        # Le jury note tous les candidats ensemble : pas de tour de comparaison.
+        # Le jury note tous les candidats ensemble (ceux d'action compris) :
+        # pas de tour de comparaison.
+        candidates = sorted(candidates + action_candidates, key=lambda c: c["_start"])
         jury_info, candidates, vetoed = _judge(candidates, sents, rubric, context, config)
         rejected += vetoed
-    elif chunked and candidates:
-        answer = llm.ask(
-            "moments",
-            _comparison_prompt(context, rubric, candidates, sents),
-            [],
-            comparison_schema(rubric, len(candidates)),
-            config=config,
-        )
-        ids = [m["id"] for m in answer["moments"]]
-        missing = sorted(set(range(len(candidates))) - set(ids))
-        if missing or len(ids) != len(set(ids)):
-            raise llm.SchemaError(f"tour de comparaison : ids manquants {missing} ou en double dans {ids}")
-        for m in answer["moments"]:
-            candidates[m["id"]]["scores"] = m["scores"]
-            candidates[m["id"]]["justification"] = m["justification"]
+    else:
+        if chunked and candidates:
+            _compare(candidates, sents, rubric, context, config)
+        if action_candidates:
+            # Pas de note du proposeur pour un candidat d'action : un appel de plus (SPEC-b0f3 R13).
+            _compare(action_candidates, sents, rubric, context, config)
+            candidates = sorted(candidates + action_candidates, key=lambda c: c["_start"])
 
     for c in candidates:
         c["bonus"] = _bonus(c["_start"], c["_end"], meta, audio, vision, rubric)
@@ -1253,6 +1442,17 @@ def _restore(
     arrondies au dixieme et creeraient de faux chevauchements). Le debut est
     celui de sa premiere phrase ou, connecteurs de tete retires, du mot qui
     les suit."""
+    if entry.get("source") == "action":
+        # Bornes de passage d'action : telles qu'enregistrees, pas de frontiere de phrase exigee.
+        return {
+            "_start": entry["start"],
+            "_end": entry["end"],
+            "_before": {"final_score": entry["final_score"], "retained": retained},
+            "_source": "action",
+            "_action": entry["action"],
+            **{k: entry[k] for k in ("format", "parts", "scores", "bonus", "final_score", "justification", "hook_text")},
+            **({"jury": entry["jury"]} if "jury" in entry else {}),
+        }
     first = max((k for k in range(len(sents)) if sents[k].start <= entry["start"] + 1e-6), default=0)
     last = _nearest(range(first, len(sents)), entry["end"], lambda k: sents[k].end)
     start = sents[first].start
@@ -1270,6 +1470,7 @@ def _restore(
         "_before": {"final_score": entry["final_score"], "retained": retained},
         **{k: entry[k] for k in ("format", "parts", "scores", "bonus", "final_score", "justification", "hook_text")},
         **({"jury": entry["jury"]} if "jury" in entry else {}),
+        **({"_source": entry["source"]} if "source" in entry else {}),
     }
 
 

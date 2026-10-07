@@ -41,6 +41,15 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
   reste identique octet pour octet ; à `true`, il élargit les fenêtres décodées aux pics hors parole et porte
   `"peak_windows": true`. Un `pipeline.json` antérieur sans l'étape `action` est relu (étape en attente).
   Activer `[action]` sur une vidéo déjà analysée demande `--force` sur `scenes` (erreur explicite sinon).
+- Jury action (4/6) : `[moments] candidates = "transcript+action"` (défaut `"transcript"`, sorties et prompts
+  inchangés) ajoute un candidat par passage de `action.json`, borné sur la frontière de phrase à moins de
+  `action_snap_seconds` (3 s) sinon au centième, connecteurs de tête retirés, SponsorBlock, durée et
+  dédoublonnage comme les autres. Même proposeur (qui voit la liste des passages), même jury (aucun appel de
+  plus) ou, en sélection `single`, un appel `moments` de plus qui note les seuls candidats d'action ; la matière
+  donnée aux noteurs est la parole (ou « (aucune) »), les signaux et les images décrites. Bonus, `[gate]`,
+  `min_score`, non-chevauchement et plafond sont communs. `moments.json` porte `source` et, pour l'action, le
+  bloc `action` ; la re-notation après vision les conserve. `action.json` absent ou `[action] enabled = false`
+  avec `transcript+action` : erreur explicite, jamais de repli sur la transcription.
 - Apprentissage (3/4) : le coach des prompts du jury passe tout seul dans le worker quand
   `[learning] coach_min_new_cases` (10) clips mûrs nouveaux existent et que `coach_min_interval_days`
   (7) jours se sont écoulés ; ses propositions sont consignées dans `state/learning/coach.json` et
