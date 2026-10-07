@@ -408,21 +408,28 @@ def test_collect_integration_source_error_ranged_as_status_error(tmp_path, monke
         assert SECRET not in text and YKEY not in text
 
 
-# -- IGDB (TASK-9d01, SPEC-4efa R12) -----------------------------------------
+# -- IGDB (TASK-3274, SPEC-df51 R12) -----------------------------------------
 
-IGDB_URL = "https://api.igdb.com/v4/release_dates"
+IGDB_URL = "https://api.igdb.com/v4/games"
 WINDOW_START = 1789948800  # 2026-09-21T00:00Z = minuit UTC de J-15 (aujourd'hui Paris = 2026-10-06)
 WINDOW_END = 1792540800    # 2026-10-21T00:00Z = minuit UTC de J+14+1
 
 
-def _row(game_id, name, date, **over):
-    row = {"id": game_id * 10, "date": date, "human": "x", "platform": {"name": "PC"},
-           "release_region": {"region": "Worldwide"}, "status": {"name": "Released"},
-           "date_format": {"format": "YYYY-MM-DD"},
-           "game": {"id": game_id, "name": name, "slug": name.lower(), "url": f"https://igdb.test/{game_id}",
-                    "hypes": 12, "first_release_date": date}}
-    row.update(over)
-    return row
+def _dated(date, **over):
+    line = {"id": date, "date": date, "human": "x", "platform": {"name": "PC"},
+            "release_region": {"region": "Worldwide"}, "status": {"name": "Released"},
+            "date_format": {"format": "YYYY-MM-DD"}}
+    line.update(over)
+    return line
+
+
+def _game(game_id, name, *dates, **over):
+    game = {"id": game_id, "name": name, "slug": str(name).lower(), "url": f"https://igdb.test/{game_id}", "hypes": 12,
+            "first_release_date": (dates or (1791244800,))[0], "cover": {"id": 5, "image_id": f"co{game_id}"},
+            "external_games": [{"uid": "620", "external_game_source": 1}],
+            "release_dates": [_dated(d) for d in (dates or (1791244800,))]}
+    game.update(over)
+    return game
 
 
 class FakeClock:
@@ -445,96 +452,140 @@ def _igdb(tmp_path, http, clock=None, **over):
 
 
 def _igdb_routes(pages):
-    return {("POST", "/oauth2/token"): [_token()], ("POST", "/v4/release_dates"): [(200, p) for p in pages]}
+    return {("POST", "/oauth2/token"): [_token()], ("POST", "/v4/games"): [(200, p) for p in pages]}
 
 
 def test_igdb_request_shape_headers_and_body(tmp_path):
-    http = FakeHttp(_igdb_routes([[_row(1, "Hytale", 1791244800)]]))
+    http = FakeHttp(_igdb_routes([[_game(1, "Hytale")]]))
     _igdb(tmp_path, http)
-    (call,) = http.to("/v4/release_dates")
+    (call,) = http.to("/v4/games")
     assert call["method"] == "POST" and call["url"] == IGDB_URL
     assert call["headers"] == {"Client-ID": "cid", "Authorization": "Bearer tok1", "Accept": "application/json"}
     body = call["content"]
-    assert "game.name" in body and "game.hypes" in body
-    assert f"where date >= {WINDOW_START} & date < {WINDOW_END}" in body
-    assert "sort date asc" in body and "limit 500" in body and "offset 0" in body
+    fields = re.search(r"fields ([^;]*);", body).group(1).split(",")
+    for needed in ("name", "hypes", "first_release_date", "cover.image_id", "external_games.uid",
+                   "external_games.external_game_source", "release_dates.date", "release_dates.platform.name"):
+        assert needed in fields
+    assert "category" not in body
+    where = re.search(r"where ([^;]*);", body).group(1)
+    assert where == f"release_dates.date >= {WINDOW_START} & release_dates.date < {WINDOW_END} & hypes >= 1"
+    assert "sort hypes desc" in body and "limit 500" in body and "offset 0" in body
 
 
 def test_igdb_shares_the_twitch_token_cache(tmp_path):
-    http = FakeHttp({**_twitch_routes(), ("POST", "/v4/release_dates"): [(200, [])]})
+    http = FakeHttp({**_twitch_routes(), ("POST", "/v4/games"): [(200, [])]})
     _twitch(tmp_path, http)
     _igdb(tmp_path, http)
     assert len(http.to("/oauth2/token")) == 1  # même twitch_token.json
-    assert http.to("/v4/release_dates")[0]["headers"]["Authorization"] == "Bearer tok1"
+    assert http.to("/v4/games")[0]["headers"]["Authorization"] == "Bearer tok1"
 
 
 def test_igdb_renews_token_once_on_401(tmp_path):
     http = FakeHttp({("POST", "/oauth2/token"): [_token("tok1"), _token("tok2")],
-                     ("POST", "/v4/release_dates"): [(401, {"message": "bad"}), (200, [_row(1, "Hytale", 1791244800)])]})
+                     ("POST", "/v4/games"): [(401, {"message": "bad"}), (200, [_game(1, "Hytale")])]})
     result = _igdb(tmp_path, http)
-    assert [c["headers"]["Authorization"] for c in http.to("/v4/release_dates")] == ["Bearer tok1", "Bearer tok2"]
-    assert len(result["releases"]) == 1
+    assert [c["headers"]["Authorization"] for c in http.to("/v4/games")] == ["Bearer tok1", "Bearer tok2"]
+    assert len(result["games"]) == 1
 
 
-def test_igdb_maps_rows_and_counts_skipped(tmp_path):
-    no_date = _row(5, "Sans Date", 1)
-    del no_date["date"]
-    rows = [
-        _row(1, "Hytale", 1791244800),                                    # 2026-10-06 UTC
-        _row(2, "Sans Hype", 1791331200 + 86399, game={"id": 2, "name": "Sans Hype", "slug": "s", "url": "u"}),
-        _row(3, "x", 1791244800, game=None),                              # sans game
-        _row(4, "x", 1791244800, game={"id": 4}),                         # sans game.name
-        no_date,                                                          # sans date
+def test_igdb_maps_games_with_all_their_dated_lines(tmp_path):
+    game = _game(1, "Hytale", 1791244800, 1791331200 + 86399,
+                 external_games=[{"uid": "10", "external_game_source": 5}, {"uid": "620", "external_game_source": 1},
+                                 {"uid": "621", "external_game_source": 1}])
+    game["release_dates"][1]["platform"] = {"name": "Nintendo Switch 2"}
+    result = _igdb(tmp_path, FakeHttp(_igdb_routes([[game]])))
+    assert result["skipped_rows"] == 0
+    (got,) = result["games"]
+    assert {k: v for k, v in got.items() if k != "release_dates"} == {
+        "igdb_id": "1", "name": "Hytale", "slug": "hytale", "url": "https://igdb.test/1", "hypes": 12,
+        "first_release_date": 1791244800, "cover_image_id": "co1", "steam_appid": "620"}
+    assert got["release_dates"] == [
+        {"date": "2026-10-06", "ts": 1791244800, "human": "x", "platform": "PC", "region": "Worldwide",
+         "status": "Released", "date_format": "YYYY-MM-DD"},
+        {"date": "2026-10-07", "ts": 1791331200 + 86399, "human": "x", "platform": "Nintendo Switch 2",
+         "region": "Worldwide", "status": "Released", "date_format": "YYYY-MM-DD"}]  # jour UTC
+
+
+def test_igdb_missing_optional_fields_are_null(tmp_path):
+    bare = {"id": 2, "name": "Nu", "hypes": 3, "release_dates": [{"date": 1791244800}]}
+    result = _igdb(tmp_path, FakeHttp(_igdb_routes([[bare]])))
+    (got,) = result["games"]
+    assert got["first_release_date"] is None and got["cover_image_id"] is None and got["steam_appid"] is None
+    assert got["slug"] is None and got["url"] is None
+    assert got["release_dates"] == [{"date": "2026-10-06", "ts": 1791244800, "human": None, "platform": None,
+                                     "region": None, "status": None, "date_format": None}]
+
+
+def test_igdb_steam_appid_ignores_other_sources_and_category(tmp_path):
+    other_source = _game(3, "Autre", external_games=[{"uid": "9", "category": 1, "external_game_source": 5}])
+    category_only = _game(4, "Vieux", external_games=[{"uid": "8", "category": 1}])
+    result = _igdb(tmp_path, FakeHttp(_igdb_routes([[other_source, category_only]])))
+    assert [g["steam_appid"] for g in result["games"]] == [None, None]
+
+
+def test_igdb_counts_unusable_games_as_skipped(tmp_path):
+    nameless = _game(4, "x")
+    del nameless["name"]
+    games = [
+        _game(1, "Bon"),
+        _game(2, "Sans Hype", hypes=None),
+        _game(3, "Hype texte", hypes="12"),
+        nameless,
+        _game(5, "Sans Date", release_dates=[]),
+        _game(6, "Date vide", release_dates=[{"human": "TBD"}]),
     ]
-    result = _igdb(tmp_path, FakeHttp(_igdb_routes([rows])))
-    assert result["skipped_rows"] == 3
-    first, second = result["releases"]
-    assert first == {"igdb_id": "1", "name": "Hytale", "slug": "hytale", "url": "https://igdb.test/1", "hypes": 12,
-                     "first_release_date": 1791244800, "date": "2026-10-06", "human": "x", "platform": "PC",
-                     "region": "Worldwide", "status": "Released", "date_format": "YYYY-MM-DD"}
-    assert second["hypes"] is None and second["date"] == "2026-10-07"  # jour UTC, hypes absent = null (pas 0)
+    result = _igdb(tmp_path, FakeHttp(_igdb_routes([games])))
+    assert [g["name"] for g in result["games"]] == ["Bon"]
+    assert result["skipped_rows"] == 5
 
 
-def test_igdb_paginates_while_500_rows_and_caps_pages(tmp_path):
-    full = [_row(i, f"G{i}", 1791244800) for i in range(1, 501)]
-    http = FakeHttp(_igdb_routes([full, full, [_row(9999, "Dernier", 1791244800)]]))
+def test_igdb_game_without_id_raises(tmp_path):
+    game = _game(1, "Sans Id")
+    del game["id"]
+    with pytest.raises(veille_sources.SourceError, match="id"):
+        _igdb(tmp_path, FakeHttp(_igdb_routes([[game]])))
+
+
+def test_igdb_paginates_while_500_games_and_caps_pages(tmp_path):
+    full = [_game(i, f"G{i}") for i in range(1, 501)]
+    http = FakeHttp(_igdb_routes([full, full, [_game(9999, "Dernier")]]))
     result = _igdb(tmp_path, http)
-    calls = http.to("/v4/release_dates")
+    calls = http.to("/v4/games")
     assert [f"offset {o};" in c["content"] for c, o in zip(calls, (0, 500, 1000))] == [True] * 3 and len(calls) == 3
-    assert len(result["releases"]) == 1001
+    assert len(result["games"]) == 1001
     capped = FakeHttp(_igdb_routes([full]))
     _igdb(tmp_path, capped, igdb_pages_max=3)
-    assert len(capped.to("/v4/release_dates")) == 3  # toujours 500 lignes : arrêt au plafond
+    assert len(capped.to("/v4/games")) == 3  # toujours 500 jeux : arrêt au plafond
     one = FakeHttp(_igdb_routes([full]))
     _igdb(tmp_path, one, igdb_pages_max=1)
-    assert len(one.to("/v4/release_dates")) == 1
+    assert len(one.to("/v4/games")) == 1
 
 
 def test_igdb_requests_are_spaced_by_250_ms(tmp_path):
     clock = FakeClock()
-    full = [_row(i, f"G{i}", 1791244800) for i in range(1, 501)]
+    full = [_game(i, f"G{i}") for i in range(1, 501)]
     stamps = []
 
     def reply(call):
         stamps.append(clock())
         return 200, full if len(stamps) < 3 else []
 
-    http = FakeHttp({("POST", "/oauth2/token"): [_token()], ("POST", "/v4/release_dates"): reply})
+    http = FakeHttp({("POST", "/oauth2/token"): [_token()], ("POST", "/v4/games"): reply})
     _igdb(tmp_path, http, clock)
     assert len(stamps) == 3
     assert all((b - a) >= timedelta(milliseconds=250) for a, b in zip(stamps, stamps[1:]))
 
 
 def test_igdb_429_names_the_rate_limit_without_secrets(tmp_path):
-    http = FakeHttp({**_igdb_routes([]), ("POST", "/v4/release_dates"): [(429, {"message": f"Too many {SECRET}"})]})
+    http = FakeHttp({**_igdb_routes([]), ("POST", "/v4/games"): [(429, {"message": f"Too many {SECRET}"})]})
     with pytest.raises(veille_sources.SourceError, match="4 requêtes/s") as err:
         _igdb(tmp_path, http)
     assert "429" in str(err.value) and SECRET not in str(err.value) and "tok1" not in str(err.value)
-    assert len(http.to("/v4/release_dates")) == 1  # pas de réessai
+    assert len(http.to("/v4/games")) == 1  # pas de réessai
 
 
 def test_igdb_http_error_has_no_secret(tmp_path):
-    http = FakeHttp({**_igdb_routes([]), ("POST", "/v4/release_dates"): [(500, {"message": f"boom tok1 {SECRET}"})]})
+    http = FakeHttp({**_igdb_routes([]), ("POST", "/v4/games"): [(500, {"message": f"boom tok1 {SECRET}"})]})
     with pytest.raises(veille_sources.SourceError) as err:
         _igdb(tmp_path, http)
     assert "HTTP 500" in str(err.value) and "tok1" not in str(err.value) and SECRET not in str(err.value)
@@ -743,7 +794,7 @@ def test_check_twitch_access_lets_other_errors_through(error):
 
 
 @real_only
-def test_real_igdb_release_dates_in_window(tmp_path):
+def test_real_igdb_games_in_window(tmp_path):
     settings = _real_settings(tmp_path)
     if not settings["twitch_client_id"]:
         pytest.skip("TWITCH_CLIENT_ID / TWITCH_CLIENT_SECRET absents")
@@ -754,8 +805,9 @@ def test_real_igdb_release_dates_in_window(tmp_path):
         return veille_sources.default_http(*args, **kwargs)
 
     result = veille_sources.default_collectors(spy)["igdb"](settings)
-    assert result["releases"], "IGDB doit rendre au moins une sortie sur la fenêtre du jour"
-    start, end = (int(x) for x in re.search(r"date >= (\d+) & date < (\d+)", captured[-1]).groups())
-    for release in result["releases"]:
-        day = datetime.fromisoformat(release["date"]).replace(tzinfo=timezone.utc).timestamp()
-        assert start - 86400 < day < end  # date en secondes Unix, dans la fenêtre demandée
+    assert result["games"], "IGDB doit rendre au moins un jeu sur la fenêtre du jour"
+    start, end = (int(x) for x in re.search(
+        r"release_dates\.date >= (\d+) & release_dates\.date < (\d+)", captured[-1]).groups())
+    assert any(g["cover_image_id"] for g in result["games"])
+    for game in result["games"]:
+        assert any(start <= d["ts"] < end for d in game["release_dates"])  # une date (secondes Unix) dans la fenêtre

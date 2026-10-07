@@ -360,7 +360,7 @@ def test_put_settings_writes_the_igdb_settings(tmp_path, isolated_cwd):
 @pytest.mark.parametrize("key,value,message", [
     ("upcoming_days", 0, "[veille] upcoming_days doit être un entier >= 1 (reçu 0)"),
     ("release_window_days", -1, "[veille] release_window_days doit être un entier >= 0 (reçu -1)"),
-    ("igdb_min_hypes", -5, "[veille] igdb_min_hypes doit être un entier >= 0 (reçu -5)"),
+    ("igdb_min_hypes", -5, "[veille] igdb_min_hypes doit être un entier >= 1 (reçu -5)"),
 ])
 def test_put_settings_refuses_an_out_of_range_igdb_setting_with_the_veille_message(
         tmp_path, isolated_cwd, key, value, message):
