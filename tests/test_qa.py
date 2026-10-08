@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import atexit
+import hashlib
 import json
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -31,7 +34,27 @@ pytestmark = needs_ffmpeg
 # --------------------------------------------------------------------------
 
 
+_MP4_CACHE: dict[tuple, Path] = {}
+_MP4_CACHE_DIR = Path(tempfile.mkdtemp(prefix="clipper-test-mp4-"))
+atexit.register(shutil.rmtree, _MP4_CACHE_DIR, ignore_errors=True)
+
+
 def make_mp4(path, *, colors=("red",), seg=1.5, size="1080x1920", silence=0.0, audio=True):
+    """Video synthetique, rendue une fois par processus pour des arguments
+    donnes (TASK-8f7c) : chaque appel recoit une COPIE, le fichier du cache
+    n'est jamais donne ni modifie."""
+    key = (tuple(colors), seg, size, silence, audio)
+    source = _MP4_CACHE.get(key)
+    if source is None:
+        name = hashlib.sha1(repr(key).encode()).hexdigest()[:16]
+        source = _MP4_CACHE_DIR / f"{name}.mp4"
+        _render_mp4(source, colors=colors, seg=seg, size=size, silence=silence, audio=audio)
+        _MP4_CACHE[key] = source
+    shutil.copyfile(source, path)
+    return path
+
+
+def _render_mp4(path, *, colors, seg, size, silence, audio):
     """Video synthetique : un plan de ``seg`` s par couleur (donc un
     changement de plan a chaque couleur), audio sinus precede de ``silence``
     secondes muettes."""
