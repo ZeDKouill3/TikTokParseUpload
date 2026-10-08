@@ -21,6 +21,8 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ### Corrigé
 
+- VOD à trous : yt-dlp ne saute plus un fragment indisponible (`skip_unavailable_fragments` faux, réglage `[download] fragment_retries`, défaut 20) ; un fragment perdu fait échouer le téléchargement (`DownloadError`) au lieu de produire une vidéo avec un trou de pts. L'audio extrait (`transcribe.extract_audio`, `audio`) suit la ligne de temps du conteneur (`aresample=async=1:first_pts=0`, silence dans un trou) : le temps du transcript et de `audio.json` égale le temps pts de `-ss`/scenes/render, plus de sous-titres d'un autre passage. Sans trou, sortie identique à l'échantillon près (±0,1 s de durée).
+
 - Veille (revue r-veille-stats 08/10) : une VOD Twitch déjà en file ou vue n'est plus reproposée au relevé suivant
   (l'id que le worker lui donne, `v2893407960`, est comparé en plus de l'id source). Une exception inattendue du choix
   de Claude est écrite dans l'état du jour (journal ERROR, `finished_at`, aucune proposition inventée) au lieu de

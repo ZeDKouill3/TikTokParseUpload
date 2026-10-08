@@ -179,3 +179,46 @@ def test_config_section_audio_resolves_via_clipper_config(isolated_cwd):
     section = config.section("audio")
     assert section["sample_rate"] == 22050
     assert section["window_seconds"] == 1.0
+
+
+# -- audio sur la ligne de temps du conteneur (TASK-4880) ---------------------
+
+import shutil
+import subprocess
+
+_needs_ffmpeg = pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg absent")
+
+
+def _gap_file(tmp_path, gap: bool):
+    """Sine 4 s en aac ; avec `gap`, pts decales de +2 s a T=2 (conteneur de 6 s)."""
+    out = tmp_path / "src.mka"
+    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=4"]
+    if gap:
+        cmd += ["-af", "asetpts='if(gte(PTS,2/TB),PTS+2/TB,PTS)'"]
+    subprocess.run(cmd + ["-c:a", "aac", "-f", "matroska", str(out)], check=True)
+    return out
+
+
+@_needs_ffmpeg
+def test_extract_samples_without_gap_keeps_the_duration(tmp_path):
+    from clipper.audio import _extract_samples_ffmpeg
+
+    samples = _extract_samples_ffmpeg(_gap_file(tmp_path, False), 16000)
+    assert abs(len(samples) / 16000 - 4.0) < 0.1
+
+
+@_needs_ffmpeg
+def test_extract_samples_fills_a_pts_gap_with_silence(tmp_path):
+    from clipper.audio import _extract_samples_ffmpeg
+
+    src = _gap_file(tmp_path, True)
+    container = float(subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(src)],
+        check=True, capture_output=True, text=True).stdout.strip())
+    assert container > 5.9
+
+    s = _extract_samples_ffmpeg(src, 16000)
+
+    assert abs(len(s) / 16000 - container) < 0.15
+    assert np.abs(s[int(2.3 * 16000):int(3.7 * 16000)]).max() < 0.01
+    assert np.abs(s[int(4.3 * 16000):int(5.3 * 16000)]).max() > 0.05
