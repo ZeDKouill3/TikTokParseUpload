@@ -582,6 +582,112 @@ def test_sync_json_shape(tmp_path):
     assert set(sync["calibration"]) == {"at", "clips", "untraced", "weights_path"}
 
 
+# ---------------------------------------------------------------- rétention à maturité (TASK-58d6dbbf1687)
+
+
+def _sidecar_fields(config, clip_id, **fields) -> None:
+    """Modifie le sidecar du clip ; une valeur None retire le champ."""
+    path = Path(config.output_dir) / VIDEO / f"{clip_id}.json"
+    side = _read(path)
+    for key, value in fields.items():
+        if value is None:
+            side.pop(key, None)
+        else:
+            side[key] = value
+    path.write_text(json.dumps(side), encoding="utf-8")
+
+
+def _stats_entry(config) -> dict:
+    return next(e for e in _journal(config) if e["kind"] == "stats")
+
+
+def _stats_row(config, clip_id, pct, *, percentile=0.5, source="action", duration=20.0):
+    outcomes._append({"kind": "stats", "video_id": VIDEO, "clip_id": clip_id, "moment_id": 1, "post_id": f"p{clip_id}",
+                      "duration": duration, "pct_watched": pct, "moment_source": source,
+                      "stats": {"views_percentile": percentile, "watched_full": 0.1}},
+                     config.section("outcomes")["journal_path"])
+
+
+def test_retention_min_n_declared():
+    assert learning.CONFIG_DEFAULTS["retention_min_n"] == 30
+
+
+def test_stats_entry_gives_duration_pct_watched_and_moment_source(tmp_path):
+    config = _config(tmp_path)
+    _linked_clip(config, "03")
+    _sidecar_fields(config, "03", duration=24.47)
+    _moments(config, VIDEO, [{"id": 3, "source": "action"}])
+    _scored_account(config, avg_watch_s=13.38, watched_full=0.4)
+
+    learning.sync(NOW, config=config)
+
+    stats = _stats_entry(config)
+    assert stats["duration"] == 24.47
+    assert stats["pct_watched"] == pytest.approx(0.547, abs=1e-3)
+    assert stats["moment_source"] == "action"
+    assert stats["stats"]["avg_watch_s"] == 13.38
+
+
+@pytest.mark.parametrize("avg_watch_s, duration", [(None, 24.47), (13.38, None), (13.38, 0)])
+def test_pct_watched_is_null_when_a_part_is_missing(tmp_path, avg_watch_s, duration):
+    config = _config(tmp_path)
+    _linked_clip(config, "03")
+    _sidecar_fields(config, "03", duration=duration)
+    _moments(config, VIDEO, [{"id": 3, "source": "transcript"}])
+    _scored_account(config, avg_watch_s=avg_watch_s)
+
+    learning.sync(NOW, config=config)
+
+    assert _stats_entry(config)["pct_watched"] is None
+
+
+def test_moment_source_is_null_when_the_moment_does_not_say(tmp_path):
+    config = _config(tmp_path)
+    _linked_clip(config, "03")
+    _sidecar_fields(config, "03", duration=24.47)
+    _moments(config, VIDEO, [{"id": 3}])
+    _scored_account(config, avg_watch_s=13.38)
+
+    learning.sync(NOW, config=config)
+
+    assert _stats_entry(config)["moment_source"] is None
+
+
+def test_retention_table_sorted_by_pct_watched_with_nulls_last(tmp_path):
+    config = _config(tmp_path)
+    for i in range(29):
+        _stats_row(config, f"{i:02d}", i / 100)
+    _stats_row(config, "99", None)
+
+    retention = learning.status(config)["retention"]
+
+    assert retention["n"] == 30 and retention["min_n"] == 30 and retention["message"] is None
+    pcts = [row["pct_watched"] for row in retention["rows"]]
+    assert pcts == [i / 100 for i in range(28, -1, -1)] + [None]
+    assert set(retention["rows"][0]) == {"video_id", "clip_id", "duration", "watched_full", "pct_watched",
+                                         "views_percentile", "moment_source"}
+
+
+def test_retention_below_threshold_says_too_few_and_still_lists_the_table(tmp_path):
+    config = _config(tmp_path)
+    for i, pct in enumerate([0.2, 0.9, 0.5, None, 0.7]):
+        _stats_row(config, f"{i:02d}", pct)
+
+    retention = learning.status(config)["retention"]
+
+    assert retention["n"] == 5
+    assert retention["message"] == "n = 5, trop peu pour conclure (minimum 30)"
+    assert [row["pct_watched"] for row in retention["rows"]] == [0.9, 0.7, 0.5, 0.2, None]
+
+
+@pytest.mark.parametrize("bad", [0, -3, 1.5, True, "30"])
+def test_retention_min_n_invalid_is_a_named_error(tmp_path, bad):
+    config = _config(tmp_path, retention_min_n=bad)
+
+    with pytest.raises(learning.LearningError, match="retention_min_n"):
+        learning.status(config)
+
+
 # ---------------------------------------------------------------- coach des prompts (TASK-c108, SPEC-00db R6)
 
 import re  # noqa: E402

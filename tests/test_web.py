@@ -9336,7 +9336,7 @@ def test_get_learning_returns_state_weights_and_every_proposal_with_both_perspec
     with llm.use_backend(fake):
         data = c.get("/api/learning").json()
 
-    assert set(data) == {"enabled", "links", "sync", "weights", "coach"} and data["enabled"] is True
+    assert set(data) == {"enabled", "links", "sync", "weights", "coach", "retention"} and data["enabled"] is True
     assert data["links"]["counts"]["compte_a"]["linked"] == 3 and data["sync"]["last_error"]["message"] == "boom"
     assert data["weights"]["judges"]["retention"]["weight"] == 1.2
     by_judge = {p["judge"]: p for p in data["coach"]}

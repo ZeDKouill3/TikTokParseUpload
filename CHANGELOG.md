@@ -10,6 +10,10 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ## [Non publié]
 
+### Ajouté
+
+- Apprentissage : rétention à maturité par clip. Chaque entrée `stats` du journal porte la durée du clip (sidecar), `pct_watched` (part moyenne vue, null si la durée ou le temps moyen manque) et la source du moment (`transcript` ou `action`, null si inconnue). L'écran Statistiques affiche un tableau trié par part vue, avec un message « n = X, trop peu pour conclure » sous le réglage nommé `[learning] retention_min_n` (défaut 30). Aucune corrélation calculée.
+
 ### Corrigé
 
 - Moments : un passage d'action dont la vraie parole commence trop tard est rejeté, avec le délai dans la raison (liste des rejetés de `moments.json`). La parole est mesurée sur les mots horodatés du transcript (plus sur les segments) ; un mot sans espace de plus de `[moments] action_word_max_chars` caractères (défaut 40, hallucination whisper sur la musique) est ignoré ; un premier mot retenu après `[moments] action_max_silent_start_s` secondes (défaut 5) du début du passage rejette le candidat. Un passage sans aucun mot retenu garde la règle « sans parole » (accroche = image). `action.json` inchangé.

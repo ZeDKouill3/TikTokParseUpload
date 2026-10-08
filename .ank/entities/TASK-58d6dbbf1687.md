@@ -5,7 +5,7 @@ slug: apprentissage-r-tention-par-clip-maturit-dur-e-r
 title: "Apprentissage : rétention par clip à maturité (durée, % regardé, source du moment) dans les stats et l'écran Statistiques"
 created: 2026-10-08T22:25:07Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/learning.py
   - clipper/web/static/screens/stats.js
@@ -18,6 +18,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/f308a2641f8b@7c52bdd
+    tree: scope/23385b2c6334
+    criteria: 3352cd5650b0
+    verifier: tests@c7b454d16c90
+    via: verifier
 schema: 4
-version: 2
+version: 4
 ---

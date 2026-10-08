@@ -37,7 +37,9 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "zero_view_alert_hours": 24,  # age (heures depuis la mise en ligne) a partir duquel un post a 0 vue est signale
     "zero_view_alert_max_views": 0,  # vues au plus au dernier releve pour qu'un post soit en alerte
     "zero_view_alert_account_min": 2,  # posts en alerte d'un meme compte pour une alerte au niveau du compte
+    "retention_min_n": 30,  # clips scored sous ce nombre : le tableau de retention est montre avec un avertissement, sans conclusion
 }
+MOMENT_SOURCES = ("transcript", "action")
 
 REASONS = ("none", "ambiguous")
 
@@ -54,6 +56,9 @@ def _settings(config: Config | None) -> dict[str, Any]:
     maturity = settings["maturity_days"]
     if isinstance(maturity, bool) or not isinstance(maturity, (int, float)) or maturity < 1:
         raise LearningError(f"[learning] maturity_days invalide : {maturity!r} (un nombre de jours >= 1 est attendu)")
+    retention_min = settings["retention_min_n"]
+    if isinstance(retention_min, bool) or not isinstance(retention_min, int) or retention_min < 1:
+        raise LearningError(f"[learning] retention_min_n invalide : {retention_min!r} (un entier >= 1 est attendu)")
     days = settings["window_days"]
     if isinstance(days, bool) or not isinstance(days, (int, float)) or days <= 0:
         raise LearningError(f"[learning] window_days invalide : {days!r} (un nombre de jours > 0 est attendu)")
@@ -356,6 +361,23 @@ def _journal_keys(journal_path: str) -> dict[str, set[str]]:
     return keys
 
 
+def _number(value: Any) -> float | None:
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def _pct_watched(avg_watch_s: Any, duration: Any) -> float | None:
+    """Part vue du clip (0 a 1, 3 decimales) ; null si l'un des deux manque ou si la duree n'est pas > 0 (ADR-ad2e)."""
+    watch, length = _number(avg_watch_s), _number(duration)
+    if watch is None or length is None or length <= 0:
+        return None
+    return round(watch / length, 3)
+
+
+def _moment_source(config: Config | None, video_id: str, moment_id: int, cache: dict[str, Any]) -> str | None:
+    source = (_moment(config, video_id, moment_id, cache) or {}).get("source")
+    return source if source in MOMENT_SOURCES else None
+
+
 def sync(now: datetime, *, config: Config | None = None) -> dict[str, Any]:
     """Verse les résultats dans le journal ``clipper.outcomes`` (SPEC-00db R2-R3, R9) : pour chaque clip relié
     (``tiktok_post.id`` présent dans les relevés du compte), une entrée ``result`` une seule fois et, dès que le
@@ -431,6 +453,9 @@ def sync(now: datetime, *, config: Config | None = None) -> dict[str, Any]:
                               **{k: row.get(k) for k in ("likes", "comments", "shares", "avg_watch_s", "watched_full",
                                                          "new_followers")}},
                     "recorded_at": stamp,
+                    "duration": _number(sidecar.get("duration")),
+                    "pct_watched": _pct_watched(row.get("avg_watch_s"), sidecar.get("duration")),
+                    "moment_source": _moment_source(config, video_id, moment_id, moments),
                 }
                 if (_moment(config, video_id, moment_id, moments) or {}).get("exploration") is True:
                     entry["exploration"] = True
@@ -700,6 +725,20 @@ def proposals(config: Config | None) -> list[dict[str, Any]]:
     return found
 
 
+def _retention(config: Config | None, settings: dict[str, Any]) -> dict[str, Any]:
+    """Tableau de retention a maturite (une ligne par clip scored, meilleure part vue d'abord) ; aucune correlation."""
+    journal_path = (config.section("outcomes") if config is not None else outcomes.CONFIG_DEFAULTS)["journal_path"]
+    rows = [{"video_id": e["video_id"], "clip_id": e["clip_id"], "duration": e.get("duration"),
+             "watched_full": (e.get("stats") or {}).get("watched_full"), "pct_watched": e.get("pct_watched"),
+             "views_percentile": (e.get("stats") or {}).get("views_percentile"),
+             "moment_source": e.get("moment_source")}
+            for e in outcomes.read(journal_path) if e.get("kind") == "stats"]
+    rows.sort(key=lambda r: (r["pct_watched"] is None, -(r["pct_watched"] or 0), r["video_id"], r["clip_id"]))
+    n, minimum = len(rows), settings["retention_min_n"]
+    message = f"n = {n}, trop peu pour conclure (minimum {minimum})" if n < minimum else None
+    return {"n": n, "min_n": minimum, "message": message, "rows": rows}
+
+
 def status(config: Config | None) -> dict[str, Any]:
     """Etat de la boucle pour l'ecran Statistiques (lecture seule : aucun calcul, aucun appel LLM)."""
     settings = _settings(config)
@@ -709,7 +748,7 @@ def status(config: Config | None) -> dict[str, Any]:
     except (OSError, ValueError) as exc:
         raise LearningError(f"poids du jury illisibles ({weights_path}) : {exc}") from exc
     return {"enabled": settings["enabled"], "links": _read_links(settings), "sync": _read_sync(settings),
-            "weights": weights, "coach": proposals(config)}
+            "weights": weights, "coach": proposals(config), "retention": _retention(config, settings)}
 
 
 # ---------------------------------------------------------------- bilan des VOD de veille (SPEC-00db R8)
