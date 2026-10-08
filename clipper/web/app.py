@@ -2703,6 +2703,46 @@ def create_app(config: Config | None = None) -> FastAPI:
             )
         return _list_clip_views(config, channel or None, video_id, status, archived=bool(archived))
 
+    @app.get("/api/clips/{video_id}/{clip_id}/sheet")
+    def clip_sheet(video_id: str, clip_id: str) -> dict[str, Any]:
+        """Fiche d'un clip (lecture seule, rien n'est recalculé) : le clip (sidecar + publication + jury), la vidéo
+        (lue si le .mp4 existe, sinon « vidéo supprimée, fiche conservée »), les relevés TikTok du post s'il y en a.
+        Une donnée absente est ``None`` (« inconnu »), jamais 0 (ADR-ad2e)."""
+        _validate_video_id(video_id)
+        _validate_clip_id(clip_id)
+        sidecar = _read_clip_sidecar(config, video_id, clip_id)
+        channel = _channel_of(video_id, config)
+        entry = _publish_entries(config, channel).get((video_id, clip_id))
+        deleted = _clip_video_deleted(config, video_id, clip_id)
+        clip = _clip_view(sidecar, channel, entry, _moments_jury_confidences(config, video_id), video_deleted=deleted)
+        clip["score"] = sidecar.get("score")
+        if deleted:
+            clip["video_url"] = clip["thumbnail_url"] = None
+        source_url, start = sidecar.get("source_url"), sidecar.get("start")
+        passage_url = None
+        if source_url and start is not None:
+            passage_url = f"{source_url}{'&' if '?' in source_url else '?'}t={int(start)}s"
+        moments_path = Path(config.workspace_dir) / video_id / "moments.json"
+        video = {
+            "title": sidecar.get("source_title"), "source_url": source_url, "passage_url": passage_url,
+            "deleted": deleted, "video_url": clip["video_url"],
+            "note": "vidéo supprimée, fiche conservée" if deleted else None,
+        }
+        moment = next((m for m in _read_json(moments_path)["moments"] if m.get("id") == sidecar.get("moment_id")),
+                      None) if moments_path.is_file() else None
+        rounds = _jury_rounds(moment["jury"]) if moment and (moment.get("jury") or {}).get("trace") else None
+        jury = {"confidence": clip["jury_confidence"], "judges": clip["jury_judge_confidences"], "rounds": rounds}
+        stats = None
+        post_id = entry.get("post_id") if entry else None
+        if post_id and entry.get("account") and entry.get("service") != "youtube":
+            try:
+                detail = tiktok_mod.video_detail(entry["account"], str(post_id), config=config)
+                stats = {"views": detail.get("views"), "likes": detail.get("likes"), "history": detail.get("history"),
+                         "error": None}
+            except tiktok_mod.TikTokError as exc:
+                stats = {"views": None, "likes": None, "history": [], "error": str(exc)}
+        return {"clip": clip, "video": video, "jury": jury, "stats": stats}
+
     def _decide(video_id: str, clip_id: str, action: str, **extra: Any) -> dict[str, Any]:
         _validate_video_id(video_id)
         _validate_clip_id(clip_id)

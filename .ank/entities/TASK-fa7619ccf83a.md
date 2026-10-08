@@ -5,7 +5,7 @@ slug: fiche-par-clip-une-page-qui-rassemble-tout-d-un
 title: "Fiche par clip : une page qui rassemble tout d'un clip (vidéo ou fiche seule si la vidéo a été supprimée, jury, passage source, format, QA, posts et leurs stats)"
 created: 2026-10-08T13:06:33Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/web/app.py
   - clipper/web/static/screens/clip.js
@@ -21,6 +21,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/1909941ac5fd@6577b81
+    tree: scope/56932a68d75d
+    criteria: fa0c894ff056
+    verifier: tests@c7b454d16c90
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---

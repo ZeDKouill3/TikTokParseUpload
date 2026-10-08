@@ -12,6 +12,8 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ### Ajouté
 
+- Fiche par clip : une page (`#/clip/<video_id>/<clip_id>`, lien « Fiche complète » dans le tiroir de l'écran Clips) qui rassemble le clip (titre, score et critères, raison, passage dans la VOD, QA), le jury, la publication (compte, statut, créneau, lien du post) et les relevés TikTok du post. `GET /api/clips/{video_id}/{clip_id}/sheet` est en lecture seule. Une vidéo supprimée (`.mp4` absent) garde la fiche avec la mention « vidéo supprimée, fiche conservée » ; une donnée absente s'affiche « inconnu », jamais 0.
+
 - Apprentissage : alerte « 0 vue à 24 h » sur le tableau de bord (section « Posts à 0 vue ») et une ligne WARNING
   par post (`state/learning/zero_views.json`, une seule fois). Lit les relevés TikTok déjà faits, sans réseau :
   un post en ligne depuis `zero_view_alert_hours` (24) dont le dernier relevé donne au plus
