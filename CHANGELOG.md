@@ -21,6 +21,12 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ### Corrigé
 
+- Veille (revue r-veille-stats 08/10) : une VOD Twitch déjà en file ou vue n'est plus reproposée au relevé suivant
+  (l'id que le worker lui donne, `v2893407960`, est comparé en plus de l'id source). Une exception inattendue du choix
+  de Claude est écrite dans l'état du jour (journal ERROR, `finished_at`, aucune proposition inventée) au lieu de
+  relancer le relevé à chaque tour du worker. Une limite de session (429) pendant le choix passe `llm.status` à
+  `retry` avec `retry_at` (`llm_retry_delay_min`, défaut 30 min) : seul le choix est refait, sans nouveau relevé, au
+  plus `llm_retry_max` fois (défaut 3), puis l'échec est explicite.
 - Vision : un lot sauvé dans `vision_partial.json` enregistre les chemins d'images qu'il couvre et n'est repris que
   si ce sont les mêmes que ceux du lot recalculé (sinon, moments refait, il décrivait d'autres images) ; avec
   `--force`, le fichier est ignoré et supprimé. Pipeline : quand l'étape moments est refaite en mode review,
