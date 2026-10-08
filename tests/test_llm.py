@@ -1157,3 +1157,42 @@ def test_action_usage_is_declared_on_the_fast_model():
 def test_model_for_resolves_the_model_ask_would_use():
     assert llm.model_for("veille", make_config()) == "opus"  # défaut [llm.usages.veille] strong -> opus
     assert llm.model_for("inconnu", make_config()) == "sonnet"  # palier par défaut fast -> sonnet
+
+
+# --- repair_attempts par appel (TASK-3268) ----------------------------------
+
+
+def test_ask_repair_attempts_argument_overrides_the_config_for_this_call():
+    fake = FakeBackend(["pas du json", "pas du json", {"couleur": "vert"}])
+    with llm.use_backend(fake):
+        value = llm.ask("qa", "p", [], COLOR_SCHEMA, config=make_config(repair_attempts=0), repair_attempts=2)
+
+    assert value == {"couleur": "vert"}
+    assert len(fake.calls) == 3
+
+
+def test_ask_repair_attempts_zero_refuses_at_once_whatever_the_config_says():
+    fake = FakeBackend(["pas du json", {"couleur": "vert"}])
+    with llm.use_backend(fake):
+        with pytest.raises(SchemaError, match="non JSON"):
+            llm.ask("qa", "p", [], COLOR_SCHEMA, config=make_config(repair_attempts=3), repair_attempts=0)
+
+    assert len(fake.calls) == 1
+
+
+def test_ask_without_repair_attempts_keeps_the_llm_section_value():
+    fake = FakeBackend(["pas du json", "pas du json", {"couleur": "vert"}])
+    with llm.use_backend(fake):
+        with pytest.raises(SchemaError, match="non JSON"):
+            llm.ask("qa", "p", [], COLOR_SCHEMA, config=make_config(repair_attempts=1))
+
+    assert len(fake.calls) == 2
+
+
+def test_ask_negative_repair_attempts_argument_is_refused_explicitly():
+    fake = FakeBackend([{"couleur": "rouge"}])
+    with llm.use_backend(fake):
+        with pytest.raises(LLMError, match="repair_attempts"):
+            llm.ask("qa", "p", [], COLOR_SCHEMA, config=make_config(), repair_attempts=-1)
+
+    assert fake.calls == []

@@ -94,6 +94,12 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "hook_words_target": 6,
     "screen_title_words_max": 6,
     "screen_title_words_target": 5,
+    # TASK-3268 : essais de reparation de l'appel qui produit titre d'ecran et
+    # legende, propres a captions (un titre trop long ne doit pas arreter la
+    # video apres une seule reparation). Les autres usages gardent
+    # [llm] repair_attempts. Aucun titre de secours : apres les essais, la
+    # SchemaError remonte.
+    "title_repair_attempts": 3,
     # SPEC-6a86 : sans configuration explicite, un screen_title avec un
     # emoji est refuse. Activer l'option ne rend pas l'emoji obligatoire,
     # elle permet seulement d'en accepter un (au plus un).
@@ -703,7 +709,8 @@ def _process_moment(
         text = _part_text(transcript, part["start"], part["end"])
         prompt = _prompt(language, video_title, source, part, parts_total, text, settings,
                           screen_title=screen_title, title=title, channel=channel)
-        answer = llm.ask("captions", prompt, [], schema, config=config, check=check, log_path=log_path)
+        answer = llm.ask("captions", prompt, [], schema, config=config, check=check, log_path=log_path,
+                         repair_attempts=int(settings["title_repair_attempts"]))
         if request_screen_title:
             screen_title = answer["screen_title"]
         if request_title:

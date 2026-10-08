@@ -10,6 +10,10 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ## [Non publié]
 
+### Corrigé
+
+- Captions : un titre d'écran trop long (ex. 7 mots pour 5 au plus) n'arrête plus la vidéo entière après une seule réparation. L'appel qui produit titre d'écran et légende dispose de ses propres essais de réparation, réglage `[captions] title_repair_attempts` (défaut 3) ; les autres usages LLM gardent `[llm] repair_attempts`. Aucun titre de secours : après les essais, l'erreur remonte comme avant.
+
 ## [0.6.0] - 2026-10-08
 
 Version autour des formats stream et webcam (zoom, contrôle par clip, visage dans le

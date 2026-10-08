@@ -417,7 +417,7 @@ def test_screen_title_with_an_emoji_is_refused_by_default_then_fails(workspace, 
     with llm.use_backend(fake), pytest.raises(llm.SchemaError, match="aucun emoji"):
         run_captions(VIDEO_ID, workspace, config=make_config(tmp_path))
 
-    assert len(fake.calls) == 2
+    assert len(fake.calls) == 4  # 1 + title_repair_attempts par defaut (TASK-3268)
     assert "aucun emoji" in fake.calls[1].prompt
     assert not (workspace / VIDEO_ID / "captions.json").exists()
 
@@ -433,7 +433,7 @@ def test_screen_title_with_a_forbidden_word_is_refused_by_default_then_fails(wor
         run_captions(VIDEO_ID, workspace, config=make_config(tmp_path))
 
     assert "'fou'" in str(exc_info.value)
-    assert len(fake.calls) == 2
+    assert len(fake.calls) == 4  # 1 + title_repair_attempts par defaut (TASK-3268)
     assert "mot interdit" in fake.calls[1].prompt
     assert not (workspace / VIDEO_ID / "captions.json").exists()
 
@@ -1413,3 +1413,86 @@ def test_keywords_first_false_gives_the_exact_previous_prompt(workspace, tmp_pat
         "ton sobre, aucun mot d'emphase clickbait ; aucun emoji.\n4. hashtags"
     ) in off
     assert "Video source : Minecraft hardcore jour 3\nPourquoi" in off
+
+
+# --------------------------------------------------------------------------
+# Essais de reparation du titre d'ecran (TASK-3268) : un titre trop long
+# n'arrete plus la video apres une seule reparation
+# --------------------------------------------------------------------------
+
+SEVEN_WORDS = "un deux trois quatre cinq six sept"
+FIVE_WORDS = "un deux trois quatre cinq"
+
+
+def _single_moment(workspace):
+    write_moments(workspace, moment(0))
+    write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
+
+
+def test_title_repair_attempts_default_is_three():
+    from clipper.captions import CONFIG_DEFAULTS
+
+    assert CONFIG_DEFAULTS["title_repair_attempts"] == 3
+
+
+def test_screen_title_refused_twice_then_repaired_at_the_third_attempt(workspace, tmp_path):
+    _single_moment(workspace)
+
+    fake, _ = run(workspace, make_config(tmp_path),
+                  [answer(screen_title=SEVEN_WORDS), answer(screen_title=SEVEN_WORDS),
+                   answer(screen_title=FIVE_WORDS)])
+
+    assert len(fake.calls) == 3
+    assert read_captions(workspace)["clips"][0]["screen_title"] == FIVE_WORDS
+
+
+def test_screen_title_still_refused_fails_explicitly_after_one_plus_title_repair_attempts(workspace, tmp_path):
+    from clipper.captions import run as run_captions
+
+    _single_moment(workspace)
+    fake = FakeBackend([answer(screen_title=SEVEN_WORDS)])
+
+    with llm.use_backend(fake), pytest.raises(llm.SchemaError, match="7 mots"):
+        run_captions(VIDEO_ID, workspace, config=make_config(tmp_path, title_repair_attempts=2))
+
+    assert len(fake.calls) == 3
+    assert not (workspace / VIDEO_ID / "captions.json").exists()
+
+
+def test_title_repair_attempts_default_gives_four_answers_before_failing(workspace, tmp_path):
+    from clipper.captions import run as run_captions
+
+    _single_moment(workspace)
+    fake = FakeBackend([answer(screen_title=SEVEN_WORDS)])
+
+    with llm.use_backend(fake), pytest.raises(llm.SchemaError, match="7 mots"):
+        run_captions(VIDEO_ID, workspace, config=make_config(tmp_path))
+
+    assert len(fake.calls) == 4
+
+
+def test_title_repair_attempts_overrides_llm_repair_attempts_for_captions(workspace, tmp_path):
+    _single_moment(workspace)
+    config = Config(
+        mode="review", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output",
+        _sections={"llm": {"repair_attempts": 0}},
+    )
+
+    fake, _ = run(workspace, config,
+                  [answer(screen_title=SEVEN_WORDS), answer(screen_title=SEVEN_WORDS),
+                   answer(screen_title=FIVE_WORDS)])
+
+    assert len(fake.calls) == 3
+    assert read_captions(workspace)["clips"][0]["screen_title"] == FIVE_WORDS
+
+
+def test_negative_title_repair_attempts_is_refused_explicitly(workspace, tmp_path):
+    from clipper.captions import run as run_captions
+
+    _single_moment(workspace)
+    fake = FakeBackend([answer()])
+
+    with llm.use_backend(fake), pytest.raises(llm.LLMError, match="repair_attempts"):
+        run_captions(VIDEO_ID, workspace, config=make_config(tmp_path, title_repair_attempts=-1))
+
+    assert fake.calls == []

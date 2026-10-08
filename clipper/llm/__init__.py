@@ -281,12 +281,14 @@ def ask(
     usage_log_path: Path | None = None,
     cache_prefix: str | None = None,
     timeout: float | None = None,
+    repair_attempts: int | None = None,
 ) -> Any:
     """Ask the model configured for ``usage`` and return its JSON answer,
     validated against ``schema`` then by ``check`` (which raises SchemaError
     to refuse it). A refused answer is sent back to the same model with the
-    error, ``[llm] repair_attempts`` times at most. ``config`` defaults to
-    load_config(). When ``log_path`` is given, every refused answer appends a
+    error, ``repair_attempts`` times at most (TASK-3268): None means
+    ``[llm] repair_attempts``, a negative value is an LLMError. ``config``
+    defaults to load_config(). When ``log_path`` is given, every refused answer appends a
     JSON line to it (timestamp, usage, model, attempt number, raw refused
     text, exact error), and an answer accepted after repair adds a final
     ``accepted: true`` line; an answer accepted on the first try is never
@@ -311,9 +313,14 @@ def ask(
     effective_usage_log_path = usage_log_path if usage_log_path is not None else _usage_log_path
     settings = _settings(config)
     name, model, backend_settings = _resolve(usage, settings)
-    attempts = int(settings["repair_attempts"])
-    if attempts < 0:
-        raise LLMError(f"[llm] repair_attempts doit etre >= 0, recu {attempts}")
+    if repair_attempts is None:
+        attempts = int(settings["repair_attempts"])
+        if attempts < 0:
+            raise LLMError(f"[llm] repair_attempts doit etre >= 0, recu {attempts}")
+    else:
+        attempts = int(repair_attempts)
+        if attempts < 0:
+            raise LLMError(f"repair_attempts doit etre >= 0, recu {attempts}")
     if cache_prefix is not None and not prompt.startswith(cache_prefix):
         raise LLMError("cache_prefix n'est pas un prefixe de prompt")
     backend = _override if _override is not None else _BACKENDS[name][1](backend_settings)
