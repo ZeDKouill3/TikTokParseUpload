@@ -358,6 +358,7 @@ def test_config_section_download_resolves_via_clipper_config(isolated_cwd):
         "js_runtimes": "node",
         "network_retries": 15,
         "network_retry_pause_s": 5,
+        "concurrent_fragments": 8,
         "ffmpeg_bin": "ffmpeg",
     }
 
@@ -819,3 +820,59 @@ def test_download_normal_mp4_never_calls_ffmpeg(isolated_cwd, monkeypatch):
 
     dl.download("https://www.twitch.tv/videos/123", workspace_dir=isolated_cwd / "ws", ydl_factory=factory)
     assert calls == []
+
+
+# -- fragments simultanes (TASK-6318) ----------------------------------------
+
+
+def test_config_defaults_declares_concurrent_fragments_at_8():
+    from clipper.download import CONFIG_DEFAULTS
+
+    assert CONFIG_DEFAULTS["concurrent_fragments"] == 8
+
+
+def test_download_passes_default_8_concurrent_fragments_to_ydl_opts(isolated_cwd):
+    from clipper.download import download
+
+    info = _load_fixture("info_dict_full.json")
+    captured_opts: dict = {}
+    download(f"https://youtu.be/{info['id']}", workspace_dir=isolated_cwd / "workspace",
+             ydl_factory=_make_fake_ydl(info, captured_opts))
+
+    assert captured_opts["concurrent_fragment_downloads"] == 8
+
+
+def test_download_passes_configured_concurrent_fragments_to_ydl_opts(isolated_cwd):
+    from clipper.download import download
+
+    info = _load_fixture("info_dict_full.json")
+    captured_opts: dict = {}
+    download(f"https://youtu.be/{info['id']}", workspace_dir=isolated_cwd / "workspace",
+             concurrent_fragments=3, ydl_factory=_make_fake_ydl(info, captured_opts))
+
+    assert captured_opts["concurrent_fragment_downloads"] == 3
+
+
+@pytest.mark.parametrize("bad", [0, -2])
+def test_download_refuses_concurrent_fragments_below_1(isolated_cwd, bad):
+    from clipper.download import DownloadError, download
+
+    info = _load_fixture("info_dict_full.json")
+    captured_opts: dict = {}
+    with pytest.raises(DownloadError, match="concurrent_fragments"):
+        download(f"https://youtu.be/{info['id']}", workspace_dir=isolated_cwd / "workspace",
+                 concurrent_fragments=bad, ydl_factory=_make_fake_ydl(info, captured_opts))
+    assert captured_opts == {}
+
+
+def test_download_logs_the_number_of_concurrent_fragments(isolated_cwd, caplog):
+    import logging
+
+    from clipper.download import download
+
+    info = _load_fixture("info_dict_full.json")
+    with caplog.at_level(logging.INFO, logger="clipper.download"):
+        download(f"https://youtu.be/{info['id']}", workspace_dir=isolated_cwd / "workspace",
+                 concurrent_fragments=5, ydl_factory=_make_fake_ydl(info, {}))
+
+    assert "5 fragments simultanes" in caplog.text

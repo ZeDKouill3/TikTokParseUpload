@@ -121,6 +121,8 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "twitch_history_retry_max": 2,
     "twitch_history_retry_wait_max_s": 60.0,
     "veille_deadline_s": 480,
+    "llm_retry_delay_min": 30,  # limite de session (429) pendant le choix : on réessaie le choix seul après ce délai
+    "llm_retry_max": 3,  # nombre de reprises du choix avant l'échec explicite
 }
 
 # Clés retirées qu'un config.toml peut encore porter : ignorées à la lecture (clipper.config).
@@ -186,7 +188,8 @@ def settings(config: Config) -> dict[str, object]:
     for key, low, high in (("steam_followers_lookups_max", 0, 60), ("steam_followers_retry_max", 0, 10),
                            ("trend_days", 7, 90), ("steam_reviews_retry_max", 0, 10), ("twitch_history_pages_max", 1, 5),
                            ("twitch_history_retry_max", 0, 10), ("twitch_access_attempts", 1, 10),
-                           ("veille_deadline_s", 60, 3600)):
+                           ("veille_deadline_s", 60, 3600), ("llm_retry_delay_min", 1, 1440),
+                           ("llm_retry_max", 0, 20)):
         value = table[key]
         if not isinstance(value, int) or isinstance(value, bool) or not low <= value <= high:
             raise VeilleError(f"[veille] {key} doit être un entier entre {low} et {high} (reçu {value!r})")
@@ -255,6 +258,17 @@ def _queue_video_ids(config: Config) -> set[str]:
         return {e["video_id"] for e in entries}
     except (KeyError, TypeError) as exc:
         raise VeilleError(f"file d'attente illisible : {path.name} ({exc})") from exc
+
+
+def _worker_video_id(vod: dict[str, Any]) -> str:
+    """Id que le worker donne à cette VOD (``download.extract_video_id`` : Twitch 2893407960 -> v2893407960) ;
+    la file et ``seen.json`` le portent. Vide si l'URL n'est pas reconnue : seul l'id source compte alors."""
+    from clipper import download  # import local : veille ne dépend de download que pour cette règle d'id
+
+    try:
+        return download.extract_video_id(str(vod["url"]))
+    except download.DownloadError:
+        return ""
 
 
 def _load_history(sdir: Path, today: date, baseline_days: int) -> list[dict[str, Any]]:
@@ -1138,7 +1152,8 @@ def collect(
             excluded["too_short"] += 1
         elif now - _parse_published(vod["published_at"]) > max_age:
             excluded["too_old"] += 1
-        elif vod["video_id"] in known or (workspace / vod["video_id"]).exists():
+        elif (vod["video_id"] in known or _worker_video_id(vod) in known
+              or (workspace / vod["video_id"]).exists()):
             excluded["already_known"] += 1
         else:
             candidates.append(_to_candidate(source, vod))
@@ -1494,10 +1509,12 @@ def _prompt(day_state: dict[str, Any], table: dict[str, object]) -> str:
     return "\n".join(lines)
 
 
-def decide(day_state: dict[str, Any], config: Config) -> dict[str, Any]:
+def decide(day_state: dict[str, Any], config: Config, now: datetime | None = None) -> dict[str, Any]:
     """Un seul appel texte à ``llm.ask("veille", ...)`` (R6) ; rend une copie de l'état avec ``llm``,
     ``proposals`` et ``skipped_note``. Aucun candidat : ``skipped``, Claude n'est pas appelé. Réponse
-    refusée (ou erreur du backend) : ``llm.status = "error"`` avec le message, aucune proposition.
+    refusée (ou erreur du backend) : ``llm.status = "error"`` avec le message, aucune proposition. Limite de
+    session / réseau (``TransientLLMError``) : ``llm.status = "retry"`` avec ``retry_at`` (``now`` +
+    ``llm_retry_delay_min``) et ``attempts`` ; au-delà de ``llm_retry_max`` reprises, ``"error"`` explicite.
     Chaque proposition porte un instantané de son candidat (``candidate``) : l'écran l'affiche encore
     une fois la VOD mise en file, quand elle n'est plus candidate."""
     table = settings(config)
@@ -1511,6 +1528,19 @@ def decide(day_state: dict[str, Any], config: Config) -> dict[str, Any]:
         answer = llm.ask("veille", _prompt(state, table), [], _schema(int(table["max_vods_per_day"])),
                          config=config,
                          check=_check_picks(candidates, int(table["max_vods_per_game"])))  # type: ignore[call-overload]
+    except llm.TransientLLMError as exc:
+        attempts = int(state.get("llm", {}).get("attempts") or 0) + 1
+        if attempts > int(table["llm_retry_max"]):  # type: ignore[call-overload]
+            message = f"{exc} (abandon après {attempts} tentatives)"
+            log.error("veille : choix de Claude impossible : %s", message)
+            state.update(llm={"status": "error", "error": message, "model": model}, proposals=[], skipped_note="")
+            return state
+        retry_at = ((now or datetime.now(timezone.utc))
+                    + timedelta(minutes=int(table["llm_retry_delay_min"]))).isoformat()  # type: ignore[call-overload]
+        log.warning("veille : choix de Claude reporté à %s (tentative %d) : %s", retry_at, attempts, exc)
+        state.update(llm={"status": "retry", "error": str(exc), "model": model, "retry_at": retry_at,
+                          "attempts": attempts}, proposals=[], skipped_note="")
+        return state
     except llm.LLMError as exc:
         log.error("veille : choix de Claude refusé : %s", exc)
         state.update(llm={"status": "error", "error": str(exc), "model": model}, proposals=[], skipped_note="")
@@ -1567,9 +1597,13 @@ def run_if_due(
         return None
     table = settings(config)
     sdir = _state_dir(table)
+    day = now.astimezone(ZoneInfo(str(table["timezone"]))).date().isoformat()
+    if not (sdir / "refresh.json").exists():
+        retry = _read_day(sdir, day)
+        if retry is not None and retry.get("llm", {}).get("status") == "retry":
+            return _retry_decide(now, config, sdir, day, retry)
     if not _due(now, table, sdir):
         return None
-    day = now.astimezone(ZoneInfo(str(table["timezone"]))).date().isoformat()
     refresh = _read_json(sdir / "refresh.json", None)
     (sdir / "refresh.json").unlink(missing_ok=True)
     requested_at = refresh.get("requested_at") if isinstance(refresh, dict) else None
@@ -1582,8 +1616,31 @@ def run_if_due(
     read_clock = clock or _elapsed_clock(now)  # la même horloge pour l'échéance et pour l'heure de fin
     state = collect(now, collectors=collectors, config=config, finalize=False, clock=read_clock)
     state["refresh_requested_at"] = requested_at
-    state = decide(state, config)
+    state = _safe_decide(state, config, now)
     state["finished_at"] = read_clock().isoformat()  # vraie heure de fin, jamais celle du départ
+    with channel_mod.file_lock(_state_lock(sdir)):
+        _write(_day_path(sdir, day), state)
+    return state
+
+
+def _safe_decide(state: dict[str, Any], config: Config, now: datetime) -> dict[str, Any]:
+    """``decide`` dont une exception inattendue est écrite dans l'état du jour (journal ERROR, aucun choix inventé,
+    ADR-ad2e) : le jour est alors fini et le relevé n'est pas relancé à chaque tour du worker."""
+    try:
+        return decide(state, config, now)
+    except Exception as exc:  # noqa: BLE001 : tout échec du choix finit le jour avec son erreur
+        log.exception("veille : le choix de Claude a échoué")
+        model = config.section("llm")["usages"].get("veille", {}).get("model")
+        return {**state, "llm": {"status": "error", "error": f"{type(exc).__name__} : {exc}", "model": model},
+                "proposals": [], "skipped_note": ""}
+
+
+def _retry_decide(now: datetime, config: Config, sdir: Path, day: str, state: dict[str, Any]) -> dict[str, Any] | None:
+    """Reprend le seul choix d'un jour en attente de ``retry_at`` (limite de session) ; ``None`` avant l'échéance."""
+    retry_at = state["llm"].get("retry_at")
+    if not retry_at or now < datetime.fromisoformat(retry_at):
+        return None
+    state = _safe_decide(state, config, now)
     with channel_mod.file_lock(_state_lock(sdir)):
         _write(_day_path(sdir, day), state)
     return state

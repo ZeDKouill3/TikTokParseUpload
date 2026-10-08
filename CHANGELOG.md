@@ -12,6 +12,11 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ### Modifié
 
+- Téléchargement plus rapide : yt-dlp télécharge les fragments HLS en parallèle (réglage
+  `[download] concurrent_fragments`, entier >= 1, défaut 8, refus explicite sinon) au lieu d'un par un
+  (constat du 08/10 : VOD Twitch de 11-21 Go à 13-20 Mo/s, plus de 14 min). Le nombre de fragments simultanés
+  est journalisé au début du téléchargement. Format, merge mp4, remux fMP4 et reprises réseau inchangés.
+
 - Étape scenes plus rapide : les fenêtres de détection sont analysées par au plus `detect_parallel` processus ffmpeg (défaut 4) ; une fenêtre de plus de `detect_chunk_seconds` (défaut 600 s) est découpée en morceaux contigus détectés en parallèle puis recollés (la scène à cheval sur une jointure est fusionnée, aucune coupure inventée). `analysis_skip_loop_filter` (défaut vrai) ajoute `-skip_loop_filter all` à l'entrée de la détection seulement, jamais à l'extraction des images clés. Un ffmpeg en échec fait échouer l'étape (`ScenesError` nommant la fenêtre) et arrête les autres ; le journal donne fenêtres, parallélisme, durée de détection et d'extraction.
 
 ### Corrigé
@@ -19,6 +24,18 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 - Coach des prompts du jury : le résultat réel d'un clip publié vient de ses vues (`views_percentile` à maturité, entrées
   `stats` portant `video_id`/`moment_id`, comme la calibration) et non plus de qa + décision, qui valait 1,0 pour tout
   clip publié. Un clip publié sans statistique mûre est exclu des cas, jamais un 1,0 par défaut (revue r-veille-stats I4).
+- Veille (revue r-veille-stats 08/10) : une VOD Twitch déjà en file ou vue n'est plus reproposée au relevé suivant
+  (l'id que le worker lui donne, `v2893407960`, est comparé en plus de l'id source). Une exception inattendue du choix
+  de Claude est écrite dans l'état du jour (journal ERROR, `finished_at`, aucune proposition inventée) au lieu de
+  relancer le relevé à chaque tour du worker. Une limite de session (429) pendant le choix passe `llm.status` à
+  `retry` avec `retry_at` (`llm_retry_delay_min`, défaut 30 min) : seul le choix est refait, sans nouveau relevé, au
+  plus `llm_retry_max` fois (défaut 3), puis l'échec est explicite.
+- Écritures d'état robustes sous Windows : `pipeline` remplace ses fichiers via `channel.replace_retrying` (le mécanisme
+  de `channel.atomic_write_json`, 20 essais de 50 ms au lieu de 5, erreur d'origine relevée si le verrou persiste,
+  fichier temporaire supprimé) ; le `.tmp` porte pid et thread (plus de vol entre worker et API web). La mise de côté
+  de `review.json` (moments refait) utilise le même réessai et ne dépend plus d'un test d'existence préalable : un
+  lecteur concurrent ne la fait plus échouer ni sauter (échecs sous charge de `test_run_respecte_lordre_des_etapes` et
+  `test_forced_moments_sets_aside_the_stale_review_json`).
 - Vision : un lot sauvé dans `vision_partial.json` enregistre les chemins d'images qu'il couvre et n'est repris que
   si ce sont les mêmes que ceux du lot recalculé (sinon, moments refait, il décrivait d'autres images) ; avec
   `--force`, le fichier est ignoré et supprimé. Pipeline : quand l'étape moments est refaite en mode review,
