@@ -537,11 +537,11 @@ function learningRetentionBlock(data) {
   if (!r) return "";
   const note = r.message ? `<p class="reason" data-learning-retention-note>${esc(r.message)}</p>` : "";
   const body = r.rows.length
-    ? r.rows.map((row) => `<tr><td>${esc(row.video_id)} · ${esc(row.clip_id)}</td><td>${statsDuration(row.duration)}</td><td>${statsPctValue(row.pct_watched, 1)}</td><td>${statsPctValue(row.watched_full, 0)}</td><td>${statsPctValue(row.views_percentile, 0)}</td><td>${esc(LEARNING_MOMENT_SOURCES[row.moment_source] || "—")}</td><td>${esc(row.style || "—")}</td></tr>`).join("")
-    : `<tr><td colspan="7" class="muted">Aucun clip mûr relevé.</td></tr>`;
+    ? r.rows.map((row) => `<tr><td>${esc(row.video_id)} · ${esc(row.clip_id)}</td><td>${statsDuration(row.duration)}</td><td>${statsPctValue(row.pct_watched, 1)}</td><td>${statsPctValue(row.watched_full, 0)}</td><td>${statsPctValue(row.views_percentile, 0)}</td><td>${esc(LEARNING_MOMENT_SOURCES[row.moment_source] || "—")}</td></tr>`).join("")
+    : `<tr><td colspan="6" class="muted">Aucun clip mûr relevé.</td></tr>`;
   return `<div class="panel panel-pad" data-learning-retention><h3>Rétention à maturité</h3>
     <p>Clips mûrs : <strong>${fr(r.n)}</strong></p>${note}
-    <div style="overflow-x:auto"><table class="table"><thead><tr><th>Clip</th><th>Durée</th><th>% vu</th><th>% vu en entier</th><th>Rang des vues</th><th>Source du moment</th><th>Style</th></tr></thead><tbody>${body}</tbody></table></div></div>`;
+    <div style="overflow-x:auto"><table class="table"><thead><tr><th>Clip</th><th>Durée</th><th>% vu</th><th>% vu en entier</th><th>Rang des vues</th><th>Source du moment</th></tr></thead><tbody>${body}</tbody></table></div></div>`;
 }
 
 function statsLearningSection() {

@@ -603,7 +603,7 @@ def _stats_entry(config) -> dict:
 
 def _stats_row(config, clip_id, pct, *, percentile=0.5, source="action", duration=20.0):
     outcomes._append({"kind": "stats", "video_id": VIDEO, "clip_id": clip_id, "moment_id": 1, "post_id": f"p{clip_id}",
-                      "duration": duration, "pct_watched": pct, "moment_source": source, "style": None,
+                      "duration": duration, "pct_watched": pct, "moment_source": source,
                       "stats": {"views_percentile": percentile, "watched_full": 0.1}},
                      config.section("outcomes")["journal_path"])
 
@@ -665,7 +665,7 @@ def test_retention_table_sorted_by_pct_watched_with_nulls_last(tmp_path):
     pcts = [row["pct_watched"] for row in retention["rows"]]
     assert pcts == [i / 100 for i in range(28, -1, -1)] + [None]
     assert set(retention["rows"][0]) == {"video_id", "clip_id", "duration", "watched_full", "pct_watched",
-                                         "views_percentile", "moment_source", "style"}
+                                         "views_percentile", "moment_source"}
 
 
 def test_retention_below_threshold_says_too_few_and_still_lists_the_table(tmp_path):

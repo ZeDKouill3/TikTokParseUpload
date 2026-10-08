@@ -456,7 +456,6 @@ def sync(now: datetime, *, config: Config | None = None) -> dict[str, Any]:
                     "duration": _number(sidecar.get("duration")),
                     "pct_watched": _pct_watched(row.get("avg_watch_s"), sidecar.get("duration")),
                     "moment_source": _moment_source(config, video_id, moment_id, moments),
-                    "style": sidecar.get("style"),
                 }
                 if (_moment(config, video_id, moment_id, moments) or {}).get("exploration") is True:
                     entry["exploration"] = True
@@ -732,7 +731,7 @@ def _retention(config: Config | None, settings: dict[str, Any]) -> dict[str, Any
     rows = [{"video_id": e["video_id"], "clip_id": e["clip_id"], "duration": e.get("duration"),
              "watched_full": (e.get("stats") or {}).get("watched_full"), "pct_watched": e.get("pct_watched"),
              "views_percentile": (e.get("stats") or {}).get("views_percentile"),
-             "moment_source": e.get("moment_source"), "style": e.get("style")}
+             "moment_source": e.get("moment_source")}
             for e in outcomes.read(journal_path) if e.get("kind") == "stats"]
     rows.sort(key=lambda r: (r["pct_watched"] is None, -(r["pct_watched"] or 0), r["video_id"], r["clip_id"]))
     n, minimum = len(rows), settings["retention_min_n"]
