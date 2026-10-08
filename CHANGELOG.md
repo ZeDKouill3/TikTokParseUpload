@@ -21,6 +21,7 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ### Corrigé
 
+- TikTok : une fenêtre connue qui surgit entre la vérification et le clic (ex. « Activer les vérifications automatiques du contenu ? ») n'arrête plus la publication : si le clic est intercepté, les fenêtres connues sont fermées (« Annuler », jamais « Activer ») puis le clic est refait une fois ; une fenêtre inconnue ou un second échec reste un arrêt R4. Nouveau réglage `[tiktok] click_timeout_s` (10 s, au lieu des 30 s de Playwright).
 - Veille (revue r-veille-stats 08/10) : une VOD Twitch déjà en file ou vue n'est plus reproposée au relevé suivant
   (l'id que le worker lui donne, `v2893407960`, est comparé en plus de l'id source). Une exception inattendue du choix
   de Claude est écrite dans l'état du jour (journal ERROR, `finished_at`, aucune proposition inventée) au lieu de
