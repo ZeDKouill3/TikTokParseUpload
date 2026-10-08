@@ -1539,3 +1539,65 @@ def test_extract_audio_fills_a_pts_gap_with_silence(tmp_path):
     assert abs(gap_part).max() < 200
     assert abs(s[int(0.5 * rate):int(1.5 * rate)]).max() > 2000
     assert abs(s[int(4.3 * rate):int(5.3 * rate)]).max() > 2000
+
+
+# --------------------------------------------------------------------------
+# TASK-a64a : mots geants inventes par whisper sur la musique
+# --------------------------------------------------------------------------
+
+GIANT = " " + "Tan" * 140  # 420 caracteres
+
+
+def _giant_segments():
+    return [
+        _segment(1, [_word(" Salut", 0.0, 0.4), _word(GIANT, 0.4, 5.0, 0.91), _word(" tout", 5.0, 5.4)]),
+        _segment(2, [_word(GIANT, 6.0, 9.0, 0.91)]),
+        _segment(3, [_word(" anticonstitutionnellement", 10.0, 11.0)]),
+    ]
+
+
+def test_giant_word_is_removed_text_rebuilt_and_counted(tmp_path, video_dir, cpu, caplog):
+    fake = FakeBackend([VOCAB, NO_FIX])
+    caplog.set_level(logging.WARNING, logger="clipper.transcribe")
+    with llm.use_backend(fake):
+        run(tmp_path, ModelFactory(segments=_giant_segments()))
+    data = read_transcript(video_dir)
+    assert [s["id"] for s in data["segments"]] == [1, 3]
+    assert data["segments"][0]["text"] == " Salut tout"
+    assert [w["word"] for w in data["segments"][0]["words"]] == [" Salut", " tout"]
+    assert data["hallucinated_words_removed"] == 2
+    assert "TanTan" not in json.dumps(data)
+    assert any("420" in r.getMessage() and "TanTan" in r.getMessage() for r in caplog.records)
+
+
+def test_long_normal_word_is_kept_at_default(tmp_path, video_dir, cpu):
+    with llm.use_backend(FakeBackend([VOCAB, NO_FIX])):
+        run(tmp_path, ModelFactory(segments=_giant_segments()))
+    words = [w["word"] for s in read_transcript(video_dir)["segments"] for w in s["words"]]
+    assert " anticonstitutionnellement" in words
+
+
+def test_transcript_without_giant_word_reports_zero(tmp_path, video_dir, cpu):
+    with llm.use_backend(FakeBackend([VOCAB, NO_FIX])):
+        run(tmp_path, ModelFactory())
+    data = read_transcript(video_dir)
+    assert data["hallucinated_words_removed"] == 0
+    assert len(data["segments"]) == 2
+
+
+def test_hallucination_word_max_chars_comes_from_config(tmp_path, video_dir, cpu):
+    with llm.use_backend(FakeBackend([VOCAB, NO_FIX])):
+        run(tmp_path, ModelFactory(segments=_giant_segments()),
+            config=make_config(tmp_path, hallucination_word_max_chars=20))
+    data = read_transcript(video_dir)
+    assert data["hallucinated_words_removed"] == 3
+
+
+@pytest.mark.parametrize("bad", [0, -1, 2.5, "40", True])
+def test_invalid_hallucination_word_max_chars_is_an_error(tmp_path, video_dir, cpu, bad):
+    from clipper.transcribe import TranscribeError
+
+    factory = ModelFactory()
+    with pytest.raises(TranscribeError, match="hallucination_word_max_chars"):
+        run(tmp_path, factory, config=make_config(tmp_path, hallucination_word_max_chars=bad))
+    assert factory.built == []
