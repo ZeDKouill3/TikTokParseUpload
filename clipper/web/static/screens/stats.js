@@ -529,12 +529,27 @@ function learningCoachBlock(data) {
   return `<div data-learning-coach><h3>Coach des prompts</h3>${body}</div>`;
 }
 
+const LEARNING_MOMENT_SOURCES = { transcript: "Transcription", action: "Action" };
+
+/* Tableau de retention a maturite : les lignes et le message viennent du serveur (triees, seuil retention_min_n) ; aucun calcul ici. */
+function learningRetentionBlock(data) {
+  const r = data.retention;
+  if (!r) return "";
+  const note = r.message ? `<p class="reason" data-learning-retention-note>${esc(r.message)}</p>` : "";
+  const body = r.rows.length
+    ? r.rows.map((row) => `<tr><td>${esc(row.video_id)} · ${esc(row.clip_id)}</td><td>${statsDuration(row.duration)}</td><td>${statsPctValue(row.pct_watched, 1)}</td><td>${statsPctValue(row.watched_full, 0)}</td><td>${statsPctValue(row.views_percentile, 0)}</td><td>${esc(LEARNING_MOMENT_SOURCES[row.moment_source] || "—")}</td><td>${esc(row.style || "—")}</td></tr>`).join("")
+    : `<tr><td colspan="7" class="muted">Aucun clip mûr relevé.</td></tr>`;
+  return `<div class="panel panel-pad" data-learning-retention><h3>Rétention à maturité</h3>
+    <p>Clips mûrs : <strong>${fr(r.n)}</strong></p>${note}
+    <div style="overflow-x:auto"><table class="table"><thead><tr><th>Clip</th><th>Durée</th><th>% vu</th><th>% vu en entier</th><th>Rang des vues</th><th>Source du moment</th><th>Style</th></tr></thead><tbody>${body}</tbody></table></div></div>`;
+}
+
 function statsLearningSection() {
   if (statsUi.learningError) {
     return `<section class="learning"><h2>Apprentissage</h2><p class="reason bad">Lecture impossible : ${esc(statsUi.learningError.message || statsUi.learningError)}</p></section>`;
   }
   if (!statsUi.learning) return "";
-  return `<section class="learning"><h2>Apprentissage</h2>${learningStateBlock(statsUi.learning)}${learningWeightsBlock(statsUi.learning)}${learningCoachBlock(statsUi.learning)}</section>`;
+  return `<section class="learning"><h2>Apprentissage</h2>${learningStateBlock(statsUi.learning)}${learningWeightsBlock(statsUi.learning)}${learningRetentionBlock(statsUi.learning)}${learningCoachBlock(statsUi.learning)}</section>`;
 }
 
 /* Adopter ecrit la perspective dans config.toml (le serveur), Refuser ne touche a rien ; l'humain decide, jamais le coach. */

@@ -10,6 +10,10 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ## [Non publié]
 
+### Ajouté
+
+- Apprentissage : rétention à maturité par clip. Chaque entrée `stats` du journal porte la durée du clip (sidecar), `pct_watched` (part moyenne vue, null si la durée ou le temps moyen manque) et la source du moment (`transcript` ou `action`, null si inconnue). L'écran Statistiques affiche un tableau trié par part vue, avec un message « n = X, trop peu pour conclure » sous le réglage nommé `[learning] retention_min_n` (défaut 30). Aucune corrélation calculée.
+
 ### Corrigé
 
 - Captions : un titre d'écran trop long (ex. 7 mots pour 5 au plus) n'arrête plus la vidéo entière après une seule réparation. L'appel qui produit titre d'écran et légende dispose de ses propres essais de réparation, réglage `[captions] title_repair_attempts` (défaut 3) ; les autres usages LLM gardent `[llm] repair_attempts`. Aucun titre de secours : après les essais, l'erreur remonte comme avant.
