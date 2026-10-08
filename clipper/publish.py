@@ -43,12 +43,16 @@ _POSTPONE_MAX_SLOTS = 512
 # ``refused_by_platform`` (TASK-7f582251f6c5) : TikTok a signale un probleme a la verification de contenu ; le clip
 # n'est pas publie, il sort des clips disponibles et n'est jamais republie tout seul. Le compte, lui, continue.
 REFUSED_BY_PLATFORM = "refused_by_platform"
-VALID_STATUSES = ("approved", "scheduled", "published", "failed", "rejected", REFUSED_BY_PLATFORM)
+# ``removed_from_platform`` (TASK-5a7b750462c4) : l'utilisateur a supprime a la main le post (programme ou en ligne)
+# sur TikTok/YouTube et le declare dans Clipper, qui n'efface rien lui-meme ; l'entree ne compte plus ni pour les
+# creneaux, ni pour les plafonds, ni pour l'apprentissage, et n'est jamais republiee.
+REMOVED_FROM_PLATFORM = "removed_from_platform"
+VALID_STATUSES = ("approved", "scheduled", "published", "failed", "rejected", REFUSED_BY_PLATFORM, REMOVED_FROM_PLATFORM)
 # Entrees pas encore closes (ni publiees, ni refusees) : supprimer leur style les abandonnerait en silence
 # (revue r-comptes 7), et set_channel ne doit pas attribuer un style a une video qui en a dans _sans_chaine.
 UNFINISHED_STATUSES = ("approved", "scheduled", "failed")
 _NON_EDITABLE_STATUSES = ("scheduled", "published")
-_NON_MOVABLE_STATUSES = ("rejected", "published", REFUSED_BY_PLATFORM)
+_NON_MOVABLE_STATUSES = ("rejected", "published", REFUSED_BY_PLATFORM, REMOVED_FROM_PLATFORM)
 _PREVIOUS_PART_STATUSES = ("approved", "scheduled", "published")
 # Reglages d'une publication du formulaire (SPEC-1ed3 R2) : approve les jetterait en reconstruisant l'entree
 # (revue fable-comptes 3 / fable-publication I3), elle se reprend par « Reessayer » ou « Modifier ».
@@ -628,6 +632,57 @@ def refused_by_platform(
     return sorted(found, key=lambda f: f[1].get("refused_at") or "", reverse=True)
 
 
+def mark_removed_from_platform(
+    video_id: str,
+    clip_id: str,
+    channel: str,
+    reason: str | None = None,
+    *,
+    state_dir: str | Path | None = None,
+    output_dir: str | Path = "output",
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Le post a ete supprime a la main de la plateforme (TASK-5a7b750462c4) : une entree ``published`` (programmee
+    sur TikTok/YouTube ou deja en ligne) passe en ``removed_from_platform`` avec ``removed_at`` et la raison
+    (facultative), journalisee. Rien n'est fait sur la plateforme. Le creneau est libere, ``tiktok_state`` et le
+    lien du post restent lisibles ; le sidecar du clip garde ``removed_from_platform`` pour que l'apprentissage
+    ignore le post. Refuse (``PublishError``) toute autre entree, dont une publication en cours."""
+    path = _state_path(channel, state_dir)
+    with _locked(path):
+        entries = _load_entries(path)
+        entry = _find_entry(entries, video_id, clip_id)
+        if entry is None:
+            raise PublishError(f"clip absent de la file de publication : {video_id}/{clip_id}")
+        _refuse_in_progress(entry, "déclaration supprimé de la plateforme")
+        if entry["status"] != "published":
+            raise PublishError(
+                f"déclaration supprimé de la plateforme refusée pour {video_id}/{clip_id} : statut {entry['status']!r} "
+                "(attendu : 'published', programmé ou en ligne sur la plateforme)")
+        stamp = _iso(_now(now))
+        entry = dict(entry)
+        entry.update(status=REMOVED_FROM_PLATFORM, removed_at=stamp, removed_reason=reason or None, slot_at=None,
+                     waiting_reason=None, in_progress_since=None, halted=False)
+        _upsert_entry(entries, entry)
+        _save_entries(path, entries)
+    log.info("%s/%s : post déclaré supprimé de la plateforme (%s)", video_id, clip_id, reason or "sans raison")
+    try:
+        sidecar = _read_sidecar(output_dir, video_id, clip_id)
+        sidecar["removed_from_platform"] = {"at": stamp, "reason": reason or None}
+        _write_sidecar(output_dir, video_id, clip_id, sidecar)
+    except (OSError, PublishError) as exc:
+        log.error("%s/%s : suppression déclarée mais sidecar non réécrit : %s", video_id, clip_id, exc)
+    return entry
+
+
+def removed_from_platform(
+    *, state_dir: str | Path | None = None, presets_dir: str | Path = "presets",
+) -> list[tuple[str, dict[str, Any]]]:
+    """(file, entree) des posts declares supprimes de la plateforme, les plus recents d'abord."""
+    found = [(name, e) for name, e in all_entries(state_dir=state_dir, presets_dir=presets_dir)
+             if e["status"] == REMOVED_FROM_PLATFORM]
+    return sorted(found, key=lambda f: f[1].get("removed_at") or "", reverse=True)
+
+
 def retry(
     video_id: str,
     clip_id: str,
@@ -673,7 +728,7 @@ def set_mode(
         if entry is None:
             raise PublishError(f"clip absent de la file de publication : {video_id}/{clip_id}")
         _refuse_in_progress(entry, "changement de mode")  # fable-publication M4
-        if entry["status"] in ("published", "rejected", REFUSED_BY_PLATFORM):
+        if entry["status"] in ("published", "rejected", REFUSED_BY_PLATFORM, REMOVED_FROM_PLATFORM):
             raise PublishError(f"changement de mode refusé pour {video_id}/{clip_id} : statut {entry['status']!r}")
         entry = dict(entry)
         entry["publish_mode"] = mode
@@ -840,7 +895,7 @@ def set_account(
         entry = _find_entry(entries, video_id, clip_id)
         if entry is None:
             raise PublishError(f"clip absent de la file de publication : {video_id}/{clip_id}")
-        if entry["status"] in ("published", "rejected"):
+        if entry["status"] in ("published", "rejected", REMOVED_FROM_PLATFORM):
             raise PublishError(f"changement de compte refusé pour {video_id}/{clip_id} : statut {entry['status']!r}")
         _refuse_in_progress(entry, "changement de compte")
         entry = dict(entry)
@@ -955,7 +1010,7 @@ def unschedule(
         if entry is None:
             raise PublishError(f"clip absent de la file de publication : {video_id}/{clip_id}")
         _refuse_in_progress(entry, "retour en attente")
-        if entry["status"] in ("rejected", REFUSED_BY_PLATFORM):
+        if entry["status"] in ("rejected", REFUSED_BY_PLATFORM, REMOVED_FROM_PLATFORM):
             raise PublishError(f"retour en attente refusé pour {video_id}/{clip_id} : statut {entry['status']!r}")
         if entry["status"] == "published" and entry.get("tiktok_state"):
             raise PublishError(
@@ -1196,7 +1251,7 @@ def create_post(
         existing = _find_entry(entries, video_id, clip_id)
         if existing is not None and existing["status"] not in _POSTABLE_STATUSES:
             status = existing["status"]
-            if status in ("rejected", "published", REFUSED_BY_PLATFORM):
+            if status in ("rejected", "published", REFUSED_BY_PLATFORM, REMOVED_FROM_PLATFORM):
                 raise PublishError(f"publication refusée pour {video_id}/{clip_id} : le clip est {status!r}")
             raise PublishError(
                 f"{video_id}/{clip_id} est déjà dans la file de publication (statut {status!r}) : "
@@ -1271,7 +1326,7 @@ def update_post(
         entry = _find_entry(entries, video_id, clip_id)
         if entry is None:
             raise PublishError(f"clip absent de la file de publication : {video_id}/{clip_id}")
-        if entry["status"] in ("published", "rejected", REFUSED_BY_PLATFORM):
+        if entry["status"] in ("published", "rejected", REFUSED_BY_PLATFORM, REMOVED_FROM_PLATFORM):
             raise PublishError(f"modification refusée pour {video_id}/{clip_id} : la publication est {entry['status']!r}")
         _refuse_in_progress(entry, "modification")
         new_mode = entry.get("publish_mode") if mode is _UNSET else mode

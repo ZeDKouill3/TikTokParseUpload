@@ -156,7 +156,8 @@ def _link_posts(account: str, settings: dict[str, Any], config: Config | None, n
 
     for path, sidecar in sidecars:
         post = sidecar.get("tiktok_post")
-        if not isinstance(post, dict) or post.get("account") != account or post.get("id") or post.get("url"):
+        if (not isinstance(post, dict) or post.get("account") != account or post.get("id") or post.get("url")
+                or sidecar.get("removed_from_platform")):  # post supprimé de la plateforme : jamais rattaché
             continue
         video_id, clip_id = path.parent.name, path.stem
         planned = tiktok._naive_utc(post.get("publish_at"))
@@ -356,6 +357,13 @@ def sync(now: datetime, *, config: Config | None = None) -> dict[str, Any]:
 
         for path, sidecar in sidecars:
             video_id, clip_id = path.parent.name, path.stem
+            removed = sidecar.get("removed_from_platform")
+            if removed:  # post supprimé de la plateforme (TASK-5a7b750462c4) : ni résultat, ni stats, ni calibration
+                post = sidecar.get("tiktok_post") if isinstance(sidecar.get("tiktok_post"), dict) else sidecar.get("youtube_post")
+                excluded.append({"video_id": video_id, "clip_id": clip_id,
+                                 "account": post.get("account") if isinstance(post, dict) else None,
+                                 "reason": "removed_from_platform"})
+                continue
             if isinstance(sidecar.get("youtube_post"), dict):
                 excluded.append({"video_id": video_id, "clip_id": clip_id, "account": sidecar["youtube_post"].get("account"),
                                  "reason": "service_without_stats"})
@@ -723,7 +731,7 @@ def write_veille_report(now: datetime, *, config: Config | None = None) -> dict[
             proposal = next((p for p in day.get("proposals", []) if p.get("candidate_id") == item["candidate_id"]), None)
             candidate = (proposal or {}).get("candidate") or {}
         clips = sidecars.get(video, [])
-        published = sum(1 for s in clips if isinstance(s.get("tiktok_post"), dict))
+        published = sum(1 for s in clips if isinstance(s.get("tiktok_post"), dict) and not s.get("removed_from_platform"))
         rows = stats.get(video, [])
         ranks = [r["views_percentile"] for r in rows if r.get("views_percentile") is not None]
         views = [r["views_at_maturity"] for r in rows if r.get("views_at_maturity") is not None]

@@ -12,6 +12,15 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ### Ajouté
 
+- Publication : action « Supprimé de la plateforme » pour un post supprimé à la main de TikTok ou YouTube
+  (programmé ou déjà en ligne). `POST /api/publish/{video_id}/{clip_id}/removed` (raison facultative) et bouton
+  avec confirmation dans la fiche du clip (écran Publication) passent l'entrée en `removed_from_platform`
+  (`removed_at`, `removed_reason`, journalisé) ; Clipper n'efface rien sur la plateforme. L'entrée libère son
+  créneau et ne compte plus pour les plafonds, n'est jamais republiée, reste visible dans la liste « Supprimés de
+  la plateforme » et supprimable par « Supprimer la sélection ». Le sidecar porte `removed_from_platform` :
+  `clipper.learning` n'y rattache aucun post, n'en verse ni résultat ni statistiques, ne le compte ni en
+  calibration ni dans le bilan veille (jamais un résultat à 0 vue). Refus 409 sur une entrée non publiée ou en cours.
+
 - Préchargement du téléchargement : dès que la vidéo en cours a fini son étape download et passe aux étapes
   CPU, le worker télécharge (étape download seule, `python -m clipper download <url>`) la première VOD en
   attente de la file, au plus une à la fois et jamais deux traitements en parallèle. Quand elle devient la vidéo

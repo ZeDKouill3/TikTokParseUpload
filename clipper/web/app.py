@@ -824,6 +824,8 @@ def _tiktok_fields(entry: dict[str, Any] | None, video_id: str, clip_id: str) ->
         tiktok_status = "failed"
     elif status == publish_mod.REFUSED_BY_PLATFORM:
         tiktok_status = publish_mod.REFUSED_BY_PLATFORM  # refuse a la verification de contenu : liste « Refusés par TikTok »
+    elif status == publish_mod.REMOVED_FROM_PLATFORM:
+        tiktok_status = publish_mod.REMOVED_FROM_PLATFORM  # supprime a la main de la plateforme : liste « Supprimés »
     else:
         tiktok_status = None
     scheduled_at = _publish_entry_instant(entry, "tiktok_publish_at") if status == "published" else None
@@ -2783,7 +2785,8 @@ def create_app(config: Config | None = None) -> FastAPI:
             entry = entries_by_channel[channel].get((video_id, clip_id))
             if entry and entry["status"] == "published" and (video_id, clip_id) not in chosen:
                 continue  # partie deja publiee entrainee par sa serie : laissee telle quelle (fable-comptes 5)
-            if entry and entry["status"] in ("published", "rejected", publish_mod.REFUSED_BY_PLATFORM):
+            if entry and entry["status"] in ("published", "rejected", publish_mod.REFUSED_BY_PLATFORM,
+                                             publish_mod.REMOVED_FROM_PLATFORM):
                 refused.append(f"{video_id}/{clip_id} : déjà {entry['status']}")
                 continue
             refusal = publish_mod.approval_refusal(entry)  # planifie, en cours, formulaire (fable-comptes 2)
@@ -2930,6 +2933,14 @@ def create_app(config: Config | None = None) -> FastAPI:
     def publish_mark_published(video_id: str, clip_id: str) -> dict[str, Any]:
         return _publish_action(video_id, clip_id, "mark_published")
 
+    @app.post("/api/publish/{video_id}/{clip_id}/removed")
+    def publish_mark_removed(video_id: str, clip_id: str, body: RemovedBody | None = None) -> dict[str, Any]:
+        """« Supprimé de la plateforme » : l'utilisateur a supprimé le post de TikTok/YouTube a la main ; Clipper
+        l'enregistre (raison facultative) sans rien faire sur la plateforme."""
+        reason = (body.reason or "").strip() if body else ""
+        return _publish_action(video_id, clip_id, "mark_removed_from_platform", reason or None,
+                               output_dir=Path(config.output_dir))
+
     @app.post("/api/publish/{video_id}/{clip_id}/unschedule")
     def publish_unschedule(video_id: str, clip_id: str) -> dict[str, Any]:
         return _publish_action(video_id, clip_id, "unschedule")
@@ -3000,7 +3011,7 @@ def create_app(config: Config | None = None) -> FastAPI:
             found = publish_mod.all_entries(state_dir=_publish_dir(config), presets_dir=_PRESETS_DIR)
         except publish_mod.PublishError as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
-        refused = []
+        refused, removed = [], []
         for channel, entry in found:
             if entry["status"] == "rejected":
                 continue
@@ -3011,9 +3022,12 @@ def create_app(config: Config | None = None) -> FastAPI:
             # clips refuses par TikTok : liste a part (raison + capture), jamais dans la file ni sur le calendrier
             if entry["status"] == publish_mod.REFUSED_BY_PLATFORM:
                 refused.append({**view, "error": entry.get("error"), "refused_at": entry.get("refused_at")})
+            elif entry["status"] == publish_mod.REMOVED_FROM_PLATFORM:  # supprime de la plateforme : liste a part
+                removed.append({**view, "removed_at": entry.get("removed_at"), "removed_reason": entry.get("removed_reason")})
             else:
                 rows.append(view)
         refused.sort(key=lambda row: str(row.get("refused_at") or ""), reverse=True)
+        removed.sort(key=lambda row: str(row.get("removed_at") or ""), reverse=True)
         def slot_instant(row: dict[str, Any]) -> float:
             # par instant, jamais par texte ISO : +00:00 (formulaire) et +02:00 (creneaux) (fable-publication M3)
             instant = _publish_entry_instant(row, "slot_at")
@@ -3023,6 +3037,7 @@ def create_app(config: Config | None = None) -> FastAPI:
         return {
             "publications": rows,
             "refused_by_platform": refused,
+            "removed_from_platform": removed,
             "accounts": _publish_accounts(config),
             "defaults": {
                 "options": {key: settings[key] for key in ("visibility", "allow_comments", "allow_reuse",
@@ -3753,6 +3768,10 @@ class PublishMoveBody(BaseModel):
 
 class AccountBody(BaseModel):
     account: str | None = None
+
+
+class RemovedBody(BaseModel):
+    reason: str | None = None
 
 
 class PublishModeBody(BaseModel):

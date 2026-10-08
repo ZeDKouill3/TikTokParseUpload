@@ -950,3 +950,50 @@ def test_run_if_due_writes_the_veille_report_after_each_sync(tmp_path, monkeypat
     learning.run_if_due(NOW, config=config)
 
     assert order == ["sync", "bilan"]
+
+
+# --------------------------------------------------------------------------
+# TASK-5a7b750462c4 : un post supprimé de la plateforme n'est jamais un résultat à 0 vue
+# --------------------------------------------------------------------------
+
+
+def _mark_removed(path: Path) -> None:
+    side = _read(path)
+    side["removed_from_platform"] = {"at": "2026-10-08T10:00:00+00:00", "reason": "mal cadré"}
+    path.write_text(json.dumps(side), encoding="utf-8")
+
+
+def test_sync_ignores_a_post_removed_from_the_platform(tmp_path):
+    config = _config(tmp_path)
+    _mark_removed(_linked_clip(config, "03"))
+    _scored_account(config)  # POST reste dans les relevés : le clip 03 serait noté sinon
+
+    sync = _sync(config)
+
+    assert _journal(config) == []
+    assert {"video_id": VIDEO, "clip_id": "03", "account": ACCOUNT, "reason": "removed_from_platform"} in sync["excluded"]
+    assert all(r != "03" for r in sync["results"]) and all(r != f"{VIDEO}/03" for r in sync["scored"])
+
+
+def test_a_removed_post_with_no_view_does_not_enter_the_calibration(tmp_path, monkeypatch):
+    config = _config(tmp_path)
+    _mark_removed(_linked_clip(config, "03"))
+    _scored_account(config, clip_views=0)
+    seen = []
+    monkeypatch.setattr(learning, "_calibrate", lambda linked, *a, **k: seen.append(list(linked)) or {})
+
+    learning.sync(NOW, config=config)
+
+    assert seen == [] and _journal(config) == []
+
+
+def test_link_posts_does_not_attach_a_removed_clip(tmp_path):
+    config = _config(tmp_path)
+    side = _sidecar(config, "clip-02")
+    _mark_removed(side)
+    _entry(config, "clip-02")
+    _snapshot(config, "2026-10-07T10:00:00+00:00", ("7000000000000000001", "Un super clip #jeu #fun", "2026-10-07T09:02:00"))
+
+    result = learning.link_posts(ACCOUNT, config=config, now=NOW)
+
+    assert result["linked"] == [] and not _read(side)["tiktok_post"].get("id")

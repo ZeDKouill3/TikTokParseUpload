@@ -19,6 +19,7 @@ const PUB_TIKTOK = {
   scheduled_on_youtube: { label: "Programmée sur YouTube", cls: "info" },
   published: { label: "Publiée", cls: "ok" }, failed: { label: "Échec", cls: "bad" },
   refused_by_platform: { label: "Refusé par TikTok", cls: "bad" },
+  removed_from_platform: { label: "Supprimé de la plateforme", cls: "pending" },
 };
 const PUB_STALE_MS = 4000;
 const PUB_HOLD_MS = 250;      // appui long avant de saisir un clip au toucher
@@ -394,7 +395,7 @@ function pubPostsSection() {
   if (pubPosts.error) return `<section>${head}<p class="reason bad">Chargement impossible : ${esc(pubPosts.error.message || pubPosts.error)}</p></section>`;
   if (!pubPosts.data) return `<section>${head}<div class="skeleton skeleton-line"></div></section>`;
   return `<section>${head}${rows.length ? `<div class="panel" id="pub-posts">${rows.map(pubPostRow).join("")}</div>`
-    : `<p class="muted" style="font-size:13px">Aucune publication en attente : « Nouvelle publication » choisit un clip, le compte, maintenant ou à une date. Les publications terminées sont dans le calendrier.</p>`}</section>${pubRefusedSection()}`;
+    : `<p class="muted" style="font-size:13px">Aucune publication en attente : « Nouvelle publication » choisit un clip, le compte, maintenant ou à une date. Les publications terminées sont dans le calendrier.</p>`}</section>${pubRefusedSection()}${pubRemovedSection()}`;
 }
 
 /* Clips refusés par TikTok à la vérification de contenu (TASK-7f582251f6c5) : retirés des clips disponibles, listés
@@ -406,6 +407,17 @@ function pubRefusedSection() {
       <div class="li-sub bad">Refusé par TikTok : ${esc(p.error || "problème signalé à la vérification de contenu")}</div>
       ${p.capture_url ? `<a href="${esc(p.capture_url)}" target="_blank" rel="noopener">voir la capture d'écran</a>` : ""}</div></div>`;
   return `<section id="pub-refused"><div class="section-title">${icon("circle-x")}Refusés par TikTok <span class="more">${rows.length}</span></div>
+    <div class="panel">${rows.map(row).join("")}</div></section>`;
+}
+
+/* Posts supprimés à la main de la plateforme (TASK-5a7b750462c4) : sortis de la file, du calendrier et des
+   statistiques d'apprentissage, jamais republiés ; Clipper n'a rien effacé sur TikTok/YouTube. */
+function pubRemovedSection() {
+  const rows = pubPosts.data ? (pubPosts.data.removed_from_platform || []).filter((p) => !pubUi.account || p.account === pubUi.account) : [];
+  if (!rows.length) return "";
+  const row = (p) => `<div class="list-item"><div class="li-main"><div class="li-title">${esc(pubTitle(p))}</div>
+      <div class="li-sub muted">Supprimé de la plateforme${p.removed_at ? ` le ${esc(pubWhen(p.removed_at))}` : ""}${p.removed_reason ? ` : ${esc(p.removed_reason)}` : ""}</div></div></div>`;
+  return `<section id="pub-removed"><div class="section-title">${icon("trash-2")}Supprimés de la plateforme <span class="more">${rows.length}</span></div>
     <div class="panel">${rows.map(row).join("")}</div></section>`;
 }
 
@@ -1225,6 +1237,26 @@ async function pubSetAccount(c, account) {
   }
 }
 
+async function pubMarkRemoved(c) {
+  const ok = await confirmDialog({
+    title: "Supprimé de la plateforme ?",
+    body: `À utiliser si tu as supprimé « ${pubTitle(c)} » toi-même de TikTok ou YouTube : Clipper ne supprime rien là-bas, il le note, le sort des posts programmés et des statistiques d'apprentissage et ne le republiera jamais tout seul.`,
+    confirmLabel: "Supprimé de la plateforme", danger: true,
+  });
+  if (!ok) return false;
+  try {
+    await api(`/api/publish/${pubEnc(c.video_id)}/${pubEnc(c.clip_id)}/removed`, jsonBody("POST", {}));
+    await pubLoad();
+    pubPosts.at = 0;
+    pubPostsLoad();
+    toast({ kind: "warn", title: "Post déclaré supprimé de la plateforme", body: pubTitle(c), ms: 2600 });
+    return true;
+  } catch (err) {
+    toastError("Impossible de déclarer le post supprimé", err);
+    return false;
+  }
+}
+
 function pubDetailHtml(c) {
   const account = c.account;
   const status = c.publish_status;
@@ -1253,6 +1285,7 @@ function pubDetailHtml(c) {
       <span class="grow"></span>
       ${status === "failed" ? `<button type="button" class="btn btn-primary" data-retry>${icon("rotate-ccw")}Réessayer</button>` : ""}
       ${status === "scheduled" || status === "failed" ? `<button type="button" class="btn" data-unschedule>${icon("undo-2")}Repasser en attente</button>` : ""}
+      ${status === "published" ? `<button type="button" class="btn btn-ghost" data-removed title="Tu as supprimé ce post de la plateforme à la main">${icon("trash-2")}Supprimé de la plateforme</button>` : ""}
       ${status === "approved" ? `<button type="button" class="btn btn-primary" data-publish-now>${icon("send")}Publier maintenant</button>` : ""}
       ${status === "scheduled" && !inProgress ? `<button type="button" class="btn" data-published title="Pour un clip déjà publié hors de Clipper">${icon("check")}Déclarer publié (hors Clipper)</button>` : ""}
     </div>`;
@@ -1270,6 +1303,8 @@ function pubOpenDetail(key) {
     if (retry) retry.onclick = async () => { closeLayer(); await pubRetry(c); };
     const un = $("[data-unschedule]", d);
     if (un) un.onclick = async () => { closeLayer(); await pubUnschedule(c); };
+    const removed = $("[data-removed]", d);
+    if (removed) removed.onclick = async () => { closeLayer(); await pubMarkRemoved(c); };
     const pub = $("[data-published]", d);
     if (pub) pub.onclick = async () => { closeLayer(); await pubMarkPublished(c); };
     const now = $("[data-publish-now]", d);
