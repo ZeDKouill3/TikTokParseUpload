@@ -54,6 +54,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--short-clips", action=argparse.BooleanOptionalAction, default=None, dest="short_clips",
                    help="Clips courts pour cette video (sinon : [moments] short_clips du style)")
 
+    p = sub.add_parser("download", help="Telecharge seulement la video (etape download, prechargement du worker)")
+    p.add_argument("url", help="URL YouTube ou VOD Twitch (twitch.tv/videos/<id>) de la video")
+
     p = sub.add_parser("render", help="Reprend une video apres la revue (ou apres un echec) jusqu'au bout")
     p.add_argument("video_id")
     p.add_argument("--force", action="store_true", help="Relance les etapes deja faites")
@@ -339,6 +342,10 @@ def main(argv: list[str] | None = None) -> int:
                                      short_clips=args.short_clips),
                 video_id, config, args.force,
             )
+        elif args.command == "download":
+            pipeline.download_only(args.url, config=config)
+            print(f"{download.extract_video_id(args.url)} : download termine")
+            return 0
         elif args.command == "render":
             state = _run_with_progress(
                 lambda: pipeline.render(args.video_id, config=config, force=args.force,

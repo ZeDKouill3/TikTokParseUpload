@@ -17,6 +17,7 @@ import ctypes
 import json
 import logging
 import os
+import shutil
 import signal
 import sys
 import threading
@@ -48,6 +49,10 @@ CONFIG_DEFAULTS: dict[str, object] = {
     # toutes les heartbeat_interval_s secondes ; l'interface le juge périmé après
     # trois intervalles sans battement.
     "heartbeat_interval_s": 5,
+    # Télécharge à l'avance la vidéo suivante de la file pendant que la vidéo en cours est traitée.
+    "prefetch_download": True,
+    # Espace libre minimal du disque (en Go) pour télécharger la vidéo suivante à l'avance.
+    "prefetch_min_free_gb": 60,
 }
 
 WORKER_COMMAND = "python -m clipper worker"
@@ -248,6 +253,11 @@ def remove(video_id: str, *, config: Config | None = None) -> None:
         if len(remaining) == len(entries):
             raise WorkerError(f"aucune entree en attente pour {video_id!r}")
         _write_queue(path, remaining)
+    prefetching = [e for e in entries if e["video_id"] == video_id and e["status"] == "waiting"
+                   and e.get("prefetch") == "running"]
+    for entry in prefetching:  # retrait d'une entree en prechargement : son processus s'arrete avec elle
+        _terminate_pid(entry.get("prefetch_pid"), float(config.section("worker")["cancel_grace_s"]))
+        _reset_download_step(video_id, config)
 
 
 _INTERRUPTED_REASON = "interrompue"
@@ -334,6 +344,12 @@ def cancel(video_id: str, *, config: Config | None = None) -> None:
     with _locked(path):
         entry = next((e for e in _read_queue(path) if e["video_id"] == video_id and e["status"] == "running"), None)
     if entry is None:
+        with _locked(path):
+            prefetching = any(e["video_id"] == video_id and e["status"] == "waiting" and e.get("prefetch") == "running"
+                              for e in _read_queue(path))
+        if prefetching:  # entree en attente dont seul le download tourne : annuler = la retirer, processus arrete
+            remove(video_id, config=config)
+            return
         _cancel_interrupted(video_id, config)
         return
 
@@ -413,6 +429,32 @@ def _pid_alive(pid: int | None) -> bool:
     return True
 
 
+def _reset_download_step(video_id: str, config: Config) -> None:
+    """Etape download laissee ``running`` par un prechargement tue (retrait, arret du worker) : elle repasse
+    ``pending`` (le prochain ``run`` la refait), jamais « en cours » sans processus."""
+    from clipper import pipeline
+
+    try:
+        state = pipeline.load_state(video_id, config=config)
+    except pipeline.PipelineError:
+        return
+    step = state["steps"]["download"]
+    if step.get("status") == "running":
+        step.update(status="pending", reason=None, started_at=None, finished_at=None, progress=None)
+        pipeline.save_state(state, config=config)
+
+
+_PREFETCH_FIELDS = ("prefetch", "prefetch_pid")
+
+
+def _build_prefetch_command(entry: dict[str, Any]) -> list[str]:
+    """Commande du prechargement : l'etape download SEULE (``python -m clipper download <url>``)."""
+    cmd = [sys.executable, "-m", "clipper"]
+    if entry.get("channel"):
+        cmd += ["--config", f"presets/{entry['channel']}.toml"]
+    return cmd + ["download", entry["url"]]
+
+
 def _build_command(entry: dict[str, Any]) -> list[str]:
     # --config est une option globale du parseur : avant la sous-commande.
     cmd = [sys.executable, "-m", "clipper"]
@@ -470,12 +512,17 @@ class Worker:
         self._process: Any | None = None
         self._entry: dict[str, Any] | None = None
         self._last_beat: float | None = None
+        self._prefetch_process: Any | None = None  # un seul prechargement a la fois
+        self._prefetch_entry_id: str | None = None
+        self._prefetch_log_handle: Any | None = None
+        self._low_disk_logged: set[str] = set()
 
     def startup(self) -> None:
         """Reprises de demarrage du vrai worker (``clipper worker``, appelees par ``loop`` seulement) : orphelins
         de la file, publications interrompues, migration des anciens styles. Jamais dans le constructeur : un
         autre processus qui construirait un Worker passerait en echec la publication que le worker pilote."""
         self._recover_orphans()
+        self._recover_prefetch()
         self._recover_interrupted_videos()
         self._recover_interrupted_publications()
         self._migrate_legacy_presets()
@@ -546,6 +593,26 @@ class Worker:
                         _write_queue(self._path, entries)
                     break
 
+    def _recover_prefetch(self) -> None:
+        """Au demarrage, un prechargement ``running`` laisse par un worker arrete : son processus, s'il vit encore,
+        est termine (aucun orphelin) puis le marqueur disparait ; l'entree sera de nouveau prechargee ou, a son
+        tour de tete, son download refait par le ``run``."""
+        grace = float(self.config.section("worker")["cancel_grace_s"])
+        stale: list[dict[str, Any]] = []
+        with _locked(self._path):
+            entries = _read_queue(self._path)
+            for entry in entries:
+                if entry["status"] == "waiting" and entry.get("prefetch") == "running":
+                    stale.append(dict(entry))
+                    for field in _PREFETCH_FIELDS:
+                        entry.pop(field, None)
+            if stale:
+                _write_queue(self._path, entries)
+        for entry in stale:
+            _terminate_pid(entry.get("prefetch_pid"), grace)
+            _reset_download_step(entry["video_id"], self.config)
+            log.warning("%s : prechargement du download interrompu par l'arret du worker, abandonne", entry["video_id"])
+
     def tick(self) -> None:
         """Une iteration : termine l'entree si l'enfant courant a fini,
         sinon lance la tete de file si aucun enfant ne vit, sinon reprend
@@ -560,12 +627,16 @@ class Worker:
         self._learning_due()
         self._veille_due()
 
+        self._prefetch_collect()
         if self._process is not None:
             if self._process.poll() is None:
+                self._prefetch_start_if_due()
                 return
             self._finish_current()
             self._veille_select_best()
 
+        if self._head_is_prefetching():
+            return  # son download tourne deja : le `run` attend la fin plutot que de le doubler
         if self._launch_head():
             return
 
@@ -1048,6 +1119,8 @@ class Worker:
             process = self._spawn(entry, _build_command(entry))
             entry["status"] = "running"
             entry["pid"] = process.pid
+            for field in _PREFETCH_FIELDS:
+                entry.pop(field, None)  # le `run` saute un download fait ou refait un download en echec
             _write_queue(self._path, entries)
         self._process = process
         self._entry = entry
@@ -1139,11 +1212,151 @@ class Worker:
             self._process = None
             self._entry = None
 
+    # ------------------------------------------------------------ prechargement (TASK-3c1c)
+
+    def _head_is_prefetching(self) -> bool:
+        if self._prefetch_process is None:
+            return False
+        entry = next((e for e in _read_queue(self._path) if e["status"] == "waiting"), None)
+        return entry is not None and entry["id"] == self._prefetch_entry_id
+
+    def _download_done(self, video_id: str) -> bool:
+        from clipper import pipeline
+
+        try:
+            return pipeline.load_state(video_id, config=self.config)["steps"]["download"]["status"] == "done"
+        except pipeline.PipelineError:
+            return False
+
+    def _free_gb(self) -> float:
+        probe = Path(self.config.workspace_dir)
+        while not probe.exists() and probe != probe.parent:
+            probe = probe.parent
+        return shutil.disk_usage(probe).free / 1024 ** 3
+
+    def _prefetch_start_if_due(self) -> None:
+        """Le download de la video en cours est fait : lance le download SEUL de la premiere entree ``waiting``
+        (au plus un a la fois, jamais retente tant qu'elle n'est pas la video en cours)."""
+        section = self.config.section("worker")
+        if not section["prefetch_download"] or self._prefetch_process is not None or self._entry is None:
+            return
+        if not self._download_done(self._entry["video_id"]):
+            return
+        minimum = float(section["prefetch_min_free_gb"])
+        with _locked(self._path):
+            entries = _read_queue(self._path)
+            entry = next((e for e in entries if e["status"] == "waiting"), None)
+            if entry is None or entry["action"] != "run" or "prefetch" in entry:
+                return
+            free = self._free_gb()
+            if free < minimum:
+                if entry["id"] not in self._low_disk_logged:
+                    self._low_disk_logged.add(entry["id"])
+                    log.info("%s : pas de prechargement du download, %.0f Go libres sur le disque du workspace "
+                             "(seuil prefetch_min_free_gb = %g)", entry["video_id"], free, minimum)
+                return
+            if entry.get("channel"):
+                self._sync_channel_mode(entry["channel"])
+            self._keep_channel(entry)
+            process = self._spawn_prefetch(entry, _build_prefetch_command(entry))
+            entry["prefetch"] = "running"
+            entry["prefetch_pid"] = process.pid
+            _write_queue(self._path, entries)
+        self._prefetch_process = process
+        self._prefetch_entry_id = entry["id"]
+        log.info("%s : prechargement du download (pid %s) pendant le traitement de %s",
+                 entry["video_id"], process.pid, self._entry["video_id"])
+
+    def _spawn_prefetch(self, entry: dict[str, Any], cmd: list[str]) -> Any:
+        if self.spawner is not None:
+            return self.spawner(cmd)
+        import subprocess
+
+        path = log_path(entry["video_id"], self.config).with_name("prefetch.log")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(path, "wb")
+        try:
+            process = self._popen(cmd, stdout=handle, stderr=subprocess.STDOUT)
+        except BaseException:
+            handle.close()
+            raise
+        self._prefetch_log_handle = handle
+        return process
+
+    def _prefetch_collect(self) -> None:
+        """Prechargement termine : l'entree (si elle est toujours en file) passe ``done`` ou ``failed`` ; un echec
+        est journalise et laisse l'etat de la video prechargee en echec visible, sans toucher la video en cours."""
+        process = self._prefetch_process
+        if process is None:
+            return
+        code = process.poll()
+        if code is None:
+            return
+        entry_id = self._prefetch_entry_id
+        if self._prefetch_log_handle is not None:
+            self._prefetch_log_handle.close()
+            self._prefetch_log_handle = None
+        self._prefetch_process = None
+        self._prefetch_entry_id = None
+        with _locked(self._path):
+            entries = _read_queue(self._path)
+            entry = next((e for e in entries if e["id"] == entry_id), None)
+            if entry is None:
+                return  # retiree ou annulee pendant le download : rien d'autre a ecrire
+            entry["prefetch"] = "done" if code == 0 else "failed"
+            entry["prefetch_pid"] = None
+            _write_queue(self._path, entries)
+        if code != 0:
+            self._record_prefetch_failure(entry, code)
+
+    def _record_prefetch_failure(self, entry: dict[str, Any], code: int) -> None:
+        from clipper import pipeline
+
+        video_id = entry["video_id"]
+        try:
+            state = pipeline.load_state(video_id, config=self.config)
+        except pipeline.PipelineError:
+            state = pipeline.new_state(video_id, entry["url"], self.config.mode, channel=entry.get("channel"))
+        step = state["steps"]["download"]
+        if step.get("status") != "failed":  # le processus est mort sans ecrire son echec
+            path = log_path(video_id, self.config).with_name("prefetch.log")
+            reason = f"le prechargement s'est termine avec le code {code} (journal : {path}) : {_log_tail(path)}"
+            step.update(status="failed", reason=reason, finished_at=_now_iso())
+            state.update(status="failed", reason=f"download : {reason}", retry_at=None)
+            pipeline.save_state(state, config=self.config)
+        log.error("%s : prechargement du download en echec (code %s) : %s", video_id, code, step.get("reason"))
+
+    def shutdown(self) -> None:
+        """Arret du worker : le processus de prechargement est termine avec lui (aucun orphelin) et son marqueur
+        retire de l'entree ; l'etape download laissee ``running`` repasse ``pending``."""
+        process = self._prefetch_process
+        if process is None:
+            return
+        entry_id = self._prefetch_entry_id
+        _terminate_pid(process.pid, float(self.config.section("worker")["cancel_grace_s"]))
+        if self._prefetch_log_handle is not None:
+            self._prefetch_log_handle.close()
+            self._prefetch_log_handle = None
+        self._prefetch_process = None
+        self._prefetch_entry_id = None
+        with _locked(self._path):
+            entries = _read_queue(self._path)
+            entry = next((e for e in entries if e["id"] == entry_id), None)
+            if entry is not None:
+                for field in _PREFETCH_FIELDS:
+                    entry.pop(field, None)
+                _write_queue(self._path, entries)
+        if entry is not None:
+            _reset_download_step(entry["video_id"], self.config)
+
     def loop(self) -> None:
         """Boucle jusqu'a interruption, a l'intervalle ``poll_interval_s``
         de CONFIG_DEFAULTS (SPEC-74e9 §2.3)."""
         interval = float(self.config.section("worker")["poll_interval_s"])
         self.startup()
-        while True:
-            self.tick()
-            time.sleep(interval)
+        try:
+            while True:
+                self.tick()
+                time.sleep(interval)
+        finally:
+            self.shutdown()

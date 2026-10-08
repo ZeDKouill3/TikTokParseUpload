@@ -2341,3 +2341,58 @@ def test_review_moment_kept_by_a_second_split_returns_to_awaiting_review(tmp_pat
         state = pipeline.render(VIDEO_ID, config=config, step_options=opts)
     assert state["status"] == "done", state
     assert len(state["clips"]) == 2
+
+
+# --------------------------------------------------------------------------
+# TASK-3c1c : download_only, l'etape download SEULE (prechargement du worker)
+# --------------------------------------------------------------------------
+
+
+def _record_downloads(monkeypatch, *, fail: Exception | None = None) -> list[str]:
+    calls: list[str] = []
+
+    def fake_download(url, workspace, **kwargs):
+        calls.append(url)
+        if fail is not None:
+            raise fail
+
+    monkeypatch.setattr(pipeline.download, "download", fake_download)
+    return calls
+
+
+def test_download_only_runs_the_download_step_and_no_other(tmp_path, monkeypatch):
+    config = Config(mode="auto", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output")
+    calls = _record_downloads(monkeypatch)
+
+    state = pipeline.download_only(URL, config=config, channel="ma_chaine")
+
+    assert calls == [URL]
+    assert state["steps"]["download"]["status"] == "done"
+    assert all(state["steps"][name]["status"] == "pending" for name in pipeline.STEPS if name != "download")
+    assert state["status"] == "pending"  # jamais « running » ni « done » : la video n'est pas traitee
+    assert state["channel"] == "ma_chaine"
+    assert pipeline.load_state(VIDEO_ID, config=config)["steps"]["download"]["status"] == "done"
+
+
+def test_download_only_does_not_download_again_when_the_step_is_done(tmp_path, monkeypatch):
+    config = Config(mode="auto", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output")
+    calls = _record_downloads(monkeypatch)
+
+    pipeline.download_only(URL, config=config)
+    pipeline.download_only(URL, config=config)
+
+    assert calls == [URL]
+
+
+def test_download_only_failure_marks_the_video_failed_and_raises(tmp_path, monkeypatch):
+    config = Config(mode="auto", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output")
+    _record_downloads(monkeypatch, fail=RuntimeError("reseau coupe"))
+
+    with pytest.raises(pipeline.PipelineError, match="reseau coupe"):
+        pipeline.download_only(URL, config=config)
+
+    state = pipeline.load_state(VIDEO_ID, config=config)
+    assert state["steps"]["download"]["status"] == "failed"
+    assert "reseau coupe" in state["steps"]["download"]["reason"]
+    assert state["status"] == "failed"
+    assert "reseau coupe" in state["reason"]
