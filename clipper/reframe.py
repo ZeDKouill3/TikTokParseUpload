@@ -259,11 +259,7 @@ CONFIG_DEFAULTS: dict[str, object] = {
     # rectangle de la webcam, quand celui-ci a été repéré sur le seul visage
     # (aucun bord d'incrustation retrouvé) ; en dessous, le clip reste en letterbox.
     "facecam_clip_face_min_share": 0.5,
-    # Localisation (TASK-495c) : un cadre net sans aucun visage sur les images de
-    # la planche (bannière de sponsor animée) n'est pas retenu comme webcam
-    # quand un candidat visage stable existe, c'est-à-dire vu sur au moins cette
-    # part du plus grand support de la période. Une webcam sans visage visible
-    # reste possible quand aucun candidat visage stable n'existe.
+    # Part du plus grand support à partir de laquelle un candidat visage est stable, et remplace un cadre sans aucun visage choisi par Claude.
     "facecam_face_stable_share": 0.8,
     # Panneau caméra : part de la hauteur de sortie, à partir de stream_top
     # (titre d'écran au-dessus) ; le jeu occupe tout le bas.
