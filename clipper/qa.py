@@ -39,6 +39,15 @@ Pour chaque clip :
   mesure sur ``camera_rect`` (aucun texte ne la recouvre) ; prompt avec le
   titre d'ecran permanent ; face_cut et subtitle_on_face restent demandes
   (le visage est a l'image).
+- clip stream_split (``layout`` = "stream_split", SPEC-76dc : webcam en haut,
+  jeu en bas, badge de chaine optionnel entre les deux) : ``webcam_rect`` et
+  ``video_rect`` obligatoires, valides comme pour stream, sinon erreur
+  explicite (jamais l'image entiere) ; ecran noir mesure sur chacun des deux
+  panneaux ; prompt avec une section ``## Format`` et, seulement si
+  ``[render] title_enabled``, le titre d'ecran (jamais un texte d'accroche
+  des 2 premieres secondes, qui n'est pas dessine) ; face_cut et
+  subtitle_on_face restent demandes, comme en stream (la webcam montre le
+  visage, les sous-titres peuvent le recouvrir selon leur position).
 
 Sortie : le JSON du clip est mis a jour en place :
 
@@ -225,14 +234,22 @@ _BLACKDETECT_RE = re.compile(
 
 
 def _black_segments(
-    mp4: Path, settings: dict[str, Any], ffmpeg_bin: str, crop: tuple[int, int, int, int] | None = None,
+    mp4: Path, settings: dict[str, Any], ffmpeg_bin: str,
+    crop: tuple[int, int, int, int] | list[tuple[int, int, int, int]] | None = None,
 ) -> list[dict[str, Any]]:
     """Plages noires du mp4 rendu (ffmpeg blackdetect), au moins
     ``black_min_seconds`` chacune ; une transition de montage courte dans la
     source ne doit pas en produire. Bloquante a partir de
     ``black_block_seconds``, avertissement en dessous. En letterbox, ``crop`` restreint la
     mesure a ``video_rect`` (x, y, w, h) : sinon l'encadre blanc du titre
-    d'ecran empeche toute detection (SPEC-6127)."""
+    d'ecran empeche toute detection (SPEC-6127). Une liste de rectangles (stream_split,
+    SPEC-76dc) mesure chaque panneau separement : un panneau noir seul, noye dans
+    l'autre, serait sinon invisible."""
+    if isinstance(crop, list):
+        found: list[dict[str, Any]] = []
+        for rect in crop:
+            found += _black_segments(mp4, settings, ffmpeg_bin, crop=rect)
+        return found
     vf = (
         f"blackdetect=d={float(settings['black_min_seconds'])}"
         f":pic_th={float(settings['black_picture_ratio'])}"
@@ -277,19 +294,36 @@ def _rect(clip: dict[str, Any], key: str) -> tuple[int, int, int, int]:
         raise QAError(f"clip {clip.get('clip_id')} : {key} invalide {rect!r}") from exc
 
 
-def _stream_rect(clip: dict[str, Any], settings: dict[str, Any]) -> tuple[int, int, int, int]:
-    """Clip stream (SPEC-3a88) : ``camera_rect`` (facecam) et ``video_rect``
-    (jeu) valides, dans l'image attendue, sans se recouvrir ; renvoie
-    ``camera_rect``, ou l'ecran noir se mesure (aucun texte ne la recouvre)."""
+def _panel_rects(
+    clip: dict[str, Any], settings: dict[str, Any], camera_key: str,
+) -> tuple[tuple[int, int, int, int], tuple[int, int, int, int]]:
+    """Les deux panneaux d'un clip stream (``camera_rect``) ou stream_split
+    (``webcam_rect``) -- webcam et ``video_rect`` (jeu) -- valides, dans
+    l'image attendue, sans se recouvrir ; sinon erreur explicite."""
+    layout = clip.get("layout")
     want_w, want_h = int(settings["expected_width"]), int(settings["expected_height"])
-    camera, game = _rect(clip, "camera_rect"), _rect(clip, "video_rect")
-    for key, (x, y, w, h) in (("camera_rect", camera), ("video_rect", game)):
+    camera, game = _rect(clip, camera_key), _rect(clip, "video_rect")
+    for key, (x, y, w, h) in ((camera_key, camera), ("video_rect", game)):
         if w <= 0 or h <= 0 or x < 0 or y < 0 or x + w > want_w or y + h > want_h:
-            raise QAError(f"clip stream {clip.get('clip_id')} : {key} {(x, y, w, h)} hors de {want_w}x{want_h}")
+            raise QAError(f"clip {layout} {clip.get('clip_id')} : {key} {(x, y, w, h)} hors de {want_w}x{want_h}")
     (cx, cy, cw, ch), (gx, gy, gw, gh) = camera, game
     if cx < gx + gw and gx < cx + cw and cy < gy + gh and gy < cy + ch:
-        raise QAError(f"clip stream {clip.get('clip_id')} : camera_rect {camera} recouvre video_rect {game}")
-    return camera
+        raise QAError(f"clip {layout} {clip.get('clip_id')} : {camera_key} {camera} recouvre video_rect {game}")
+    return camera, game
+
+
+def _stream_rect(clip: dict[str, Any], settings: dict[str, Any]) -> tuple[int, int, int, int]:
+    """Clip stream (SPEC-3a88) : ``camera_rect`` (facecam) et ``video_rect``
+    (jeu) valides ; renvoie ``camera_rect``, ou l'ecran noir se mesure
+    (aucun texte ne la recouvre)."""
+    return _panel_rects(clip, settings, "camera_rect")[0]
+
+
+def _split_rects(clip: dict[str, Any], settings: dict[str, Any]) -> list[tuple[int, int, int, int]]:
+    """Clip stream_split (SPEC-76dc) : ``webcam_rect`` et ``video_rect``
+    valides ; l'ecran noir se mesure sur chacun des deux panneaux (le badge
+    et le titre n'y sont pas)."""
+    return list(_panel_rects(clip, settings, "webcam_rect"))
 
 
 def _video_rect(clip: dict[str, Any]) -> tuple[int, int, int, int] | None:
@@ -313,7 +347,7 @@ def _video_rect(clip: dict[str, Any]) -> tuple[int, int, int, int] | None:
 
 def _local_issues(
     mp4: Path, clip: dict[str, Any], settings: dict[str, Any], ffmpeg_bin: str, ffprobe_bin: str,
-    crop: tuple[int, int, int, int] | None = None,
+    crop: tuple[int, int, int, int] | list[tuple[int, int, int, int]] | None = None,
 ) -> list[dict[str, Any]]:
     info = _probe(mp4, ffprobe_bin)
     streams = info.get("streams", [])
@@ -500,7 +534,10 @@ def response_schema(letterbox: bool = False, part: int = 1) -> dict[str, Any]:
     }
 
 
-def _prompt(clip: dict[str, Any], frames: list[tuple[Path, float, list[str]]], letterbox: bool = False) -> str:
+def _prompt(
+    clip: dict[str, Any], frames: list[tuple[Path, float, list[str]]], letterbox: bool = False,
+    title_enabled: bool = True,
+) -> str:
     part = int(clip.get("part", 1))
     excluded = _excluded_defects(letterbox, part)
     defect_keys = [d for d in DEFECTS if d not in excluded]
@@ -508,7 +545,20 @@ def _prompt(clip: dict[str, Any], frames: list[tuple[Path, float, list[str]]], l
     images = "\n".join(
         f"Image {k} : t={t:.2f} s ({', '.join(labels)})" for k, (_, t, labels) in enumerate(frames, 1)
     )
-    if clip.get("layout") == "stream":
+    if clip.get("layout") == "stream_split":
+        # SPEC-76dc : webcam en haut, jeu en bas, badge de chaine optionnel a leur jonction ;
+        # le titre d'ecran n'est dessine que si [render] title_enabled.
+        format_line = (
+            "## Format\n"
+            "Clip stream_split : webcam en haut (celle du createur), jeu en bas, un badge de chaine "
+            "(logo et nom sur fond noir) eventuel entre les deux, sous-titres selon le reglage. "
+            "Aucun texte d'accroche n'est affiche au debut du clip.\n\n"
+        )
+        hook_line = (
+            f"Titre d'ecran affiche en permanence (accroche) : {clip.get('screen_title', '')}\n"
+            if title_enabled else ""
+        )
+    elif clip.get("layout") == "stream":
         format_line = (
             "## Format\n"
             "Clip stream : titre d'ecran sur encadre blanc en haut, la facecam (webcam du "
@@ -609,15 +659,28 @@ def check_clip(
     renvoie le champ ``qa``."""
     clip = json.loads(json_path.read_text(encoding="utf-8"))
     letterbox = clip.get("layout") == "letterbox"
-    crop = _stream_rect(clip, settings) if clip.get("layout") == "stream" else _video_rect(clip)
+    layout = clip.get("layout")
+    if layout == "stream":
+        crop = _stream_rect(clip, settings)
+    elif layout == "stream_split":
+        crop = _split_rects(clip, settings)
+    else:
+        crop = _video_rect(clip)
     mp4 = json_path.with_suffix(".mp4")
     if not mp4.exists():
         raise QAError(f"video du clip absente : {mp4}")
+    title_enabled = True
+    if layout == "stream_split":
+        if config is None:
+            from clipper.config import load_config
+
+            config = load_config()
+        title_enabled = bool(config.section("render")["title_enabled"])
 
     issues = _local_issues(mp4, clip, settings, ffmpeg_bin, ffprobe_bin, crop=crop)
     frames = _extract_frames(mp4, frames_dir, settings)
     answer = llm.ask(
-        "qa", _prompt(clip, frames, letterbox=letterbox), [p for p, _, _ in frames],
+        "qa", _prompt(clip, frames, letterbox=letterbox, title_enabled=title_enabled), [p for p, _, _ in frames],
         response_schema(letterbox=letterbox, part=int(clip.get("part", 1))), config=config,
     )
     issues = [

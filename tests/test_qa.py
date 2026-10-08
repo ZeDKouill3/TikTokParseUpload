@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -1009,3 +1010,178 @@ def test_stream_with_missing_or_inconsistent_rects_raises(tmp_path, dirs, overri
         with pytest.raises(qa.QAError, match="stream"):
             run(tmp_path, workspace, output)
     assert path.read_text(encoding="utf-8") == before
+
+
+# --------------------------------------------------------------------------
+# TASK-e8f2 : clip stream_split (SPEC-76dc, webcam en haut, jeu en bas)
+# controle selon son vrai format
+# --------------------------------------------------------------------------
+
+SPLIT_WEBCAM = {"x": 0, "y": 100, "w": 1080, "h": 700}
+SPLIT_GAME = {"x": 0, "y": 900, "w": 1080, "h": 800}
+
+
+def make_split_mp4(path, *, black_panel=None, black_seconds=3.5, segment_seconds=1.0, size="1080x1920"):
+    """Fond blanc, deux panneaux rouges (webcam, jeu) ; le panneau nomme par
+    ``black_panel`` ("webcam" | "game") passe au noir pendant ``black_seconds``."""
+    total = round(segment_seconds * 2 + black_seconds, 3)
+    panels = {"webcam": SPLIT_WEBCAM, "game": SPLIT_GAME}
+
+    def seg(dur, black):
+        boxes = ",".join(
+            f"drawbox=x={r['x']}:y={r['y']}:w={r['w']}:h={r['h']}:"
+            f"color={'black' if name == black else 'red'}:t=fill"
+            for name, r in panels.items()
+        )
+        return f"color=c=white:s={size}:r=30:d={dur},{boxes}"
+
+    args = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-f", "lavfi", "-i", seg(segment_seconds, None),
+        "-f", "lavfi", "-i", seg(black_seconds, black_panel),
+        "-f", "lavfi", "-i", seg(segment_seconds, None),
+        "-f", "lavfi", "-i", f"sine=frequency=440:sample_rate=48000:duration={total}",
+        "-filter_complex", "[0:v][1:v][2:v]concat=n=3:v=1:a=0[v]",
+        "-map", "[v]", "-map", "3:a",
+        "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-t", str(total),
+        "-c:a", "aac", "-ar", "48000", str(path),
+    ]
+    subprocess.run(args, check=True)
+    return total
+
+
+def write_split_clip(output_dir, *, black_panel=None, clip_id=CLIP_ID, **overrides):
+    d = output_dir / VIDEO_ID
+    total = make_split_mp4(d / f"{clip_id}.mp4", black_panel=black_panel)
+    fields = {
+        "layout": "stream_split", "webcam_rect": SPLIT_WEBCAM, "video_rect": SPLIT_GAME,
+        "screen_title": "Titre d'ecran du split", "hook_text": "ignore-moi",
+    }
+    fields.update(overrides)
+    fields = {k: v for k, v in fields.items() if v is not _MISSING}
+    (d / f"{clip_id}.json").write_text(
+        json.dumps(clip_json(duration=total, clip_id=clip_id, **fields)), encoding="utf-8",
+    )
+    return d / f"{clip_id}.json"
+
+
+_MISSING = object()
+
+
+def ask_prompt(tmp_path, workspace, output, cfg=None):
+    fake = FakeBackend([no_issue])
+    with llm.use_backend(fake):
+        qa.run(VIDEO_ID, workspace, output, config=cfg or config(tmp_path))
+    return fake.calls[0]
+
+
+def test_split_prompt_has_format_section_without_phantom_hook(tmp_path, dirs):
+    workspace, output = dirs
+    write_split_clip(output)
+    prompt = ask_prompt(tmp_path, workspace, output).prompt
+    assert "## Format" in prompt
+    assert "webcam en haut" in prompt
+    assert "jeu en bas" in prompt
+    assert "badge" in prompt
+    assert "2 premieres secondes" not in prompt
+    assert "ignore-moi" not in prompt
+    assert "Titre d'ecran du split" in prompt
+
+
+def test_split_prompt_without_title_does_not_mention_screen_title(tmp_path, dirs):
+    workspace, output = dirs
+    write_split_clip(output)
+    cfg = Config(
+        mode="auto", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output",
+        _sections={"qa": {"parallel": 1}, "render": {"title_enabled": False}},
+    )
+    prompt = ask_prompt(tmp_path, workspace, output, cfg).prompt
+    assert "## Format" in prompt
+    assert "Titre d'ecran du split" not in prompt
+    assert "2 premieres secondes" not in prompt
+    assert "titre d'ecran affiche" not in prompt.lower()
+
+
+def test_split_schema_keeps_face_cut_and_subtitle_on_face(tmp_path, dirs):
+    workspace, output = dirs
+    write_split_clip(output)
+    call = ask_prompt(tmp_path, workspace, output)
+    enum = call.schema["properties"]["issues"]["items"]["properties"]["type"]["enum"]
+    assert set(enum) == set(qa.DEFECTS)
+
+
+@pytest.mark.parametrize("panel", ["webcam", "game"])
+def test_split_black_screen_measured_on_each_panel(tmp_path, dirs, panel):
+    workspace, output = dirs
+    path = write_split_clip(output, black_panel=panel)
+    with llm.use_backend(FakeBackend([no_issue])):
+        run(tmp_path, workspace, output)
+    assert local_types(path) == {"black_screen"}
+    assert read(path)["qa"]["status"] == "rejected"
+
+
+def test_split_without_black_is_passed(tmp_path, dirs):
+    workspace, output = dirs
+    path = write_split_clip(output)
+    with llm.use_backend(FakeBackend([no_issue])):
+        run(tmp_path, workspace, output)
+    assert read(path)["qa"]["status"] == "passed"
+
+
+@pytest.mark.parametrize("missing", ["webcam_rect", "video_rect"])
+def test_split_missing_rect_raises(tmp_path, dirs, missing):
+    workspace, output = dirs
+    path = write_split_clip(output, **{missing: _MISSING})
+    before = path.read_text(encoding="utf-8")
+    with llm.use_backend(FakeBackend([])):
+        with pytest.raises(qa.QAError, match=missing):
+            run(tmp_path, workspace, output)
+    assert path.read_text(encoding="utf-8") == before
+
+
+@pytest.mark.parametrize("rects", [
+    {"webcam_rect": {"x": 0, "y": 100, "w": 1080, "h": 3000}},
+    {"video_rect": {"x": 0, "y": 600, "w": 1080, "h": 800}},
+    {"webcam_rect": {"x": 0, "y": 100, "w": 0, "h": 700}},
+])
+def test_split_invalid_rect_raises(tmp_path, dirs, rects):
+    workspace, output = dirs
+    write_split_clip(output, **rects)
+    with llm.use_backend(FakeBackend([])):
+        with pytest.raises(qa.QAError):
+            run(tmp_path, workspace, output)
+
+
+# Prompts figes d'avant TASK-e8f2 : letterbox, stream et crop ne changent pas.
+_LETTERBOX_PROMPT_PARTS = (
+    "## Format\n"
+    "Clip letterbox : titre d'ecran sur encadre blanc en haut, video zoomee au centre "
+    "(fond flou de la video autour), sous-titres dans la bande du bas. Le zoom rogne "
+    "volontairement les bords et les sous-titres sont hors de l'image : normal, ne "
+    "pas le signaler.\n\n",
+    "Titre d'ecran affiche en permanence (accroche) : T\n",
+)
+_STREAM_PROMPT_PARTS = (
+    "## Format\n"
+    "Clip stream : titre d'ecran sur encadre blanc en haut, la facecam (webcam du "
+    "createur) agrandie dessous, le jeu ou l'ecran en bas, sous-titres sur le jeu.\n\n",
+    "Titre d'ecran affiche en permanence (accroche) : T\n",
+)
+_CROP_PROMPT_HOOK = "Texte d'accroche affiche les 2 premieres secondes : H\n"
+
+
+def _prompt_for(**fields):
+    clip = clip_json(duration=3.0, **fields)
+    return qa._prompt(clip, [(Path("a.jpg"), 0.0, ["debut"])], letterbox=clip.get("layout") == "letterbox")
+
+
+def test_letterbox_stream_crop_prompts_unchanged():
+    letterbox = _prompt_for(layout="letterbox", screen_title="T", hook_text="H")
+    assert all(part in letterbox for part in _LETTERBOX_PROMPT_PARTS)
+    stream = _prompt_for(layout="stream", screen_title="T", hook_text="H")
+    assert all(part in stream for part in _STREAM_PROMPT_PARTS)
+    crop = _prompt_for(layout="crop", hook_text="H")
+    assert _CROP_PROMPT_HOOK in crop
+    assert "## Format" not in crop
+    single = _prompt_for(layout="single", hook_text="H")
+    assert _CROP_PROMPT_HOOK in single and "## Format" not in single

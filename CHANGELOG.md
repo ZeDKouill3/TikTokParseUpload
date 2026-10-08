@@ -21,6 +21,7 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ### Corrigé
 
+- QA d'un clip `stream_split` (revue r-adr 08/10, M1) : contrôlé selon son vrai format (SPEC-76dc). Le prompt ne parle plus d'un texte d'accroche affiché les 2 premières secondes (rien n'est dessiné) : section `## Format` (webcam en haut, jeu en bas, badge éventuel entre les deux) et titre d'écran seulement si `[render] title_enabled`. L'écran noir est mesuré sur chacun des deux panneaux (`webcam_rect`, `video_rect`), validés comme en stream ; rectangle absent ou invalide = erreur explicite, jamais l'image entière. `face_cut` et `subtitle_on_face` restent demandés (la webcam montre le visage). Letterbox, stream et crop inchangés.
 - Veille (revue r-veille-stats 08/10) : une VOD Twitch déjà en file ou vue n'est plus reproposée au relevé suivant
   (l'id que le worker lui donne, `v2893407960`, est comparé en plus de l'id source). Une exception inattendue du choix
   de Claude est écrite dans l'état du jour (journal ERROR, `finished_at`, aucune proposition inventée) au lieu de
