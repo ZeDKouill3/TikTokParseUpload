@@ -1,8 +1,8 @@
 """Regression pour TASK-2562 : ecriture atomique de l'etat robuste face a un
-PermissionError transitoire sur Path.replace (Windows, fichier lu par un
+PermissionError transitoire sur os.replace (Windows, fichier lu par un
 autre processus au meme instant : CLI de progression, interface web).
 
-Ne depend pas de la plateforme : Path.replace est monkeypatche pour lever
+Ne depend pas de la plateforme : os.replace est monkeypatche pour lever
 PermissionError a volonte, sans avoir a reproduire un vrai verrou de fichier.
 """
 
@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 
 import pytest
 
-from clipper import llm, pipeline
+from clipper import channel, llm, pipeline
 from clipper.config import Config
 from clipper.llm.fake import FakeBackend
 
@@ -39,24 +40,24 @@ def _patch_noop_steps(monkeypatch, *, except_name=None, except_fn=None):
 
 
 def _flaky_replace(fail_times: int | None):
-    """Remplace Path.replace : leve PermissionError `fail_times` fois (ou
+    """Remplace os.replace : leve PermissionError `fail_times` fois (ou
     indefiniment si None) avant de retomber sur le vrai replace."""
 
-    real_replace = Path.replace
+    real_replace = os.replace
     calls = {"n": 0}
 
-    def fake_replace(self, target):
+    def fake_replace(src, target):
         calls["n"] += 1
         if fail_times is None or calls["n"] <= fail_times:
             raise PermissionError(13, "Acces refuse (simule)")
-        return real_replace(self, target)
+        return real_replace(src, target)
 
     return fake_replace, calls
 
 
 def test_save_state_retries_on_transient_permission_error(tmp_path, monkeypatch):
     fake_replace, calls = _flaky_replace(fail_times=2)
-    monkeypatch.setattr(Path, "replace", fake_replace)
+    monkeypatch.setattr(os, "replace", fake_replace)
     sleeps = []
     monkeypatch.setattr(pipeline.time, "sleep", lambda s: sleeps.append(s))
 
@@ -66,14 +67,14 @@ def test_save_state_retries_on_transient_permission_error(tmp_path, monkeypatch)
     path = pipeline.save_state(state, config=config)
 
     assert calls["n"] == 3
-    assert sleeps == [pipeline._REPLACE_DELAY_S, pipeline._REPLACE_DELAY_S]
+    assert sleeps == [channel._REPLACE_DELAY_S, channel._REPLACE_DELAY_S]
     saved = json.loads(path.read_text(encoding="utf-8"))
     assert saved["video_id"] == VIDEO_ID
 
 
 def test_save_state_raises_after_persistent_permission_error(tmp_path, monkeypatch):
     fake_replace, calls = _flaky_replace(fail_times=None)
-    monkeypatch.setattr(Path, "replace", fake_replace)
+    monkeypatch.setattr(os, "replace", fake_replace)
     monkeypatch.setattr(pipeline.time, "sleep", lambda s: None)
 
     config = _config(tmp_path)
@@ -82,11 +83,34 @@ def test_save_state_raises_after_persistent_permission_error(tmp_path, monkeypat
     with pytest.raises(PermissionError):
         pipeline.save_state(state, config=config)
 
-    assert calls["n"] == pipeline._REPLACE_ATTEMPTS
+    assert calls["n"] == channel._REPLACE_ATTEMPTS
     # Pas de perte silencieuse : le fichier final n'existe pas, seul le
     # fichier temporaire (donnee non publiee) est present.
     final = tmp_path / "workspace" / VIDEO_ID / pipeline.STATE_FILE
     assert not final.exists()
+    assert not list(final.parent.glob("*.tmp"))
+
+
+def test_set_aside_review_retries_then_raises_and_keeps_the_file(tmp_path, monkeypatch):
+    video_dir = tmp_path / "v"
+    video_dir.mkdir()
+    (video_dir / pipeline.REVIEW_FILE).write_text("{}", encoding="utf-8")
+    fake_replace, calls = _flaky_replace(fail_times=2)
+    monkeypatch.setattr(os, "replace", fake_replace)
+    monkeypatch.setattr(pipeline.time, "sleep", lambda s: None)
+
+    pipeline._set_aside_review(video_dir)
+
+    assert calls["n"] == 3
+    assert not (video_dir / pipeline.REVIEW_FILE).exists()
+    assert len(list(video_dir.glob("review.json.*"))) == 1
+
+    (video_dir / pipeline.REVIEW_FILE).write_text("{}", encoding="utf-8")
+    fake_replace, calls = _flaky_replace(fail_times=None)
+    monkeypatch.setattr(os, "replace", fake_replace)
+    with pytest.raises(PermissionError):
+        pipeline._set_aside_review(video_dir)
+    assert (video_dir / pipeline.REVIEW_FILE).exists()  # jamais perdu en silence
 
 
 # --------------------------------------------------------------------------
@@ -297,3 +321,35 @@ def test_process_queue_vanished_channel_logs_and_keeps_the_video_waiting(tmp_pat
     state = pipeline.load_state(VIDEO_ID, config=config)
     assert state["status"] == "queued"
     assert "disparue" in state["reason"]
+
+
+def test_set_aside_review_is_stable_with_a_concurrent_reader_30_times(tmp_path):
+    """Un lecteur qui rouvre review.json en boucle (antivirus, API web) ne fait
+    ni echouer ni sauter la mise de cote : 30 tours, jamais de review.json
+    perime a la fin."""
+    import threading
+
+    video_dir = tmp_path / "v"
+    video_dir.mkdir()
+    review = video_dir / pipeline.REVIEW_FILE
+    stop = threading.Event()
+
+    def reader():
+        while not stop.is_set():
+            try:
+                review.read_bytes()
+            except OSError:
+                pass
+
+    thread = threading.Thread(target=reader, daemon=True)
+    thread.start()
+    try:
+        for _ in range(30):
+            review.write_text("{}", encoding="utf-8")
+            pipeline._set_aside_review(video_dir)
+            assert not review.exists()
+            for aside in video_dir.glob("review.json.*"):
+                aside.unlink()
+    finally:
+        stop.set()
+        thread.join()

@@ -16,6 +16,12 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ### Corrigé
 
+- Écritures d'état robustes sous Windows : `pipeline` remplace ses fichiers via `channel.replace_retrying` (le mécanisme
+  de `channel.atomic_write_json`, 20 essais de 50 ms au lieu de 5, erreur d'origine relevée si le verrou persiste,
+  fichier temporaire supprimé) ; le `.tmp` porte pid et thread (plus de vol entre worker et API web). La mise de côté
+  de `review.json` (moments refait) utilise le même réessai et ne dépend plus d'un test d'existence préalable : un
+  lecteur concurrent ne la fait plus échouer ni sauter (échecs sous charge de `test_run_respecte_lordre_des_etapes` et
+  `test_forced_moments_sets_aside_the_stale_review_json`).
 - Vision : un lot sauvé dans `vision_partial.json` enregistre les chemins d'images qu'il couvre et n'est repris que
   si ce sont les mêmes que ceux du lot recalculé (sinon, moments refait, il décrivait d'autres images) ; avec
   `--force`, le fichier est ignoré et supprimé. Pipeline : quand l'étape moments est refaite en mode review,
