@@ -125,6 +125,10 @@ CONFIG_DEFAULTS: dict[str, object] = {
     # reglage (TASK-db6f : perdre au plus une tranche et le detecter en
     # quelques minutes, pas tout recommencer apres le timeout global de 900 s).
     "fix_timeout_s": 360,
+    # Longueur (caracteres, sans espaces) au-dela de laquelle un « mot » whisper
+    # est une hallucination sur la musique (ex. « Tantantan... » de 420
+    # caracteres) : il est retire, journalise et compte (TASK-a64a).
+    "hallucination_word_max_chars": 40,
 }
 
 log = logging.getLogger(__name__)
@@ -227,6 +231,46 @@ def _settings(config: Any) -> dict[str, Any]:
 
         config = load_config()
     return {**CONFIG_DEFAULTS, **config.section("transcribe")}
+
+
+def _check_hallucination_word_max_chars(settings: dict[str, Any]) -> int:
+    bound = settings["hallucination_word_max_chars"]
+    if not isinstance(bound, int) or isinstance(bound, bool) or bound < 1:
+        raise TranscribeError(
+            f"[transcribe] hallucination_word_max_chars = {bound!r} : attendu un entier >= 1"
+        )
+    return bound
+
+
+def _drop_hallucinated_words(segments: list[dict[str, Any]], max_chars: int) -> int:
+    """Retire de ``segments`` (en place) les mots plus longs que ``max_chars``
+    caracteres (espaces retires) ; le texte du segment est reconstruit, un
+    segment sans mot restant disparait. Chaque retrait est journalise.
+    Renvoie le nombre de mots retires."""
+    removed = 0
+    kept_segments = []
+    for seg in segments:
+        words = []
+        dropped = False
+        for w in seg["words"]:
+            core = "".join(w["word"].split())
+            if len(core) > max_chars:
+                removed += 1
+                dropped = True
+                log.warning(
+                    "mot whisper retire (hallucination) a %.2f s : %d caracteres, debut %r",
+                    w["start"], len(core), core[:40],
+                )
+            else:
+                words.append(w)
+        if not words and seg["words"]:
+            continue
+        if dropped:
+            seg["words"] = words
+            seg["text"] = "".join(w["word"] for w in words)
+        kept_segments.append(seg)
+    segments[:] = kept_segments
+    return removed
 
 
 def _ask_vocab(meta: dict[str, Any], config: Any) -> list[str]:
@@ -725,6 +769,7 @@ def transcribe(
 
     settings = _settings(config)
     _check_vocab_max_tokens(settings)
+    max_word_chars = _check_hallucination_word_max_chars(settings)
     raw_path = video_dir / "transcript_raw.json"
 
     if raw_path.exists() and not force:
@@ -761,6 +806,8 @@ def transcribe(
         tmp_raw.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp_raw.replace(raw_path)
 
+    hallucinated = _drop_hallucinated_words(segments, max_word_chars)
+
     fix_stats = _FixStats()
     if settings["transcript_fix"]:
         chunks = _chunks(segments, int(settings["fix_chunk_words"]))
@@ -777,6 +824,7 @@ def transcribe(
         "vocab": vocab,
         "segments": segments,
         "transcript_fix_refused": fix_stats.refused,
+        "hallucinated_words_removed": hallucinated,
     }
     tmp = out.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(transcript, ensure_ascii=False, indent=2), encoding="utf-8")
