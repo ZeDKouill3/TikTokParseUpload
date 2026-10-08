@@ -17,6 +17,10 @@ param(
     # pour les tests (tests/test_installer.py), la vraie console ecoutant
     # toujours sur 8000.
     [int]$Port = 8000,
+    # Bureau ou chercher Clipper.lnk : meme statut que $Port, seulement un
+    # point d'injection pour les tests (un test ne doit jamais toucher le vrai
+    # Bureau). Vide = dossier Bureau de l'utilisateur.
+    [string]$Bureau = "",
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$RawArgs = @()
 )
@@ -30,6 +34,11 @@ function Fail {
         Write-Host "  remede : $Remedy" -ForegroundColor Red
     }
     exit 1
+}
+
+function Get-CheminNormalise {
+    param([string]$Chemin)
+    return [IO.Path]::GetFullPath($Chemin).TrimEnd('\')
 }
 
 function Test-ConsolePortListening {
@@ -72,7 +81,11 @@ if (-not $hasInstallMarker) {
     Fail "aucune installation Clipper sous $App (install.json absent)" "passe --app <dossier app> ou verifie l'installation"
 }
 
-$desktop = [Environment]::GetFolderPath("Desktop")
+if ($Bureau) {
+    $desktop = $Bureau
+} else {
+    $desktop = [Environment]::GetFolderPath("Desktop")
+}
 $shortcut = Join-Path $desktop "Clipper.lnk"
 
 Write-Host "Desinstallation : $App sera supprime"
@@ -84,6 +97,39 @@ if (Test-Path $installJsonPath) {
     $info = Get-Content -Path $installJsonPath -Raw | ConvertFrom-Json
     if ($info.data) {
         $data = [string]$info.data
+    }
+}
+
+# Pointeur %LOCALAPPDATA%\Clipper\install.json (pose par install.ps1 Step11,
+# toujours a cet emplacement fixe, meme avec --app personnalise). Il n'est
+# retire que s'il designe CE $App ; un pointeur d'une autre installation ou
+# illisible est laisse, et le dit (ADR-ad2e : aucun repli silencieux).
+$pointerDir = Join-Path $env:LOCALAPPDATA "Clipper"
+$pointerPath = Join-Path $pointerDir "install.json"
+$pointerSupprime = $false
+$pointerRaison = ""
+if (Test-Path $pointerPath) {
+    $pointerApp = $null
+    try {
+        $pointerInfo = Get-Content -Path $pointerPath -Raw | ConvertFrom-Json
+        $pointerApp = [string]$pointerInfo.app
+    } catch {
+        $pointerApp = $null
+    }
+    if (-not $pointerApp) {
+        $pointerRaison = "illisible ou sans champ app"
+    } elseif ((Get-CheminNormalise $pointerApp) -ieq (Get-CheminNormalise $App)) {
+        $pointerSupprime = $true
+    } else {
+        $pointerRaison = "autre installation : $pointerApp"
+    }
+    if ($pointerSupprime) {
+        Write-Host "Desinstallation : $pointerPath sera supprime"
+    } else {
+        Write-Host "Desinstallation : $pointerPath laisse ($pointerRaison)" -ForegroundColor Yellow
+        if ($pointerRaison -like "illisible*") {
+            Write-Host "  remede : verifie ou supprime ce fichier a la main, il n'est pas lu par cette desinstallation" -ForegroundColor Yellow
+        }
     }
 }
 
@@ -112,6 +158,15 @@ if (Test-Path $shortcut) {
 }
 if ($removeData -and $data -and (Test-Path $data)) {
     Remove-Item -Recurse -Force -Path $data
+}
+
+if ($pointerSupprime -and (Test-Path $pointerPath)) {
+    Remove-Item -Force -Path $pointerPath
+    # Le dossier %LOCALAPPDATA%\Clipper ne part que vide : il peut contenir
+    # autre chose (autre installation, fichiers de l'utilisateur).
+    if ((Test-Path $pointerDir) -and -not (Get-ChildItem -Force -Path $pointerDir)) {
+        Remove-Item -Force -Path $pointerDir
+    }
 }
 
 Write-Host "Desinstallation terminee." -ForegroundColor Green
