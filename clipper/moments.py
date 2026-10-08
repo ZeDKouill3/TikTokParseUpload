@@ -814,18 +814,22 @@ def _action_material(
     return f"{parole}\n{mesures}\nImages : {images}"
 
 
-def _first_real_word(sents: list[Sentence], included: list[int], word_max_chars: int) -> float | None:
+def _first_real_word(
+    sents: list[Sentence], included: list[int], word_max_chars: int, since: float = 0.0,
+) -> float | None:
     """Debut du premier mot retenu des phrases ``included`` : un mot sans
-    espace de plus de ``word_max_chars`` caracteres est ignore. Phrase sans
-    horodatage des mots : ses mots comptent au debut de la phrase."""
+    espace de plus de ``word_max_chars`` caracteres est ignore, et un mot
+    horodate avant ``since`` ne compte pas. Phrase sans horodatage des mots :
+    ses mots comptent au debut de la phrase, ou a ``since`` si elle commence
+    avant."""
     for k in included:
         sent = sents[k]
         if sent.words:
             for t, w in sent.words:
-                if w.strip() and len(w.strip()) <= word_max_chars:
+                if w.strip() and len(w.strip()) <= word_max_chars and t >= since - 1e-6:
                     return t
         elif any(len(w) <= word_max_chars for w in sent.text.split()):
-            return sent.start
+            return max(sent.start, since)
     return None
 
 
@@ -864,7 +868,10 @@ def _action_candidate(
 
     included = [k for k in range(len(sents)) if sents[k].start >= start - 1e-6 and sents[k].end <= end + 1e-6]
     hook_text, cut, speech = "", "", None
-    first_word = _first_real_word(sents, included, word_max_chars)
+    # une phrase deja commencee au debut du passage et qui continue dedans
+    # compte pour la mesure de la parole, sans changer l'accroche
+    straddling = [k for k in range(len(sents)) if sents[k].start < start - 1e-6 < sents[k].end]
+    first_word = _first_real_word(sents, straddling + included, word_max_chars, start)
     if first_word is not None and first_word - start > max_silent_start + 1e-6:
         reason = (
             f"la parole commence trop tard : premier mot a +{first_word - start:.1f} s du debut du passage "
