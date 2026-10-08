@@ -381,3 +381,22 @@ def test_series_clip_ids_groups_parts_and_leaves_single_clips_alone(isolated_cwd
 
     assert ws_mod.series_clip_ids(VID, "01-p2", isolated_cwd / "output") == ["01-p1", "01-p2"]
     assert ws_mod.series_clip_ids(VID, "05-p1", isolated_cwd / "output") == ["05-p1"]
+
+
+def test_workspace_owns_extract_video_id_and_download_reexports_it():
+    # Le parseur d'id vit dans un module sans etape ; download le reexporte (meme objet).
+    from clipper import download, workspace
+
+    assert workspace.extract_video_id("https://youtu.be/dQw4w9WgXcQ") == "dQw4w9WgXcQ"
+    assert workspace.extract_video_id("https://www.twitch.tv/videos/2887271276") == "v2887271276"
+    assert download.extract_video_id is workspace.extract_video_id
+    assert download.DownloadError is workspace.DownloadError
+
+
+def test_workspace_extract_video_id_raises_workspace_download_error():
+    from clipper.workspace import DownloadError, extract_video_id
+
+    import pytest
+
+    with pytest.raises(DownloadError):
+        extract_video_id("https://example.com/not-youtube")

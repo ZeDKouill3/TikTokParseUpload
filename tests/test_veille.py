@@ -3185,3 +3185,22 @@ def test_session_limit_retries_are_bounded_then_the_failure_is_explicit(tmp_path
 def test_llm_retry_settings_are_validated(tmp_path, key, value):
     with pytest.raises(veille.VeilleError, match=key):
         veille.settings(_make_config(tmp_path, **{key: value}))
+
+
+def test_veille_does_not_import_the_download_step():
+    # ADR-ca9a : la veille est une bibliotheque, jamais l'import d'une etape (download) ;
+    # lu dans le source, import local compris.
+    import ast
+    from pathlib import Path
+
+    source = (Path(veille.__file__)).read_text(encoding="utf-8")
+    imported = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            imported.add(module)
+            imported.update(f"{module}.{alias.name}" for alias in node.names)
+
+    assert "clipper.download" not in imported
