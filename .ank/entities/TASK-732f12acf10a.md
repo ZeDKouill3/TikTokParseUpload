@@ -5,7 +5,7 @@ slug: vision-un-lot-sauv-vision-partial-json-n-est-rep
 title: "Vision : un lot sauvé (vision_partial.json) n'est repris que s'il porte les mêmes images ; review.json périmé écarté quand moments est refait"
 created: 2026-10-07T23:47:32Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/vision.py
   - clipper/pipeline.py
@@ -18,6 +18,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/7a0ee0e9f895@f1f3e31
+    tree: scope/acc8962970e9
+    criteria: 9f89c618f75f
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---

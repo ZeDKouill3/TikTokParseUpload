@@ -526,7 +526,7 @@ def test_partial_file_stays_valid_after_concurrent_batch_writes(tmp_path, video_
 
     partial = json.loads((video_dir / "vision_partial.json").read_text(encoding="utf-8"))
     assert sorted(int(k) for k in partial["batches"]) == [0, 1, 3, 4]
-    assert len(partial["batches"]["0"]) == 1
+    assert len(partial["batches"]["0"]["frames"]) == 1
 
 
 def test_retry_after_batch_failure_does_not_redescribe_completed_batches(tmp_path, video_dir):
@@ -692,3 +692,82 @@ def test_real_llm_describes_a_real_frame(tmp_path, video_dir):
     frames = json.loads(Path(path).read_text(encoding="utf-8"))["frames"]
     assert len(frames) == 5
     assert all(f["description"].strip() for f in frames)
+
+
+# --------------------------------------------------------------------------
+# Revue r-pipeline 08/10 (Important 3) : un lot sauve n'est repris que s'il
+# porte les memes images ; --force ignore et supprime vision_partial.json.
+# --------------------------------------------------------------------------
+
+
+def _fail_on(timecode):
+    def respond(request):
+        if f"{timecode} s" in request.prompt:
+            raise llm.TransientLLMError("quota")
+        return describe_all()(request)
+
+    return respond
+
+
+def test_saved_batch_records_the_image_paths_it_covers(tmp_path, video_dir):
+    with pytest.raises(llm.TransientLLMError):
+        run_vision(tmp_path, [_fail_on("115.0")], batch_size=1, parallel=4)
+
+    partial = json.loads((video_dir / "vision_partial.json").read_text(encoding="utf-8"))
+    assert partial["batches"]["0"]["paths"] == ["frames/f0091.jpg"]
+    assert partial["batches"]["0"]["frames"][0]["timecode"] == 91.0
+
+
+def test_saved_batch_with_other_images_is_recomputed(tmp_path, video_dir):
+    with pytest.raises(llm.TransientLLMError):
+        run_vision(tmp_path, [_fail_on("115.0")], batch_size=1, parallel=4)
+    # moments refait : les fenetres changent, le lot 0 ne couvre plus la meme image
+    write_moments(video_dir, tmp_path, moments=[{"id": 0, "start": 40.0, "end": 60.0, "hook_text": "x"}], rejected=[])
+
+    fake, path = run_vision(tmp_path, [describe_all()], batch_size=1, parallel=4)
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert [f["timecode"] for f in data["frames"]] == [50.0]
+    assert [f["description"] for f in data["frames"]] == ["image a 50.0"]
+    assert len(fake.calls) == 1
+
+
+def test_saved_batch_with_the_same_images_is_reused(tmp_path, video_dir):
+    with pytest.raises(llm.TransientLLMError):
+        run_vision(tmp_path, [_fail_on("115.0")], batch_size=1, parallel=4)
+
+    fake, _ = run_vision(tmp_path, [describe_all()], batch_size=1, parallel=4)
+
+    assert len(fake.calls) == 1  # seul le lot rate
+
+
+def test_force_ignores_and_deletes_the_partial_file(tmp_path, video_dir):
+    from clipper.vision import run
+
+    with pytest.raises(llm.TransientLLMError):
+        run_vision(tmp_path, [_fail_on("115.0")], batch_size=1, parallel=4)
+    assert (video_dir / "vision_partial.json").exists()
+
+    fake = FakeBackend([describe_all()])
+    with llm.use_backend(fake):
+        run(VIDEO_ID, tmp_path / "workspace", config=make_config(tmp_path, vision={"batch_size": 1, "parallel": 4}),
+            force=True)
+
+    assert len(fake.calls) == 5  # les 5 lots redemandes
+    assert not (video_dir / "vision_partial.json").exists()
+
+
+def test_force_deletes_the_partial_file_even_if_the_rerun_fails(tmp_path, video_dir):
+    from clipper.vision import run
+
+    with pytest.raises(llm.TransientLLMError):
+        run_vision(tmp_path, [_fail_on("115.0")], batch_size=1, parallel=4)
+
+    fake = FakeBackend([_fail_on("91.0")])
+    with llm.use_backend(fake), pytest.raises(llm.TransientLLMError):
+        run(VIDEO_ID, tmp_path / "workspace", config=make_config(tmp_path, vision={"batch_size": 1, "parallel": 1}),
+            force=True)
+
+    partial = json.loads((video_dir / "vision_partial.json").read_text(encoding="utf-8"))
+    assert all(len(b["paths"]) == 1 for b in partial["batches"].values())
+    assert len(fake.calls) >= 1

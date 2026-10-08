@@ -16,6 +16,11 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ### Corrigé
 
+- Vision : un lot sauvé dans `vision_partial.json` enregistre les chemins d'images qu'il couvre et n'est repris que
+  si ce sont les mêmes que ceux du lot recalculé (sinon, moments refait, il décrivait d'autres images) ; avec
+  `--force`, le fichier est ignoré et supprimé. Pipeline : quand l'étape moments est refaite en mode review,
+  `review.json` (décisions indexées par moment) est renommé avec horodatage (journal INFO) au lieu d'être appliqué
+  aux moments renumérotés (revue r-pipeline 08/10, Important 3 et 4).
 - Publication : un post réussi est toujours tracé (revue r-publish 08/10). Le sidecar est réécrit avec les mêmes
   réessais sous Windows que la file (`channel.atomic_write_json`) ; `mark_published` écrit d'abord l'état de file
   (preuve que le post est parti), puis le sidecar : un échec d'écriture est journalisé ERROR avec le `post_url` et
