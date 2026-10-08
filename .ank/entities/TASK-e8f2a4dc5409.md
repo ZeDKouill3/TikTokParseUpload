@@ -5,7 +5,7 @@ slug: qa-un-clip-stream-split-webcam-en-haut-jeu-en-ba
 title: "QA : un clip stream_split (webcam en haut, jeu en bas) est contrôlé selon son vrai format (prompt, accroche, écran noir par panneau)"
 created: 2026-10-08T01:53:43Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/qa.py
   - tests/test_qa.py
@@ -16,6 +16,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/f3f44000fdc7@5bf5e22
+    tree: scope/458afc137185
+    criteria: 8bcf61ab72fc
+    verifier: tests@c7b454d16c90
+    via: verifier
 schema: 4
-version: 1
+version: 5
 ---
