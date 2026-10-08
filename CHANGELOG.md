@@ -16,6 +16,9 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ### Corrigé
 
+- Coach des prompts du jury : le résultat réel d'un clip publié vient de ses vues (`views_percentile` à maturité, entrées
+  `stats` portant `video_id`/`moment_id`, comme la calibration) et non plus de qa + décision, qui valait 1,0 pour tout
+  clip publié. Un clip publié sans statistique mûre est exclu des cas, jamais un 1,0 par défaut (revue r-veille-stats I4).
 - Publication : un post réussi est toujours tracé (revue r-publish 08/10). Le sidecar est réécrit avec les mêmes
   réessais sous Windows que la file (`channel.atomic_write_json`) ; `mark_published` écrit d'abord l'état de file
   (preuve que le post est parti), puis le sidecar : un échec d'écriture est journalisé ERROR avec le `post_url` et

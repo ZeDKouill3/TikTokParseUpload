@@ -25,9 +25,9 @@ Deroulement, par juge (``conformite`` est toujours exclu, ADR-1cf0 point 5,
 jamais coache meme s'il figure dans ``judges`` ou ``cases``) :
 
 1. Relie chaque cas a son resultat reel (0-1) via le journal des resultats
-   (clipper.outcomes, entrees ``kind: result`` seulement : qa et decision
-   humaine, moyennees si les deux sont presentes ; les statistiques de
-   plateforme n'existent pas encore dans ce journal, ADR-1cf0 point 1).
+   (clipper.outcomes, entrees ``kind: stats`` portant video_id/moment_id :
+   ``views_percentile`` a maturite, comme la calibration ; un clip publie
+   sans statistique mure n'a pas de resultat et n'est pas un cas).
    Moins de ``min_cases`` cas relies pour ce juge : pas de proposition
    (raison ``pas assez de cas connus``), rien n'est demande a clipper.llm.
 2. Deja ``max_lessons_per_judge`` versions adoptees pour ce juge (fichiers
@@ -93,9 +93,7 @@ CONFIG_DEFAULTS: dict[str, object] = {
 # des resultats (ADR-1cf0 point 5).
 EXCLUDED_JUDGES = ("conformite",)
 
-_QA = {"passed": 1.0, "rejected": 0.0}
-_POSITIVE_DECISIONS = ("accepted", "approved", "adjusted")
-_NEGATIVE_DECISIONS = ("rejected",)
+_METRIC = "views_percentile"
 _VERSION_RE = re.compile(r"^v(\d+)\.md$")
 
 
@@ -114,29 +112,22 @@ def _at(value: str) -> datetime:
 
 
 def _real_outcomes(journal: list[dict[str, Any]], since: datetime) -> dict[tuple[Any, Any], float]:
-    """(video_id, moment_id) -> resultat reel (0-1), moyenne de qa et de la
-    decision humaine sur les entrees ``result`` du journal depuis ``since``."""
+    """(video_id, moment_id) -> resultat reel (0-1) : ``views_percentile`` des
+    entrees ``stats`` du journal depuis ``since`` qui portent ``video_id`` et
+    ``moment_id`` (rang des vues a maturite, clipper.learning), moyenne s'il
+    y en a plusieurs. Un clip sans statistique mure n'a pas de resultat :
+    qa et decision humaine ne valent rien pour un clip publie (toujours 1,0),
+    ils ne sont jamais un repli (ADR-ad2e)."""
     values: dict[tuple[Any, Any], list[float]] = defaultdict(list)
     for e in journal:
-        if e.get("kind") != "result" or _at(e["recorded_at"]) < since:
+        if e.get("kind") != "stats" or _at(e["recorded_at"]) < since:
             continue
-        signals: list[float] = []
-        qa = e.get("qa")
-        if qa is not None:
-            status = qa.get("status")
-            if status not in _QA:
-                raise CoachError(f"statut qa inconnu {status!r} (clip {e.get('clip_id')!r})")
-            signals.append(_QA[status])
-        decision = e.get("human_decision")
-        if decision is not None:
-            if decision in _POSITIVE_DECISIONS:
-                signals.append(1.0)
-            elif decision in _NEGATIVE_DECISIONS:
-                signals.append(0.0)
-            else:
-                raise CoachError(f"decision humaine inconnue {decision!r} (clip {e.get('clip_id')!r})")
-        if signals:
-            values[(e["video_id"], e["moment_id"])].extend(signals)
+        if e.get("video_id") is None or e.get("moment_id") is None:
+            continue
+        percentile = (e.get("stats") or {}).get(_METRIC)
+        if percentile is None:
+            continue
+        values[(e["video_id"], e["moment_id"])].append(float(percentile))
     return {k: sum(v) / len(v) for k, v in values.items()}
 
 
