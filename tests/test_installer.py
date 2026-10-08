@@ -193,12 +193,18 @@ def run_step9_launcher(tmp_path: Path, root: Path, *, data_name: str = "data") -
 
 
 def run_desinstaller(
-    root: Path, args: list[str], env: dict[str, str] | None = None, port: int | None = None
+    root: Path,
+    args: list[str],
+    env: dict[str, str] | None = None,
+    port: int | None = None,
+    bureau: Path | None = None,
 ) -> subprocess.CompletedProcess:
     desinstaller_ps1 = root / "installer" / "desinstaller.ps1"
     cmd = [POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(desinstaller_ps1)]
     if port is not None:
         cmd += ["-Port", str(port)]
+    if bureau is not None:
+        cmd += ["-Bureau", str(bureau)]
     cmd += list(args)
     return subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=120)
 
@@ -627,6 +633,142 @@ def test_desinstaller_refuses_when_console_port_listens(installer_dir: Path, lis
     assert result.returncode != 0
     assert str(listening_port) in result.stdout
     assert app_dir.exists()
+
+
+# --------------------------------------------------------------------------
+# (5bis) desinstaller.ps1 : pointeur %LOCALAPPDATA%\Clipper\install.json
+# (TASK-8cb4893794e7). LOCALAPPDATA est redirige vers tmp_path, jamais le vrai.
+# --------------------------------------------------------------------------
+
+
+def _pointer_env(tmp_path: Path) -> tuple[dict[str, str], Path, Path]:
+    fake_localappdata = tmp_path / "localappdata"
+    pointer_dir = fake_localappdata / "Clipper"
+    pointer_dir.mkdir(parents=True)
+    env = dict(os.environ)
+    env["LOCALAPPDATA"] = str(fake_localappdata)
+    return env, pointer_dir, pointer_dir / "install.json"
+
+
+def _make_app_under(pointer_dir: Path) -> Path:
+    app_dir = pointer_dir / "app"
+    app_dir.mkdir()
+    (app_dir / "install.json").write_text(
+        json.dumps({"app": str(app_dir), "data": str(pointer_dir / "data"), "version": NEW_VERSION}),
+        encoding="utf-8",
+    )
+    return app_dir
+
+
+def test_pointer_for_same_app_is_listed_removed_in_dry_run(tmp_path: Path, installer_dir: Path) -> None:
+    env, pointer_dir, pointer = _pointer_env(tmp_path)
+    app_dir = _make_app_under(pointer_dir)
+    pointer.write_text(json.dumps({"app": str(app_dir), "version": NEW_VERSION}), encoding="utf-8")
+
+    result = run_desinstaller(installer_dir, ["--app", str(app_dir), "--dry-run"], env=env, port=_free_port())
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"{pointer} sera supprime" in result.stdout
+    assert pointer.exists()
+
+
+def test_pointer_for_same_app_matches_case_insensitively(tmp_path: Path, installer_dir: Path) -> None:
+    env, pointer_dir, pointer = _pointer_env(tmp_path)
+    app_dir = _make_app_under(pointer_dir)
+    pointer.write_text(json.dumps({"app": str(app_dir).upper(), "version": NEW_VERSION}), encoding="utf-8")
+
+    result = run_desinstaller(installer_dir, ["--app", str(app_dir), "--dry-run"], env=env, port=_free_port())
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"{pointer} sera supprime" in result.stdout
+
+
+def test_pointer_for_other_app_is_kept_with_reason(tmp_path: Path, installer_dir: Path) -> None:
+    env, pointer_dir, pointer = _pointer_env(tmp_path)
+    app_dir = _make_app_under(pointer_dir)
+    other_app = tmp_path / "autre-app"
+    pointer.write_text(json.dumps({"app": str(other_app), "version": NEW_VERSION}), encoding="utf-8")
+
+    result = run_desinstaller(installer_dir, ["--app", str(app_dir), "--dry-run"], env=env, port=_free_port())
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"{pointer} laisse" in result.stdout
+    assert "autre installation" in result.stdout
+    assert pointer.exists()
+
+
+def test_unreadable_pointer_gets_explicit_message_and_is_kept(tmp_path: Path, installer_dir: Path) -> None:
+    env, pointer_dir, pointer = _pointer_env(tmp_path)
+    app_dir = _make_app_under(pointer_dir)
+    pointer.write_text("{pas du json", encoding="utf-8")
+
+    result = run_desinstaller(installer_dir, ["--app", str(app_dir), "--dry-run"], env=env, port=_free_port())
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"{pointer} laisse" in result.stdout
+    assert "illisible" in result.stdout
+    assert pointer.exists()
+
+
+def test_no_pointer_means_nothing_listed_for_pointer(tmp_path: Path, installer_dir: Path) -> None:
+    env, pointer_dir, pointer = _pointer_env(tmp_path)
+    app_dir = _make_app_under(pointer_dir)
+
+    result = run_desinstaller(installer_dir, ["--app", str(app_dir), "--dry-run"], env=env, port=_free_port())
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert str(pointer) not in result.stdout
+
+
+def test_real_run_removes_same_app_pointer_and_empty_clipper_dir(tmp_path: Path, installer_dir: Path) -> None:
+    env, pointer_dir, pointer = _pointer_env(tmp_path)
+    app_dir = _make_app_under(pointer_dir)
+    bureau = tmp_path / "bureau"
+    bureau.mkdir()
+    pointer.write_text(json.dumps({"app": str(app_dir), "version": NEW_VERSION}), encoding="utf-8")
+
+    result = run_desinstaller(
+        installer_dir, ["--app", str(app_dir)], env=env, port=_free_port(), bureau=bureau
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not app_dir.exists()
+    assert not pointer.exists()
+    assert not pointer_dir.exists()
+
+
+def test_real_run_keeps_clipper_dir_when_not_empty(tmp_path: Path, installer_dir: Path) -> None:
+    env, pointer_dir, pointer = _pointer_env(tmp_path)
+    app_dir = _make_app_under(pointer_dir)
+    bureau = tmp_path / "bureau"
+    bureau.mkdir()
+    (pointer_dir / "reste.txt").write_text("autre chose", encoding="utf-8")
+    pointer.write_text(json.dumps({"app": str(app_dir), "version": NEW_VERSION}), encoding="utf-8")
+
+    result = run_desinstaller(
+        installer_dir, ["--app", str(app_dir)], env=env, port=_free_port(), bureau=bureau
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not pointer.exists()
+    assert (pointer_dir / "reste.txt").exists()
+
+
+def test_real_run_keeps_pointer_of_other_app(tmp_path: Path, installer_dir: Path) -> None:
+    env, pointer_dir, pointer = _pointer_env(tmp_path)
+    app_dir = _make_app_under(pointer_dir)
+    bureau = tmp_path / "bureau"
+    bureau.mkdir()
+    other_app = tmp_path / "autre-app"
+    pointer.write_text(json.dumps({"app": str(other_app), "version": NEW_VERSION}), encoding="utf-8")
+
+    result = run_desinstaller(
+        installer_dir, ["--app", str(app_dir)], env=env, port=_free_port(), bureau=bureau
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert pointer.exists()
+    assert not app_dir.exists()
 
 
 # --------------------------------------------------------------------------
