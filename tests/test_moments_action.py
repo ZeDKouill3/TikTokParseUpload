@@ -557,3 +557,36 @@ def test_invalid_speech_start_settings_are_a_moments_error(tmp_path, video_dir, 
     write_action(video_dir)
     with pytest.raises(MomentsError, match=name):
         go(tmp_path, rubric_path, [], **{name: value})
+
+
+def straddle(video_dir, *, with_words=True):
+    """Phrase commencee a 6.25 s et qui dure jusqu'a 18.05 s : elle chevauche le
+    debut d'un passage d'action a 10.25 s (sans horodatage des mots si demande)."""
+    t = make_transcript()
+    t["segments"] = [s for s in t["segments"] if s["id"] not in (1, 2, 3)]
+    words = [{"word": f" lo{i}", "start": 6.25 + i, "end": 6.25 + i + 0.8, "probability": 0.9}
+             for i in range(12)] if with_words else []
+    text = "".join(w["word"] for w in words) if with_words else " une longue phrase qui continue."
+    t["segments"].append({"id": 1, "start": 6.25, "end": 18.05, "text": text, "words": words})
+    t["segments"].sort(key=lambda s: s["start"])
+    (video_dir / "transcript.json").write_text(json.dumps(t), encoding="utf-8")
+
+
+def test_a_sentence_begun_before_the_passage_counts_as_speech_from_its_start(tmp_path, video_dir, rubric_path):
+    straddle(video_dir)  # mots horodates continus, parole a 10.25 s dans la phrase
+    write_action(video_dir, passage(10.25, 44.65, speech_ratio=0.68))
+
+    go(tmp_path, rubric_path, [{"moments": []}, rate(GOOD)])
+
+    [m] = read_moments(video_dir)["moments"]
+    assert m["source"] == "action"
+
+
+def test_a_sentence_begun_before_the_passage_without_word_timing_counts_as_speech(tmp_path, video_dir, rubric_path):
+    straddle(video_dir, with_words=False)
+    write_action(video_dir, passage(10.25, 44.65, speech_ratio=0.68))
+
+    go(tmp_path, rubric_path, [{"moments": []}, rate(GOOD)])
+
+    [m] = read_moments(video_dir)["moments"]
+    assert m["source"] == "action"
