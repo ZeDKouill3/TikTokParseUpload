@@ -554,8 +554,16 @@ class _Flow:
                 button = modal.query_selector(self.sel["modal"]["button"].format(label=label))
                 if button is None:
                     raise self.stop("element_missing", f"fenêtre connue « {fragment} » sans son bouton « {label} »")
-                button.click()
+                button.click(timeout=float(self.settings["click_timeout_s"]) * 1000)   # jamais les 30 s de Playwright
                 logger.info("TikTok %s : fenêtre connue « %s » fermée par « %s »", self.account, fragment, label)
+                if self.settings["content_check"] == "wait" and self.sel["modal"]["content_check_popup"].casefold() in fragment.casefold():
+                    # « Annuler » refuse seulement l'activation automatique proposee par TikTok : il ne change pas
+                    # l'interrupteur « Vérification de contenu simple », que le parcours controle et attend ensuite
+                    # ([tiktok] content_check = "wait"). Jamais « Activer » (le programme n'active rien a la place de
+                    # l'utilisateur) ; la politique n'est pas modifiee en silence : elle est dite ici.
+                    logger.warning("TikTok %s : fenêtre « %s » fermée par « %s » ; la vérification de contenu demandée "
+                                   "([tiktok] content_check = \"wait\") reste contrôlée par le parcours, rien n'est désactivé",
+                                   self.account, fragment, label)
         raise self.stop("unexpected_page", f"fenêtres surgissantes qui reviennent après {MAX_POPUP_ROUNDS} fermetures")
 
     # -- actions
