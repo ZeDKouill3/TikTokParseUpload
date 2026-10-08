@@ -570,7 +570,7 @@ def _coach_world(config, n=12, *, traced=True, at=NOW - timedelta(days=1)) -> No
         path.write_text(json.dumps(side), encoding="utf-8")
         outcomes.record(VIDEO, clip_id, k, qa={"status": "passed" if k % 2 == 0 else "rejected", "issues": []}, path=journal)
         outcomes._append({"kind": "stats", "video_id": VIDEO, "clip_id": clip_id, "moment_id": k, "recorded_at": at.isoformat(),
-                          "stats": {"views_percentile": 0.5}}, journal)
+                          "stats": {"views_percentile": 1.0 if k % 2 == 0 else 0.0}}, journal)
         wrong = 0 if k % 2 == 0 else 100  # note passee a l'envers du resultat reel
         trace = {"rounds": [{"round": 1, "judges": {j: {"score": wrong, "argument": "..."} for j in JUDGES}}]}
         moments.append({"id": k, "jury": {"trace": trace}} if traced else {"id": k})

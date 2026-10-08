@@ -5,7 +5,7 @@ slug: coach-des-prompts-du-jury-les-r-sultats-r-els-de
 title: "Coach des prompts du jury : les résultats réels des clips publiés viennent des vues (stats), plus d'un 1,0 constant"
 created: 2026-10-08T00:03:52Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/jury_coach.py
   - tests/test_jury_coach.py
@@ -16,6 +16,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/fd02fa05e0a4@33370a4
+    tree: scope/1d1cad2e47cf
+    criteria: 21c9afba45bc
+    verifier: tests@c7b454d16c90
+    via: verifier
 schema: 4
-version: 1
+version: 5
 ---

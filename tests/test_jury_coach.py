@@ -38,7 +38,20 @@ def write_journal(entries, path="state/outcomes.jsonl"):
             f.write(json.dumps(e) + "\n")
 
 
+def stats_entry(video_id, moment_id, percentile, *, at=None, with_ids=True):
+    """Releve mur d'un clip publie (clipper.learning) : rang des vues dans le compte."""
+    return {
+        "kind": "stats",
+        "video_id": video_id if with_ids else None,
+        "clip_id": f"{video_id}-{moment_id}",
+        "moment_id": moment_id if with_ids else None,
+        "stats": {"views": 1000, "views_percentile": percentile},
+        "recorded_at": (at or NOW - timedelta(days=1)).isoformat(),
+    }
+
+
 def result_entry(video_id, moment_id, *, qa="passed", at=None):
+    """Clip publie : qa + decision vide, vaut passed pour tout clip publie."""
     return {
         "kind": "result",
         "video_id": video_id,
@@ -59,13 +72,14 @@ def trace_for(judge, score):
 
 
 def make_cases(judge="retention", n=6, video_id="v1"):
-    """n cas au resultat reel connu (qa passed/rejected en alternance), avec
+    """n cas au resultat reel connu (percentile de vues 1.0/0.0 en alternance), avec
     une note passee du juge a l'envers du resultat reel : un rejeu qui
     predit juste doit donc faire mieux que l'ancienne perspective."""
     cases, journal = [], []
     for k in range(n):
         outcome_qa = "passed" if k % 2 == 0 else "rejected"
-        journal.append(result_entry(video_id, k, qa=outcome_qa))
+        journal.append(result_entry(video_id, k))
+        journal.append(stats_entry(video_id, k, 1.0 if outcome_qa == "passed" else 0.0))
         wrong_score = 0 if outcome_qa == "passed" else 100
         cases.append(
             {
@@ -248,3 +262,44 @@ def test_conformite_judge_is_never_coached(isolated_cwd):
     assert "conformite" not in [r["judge"] for r in results]
     assert all("conformite" not in (c.usage or "") for c in fake.calls)
     assert not Path("prompts/jury/conformite").exists()
+
+
+# --------------------------------------------------------------------------
+# Resultat reel = vues (stats), jamais qa/decision seuls
+# --------------------------------------------------------------------------
+
+
+def real_outcomes(journal):
+    return jury_coach._real_outcomes(journal, NOW - timedelta(days=90))
+
+
+def test_published_clips_with_different_percentiles_have_different_outcomes():
+    out = real_outcomes([
+        result_entry("v1", 0), stats_entry("v1", 0, 0.9),
+        result_entry("v1", 1), stats_entry("v1", 1, 0.2),
+    ])
+    assert out == {("v1", 0): pytest.approx(0.9), ("v1", 1): pytest.approx(0.2)}
+
+
+def test_published_clip_without_stats_is_excluded_not_one():
+    out = real_outcomes([result_entry("v1", 0), result_entry("v1", 1), stats_entry("v1", 1, 0.4)])
+    assert out == {("v1", 1): pytest.approx(0.4)}
+
+
+def test_stats_without_percentile_or_ids_or_outside_window_are_excluded():
+    no_metric = stats_entry("v1", 0, 0.5)
+    no_metric["stats"]["views_percentile"] = None
+    old = stats_entry("v1", 1, 0.5, at=NOW - timedelta(days=200))
+    out = real_outcomes([no_metric, old, stats_entry("v1", 2, 0.5, with_ids=False)])
+    assert out == {}
+
+
+def test_case_with_only_qa_result_is_not_coached_on_a_constant(isolated_cwd):
+    cases = make_cases(n=6)
+    Path("state/outcomes.jsonl").write_text(
+        "".join(json.dumps(result_entry("v1", k)) + "\n" for k in range(6)), encoding="utf-8")
+    fake = FakeBackend([make_backend({"perspective": NEW_GOOD, "justification": "..."})])
+    with llm.use_backend(fake):
+        results = jury_coach.propose(cases, RUBRIC, {"retention": OLD_RETENTION}, config=make_config(), now=NOW)
+    assert results[0]["accepted"] is False
+    assert results[0]["reason"] == "pas assez de cas connus"
