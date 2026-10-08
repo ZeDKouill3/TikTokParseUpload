@@ -1205,6 +1205,52 @@ def run(
     return _advance(_start(state, config, force, step_options, force_steps=force_steps), through_review=False)
 
 
+def download_only(
+    url: str,
+    *,
+    config: Config | None = None,
+    channel: str | None = None,
+    step_options: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Prechargement (TASK-3c1c) : execute l'etape ``download`` SEULE de ``url`` pendant que le worker traite
+    une autre video. Etape deja ``done`` : rien n'est relance (ADR-b16b). La video n'est ni ``running`` ni
+    ``done`` : seul son etape download change, le statut de la video reste ``pending``. Un echec marque l'etape
+    et la video ``failed`` avec la raison (jamais une video faussement prete, ADR-ad2e) puis leve
+    ``PipelineError`` ; le prochain ``run`` refait le download."""
+    config = config or load_config()
+    try:
+        video_id = download.extract_video_id(url)
+    except download.DownloadError as exc:
+        raise PipelineError(str(exc)) from exc
+    try:
+        state = load_state(video_id, config=config)
+    except PipelineError:
+        state = new_state(video_id, url, config.mode, channel=channel)
+    state["source_url"] = url
+    if channel is not None:
+        state["channel"] = channel
+    step = state["steps"]["download"]
+    if step["status"] == "done":
+        return state
+    run = _Run(state, config, False, step_options)
+    step.update(status="running", reason=None, started_at=_iso(_now()), finished_at=None)
+    save_state(state, config=config)
+    t0 = time.monotonic()
+    try:
+        run.download()
+    except Exception as exc:  # noqa: BLE001 - toute erreur est journalisee dans l'etat
+        reason = f"{type(exc).__name__}: {exc}"
+        step.update(status="failed", reason=reason, finished_at=_iso(_now()))
+        state.update(status="failed", reason=f"download : {reason}", retry_at=None)
+        log.error("%s : prechargement du download en echec : %s", video_id, reason)
+        save_state(state, config=config)
+        raise PipelineError(f"download de {video_id} en echec : {reason}") from exc
+    step.update(status="done", finished_at=_iso(_now()))
+    save_state(state, config=config)
+    log.info("%s : download precharge en %.1fs", video_id, time.monotonic() - t0)
+    return state
+
+
 def render(
     video_id: str,
     *,

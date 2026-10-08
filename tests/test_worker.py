@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 import threading
 from pathlib import Path
@@ -3248,3 +3249,356 @@ def test_an_account_paused_between_takeover_and_post_gets_no_post(tmp_path, monk
     entry = _entries(tmp_path)[0]
     assert entry["status"] == "scheduled" and not entry.get("in_progress_since")
     assert "en pause (manuel)" in entry["waiting_reason"]
+
+
+# --------------------------------------------------------------------------
+# TASK-3c1c : prechargement du download de la VOD suivante pendant le traitement CPU
+# --------------------------------------------------------------------------
+
+VIDEO_C = "CCCCCCCCCCC"
+URL_C = f"https://youtu.be/{VIDEO_C}"
+
+
+class SeqSpawner:
+    """Un faux processus distinct par lancement (pid 7001, 7002...) : l'enfant, puis le prechargement."""
+
+    def __init__(self):
+        self.calls: list[list[str]] = []
+        self.processes: list[FakeProcess] = []
+
+    def __call__(self, cmd: list[str]):
+        self.calls.append(cmd)
+        process = FakeProcess(pid=7000 + len(self.calls))
+        self.processes.append(process)
+        return process
+
+
+def _mark_download_done(config: Config, video_id: str) -> None:
+    state = pipeline.new_state(video_id, f"https://youtu.be/{video_id}", config.mode)
+    state["steps"]["download"]["status"] = "done"
+    pipeline.save_state(state, config=config)
+
+
+def _prefetch_worker(tmp_path, *, waiting=(VIDEO_B, VIDEO_C), download_done=True, **overrides):
+    """File A (lancee au 1er tick) puis les entrees ``waiting`` ; A a (ou non) son download fait."""
+    config = _config(tmp_path, **{"prefetch_min_free_gb": 0, **overrides})
+    _write_queue(config, [_entry(v, f"https://youtu.be/{v}") for v in (VIDEO_A, *waiting)])
+    spawner = SeqSpawner()
+    w = worker.Worker(config=config, spawner=spawner)
+    w.tick()  # lance A
+    if download_done:
+        _mark_download_done(config, VIDEO_A)
+    return config, w, spawner
+
+
+def _by_video(config: Config) -> dict[str, dict]:
+    return {e["video_id"]: e for e in _queue(config)}
+
+
+def test_worker_defaults_declare_the_prefetch_settings():
+    assert worker.CONFIG_DEFAULTS["prefetch_download"] is True
+    assert worker.CONFIG_DEFAULTS["prefetch_min_free_gb"] == 60
+
+
+def test_no_prefetch_while_the_current_video_has_not_finished_its_download(tmp_path):
+    config, w, spawner = _prefetch_worker(tmp_path, download_done=False)
+
+    w.tick()
+    w.tick()
+
+    assert len(spawner.calls) == 1  # seulement A
+    assert "prefetch" not in _by_video(config)[VIDEO_B]
+
+
+def test_prefetch_starts_the_download_alone_of_the_first_waiting_entry_once_the_current_download_is_done(tmp_path):
+    config, w, spawner = _prefetch_worker(tmp_path)
+
+    w.tick()
+
+    assert spawner.calls[1] == [sys.executable, "-m", "clipper", "download", URL_B]
+    entries = _by_video(config)
+    assert entries[VIDEO_B]["prefetch"] == "running"
+    assert entries[VIDEO_B]["prefetch_pid"] == 7002
+    assert entries[VIDEO_B]["status"] == "waiting"  # toujours en file, pas « running »
+    assert entries[VIDEO_A]["status"] == "running"
+    assert "prefetch" not in entries[VIDEO_C]
+
+
+def test_prefetch_command_carries_the_channel_preset_before_the_subcommand(tmp_path):
+    config = _config(tmp_path, prefetch_min_free_gb=0)
+    queued_b = {**_entry(VIDEO_B, URL_B), "channel": "ma_chaine"}
+    _write_queue(config, [_entry(VIDEO_A, URL_A), queued_b])
+    spawner = SeqSpawner()
+    w = worker.Worker(config=config, spawner=spawner)
+    w.tick()
+    _mark_download_done(config, VIDEO_A)
+
+    w.tick()
+
+    assert spawner.calls[1] == [sys.executable, "-m", "clipper", "--config", "presets/ma_chaine.toml", "download", URL_B]
+
+
+def test_prefetch_command_is_accepted_by_the_real_parser(tmp_path):
+    from clipper.__main__ import build_parser
+
+    cmd = worker._build_prefetch_command({**_entry(VIDEO_B, URL_B), "channel": "ma_chaine"})
+    args = build_parser().parse_args(cmd[3:])
+
+    assert (args.config, args.command, args.url) == ("presets/ma_chaine.toml", "download", URL_B)
+
+
+def test_only_one_prefetch_at_a_time(tmp_path):
+    config, w, spawner = _prefetch_worker(tmp_path)
+
+    for _ in range(4):
+        w.tick()
+
+    assert len(spawner.calls) == 2  # A, puis le seul prechargement de B
+    assert "prefetch" not in _by_video(config)[VIDEO_C]
+
+
+def test_no_second_prefetch_after_the_first_one_finished(tmp_path):
+    config, w, spawner = _prefetch_worker(tmp_path)
+    w.tick()
+    spawner.processes[1].finish(0)
+
+    w.tick()
+    w.tick()
+
+    assert len(spawner.calls) == 2  # C n'est pas precharge : seul le premier waiting l'est
+    entries = _by_video(config)
+    assert entries[VIDEO_B]["prefetch"] == "done"
+    assert entries[VIDEO_B]["prefetch_pid"] is None
+    assert "prefetch" not in entries[VIDEO_C]
+
+
+def test_prefetched_entry_is_launched_as_a_normal_run_and_loses_its_prefetch_fields(tmp_path):
+    config, w, spawner = _prefetch_worker(tmp_path)
+    w.tick()
+    spawner.processes[1].finish(0)
+    w.tick()
+    spawner.processes[0].finish(0)  # A termine
+
+    w.tick()
+
+    assert spawner.calls[2] == [sys.executable, "-m", "clipper", "run", URL_B]  # le run saute le download fait
+    entry = _by_video(config)[VIDEO_B]
+    assert entry["status"] == "running"
+    assert "prefetch" not in entry and "prefetch_pid" not in entry
+
+
+def test_current_video_finishing_while_its_successor_is_still_downloading_waits_for_the_download(tmp_path):
+    config, w, spawner = _prefetch_worker(tmp_path)
+    w.tick()  # prechargement de B en cours
+    spawner.processes[0].finish(0)  # A termine avant la fin du download de B
+
+    w.tick()
+    w.tick()
+
+    assert len(spawner.calls) == 2  # B n'est pas lance en `run` pendant qu'il se telecharge
+    assert _by_video(config)[VIDEO_B]["status"] == "waiting"
+    spawner.processes[1].finish(0)
+    w.tick()
+    assert spawner.calls[2] == [sys.executable, "-m", "clipper", "run", URL_B]
+
+
+def test_prefetch_failure_is_logged_visible_and_does_not_fail_the_current_video(tmp_path, caplog):
+    config, w, spawner = _prefetch_worker(tmp_path)
+    w.tick()
+    _pipeline_state(VIDEO_B, config, status="pending")
+    state = pipeline.load_state(VIDEO_B, config=config)  # ecrit par _keep_channel/le prechargement : etat de B
+    state["steps"]["download"].update(status="failed", reason="RuntimeError: reseau coupe")
+    state.update(status="failed", reason="download : RuntimeError: reseau coupe")
+    pipeline.save_state(state, config=config)
+
+    with caplog.at_level("ERROR"):
+        spawner.processes[1].finish(1)
+        w.tick()
+
+    entries = _by_video(config)
+    assert entries[VIDEO_B]["prefetch"] == "failed"
+    assert entries[VIDEO_B]["status"] == "waiting"  # reste dans la file
+    assert entries[VIDEO_A]["status"] == "running"  # la video en cours n'est pas touchee
+    assert spawner.processes[0].poll() is None
+    assert any(VIDEO_B in r.getMessage() and "pr" in r.getMessage() for r in caplog.records)
+    assert pipeline.load_state(VIDEO_B, config=config)["steps"]["download"]["status"] == "failed"
+    w.tick()
+    assert len(spawner.calls) == 2  # pas de nouvel essai tant qu'elle n'est pas la video en cours
+
+
+def test_prefetch_killed_without_writing_its_state_still_leaves_a_visible_failure(tmp_path):
+    config, w, spawner = _prefetch_worker(tmp_path)
+    w.tick()
+    _pipeline_state(VIDEO_B, config, status="pending")
+    state = pipeline.load_state(VIDEO_B, config=config)
+    state["steps"]["download"]["status"] = "running"  # le processus est mort sans rien ecrire de plus
+    pipeline.save_state(state, config=config)
+    spawner.processes[1].finish(3)
+
+    w.tick()
+
+    after = pipeline.load_state(VIDEO_B, config=config)
+    assert after["steps"]["download"]["status"] == "failed"
+    assert "code 3" in after["steps"]["download"]["reason"]
+    assert after["status"] == "failed"
+
+
+def test_failed_prefetched_entry_retries_its_download_when_it_becomes_the_current_video(tmp_path):
+    config, w, spawner = _prefetch_worker(tmp_path)
+    w.tick()
+    spawner.processes[1].finish(1)
+    w.tick()
+    spawner.processes[0].finish(0)
+
+    w.tick()
+
+    assert spawner.calls[2] == [sys.executable, "-m", "clipper", "run", URL_B]
+    assert "prefetch" not in _by_video(config)[VIDEO_B]
+
+
+def test_prefetch_download_false_never_prefetches(tmp_path):
+    config, w, spawner = _prefetch_worker(tmp_path, prefetch_download=False)
+
+    for _ in range(3):
+        w.tick()
+
+    assert len(spawner.calls) == 1
+    assert "prefetch" not in _by_video(config)[VIDEO_B]
+
+
+def test_prefetch_skipped_under_the_free_disk_threshold_with_one_log_line(tmp_path, monkeypatch, caplog):
+    config, w, spawner = _prefetch_worker(tmp_path, prefetch_min_free_gb=60)
+    gb = 1024 ** 3
+    monkeypatch.setattr(worker.shutil, "disk_usage", lambda path: shutil._ntuple_diskusage(500 * gb, 440 * gb, 10 * gb))
+
+    with caplog.at_level("INFO"):
+        w.tick()
+        w.tick()
+
+    assert len(spawner.calls) == 1
+    assert "prefetch" not in _by_video(config)[VIDEO_B]
+    lines = [r.getMessage() for r in caplog.records if "pr" in r.getMessage() and VIDEO_B in r.getMessage()]
+    assert len(lines) == 1 and "10" in lines[0] and "60" in lines[0]
+
+
+def test_prefetch_runs_when_the_free_disk_is_above_the_threshold(tmp_path, monkeypatch):
+    config, w, spawner = _prefetch_worker(tmp_path, prefetch_min_free_gb=60)
+    gb = 1024 ** 3
+    monkeypatch.setattr(worker.shutil, "disk_usage", lambda path: shutil._ntuple_diskusage(500 * gb, 300 * gb, 200 * gb))
+
+    w.tick()
+
+    assert len(spawner.calls) == 2
+
+
+def test_removing_a_prefetching_entry_terminates_its_process(tmp_path, monkeypatch):
+    config, w, spawner = _prefetch_worker(tmp_path)
+    w.tick()
+    killed = []
+    monkeypatch.setattr(worker, "_pid_alive", lambda pid: pid not in [p for p, _ in killed])
+    monkeypatch.setattr(worker.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+
+    worker.remove(VIDEO_B, config=config)
+
+    assert [pid for pid, _ in killed] == [7002]
+    assert VIDEO_B not in _by_video(config)
+    spawner.processes[1].finish(-15)
+    w.tick()  # le worker constate la mort du prechargement d'une entree disparue : rien d'autre n'est ecrit
+    assert VIDEO_B not in _by_video(config)
+
+
+def test_cancelling_a_prefetching_entry_terminates_its_process(tmp_path, monkeypatch):
+    config, w, spawner = _prefetch_worker(tmp_path)
+    w.tick()
+    killed = []
+    monkeypatch.setattr(worker, "_pid_alive", lambda pid: pid not in [p for p, _ in killed])
+    monkeypatch.setattr(worker.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+
+    worker.cancel(VIDEO_B, config=config)
+
+    assert [pid for pid, _ in killed] == [7002]
+    assert VIDEO_B not in _by_video(config)
+
+
+def test_removing_an_entry_resets_the_download_step_left_running_by_the_killed_prefetch(tmp_path, monkeypatch):
+    config, w, spawner = _prefetch_worker(tmp_path)
+    w.tick()
+    _pipeline_state(VIDEO_B, config, status="pending")
+    state = pipeline.load_state(VIDEO_B, config=config)
+    state["steps"]["download"]["status"] = "running"
+    pipeline.save_state(state, config=config)
+    monkeypatch.setattr(worker, "_pid_alive", lambda pid: False)
+
+    worker.remove(VIDEO_B, config=config)
+
+    assert pipeline.load_state(VIDEO_B, config=config)["steps"]["download"]["status"] == "pending"
+
+
+def test_worker_shutdown_terminates_the_prefetch_process(tmp_path, monkeypatch):
+    config, w, spawner = _prefetch_worker(tmp_path)
+    w.tick()
+    killed = []
+    monkeypatch.setattr(worker, "_pid_alive", lambda pid: pid not in [p for p, _ in killed])
+    monkeypatch.setattr(worker.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+
+    w.shutdown()
+
+    assert [pid for pid, _ in killed] == [7002]
+    assert "prefetch" not in _by_video(config)[VIDEO_B]  # sera retente
+
+
+def test_loop_shuts_the_prefetch_down_when_interrupted(tmp_path, monkeypatch):
+    config = _config(tmp_path)
+    w = worker.Worker(config=config, spawner=SeqSpawner())
+    calls = []
+    monkeypatch.setattr(w, "startup", lambda: None)
+    monkeypatch.setattr(w, "shutdown", lambda: calls.append("shutdown"))
+
+    def interrupted():
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(w, "tick", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        w.loop()
+
+    assert calls == ["shutdown"]
+
+
+def test_startup_terminates_a_prefetch_orphaned_by_a_previous_worker_and_clears_its_marker(tmp_path, monkeypatch):
+    config = _config(tmp_path)
+    b = {**_entry(VIDEO_B, URL_B), "prefetch": "running", "prefetch_pid": 8123}
+    done = {**_entry(VIDEO_C, URL_C), "prefetch": "done", "prefetch_pid": None}
+    _write_queue(config, [b, done])
+    killed = []
+    monkeypatch.setattr(worker, "_pid_alive", lambda pid: pid == 8123 and not killed)
+    monkeypatch.setattr(worker.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+
+    worker.Worker(config=config, spawner=SeqSpawner()).startup()
+
+    assert [pid for pid, _ in killed] == [8123]
+    entries = _by_video(config)
+    assert "prefetch" not in entries[VIDEO_B] and "prefetch_pid" not in entries[VIDEO_B]
+    assert entries[VIDEO_C]["prefetch"] == "done"  # un download deja fait reste un fait
+
+
+def test_startup_clears_the_marker_of_a_prefetch_whose_process_is_gone(tmp_path, monkeypatch):
+    config = _config(tmp_path)
+    _write_queue(config, [{**_entry(VIDEO_B, URL_B), "prefetch": "running", "prefetch_pid": 8123}])
+    monkeypatch.setattr(worker, "_pid_alive", lambda pid: False)
+
+    worker.Worker(config=config, spawner=SeqSpawner()).startup()
+
+    assert "prefetch" not in _by_video(config)[VIDEO_B]
+
+
+def test_main_download_command_runs_only_the_download_step(tmp_path, monkeypatch, capsys):
+    from clipper.__main__ import main
+
+    config = _config(tmp_path)
+    monkeypatch.setattr("clipper.__main__.load_config", lambda path="config.toml": config)
+    seen = {}
+    monkeypatch.setattr(pipeline, "download_only", lambda url, *, config: seen.update(url=url, config=config))
+
+    assert main(["download", URL_B]) == 0
+    assert seen == {"url": URL_B, "config": config}
+    assert f"{VIDEO_B} : download termine" in capsys.readouterr().out

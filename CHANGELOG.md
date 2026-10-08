@@ -10,6 +10,19 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ## [Non publié]
 
+### Ajouté
+
+- Préchargement du téléchargement : dès que la vidéo en cours a fini son étape download et passe aux étapes
+  CPU, le worker télécharge (étape download seule, `python -m clipper download <url>`) la première VOD en
+  attente de la file, au plus une à la fois et jamais deux traitements en parallèle. Quand elle devient la vidéo
+  en cours, son download déjà fait n'est pas relancé. Réglages `[worker] prefetch_download` (défaut vrai ; faux =
+  comportement d'avant) et `prefetch_min_free_gb` (défaut 60 : sous cet espace libre sur le disque du workspace,
+  pas de préchargement, une ligne de journal). Un échec est journalisé et visible (étape download et vidéo
+  `failed` dans `pipeline.json`) sans toucher la vidéo en cours ; son download est retenté quand elle passe en
+  cours. `/api/queue` expose `prefetch` (`running`, `done` ou `failed`) sur l'entrée en attente. Retirer ou
+  annuler l'entrée, ou arrêter le worker, termine le processus de préchargement ; au démarrage, un préchargement
+  resté d'un worker arrêté est terminé.
+
 ### Modifié
 
 - Téléchargement plus rapide : yt-dlp télécharge les fragments HLS en parallèle (réglage
