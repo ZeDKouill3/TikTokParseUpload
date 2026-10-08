@@ -27,6 +27,9 @@ CONFIG_DEFAULTS: dict[str, object] = {
     # Coupures reseau (WinError 10054 sur usher.ttvnw.net...) : essais rapproches avant d'echouer.
     "network_retries": 15,
     "network_retry_pause_s": 5,
+    # Fragments HLS/DASH telecharges en parallele par yt-dlp (entier >= 1) : un par un, une VOD
+    # Twitch de 11-21 Go reste a 13-20 Mo/s.
+    "concurrent_fragments": 8,
     # Binaire ffmpeg du remux d'un mp4 fragmente (resolu par le PATH).
     "ffmpeg_bin": "ffmpeg",
 }
@@ -209,6 +212,7 @@ def _ydl_opts(
     cookies_from_browser: str | None,
     js_runtimes: str | None,
     video_id: str,
+    concurrent_fragments: int = 8,
 ) -> dict[str, Any]:
     opts: dict[str, Any] = {
         "format": _FORMAT,
@@ -217,6 +221,7 @@ def _ydl_opts(
         "postprocessors": [{"key": "SponsorBlock", "categories": ["all"]}],
         "quiet": True,
         "noprogress": True,
+        "concurrent_fragment_downloads": concurrent_fragments,
         "progress_hooks": [_progress_hook(video_id, video_dir)],
     }
     if cookies_file:
@@ -340,6 +345,7 @@ def download(
     network_retry_pause_s: float = 5,
     sleep: Callable[[float], None] = time.sleep,
     ffmpeg_bin: str = "ffmpeg",
+    concurrent_fragments: int = 8,
 ) -> dict[str, Any]:
     """Download a YouTube video and write its metadata (ADR-b16b: a step
     reads its inputs and writes workspace/<video_id>/ itself).
@@ -348,6 +354,10 @@ def download(
     re-downloaded; the recorded meta.json is returned as-is instead.
     """
     video_id = extract_video_id(url)
+    if isinstance(concurrent_fragments, bool) or not isinstance(concurrent_fragments, int)             or concurrent_fragments < 1:
+        raise DownloadError(
+            f"[download] concurrent_fragments doit etre un entier >= 1 (recu {concurrent_fragments!r})"
+        )
     video_dir = Path(workspace_dir) / video_id
     meta_file = video_dir / "meta.json"
     video_file = video_dir / f"{video_id}.mp4"
@@ -368,7 +378,10 @@ def download(
         cookies_from_browser = None  # le profil prime sur la lecture des cookies d'un navigateur
 
     video_dir.mkdir(parents=True, exist_ok=True)
-    opts = _ydl_opts(video_dir, cookies_file, cookies_from_browser, js_runtimes, video_id)
+    opts = _ydl_opts(
+        video_dir, cookies_file, cookies_from_browser, js_runtimes, video_id, concurrent_fragments
+    )
+    log.info("%s : telechargement avec %d fragments simultanes", video_id, concurrent_fragments)
     info = _extract_with_retries(
         url, opts, ydl_factory, video_id, network_retries, network_retry_pause_s, sleep
     )
