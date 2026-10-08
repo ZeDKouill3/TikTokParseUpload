@@ -5,7 +5,7 @@ slug: contr-le-webcam-par-clip-le-visage-est-cherch-da
 title: "Contrôle webcam par clip : le visage est cherché dans le recadrage agrandi du rectangle, pas sur l'image entière (vraie webcam sans cadre rejetée à tort, 23/24 clips AION en letterbox)"
 created: 2026-10-08T14:06:37Z
 author: nicoc@zedk_ordi
-status: open
+status: in_progress
 scope:
   - clipper/reframe.py
   - tests/test_reframe.py
@@ -17,5 +17,5 @@ criteria_by: creator
 verify: [tests]
 method: tdd
 schema: 4
-version: 1
+version: 2
 ---
