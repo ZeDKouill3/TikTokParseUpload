@@ -797,6 +797,25 @@ class _Flow:
             elements = [element] if element is not None else []
         return any(e.is_visible() for e in elements)
 
+    def enable_content_check(self) -> None:
+        """Mode ``wait`` : l'interrupteur « Verification de contenu simple » doit etre allume avant d'attendre le
+        resultat, sinon aucun scan ne demarre. Eteint et accessible : allume une fois pour cette video ; deja
+        allume : aucun clic ; grise eteint, introuvable ou refuse : arret R4 tout de suite, sans attendre le delai."""
+        switch = self.page.query_selector(self.sel["selectors"]["content_check_switch"])
+        if switch is None:
+            raise self.stop("element_missing", "interrupteur « Vérification de contenu simple » introuvable : impossible "
+                                               "de savoir si la vérification tourne ([tiktok] content_check = \"wait\")")
+        if switch.is_checked():
+            return
+        if switch.is_disabled():
+            raise self.stop("unexpected_page", "interrupteur « Vérification de contenu simple » grisé alors qu'éteint : "
+                                               "impossible à allumer ([tiktok] content_check = \"wait\")")
+        switch.check(force=True)
+        self.pause()
+        if not switch.is_checked():
+            raise self.stop("unexpected_page", "l'interrupteur « Vérification de contenu simple » n'a pas pu être allumé")
+        logger.info("TikTok %s : interrupteur allumé pour cette vidéo : [tiktok] content_check = wait", self.account)
+
     def await_content_check(self) -> None:
         """Avant le clic final : attend « Aucun probleme constate ». Probleme signale par TikTok : arret de CE clip
         (code ``content_check_refused``, le worker le marque refuse par la plateforme et le compte continue) ; delai
@@ -971,6 +990,7 @@ class _Flow:
         if self.settings["content_check"] == "off":
             self.disable_content_check()
         else:
+            self.enable_content_check()
             self.await_content_check()
         self.post(mode)
 

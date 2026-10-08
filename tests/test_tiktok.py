@@ -239,6 +239,11 @@ class StudioPage(FakePage):
         else:
             self.present.add(sel["visibility_dropdown"])
         self.set_check(check)
+        # Interrupteur « Vérification de contenu simple » : allumé au départ (état du compte) ; ``switch`` garde son
+        # état réel, ``refuse_switch`` : TikTok refuse le changement (l'interrupteur reste éteint).
+        self.switch = {"checked": True, "disabled": False}
+        self.refuse_switch = False
+        self.present.add(sel["content_check_switch"])
         # Reglages par post (apres « Afficher plus ») : etat initial de TikTok (commentaires et reutilisation
         # cochees, contenu IA coupe) ; ``toggles`` garde chaque changement d'etat, jamais un clic « de position ».
         self.options = {"comment_switch": True, "reuse_switch": True, "ai_switch": False}
@@ -267,6 +272,8 @@ class StudioPage(FakePage):
         sel = self.s
         if selector == sel["post_button"]:
             return FakeElement(self, selector, text=self.texts[selector], on_click=self.after_post)
+        if selector == sel["content_check_switch"]:
+            return ContentSwitch(self, selector)
         if selector == sel["calendar_month_title"]:
             return FakeElement(self, selector, text=lambda: MONTHS[self.cal[1] - 1])
         if selector == sel["calendar_year_title"]:
@@ -354,6 +361,26 @@ class StudioPage(FakePage):
     def pick_time(self, hour=None, minute=None):
         h, m = self.time_value.split(":")
         self.time_value = f"{hour if hour is not None else int(h):02d}:{minute if minute is not None else int(m):02d}"
+
+
+class ContentSwitch(FakeElement):
+    """L'interrupteur « Vérification de contenu simple » de la page : état dans ``page.switch``, ``check`` refusé si
+    ``page.refuse_switch``. Chaque clic est journalisé dans ``calls``."""
+
+    def is_checked(self):
+        return self.page.switch["checked"]
+
+    def is_disabled(self):
+        return self.page.switch["disabled"]
+
+    def check(self, **kwargs):
+        self.page.calls.append(("check", self.selector))
+        if not self.page.refuse_switch:
+            self.page.switch["checked"] = True
+
+    def uncheck(self, **kwargs):
+        self.page.calls.append(("uncheck", self.selector))
+        self.page.switch["checked"] = False
 
 
 class FakeToggle(FakeElement):
@@ -942,6 +969,73 @@ def test_content_check_is_also_awaited_for_a_scheduled_post(tmp_path, monkeypatc
     env.page.timeline = [lambda: env.page.set_check("ok")]
     env.publish("scheduled", NOW + timedelta(days=2))
     assert env.page.waits == 1 and env.page.posted == ["scheduled"]
+
+
+# ---------------------------------------------------------------- interrupteur en mode wait (TASK-0c44)
+# Constat réel 08/10 : interrupteur éteint, aucun scan lancé, 900 s d'attente pour rien. En mode wait, le parcours
+# l'allume lui-même une fois pour cette vidéo, puis attend le résultat comme avant.
+
+
+def _switch_selector() -> str:
+    return _sel()["selectors"]["content_check_switch"]
+
+
+def test_wait_turns_the_switch_on_once_then_waits_for_the_result_and_publishes(tmp_path, monkeypatch, caplog):
+    env = Env(tmp_path, monkeypatch, page_kwargs={"check": "running"})
+    env.page.switch["checked"] = False
+    env.page.timeline = [lambda: env.page.set_check("ok")]
+
+    with caplog.at_level("INFO"):
+        result = env.publish()
+
+    checks = [i for i, c in enumerate(env.page.calls) if c == ("check", _switch_selector())]
+    assert len(checks) == 1 and env.page.switch["checked"] is True
+    assert env.page.waits == 1  # attente du résultat, après l'allumage
+    assert checks[0] < env.page.calls.index(("click", _sel()["selectors"]["post_button"]))
+    assert env.page.posted == ["now"] and result["state"] == "published"
+    assert "interrupteur allumé pour cette vidéo : [tiktok] content_check = wait" in caplog.text
+
+
+def test_wait_with_a_greyed_off_switch_is_an_immediate_r4_stop_not_a_900_second_wait(tmp_path, monkeypatch):
+    env = Env(tmp_path, monkeypatch, page_kwargs={"check": "ok"})
+    env.page.switch.update(checked=False, disabled=True)
+
+    with pytest.raises(tiktok.TikTokStop) as stop:
+        env.publish()
+
+    assert stop.value.code == "unexpected_page" and "grisé" in str(stop.value)
+    assert env.page.waits == 0 and env.page.posted == [] and ("check", _switch_selector()) not in env.page.calls
+
+
+def test_wait_without_the_switch_on_the_page_is_an_immediate_element_missing_stop(tmp_path, monkeypatch):
+    env = Env(tmp_path, monkeypatch, page_kwargs={"check": "ok"}, remove=("content_check_switch",))
+
+    with pytest.raises(tiktok.TikTokStop) as stop:
+        env.publish()
+
+    assert stop.value.code == "element_missing" and "introuvable" in str(stop.value)
+    assert env.page.waits == 0 and env.page.posted == []
+
+
+def test_wait_with_the_switch_already_on_never_clicks_it(tmp_path, monkeypatch):
+    env = Env(tmp_path, monkeypatch, page_kwargs={"check": "ok"})
+
+    result = env.publish()
+
+    assert not [c for c in env.page.calls if c[0] in ("check", "uncheck") and c[1] == _switch_selector()]
+    assert env.page.posted == ["now"] and result["state"] == "published"
+
+
+def test_wait_when_tiktok_refuses_the_switch_leaves_it_off_and_is_an_r4_stop(tmp_path, monkeypatch):
+    env = Env(tmp_path, monkeypatch, page_kwargs={"check": "ok"})
+    env.page.switch["checked"] = False
+    env.page.refuse_switch = True
+
+    with pytest.raises(tiktok.TikTokStop) as stop:
+        env.publish()
+
+    assert stop.value.code == "unexpected_page" and "allumé" in str(stop.value)
+    assert env.page.waits == 0 and env.page.posted == []
 
 
 # ---------------------------------------------------------------- fenetres surgissantes (criteres 5 et 7)
@@ -3207,7 +3301,21 @@ def test_a_greyed_switch_is_logged_and_the_wait_continues_without_touching_it(tm
 
 
 def test_a_missing_switch_is_logged_and_the_wait_continues(tmp_path, monkeypatch, caplog):
+    # L'interrupteur est là au départ (allumé, TASK-0c44) puis disparaît pendant l'attente : la relance est
+    # impossible, c'est journalisé et l'attente continue. Introuvable AU DÉPART : arrêt R4 (autre test).
+    switch = RetriggerSwitch()
     env = _stuck_env(tmp_path, monkeypatch, None)
+    sw = _sel()["selectors"]["content_check_switch"]
+    gone = env.page.query_selector
+    seen = []
+
+    def present_once(css):
+        if css == sw:
+            seen.append(css)
+            return switch if len(seen) == 1 else None
+        return gone(css)
+
+    env.page.query_selector = present_once
     env.page.timeline = [None] * 3 + [lambda: env.page.set_check("ok")]
 
     with caplog.at_level("INFO"):
