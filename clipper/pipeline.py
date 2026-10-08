@@ -748,6 +748,11 @@ def _undecided(video_dir: Path) -> list[int]:
     return [i for i in ids if str(i) not in decisions]
 
 
+class _ReviewPending(Exception):
+    """Levee par _apply_review : des moments de parts.json (refait) n'ont pas de decision
+    humaine ; _advance_steps remet la video en awaiting_review."""
+
+
 def _apply_review(run: _Run) -> bool:
     """Applique les decisions humaines avant captions : bornes ajustees dans
     moments.json (parts refait), moments refuses sortis de parts.json. Rend
@@ -768,6 +773,10 @@ def _apply_review(run: _Run) -> bool:
     if adjusted:
         _write_json(moments_path, moments_data)
         parts.run(run.video_id, run.ws, config=run.config, force=True, **run.opts("parts"))
+        # La re-decoupe peut garder un moment rejete au premier passage : l'humain ne l'a jamais
+        # vu, il n'a aucune decision. Retour en attente de revue, jamais de rendu sans decision.
+        if _undecided(run.dir):
+            raise _ReviewPending
 
     parts_path = run.dir / "parts.json"
     parts_data = _read_json(parts_path)
@@ -1069,6 +1078,20 @@ def _advance_steps(run: _Run, *, through_review: bool) -> dict[str, Any]:
         t0 = time.monotonic()
         try:
             getattr(run, name)()
+        except _ReviewPending:
+            state["awaiting"] = _undecided(run.dir)
+            step.update(status="pending", reason=None, started_at=None, finished_at=None)
+            run.current_step = None
+            reason = f"moments {state['awaiting']} sans decision apres re-decoupe, a decider"
+            log.info("%s : %s", run.video_id, reason)
+            state.update(status="awaiting_review", reason=reason)
+            save_state(state, config=config)
+            if through_review:
+                raise PipelineError(
+                    f"decisions manquantes pour les moments {state['awaiting']} de {run.video_id} : "
+                    f"python -m clipper decide {run.video_id} <moment_id> accepted|rejected|adjusted"
+                )
+            return state
         except Exception as exc:  # noqa: BLE001 - toute erreur est journalisee dans l'etat
             log.debug("%s : %s", run.video_id, name, exc_info=True)
             if skipped:

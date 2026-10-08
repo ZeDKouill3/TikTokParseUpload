@@ -2279,3 +2279,65 @@ def test_auto_mode_leaves_review_json_alone(tmp_path, monkeypatch):
 
     assert (video_dir / pipeline.REVIEW_FILE).exists()
     assert not list(video_dir.glob("review.json.*"))
+
+
+# --------------------------------------------------------------------------
+# Revue r-adr I1 : apres une re-decoupe (borne ajustee), un moment que parts
+# garde alors qu'il etait rejete au premier passage n'a aucune decision
+# humaine : la video revient en attente de revue, elle n'echoue pas (KeyError)
+# et rien n'en est rendu (ADR-ad2e).
+# --------------------------------------------------------------------------
+
+
+@no_ffmpeg
+def test_review_moment_kept_by_a_second_split_returns_to_awaiting_review(tmp_path, isolated_cwd, source_video,
+                                                                          monkeypatch):
+    from clipper import pipeline
+
+    config = make_fast_config(tmp_path, mode="review")
+    opts = step_options(source_video)
+    scores = {k: 9 for k in ("hook", "standalone", "payoff", "emotion", "value", "trend")}
+    two = {"moments": [
+        {"hook_text": "GTA six arrive vraiment.", "start": s, "end": e, "format": "single", "part_breaks": [],
+         "justification": "Annonce forte", "scores": scores}
+        for s, e in ((2.0, 6.0), (10.0, 14.0))
+    ]}
+
+    real_run = pipeline.parts.run
+    calls = []
+
+    def flaky_parts(*args, **kwargs):
+        path = real_run(*args, **kwargs)
+        calls.append(path)
+        if len(calls) == 1:  # 1er decoupage : le moment 1 est rejete ; le 2e le garde
+            data = json.loads(path.read_text(encoding="utf-8"))
+            dropped = [m for m in data["moments"] if m["id"] == 1]
+            data["moments"] = [m for m in data["moments"] if m["id"] != 1]
+            data["rejected"] += [{"id": m["id"], "start": m["start"], "end": m["end"],
+                                  "duration": m["duration"], "reason": "rejete au 1er passage"} for m in dropped]
+            path.write_text(json.dumps(data), encoding="utf-8")
+        return path
+
+    monkeypatch.setattr(pipeline.parts, "run", flaky_parts)
+
+    with llm.use_backend(backend(("moments", two))):
+        state = pipeline.run(URL, config=config, step_options=opts)
+    assert state["status"] == "awaiting_review" and state["awaiting"] == [0]
+
+    pipeline.decide(VIDEO_ID, 0, "adjusted", start=2.0, end=8.0, config=config)
+    with llm.use_backend(backend()):
+        with pytest.raises(pipeline.PipelineError, match=r"\[1\]"):
+            pipeline.render(VIDEO_ID, config=config, step_options=opts)
+    state = pipeline.load_state(VIDEO_ID, config=config)
+
+    assert len(calls) >= 2  # la re-decoupe a eu lieu
+    assert state["status"] == "awaiting_review", state
+    assert state["awaiting"] == [1]
+    assert clip_files(tmp_path) == ([], [])
+
+    # Une fois le moment 1 decide, la video reprend et rend les deux moments.
+    pipeline.decide(VIDEO_ID, 1, "accepted", config=config)
+    with llm.use_backend(backend()):
+        state = pipeline.render(VIDEO_ID, config=config, step_options=opts)
+    assert state["status"] == "done", state
+    assert len(state["clips"]) == 2

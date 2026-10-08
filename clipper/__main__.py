@@ -388,7 +388,9 @@ def main(argv: list[str] | None = None) -> int:
                 sections = {**config._sections,
                             "web": {**config._sections.get("web", {}), "host": host, "port": int(port)}}
                 config = dataclasses.replace(config, _sections=sections)
-            worker_proc = _popen([sys.executable, "-m", "clipper", "worker"])
+            # le worker enfant lit la meme config que le serveur (sinon il retomberait sur config.toml)
+            config_args = ["--config", args.config] if args.config is not None else []
+            worker_proc = _popen([sys.executable, "-m", "clipper", *config_args, "worker"])
             try:
                 uvicorn.run(create_app(config=config), host=host, port=int(port))
             finally:
