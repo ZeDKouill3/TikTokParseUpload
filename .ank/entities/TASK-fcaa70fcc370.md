@@ -5,7 +5,7 @@ slug: moments-un-passage-d-action-dont-la-vraie-parole
 title: "Moments : un passage d'action dont la vraie parole commence trop tard est rejeté (parole mesurée sur les mots horodatés, mots géants hallucinés ignorés)"
 created: 2026-10-08T22:24:56Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/moments.py
   - tests/test_moments_action.py
@@ -16,6 +16,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/4256d4f6f1a0@3462abf
+    tree: scope/74c585836530
+    criteria: acde7d038ca2
+    verifier: tests@c7b454d16c90
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---
