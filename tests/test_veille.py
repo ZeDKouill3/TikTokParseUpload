@@ -118,7 +118,7 @@ def test_config_defaults_are_exactly_r1():
         "baseline_days": 7, "history_days": 90, "rise_min_pct": 50, "vod_min_duration_s": 1800,
         "vod_max_age_h": 36, "twitch_top_games": 20, "twitch_vods_per_game": 10,
         "youtube_max_results": 50, "youtube_min_duration_s": 600, "steam_top": 100,
-        "steam_name_lookups_max": 100, "twitch_access_attempts": 5, "twitch_access_retry_pause_s": 3.0, "twitch_client_id": "", "twitch_client_secret": "", "youtube_api_key": "",
+        "steam_name_lookups_max": 100, "twitch_access_attempts": 5, "twitch_access_retry_pause_s": 3.0, "twitch_access_workers": 4, "twitch_client_id": "", "twitch_client_secret": "", "youtube_api_key": "",
         "state_dir": "state/veille", "http_timeout_s": 20,
         "steam_rank_gain_min": 5, "steam_risers_max": 10, "steam_sellers_top": 50,
         "upcoming_days": 14, "release_window_days": 15, "igdb_min_hypes": 5, "igdb_recent_max": 12,
@@ -1152,6 +1152,100 @@ def test_k_failures_then_success_keeps_the_vod(tmp_path):
     assert [c["video_id"] for c in day["candidates"]] == ["v0"]
     counts = day["sources"]["twitch"]["counts"]
     assert (counts["restricted"], counts["unreachable"], counts["untested"]) == (0, 0, 1)
+
+
+@pytest.mark.parametrize("bad", [0, 17, True, 2.5, "4"])
+def test_access_workers_bounds_name_the_key(tmp_path, bad):
+    with pytest.raises(veille.VeilleError, match="twitch_access_workers"):
+        veille.settings(_make_config(tmp_path, twitch_access_workers=bad))
+
+
+def test_access_workers_accept_the_bounds(tmp_path):
+    veille.settings(_make_config(tmp_path, twitch_access_workers=1))
+    veille.settings(_make_config(tmp_path, twitch_access_workers=16))
+
+
+def _many_games(n, vods_per_game=2):
+    """n jeux (g00 le plus regardé, donc le premier de ``games``), chacun avec ``vods_per_game`` VOD (vues décroissantes)."""
+    names = [f"Jeu G{i:02d}" for i in range(n)]
+    vods = [{**_vod(f"g{i:02d}v{j}", game=name), "view_count": 1000 - j} for i, name in enumerate(names)
+            for j in range(vods_per_game)]
+    collectors = _collectors(vods=vods)
+    collectors["twitch"].result["games"] = [{"name": name, "viewers_fr": 5000 - i} for i, name in enumerate(names)]
+    return collectors
+
+
+def test_access_runs_games_in_parallel_but_never_more_than_the_workers_setting(tmp_path):
+    lock = threading.Lock()
+    state = {"now": 0, "max": 0}
+
+    def access(url, timeout_s):
+        with lock:
+            state["now"] += 1
+            state["max"] = max(state["max"], state["now"])
+        threading.Event().wait(0.03)  # time.sleep est neutralisé par la fixture autouse
+        with lock:
+            state["now"] -= 1
+
+    veille.collect(NOW, collectors=_many_games(9, 1), access_check=access,
+                   config=_make_config(tmp_path, max_vods_per_game=1, twitch_access_workers=3))
+    assert state["max"] == 3
+
+
+def test_access_with_one_worker_is_sequential(tmp_path):
+    lock = threading.Lock()
+    state = {"now": 0, "max": 0}
+
+    def access(url, timeout_s):
+        with lock:
+            state["now"] += 1
+            state["max"] = max(state["max"], state["now"])
+        threading.Event().wait(0.01)
+        with lock:
+            state["now"] -= 1
+
+    veille.collect(NOW, collectors=_many_games(4, 1), access_check=access,
+                   config=_make_config(tmp_path, max_vods_per_game=1, twitch_access_workers=1))
+    assert state["max"] == 1
+
+
+def test_parallel_access_gives_the_same_result_as_sequential(tmp_path):
+    outcomes = {
+        "g00v0": veille_sources.AccessRestricted("sub"),
+        "g02v0": ConnectionResetError("WinError 10054"), "g02v1": ConnectionResetError("WinError 10054"),
+        "g03v0": veille_sources.AccessRestricted("sub"), "g03v1": veille_sources.AccessRestricted("sub"),
+        "g05v1": veille_sources.AccessRestricted("sub"),
+    }
+    results = []
+    for workers in (1, 4):
+        sub = tmp_path / f"w{workers}"
+        veille.collect(NOW, collectors=_many_games(7), access_check=FakeAccess(outcomes), access_sleep=lambda s: None,
+                       config=_make_config(sub, max_vods_per_game=1, twitch_access_attempts=2, twitch_access_workers=workers))
+        day = _day(sub)
+        results.append(([c["video_id"] for c in day["candidates"]], day["sources"]["twitch"]["counts"], _access_excluded(sub)))
+    assert results[0] == results[1]
+    assert results[0][0] == ["g00v1", "g01v0", "g04v0", "g05v0", "g06v0"]
+    assert (results[0][1]["restricted"], results[0][1]["unreachable"], results[0][1]["untested"]) == (3, 2, 4)
+
+
+def test_deadline_cuts_the_least_interesting_games_first_when_testing_in_parallel(tmp_path):
+    clock = Clock()
+    barrier = threading.Barrier(2)
+    asked = []
+
+    def access(url, timeout_s):
+        asked.append(url.rsplit("/", 1)[-1])
+        barrier.wait(timeout=5)  # les deux premiers jeux sont en vol ensemble
+        clock.advance(100)  # l'échéance (60 s) est passée pour tout essai suivant
+
+    state = veille.collect(NOW, collectors=_many_games(6, 1), access_check=access, clock=clock,
+                           config=_make_config(tmp_path, max_vods_per_game=1, twitch_access_workers=2,
+                                               veille_deadline_s=DEADLINE_S))
+    assert sorted(asked) == ["g00v0", "g01v0"]
+    assert sorted(c["video_id"] for c in state["candidates"]) == ["g00v0", "g01v0"]
+    assert state["excluded"]["access_deadline"] == 4  # les 4 VOD des jeux les moins utiles : non testées, jamais présumées OK
+    assert state["sources"]["twitch"]["counts"]["deadline"] == 4
+    assert state["sources"]["twitch"]["status"] == "partial"
 
 
 def test_legacy_access_check_max_in_config_is_accepted(tmp_path):

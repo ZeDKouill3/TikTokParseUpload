@@ -56,6 +56,7 @@ import re
 import threading
 import time
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -87,6 +88,7 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "steam_name_lookups_max": 100,
     "twitch_access_attempts": 5,
     "twitch_access_retry_pause_s": 3.0,
+    "twitch_access_workers": 4,  # jeux testés en même temps ; au plus une VOD par jeu à la fois, mêmes essais par VOD
     "steam_sellers_top": 50,
     "twitch_client_id": "",
     "twitch_client_secret": "",
@@ -188,7 +190,7 @@ def settings(config: Config) -> dict[str, object]:
     for key, low, high in (("steam_followers_lookups_max", 0, 60), ("steam_followers_retry_max", 0, 10),
                            ("trend_days", 7, 90), ("steam_reviews_retry_max", 0, 10), ("twitch_history_pages_max", 1, 5),
                            ("twitch_history_retry_max", 0, 10), ("twitch_access_attempts", 1, 10),
-                           ("veille_deadline_s", 60, 3600), ("llm_retry_delay_min", 1, 1440),
+                           ("twitch_access_workers", 1, 16), ("veille_deadline_s", 60, 3600), ("llm_retry_delay_min", 1, 1440),
                            ("llm_retry_max", 0, 20)):
         value = table[key]
         if not isinstance(value, int) or isinstance(value, bool) or not low <= value <= high:
@@ -983,14 +985,19 @@ def _check_twitch_access(
     moins vues, jusqu'à ``max_vods_per_game`` accessibles ; les suivantes ne sont pas testées (``untested``).
     Réservée aux abonnés ou injoignable : écartée, comptée. Échéance passée (R29) : plus aucun essai, les VOD pas
     encore testées sont écartées et comptées ``deadline``, jamais gardées « non vérifiées ».
+    Les jeux sont pris dans l'ordre de ``games`` (celui dont Claude se sert : les plus utiles d'abord) par au plus
+    ``twitch_access_workers`` fils ; chaque jeu reste séquentiel (une VOD à la fois) : le résultat est celui du
+    test séquentiel, seule l'échéance coupe, et elle coupe les derniers jeux de la liste.
     Rend (gardées, {restricted, unreachable, untested, deadline})."""
     wanted = int(table["max_vods_per_game"])  # type: ignore[call-overload]
     attempts = int(table["twitch_access_attempts"])  # type: ignore[call-overload]
     pause_s = float(table["twitch_access_retry_pause_s"])  # type: ignore[arg-type]
     timeout_s = float(table["http_timeout_s"])  # type: ignore[arg-type]
-    counts = {"restricted": 0, "unreachable": 0, "untested": 0, "deadline": 0}
-    dropped: set[str] = set()
-    for game in games:
+    workers = int(table["twitch_access_workers"])  # type: ignore[call-overload]
+
+    def check_game(game: dict[str, Any]) -> tuple[dict[str, int], set[str]]:
+        counts = {"restricted": 0, "unreachable": 0, "untested": 0, "deadline": 0}
+        dropped: set[str] = set()
         vods = [c for c in candidates if c["source"] == "twitch" and c["game_key"] == game["key"]]
         vods.sort(key=lambda c: -(c["view_count"] or 0))  # tri stable : à vues égales, ordre de la source
         accessible = 0
@@ -1005,7 +1012,17 @@ def _check_twitch_access(
             else:
                 counts[outcome] += 1
                 dropped.add(candidate["id"])
-    return [c for c in candidates if c["id"] not in dropped], counts
+        return counts, dropped
+
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="veille-access") as pool:
+        outcomes = list(pool.map(check_game, games))  # soumis dans l'ordre de ``games``, rendus dans le même ordre
+    totals = {"restricted": 0, "unreachable": 0, "untested": 0, "deadline": 0}
+    dropped_all: set[str] = set()
+    for counts, dropped in outcomes:
+        for name, number in counts.items():
+            totals[name] += number
+        dropped_all |= dropped
+    return [c for c in candidates if c["id"] not in dropped_all], totals
 
 
 def _parse_published(value: str) -> datetime:
