@@ -471,11 +471,11 @@ def run_if_due(now: datetime, *, config: Config | None = None) -> dict[str, Any]
             if not hasattr(exc, "where"):
                 exc.where = "sync"  # type: ignore[attr-defined]
             raise
-        try:
-            write_veille_report(now, config=config)
-        except Exception as exc:
-            exc.where = "veille_report"  # type: ignore[attr-defined]
-            raise
+    try:  # à chaque passage : clips produits et VOD en traitement bougent sans nouveau relevé TikTok
+        write_veille_report(now, config=config)
+    except Exception as exc:
+        exc.where = "veille_report"  # type: ignore[attr-defined]
+        raise
     try:
         coached = coach_if_due(now, config=config)
     except (jury_coach.CoachError, jury.JuryError, llm.LLMError) as exc:
@@ -689,11 +689,25 @@ def _read_state_json(path: Path, default: Any) -> Any:
         raise LearningError(f"fichier d'état de la veille illisible : {path.name} ({path}) : {exc}") from exc
 
 
-def _vod_missing(clips: int, published: int, mature: int, excluded: list[dict[str, Any]]) -> str | None:
+def _processing_videos(config: Config | None) -> set[str]:
+    """VOD encore dans la file du worker (waiting ou running) : leurs clips ne sont pas finis, ce n'est pas un zéro."""
+    if config is not None:
+        path = Path(str(config.section("worker")["queue_path"]))
+    else:
+        from clipper import worker  # import local : worker importe learning
+        path = Path(str(worker.CONFIG_DEFAULTS["queue_path"]))
+    entries = _read_state_json(path, [])
+    try:
+        return {e["video_id"] for e in entries}
+    except (KeyError, TypeError) as exc:
+        raise LearningError(f"file d'attente illisible : {path.name} ({path}) : {exc}") from exc
+
+
+def _vod_missing(clips: int, published: int, mature: int, excluded: list[dict[str, Any]], processing: bool) -> str | None:
     if mature:
         return None
     if clips == 0:
-        return "no_clips"
+        return "processing" if processing else "no_clips"
     if published == 0:
         return "not_published"
     return "account_below_min" if any(e.get("reason") == "account_below_min" for e in excluded) else "immature"
@@ -701,8 +715,8 @@ def _vod_missing(clips: int, published: int, mature: int, excluded: list[dict[st
 
 def write_veille_report(now: datetime, *, config: Config | None = None) -> dict[str, Any]:
     """Écrit ``<[veille] state_dir>/bilan.json`` (SPEC-00db R8) : pour les VOD mises en file (``seen.json``) dans les
-    ``veille_report_days`` derniers jours, au plus ``veille_report_max``, les plus récentes d'abord : clips publiés,
-    clips mûrs, rang moyen et vues max à maturité lus dans les entrées ``stats`` du journal (jamais recalculés), ou
+    ``veille_report_days`` derniers jours, au plus ``veille_report_max``, les plus récentes d'abord : clips produits
+    (sidecars réels de la VOD), ``processing`` (encore dans la file du worker), clips publiés, clips mûrs, rang moyen et vues max à maturité lus dans les entrées ``stats`` du journal (jamais recalculés), ou
     ``missing`` (la raison) et des chiffres ``null``. Le fichier est le contrat avec ``clipper.veille`` (qui ne
     l'importe pas) ; déterministe hors ``computed_at``. Rend le contenu écrit."""
     settings = _settings(config)
@@ -721,6 +735,7 @@ def write_veille_report(now: datetime, *, config: Config | None = None) -> dict[
         if entry.get("kind") == "stats" and entry.get("video_id"):
             stats.setdefault(entry["video_id"], []).append(entry["stats"])
     excluded = _read_sync(settings)["excluded"]
+    processing_videos = _processing_videos(config)
     entries = []
     for item in queued:
         video = item["video_id"]
@@ -738,10 +753,12 @@ def write_veille_report(now: datetime, *, config: Config | None = None) -> dict[
         entries.append({
             "picked_on": item["date"], "candidate_id": item["candidate_id"], "source": candidate.get("source"),
             "game_name": candidate.get("game_name"), "channel_name": candidate.get("channel_name"),
-            "title": candidate.get("title"), "video_id": video, "clips_published": published, "clips_mature": len(rows),
+            "title": candidate.get("title"), "video_id": video, "clips_produced": len(clips), "processing": video in processing_videos,
+            "clips_published": published, "clips_mature": len(rows),
             "views_percentile_mean": sum(ranks) / len(ranks) if ranks else None,
             "views_at_maturity_max": max(views) if views else None,
-            "missing": _vod_missing(len(clips), published, len(rows), [e for e in excluded if e.get("video_id") == video]),
+            "missing": _vod_missing(len(clips), published, len(rows), [e for e in excluded if e.get("video_id") == video],
+                                  video in processing_videos),
         })
     report = {"computed_at": _now_iso(now), "days": settings["veille_report_days"], "entries": entries}
     target = sdir / "bilan.json"
