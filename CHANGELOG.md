@@ -10,10 +10,42 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ## [Non publié]
 
+## [0.6.0] - 2026-10-08
+
+Version autour des formats stream et webcam (zoom, contrôle par clip, visage dans le
+recadrage, cas « aucune webcam »), des styles gaming (candidats d'action), de la fiche
+clip, de l'alerte « 0 vue à 24 h », du préchargement du téléchargement, de la publication
+TikTok (fenêtres superposées, interrupteur de vérification de contenu, post supprimé de la
+plateforme), de la veille (historique de tendance, Steam officiel, calendrier des sorties)
+et de la vitesse (étape scenes, téléchargement, suite de tests). Le zip s'appelle
+`Clipper-portable-0.6.0.zip` ; la mise à jour se fait en relançant `Installer.bat` depuis
+ce zip, tes données ne sont pas touchées. Nouveaux réglages par table :
+`[worker]` : `prefetch_download`, `prefetch_min_free_gb` ;
+`[download]` : `concurrent_fragments`, `fragment_retries`, `ffmpeg_bin` ;
+`[scenes]` : `detect_parallel`, `detect_chunk_seconds`, `analysis_skip_loop_filter`,
+`extract_batch`, `extract_threads` ;
+`[reframe]` : `facecam_clip_face_margin`, `facecam_clip_face_crop_height`,
+`facecam_clip_face_min_inside`, `facecam_clip_face_min_share`, `facecam_zoom_frames`,
+`facecam_zoom_tile_height`, `facecam_face_stable_share` ;
+`[tiktok]` : `click_timeout_s` ;
+`[learning]` : `zero_view_alert_hours`, `zero_view_alert_max_views`,
+`zero_view_alert_account_min`, `coach_min_new_cases`, `coach_min_interval_days` ;
+`[action]` (table nouvelle, désactivée par défaut) : `enabled`, `max_passage_seconds`,
+`frames_per_passage`, `max_images_per_hour` ;
+`[moments]` : `candidates`, `action_snap_seconds` ; `[gate]` (table optionnelle d'une
+grille : `criterion`, `min`, `unless_criterion`, `unless_min`) ;
+`[veille]` : `twitch_access_workers`, `twitch_access_attempts`, `twitch_access_retry_pause_s`,
+`veille_deadline_s`, `trend_days`, `trend_games_max`, `steam_reviews_*`, `twitch_history_*`,
+`steam_players_lookups_max`, `steam_followers_lookups_max`, `steam_followers_pause_s`,
+`steam_followers_retry_max`, `steam_followers_retry_wait_max_s`, `community_min_steam_players`,
+`community_min_steam_followers`, `community_min_twitch_viewers`, `community_min_hypes`,
+`max_vods_per_game`, `llm_retry_delay_min`, `llm_retry_max` ; `[veille] igdb_min_hypes` vaut
+5 par défaut, et `twitch_access_check_max` et `igdb_releases_max` sont retirés (ignorés
+s'ils restent dans `config.toml`). La veille reste désactivée par défaut.
+
 ### Ajouté
 
 - Fiche par clip : une page (`#/clip/<video_id>/<clip_id>`, lien « Fiche complète » dans le tiroir de l'écran Clips) qui rassemble le clip (titre, score et critères, raison, passage dans la VOD, QA), le jury, la publication (compte, statut, créneau, lien du post) et les relevés TikTok du post. `GET /api/clips/{video_id}/{clip_id}/sheet` est en lecture seule. Une vidéo supprimée (`.mp4` absent) garde la fiche avec la mention « vidéo supprimée, fiche conservée » ; une donnée absente s'affiche « inconnu », jamais 0.
-
 - Apprentissage : alerte « 0 vue à 24 h » sur le tableau de bord (section « Posts à 0 vue ») et une ligne WARNING
   par post (`state/learning/zero_views.json`, une seule fois). Lit les relevés TikTok déjà faits, sans réseau :
   un post en ligne depuis `zero_view_alert_hours` (24) dont le dernier relevé donne au plus
@@ -28,7 +60,6 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
   la plateforme » et supprimable par « Supprimer la sélection ». Le sidecar porte `removed_from_platform` :
   `clipper.learning` n'y rattache aucun post, n'en verse ni résultat ni statistiques, ne le compte ni en
   calibration ni dans le bilan veille (jamais un résultat à 0 vue). Refus 409 sur une entrée non publiée ou en cours.
-
 - Préchargement du téléchargement : dès que la vidéo en cours a fini son étape download et passe aux étapes
   CPU, le worker télécharge (étape download seule, `python -m clipper download <url>`) la première VOD en
   attente de la file, au plus une à la fois et jamais deux traitements en parallèle. Quand elle devient la vidéo
@@ -39,117 +70,6 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
   cours. `/api/queue` expose `prefetch` (`running`, `done` ou `failed`) sur l'entrée en attente. Retirer ou
   annuler l'entrée, ou arrêter le worker, termine le processus de préchargement ; au démarrage, un préchargement
   resté d'un worker arrêté est terminé.
-
-### Modifié
-
-- Étape scenes plus rapide, résultat identique : profil sur un extrait réel de 25 min de la VOD ARC
-  (10 fenêtres de parole, 284 images clés) = détection 29,4 s (décodage ffmpeg, plancher), extraction
-  des images clés 23,5 s, soit 45 % du temps. Le score de contenu (`ContentDetector`) se calcule en
-  un `absdiff` + `sumElems` sur les trois canaux HSV au lieu de trois passes numpy int32 (mêmes
-  entiers, mêmes opérations, scores identiques flottant pour flottant), la lecture du tube ffmpeg se
-  fait par blocs de 32 images, et les images clés sortent par lots (`[scenes] extract_batch`, défaut 8,
-  un seul processus ffmpeg et une seule ouverture du fichier par lot, 1 = un processus par image) avec
-  `[scenes] extract_threads` (défaut 2, 0 = défaut ffmpeg) fils de décodage par processus au lieu de
-  tous les coeurs disputés par `extract_parallel` processus. Mesure avant/après (extrait 25 min,
-  PC à vide, 2 passes) : 53,0 s -> 43,9 s (-17 %), extraction 23,5 s -> 16,5 s (-30 %), détection
-  29,4 s -> 27,3 s (-7 %) ; `scenes.json` identique octet pour octet et les 284 jpg identiques.
-  Extrapolation à la VOD ARC de 294 min (6093 images clés) : extraction ~8,4 min -> ~5,9 min, soit
-  environ 19 min -> ~16 min pour l'étape ; le reste est le décodage ffmpeg, déjà au plancher.
-
-- Téléchargement plus rapide : yt-dlp télécharge les fragments HLS en parallèle (réglage
-  `[download] concurrent_fragments`, entier >= 1, défaut 8, refus explicite sinon) au lieu d'un par un
-  (constat du 08/10 : VOD Twitch de 11-21 Go à 13-20 Mo/s, plus de 14 min). Le nombre de fragments simultanés
-  est journalisé au début du téléchargement. Format, merge mp4, remux fMP4 et reprises réseau inchangés.
-
-- Étape scenes plus rapide : les fenêtres de détection sont analysées par au plus `detect_parallel` processus ffmpeg (défaut 4) ; une fenêtre de plus de `detect_chunk_seconds` (défaut 600 s) est découpée en morceaux contigus détectés en parallèle puis recollés (la scène à cheval sur une jointure est fusionnée, aucune coupure inventée). `analysis_skip_loop_filter` (défaut vrai) ajoute `-skip_loop_filter all` à l'entrée de la détection seulement, jamais à l'extraction des images clés. Un ffmpeg en échec fait échouer l'étape (`ScenesError` nommant la fenêtre) et arrête les autres ; le journal donne fenêtres, parallélisme, durée de détection et d'extraction.
-
-### Corrigé
-
-- TikTok : `[tiktok] content_check = "wait"` ne lance plus de scan dans le vide. L'interrupteur « Vérification de contenu simple » éteint est allumé une fois pour cette vidéo avant d'attendre le résultat (log « interrupteur allumé pour cette vidéo »), au lieu d'attendre 900 s pour rien. Interrupteur déjà allumé : aucun clic. Grisé alors qu'éteint, introuvable ou refusé : arrêt R4 immédiat, sans attente ni publication. `off` inchangé (TASK-0c44).
-- Fiche clip lisible : les libellés ne se coupent plus lettre par lettre, le contrôle qualité affiche le type, la sévérité et le détail de chaque problème (au lieu de « [object Object] »), les créneaux et publications sont à l'heure de Paris au format court français, et le compte s'affiche par son nom avec son id en secondaire (« inconnu » s'il n'existe plus).
-
-- TikTok : deux fenêtres superposées (bulle « Nouvelles fonctionnalités » sous « Activer les vérifications automatiques ») : `close_popups` ferme une fenêtre à la fois, la plus haute d'abord (dernière dans le DOM), puis relit les fenêtres visibles ; le clic sur la bulle du dessous était intercepté par l'overlay du dessus. Un arrêt R4 avec capture enregistre aussi le HTML de la page à côté (`.html`) ; un échec d'écriture du HTML est journalisé sans masquer l'arrêt d'origine. Jamais « Activer », jamais de clic de repli (TASK-0bc5).
-
-- Reframe : la réponse « aucune webcam » de Claude n'est plus refusée quand plusieurs visages stables viennent du jeu (menus, ARC Raiders sur PS5) : seul un unique candidat stable ET persistant sur les périodes de la vidéo la contredit ; les visages non persistants sont écartés (warning avec les candidats, raison écrite dans la période), plusieurs persistants restent une erreur explicite (TASK-5979).
-- Format stream : le contrôle webcam par clip (webcam repérée sur le seul visage) cherche le visage dans le recadrage agrandi du rectangle, plus sur l'image entière (TASK-0cb1). Mesure réelle v2894178473 (AION 2) : visage trouvé sur 2 images clés sur 41 en image entière (mediapipe courte portée, visage de 60-80 px sur 1920x1080), 39 sur 41 dans le recadrage ; 23 clips sur 24 passaient à tort en letterbox. Réglages `[reframe]` : `facecam_clip_face_margin` (0,25 : marge par côté, fraction du rectangle), `facecam_clip_face_crop_height` (720 : hauteur d'agrandissement en px) et `facecam_clip_face_min_inside` (0,9 : part de la boîte du visage qui doit tomber dans le rectangle ; une webcam déplacée en gardait 0,64 à 0,73, la bonne 1,0). Les 7 clips du constat de TASK-9957 (v2894232594 00-02, v2894088024 03/04/06/09) restent en letterbox, vérifié sur leurs images clés réelles.
-
-- Mineurs de la revue du 08/10 (TASK-2d9a) : (1) un relevé TikTok lancé depuis l'écran et fini après un tour du worker n'est plus ignoré par l'apprentissage jusqu'au relevé suivant : le rattachement et le versement suivent les fichiers de relevé déjà traités (`snapshots` dans `links.json` et `sync.json`), plus la comparaison de `fetched_at` (pris au début du relevé) avec le dernier passage ; (2) `llm.model` de l'état du jour de la veille est le modèle réellement utilisé (`clipper.llm.model_for`), plus l'alias de la config ou `null` ; (3) le rejeu des prompts du coach utilise le modèle du juge concerné, comme le jugement réel ; (4) un appel LLM de la veille ou du coach fait par le worker n'est plus compté dans `llm_usage.jsonl` de la vidéo en reprise : chacun écrit dans son propre journal (`state/veille/llm_usage.jsonl`, `state/learning/llm_usage.jsonl`) ; (5) `review.json` mis de côté est horodaté en UTC explicite (suffixe `Z`), plus l'heure locale du PC.
-
-- Veille : le test d'accès des VOD Twitch finit avant l'échéance. Mesure (état du jour du 08/10, relevé de 11:59 Paris) : 61 VOD sur 191 testées (10 réservées, 5 injoignables, le reste accessible) en moins de 480 s, soit au plus ~7,9 s par VOD, pauses de 3 s des réessais comprises (mesure réelle de yt-dlp non refaite hors CI). Les jeux sont maintenant testés en parallèle borné (`[veille] twitch_access_workers`, défaut 4, de 1 à 16), dans l'ordre de `games` (celui dont Claude se sert : les plus utiles d'abord) ; chaque jeu reste séquentiel (une VOD à la fois, mêmes essais et mêmes pauses sur 10054, aucune requête de plus). `veille_deadline_s` reste la garde : elle coupe les derniers jeux de la liste, leurs VOD restent « non testées » (comptées `deadline`), jamais présumées accessibles. Résultat identique au test séquentiel.
-
-- Veille : le bilan des choix passés transmis à Claude compte les vrais clips produits. Il ne disait « aucun clip »
-  pour des VOD AION 2 qui en avaient donné des dizaines : le bilan n'était recalculé qu'après un nouveau relevé TikTok
-  (donc figé avant que les clips existent) et n'exposait que les clips publiés. Il est recalculé à chaque passage du
-  worker et distingue VOD en traitement (encore dans la file), clips produits, clips publiés et vues à maturité ;
-  une donnée manquante est dite inconnue, jamais comptée 0.
-- Localisation webcam : Claude voit vraiment le contenu de chaque candidat (constat 08/10, pilote v2894103366 re-rendu : webcam de 90x65 px sur la planche, chiffres « 6 » et « 5 » dessinés dessus, réponse « aucune webcam » et 17 clips sur 18 en letterbox alors que le candidat 6 avait un visage sur 23 images clés). Les numéros sont maintenant dans une pastille collée hors du rectangle ; une seconde image (`facecam/period_N_zoom.jpg`) agrandit chaque candidat, une ligne par numéro, sur `facecam_zoom_frames` images (défaut 3, `facecam_zoom_tile_height` 240 px) ; la liste texte dit « visage détecté sur N image(s) clé(s) ». Garde-fou local symétrique : une réponse « aucune webcam » alors qu'un unique candidat a support et visage sur au moins `facecam_face_stable_share` du plus grand support est remplacée par ce candidat (avertissement, `override` avec `from: null` dans `facecam.json`) ; plusieurs candidats stables : erreur explicite ; aucun : « aucune webcam » conservée.
-- Localisation webcam : un cadre sans aucun visage (bannière de sponsor animée, constat 08/10 pilote v2894103366 : cadre 212x150 choisi à la place de la vraie webcam, ~11 clips rendus avec la bannière) n'est plus retenu quand un candidat visage stable existe. Chaque candidat cadre porte maintenant le nombre d'images clés avec un visage dedans (`face_support`, transmis à Claude dans la liste des rectangles : « aucun visage vu dedans »), et un choix de cadre à zéro visage est remplacé localement par l'unique candidat visage vu sur au moins `[reframe] facecam_face_stable_share` (défaut 0,8) du plus grand support, avec un avertissement et `override` dans `facecam.json` ; plusieurs candidats visage stables : erreur explicite. Sans candidat visage stable, une webcam sans visage reste possible (règle SPEC-8257/76dc inchangée). Aucune règle par streamer ou jeu.
-
-- Stream split : un clip dont le panneau webcam ne montre pas la webcam (scène sans caméra, écran de pause où la caméra a bougé) n'est plus rendu en split mais en letterbox. Quand la webcam a été localisée sur le seul visage (aucun bord réel à retrouver), le contrôle par clip exige désormais un visage dans le rectangle sur au moins `[reframe] facecam_clip_face_min_share` (défaut 0,5) des images clés, raison journalisée sinon ; avant, un jeu qui bouge passait pour une webcam vivante (constat 08/10 : 7 clips, mesure réelle 0 % de visage contre 64 à 100 % sur les clips sains). La QA d'un clip `stream_split` demande en plus le défaut bloquant `empty_webcam` (panneau webcam sans visage ni webcam sur la majorité des images) ; les autres formats ne changent pas.
-
-- Écritures JSON atomiques : `scenes.json`, `audio.json`, `meta.json`, `thumbnail.json` et le fichier des
-  poids du jury passent par un fichier temporaire puis un remplacement (avec les réessais Windows
-  existants) ; un arrêt en pleine écriture ne laisse plus un JSON tronqué que l'étape prendrait pour « déjà
-  faite ». Un de ces fichiers déjà tronqué donne une erreur explicite qui nomme le fichier et la commande pour
-  refaire l'étape (`--force`), sans réparation silencieuse.
-- TikTok : la fenêtre « Activer les vérifications automatiques du contenu ? » est réellement fermée avant le nouvel essai de clic (constat du 08/10 sur TwitchClipperTV : arrêt R4, compte décoché). Cause mesurée dans un vrai Chrome : cette fenêtre est un `TUXModal-overlay` sans `role=dialog` ni `aria-modal`, donc le sélecteur `[modal] container` ne la voyait pas et `close_popups` rendait sans rien fermer ; le conteneur reconnaît maintenant `.TUXModal-overlay`. Le clic du bouton de la fenêtre porte aussi `click_timeout_s` (il n'avait que les 30 s de Playwright). Avec `content_check = "wait"`, la fermeture par « Annuler » est signalée en avertissement : elle refuse seulement l'activation automatique proposée par TikTok, ne désactive pas la vérification de contenu demandée (contrôlée ensuite par le parcours) ; jamais « Activer ». Fenêtre inconnue ou second échec : toujours un arrêt R4, jamais de clic de repli.
-- Mode review : après une re-découpe (borne ajustée), un moment que `parts` garde alors qu'il avait été rejeté au premier passage n'a aucune décision humaine ; la vidéo ne finit plus en échec (`KeyError`) mais revient en `awaiting_review` avec ces moments à décider (raison lisible), et rien n'est rendu sans décision (ADR-ad2e). `clipper --config X serve` lance désormais son worker enfant avec le même `--config X` (sans `--config`, inchangé).
-- Tests : la suite complète ne laisse plus ~19 Go dans le dossier temporaire. Les images clés synthétiques de `tests/test_reframe.py` passent de BMP 1920x1080 bruités pixel par pixel (6 Mo l'une) à des PNG sans perte au niveau de compression maximal, avec un fond bruité par cellules décalées au hasard à chaque image ; mêmes assertions, aucun test retiré. Mesure du dossier basetemp d'un run de `tests/test_reframe.py` : 18,4 Go avant (713 Mo à 1,4 Go par test lourd), 145 Mo après (au plus 11 Mo par test). `pyproject.toml` : `tmp_path_retention_policy = "failed"` et `tmp_path_retention_count = 1` ne gardent que les dossiers des tests en échec.
-
-- VOD à trous : yt-dlp ne saute plus un fragment indisponible (`skip_unavailable_fragments` faux, réglage `[download] fragment_retries`, défaut 20) ; un fragment perdu fait échouer le téléchargement (`DownloadError`) au lieu de produire une vidéo avec un trou de pts. L'audio extrait (`transcribe.extract_audio`, `audio`) suit la ligne de temps du conteneur (`aresample=async=1:first_pts=0`, silence dans un trou) : le temps du transcript et de `audio.json` égale le temps pts de `-ss`/scenes/render, plus de sous-titres d'un autre passage. Sans trou, sortie identique à l'échantillon près (±0,1 s de durée).
-
-- QA d'un clip `stream_split` (revue r-adr 08/10, M1) : contrôlé selon son vrai format (SPEC-76dc). Le prompt ne parle plus d'un texte d'accroche affiché les 2 premières secondes (rien n'est dessiné) : section `## Format` (webcam en haut, jeu en bas, badge éventuel entre les deux) et titre d'écran seulement si `[render] title_enabled`. L'écran noir est mesuré sur chacun des deux panneaux (`webcam_rect`, `video_rect`), validés comme en stream ; rectangle absent ou invalide = erreur explicite, jamais l'image entière. `face_cut` et `subtitle_on_face` restent demandés (la webcam montre le visage). Letterbox, stream et crop inchangés.
-- Coach des prompts du jury : le résultat réel d'un clip publié vient de ses vues (`views_percentile` à maturité, entrées
-  `stats` portant `video_id`/`moment_id`, comme la calibration) et non plus de qa + décision, qui valait 1,0 pour tout
-  clip publié. Un clip publié sans statistique mûre est exclu des cas, jamais un 1,0 par défaut (revue r-veille-stats I4).
-- TikTok : une fenêtre connue qui surgit entre la vérification et le clic (ex. « Activer les vérifications automatiques du contenu ? ») n'arrête plus la publication : si le clic est intercepté, les fenêtres connues sont fermées (« Annuler », jamais « Activer ») puis le clic est refait une fois ; une fenêtre inconnue ou un second échec reste un arrêt R4. Nouveau réglage `[tiktok] click_timeout_s` (10 s, au lieu des 30 s de Playwright).
-- Veille (revue r-veille-stats 08/10) : une VOD Twitch déjà en file ou vue n'est plus reproposée au relevé suivant
-  (l'id que le worker lui donne, `v2893407960`, est comparé en plus de l'id source). Une exception inattendue du choix
-  de Claude est écrite dans l'état du jour (journal ERROR, `finished_at`, aucune proposition inventée) au lieu de
-  relancer le relevé à chaque tour du worker. Une limite de session (429) pendant le choix passe `llm.status` à
-  `retry` avec `retry_at` (`llm_retry_delay_min`, défaut 30 min) : seul le choix est refait, sans nouveau relevé, au
-  plus `llm_retry_max` fois (défaut 3), puis l'échec est explicite.
-- Écritures d'état robustes sous Windows : `pipeline` remplace ses fichiers via `channel.replace_retrying` (le mécanisme
-  de `channel.atomic_write_json`, 20 essais de 50 ms au lieu de 5, erreur d'origine relevée si le verrou persiste,
-  fichier temporaire supprimé) ; le `.tmp` porte pid et thread (plus de vol entre worker et API web). La mise de côté
-  de `review.json` (moments refait) utilise le même réessai et ne dépend plus d'un test d'existence préalable : un
-  lecteur concurrent ne la fait plus échouer ni sauter (échecs sous charge de `test_run_respecte_lordre_des_etapes` et
-  `test_forced_moments_sets_aside_the_stale_review_json`).
-- Vision : un lot sauvé dans `vision_partial.json` enregistre les chemins d'images qu'il couvre et n'est repris que
-  si ce sont les mêmes que ceux du lot recalculé (sinon, moments refait, il décrivait d'autres images) ; avec
-  `--force`, le fichier est ignoré et supprimé. Pipeline : quand l'étape moments est refaite en mode review,
-  `review.json` (décisions indexées par moment) est renommé avec horodatage (journal INFO) au lieu d'être appliqué
-  aux moments renumérotés (revue r-pipeline 08/10, Important 3 et 4).
-- Publication : un post réussi est toujours tracé (revue r-publish 08/10). Le sidecar est réécrit avec les mêmes
-  réessais sous Windows que la file (`channel.atomic_write_json`) ; `mark_published` écrit d'abord l'état de file
-  (preuve que le post est parti), puis le sidecar : un échec d'écriture est journalisé ERROR avec le `post_url` et
-  l'entrée reste `published`, jamais « en cours » ni republiable par Réessayer. La pause d'un compte est revérifiée
-  après la prise en main, juste avant le publisher : entrée relâchée en attente avec la raison, aucun post.
-- Stats TikTok : les évolutions et pourcentages avec séparateur de milliers (« 4,300.0% », « 4 300,0 % », espaces
-  fines et insécables comprises) sont lus correctement au lieu de faire échouer le relevé (« valeur illisible
-  (tuile views, 7 jours) ») ; « 1,5% » et « 12,5 % » restent des décimales, les formes ambiguës restent refusées.
-- Jury : la re-notation après vision lit la grille enregistrée dans `moments.json` (`rubric.path`) et non celle du style (un style changé de grille entre moments et vision ne provoque plus `KeyError: 'action'`) ; grille enregistrée introuvable : erreur explicite, jamais de repli. L'exploration ne repêche plus un candidat éliminé par le seuil `[gate]` (les rejets `min_score` restent repêchables).
-- Téléchargement : une VOD Twitch en mp4 fragmenté (fMP4 : 1 `moov` + des dizaines de milliers de `moof`/`mdat`,
-  aucun index) est remuxée sans réencodage en mp4 indexé (`ffmpeg -c copy -movflags +faststart`) avant l'écriture
-  de `meta.json`. Constat du 07/10 (v2894103366, 11 Go) : ~30 s par `-ss` avant `-i` contre 0,4 s après remux,
-  soit ~6 h pour l'étape scenes. Un mp4 déjà indexé n'est jamais touché ; un remux en échec (ffmpeg absent, code
-  non nul, sortie vide) lève `DownloadError`, laisse l'original et n'écrit pas `meta.json`. Réglage `ffmpeg_bin`.
-- Veille (relevé réel du 07/10 à 16:56) : les propositions encore à décider s'affichent d'abord, dans l'ordre
-  de Claude ; les déjà décidées (mises en file, ignorées) passent dans une section repliée « Déjà décidées ».
-  Une proposition mise en file montre son état réel, lu en lecture seule par `GET /api/veille` dans
-  `state/queue.json` et `workspace/<video_id>/pipeline.json` : en file, en cours, traitée, à relire, annulée,
-  échouée, interrompue ou « retirée de la file » ; plus jamais « en file » quand la vidéo n'y est plus.
-  `finished_at` du relevé est la vraie heure de fin (la durée se lit), et non plus l'heure de départ.
-- Veille : les abonnés Steam (`memberslistxml`) ne plantent plus toute la source sur un HTTP 429 (relevé
-  réel du 07/10 : « HTTP 429 », aucun abonné lu). Le collecteur attend (pause, doublée à chaque essai,
-  `Retry-After` s'il est plus long, plafonnée par `steam_followers_retry_wait_max_s`), réessaie le même
-  appid au plus `steam_followers_retry_max` fois et journalise chaque attente. Essais épuisés : les
-  abonnés déjà lus sont gardés, le reste vaut `null` (`counts.rate_limited`) et la source passe en
-  statut `partial` visible, les autres sources continuent. Défauts plus prudents :
-  `steam_followers_pause_s` 3 s et `steam_followers_lookups_max` 50 (au plus 60).
-
-### Ajouté
-
 - Clips : bouton « Supprimer la sélection » (style danger) dans la barre de sélection, après confirmation
   (« Supprimer N clips ? Irréversible. »). `POST /api/clips/delete` supprime via
   `clipper.workspace.delete_clips` le `.mp4`, le sidecar `.json` et les annexes d'un clip jamais publié, rend les
@@ -189,7 +109,6 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
   mesurés / 30 », « pic <date> », résumé « s4 → s1 »). Onze réglages `[veille]` (`trend_days`, `trend_games_max`,
   `steam_reviews_*`, `twitch_history_*`, `twitch_access_attempts`, `twitch_access_retry_pause_s`,
   `veille_deadline_s`), les sept principaux dans le formulaire des réglages et l'aperçu de l'écran Veille.
-
 - Jury action (1/6) : la planche d'images légendée de `vision.py` devient la bibliothèque
   `clipper/montage.py` (`montage(...)`, `LABEL_HEIGHT`, `MontageError` nommant le fichier), réutilisable par
   l'étape action sans qu'une étape en importe une autre (ADR-b16b, SPEC-b0f3 R8). `vision` l'importe, rendu
@@ -249,13 +168,30 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ### Modifié
 
+- Étape scenes plus rapide, résultat identique : profil sur un extrait réel de 25 min de la VOD ARC
+  (10 fenêtres de parole, 284 images clés) = détection 29,4 s (décodage ffmpeg, plancher), extraction
+  des images clés 23,5 s, soit 45 % du temps. Le score de contenu (`ContentDetector`) se calcule en
+  un `absdiff` + `sumElems` sur les trois canaux HSV au lieu de trois passes numpy int32 (mêmes
+  entiers, mêmes opérations, scores identiques flottant pour flottant), la lecture du tube ffmpeg se
+  fait par blocs de 32 images, et les images clés sortent par lots (`[scenes] extract_batch`, défaut 8,
+  un seul processus ffmpeg et une seule ouverture du fichier par lot, 1 = un processus par image) avec
+  `[scenes] extract_threads` (défaut 2, 0 = défaut ffmpeg) fils de décodage par processus au lieu de
+  tous les coeurs disputés par `extract_parallel` processus. Mesure avant/après (extrait 25 min,
+  PC à vide, 2 passes) : 53,0 s -> 43,9 s (-17 %), extraction 23,5 s -> 16,5 s (-30 %), détection
+  29,4 s -> 27,3 s (-7 %) ; `scenes.json` identique octet pour octet et les 284 jpg identiques.
+  Extrapolation à la VOD ARC de 294 min (6093 images clés) : extraction ~8,4 min -> ~5,9 min, soit
+  environ 19 min -> ~16 min pour l'étape ; le reste est le décodage ffmpeg, déjà au plancher.
+- Téléchargement plus rapide : yt-dlp télécharge les fragments HLS en parallèle (réglage
+  `[download] concurrent_fragments`, entier >= 1, défaut 8, refus explicite sinon) au lieu d'un par un
+  (constat du 08/10 : VOD Twitch de 11-21 Go à 13-20 Mo/s, plus de 14 min). Le nombre de fragments simultanés
+  est journalisé au début du téléchargement. Format, merge mp4, remux fMP4 et reprises réseau inchangés.
+- Étape scenes plus rapide : les fenêtres de détection sont analysées par au plus `detect_parallel` processus ffmpeg (défaut 4) ; une fenêtre de plus de `detect_chunk_seconds` (défaut 600 s) est découpée en morceaux contigus détectés en parallèle puis recollés (la scène à cheval sur une jointure est fusionnée, aucune coupure inventée). `analysis_skip_loop_filter` (défaut vrai) ajoute `-skip_loop_filter all` à l'entrée de la détection seulement, jamais à l'extraction des images clés. Un ffmpeg en échec fait échouer l'étape (`ScenesError` nommant la fenêtre) et arrête les autres ; le journal donne fenêtres, parallélisme, durée de détection et d'extraction.
 - Veille : un relevé rejoué le même jour (Rafraîchir ou relevé quotidien repris) efface toute la liste des
   propositions du jour, décidées comprises, puis la remplace par les choix de Claude de ce relevé ; « Déjà
   décidées » ne montre plus que les décisions du relevé courant (SPEC-8a45, complète SPEC-bdd9). Conservés :
   `seen.json` (les VOD déjà décidées restent exclues), `history/`, `selection/`, `bilan.json`, la file et les
   vidéos. À la décision, `seen.json` garde aussi source, titre, jeu et chaîne de la VOD, lus par le bilan
   des VOD même si le jour est rejoué.
-
 - Veille : le test d'accès des VOD Twitch se fait par jeu, avec `twitch_access_attempts` essais par VOD, et
   s'arrête dès `max_vods_per_game` VOD accessibles. Les VOD réservées aux abonnés, injoignables, non testées (jeu
   déjà servi) ou non testées à l'échéance sont **écartées et comptées par raison** (bandeau des sources et KPI) :
@@ -265,9 +201,84 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
   parallèles (une par hôte) en trois phases, sous une échéance globale `veille_deadline_s` (480 s). À l'échéance, les
   sources coupées sont « incomplètes » en orange avec leur message, un bandeau « Relevé incomplet » s'affiche et
   Claude choisit avec ce qui est relevé.
-
 - Veille : `igdb_min_hypes` vaut 5 par défaut et doit être >= 1 ; `igdb_releases_max` est ignoré s'il
   reste dans `config.toml`.
+
+### Corrigé
+
+- TikTok : `[tiktok] content_check = "wait"` ne lance plus de scan dans le vide. L'interrupteur « Vérification de contenu simple » éteint est allumé une fois pour cette vidéo avant d'attendre le résultat (log « interrupteur allumé pour cette vidéo »), au lieu d'attendre 900 s pour rien. Interrupteur déjà allumé : aucun clic. Grisé alors qu'éteint, introuvable ou refusé : arrêt R4 immédiat, sans attente ni publication. `off` inchangé (TASK-0c44).
+- Fiche clip lisible : les libellés ne se coupent plus lettre par lettre, le contrôle qualité affiche le type, la sévérité et le détail de chaque problème (au lieu de « [object Object] »), les créneaux et publications sont à l'heure de Paris au format court français, et le compte s'affiche par son nom avec son id en secondaire (« inconnu » s'il n'existe plus).
+- TikTok : deux fenêtres superposées (bulle « Nouvelles fonctionnalités » sous « Activer les vérifications automatiques ») : `close_popups` ferme une fenêtre à la fois, la plus haute d'abord (dernière dans le DOM), puis relit les fenêtres visibles ; le clic sur la bulle du dessous était intercepté par l'overlay du dessus. Un arrêt R4 avec capture enregistre aussi le HTML de la page à côté (`.html`) ; un échec d'écriture du HTML est journalisé sans masquer l'arrêt d'origine. Jamais « Activer », jamais de clic de repli (TASK-0bc5).
+- Reframe : la réponse « aucune webcam » de Claude n'est plus refusée quand plusieurs visages stables viennent du jeu (menus, ARC Raiders sur PS5) : seul un unique candidat stable ET persistant sur les périodes de la vidéo la contredit ; les visages non persistants sont écartés (warning avec les candidats, raison écrite dans la période), plusieurs persistants restent une erreur explicite (TASK-5979).
+- Format stream : le contrôle webcam par clip (webcam repérée sur le seul visage) cherche le visage dans le recadrage agrandi du rectangle, plus sur l'image entière (TASK-0cb1). Mesure réelle v2894178473 (AION 2) : visage trouvé sur 2 images clés sur 41 en image entière (mediapipe courte portée, visage de 60-80 px sur 1920x1080), 39 sur 41 dans le recadrage ; 23 clips sur 24 passaient à tort en letterbox. Réglages `[reframe]` : `facecam_clip_face_margin` (0,25 : marge par côté, fraction du rectangle), `facecam_clip_face_crop_height` (720 : hauteur d'agrandissement en px) et `facecam_clip_face_min_inside` (0,9 : part de la boîte du visage qui doit tomber dans le rectangle ; une webcam déplacée en gardait 0,64 à 0,73, la bonne 1,0). Les 7 clips du constat de TASK-9957 (v2894232594 00-02, v2894088024 03/04/06/09) restent en letterbox, vérifié sur leurs images clés réelles.
+- Mineurs de la revue du 08/10 (TASK-2d9a) : (1) un relevé TikTok lancé depuis l'écran et fini après un tour du worker n'est plus ignoré par l'apprentissage jusqu'au relevé suivant : le rattachement et le versement suivent les fichiers de relevé déjà traités (`snapshots` dans `links.json` et `sync.json`), plus la comparaison de `fetched_at` (pris au début du relevé) avec le dernier passage ; (2) `llm.model` de l'état du jour de la veille est le modèle réellement utilisé (`clipper.llm.model_for`), plus l'alias de la config ou `null` ; (3) le rejeu des prompts du coach utilise le modèle du juge concerné, comme le jugement réel ; (4) un appel LLM de la veille ou du coach fait par le worker n'est plus compté dans `llm_usage.jsonl` de la vidéo en reprise : chacun écrit dans son propre journal (`state/veille/llm_usage.jsonl`, `state/learning/llm_usage.jsonl`) ; (5) `review.json` mis de côté est horodaté en UTC explicite (suffixe `Z`), plus l'heure locale du PC.
+- Veille : le test d'accès des VOD Twitch finit avant l'échéance. Mesure (état du jour du 08/10, relevé de 11:59 Paris) : 61 VOD sur 191 testées (10 réservées, 5 injoignables, le reste accessible) en moins de 480 s, soit au plus ~7,9 s par VOD, pauses de 3 s des réessais comprises (mesure réelle de yt-dlp non refaite hors CI). Les jeux sont maintenant testés en parallèle borné (`[veille] twitch_access_workers`, défaut 4, de 1 à 16), dans l'ordre de `games` (celui dont Claude se sert : les plus utiles d'abord) ; chaque jeu reste séquentiel (une VOD à la fois, mêmes essais et mêmes pauses sur 10054, aucune requête de plus). `veille_deadline_s` reste la garde : elle coupe les derniers jeux de la liste, leurs VOD restent « non testées » (comptées `deadline`), jamais présumées accessibles. Résultat identique au test séquentiel.
+- Veille : le bilan des choix passés transmis à Claude compte les vrais clips produits. Il ne disait « aucun clip »
+  pour des VOD AION 2 qui en avaient donné des dizaines : le bilan n'était recalculé qu'après un nouveau relevé TikTok
+  (donc figé avant que les clips existent) et n'exposait que les clips publiés. Il est recalculé à chaque passage du
+  worker et distingue VOD en traitement (encore dans la file), clips produits, clips publiés et vues à maturité ;
+  une donnée manquante est dite inconnue, jamais comptée 0.
+- Localisation webcam : Claude voit vraiment le contenu de chaque candidat (constat 08/10, pilote v2894103366 re-rendu : webcam de 90x65 px sur la planche, chiffres « 6 » et « 5 » dessinés dessus, réponse « aucune webcam » et 17 clips sur 18 en letterbox alors que le candidat 6 avait un visage sur 23 images clés). Les numéros sont maintenant dans une pastille collée hors du rectangle ; une seconde image (`facecam/period_N_zoom.jpg`) agrandit chaque candidat, une ligne par numéro, sur `facecam_zoom_frames` images (défaut 3, `facecam_zoom_tile_height` 240 px) ; la liste texte dit « visage détecté sur N image(s) clé(s) ». Garde-fou local symétrique : une réponse « aucune webcam » alors qu'un unique candidat a support et visage sur au moins `facecam_face_stable_share` du plus grand support est remplacée par ce candidat (avertissement, `override` avec `from: null` dans `facecam.json`) ; plusieurs candidats stables : erreur explicite ; aucun : « aucune webcam » conservée.
+- Localisation webcam : un cadre sans aucun visage (bannière de sponsor animée, constat 08/10 pilote v2894103366 : cadre 212x150 choisi à la place de la vraie webcam, ~11 clips rendus avec la bannière) n'est plus retenu quand un candidat visage stable existe. Chaque candidat cadre porte maintenant le nombre d'images clés avec un visage dedans (`face_support`, transmis à Claude dans la liste des rectangles : « aucun visage vu dedans »), et un choix de cadre à zéro visage est remplacé localement par l'unique candidat visage vu sur au moins `[reframe] facecam_face_stable_share` (défaut 0,8) du plus grand support, avec un avertissement et `override` dans `facecam.json` ; plusieurs candidats visage stables : erreur explicite. Sans candidat visage stable, une webcam sans visage reste possible (règle SPEC-8257/76dc inchangée). Aucune règle par streamer ou jeu.
+- Stream split : un clip dont le panneau webcam ne montre pas la webcam (scène sans caméra, écran de pause où la caméra a bougé) n'est plus rendu en split mais en letterbox. Quand la webcam a été localisée sur le seul visage (aucun bord réel à retrouver), le contrôle par clip exige désormais un visage dans le rectangle sur au moins `[reframe] facecam_clip_face_min_share` (défaut 0,5) des images clés, raison journalisée sinon ; avant, un jeu qui bouge passait pour une webcam vivante (constat 08/10 : 7 clips, mesure réelle 0 % de visage contre 64 à 100 % sur les clips sains). La QA d'un clip `stream_split` demande en plus le défaut bloquant `empty_webcam` (panneau webcam sans visage ni webcam sur la majorité des images) ; les autres formats ne changent pas.
+- Écritures JSON atomiques : `scenes.json`, `audio.json`, `meta.json`, `thumbnail.json` et le fichier des
+  poids du jury passent par un fichier temporaire puis un remplacement (avec les réessais Windows
+  existants) ; un arrêt en pleine écriture ne laisse plus un JSON tronqué que l'étape prendrait pour « déjà
+  faite ». Un de ces fichiers déjà tronqué donne une erreur explicite qui nomme le fichier et la commande pour
+  refaire l'étape (`--force`), sans réparation silencieuse.
+- TikTok : la fenêtre « Activer les vérifications automatiques du contenu ? » est réellement fermée avant le nouvel essai de clic (constat du 08/10 sur TwitchClipperTV : arrêt R4, compte décoché). Cause mesurée dans un vrai Chrome : cette fenêtre est un `TUXModal-overlay` sans `role=dialog` ni `aria-modal`, donc le sélecteur `[modal] container` ne la voyait pas et `close_popups` rendait sans rien fermer ; le conteneur reconnaît maintenant `.TUXModal-overlay`. Le clic du bouton de la fenêtre porte aussi `click_timeout_s` (il n'avait que les 30 s de Playwright). Avec `content_check = "wait"`, la fermeture par « Annuler » est signalée en avertissement : elle refuse seulement l'activation automatique proposée par TikTok, ne désactive pas la vérification de contenu demandée (contrôlée ensuite par le parcours) ; jamais « Activer ». Fenêtre inconnue ou second échec : toujours un arrêt R4, jamais de clic de repli.
+- Mode review : après une re-découpe (borne ajustée), un moment que `parts` garde alors qu'il avait été rejeté au premier passage n'a aucune décision humaine ; la vidéo ne finit plus en échec (`KeyError`) mais revient en `awaiting_review` avec ces moments à décider (raison lisible), et rien n'est rendu sans décision (ADR-ad2e). `clipper --config X serve` lance désormais son worker enfant avec le même `--config X` (sans `--config`, inchangé).
+- Tests : la suite complète ne laisse plus ~19 Go dans le dossier temporaire. Les images clés synthétiques de `tests/test_reframe.py` passent de BMP 1920x1080 bruités pixel par pixel (6 Mo l'une) à des PNG sans perte au niveau de compression maximal, avec un fond bruité par cellules décalées au hasard à chaque image ; mêmes assertions, aucun test retiré. Mesure du dossier basetemp d'un run de `tests/test_reframe.py` : 18,4 Go avant (713 Mo à 1,4 Go par test lourd), 145 Mo après (au plus 11 Mo par test). `pyproject.toml` : `tmp_path_retention_policy = "failed"` et `tmp_path_retention_count = 1` ne gardent que les dossiers des tests en échec.
+- VOD à trous : yt-dlp ne saute plus un fragment indisponible (`skip_unavailable_fragments` faux, réglage `[download] fragment_retries`, défaut 20) ; un fragment perdu fait échouer le téléchargement (`DownloadError`) au lieu de produire une vidéo avec un trou de pts. L'audio extrait (`transcribe.extract_audio`, `audio`) suit la ligne de temps du conteneur (`aresample=async=1:first_pts=0`, silence dans un trou) : le temps du transcript et de `audio.json` égale le temps pts de `-ss`/scenes/render, plus de sous-titres d'un autre passage. Sans trou, sortie identique à l'échantillon près (±0,1 s de durée).
+- QA d'un clip `stream_split` (revue r-adr 08/10, M1) : contrôlé selon son vrai format (SPEC-76dc). Le prompt ne parle plus d'un texte d'accroche affiché les 2 premières secondes (rien n'est dessiné) : section `## Format` (webcam en haut, jeu en bas, badge éventuel entre les deux) et titre d'écran seulement si `[render] title_enabled`. L'écran noir est mesuré sur chacun des deux panneaux (`webcam_rect`, `video_rect`), validés comme en stream ; rectangle absent ou invalide = erreur explicite, jamais l'image entière. `face_cut` et `subtitle_on_face` restent demandés (la webcam montre le visage). Letterbox, stream et crop inchangés.
+- Coach des prompts du jury : le résultat réel d'un clip publié vient de ses vues (`views_percentile` à maturité, entrées
+  `stats` portant `video_id`/`moment_id`, comme la calibration) et non plus de qa + décision, qui valait 1,0 pour tout
+  clip publié. Un clip publié sans statistique mûre est exclu des cas, jamais un 1,0 par défaut (revue r-veille-stats I4).
+- TikTok : une fenêtre connue qui surgit entre la vérification et le clic (ex. « Activer les vérifications automatiques du contenu ? ») n'arrête plus la publication : si le clic est intercepté, les fenêtres connues sont fermées (« Annuler », jamais « Activer ») puis le clic est refait une fois ; une fenêtre inconnue ou un second échec reste un arrêt R4. Nouveau réglage `[tiktok] click_timeout_s` (10 s, au lieu des 30 s de Playwright).
+- Veille (revue r-veille-stats 08/10) : une VOD Twitch déjà en file ou vue n'est plus reproposée au relevé suivant
+  (l'id que le worker lui donne, `v2893407960`, est comparé en plus de l'id source). Une exception inattendue du choix
+  de Claude est écrite dans l'état du jour (journal ERROR, `finished_at`, aucune proposition inventée) au lieu de
+  relancer le relevé à chaque tour du worker. Une limite de session (429) pendant le choix passe `llm.status` à
+  `retry` avec `retry_at` (`llm_retry_delay_min`, défaut 30 min) : seul le choix est refait, sans nouveau relevé, au
+  plus `llm_retry_max` fois (défaut 3), puis l'échec est explicite.
+- Écritures d'état robustes sous Windows : `pipeline` remplace ses fichiers via `channel.replace_retrying` (le mécanisme
+  de `channel.atomic_write_json`, 20 essais de 50 ms au lieu de 5, erreur d'origine relevée si le verrou persiste,
+  fichier temporaire supprimé) ; le `.tmp` porte pid et thread (plus de vol entre worker et API web). La mise de côté
+  de `review.json` (moments refait) utilise le même réessai et ne dépend plus d'un test d'existence préalable : un
+  lecteur concurrent ne la fait plus échouer ni sauter (échecs sous charge de `test_run_respecte_lordre_des_etapes` et
+  `test_forced_moments_sets_aside_the_stale_review_json`).
+- Vision : un lot sauvé dans `vision_partial.json` enregistre les chemins d'images qu'il couvre et n'est repris que
+  si ce sont les mêmes que ceux du lot recalculé (sinon, moments refait, il décrivait d'autres images) ; avec
+  `--force`, le fichier est ignoré et supprimé. Pipeline : quand l'étape moments est refaite en mode review,
+  `review.json` (décisions indexées par moment) est renommé avec horodatage (journal INFO) au lieu d'être appliqué
+  aux moments renumérotés (revue r-pipeline 08/10, Important 3 et 4).
+- Publication : un post réussi est toujours tracé (revue r-publish 08/10). Le sidecar est réécrit avec les mêmes
+  réessais sous Windows que la file (`channel.atomic_write_json`) ; `mark_published` écrit d'abord l'état de file
+  (preuve que le post est parti), puis le sidecar : un échec d'écriture est journalisé ERROR avec le `post_url` et
+  l'entrée reste `published`, jamais « en cours » ni republiable par Réessayer. La pause d'un compte est revérifiée
+  après la prise en main, juste avant le publisher : entrée relâchée en attente avec la raison, aucun post.
+- Stats TikTok : les évolutions et pourcentages avec séparateur de milliers (« 4,300.0% », « 4 300,0 % », espaces
+  fines et insécables comprises) sont lus correctement au lieu de faire échouer le relevé (« valeur illisible
+  (tuile views, 7 jours) ») ; « 1,5% » et « 12,5 % » restent des décimales, les formes ambiguës restent refusées.
+- Jury : la re-notation après vision lit la grille enregistrée dans `moments.json` (`rubric.path`) et non celle du style (un style changé de grille entre moments et vision ne provoque plus `KeyError: 'action'`) ; grille enregistrée introuvable : erreur explicite, jamais de repli. L'exploration ne repêche plus un candidat éliminé par le seuil `[gate]` (les rejets `min_score` restent repêchables).
+- Téléchargement : une VOD Twitch en mp4 fragmenté (fMP4 : 1 `moov` + des dizaines de milliers de `moof`/`mdat`,
+  aucun index) est remuxée sans réencodage en mp4 indexé (`ffmpeg -c copy -movflags +faststart`) avant l'écriture
+  de `meta.json`. Constat du 07/10 (v2894103366, 11 Go) : ~30 s par `-ss` avant `-i` contre 0,4 s après remux,
+  soit ~6 h pour l'étape scenes. Un mp4 déjà indexé n'est jamais touché ; un remux en échec (ffmpeg absent, code
+  non nul, sortie vide) lève `DownloadError`, laisse l'original et n'écrit pas `meta.json`. Réglage `ffmpeg_bin`.
+- Veille (relevé réel du 07/10 à 16:56) : les propositions encore à décider s'affichent d'abord, dans l'ordre
+  de Claude ; les déjà décidées (mises en file, ignorées) passent dans une section repliée « Déjà décidées ».
+  Une proposition mise en file montre son état réel, lu en lecture seule par `GET /api/veille` dans
+  `state/queue.json` et `workspace/<video_id>/pipeline.json` : en file, en cours, traitée, à relire, annulée,
+  échouée, interrompue ou « retirée de la file » ; plus jamais « en file » quand la vidéo n'y est plus.
+  `finished_at` du relevé est la vraie heure de fin (la durée se lit), et non plus l'heure de départ.
+- Veille : les abonnés Steam (`memberslistxml`) ne plantent plus toute la source sur un HTTP 429 (relevé
+  réel du 07/10 : « HTTP 429 », aucun abonné lu). Le collecteur attend (pause, doublée à chaque essai,
+  `Retry-After` s'il est plus long, plafonnée par `steam_followers_retry_wait_max_s`), réessaie le même
+  appid au plus `steam_followers_retry_max` fois et journalise chaque attente. Essais épuisés : les
+  abonnés déjà lus sont gardés, le reste vaut `null` (`counts.rate_limited`) et la source passe en
+  statut `partial` visible, les autres sources continuent. Défauts plus prudents :
+  `steam_followers_pause_s` 3 s et `steam_followers_lookups_max` 50 (au plus 60).
 
 ## [0.5.3] - 2026-10-07
 
@@ -1195,7 +1206,8 @@ verticaux sous-titrés, en local.
 - Aucune publication automatique sur TikTok : le dépôt produit les clips
   et leurs métadonnées, la mise en ligne reste manuelle.
 
-[Non publié]: https://github.com/ZeDKouill3/TiktokClipper/compare/v0.5.3...HEAD
+[Non publié]: https://github.com/ZeDKouill3/TiktokClipper/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/ZeDKouill3/TiktokClipper/compare/v0.5.3...v0.6.0
 [0.5.3]: https://github.com/ZeDKouill3/TiktokClipper/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/ZeDKouill3/TiktokClipper/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/ZeDKouill3/TiktokClipper/compare/v0.5.0...v0.5.1
