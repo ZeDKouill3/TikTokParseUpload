@@ -1,4 +1,4 @@
-"""Etape reframe : cadrage 9:16 plein ecran d'un clip (SPEC-6127).
+﻿"""Etape reframe : cadrage 9:16 plein ecran d'un clip (SPEC-6127).
 
 Deux mises en page (``format`` en config) :
 - ``letterbox`` (defaut) : zoom fixe centre, fond flou, aucun visage suivi,
@@ -261,6 +261,11 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "facecam_clip_face_min_share": 0.5,
     # Part du plus grand support à partir de laquelle un candidat visage est stable, et remplace un cadre sans aucun visage choisi par Claude.
     "facecam_face_stable_share": 0.8,
+    # Vignettes agrandies envoyees a Claude en plus de la planche (TASK-a769) :
+    # une ligne par candidat, facecam_zoom_frames recadrages du rectangle
+    # (images equireparties de la periode), chacun facecam_zoom_tile_height px de haut.
+    "facecam_zoom_frames": 3,
+    "facecam_zoom_tile_height": 240,
     # Panneau caméra : part de la hauteur de sortie, à partir de stream_top
     # (titre d'écran au-dessus) ; le jeu occupe tout le bas.
     "stream_camera_ratio": 0.4,
@@ -1939,6 +1944,63 @@ _BOARD_COLORS = [
 ]
 
 
+def _draw_label(
+    tile: np.ndarray, text: str, p0: tuple[int, int], p1: tuple[int, int], color: tuple[int, int, int], tile_w: int
+) -> None:
+    """Numero d'un candidat dans une pastille collee HORS du rectangle (au-dessus,
+    sinon dessous, sinon a cote) : il ne masque jamais le contenu (TASK-a769)."""
+    font, scale, thick = cv2.FONT_HERSHEY_SIMPLEX, tile_w / 480, max(1, round(tile_w / 240))
+    (tw, th), base = cv2.getTextSize(text, font, scale, thick)
+    pad = 3
+    w, h = tw + 2 * pad, th + base + 2 * pad
+    tile_h, tile_width = tile.shape[:2]
+    x = min(max(p0[0], 0), max(tile_width - w, 0))
+    if p0[1] - h >= 0:
+        y = p0[1] - h
+    elif p1[1] + h <= tile_h:
+        y = p1[1]
+    else:
+        x, y = (p1[0], p0[1]) if p1[0] + w <= tile_width else (max(p0[0] - w, 0), p0[1])
+    cv2.rectangle(tile, (x, y), (x + w, y + h), color, -1)
+    cv2.putText(tile, text, (x + pad, y + pad + th), font, scale, (255, 255, 255), thick, cv2.LINE_AA)
+
+
+def _draw_zoom(images: list[np.ndarray], candidates: list[dict[str, Any]], path: Path, settings: dict[str, Any]) -> None:
+    """Vignettes agrandies : une ligne par candidat (numero dans une bande a
+    gauche, jamais sur le contenu), ``facecam_zoom_frames`` recadrages du
+    rectangle pris sur des images equireparties de la periode, chacun de
+    ``facecam_zoom_tile_height`` px de haut (TASK-a769)."""
+    row_h = int(settings["facecam_zoom_tile_height"])
+    count = max(1, min(int(settings["facecam_zoom_frames"]), len(images)))
+    picks = sorted({round(v) for v in np.linspace(0, len(images) - 1, count)})
+    rows: list[list[np.ndarray]] = []
+    for c in candidates:
+        r = c["rect"]
+        crops = []
+        for k in picks:
+            crop = images[k][r["y"]:r["y"] + r["h"], r["x"]:r["x"] + r["w"]]
+            width = max(1, round(row_h * crop.shape[1] / max(crop.shape[0], 1)))
+            crops.append(cv2.resize(crop, (width, row_h), interpolation=cv2.INTER_CUBIC))
+        rows.append(crops)
+    tile_w = max(crop.shape[1] for crops in rows for crop in crops)
+    band = row_h // 3
+    sheet = np.zeros((len(rows) * row_h, band + len(picks) * (tile_w + 4), 3), dtype=np.uint8)
+    for i, (c, crops) in enumerate(zip(candidates, rows)):
+        color = _BOARD_COLORS[(c["id"] - 1) % len(_BOARD_COLORS)]
+        top = i * row_h
+        sheet[top:top + row_h, :band] = color
+        cv2.putText(
+            sheet, str(c["id"]), (band // 6, top + row_h // 2 + band // 4), cv2.FONT_HERSHEY_SIMPLEX,
+            band / 30, (255, 255, 255), max(2, band // 14), cv2.LINE_AA,
+        )
+        for j, crop in enumerate(crops):
+            x = band + j * (tile_w + 4) + 2
+            sheet[top:top + row_h, x:x + crop.shape[1]] = crop
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not cv2.imwrite(str(path), sheet, [cv2.IMWRITE_JPEG_QUALITY, int(settings["jpeg_quality"])]):
+        raise ReframeError(f"ecriture des vignettes impossible : {path}")
+
+
 def _draw_board(
     images: list[np.ndarray], times: list[float], candidates: list[dict[str, Any]], path: Path, settings: dict[str, Any]
 ) -> None:
@@ -1961,10 +2023,7 @@ def _draw_board(
             p0 = (round(r["x"] * scale), round(r["y"] * scale))
             p1 = (round((r["x"] + r["w"]) * scale), round((r["y"] + r["h"]) * scale))
             cv2.rectangle(tile, p0, p1, color, thickness * 2)
-            cv2.putText(
-                tile, str(c["id"]), (p0[0] + 4, p0[1] + 6 + tile_w // 16),
-                cv2.FONT_HERSHEY_SIMPLEX, tile_w / 240, color, thickness * 2,
-            )
+            _draw_label(tile, str(c["id"]), p0, p1, color, tile_w)
         cv2.putText(tile, f"{t:.0f}s", (4, tile_h - 6), cv2.FONT_HERSHEY_SIMPLEX, tile_w / 600, (255, 255, 255), 1)
         r0, c0 = divmod(k, columns)
         board[r0 * tile_h:(r0 + 1) * tile_h, c0 * tile_w:(c0 + 1) * tile_w] = tile
@@ -1976,21 +2035,25 @@ def _draw_board(
 def _facecam_prompt(candidates: list[dict[str, Any]], start: float, end: float) -> str:
     def seen(c: dict[str, Any]) -> str:
         if c["kind"] == "visage+cadre":
-            return f"cadre net sur {c['support']} image(s), visage vu sur {c['face_support']} image(s)"
+            return f"cadre net sur {c['support']} image(s), visage detecte sur {c['face_support']} image(s) cle(s)"
         if c["kind"] == "cadre":
             faces = c.get("face_support")
             if faces == 0:
                 return f"cadre net sur {c['support']} image(s), aucun visage vu dedans"
             if faces:
-                return f"cadre net sur {c['support']} image(s), visage vu sur {faces} image(s)"
+                return f"cadre net sur {c['support']} image(s), visage detecte sur {faces} image(s) cle(s)"
+        if c["kind"] == "visage":
+            return f"visage detecte sur {c['face_support']} image(s) cle(s)"
         return f"vu sur {c['support']} image(s)"
 
     listing = "\n".join(f"- {c['id']} : rectangle {c['kind']}, {seen(c)}" for c in candidates)
     return (
-        "Cette planche reunit des images d'un stream (jeu video, ou discussion) entre "
-        f"{start:.0f}s et {end:.0f}s. Des rectangles numerotes sont dessines sur chaque image : "
+        "La premiere image est une planche d'images d'un stream (jeu video, ou discussion) entre "
+        f"{start:.0f}s et {end:.0f}s. Des rectangles numerotes sont dessines sur chaque image "
+        "(le numero est dans une pastille collee au-dessus du rectangle, jamais dessus) : "
         "ce sont les emplacements possibles de la webcam du streamer (sa propre camera filmant "
-        "sa personne, incrustee par-dessus le jeu).\n"
+        "sa personne, incrustee par-dessus le jeu). La seconde image agrandit le contenu de chaque "
+        "candidat, une ligne par numero, sur plusieurs images de la periode.\n"
         f"Rectangles candidats :\n{listing}\n"
         "Reponds le numero du rectangle qui est la webcam du streamer, ou null si aucun ne l'est "
         "(widget, alerte, chat, camera de jeu, zone de l'interface du jeu, personne a l'ecran). "
@@ -2023,6 +2086,23 @@ def _stable_face_instead(
             f"visage stables existent ({sorted(c['id'] for c in stable)}) : choix impossible sans deviner"
         )
     return stable[0]
+
+
+def _stable_face_over_null(candidates: list[dict[str, Any]], settings: dict[str, Any]) -> dict[str, Any] | None:
+    """Garde-fou local sur « aucune webcam » (TASK-a769, symetrique de
+    ``_stable_face_instead``) : un unique candidat dont le support ET le visage
+    atteignent ``facecam_face_stable_share`` du plus grand support est retenu
+    malgre la reponse de Claude (override journalise). ``None`` s'il n'y en a
+    aucun (la reponse tient), erreur explicite s'il y en a plusieurs (ADR-ad2e)."""
+    top = max(c["support"] for c in candidates)
+    floor = float(settings["facecam_face_stable_share"]) * top - 1e-9
+    stable = [c for c in candidates if c["support"] >= floor and (c.get("face_support") or 0) >= floor]
+    if len(stable) > 1:
+        raise ReframeError(
+            "[reframe] Claude a repondu aucune webcam alors que plusieurs candidats visage stables existent "
+            f"({sorted(c['id'] for c in stable)}) : choix impossible sans deviner"
+        )
+    return stable[0] if stable else None
 
 
 def _facecam_check(ids: set[int]) -> Callable[[Any], None]:
@@ -2175,12 +2255,26 @@ def detect_facecam(
             path = video_dir / "facecam" / f"period_{index}.jpg"
             _draw_board(item["images"], item["times"], candidates, path, settings)
             board = path.relative_to(video_dir).as_posix()
+            zoom = video_dir / "facecam" / f"period_{index}_zoom.jpg"
+            _draw_zoom(item["all_images"], candidates, zoom, settings)
             answer = llm.ask(
-                "facecam", _facecam_prompt(candidates, item["start"], item["end"]), [path], FACECAM_SCHEMA,
+                "facecam", _facecam_prompt(candidates, item["start"], item["end"]), [path, zoom], FACECAM_SCHEMA,
                 config=config, check=_facecam_check({c["id"] for c in candidates}),
             )
+            chosen = None
+            better = None
             if answer["webcam"] is None:
-                reason = f"Claude : aucune webcam sur cette periode ({answer['reason']})"
+                better = _stable_face_over_null(candidates, settings)
+                if better is None:
+                    reason = f"Claude : aucune webcam sur cette periode ({answer['reason']})"
+                else:
+                    override = {
+                        "from": None, "to": better["id"],
+                        "reason": f"Claude a repondu aucune webcam ({answer['reason']}) mais le candidat "
+                                  f"{better['id']} a un visage stable (vu sur {better['face_support']} image(s) cle(s))",
+                    }
+                    log.warning("%s : periode %d, %s", video_id, index, override["reason"])
+                    chosen = better
             else:
                 chosen = next(c for c in candidates if c["id"] == answer["webcam"])
                 better = _stable_face_instead(candidates, chosen, settings)
@@ -2192,6 +2286,7 @@ def detect_facecam(
                     }
                     log.warning("%s : periode %d, %s", video_id, index, override["reason"])
                     chosen = better
+            if chosen is not None:
                 rect, edge_reason, reason = dict(chosen["rect"]), chosen["edge_reason"], None
                 candidate_rect = dict(rect)
                 refined_rect, refine_reason = _refine_rect(
