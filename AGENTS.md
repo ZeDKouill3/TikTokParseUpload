@@ -64,6 +64,10 @@ python -m pytest -q tests/test_action_real.py
 
 ## Décisions ratifiées (ADR / SPEC)
 
+Liste régénérée depuis `ank find --type adr --status accepted` et `ank find --type spec --status accepted` (statuts exacts). Les specs remplacées (superseded) ne sont pas listées : leur successeur l'est.
+
+### ADR acceptés
+
 - **ADR-b16b** — pipeline `clipper/` (Python >= 3.11) : une étape = un module
   qui lit ses entrées et écrit sous `workspace/<video_id>/` ; une étape déjà
   faite ne se relance pas sauf `--force` ; une étape n'importe jamais une
@@ -78,14 +82,6 @@ python -m pytest -q tests/test_action_real.py
   échec remonte, est journalisé, ou met la vidéo en attente.
 - **ADR-09ad** — interface web (`clipper/web/`) : page statique servie par
   FastAPI, aucune logique de traitement vidéo/audio/LLM dedans.
-- **SPEC-6a47** — contrat de sortie d'un clip (`output/<video_id>/<clip_id>.mp4`
-  + `.json` sidecar, champs obligatoires), format letterbox par défaut (zoom
-  fixe, titre d'écran en haut, sous-titres dans la bande floue du bas) ; le
-  format crop (suivi de visage) reste une option figée. Ajoute un appel à
-  l'abonnement optionnel (pseudo de chaîne discret sous le titre d'écran +
-  carte de fin « Abonne-toi ! »), désactivé par défaut. Remplace SPEC-6127
-  (elle-même remplaçait SPEC-350f). Successeur proposé (non ratifié) :
-  **SPEC-6a86** — titre d'écran sobre, sans emoji ni superlatif par défaut.
 - **ADR-e1da** / **SPEC-38f7** — installeur portable Windows : zip
   d'amorçage (`uv.exe` + wheel + `installer/`) construit par
   `tools/build_portable.py` ; programme sous `%LOCALAPPDATA%\Clipper\app`
@@ -93,21 +89,97 @@ python -m pytest -q tests/test_action_real.py
   (jamais touchées par une mise à jour) ; CUDA seulement si un GPU NVIDIA
   est détecté ; `claude` installé par son installeur officiel ; `clipper
   doctor` vérifie l'installation ; aucun repli silencieux.
-- **SPEC-53f3** — grille de notation des moments (`rubric.toml`), critères et
-  règles de sélection.
-- **SPEC-8257** *(proposée, pas encore `ank accept`)* — succède à SPEC-3a88
-  (format stream) : le choix du format par clip (stream ou letterbox) se
-  fait sur la présence du rectangle de webcam lui-même (contenu non noir,
-  bords retrouvés, non figé), plus sur la détection du visage dedans ; la
-  localisation (une fois par vidéo) garde le visage comme indice, avec un
-  seuil séparé et plus bas par défaut.
-- **SPEC-76dc** *(proposée, pas encore `ank accept`)* — succède à SPEC-8257 :
-  reprend ses règles de format stream à l'identique et ajoute un second
-  agencement stream `split` réglable (`stream_variant`), choisi par config,
-  le `top` de SPEC-3a88 restant le défaut global : webcam en haut, jeu en
-  bas, badge de chaîne optionnel (logo + nom sur fond noir) à leur jonction,
-  style des sous-titres réglable (police, couleurs, contour, ombre,
-  position).
+- **ADR-1cf0** — apprentissage du jury à partir des erreurs, sans
+  uniformisation : vérité terrain = signaux réels, poids des juges bornés,
+  prompts retouchés par lots et jamais au fil de l'eau, exploration, juge
+  conformité hors apprentissage.
+- **ADR-c260** — boucle d'apprentissage branchée sur les relevés réels
+  (amende ADR-1cf0) : `clipper/learning.py`, rattachement post→clip, versement
+  stats→outcomes, recalibrage, coach validé dans l'interface.
+- **ADR-ff87** — jury de juges IA pour les décisions de jugement du mode
+  auto : au moins 3 juges indépendants et anonymes, débat ciblé sur les
+  divergences, veto motivé du juge conformité.
+- **ADR-35b7** — console de gestion web v2 : worker séparé qui traite une
+  vidéo à la fois, presets par chaîne en surcouche, SSE, jeton d'accès local.
+- **ADR-4e57** — candidats d'action pour les VOD gaming : étape `action`
+  (pics audio, densité de plans, images décrites par le LLM) entre `scenes`
+  et `moments` ; moments en `transcript+action` selon le style.
+- **ADR-ca9a** — veille des sujets chauds : `clipper/veille.py` (bibliothèque,
+  pas une étape), sources officielles seulement (Twitch, YouTube, Steam),
+  état sous `state/veille/`, exécution par le worker seul, meilleurs clips
+  du jour archivés, jamais supprimés.
+- **ADR-798c** — veille : IGDB (API officielle de Twitch) source des dates de
+  sortie et de la hype, avec le même jeton d'app Twitch que Helix.
+- **ADR-0944** — veille : IGDB fournit aussi les champs d'affichage d'un jeu ;
+  jaquettes affichées par URL directe `images.igdb.com`, jamais stockées.
+- **ADR-05a4** — veille : Steam officiel (joueurs simultanés, joueurs par
+  appid, abonnés via la page XML publique), plafonné et espacé.
+- **ADR-6e21** — veille : historique de tendance sur 30 jours pour tout jeu
+  retenu (avis Steam, VOD Twitch sur un mois), relevés propres, rien d'estimé,
+  relevé dans un fil du worker qui ne bloque jamais la boucle.
+- **ADR-1a58** — publication et statistiques TikTok par pilotage d'un vrai
+  navigateur (Playwright, profils persistants), en attendant l'API officielle.
+- **ADR-58c0** — publication et statistiques YouTube (Shorts) par pilotage
+  d'un vrai navigateur sur YouTube Studio, comme TikTok.
+
+### SPEC acceptées
+
+- **SPEC-6a86** — contrat de sortie d'un clip : titre d'écran sobre, sans
+  emoji ni superlatif par défaut. Succède à SPEC-6a47 (reprise à l'identique
+  pour le reste : format letterbox par défaut, `.mp4` + `.json` sidecar,
+  appel à l'abonnement désactivé par défaut).
+- **SPEC-76dc** — agencement stream `split` réglable : webcam en haut, jeu en
+  bas, badge de chaîne optionnel, style des sous-titres réglable. Succède à
+  SPEC-8257 (format stream par présence de la webcam).
+- **SPEC-4063** — grille de notation des moments v4 (plafond souple par heure
+  avec plancher `min_moments_cap`). Succède à SPEC-53f3.
+- **SPEC-9216** — grille gaming embarquée (`builtin:gaming`), choisie par
+  chaîne.
+- **SPEC-b0f3** — grille gaming-action embarquée (`builtin:gaming-action`,
+  seuil éliminatoire) et candidats d'action par passages, choisis par style.
+- **SPEC-73d0** — jury : chaque juge donne sa confiance par moment, prise en
+  compte dans le débat et l'agrégation.
+- **SPEC-00db** — boucle d'apprentissage : rattachement post→clip après
+  relevé, métrique à maturité, recalibrage automatique, coach validé dans
+  l'interface.
+- **SPEC-1ed3** — publication pilotée depuis l'écran Publication : choisir le
+  clip, le compte, maintenant ou programmé, et tous les réglages.
+- **SPEC-6076** — TikTok par navigateur v2 : aucun compte dans un preset, le
+  compte est choisi à chaque publication.
+- **SPEC-5e50** — YouTube Shorts par navigateur : comptes YouTube, publication
+  immédiate ou programmée, statistiques à l'usage, heure de Paris partout.
+- **SPEC-47e2** — statistiques TikTok : tableau de bord par compte alimenté
+  uniquement par le relevé de TikTok Studio, relevé seulement quand Clipper
+  est utilisé.
+- **SPEC-6fa4** — comptes : carnet local (e-mails, mots de passe dans le
+  coffre de l'OS via keyring), générateur de mot de passe, jamais de repli
+  silencieux.
+- **SPEC-f348** — comptes = comptes de publication : connexion vérifiée,
+  « prêt à publier » automatique, pause manuelle d'un compte, compte choisi
+  par publication.
+- **SPEC-74e9** — modèle de données de la console v2 : chaînes, file de
+  traitement, publication, surveillance, état vidéo étendu.
+- **SPEC-c100** — règles de l'interface de gestion v2 : écrans, actions,
+  erreurs visibles, temps réel, raccourcis, accès.
+- **SPEC-bdd9** — veille : réglages `[veille]`, fichiers sous `state/veille/`,
+  sources, candidats, choix de Claude, actions Clipper/Ignorer, meilleurs
+  clips du jour archivés, écran Veille.
+- **SPEC-85a0** — veille : historique de tendance sur 30 jours, séries à
+  trous jamais estimées, test d'accès Twitch par jeu, relevé dans un fil du
+  worker avec échéance globale.
+- **SPEC-8a45** — veille : un relevé rejoué le même jour remplace la liste des
+  propositions du jour, décidées comprises.
+- **SPEC-df51** — veille : calendrier des sorties de jeux (IGDB, J-15..J+14),
+  Steam officiel à la place de SteamDB, filtre de communauté, au plus N VOD
+  par jeu.
+
+### SPEC proposée (pas encore `ank accept`)
+
+- **SPEC-4a9b** — proposée, pas encore `ank accept` : webcam du stream trouvée
+  par période, rectangles candidats numérotés choisis par Claude. Succède à
+  SPEC-76dc.
+- **SPEC-2a1e** — doublon vide créé par erreur (corps absent), à ne pas
+  ratifier : la vraie spec est SPEC-0eec, remplacée par SPEC-4063.
 
 ## Conventions
 

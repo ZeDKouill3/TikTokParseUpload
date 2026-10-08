@@ -5,7 +5,7 @@ slug: agents-md-section-des-d-cisions-ratifi-es-r-g-n
 title: "AGENTS.md : section des décisions ratifiées régénérée depuis ank (statuts exacts)"
 created: 2026-10-08T23:34:08Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - AGENTS.md
 blocked_by: []
@@ -14,6 +14,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/00b6ffce4c19@0e965e5
+    tree: scope/1a47cbc98892
+    criteria: c3c170560165
+    verifier: tests@c7b454d16c90
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---
