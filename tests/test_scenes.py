@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import subprocess
@@ -824,3 +824,206 @@ def test_cuts_match_a_full_decode_when_speech_covers_the_whole_video(
     assert starts[1] == pytest.approx(2.0, abs=0.5)
     assert starts[2] == pytest.approx(4.0, abs=0.5)
     assert result["scenes"][-1]["end"] == pytest.approx(6.0, abs=0.5)
+
+
+# --- TASK-e2dc : detection parallele des fenetres, filtre anti-blocs coupe ---
+
+
+@pytest.fixture
+def six_second_color_video(tmp_path):
+    """3 plans de 6 s (rouge/bleu/vert, 25 fps) : coupures a 6 s et 12 s."""
+    video_path = tmp_path / "long_scenes.mp4"
+    _make_color_video(video_path, ["red", "blue", "green"], segment_seconds=6.0)
+    return video_path
+
+
+def test_config_defaults_declares_parallel_detection_options():
+    from clipper.scenes import CONFIG_DEFAULTS
+
+    assert CONFIG_DEFAULTS["detect_parallel"] == 4
+    assert CONFIG_DEFAULTS["detect_chunk_seconds"] == 600.0
+    assert CONFIG_DEFAULTS["analysis_skip_loop_filter"] is True
+
+
+def test_detect_parallel_below_one_is_refused(isolated_cwd, three_scene_video):
+    from clipper.scenes import ScenesError, detect_scenes
+
+    _full_speech(isolated_cwd / "workspace")
+    with pytest.raises(ScenesError, match="detect_parallel"):
+        detect_scenes(three_scene_video, isolated_cwd / "workspace", "vid1", detect_parallel=0)
+
+
+def test_detect_chunk_seconds_not_positive_is_refused(isolated_cwd, three_scene_video):
+    from clipper.scenes import ScenesError, detect_scenes
+
+    _full_speech(isolated_cwd / "workspace")
+    with pytest.raises(ScenesError, match="detect_chunk_seconds"):
+        detect_scenes(three_scene_video, isolated_cwd / "workspace", "vid1", detect_chunk_seconds=0)
+
+
+def test_chunked_parallel_detection_equals_sequential_one_window(
+    isolated_cwd, six_second_color_video
+):
+    """Une fenetre de 18 s decoupee en morceaux de 5 s (jointures a 5, 10, 15 s,
+    aucune sur une coupure reelle) detectee a 4 en parallele : meme liste de
+    scenes que le calcul sequentiel, aucune coupure inventee aux jointures."""
+    from clipper.scenes import detect_scenes
+
+    _full_speech(isolated_cwd / "ws_seq")
+    sequential = detect_scenes(
+        six_second_color_video, isolated_cwd / "ws_seq", "vid1",
+        detect_parallel=1, detect_chunk_seconds=1e6,
+    )
+    _full_speech(isolated_cwd / "ws_par")
+    parallel = detect_scenes(
+        six_second_color_video, isolated_cwd / "ws_par", "vid1",
+        detect_parallel=4, detect_chunk_seconds=5.0,
+    )
+    assert len(sequential["scenes"]) == 3
+    assert len(parallel["scenes"]) == 3
+    for seq, par in zip(sequential["scenes"], parallel["scenes"]):
+        assert par["start"] == pytest.approx(seq["start"], abs=0.05)
+        assert par["end"] == pytest.approx(seq["end"], abs=0.05)
+    assert len(parallel["frames"]) == len(sequential["frames"])
+
+
+def test_chunked_detection_splits_a_long_window_into_contiguous_chunks(
+    isolated_cwd, six_second_color_video, recorded_ffmpeg_commands
+):
+    from clipper.scenes import detect_scenes
+
+    _full_speech(isolated_cwd / "workspace")
+    detect_scenes(
+        six_second_color_video, isolated_cwd / "workspace", "vid1",
+        detect_parallel=2, detect_chunk_seconds=5.0,
+    )
+
+    commands = _decode_commands(recorded_ffmpeg_commands)
+    starts = sorted(float(cmd[cmd.index("-ss") + 1]) for cmd in commands)
+    assert starts[:4] == pytest.approx([0.0, 5.0, 10.0, 15.0])
+    durations = [float(cmd[cmd.index("-t") + 1]) for cmd in commands]
+    assert durations.count(pytest.approx(5.0)) >= 3
+
+
+def test_windows_are_detected_in_parallel_up_to_detect_parallel(
+    isolated_cwd, three_scene_video, monkeypatch
+):
+    import clipper.scenes as scenes_module
+
+    lock = threading.Lock()
+    state = {"running": 0, "peak": 0}
+
+    def fake_decode(video_path, window_start, window_end, *args, **kwargs):
+        with lock:
+            state["running"] += 1
+            state["peak"] = max(state["peak"], state["running"])
+        time.sleep(0.2)
+        with lock:
+            state["running"] -= 1
+        return [(0.0, window_end - window_start)]
+
+    monkeypatch.setattr(scenes_module, "_decode_window_cuts", fake_decode)
+    scenes_module._detect_scene_list(
+        three_scene_video, 27.0, 256, 30.0, "",
+        [(10.0 * i, 10.0 * i + 1.0) for i in range(6)], "ffmpeg", "ffprobe",
+        detect_parallel=3, detect_chunk_seconds=600.0, skip_loop_filter=True,
+    )
+
+    assert state["peak"] == 3
+
+
+def test_failing_window_fails_the_step_naming_the_window(
+    isolated_cwd, three_scene_video
+):
+    """Fenetre 1000-1005 s au-dela de la fin de la video : aucune image
+    decodee. L'etape echoue (ScenesError qui nomme la fenetre), sans
+    scenes.json partiel ; aucun ffmpeg ne reste en vie."""
+    from clipper.scenes import ScenesError, detect_scenes
+
+    workspace_dir = isolated_cwd / "workspace"
+    _write_transcript(
+        workspace_dir, "vid1",
+        [{"start": 0.0, "end": 2.0}, {"start": 1000.0, "end": 1005.0}],
+    )
+
+    with pytest.raises(ScenesError, match="1000"):
+        detect_scenes(
+            three_scene_video, workspace_dir, "vid1",
+            speech_margin_seconds=0.0, detect_parallel=2,
+        )
+    assert not (workspace_dir / "vid1" / "scenes.json").exists()
+
+
+def test_failing_chunk_kills_the_other_ffmpeg_processes(
+    isolated_cwd, three_scene_video, monkeypatch
+):
+    import clipper.scenes as scenes_module
+
+    procs: list[subprocess.Popen] = []
+    real_popen = subprocess.Popen
+
+    def recording_popen(cmd, *args, **kwargs):
+        proc = real_popen(cmd, *args, **kwargs)
+        procs.append(proc)
+        return proc
+
+    monkeypatch.setattr(scenes_module.subprocess, "Popen", recording_popen)
+    _write_transcript(
+        isolated_cwd / "workspace", "vid1",
+        [{"start": 1000.0, "end": 1005.0}, {"start": 0.0, "end": 6.0}],
+    )
+
+    with pytest.raises(scenes_module.ScenesError):
+        scenes_module.detect_scenes(
+            three_scene_video, isolated_cwd / "workspace", "vid1",
+            speech_margin_seconds=0.0, detect_parallel=2,
+        )
+    assert all(proc.poll() is not None for proc in procs)
+
+
+def test_skip_loop_filter_only_in_the_detection_command(
+    isolated_cwd, three_scene_video, recorded_ffmpeg_commands
+):
+    from clipper.scenes import detect_scenes
+
+    _full_speech(isolated_cwd / "workspace")
+    detect_scenes(three_scene_video, isolated_cwd / "workspace", "vid1")
+
+    detection = _decode_commands(recorded_ffmpeg_commands)
+    others = [c for c in recorded_ffmpeg_commands if "rawvideo" not in c]
+    assert detection
+    for cmd in detection:
+        i = cmd.index("-skip_loop_filter")
+        assert cmd[i + 1] == "all"
+        assert i < cmd.index("-i")
+    assert all("-skip_loop_filter" not in cmd for cmd in others)
+
+
+def test_skip_loop_filter_can_be_turned_off(
+    isolated_cwd, three_scene_video, recorded_ffmpeg_commands
+):
+    from clipper.scenes import detect_scenes
+
+    _full_speech(isolated_cwd / "workspace")
+    detect_scenes(
+        three_scene_video, isolated_cwd / "workspace", "vid1",
+        analysis_skip_loop_filter=False,
+    )
+
+    assert all("-skip_loop_filter" not in cmd for cmd in recorded_ffmpeg_commands)
+
+
+def test_detection_logs_windows_parallelism_and_durations(
+    isolated_cwd, three_scene_video, caplog
+):
+    import logging
+
+    from clipper.scenes import detect_scenes
+
+    _full_speech(isolated_cwd / "workspace")
+    with caplog.at_level(logging.INFO, logger="clipper.scenes"):
+        detect_scenes(three_scene_video, isolated_cwd / "workspace", "vid1", detect_parallel=2)
+
+    text = " ".join(record.getMessage() for record in caplog.records)
+    assert "fenetre" in text and "parallelisme" in text
+    assert "detection" in text and "extraction" in text

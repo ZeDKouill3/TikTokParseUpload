@@ -1,4 +1,4 @@
-"""Etape scenes : detection des changements de plan et images cles.
+﻿"""Etape scenes : detection des changements de plan et images cles.
 
 Le decodage passe par ffmpeg en sous-processus (TASK-1f16) : l'analyse porte
 sur des images reduites (``analysis_width`` pixels de large, au plus
@@ -33,9 +33,12 @@ la video en silence (ADR-ad2e).
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 import tempfile
-from concurrent.futures import ThreadPoolExecutor
+import threading
+import time
+from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 from fractions import Fraction
 from pathlib import Path
 from typing import Any
@@ -45,6 +48,8 @@ import numpy as np
 from scenedetect import FrameTimecode
 from scenedetect.detectors import ContentDetector
 from scenedetect.scene_manager import get_scenes_from_cuts
+
+logger = logging.getLogger(__name__)
 
 CONFIG_DEFAULTS: dict[str, object] = {
     "threshold": 27.0,
@@ -58,9 +63,21 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "decoder": "",
     # Processus ffmpeg d'extraction d'images cles lances en parallele au plus.
     "extract_parallel": 4,
+    # Processus ffmpeg de detection (fenetres ou morceaux) lances en parallele au plus.
+    "detect_parallel": 4,
+    # Duree (s) au-dela de laquelle une fenetre est decoupee en morceaux contigus
+    # detectes en parallele puis recolles.
+    "detect_chunk_seconds": 600.0,
+    # -skip_loop_filter all a l entree de la detection seulement (jamais pour
+    # l extraction des images cles, qui restent pleine qualite).
+    "analysis_skip_loop_filter": True,
     # Marge (s) ajoutee avant/apres chaque plage de parole avant decodage.
     "speech_margin_seconds": 5.0,
 }
+
+
+# Un dernier morceau plus court est recolle au precedent (pas de decodage vide).
+MIN_TAIL_SECONDS = 2.0
 
 
 class ScenesError(Exception):
@@ -106,6 +123,20 @@ def _probe(video_path: Path, ffprobe_bin: str) -> tuple[int, int, Fraction]:
         if int(num or 0) > 0 and int(den or 1) > 0:
             return int(stream["width"]), int(stream["height"]), Fraction(int(num), int(den or 1))
     raise ScenesError(f"cadence d'images inconnue pour {video_path}")
+
+
+def _duration(video_path: Path, ffprobe_bin: str) -> float:
+    out = _run(
+        [
+            ffprobe_bin, "-v", "error", "-show_entries", "format=duration",
+            "-of", "json", str(video_path),
+        ],
+        f"lecture de la duree de {video_path}",
+    )
+    try:
+        return float((json.loads(out or b"{}").get("format") or {})["duration"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ScenesError(f"duree inconnue pour {video_path}") from exc
 
 
 def _read_json(path: Path) -> Any:
@@ -161,6 +192,9 @@ def _decode_window_cuts(
     rate: Fraction,
     out_w: int,
     out_h: int,
+    skip_loop_filter: bool = False,
+    running: set[subprocess.Popen] | None = None,
+    running_lock: threading.Lock | None = None,
 ) -> list[tuple[float, float]]:
     """Scene cuts within one [window_start, window_end) window, as times
     relative to the window's own start. Input-side seek (``-ss`` before
@@ -169,6 +203,7 @@ def _decode_window_cuts(
     cmd = [
         ffmpeg_bin, "-v", "error", "-nostdin", "-noautorotate",
         "-ss", f"{window_start:.3f}",
+        *(["-skip_loop_filter", "all"] if skip_loop_filter else []),
         *_decoder_args(decoder), "-i", str(video_path),
         "-t", f"{window_end - window_start:.3f}",
         "-map", "0:v:0", "-an", "-sn",
@@ -184,6 +219,9 @@ def _decode_window_cuts(
         except FileNotFoundError as exc:
             raise ScenesError(f"{ffmpeg_bin} introuvable (analyse de {video_path})") from exc
         assert proc.stdout is not None
+        if running is not None and running_lock is not None:
+            with running_lock:
+                running.add(proc)
         try:
             while len(buf := proc.stdout.read(frame_bytes)) == frame_bytes:
                 frame = np.frombuffer(buf, np.uint8).reshape(out_h, out_w, 3)
@@ -192,6 +230,9 @@ def _decode_window_cuts(
         finally:
             proc.stdout.close()
             returncode = proc.wait()
+            if running is not None and running_lock is not None:
+                with running_lock:
+                    running.discard(proc)
         stderr.seek(0)
         message = stderr.read().decode(errors="replace").strip()
 
@@ -214,6 +255,41 @@ def _decode_window_cuts(
     return [(start.seconds, stop.seconds) for start, stop in scene_list]
 
 
+def _split_window(
+    start: float, end: float, chunk_seconds: float, rate: Fraction
+) -> list[tuple[float, float]]:
+    """Contiguous chunks of ``chunk_seconds`` (rounded to a whole number of
+    analysed frames, so every chunk samples the same frame grid as one
+    sequential decode of the window); a window not longer than that stays whole."""
+    if end - start <= chunk_seconds:
+        return [(start, end)]
+    frames = max(1, round(chunk_seconds * float(rate)))
+    step = float(Fraction(frames) / rate)
+    chunks: list[tuple[float, float]] = []
+    chunk_start = start
+    while end - chunk_start > step:
+        chunks.append((chunk_start, chunk_start + step))
+        chunk_start += step
+    if chunks and end - chunk_start < MIN_TAIL_SECONDS:
+        chunk_start = chunks.pop()[0]
+    chunks.append((chunk_start, end))
+    return chunks
+
+
+def _join_chunks(chunk_scenes: list[list[tuple[float, float]]]) -> list[tuple[float, float]]:
+    """Absolute scenes of consecutive chunks of one window, recollees : the
+    scene touching a seam is merged with its neighbour (a cut is never
+    invented at a seam)."""
+    joined: list[tuple[float, float]] = []
+    for scenes in chunk_scenes:
+        for index, (start, stop) in enumerate(scenes):
+            if index == 0 and joined:
+                joined[-1] = (joined[-1][0], stop)
+            else:
+                joined.append((start, stop))
+    return joined
+
+
 def _detect_scene_list(
     video_path: Path,
     threshold: float,
@@ -223,20 +299,83 @@ def _detect_scene_list(
     windows: list[tuple[float, float]],
     ffmpeg_bin: str,
     ffprobe_bin: str,
+    detect_parallel: int = 1,
+    detect_chunk_seconds: float = 600.0,
+    skip_loop_filter: bool = False,
 ) -> list[tuple[float, float]]:
     width, height, source_rate = _probe(video_path, ffprobe_bin)
     rate = min(source_rate, Fraction(analysis_max_fps).limit_denominator(1001))
     fps = float(rate)
     out_w, out_h = _analysis_size(width, height, analysis_width)
 
-    scene_list: list[tuple[float, float]] = []
-    for window_start, window_end in windows:
-        window_scenes = _decode_window_cuts(
-            video_path, window_start, window_end, threshold, decoder, ffmpeg_bin, fps, rate, out_w, out_h
-        )
-        scene_list += [(window_start + start, window_start + stop) for start, stop in window_scenes]
-    return scene_list
+    # Les fenetres depassent souvent la fin de la video (fin de parole + marge) :
+    # le decoupage ne porte que sur la partie reelle, ffmpeg s arrete seul a la fin.
+    duration = _duration(video_path, ffprobe_bin)
+    chunks = []
+    for start, end in windows:
+        real_end = min(end, duration)
+        if real_end <= start:
+            chunks.append([(start, end)])
+            continue
+        window_chunks = _split_window(start, real_end, detect_chunk_seconds, rate)
+        window_chunks[-1] = (window_chunks[-1][0], end)
+        chunks.append(window_chunks)
+    jobs = [(w, c, cs, ce) for w, window in enumerate(chunks) for c, (cs, ce) in enumerate(window)]
+    logger.info(
+        "detection : %d fenetre(s) en %d morceau(x), parallelisme %d",
+        len(windows), len(jobs), detect_parallel,
+    )
 
+    running: set[subprocess.Popen] = set()
+    running_lock = threading.Lock()
+    failed = threading.Event()
+
+    def detect(job: tuple[int, int, float, float]) -> list[tuple[float, float]]:
+        _, _, chunk_start, chunk_end = job
+        if failed.is_set():
+            raise ScenesError("annule : un autre morceau a echoue")
+        try:
+            return _decode_window_cuts(
+                video_path, chunk_start, chunk_end, threshold, decoder, ffmpeg_bin,
+                fps, rate, out_w, out_h, skip_loop_filter, running, running_lock,
+            )
+        except ScenesError as exc:
+            if failed.is_set():
+                raise
+            raise ScenesError(
+                f"fenetre {windows[job[0]][0]:.3f}s-{windows[job[0]][1]:.3f}s "
+                f"(morceau {chunk_start:.3f}s-{chunk_end:.3f}s) : {exc}"
+            ) from exc
+
+    started = time.monotonic()
+    executor = ThreadPoolExecutor(max_workers=detect_parallel)
+    futures = [executor.submit(detect, job) for job in jobs]
+    try:
+        wait(futures, return_when=FIRST_EXCEPTION)
+        errors = [f.exception() for f in futures if f.done() and f.exception() is not None]
+        if errors:
+            failed.set()
+            with running_lock:
+                for proc in running:
+                    proc.kill()
+            raise errors[0]
+        results = [f.result() for f in futures]
+    finally:
+        failed.set()
+        executor.shutdown(wait=True, cancel_futures=True)
+    logger.info("detection : %.1f s", time.monotonic() - started)
+
+    scene_list: list[tuple[float, float]] = []
+    for w, (window_start, _) in enumerate(windows):
+        relative = [
+            [(chunk_start - window_start + s, chunk_start - window_start + e) for s, e in rel]
+            for (jw, _c, chunk_start, _e), rel in zip(jobs, results)
+            if jw == w
+        ]
+        scene_list += [
+            (window_start + s, window_start + e) for s, e in _join_chunks(relative)
+        ]
+    return scene_list
 
 def _keyframe_timecodes(start: float, end: float, interval: float) -> list[float]:
     """One keyframe in the middle of the plan, plus one every ``interval``
@@ -283,6 +422,9 @@ def detect_scenes(
     decoder: str = "",
     extract_parallel: int = 4,
     speech_margin_seconds: float = 5.0,
+    detect_parallel: int = 4,
+    detect_chunk_seconds: float = 600.0,
+    analysis_skip_loop_filter: bool = True,
     peak_windows: bool = False,
     ffmpeg_bin: str = "ffmpeg",
     ffprobe_bin: str = "ffprobe",
@@ -293,7 +435,13 @@ def detect_scenes(
 
     A video already analysed (scenes.json present) is not re-analysed unless
     ``force`` is set. Keyframes are extracted with at most ``extract_parallel``
-    ffmpeg processes running at once (1 = sequential).
+    ffmpeg processes running at once (1 = sequential). Detection windows run
+    in at most ``detect_parallel`` ffmpeg processes; a window longer than
+    ``detect_chunk_seconds`` is split into contiguous chunks detected in
+    parallel then joined (the scene across a seam is merged, no cut invented).
+    ``analysis_skip_loop_filter`` adds ``-skip_loop_filter all`` to the
+    detection input only. One failing ffmpeg fails the step (ScenesError naming
+    the window) and the others are killed.
 
     Only the union of transcript.json's speech segments (widened by
     ``speech_margin_seconds``) is decoded -- a moment can only come from a
@@ -309,6 +457,14 @@ def detect_scenes(
     if extract_parallel < 1:
         raise ScenesError(
             f"extract_parallel doit etre >= 1 (recu {extract_parallel})"
+        )
+    if detect_parallel < 1:
+        raise ScenesError(
+            f"detect_parallel doit etre >= 1 (recu {detect_parallel})"
+        )
+    if detect_chunk_seconds <= 0:
+        raise ScenesError(
+            f"detect_chunk_seconds doit etre > 0 (recu {detect_chunk_seconds})"
         )
     video_path = Path(video_path)
     video_dir = Path(workspace_dir) / video_id
@@ -328,8 +484,10 @@ def detect_scenes(
         )
 
     scene_list = _detect_scene_list(
-        video_path, threshold, analysis_width, analysis_max_fps, decoder, windows, ffmpeg_bin, ffprobe_bin
+        video_path, threshold, analysis_width, analysis_max_fps, decoder, windows, ffmpeg_bin, ffprobe_bin,
+        detect_parallel, detect_chunk_seconds, analysis_skip_loop_filter,
     )
+    detected = time.monotonic()
 
     frames_dir.mkdir(parents=True, exist_ok=True)
     tasks: list[tuple[int, float, str]] = []
@@ -357,6 +515,8 @@ def detect_scenes(
                     "scene": scene_index,
                 }
             )
+
+    logger.info("extraction : %d image(s) en %.1f s", len(frames), time.monotonic() - detected)
 
     result: dict[str, Any] = {
         "scenes": [{"start": start, "end": end} for start, end in scene_list],
