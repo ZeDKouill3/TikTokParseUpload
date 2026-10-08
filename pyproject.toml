@@ -71,3 +71,7 @@ testpaths = ["tests", "tools"]
 # -n 6 (coeurs physiques) laisse une marge CPU/RAM pour le reste du PC
 # partage, au prix d'un gain moindre que -n auto.
 addopts = "-n 6"
+# Ne garde que les dossiers temporaires des tests en echec (TASK-20f1) : une
+# suite complete laissait ~19 Go dans le dossier temporaire (pytest-of-<user>).
+tmp_path_retention_policy = "failed"
+tmp_path_retention_count = 1

@@ -7,6 +7,7 @@ inattendue. Aucun navigateur, aucun reseau, aucun TikTok.
 
 from __future__ import annotations
 
+import re
 import ast
 import json
 import random
@@ -36,6 +37,19 @@ def _sel() -> dict:
 
 
 # ---------------------------------------------------------------- fausse page
+
+
+def _css_matches(selector, attrs):
+    """Rejoue le SELECTEUR REEL sur les attributs d'une fenetre (liste separee par des virgules ; chaque terme :
+    ``[attr='v']`` / ``.classe`` hors ``:not(...)``) : un faux qui ignore le selecteur ne peut pas voir qu'il rate
+    une vraie fenetre (TASK-4b5a, TUXModal sans role)."""
+    for part in re.split(r",\s*(?![^()]*\))", selector):
+        part = re.sub(r":not\((?:[^()]|\([^()]*\))*\)", "", part)
+        wanted = re.findall(r"\[([\w-]+)='([^']*)'\]", part), re.findall(r"\.([\w-]+)", part)
+        classes = attrs.get("class", "").split()
+        if (wanted[0] or wanted[1]) and all(attrs.get(k) == v for k, v in wanted[0]) and all(c in classes for c in wanted[1]):
+            return True
+    return False
 
 
 class FakeElement:
@@ -96,8 +110,9 @@ class FakeKeyboard:
 class FakeModal(FakeElement):
     """Une fenetre surgissante : un bouton par libelle ; le clic la ferme."""
 
-    def __init__(self, page, text, labels):
+    def __init__(self, page, text, labels, attrs=None):
         super().__init__(page, _sel()["modal"]["container"], text=text)
+        self.attrs = attrs if attrs is not None else {"role": "dialog"}   # ce que le DOM expose au selecteur
         self.labels = list(labels)
         template = _sel()["modal"]["button"]
         for label in labels:
@@ -146,7 +161,7 @@ class FakePage:
 
     def query_selector_all(self, selector):
         if selector == _sel()["modal"]["container"]:
-            return list(self.modals)
+            return [m for m in self.modals if _css_matches(selector, m.attrs)]
         return list(self.lists.get(selector, []))
 
     def wait_for_selector(self, selector, timeout=None, state=None):
@@ -3269,3 +3284,66 @@ def test_error_retries_share_the_budget_with_the_stuck_retriggers_and_stay_insid
 
     assert link.clicks == 3 and stop.value.code == "content_check"
     assert env.page.posted == []
+
+
+# ---------------------------------------------------------------- TUXModal sans role=dialog (TASK-4b5a)
+
+
+def _tux_modal(env, text="Activer les vérifications automatiques du contenu ? Annuler Activer", labels=("Annuler", "Activer")):
+    """Constat reel du 08/10 : la fenetre est un TUXModal-overlay dans un portail, SANS role=dialog ni aria-modal."""
+    return lambda: FakeModal(env.page, text, list(labels), attrs={"class": "TUXModal-overlay"})
+
+
+def test_the_modal_container_selector_sees_a_tuxmodal_without_role_dialog():
+    container = _sel()["modal"]["container"]
+    assert _css_matches(container, {"class": "TUXModal-overlay"})
+    assert _css_matches(container, {"role": "dialog"}) and _css_matches(container, {"aria-modal": "true"})
+    assert not _css_matches(container, {"class": "Select__item"})
+
+
+def test_a_tuxmodal_without_role_dialog_is_closed_the_click_redone_and_the_publication_continues(tmp_path, monkeypatch, caplog):
+    env = Env(tmp_path, monkeypatch)
+    post = _sel()["selectors"]["post_button"]
+    _modal_between_guard_and_click(env, post, _tux_modal(env))
+
+    with caplog.at_level("INFO"):
+        result = env.publish()
+
+    assert env.page.popups_closed == ["Annuler"]             # jamais « Activer »
+    assert env.page.clicks().count(post) == 2
+    assert env.page.posted == ["now"] and result["state"] == "published"
+    assert set(env.page.click_timeouts) == {10_000}          # le bouton de la fenetre aussi : jamais les 30 s de Playwright
+
+
+def test_cancelling_the_auto_checks_window_is_reported_when_content_check_is_wait(tmp_path, monkeypatch, caplog):
+    env = Env(tmp_path, monkeypatch, settings={"content_check": "wait"})
+    post = _sel()["selectors"]["post_button"]
+    _modal_between_guard_and_click(env, post, _tux_modal(env))
+
+    with caplog.at_level("WARNING"):
+        env.publish()
+
+    assert "vérification de contenu" in caplog.text.casefold() and "Annuler" in caplog.text
+
+
+def test_an_unknown_tuxmodal_is_an_r4_stop_never_clicked(tmp_path, monkeypatch):
+    env = Env(tmp_path, monkeypatch)
+    post = _sel()["selectors"]["post_button"]
+    _modal_between_guard_and_click(env, post, _tux_modal(env, "Votre compte a été restreint OK", ["OK"]))
+
+    with pytest.raises(tiktok.TikTokStop) as stop:
+        env.publish()
+
+    assert stop.value.code == "unexpected_page" and "Votre compte a été restreint" in str(stop.value)
+    assert env.page.popups_closed == [] and env.page.clicks().count(post) == 1
+
+
+def test_a_tuxmodal_that_comes_back_after_the_retry_is_an_r4_stop(tmp_path, monkeypatch):
+    env = Env(tmp_path, monkeypatch)
+    post = _sel()["selectors"]["post_button"]
+    _modal_between_guard_and_click(env, post, _tux_modal(env), times=2)
+
+    with pytest.raises(tiktok.TikTokStop) as stop:
+        env.publish()
+
+    assert stop.value.code == "unexpected_page" and env.page.clicks().count(post) == 2 and env.page.posted == []
