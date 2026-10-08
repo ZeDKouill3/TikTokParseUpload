@@ -1664,10 +1664,12 @@ def test_facecam_detection_is_cached_per_video(tmp_path, video_dir):
     write_keyframes(video_dir, pattern(40, 40))
     factory = PixelDetectorFactory()
     run_stream(tmp_path, start=0.0, end=20.0, clip_id="01", factory=factory)
-    run_stream(tmp_path, start=20.0, end=40.0, clip_id="02", factory=factory)
-    assert len(factory.built) == 1  # une seule detection pour toute la video
-    detect(tmp_path, factory=factory, force=True)
+    # detection + controle du clip (rectangle sur le seul visage, TASK-9957)
     assert len(factory.built) == 2
+    run_stream(tmp_path, start=20.0, end=40.0, clip_id="02", factory=factory)
+    assert len(factory.built) == 3  # seul le controle du clip : la detection de la video n'est pas refaite
+    detect(tmp_path, factory=factory, force=True)
+    assert len(factory.built) == 4
 
 
 # --------------------------------------------------------------------------
@@ -2681,3 +2683,100 @@ def test_detect_facecam_writes_refined_and_original_rectangles(tmp_path, video_d
     x0, y0, x1, y1 = rect_box(refined)
     assert x0 <= REAL_CAM[0] + 2 and x1 >= REAL_CAM[2] - 2 and y0 <= REAL_CAM[1] + 2 and y1 >= REAL_CAM[3] - 2
     assert refined["w"] <= REAL_CAM[2] - REAL_CAM[0] + 4
+
+
+# --------------------------------------------------------------------------
+# TASK-9957 : rectangle ancre sur le seul visage (edge_reason non nul, aucun
+# bord reel a retrouver) : le contenu d'un jeu qui bouge passait pour une
+# webcam vivante (ni noir, ni fige). Il faut un visage dans le rectangle sur
+# facecam_clip_face_min_share des images cles du clip, sinon letterbox.
+# Mesure reelle (mediapipe) : clips faux 0/N, clips sains 64 % a 100 %.
+# --------------------------------------------------------------------------
+
+
+def _write_noise_keyframes(video_dir, faces, *, seed=0):
+    """Comme ``write_keyframes`` mais le fond est un bruit vivant (< 128 : le
+    detecteur factice ne le prend pas pour un visage), jamais noir ni fige."""
+    rng = np.random.default_rng(seed)
+    frames_dir = video_dir / "frames"
+    frames_dir.mkdir(exist_ok=True)
+    frames = []
+    for k, (t, box) in enumerate(faces):
+        image = coarse_noise(rng, 40, 120, H, W)
+        if box is not None:
+            x0, y0, x1, y1 = box
+            image[y0:y1, x0:x1] = 255
+        name = f"scene0000_{k:03d}.png"
+        (frames_dir / name).write_bytes(encode_png(image))
+        frames.append({"path": f"frames/{name}", "timecode": t, "scene": 0})
+    (video_dir / "scenes.json").write_text(
+        json.dumps({"scenes": [{"start": 0.0, "end": 200.0}], "frames": frames}), encoding="utf-8",
+    )
+
+
+def _face_only_facecam(tmp_path, video_dir):
+    """Localise la webcam sur le seul visage (aucun bord reel) puis renvoie sa
+    periode : edge_reason non nul."""
+    write_keyframes(video_dir, pattern(20, 20))
+    path, _ = detect(tmp_path)
+    period = period0(path)
+    assert period["edge_reason"]
+    return period["facecam"]
+
+
+def test_face_only_facecam_with_a_face_in_every_clip_frame_stays_stream(tmp_path, video_dir):
+    _face_only_facecam(tmp_path, video_dir)
+    _write_noise_keyframes(video_dir, pattern(20, 20))
+    out, factory = run_stream(tmp_path, stream_variant="split")
+    assert load(out)["layout"] == "stream_split"
+    assert all(d.closed for d in factory.detectors)
+
+
+def test_face_only_facecam_without_webcam_in_the_scene_goes_letterbox(tmp_path, video_dir, caplog):
+    # scene sans webcam : le "rectangle" montre l'interface du jeu (contenu vivant, aucun visage)
+    _face_only_facecam(tmp_path, video_dir)
+    _write_noise_keyframes(video_dir, pattern(20, 0))
+    with caplog.at_level("INFO", logger="clipper.reframe"):
+        out, factory = run_stream(tmp_path, stream_variant="split")
+    data = load(out)
+    assert data["layout"] == "letterbox"
+    assert "visage" in data["layout_reason"] and "0/20" in data["layout_reason"]
+    assert data["layout_reason"] in caplog.text
+    assert all(d.closed for d in factory.detectors)
+
+
+def test_face_only_facecam_moved_during_the_clip_goes_letterbox(tmp_path, video_dir):
+    # webcam deplacee (ecran de pause) : le visage est ailleurs, hors du rectangle localise
+    _face_only_facecam(tmp_path, video_dir)
+    moved = (1500, 700, 1630, 850)
+    _write_noise_keyframes(video_dir, pattern(20, 20, box=moved))
+    out, _ = run_stream(tmp_path, stream_variant="split")
+    assert load(out)["layout"] == "letterbox"
+
+
+def test_face_only_facecam_visible_on_a_majority_of_frames_stays_stream(tmp_path, video_dir):
+    _face_only_facecam(tmp_path, video_dir)
+    _write_noise_keyframes(video_dir, pattern(20, 13))  # 65 % >= facecam_clip_face_min_share
+    out, _ = run_stream(tmp_path)
+    assert load(out)["layout"] == "stream"
+
+
+def test_face_min_share_is_a_setting(tmp_path, video_dir):
+    from clipper.reframe import CONFIG_DEFAULTS
+
+    assert CONFIG_DEFAULTS["facecam_clip_face_min_share"] == 0.5
+    _face_only_facecam(tmp_path, video_dir)
+    _write_noise_keyframes(video_dir, pattern(20, 13))
+    out, _ = run_stream(tmp_path, facecam_clip_face_min_share=0.8)
+    assert load(out)["layout"] == "letterbox"
+
+
+def test_clip_facecam_face_only_without_detector_is_an_explicit_error(tmp_path):
+    from clipper import reframe
+
+    facecam = _offset_facecam(4)
+    facecam["edge_reason"] = "bords introuvables"
+    with pytest.raises(reframe.ReframeError, match="detecteur"):
+        reframe._clip_facecam(
+            facecam, 0.0, 3.0, dict(reframe.CONFIG_DEFAULTS), tmp_path, image_reader=_offset_reader(False)
+        )

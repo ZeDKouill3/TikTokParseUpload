@@ -255,6 +255,10 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "facecam_clip_edge_tolerance": 0.04,
     "facecam_frozen_min_diff": 8.0,
     "facecam_frozen_min_pixel_share": 0.001,
+    # Part minimale des images du clip où un visage doit se trouver dans le
+    # rectangle de la webcam, quand celui-ci a été repéré sur le seul visage
+    # (aucun bord d'incrustation retrouvé) ; en dessous, le clip reste en letterbox.
+    "facecam_clip_face_min_share": 0.5,
     # Panneau caméra : part de la hauteur de sortie, à partir de stream_top
     # (titre d'écran au-dessus) ; le jeu occupe tout le bas.
     "stream_camera_ratio": 0.4,
@@ -2273,6 +2277,7 @@ def _clip_facecam(
     settings: dict[str, Any],
     video_dir: Path,
     image_reader: Callable[[str], np.ndarray | None] = cv2.imread,
+    detector: Any = None,
 ) -> tuple[dict[str, int] | None, str | None]:
     """Choix du clip, tout ou rien (SPEC-8257 regle 2) : le rectangle de la
     facecam (deja localise) s'il y est present et vivant -- contenu non noir,
@@ -2293,8 +2298,26 @@ def _clip_facecam(
     # la regle (b) ne s'applique donc pas (elle ne ferait jamais que
     # rejeter, quel que soit le contenu).
     skip_edge_check = facecam.get("edge_reason") is not None
+    # Sans bord a retrouver, seul un visage dans le rectangle prouve que
+    # c'est bien la webcam (TASK-9957) : le detecteur est alors obligatoire.
+    if skip_edge_check and detector is None:
+        raise ReframeError(
+            "[reframe] rectangle de webcam localise sur le seul visage (edge_reason) : "
+            "un detecteur de visages est requis pour controler le clip"
+        )
+    min_conf = float(settings["min_confidence"])
+
+    def face_inside(image: np.ndarray) -> bool:
+        for d in detector.detect(image):
+            if d[4] < min_conf:
+                continue
+            cx, cy = (d[0] + d[2]) / 2, (d[1] + d[3]) / 2
+            if rect["x"] <= cx <= rect["x"] + rect["w"] and rect["y"] <= cy <= rect["y"] + rect["h"]:
+                return True
+        return False
 
     alive = 0
+    faces = 0
     prev_gray: np.ndarray | None = None
     for k in keys:
         path = video_dir / k["path"]
@@ -2308,12 +2331,23 @@ def _clip_facecam(
             and (skip_edge_check or _rect_edges_found(image, rect, settings))
             and not _rect_is_frozen(prev_gray, gray, settings)
         )
+        if skip_edge_check and face_inside(image):
+            faces += 1
         if live:
             alive += 1
         prev_gray = gray
 
     share = alive / len(keys)
     min_share = float(settings["facecam_clip_min_share"])
+    if skip_edge_check:
+        face_share = faces / len(keys)
+        min_face = float(settings["facecam_clip_face_min_share"])
+        if face_share < min_face - 1e-9:
+            return None, (
+                f"panneau webcam sans visage sur {1 - face_share:.0%} des images cles du clip "
+                f"({faces}/{len(keys)} avec un visage dans le rectangle seulement, "
+                f"facecam_clip_face_min_share = {min_face:.0%}) : webcam absente de la scene ou deplacee"
+            )
     if share < min_share - 1e-9:
         return None, (
             f"webcam absente, noire ou figee sur {1 - share:.0%} des images cles du clip "
@@ -2932,7 +2966,23 @@ def reframe(
         # Chaque clip prend la webcam de la periode qui contient son debut.
         period = [p for p in detected["periods"] if p["start"] <= start + 1e-9][-1]
         facecam = {**period, "source": detected["source"], "keyframes": detected["keyframes"]}
-        rect, reason = _clip_facecam(facecam, start, end, settings, video_dir)
+        detector = None
+        if period["facecam"] is not None and period.get("edge_reason") is not None:
+            # Rectangle localise sur le seul visage : le controle du clip en a besoin (TASK-9957).
+            if detector_factory is None:
+                if settings["detector"] not in _DETECTORS:
+                    raise ReframeError(
+                        f"[reframe] detecteur inconnu {settings['detector']!r} (attendu : {' | '.join(_DETECTORS)})"
+                    )
+                detector_factory = _DETECTORS[settings["detector"]]
+            detector = detector_factory(settings, get_device())
+        try:
+            rect, reason = _clip_facecam(facecam, start, end, settings, video_dir, detector=detector)
+        finally:
+            if detector is not None:
+                detector.close()
+                detector = None
+                gc.collect()
         candidate = None if period["answer"] is None else period["answer"]["webcam"]
         if rect is not None:
             if settings["stream_variant"] == "split":
