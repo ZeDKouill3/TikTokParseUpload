@@ -166,6 +166,13 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "candidates": "transcript",
     # Distance maximale en secondes pour caler un passage d'action sur le début ou la fin d'une phrase.
     "action_snap_seconds": 3,
+    # Parole d'un passage d'action mesurée sur les mots horodatés : un mot sans
+    # espace de plus de ce nombre de caractères est une hallucination de
+    # whisper (musique) et est ignoré.
+    "action_word_max_chars": 40,
+    # Un passage qui contient de la parole retenue est rejeté si le premier mot
+    # retenu arrive plus de ce nombre de secondes après son début.
+    "action_max_silent_start_s": 5,
 }
 
 CANDIDATES = ("transcript", "transcript+action")
@@ -807,15 +814,33 @@ def _action_material(
     return f"{parole}\n{mesures}\nImages : {images}"
 
 
+def _first_real_word(sents: list[Sentence], included: list[int], word_max_chars: int) -> float | None:
+    """Debut du premier mot retenu des phrases ``included`` : un mot sans
+    espace de plus de ``word_max_chars`` caracteres est ignore. Phrase sans
+    horodatage des mots : ses mots comptent au debut de la phrase."""
+    for k in included:
+        sent = sents[k]
+        if sent.words:
+            for t, w in sent.words:
+                if w.strip() and len(w.strip()) <= word_max_chars:
+                    return t
+        elif any(len(w) <= word_max_chars for w in sent.text.split()):
+            return sent.start
+    return None
+
+
 def _action_candidate(
     p: dict[str, Any], sents: list[Sentence], rubric: dict[str, Any], excluded: list[dict[str, Any]],
-    connectors: Connectors, snap: float,
+    connectors: Connectors, snap: float, word_max_chars: int = 40, max_silent_start: float = 5,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     """(candidat d'action, None) ou (None, rejet motive) pour un passage
     d'action.json (SPEC-b0f3 R11) : bornes recalees sur la frontiere de phrase
     la plus proche si elle est a moins de ``snap`` s, sinon gardees ; connecteurs
     de tete retires ; SponsorBlock et duree comme pour un candidat de la
-    transcription. Aucun appel LLM."""
+    transcription. La parole est mesuree sur les mots horodates (mots geants
+    ignores) : un premier mot retenu apres ``max_silent_start`` s rejette le
+    passage ; sans aucun mot retenu, regle R11 (accroche = image). Aucun appel
+    LLM."""
     block = {
         "id": p["id"], "score": p["score"], "signals": p["signals"],
         "frames": [f["timecode"] for f in p["frames"]],
@@ -839,6 +864,16 @@ def _action_candidate(
 
     included = [k for k in range(len(sents)) if sents[k].start >= start - 1e-6 and sents[k].end <= end + 1e-6]
     hook_text, cut, speech = "", "", None
+    first_word = _first_real_word(sents, included, word_max_chars)
+    if first_word is not None and first_word - start > max_silent_start + 1e-6:
+        reason = (
+            f"la parole commence trop tard : premier mot a +{first_word - start:.1f} s du debut du passage "
+            f"(maximum {max_silent_start:g} s)"
+        )
+        log.warning("passage d'action %s rejete : %s", p["id"], reason)
+        return reject(reason)
+    if included and first_word is None:
+        included = []  # que des mots geants : passage sans parole
     if included:
         head = sents[included[0]]
         hook_text = head.text
@@ -884,6 +919,10 @@ def _action_passages(video_dir: Path, settings: dict[str, Any]) -> list[dict[str
     snap = settings["action_snap_seconds"]
     if not _number(snap) or snap < 0:
         raise MomentsError(f"[moments] action_snap_seconds invalide : {snap!r} (attendu : nombre >= 0)")
+    for name in ("action_word_max_chars", "action_max_silent_start_s"):
+        v = settings[name]
+        if not _number(v) or v < 0:
+            raise MomentsError(f"[moments] {name} invalide : {v!r} (attendu : nombre >= 0)")
     if value == "transcript":
         return None
     path = video_dir / "action.json"
@@ -1369,7 +1408,10 @@ def run(
         taken = {(_round2(c["_start"]), _round2(c["_end"])) for c in candidates}
         snap = float(settings["action_snap_seconds"])
         for p in action_passages:
-            candidate, rejection = _action_candidate(p, sents, rubric, excluded, connectors, snap)
+            candidate, rejection = _action_candidate(
+                p, sents, rubric, excluded, connectors, snap,
+                float(settings["action_word_max_chars"]), float(settings["action_max_silent_start_s"]),
+            )
             if rejection is not None:
                 rejected.append(rejection)
                 continue

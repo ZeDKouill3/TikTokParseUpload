@@ -475,3 +475,85 @@ def test_rescore_reapplies_the_gate_to_an_action_candidate(tmp_path, video_dir):
     [r] = data["rejected"]
     assert r["reason"] == "emotion 6 < seuil éliminatoire 7 (grille)"
     assert (r["source"], r["start"], r["end"]) == ("action", 12.0, 47.5)
+
+
+# --------------------------------------------------------------------------
+# Parole tardive (TASK-fcaa) : parole mesuree sur les mots horodates,
+# mots geants hallucines ignores
+# --------------------------------------------------------------------------
+
+GIANT = " " + "Tan" * 140  # 420 caracteres sans espace : hallucination whisper sur la musique
+
+
+def hallucinate(video_dir, first, last, *, start=None):
+    """Remplace les phrases first..last par un seul « mot » geant."""
+    t = make_transcript()
+    begin = 5 * first + 0.25 if start is None else start
+    giant = {"id": first, "start": begin, "end": 5 * last + 4.65, "text": GIANT,
+             "words": [{"word": GIANT, "start": begin, "end": 5 * last + 4.65, "probability": 0.5}]}
+    t["segments"] = [s for s in t["segments"] if not first <= s["id"] <= last]
+    t["segments"].append(giant)
+    t["segments"].sort(key=lambda s: s["start"])
+    (video_dir / "transcript.json").write_text(json.dumps(t), encoding="utf-8")
+
+
+def test_a_passage_whose_real_speech_starts_too_late_is_rejected_with_the_delay(tmp_path, video_dir, rubric_path):
+    hallucinate(video_dir, 2, 5)  # mot geant a +2 s, vraie parole a 30.25 s
+    write_action(video_dir, passage(10.25, 44.65, speech_ratio=0.68))
+
+    fake = go(tmp_path, rubric_path, [{"moments": []}])
+
+    data = read_moments(video_dir)
+    assert data["moments"] == []
+    [r] = data["rejected"]
+    assert r["source"] == "action"
+    assert "parole" in r["reason"] and "20.0 s" in r["reason"] and "5" in r["reason"]
+    assert len(fake.calls) == 1
+
+
+def test_the_same_passage_with_speech_from_the_start_is_accepted(tmp_path, video_dir, rubric_path):
+    write_action(video_dir, passage(10.25, 44.65, speech_ratio=0.68))
+
+    go(tmp_path, rubric_path, [{"moments": []}, rate(GOOD)])
+
+    [m] = read_moments(video_dir)["moments"]
+    assert m["source"] == "action"
+
+
+def test_a_giant_word_after_real_speech_does_not_reject(tmp_path, video_dir, rubric_path):
+    hallucinate(video_dir, 4, 5)
+    write_action(video_dir, passage(10.25, 44.65))
+
+    go(tmp_path, rubric_path, [{"moments": []}, rate(GOOD)])
+
+    [m] = read_moments(video_dir)["moments"]
+    assert m["hook_text"].startswith("mot2_0")
+
+
+def test_a_passage_with_only_giant_words_keeps_the_speechless_rule(tmp_path, video_dir, rubric_path):
+    hallucinate(video_dir, 2, 8)
+    write_action(video_dir, passage(10.25, 44.65, frames=[frame(20.0, "une explosion", "mort", 9)]))
+
+    go(tmp_path, rubric_path, [{"moments": []}, rate(GOOD)])
+
+    [m] = read_moments(video_dir)["moments"]
+    assert m["hook_text"] == "une explosion"
+    assert (m["start"], m["end"]) == (10.25, 44.65)
+
+
+def test_the_word_and_delay_thresholds_are_settings(tmp_path, video_dir, rubric_path):
+    hallucinate(video_dir, 2, 5)
+    write_action(video_dir, passage(10.25, 44.65))
+
+    go(tmp_path, rubric_path, [{"moments": []}, rate(GOOD)], action_max_silent_start_s=25)
+    assert len(read_moments(video_dir)["moments"]) == 1
+
+
+@pytest.mark.parametrize("name", ["action_word_max_chars", "action_max_silent_start_s"])
+@pytest.mark.parametrize("value", [-1, "x"])
+def test_invalid_speech_start_settings_are_a_moments_error(tmp_path, video_dir, rubric_path, name, value):
+    from clipper.moments import MomentsError
+
+    write_action(video_dir)
+    with pytest.raises(MomentsError, match=name):
+        go(tmp_path, rubric_path, [], **{name: value})
