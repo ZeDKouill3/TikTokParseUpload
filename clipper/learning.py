@@ -98,7 +98,7 @@ def _read_links(settings: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("objet JSON attendu")
     except (OSError, ValueError) as exc:
         raise LearningError(f"état du rattachement illisible ({path}) : {exc}") from exc
-    return {"last_run": {}, "unlinked": [], "counts": {}, **data}
+    return {"last_run": {}, "snapshots": {}, "unlinked": [], "counts": {}, **data}
 
 
 def _write_links(settings: dict[str, Any], links: dict[str, Any]) -> None:

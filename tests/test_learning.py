@@ -223,6 +223,21 @@ def test_link_if_due_only_processes_accounts_with_a_newer_snapshot(tmp_path):
     assert [d["clip_id"] for d in again] == ["clip-03"]
 
 
+def test_link_if_due_reads_a_links_json_written_before_snapshots_existed(tmp_path):
+    """links.json d'avant TASK-2d9a (sans « snapshots ») : le worker ne plante plus (KeyError réel du 08/10)."""
+    config = _config(tmp_path)
+    path = Path(config.section("learning")["state_dir"]) / "links.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"last_run": {}, "unlinked": [], "counts": {}}), encoding="utf-8")
+    _sidecar(config, "clip-02")
+    _snapshot(config, "2026-10-07T10:00:00+00:00", ("7000000000000000013", "Un super clip #jeu #fun", "2026-10-07T09:00:00"))
+
+    done = learning.link_if_due(datetime(2026, 10, 7, 10, 30, tzinfo=timezone.utc), config=config)
+
+    assert [d["clip_id"] for d in done] == ["clip-02"]
+    assert ACCOUNT in _links(config)["snapshots"]
+
+
 def test_link_if_due_takes_a_snapshot_written_after_the_pass_even_if_fetched_before_it(tmp_path):
     """Un relevé commencé avant le passage du worker mais fini après (fetched_at < last_run) n'est pas ignoré."""
     config = _config(tmp_path)
