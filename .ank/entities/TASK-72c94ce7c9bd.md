@@ -5,7 +5,7 @@ slug: version-0-6-0-section-changelog-unique-et-compl
 title: "Version 0.6.0 : section CHANGELOG unique et complète, numéro de version, zip portable construit"
 created: 2026-10-08T21:34:55Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - CHANGELOG.md
   - pyproject.toml
@@ -16,6 +16,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/00530d10781e@ca0b381
+    tree: scope/94f889bd85b9
+    criteria: 8ce8139b8283
+    verifier: tests@c7b454d16c90
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---
