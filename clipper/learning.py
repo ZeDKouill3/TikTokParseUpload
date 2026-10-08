@@ -34,6 +34,9 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "coach_min_interval_days": 7,  # jours minimaux entre deux passages du coach (ADR-c260 : cout borne)
     "veille_report_days": 30,  # fenetre (jours) des VOD mises en file que reprend state/veille/bilan.json
     "veille_report_max": 20,  # nombre maximal d entrees du bilan, les plus recentes d abord
+    "zero_view_alert_hours": 24,  # age (heures depuis la mise en ligne) a partir duquel un post a 0 vue est signale
+    "zero_view_alert_max_views": 0,  # vues au plus au dernier releve pour qu'un post soit en alerte
+    "zero_view_alert_account_min": 2,  # posts en alerte d'un meme compte pour une alerte au niveau du compte
 }
 
 REASONS = ("none", "ambiguous")
@@ -67,6 +70,15 @@ def _settings(config: Config | None) -> dict[str, Any]:
         value = settings[key]
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise LearningError(f"[learning] {key} invalide : {value!r} (un entier >= 1 est attendu)")
+    hours = settings["zero_view_alert_hours"]
+    if isinstance(hours, bool) or not isinstance(hours, (int, float)) or hours <= 0:
+        raise LearningError(f"[learning] zero_view_alert_hours invalide : {hours!r} (un nombre d'heures > 0 est attendu)")
+    max_views = settings["zero_view_alert_max_views"]
+    if isinstance(max_views, bool) or not isinstance(max_views, int) or max_views < 0:
+        raise LearningError(f"[learning] zero_view_alert_max_views invalide : {max_views!r} (un entier >= 0 est attendu)")
+    account_min = settings["zero_view_alert_account_min"]
+    if isinstance(account_min, bool) or not isinstance(account_min, int) or account_min < 1:
+        raise LearningError(f"[learning] zero_view_alert_account_min invalide : {account_min!r} (un entier >= 1 est attendu)")
     if not isinstance(settings["enabled"], bool):
         raise LearningError(f"[learning] enabled invalide : {settings['enabled']!r} (true ou false attendu)")
     return settings
@@ -476,6 +488,11 @@ def run_if_due(now: datetime, *, config: Config | None = None) -> dict[str, Any]
     except Exception as exc:
         exc.where = "veille_report"  # type: ignore[attr-defined]
         raise
+    try:  # apres le releve : une alerte ne se journalise qu'une fois par post (TASK-974e)
+        log_zero_view_alerts(now, config=config)
+    except Exception as exc:
+        exc.where = "zero_views"  # type: ignore[attr-defined]
+        raise
     try:
         coached = coach_if_due(now, config=config)
     except (jury_coach.CoachError, jury.JuryError, llm.LLMError) as exc:
@@ -765,3 +782,102 @@ def write_veille_report(now: datetime, *, config: Config | None = None) -> dict[
     with channel_mod.file_lock(target):
         channel_mod.atomic_write_json(target, report)
     return report
+
+# ---------------------------------------------------------------- alerte « 0 vue à 24 h » (TASK-974e)
+
+_ZERO_VIEWS_LOG = "zero_views.json"  # posts déjà journalisés en WARNING : une seule ligne par post
+
+
+def _zero_views_path(settings: dict[str, Any]) -> Path:
+    return Path(settings["state_dir"]) / _ZERO_VIEWS_LOG
+
+
+def zero_view_alerts(now: datetime, *, config: Config | None = None) -> dict[str, Any]:
+    """Posts TikTok en ligne depuis au moins ``zero_view_alert_hours`` dont le dernier relevé donne au plus
+    ``zero_view_alert_max_views`` vues (TASK-974e). Lecture seule, sans réseau : elle lit les relevés déjà faits.
+    Un compte avec ``zero_view_alert_account_min`` posts en alerte devient une alerte de compte. Ignorés : posts
+    supprimés de la plateforme (sidecar ou relevé complet), comptes en pause manuelle, vues non affichées. Un post
+    lié à un clip, sans relevé après le délai, est rendu à part dans ``no_reading``, jamais compté à zéro (ADR-ad2e).
+    Rend ``{hours, accounts: [{account, level, posts}], no_reading: [...]}``."""
+    settings = _settings(config)
+    hours = float(settings["zero_view_alert_hours"])
+    max_views = settings["zero_view_alert_max_views"]
+    minimum = settings["zero_view_alert_account_min"]
+    delay = timedelta(hours=hours)
+    sidecars = _read_sidecars(config)
+    accounts = accounts_mod.list_accounts(config) if config is not None else []
+    paused = {a["id"] for a in accounts if accounts_mod.pause_reason(a)}
+    removed: set[tuple[Any, str]] = set()  # (compte, id) supprimés de la plateforme (TASK-5a7b)
+    linked: dict[tuple[Any, str], tuple[str, str]] = {}  # (compte, id) -> (video_id, clip_id)
+    for path, sidecar in sidecars:
+        post = sidecar.get("tiktok_post")
+        if not isinstance(post, dict) or not _post_id_of(post):
+            continue
+        key = (post.get("account"), _post_id_of(post))
+        linked[key] = (path.parent.name, path.stem)
+        if sidecar.get("removed_from_platform"):
+            removed.add(key)
+
+    found: dict[str, list[dict[str, Any]]] = {}
+    seen: dict[str, tuple[dict[str, Any], set[str]]] = {}  # compte -> (posts releves, posts supprimes)
+    for account in _history_accounts(config):
+        if account in paused:
+            continue
+        history = tiktok.read_history(account, config=config)
+        if not history:
+            continue
+        latest, deleted = tiktok.merged_posts(history), tiktok.deleted_post_ids(history)
+        seen[account] = (latest, deleted)
+        for post_id, row in latest.items():
+            posted, views = tiktok._naive_utc(row.get("posted_at")), row.get("views")
+            if post_id in deleted or (account, post_id) in removed or posted is None or views is None:
+                continue
+            if now - posted >= delay and views <= max_views:
+                video_id, clip_id = linked.get((account, post_id), (None, None))
+                found.setdefault(account, []).append({
+                    "video_id": video_id, "clip_id": clip_id, "post_id": post_id, "posted_at": row.get("posted_at"),
+                    "views": views, "read_at": row.get("last_seen")})
+
+    no_reading: list[dict[str, Any]] = []
+    for path, sidecar in sidecars:  # posts lies a un clip, absents des releves apres le delai
+        post = sidecar.get("tiktok_post")
+        if not isinstance(post, dict) or not _post_id_of(post) or post.get("account") in paused:
+            continue
+        account, post_id = post.get("account"), _post_id_of(post)
+        published = tiktok._naive_utc(post.get("publish_at"))
+        if (account, post_id) in removed or published is None or now - published < delay:
+            continue
+        latest, deleted = seen.get(account, ({}, set()))
+        if post_id in deleted or post_id in latest:
+            continue
+        no_reading.append({"video_id": path.parent.name, "clip_id": path.stem, "account": account, "post_id": post_id,
+                           "reason": "no_reading"})
+
+    accounts_out = []
+    for account in sorted(found):
+        posts = sorted(found[account], key=lambda p: (p["posted_at"] or "", p["post_id"]))
+        accounts_out.append({"account": account, "level": "account" if len(posts) >= minimum else "post", "posts": posts})
+    return {"hours": hours, "accounts": accounts_out, "no_reading": no_reading}
+
+
+def log_zero_view_alerts(now: datetime, *, config: Config | None = None) -> dict[str, Any]:
+    """Journalise en WARNING chaque post en alerte une seule fois (``state/learning/zero_views.json``) ; rend les
+    alertes lues par ``zero_view_alerts``."""
+    settings = _settings(config)
+    alerts = zero_view_alerts(now, config=config)
+    path = _zero_views_path(settings)
+    logged = set(_read_state_json(path, {"logged": []}).get("logged", []))
+    fresh = []
+    for group in alerts["accounts"]:
+        for post in group["posts"]:
+            key = f"{group['account']}/{post['post_id']}"
+            if key in logged:
+                continue
+            log.warning("0 vue à %d h : post %s du compte %s (clip %s/%s) publié le %s, %s vue(s) au relevé du %s%s",
+                        int(alerts["hours"]), post["post_id"], group["account"], post["video_id"], post["clip_id"],
+                        post["posted_at"], post["views"], post["read_at"],
+                        " : le compte ne diffuse peut-être plus" if group["level"] == "account" else "")
+            fresh.append(key)
+    if fresh:
+        channel_mod.atomic_write_json(path, {"logged": sorted(logged | set(fresh))})
+    return alerts

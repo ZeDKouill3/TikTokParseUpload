@@ -10048,3 +10048,33 @@ def test_publish_screen_has_the_removed_from_platform_button_with_confirmation()
     assert "/removed" in js and "Supprimé de la plateforme" in js and "data-removed" in js
     assert "removed_from_platform" in js
     assert "confirmDialog" in js[js.index("async function pubMarkRemoved"):js.index("async function pubMarkRemoved") + 900]
+
+
+# --------------------------------------------------------------------------
+# Alerte « 0 vue à 24 h » sur le tableau de bord (TASK-974e) : lecture seule, erreur visible
+# --------------------------------------------------------------------------
+
+
+def test_dashboard_carries_the_zero_view_alerts(tmp_path, monkeypatch):
+    from clipper import learning
+
+    alerts = {"hours": 24.0, "no_reading": [], "accounts": [{"account": "compte_a", "level": "post", "posts": [
+        {"video_id": "VVVVVVVVVVV", "clip_id": "01", "post_id": "7000000000000000101", "posted_at": "2026-10-08T09:00:00+00:00",
+         "views": 0, "read_at": "2026-10-10T12:00:00+00:00"}]}]}
+    monkeypatch.setattr(learning, "zero_view_alerts", lambda now, **kwargs: alerts)
+
+    assert _dashboard(tmp_path)["zero_views"] == alerts
+
+
+def test_dashboard_zero_view_error_is_visible_and_the_rest_stays(tmp_path, monkeypatch):
+    from clipper import learning
+
+    def broken(now, **kwargs):
+        raise learning.LearningError("[learning] zero_view_alert_hours invalide : 0")
+
+    monkeypatch.setattr(learning, "zero_view_alerts", broken)
+    data = _dashboard(tmp_path)
+
+    assert data["zero_views"] is None
+    assert "zero_view_alert_hours invalide" in data["zero_views_error"]
+    assert "queued" in data and "running" in data
