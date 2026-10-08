@@ -5,7 +5,7 @@ slug: alerte-0-vue-24-h-un-post-publi-qui-n-a-presque
 title: "Alerte « 0 vue à 24 h » : un post publié qui n'a (presque) aucune vue 24 h après sa mise en ligne est signalé sur le tableau de bord et au journal"
 created: 2026-10-08T13:06:32Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/learning.py
   - clipper/web/app.py
@@ -19,6 +19,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/84f9d51e48dc@4b0f8fb
+    tree: scope/8fe75f0e1398
+    criteria: a530ba716c74
+    verifier: tests@c7b454d16c90
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---

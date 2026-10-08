@@ -715,6 +715,14 @@ def _with_thumbnails(config: Config, entries: list[dict[str, Any]]) -> list[dict
     return [{**e, "platform_thumbnail": _platform_thumbnail(config, e["video_id"], e.get("url"))} for e in entries]
 
 
+def _dashboard_zero_views(config: Config) -> dict[str, Any]:
+    """Alertes « 0 vue à 24 h » (TASK-974e) : lecture seule des relevés déjà faits ; une erreur reste visible."""
+    try:
+        return {"zero_views": learning_mod.zero_view_alerts(datetime.now(timezone.utc), config=config)}
+    except (learning_mod.LearningError, tiktok_mod.TikTokError) as exc:
+        return {"zero_views": None, "zero_views_error": f"alertes 0 vue illisibles : {exc}"}
+
+
 def _dashboard(config: Config) -> dict[str, Any]:
     out: dict[str, Any] = {}
     _fill(out, ("running", "failed", "queued"), "etat des videos (workspace/*/pipeline.json)",
@@ -727,6 +735,7 @@ def _dashboard(config: Config) -> dict[str, Any]:
     _fill(out, ("worker",), "battement du worker (state/worker.json)", lambda: _dashboard_worker(config))
     _fill(out, ("next_publications",), "publications (state/publish)", lambda: _dashboard_next_publications(config))
     _fill(out, ("llm_cost",), "journal llm_usage.jsonl", lambda: _dashboard_llm_cost(config))
+    out.update(_dashboard_zero_views(config))
     out.update(_dashboard_hardware())
     return out
 

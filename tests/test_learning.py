@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -321,6 +322,8 @@ def test_concurrent_link_passes_do_not_corrupt_links_json_nor_double_count(tmp_p
 
 NOW = datetime(2026, 10, 10, 13, 0, tzinfo=timezone.utc)
 POST = "7000000000000000101"
+OTHER_POST = "7000000000000000102"
+PAUSED_POST = "7000000000000000103"
 CLIP_POSTED = "2026-09-20T09:00:00"  # heure de Paris
 
 
@@ -1109,3 +1112,151 @@ def test_coach_llm_calls_go_to_the_coach_own_usage_log_not_the_one_of_a_video_in
     assert not video_log.exists()
     own = Path(config.section("learning")["state_dir"]) / "llm_usage.jsonl"
     assert {json.loads(line)["usage"] for line in own.read_text(encoding="utf-8").splitlines()} >= {"coach"}
+
+
+# ---------------------------------------------------------------- alerte « 0 vue à 24 h » (TASK-974e)
+
+ALERT_POSTED = "2026-10-08T09:00:00+00:00"  # 52 h avant NOW : au-delà de 24 h
+RECENT_POSTED = "2026-10-10T03:00:00+00:00"  # 10 h avant NOW : en deçà de 24 h
+
+
+def _reading(config, fetched_at, *rows, account=ACCOUNT, origin="full") -> None:
+    """Un relevé complet : rows = (post_id, posted_at, views)."""
+    snapshot = {"account": account, "fetched_at": fetched_at, "source": "tiktok_studio", "origin": origin,
+                "overview": {}, "posts": [
+                    {"post_id": pid, "post_url": f"https://www.tiktok.com/@x/video/{pid}", "caption": "légende",
+                     "posted_at": posted_at, "views": views} for pid, posted_at, views in rows]}
+    tiktok.append_snapshot(account, tiktok.get_settings(config), snapshot)
+
+
+def _accounts(config, *paused) -> None:
+    path = Path(config.section("accounts")["state_file"])
+    path.write_text(json.dumps({"accounts": [
+        {"id": pid, "label": pid, "service": "tiktok", "paused_at": "2026-10-09T10:00:00+00:00" if pid in paused else None}
+        for pid in (ACCOUNT, OTHER)]}), encoding="utf-8")
+
+
+def test_zero_view_alert_settings_declared():
+    assert learning.CONFIG_DEFAULTS["zero_view_alert_hours"] == 24
+    assert learning.CONFIG_DEFAULTS["zero_view_alert_max_views"] == 0
+    assert learning.CONFIG_DEFAULTS["zero_view_alert_account_min"] == 2
+
+
+def test_zero_view_alert_settings_invalid_is_a_named_error(tmp_path):
+    config = _config(tmp_path, zero_view_alert_hours=0)
+    with pytest.raises(learning.LearningError, match="zero_view_alert_hours"):
+        learning.zero_view_alerts(NOW, config=config)
+
+
+def test_post_with_no_view_after_24h_is_an_alert(tmp_path):
+    config = _config(tmp_path)
+    _sidecar(config, "01", post_id=POST)
+    _reading(config, "2026-10-10T12:00:00+00:00", (POST, ALERT_POSTED, 0))
+
+    alerts = learning.zero_view_alerts(NOW, config=config)
+
+    assert alerts["no_reading"] == []
+    assert len(alerts["accounts"]) == 1
+    account = alerts["accounts"][0]
+    assert (account["account"], account["level"]) == (ACCOUNT, "post")
+    assert account["posts"] == [{"video_id": VIDEO, "clip_id": "01", "post_id": POST, "posted_at": ALERT_POSTED,
+                                 "views": 0, "read_at": "2026-10-10T12:00:00+00:00"}]
+
+
+def test_post_with_no_view_before_24h_is_not_an_alert(tmp_path):
+    config = _config(tmp_path)
+    _sidecar(config, "01", post_id=POST)
+    _reading(config, "2026-10-10T12:00:00+00:00", (POST, RECENT_POSTED, 0))
+
+    alerts = learning.zero_view_alerts(NOW, config=config)
+
+    assert alerts["accounts"] == [] and alerts["no_reading"] == []
+
+
+def test_post_with_views_is_not_an_alert(tmp_path):
+    config = _config(tmp_path)
+    _sidecar(config, "01", post_id=POST)
+    _reading(config, "2026-10-10T12:00:00+00:00", (POST, ALERT_POSTED, 3))
+
+    assert learning.zero_view_alerts(NOW, config=config)["accounts"] == []
+
+
+def test_post_without_reading_after_24h_is_no_reading_never_zero(tmp_path):
+    config = _config(tmp_path)
+    _sidecar(config, "01", post_id=POST, publish_at=ALERT_POSTED)
+    _reading(config, "2026-10-10T12:00:00+00:00", ("7000000000000000999", ALERT_POSTED, 500))
+
+    alerts = learning.zero_view_alerts(NOW, config=config)
+
+    assert alerts["accounts"] == []
+    assert alerts["no_reading"] == [{"video_id": VIDEO, "clip_id": "01", "account": ACCOUNT, "post_id": POST,
+                                     "reason": "no_reading"}]
+
+
+def test_two_zero_view_posts_of_one_account_give_an_account_alert(tmp_path):
+    config = _config(tmp_path)
+    _sidecar(config, "01", post_id=POST)
+    _sidecar(config, "02", post_id=OTHER_POST)
+    _reading(config, "2026-10-10T12:00:00+00:00", (POST, ALERT_POSTED, 0), (OTHER_POST, ALERT_POSTED, 0))
+
+    alerts = learning.zero_view_alerts(NOW, config=config)
+
+    assert len(alerts["accounts"]) == 1
+    account = alerts["accounts"][0]
+    assert (account["account"], account["level"]) == (ACCOUNT, "account")
+    assert sorted(p["post_id"] for p in account["posts"]) == sorted([POST, OTHER_POST])
+
+
+def test_account_min_and_hours_are_configurable(tmp_path):
+    config = _config(tmp_path, zero_view_alert_hours=10, zero_view_alert_account_min=3)
+    _sidecar(config, "01", post_id=POST)
+    _sidecar(config, "02", post_id=OTHER_POST)
+    _reading(config, "2026-10-10T12:00:00+00:00", (POST, RECENT_POSTED, 0), (OTHER_POST, ALERT_POSTED, 0))
+
+    account = learning.zero_view_alerts(NOW, config=config)["accounts"][0]
+
+    assert account["level"] == "post"  # 2 posts < 3 : pas d'alerte de compte
+    assert len(account["posts"]) == 2  # 10 h : le post de 10 h est déjà en alerte
+
+
+def test_removed_deleted_and_paused_posts_are_ignored(tmp_path):
+    config = _config(tmp_path)
+    _mark_removed(_sidecar(config, "01", post_id=POST))  # supprimé de la plateforme (TASK-5a7b)
+    _sidecar(config, "02", post_id=OTHER_POST)  # présent au premier relevé complet, absent du dernier : supprimé
+    _sidecar(config, "03", account=OTHER, post_id=PAUSED_POST)  # compte en pause
+    _reading(config, "2026-10-09T12:00:00+00:00", (POST, ALERT_POSTED, 0), (OTHER_POST, ALERT_POSTED, 0))
+    _reading(config, "2026-10-10T12:00:00+00:00", (POST, ALERT_POSTED, 0))
+    _reading(config, "2026-10-10T12:00:00+00:00", (PAUSED_POST, ALERT_POSTED, 0), account=OTHER)
+    _accounts(config, OTHER)
+
+    alerts = learning.zero_view_alerts(NOW, config=config)
+
+    assert alerts["accounts"] == []
+    assert alerts["no_reading"] == []
+
+
+def test_zero_view_alert_is_logged_once_per_post(tmp_path, caplog):
+    config = _config(tmp_path)
+    _sidecar(config, "01", post_id=POST)
+    _reading(config, "2026-10-10T12:00:00+00:00", (POST, ALERT_POSTED, 0))
+
+    with caplog.at_level(logging.WARNING, logger="clipper.learning"):
+        learning.log_zero_view_alerts(NOW, config=config)
+        learning.log_zero_view_alerts(NOW, config=config)
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING and POST in r.getMessage()]
+    assert len(warnings) == 1
+
+
+def test_run_if_due_logs_zero_view_alerts(tmp_path, monkeypatch):
+    config = _config(tmp_path)
+    calls = []
+    monkeypatch.setattr(learning, "link_if_due", lambda *a, **k: [])
+    monkeypatch.setattr(learning, "_snapshot_newer_than_sync", lambda *a, **k: False)
+    monkeypatch.setattr(learning, "coach_if_due", lambda *a, **k: [])
+    monkeypatch.setattr(learning, "write_veille_report", lambda *a, **k: None)
+    monkeypatch.setattr(learning, "log_zero_view_alerts", lambda *a, **k: calls.append("alerte"))
+
+    learning.run_if_due(NOW, config=config)
+
+    assert calls == ["alerte"]

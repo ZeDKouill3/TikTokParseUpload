@@ -12,6 +12,12 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ### Ajouté
 
+- Apprentissage : alerte « 0 vue à 24 h » sur le tableau de bord (section « Posts à 0 vue ») et une ligne WARNING
+  par post (`state/learning/zero_views.json`, une seule fois). Lit les relevés TikTok déjà faits, sans réseau :
+  un post en ligne depuis `zero_view_alert_hours` (24) dont le dernier relevé donne au plus
+  `zero_view_alert_max_views` (0) vue est signalé ; `zero_view_alert_account_min` (2) posts en alerte d'un même
+  compte donnent une alerte au niveau du compte. Un post sans relevé après le délai est rendu à part (« Pas de
+  relevé »), jamais compté à zéro. Les posts supprimés de la plateforme et les comptes en pause sont ignorés.
 - Publication : action « Supprimé de la plateforme » pour un post supprimé à la main de TikTok ou YouTube
   (programmé ou déjà en ligne). `POST /api/publish/{video_id}/{clip_id}/removed` (raison facultative) et bouton
   avec confirmation dans la fiche du clip (écran Publication) passent l'entrée en `removed_from_platform`

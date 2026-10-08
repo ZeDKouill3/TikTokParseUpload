@@ -105,6 +105,32 @@ function dashProblemRow(video, kind) {
   </div>`;
 }
 
+/* Posts sans vue depuis zero_view_alert_hours (TASK-974e) : compte en alerte d'un bloc, pas de relevé à part. */
+function dashZeroViewRow(account, post) {
+  const clip = post.video_id ? `${esc(post.video_id)} · clip ${esc(post.clip_id)}` : "post non relié à un clip";
+  return `<div class="list-item dash-problem" data-post="${esc(post.post_id)}">
+    <span class="chip failed">0 vue</span>
+    <div class="li-main"><div class="li-title mono">${esc(post.post_id)}</div>
+      <div class="li-sub">${esc(account)} · ${clip} · publié le ${esc(dashDate(post.posted_at))}</div>
+      <div class="li-sub">${esc(post.views)} vue(s) au relevé du ${esc(dashDate(post.read_at))}</div></div></div>`;
+}
+
+function dashZeroViewsContent(data) {
+  if (data.zero_views === null || data.zero_views === undefined) {
+    return dashError(data.zero_views_error || "alertes 0 vue : donnée absente de la réponse.");
+  }
+  const { hours, accounts, no_reading: missing } = data.zero_views;
+  const rows = accounts.map((group) => {
+    const head = group.level === "account"
+      ? `<div class="list-item"><p class="reason bad">Le compte ${esc(group.account)} ne diffuse peut-être plus : ${group.posts.length} posts à 0 vue depuis ${esc(hours)} h.</p></div>`
+      : "";
+    return head + group.posts.map((post) => dashZeroViewRow(group.account, post)).join("");
+  }).join("");
+  const silent = missing.map((item) => `<div class="list-item muted"><div class="li-main">
+    <div class="li-sub">Pas de relevé : ${esc(item.account)} · ${esc(item.post_id)} · clip ${esc(item.clip_id)}</div></div></div>`).join("");
+  return rows + silent || dashEmpty(`Aucun post sans vue depuis ${esc(hours)} h.`);
+}
+
 function dashPublicationRow(entry) {
   return `<a class="list-item" href="#/publish" data-clip="${esc(entry.clip_id)}">
     <div class="when num">${esc(dashDate(entry.slot_at))}</div>
@@ -345,6 +371,7 @@ Screens.dashboard = {
           ${dashSection("running", "activity", "En cours", `<div class="jobs">${dashList(data, "running", "Aucune vidéo en cours de traitement.", dashRunningRow)}</div>`)}
           ${dashSection("failed", "triangle-alert", "Échecs", dashList(data, "failed", "Aucun échec : rien à relancer.", (v) => dashProblemRow(v, "failed")))}
           ${dashSection("queued", "hourglass", "En attente de reprise", dashList(data, "queued", "Aucune vidéo en attente de reprise.", (v) => dashProblemRow(v, "queued")))}
+          ${dashSection("zero_views", "triangle-alert", "Posts à 0 vue", dashZeroViewsContent(data))}
           ${dashSection("queue", "list-filter", "File d'attente", queueContent)}
           ${dashSection("watch_pending", "eye", "VOD à confirmer", dashList(data, "watch_pending", "Aucune VOD à confirmer.", watchVodRow))}
         </div>
