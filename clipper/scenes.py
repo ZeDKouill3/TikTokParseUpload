@@ -1,4 +1,4 @@
-﻿"""Etape scenes : detection des changements de plan et images cles.
+"""Etape scenes : detection des changements de plan et images cles.
 
 Le decodage passe par ffmpeg en sous-processus (TASK-1f16) : l'analyse porte
 sur des images reduites (``analysis_width`` pixels de large, au plus
