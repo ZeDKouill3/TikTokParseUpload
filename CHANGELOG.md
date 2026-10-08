@@ -12,6 +12,9 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ### Corrigé
 
+- Stats TikTok : les évolutions et pourcentages avec séparateur de milliers (« 4,300.0% », « 4 300,0 % », espaces
+  fines et insécables comprises) sont lus correctement au lieu de faire échouer le relevé (« valeur illisible
+  (tuile views, 7 jours) ») ; « 1,5% » et « 12,5 % » restent des décimales, les formes ambiguës restent refusées.
 - Téléchargement : une VOD Twitch en mp4 fragmenté (fMP4 : 1 `moov` + des dizaines de milliers de `moof`/`mdat`,
   aucun index) est remuxée sans réencodage en mp4 indexé (`ffmpeg -c copy -movflags +faststart`) avant l'écriture
   de `meta.json`. Constat du 07/10 (v2894103366, 11 Go) : ~30 s par `-ss` avant `-i` contre 0,4 s après remux,
