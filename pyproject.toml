@@ -70,6 +70,9 @@ testpaths = ["tests", "tools"]
 # les tests de concurrence reelle avant leur correctif, cf. TASK-42a46cb23f78).
 # -n 6 (coeurs physiques) laisse une marge CPU/RAM pour le reste du PC
 # partage, au prix d'un gain moindre que -n auto.
+# -n 8 (TASK-8f7c) non adopte : il exige 3 suites completes vertes consecutives
+# et une RAM libre > 2 Go mesuree pendant ces suites, pas encore relevees ;
+# -n 6 reste donc le reglage.
 addopts = "-n 6"
 # Ne garde que les dossiers temporaires des tests en echec (TASK-20f1) : une
 # suite complete laissait ~19 Go dans le dossier temporaire (pytest-of-<user>).

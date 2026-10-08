@@ -20,6 +20,30 @@ def _load_pyproject() -> dict:
     return tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
 
 
+@pytest.fixture(scope="session")
+def built_wheel(tmp_path_factory) -> Path:
+    """Un seul wheel par processus de test (TASK-8f7c) : construit hors ligne
+    dans une copie isolee du paquet (setuptools ecrit build/ a cote du
+    pyproject.toml), puis lu en lecture seule par les tests qui inspectent
+    son contenu ou l'installent."""
+    base = tmp_path_factory.mktemp("wheel")
+    src = base / "src"
+    shutil.copytree(ROOT / "clipper", src / "clipper")
+    shutil.copy2(PYPROJECT, src / "pyproject.toml")
+
+    out_dir = base / "dist"
+    result = subprocess.run(
+        ["uv", "build", "--offline", "--wheel", "--out-dir", str(out_dir), str(src)],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+    wheels = list(out_dir.glob("*.whl"))
+    assert wheels, f"aucun wheel produit dans {out_dir}"
+    return wheels[0]
+
+
 def test_fastapi_and_uvicorn_are_project_dependencies():
     deps = _load_pyproject()["project"]["dependencies"]
     assert "fastapi" in deps
@@ -45,56 +69,25 @@ def test_import_fastapi_uvicorn_httpx():
 
 
 @pytest.mark.skipif(shutil.which("uv") is None, reason="uv absent du PATH")
-def test_wheel_contains_the_font_assets(tmp_path):
+def test_wheel_contains_the_font_assets(built_wheel):
     """Une installation non editable (uv pip install .) doit apporter
     clipper/assets/fonts/Poppins-ExtraBold.ttf : on construit le wheel hors
-    ligne (cache uv local, aucun reseau) dans une copie isolee du paquet
-    (setuptools ecrit un dossier build/ a cote du pyproject.toml construit,
-    qu'on ne veut pas laisser trainer dans le worktree) et on inspecte le
-    contenu du wheel produit."""
-    src = tmp_path / "src"
-    shutil.copytree(ROOT / "clipper", src / "clipper")
-    shutil.copy2(PYPROJECT, src / "pyproject.toml")
+    ligne (cache uv local, aucun reseau) : le wheel de la session
+    (fixture built_wheel) est inspecte, sans le reconstruire."""
 
-    out_dir = tmp_path / "dist"
-    result = subprocess.run(
-        ["uv", "build", "--offline", "--wheel", "--out-dir", str(out_dir), str(src)],
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode == 0, result.stderr
-
-    wheels = list(out_dir.glob("*.whl"))
-    assert wheels, f"aucun wheel produit dans {out_dir}"
-
-    with zipfile.ZipFile(wheels[0]) as zf:
+    with zipfile.ZipFile(built_wheel) as zf:
         names = zf.namelist()
     assert "clipper/assets/fonts/Poppins-ExtraBold.ttf" in names
     assert "clipper/assets/fonts/OFL.txt" in names
 
 
 @pytest.mark.skipif(shutil.which("uv") is None, reason="uv absent du PATH")
-def test_wheel_contains_the_web_static_assets(tmp_path):
+def test_wheel_contains_the_web_static_assets(built_wheel):
     """TASK-4ed9 : une installation non editable (uv pip install .) doit
     apporter clipper/web/static/index.html, app.js et style.css, en plus des
-    polices deja couvertes. Meme construction isolee que le test des
-    polices : wheel hors ligne dans une copie du paquet, contenu inspecte."""
-    src = tmp_path / "src"
-    shutil.copytree(ROOT / "clipper", src / "clipper")
-    shutil.copy2(PYPROJECT, src / "pyproject.toml")
+    polices deja couvertes. Lit le wheel de la session (fixture built_wheel)."""
 
-    out_dir = tmp_path / "dist"
-    result = subprocess.run(
-        ["uv", "build", "--offline", "--wheel", "--out-dir", str(out_dir), str(src)],
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode == 0, result.stderr
-
-    wheels = list(out_dir.glob("*.whl"))
-    assert wheels, f"aucun wheel produit dans {out_dir}"
-
-    with zipfile.ZipFile(wheels[0]) as zf:
+    with zipfile.ZipFile(built_wheel) as zf:
         names = zf.namelist()
     assert "clipper/web/static/index.html" in names
     assert "clipper/web/static/app.js" in names
@@ -125,25 +118,11 @@ def test_embedded_config_example_matches_repo():
 
 
 @pytest.mark.skipif(shutil.which("uv") is None, reason="uv absent du PATH")
-def test_wheel_contains_rubric_and_config_example_assets(tmp_path):
+def test_wheel_contains_rubric_and_config_example_assets(built_wheel):
     """La grille par defaut et config.example.toml doivent etre embarquees
     dans la wheel (package data), pas seulement presentes dans le depot."""
-    src = tmp_path / "src"
-    shutil.copytree(ROOT / "clipper", src / "clipper")
-    shutil.copy2(PYPROJECT, src / "pyproject.toml")
 
-    out_dir = tmp_path / "dist"
-    result = subprocess.run(
-        ["uv", "build", "--offline", "--wheel", "--out-dir", str(out_dir), str(src)],
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode == 0, result.stderr
-
-    wheels = list(out_dir.glob("*.whl"))
-    assert wheels, f"aucun wheel produit dans {out_dir}"
-
-    with zipfile.ZipFile(wheels[0]) as zf:
+    with zipfile.ZipFile(built_wheel) as zf:
         names = zf.namelist()
     assert "clipper/assets/rubric.toml" in names
     assert "clipper/assets/config.example.toml" in names
@@ -170,26 +149,12 @@ def _venv_console_script(venv_dir: Path, name: str) -> Path:
 
 
 @pytest.mark.skipif(shutil.which("uv") is None, reason="uv absent du PATH")
-def test_wheel_installed_alone_in_a_fresh_venv_runs_clipper_help_and_init(tmp_path):
+def test_wheel_installed_alone_in_a_fresh_venv_runs_clipper_help_and_init(built_wheel, tmp_path):
     """TASK-c8a11756eb4e (critere principal) : installee SEULE dans un venv
     neuf hors depot (uv venv + uv pip install de la wheel), la wheel fournit
     la commande 'clipper' et 'clipper init' ecrit config.toml/rubric.toml
     dans le dossier courant, identiques a la grille et a l'exemple de config
     du depot."""
-    src = tmp_path / "src"
-    shutil.copytree(ROOT / "clipper", src / "clipper")
-    shutil.copy2(PYPROJECT, src / "pyproject.toml")
-
-    dist_dir = tmp_path / "dist"
-    build = subprocess.run(
-        ["uv", "build", "--offline", "--wheel", "--out-dir", str(dist_dir), str(src)],
-        capture_output=True,
-        text=True,
-    )
-    assert build.returncode == 0, build.stderr
-    wheels = list(dist_dir.glob("*.whl"))
-    assert wheels, f"aucun wheel produit dans {dist_dir}"
-
     venv_dir = tmp_path / "venv"
     venv_created = subprocess.run(
         ["uv", "venv", "--offline", str(venv_dir)],
@@ -202,7 +167,7 @@ def test_wheel_installed_alone_in_a_fresh_venv_runs_clipper_help_and_init(tmp_pa
         [
             "uv", "pip", "install", "--offline",
             "--python", str(_venv_python(venv_dir)),
-            str(wheels[0]),
+            str(built_wheel),
         ],
         capture_output=True,
         text=True,
