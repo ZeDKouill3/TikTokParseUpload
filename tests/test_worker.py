@@ -26,12 +26,33 @@ URL_A = f"https://youtu.be/{VIDEO_A}"
 URL_B = f"https://youtu.be/{VIDEO_B}"
 
 
+@pytest.fixture(autouse=True)
+def _cwd_hors_depot(tmp_path, monkeypatch):
+    # TASK-0f21 : filet pour les tests qui construisent leur Config à la main (sans _config) : les défauts
+    # d'état sont relatifs au cwd, donc chaque test démarre dans un dossier vide et ne touche jamais le state/ du dépôt.
+    monkeypatch.chdir(tmp_path)
+
+
 def _config(tmp_path, **worker_overrides) -> Config:
+    # Tous les dossiers d'état sous tmp_path (TASK-0f21) : les défauts sont relatifs au cwd, donc un tick
+    # lirait et écrirait le state/ du dépôt quand la suite tourne depuis lui.
+    state = tmp_path / "state"
     return Config(
         mode="auto",
         workspace_dir=tmp_path / "workspace",
         output_dir=tmp_path / "output",
-        _sections={"worker": {"queue_path": str(tmp_path / "state" / "queue.json"), **worker_overrides}},
+        _sections={
+            "worker": {"queue_path": str(state / "queue.json"), **worker_overrides},
+            "learning": {"state_dir": str(state / "learning")},
+            "tiktok": {"stats_dir": str(state / "stats" / "tiktok"), "events_path": str(state / "tiktok" / "events.json")},
+            "veille": {"state_dir": str(state / "veille")},
+            "watch": {"state_dir": str(state / "watch")},
+            "publish": {"state_dir": str(state / "publish")},
+            "outcomes": {"journal_path": str(state / "outcomes.jsonl")},
+            "jury_calibration": {"weights_path": str(state / "jury_weights.json")},
+            "accounts": {"state_file": str(state / "accounts.json")},
+            "feedback": {"journal_path": str(state / "feedback.jsonl")},
+        },
     )
 
 
@@ -3110,6 +3131,31 @@ def test_learning_disabled_does_nothing(tmp_path):
     worker.Worker(config=config, spawner=FakeSpawner(),
                   learning_runner=lambda now, *, config: calls.append(1) or {}).tick()
     assert calls == []
+
+
+def test_tick_ne_lit_ni_n_ecrit_jamais_le_state_du_dossier_courant(tmp_path, monkeypatch, caplog):
+    # Régression TASK-0f21 : les chemins d'état par défaut sont relatifs au cwd ; un state/ piégé dans le cwd
+    # (JSON cassé) ne doit être ni lu, ni modifié, ni journalisé en erreur par un tick de test standard.
+    import logging
+
+    trap = tmp_path / "depot"
+    trapped = {
+        trap / "state" / "learning" / "links.json": "{casse",
+        trap / "state" / "stats" / "tiktok" / "acc" / "2026-10-01.json": "{casse",
+        trap / "state" / "veille" / "bilan.json": "{casse",
+    }
+    for path, text in trapped.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    before = {path: path.read_bytes() for path in trapped}
+    monkeypatch.chdir(trap)
+
+    with caplog.at_level(logging.ERROR):
+        worker.Worker(config=_config(tmp_path / "suite"), spawner=FakeSpawner()).tick()
+
+    assert {path: path.read_bytes() for path in trapped} == before
+    assert not (trap / "state" / "learning" / "sync.json").exists()
+    assert "apprentissage impossible" not in caplog.text
 
 
 # ---- pause manuelle d'un compte (SPEC-f348 R7.3, R7.5)
