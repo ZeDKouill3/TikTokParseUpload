@@ -130,6 +130,7 @@ def test_config_defaults_are_exactly_r1():
         "trend_days": 30, "trend_games_max": 40, "steam_reviews_pause_s": 2.0, "steam_reviews_retry_max": 3,
         "steam_reviews_retry_wait_max_s": 60.0, "twitch_history_pages_max": 5, "twitch_history_retry_max": 2,
         "twitch_history_retry_wait_max_s": 60.0, "veille_deadline_s": 480,
+        "llm_retry_delay_min": 30, "llm_retry_max": 3,
     }
 
 
@@ -2916,3 +2917,108 @@ def test_run_if_due_without_injected_clock_uses_the_elapsed_real_time(tmp_path):
         state = veille.run_if_due(AFTER_RUN_AT, config, collectors)
     elapsed = datetime.fromisoformat(state["finished_at"]) - datetime.fromisoformat(state["started_at"])
     assert called and elapsed >= timedelta(seconds=0.1)
+
+
+# --- TASK-0015 : VOD déjà en file sous id « v… », échec du choix, limite de session -----------------------
+
+
+def _twitch_vod(numeric_id):
+    return {**_vod(numeric_id), "url": f"https://www.twitch.tv/videos/{numeric_id}"}
+
+
+def test_twitch_vod_already_queued_under_its_worker_id_is_not_proposed_again(tmp_path, config):
+    (tmp_path / "state").mkdir(exist_ok=True)
+    (tmp_path / "state" / "queue.json").write_text(json.dumps([
+        {"id": "q", "video_id": "v2893407960", "url": "u", "channel": None, "action": "run", "status": "waiting"},
+    ]), encoding="utf-8")
+    veille.collect(NOW, collectors=_collectors(vods=[_twitch_vod("2893407960"), _twitch_vod("2893407961")]),
+                   config=config)
+    day = _read(_sdir(tmp_path) / "days" / f"{TODAY}.json")
+    assert [c["video_id"] for c in day["candidates"]] == ["2893407961"]
+    assert day["excluded"]["already_known"] == 1
+
+
+def test_twitch_vod_seen_under_its_worker_id_is_not_proposed_again(tmp_path, config):
+    _sdir(tmp_path).mkdir(parents=True)
+    (_sdir(tmp_path) / "seen.json").write_text(json.dumps({
+        "queued": [{"candidate_id": "twitch:2893407960", "video_id": "v2893407960"}], "ignored": [],
+    }), encoding="utf-8")
+    veille.collect(NOW, collectors=_collectors(vods=[_twitch_vod("2893407960")]), config=config)
+    day = _read(_sdir(tmp_path) / "days" / f"{TODAY}.json")
+    assert day["candidates"] == [] and day["excluded"]["already_known"] == 1
+
+
+def test_a_decide_crash_is_written_once_and_the_collect_is_not_replayed(tmp_path, monkeypatch):
+    config = _make_config(tmp_path, enabled=True)
+    calls = {"decide": 0, "twitch": 0}
+    collectors = _run_collectors()
+    inner = collectors["twitch"]
+
+    def twitch(settings):
+        calls["twitch"] += 1
+        return inner(settings)
+
+    collectors["twitch"] = twitch
+
+    def boom(state, config, now=None):
+        calls["decide"] += 1
+        raise veille.VeilleError("fichier d'état illisible")
+
+    monkeypatch.setattr(veille, "decide", boom)
+    state = veille.run_if_due(AFTER_RUN_AT, config, collectors)
+    assert state["llm"]["status"] == "error" and "illisible" in state["llm"]["error"]
+    assert state["proposals"] == [] and state["finished_at"]
+    assert veille.run_if_due(AFTER_RUN_AT + timedelta(minutes=1), config, collectors) is None
+    assert calls == {"decide": 1, "twitch": 1}
+    assert _read(_sdir(tmp_path) / "days" / f"{TODAY}.json")["llm"]["status"] == "error"
+
+
+def _quota():
+    return llm.TransientLLMError("limite de session atteinte (429)")
+
+
+def test_a_session_limit_schedules_a_retry_of_the_choice_only(tmp_path):
+    config = _make_config(tmp_path, enabled=True, llm_retry_delay_min=30)
+    calls = {"twitch": 0}
+    collectors = _run_collectors()
+    inner = collectors["twitch"]
+
+    def twitch(settings):
+        calls["twitch"] += 1
+        return inner(settings)
+
+    collectors["twitch"] = twitch
+    fake = FakeBackend([_quota(), _picks("twitch:AAA")])
+    with llm.use_backend(fake):
+        state = veille.run_if_due(AFTER_RUN_AT, config, collectors)
+        assert state["llm"]["status"] == "retry" and state["llm"]["retry_at"]
+        assert state["llm"]["retry_at"] == (AFTER_RUN_AT + timedelta(minutes=30)).isoformat()
+        assert veille.run_if_due(AFTER_RUN_AT + timedelta(minutes=10), config, collectors) is None
+        assert len(fake.calls) == 1
+        state = veille.run_if_due(AFTER_RUN_AT + timedelta(minutes=31), config, collectors)
+    assert calls["twitch"] == 1  # le relevé n'est pas refait
+    assert state["llm"]["status"] == "ok"
+    assert [p["candidate_id"] for p in state["proposals"]] == ["twitch:AAA"]
+    assert len(state["candidates"]) == 2 and state["finished_at"]
+    assert _read(_sdir(tmp_path) / "days" / f"{TODAY}.json")["llm"]["status"] == "ok"
+
+
+def test_session_limit_retries_are_bounded_then_the_failure_is_explicit(tmp_path):
+    config = _make_config(tmp_path, enabled=True, llm_retry_delay_min=30, llm_retry_max=2)
+    fake = FakeBackend([_quota(), _quota(), _quota(), _picks("twitch:AAA")])
+    with llm.use_backend(fake):
+        state = veille.run_if_due(AFTER_RUN_AT, config, _run_collectors())
+        assert state["llm"]["status"] == "retry"
+        state = veille.run_if_due(AFTER_RUN_AT + timedelta(minutes=31), config, _run_collectors())
+        assert state["llm"]["status"] == "retry"
+        state = veille.run_if_due(AFTER_RUN_AT + timedelta(minutes=62), config, _run_collectors())
+        assert state["llm"]["status"] == "error" and "429" in state["llm"]["error"]
+        assert state["proposals"] == []
+        assert veille.run_if_due(AFTER_RUN_AT + timedelta(hours=5), config, _run_collectors()) is None
+    assert len(fake.calls) == 3
+
+
+@pytest.mark.parametrize("key,value", [("llm_retry_delay_min", 0), ("llm_retry_max", -1)])
+def test_llm_retry_settings_are_validated(tmp_path, key, value):
+    with pytest.raises(veille.VeilleError, match=key):
+        veille.settings(_make_config(tmp_path, **{key: value}))

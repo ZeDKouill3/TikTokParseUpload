@@ -16,6 +16,12 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ### Corrigé
 
+- Veille (revue r-veille-stats 08/10) : une VOD Twitch déjà en file ou vue n'est plus reproposée au relevé suivant
+  (l'id que le worker lui donne, `v2893407960`, est comparé en plus de l'id source). Une exception inattendue du choix
+  de Claude est écrite dans l'état du jour (journal ERROR, `finished_at`, aucune proposition inventée) au lieu de
+  relancer le relevé à chaque tour du worker. Une limite de session (429) pendant le choix passe `llm.status` à
+  `retry` avec `retry_at` (`llm_retry_delay_min`, défaut 30 min) : seul le choix est refait, sans nouveau relevé, au
+  plus `llm_retry_max` fois (défaut 3), puis l'échec est explicite.
 - Publication : un post réussi est toujours tracé (revue r-publish 08/10). Le sidecar est réécrit avec les mêmes
   réessais sous Windows que la file (`channel.atomic_write_json`) ; `mark_published` écrit d'abord l'état de file
   (preuve que le post est parti), puis le sidecar : un échec d'écriture est journalisé ERROR avec le `post_url` et
