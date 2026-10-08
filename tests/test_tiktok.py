@@ -39,6 +39,8 @@ def _sel() -> dict:
 
 
 class FakeElement:
+    in_modal = False   # bouton d'une fenetre : jamais intercepte par elle
+
     def __init__(self, page, selector, href=None, text="", value=None, on_click=None, visible=True):
         self.page, self.selector, self.href = page, selector, href
         self.text, self.value, self.on_click, self.visible = text, value, on_click, visible
@@ -46,8 +48,13 @@ class FakeElement:
 
     def click(self, **kwargs):
         self.page.calls.append(("click", self.selector))
+        self.page.click_timeouts.append(kwargs.get("timeout"))
         if self.page.fail_click:
             raise RuntimeError("Target page, context or browser has been closed")
+        if self.page.modals_block_clicks and self.page.modals and not self.in_modal:
+            # Playwright : l'overlay d'une fenetre recouvre l'element et attend en vain (TimeoutError)
+            raise TimeoutError("Locator.click: Timeout 10000ms exceeded.\n  - <div class=\"TUXModal-overlay\"> "
+                               "intercepts pointer events\n  - retrying click action")
         for added in self.page.after_click.get(self.selector, ()):
             self.page.present.add(added)
         if self.on_click is not None:
@@ -94,8 +101,9 @@ class FakeModal(FakeElement):
         self.labels = list(labels)
         template = _sel()["modal"]["button"]
         for label in labels:
-            self.children[template.format(label=label)] = FakeElement(
-                page, template.format(label=label), on_click=lambda label=label: self.close(label))
+            button = FakeElement(page, template.format(label=label), on_click=lambda label=label: self.close(label))
+            button.in_modal = True
+            self.children[template.format(label=label)] = button
 
     def close(self, label):
         self.page.modals.remove(self)
@@ -117,6 +125,8 @@ class FakePage:
         self.hidden: set[str] = set()
         self.modals: list[FakeModal] = []
         self.popups_closed: list[str] = []
+        self.modals_block_clicks = False
+        self.click_timeouts: list = []
         self.timeline: list = []
         self.waits = 0
         self.keyboard = FakeKeyboard(self)
@@ -978,6 +988,110 @@ def test_a_popup_that_keeps_coming_back_is_an_r4_stop(tmp_path, monkeypatch):
     with pytest.raises(tiktok.TikTokStop) as stop:
         env.publish()
     assert stop.value.code == "unexpected_page" and "fenêtre" in str(stop.value)
+
+
+def _modal_between_guard_and_click(env, selector, modal, times=1):
+    """La fenetre surgit APRES la garde de ``wait`` et avant le clic (constat reel du 08/10) : elle s'ajoute
+    quand la page rend l'element cherche, ``times`` fois au plus."""
+    real, left = env.page.wait_for_selector, [times]
+
+    def wait_for_selector(sel, timeout=None, state=None):
+        element = real(sel, timeout=timeout, state=state)
+        if sel == selector and left[0] > 0:
+            left[0] -= 1
+            env.page.modals.append(modal())
+        return element
+
+    env.page.wait_for_selector = wait_for_selector
+    env.page.modals_block_clicks = True
+
+
+def _auto_checks_modal(env):
+    return lambda: FakeModal(env.page, "Activer les vérifications automatiques du contenu ?\nAnnuler Activer",
+                             ["Annuler", "Activer"])
+
+
+def test_a_known_popup_between_the_guard_and_the_click_is_closed_and_the_click_redone_once(tmp_path, monkeypatch, caplog):
+    env = Env(tmp_path, monkeypatch)
+    post = _sel()["selectors"]["post_button"]
+    _modal_between_guard_and_click(env, post, _auto_checks_modal(env))
+
+    with caplog.at_level("INFO"):
+        result = env.publish()
+
+    assert env.page.popups_closed == ["Annuler"]            # jamais « Activer »
+    assert env.page.clicks().count(post) == 2                # un echec intercepte, puis le clic refait
+    assert env.page.posted == ["now"] and result["state"] == "published"
+    assert "fenêtre connue" in caplog.text
+
+
+def test_a_schedule_click_hit_by_a_known_popup_is_redone_after_closing_it(tmp_path, monkeypatch):
+    env = Env(tmp_path, monkeypatch)
+    later = _sel()["selectors"]["schedule_later"]
+    _modal_between_guard_and_click(env, later, _auto_checks_modal(env))
+
+    env.publish(mode="scheduled", schedule_at=NOW + timedelta(days=1))
+
+    assert env.page.popups_closed == ["Annuler"] and env.page.posted == ["scheduled"]
+    assert env.page.clicks().count(later) == 2
+
+
+def test_an_unknown_window_between_the_guard_and_the_click_is_an_r4_stop_never_clicked(tmp_path, monkeypatch):
+    env = Env(tmp_path, monkeypatch)
+    post = _sel()["selectors"]["post_button"]
+    _modal_between_guard_and_click(env, post, lambda: FakeModal(env.page, "Votre compte a été restreint\nOK", ["OK"]))
+
+    with pytest.raises(tiktok.TikTokStop) as stop:
+        env.publish()
+
+    assert stop.value.code == "unexpected_page" and "Votre compte a été restreint" in str(stop.value)
+    assert env.page.popups_closed == [] and env.page.posted == []
+    assert env.page.clicks().count(post) == 1                # pas de second clic
+
+
+def test_a_click_failing_again_after_the_popup_is_closed_is_an_r4_stop(tmp_path, monkeypatch):
+    env = Env(tmp_path, monkeypatch)
+    post = _sel()["selectors"]["post_button"]
+    _modal_between_guard_and_click(env, post, _auto_checks_modal(env), times=2)   # elle revient apres le re-essai
+
+    with pytest.raises(tiktok.TikTokStop) as stop:
+        env.publish()
+
+    assert stop.value.code == "unexpected_page"
+    assert env.page.clicks().count(post) == 2                # UN seul nouvel essai
+    assert env.page.posted == []
+
+
+def test_a_click_without_any_window_is_a_single_click_with_the_click_timeout(tmp_path, monkeypatch):
+    env = Env(tmp_path, monkeypatch)
+    post = _sel()["selectors"]["post_button"]
+
+    env.publish()
+
+    assert env.page.clicks().count(post) == 1 and env.page.posted == ["now"]
+    assert set(env.page.click_timeouts) == {10_000}          # click_timeout_s = 10 par defaut, pas les 30 s de Playwright
+
+
+def test_the_click_timeout_is_a_setting_with_a_default_and_is_validated(tmp_path, monkeypatch):
+    assert tiktok.CONFIG_DEFAULTS["click_timeout_s"] == 10
+    env = Env(tmp_path, monkeypatch, settings={"click_timeout_s": 3})
+    env.publish()
+    assert set(env.page.click_timeouts) == {3_000}
+    for bad in (0, "10", True):
+        config = Config(mode="review", workspace_dir=tmp_path, output_dir=tmp_path, _sections={"tiktok": {"click_timeout_s": bad}})
+        with pytest.raises(tiktok.TikTokError, match="click_timeout_s"):
+            tiktok.get_settings(config)
+
+
+def test_a_failing_click_without_interception_nor_window_is_not_retried(tmp_path, monkeypatch):
+    env = Env(tmp_path, monkeypatch)
+    env.page.fail_click = True
+
+    with pytest.raises(tiktok.TikTokStop) as stop:
+        env.publish()
+
+    assert stop.value.code == "unexpected_page" and "closed" in str(stop.value)
+    assert len(env.page.clicks()) == 1
 
 
 def test_a_missing_chrome_is_a_browser_error_not_a_stop(tmp_path, monkeypatch):

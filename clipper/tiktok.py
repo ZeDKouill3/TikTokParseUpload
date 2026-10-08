@@ -60,6 +60,7 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "schedule_max_days": 10,           # limite native de TikTok Studio
     "schedule_min_minutes": 15,        # avance minimale native de TikTok Studio
     "action_timeout_s": 30,            # attente d'un element de la page
+    "click_timeout_s": 10,             # attente d'un clic (Playwright : 30 s) ; intercepte par une fenetre : elle est fermee, puis un seul nouvel essai
     "upload_timeout_s": 300,           # attente de la fin de l'envoi du mp4
     "publish_confirm_timeout_s": 60,   # attente de la preuve de publication apres « Publier »
     "content_check": "off",            # off : coupe la verification de contenu de TikTok avant de publier
@@ -134,7 +135,7 @@ def get_settings(config: Config | None) -> dict[str, Any]:
             raise TikTokError(f"[tiktok] {key} invalide : {settings[key]!r} (attendu : {' | '.join(allowed)})")
     for key, minimum in (("max_posts_per_day", 1), ("min_gap_minutes", 0), ("min_action_delay_s", 0),
                          ("max_action_delay_s", 0), ("schedule_max_days", 1), ("schedule_min_minutes", 0),
-                         ("action_timeout_s", 1), ("upload_timeout_s", 1), ("publish_confirm_timeout_s", 1),
+                         ("action_timeout_s", 1), ("click_timeout_s", 1), ("upload_timeout_s", 1), ("publish_confirm_timeout_s", 1),
                          ("content_check_timeout_s", 1), ("content_check_retrigger_s", 1), ("content_check_retriggers", 0),
                          ("poll_interval_s", 1), ("type_delay_ms", 0)):
         value = settings[key]
@@ -581,8 +582,32 @@ class _Flow:
             raise self.stop("element_missing", f"élément attendu absent après {timeout:g} s : {name}")
         return element
 
+    def click_with(self, find: Callable[[], Any], first: Any = None) -> None:
+        """Clic unique du parcours de publication. Une fenetre surgie entre la verification et le clic
+        (l'overlay « intercepts pointer events », ou une fenetre modale visible) : ``close_popups`` (fenetres
+        connues seulement, une inconnue est un arret R4), l'element est recherche a nouveau et clique UNE
+        fois de plus ; un second echec remonte (arret R4 par l'appelant). Jamais de clic de repli."""
+        timeout_ms = float(self.settings["click_timeout_s"]) * 1000
+        try:
+            (first if first is not None else find()).click(timeout=timeout_ms)
+            return
+        except Exception as exc:
+            if not self._click_blocked(exc):
+                raise
+            logger.info("TikTok %s : clic bloqué par une fenêtre, fermeture des fenêtres connues puis nouvel essai : %s",
+                        self.account, str(exc).splitlines()[0] if str(exc) else type(exc).__name__)
+        self.close_popups()
+        find().click(timeout=timeout_ms)
+
+    def _click_blocked(self, exc: Exception) -> bool:
+        if "intercepts pointer events" in str(exc):
+            return True
+        if "Timeout" not in type(exc).__name__:
+            return False
+        return any(m.is_visible() for m in self.page.query_selector_all(self.sel["modal"]["container"]))
+
     def click(self, name: str) -> None:
-        self.wait(name).click()
+        self.click_with(lambda: self.wait(name))
         self.pause()
 
     def all(self, name: str) -> list[Any]:
@@ -594,7 +619,7 @@ class _Flow:
         """L'editeur Draft.js est pre-rempli du nom du fichier : clic, tout selectionner, effacer, puis
         le texte d'un coup par insert_text (un seul evenement de saisie, instantane ; ``fill`` n'est pas
         pris en compte par l'editeur)."""
-        self.wait("caption_editor").click()
+        self.click_with(lambda: self.wait("caption_editor"))
         keyboard = self.page.keyboard
         keyboard.press("Control+A")
         keyboard.press("Backspace")
@@ -653,11 +678,11 @@ class _Flow:
         if len(self.all("schedule_inputs")) != 2 or ":" not in str(self.field(0).input_value()):
             raise self.stop("unexpected_page", "champs de programmation inattendus : l'heure (valeur avec « : »), "
                                                "puis la date, sont attendus")
-        self.field(1).click()
+        self.click_with(lambda: self.field(1))
         self.pause()
         self.pick_date(local)
         self.click("schedule_picker_close")
-        self.field(0).click()
+        self.click_with(lambda: self.field(0))
         self.pause()
         minute = self.pick_time(local)
         self.click("schedule_picker_close")
@@ -693,13 +718,13 @@ class _Flow:
             arrows = self.all("calendar_arrow")
             if len(arrows) < 2:
                 raise self.stop("element_missing", "flèches du calendrier absentes (2 attendues : précédent, suivant)")
-            arrows[1 if gap > 0 else 0].click()
+            self.click_with(lambda: self.all("calendar_arrow")[1 if gap > 0 else 0])
             self.pause()
         else:
             raise self.stop("unexpected_page", f"mois cible {target.year}-{target.month:02d} introuvable dans le calendrier")
-        for day in self.all("calendar_day"):
+        for index, day in enumerate(self.all("calendar_day")):
             if str(day.inner_text()).strip() == str(target.day):
-                day.click()
+                self.click_with(lambda: self.all("calendar_day")[index])
                 self.pause()
                 return
         raise self.stop("element_missing", f"jour {target.day} absent du calendrier ({target.strftime('%Y-%m')})")
@@ -707,9 +732,9 @@ class _Flow:
     def pick_time(self, target: datetime) -> int:
         """Clique l'heure et la minute ; rend la minute choisie (la plus proche de la demandee
         parmi celles que TikTok propose)."""
-        for option in self.all("timepicker_hour"):
+        for index, option in enumerate(self.all("timepicker_hour")):
             if str(option.inner_text()).strip().isdigit() and int(str(option.inner_text()).strip()) == target.hour:
-                option.click()
+                self.click_with(lambda: self.all("timepicker_hour")[index])
                 self.pause()
                 break
         else:
@@ -718,7 +743,8 @@ class _Flow:
         if not offered:
             raise self.stop("element_missing", "minutes absentes du sélecteur d'heure")
         minute = min(offered, key=lambda m: (abs(m - target.minute), m))
-        offered[minute].click()
+        self.click_with(lambda: {int(str(o.inner_text()).strip()): o for o in self.all("timepicker_minute")
+                                 if str(o.inner_text()).strip().isdigit()}[minute])
         self.pause()
         return minute
 
@@ -812,7 +838,7 @@ class _Flow:
         if error:
             link = self.page.query_selector(sel["content_check_retry"])
             if link is not None:
-                link.click()
+                self.click_with(lambda: self.page.query_selector(sel["content_check_retry"]) or link)
                 self.pause()
                 logger.info("TikTok %s : vérification de contenu en erreur, « Réessayer » cliqué (relance %d/%d)",
                             self.account, number, total)
@@ -844,7 +870,7 @@ class _Flow:
         if label != expected:
             raise self.stop("unexpected_page", f"bouton final « {label} » au lieu de « {expected} » : "
                                                f"la page n'est pas en mode {mode}")
-        button.click()
+        self.click_with(lambda: self.wait("post_button"), first=button)
         self.pause()
 
     def await_published(self, mode: str) -> None:

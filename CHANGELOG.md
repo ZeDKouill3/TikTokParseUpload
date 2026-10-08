@@ -27,6 +27,7 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 - Coach des prompts du jury : le résultat réel d'un clip publié vient de ses vues (`views_percentile` à maturité, entrées
   `stats` portant `video_id`/`moment_id`, comme la calibration) et non plus de qa + décision, qui valait 1,0 pour tout
   clip publié. Un clip publié sans statistique mûre est exclu des cas, jamais un 1,0 par défaut (revue r-veille-stats I4).
+- TikTok : une fenêtre connue qui surgit entre la vérification et le clic (ex. « Activer les vérifications automatiques du contenu ? ») n'arrête plus la publication : si le clic est intercepté, les fenêtres connues sont fermées (« Annuler », jamais « Activer ») puis le clic est refait une fois ; une fenêtre inconnue ou un second échec reste un arrêt R4. Nouveau réglage `[tiktok] click_timeout_s` (10 s, au lieu des 30 s de Playwright).
 - Veille (revue r-veille-stats 08/10) : une VOD Twitch déjà en file ou vue n'est plus reproposée au relevé suivant
   (l'id que le worker lui donne, `v2893407960`, est comparé en plus de l'id source). Une exception inattendue du choix
   de Claude est écrite dans l'état du jour (journal ERROR, `finished_at`, aucune proposition inventée) au lieu de
