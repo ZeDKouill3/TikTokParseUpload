@@ -1862,9 +1862,34 @@ def test_counts_are_parsed_from_the_displayed_text(text, expected):
 
 @pytest.mark.parametrize("text,expected", [
     ("+12,5%", 12.5), ("-3 %", -3.0), ("−4%", -4.0), ("4%", 4.0), ("0%", 0.0), ("--", None), ("", None),
+    ("4,300.0%", 4300.0), ("+4,300.0%", 4300.0), ("-1,234.5%", -1234.5), ("4 300,0 %", 4300.0),
+    ("4 300,0 %", 4300.0), ("4 300,0 %", 4300.0), ("−4 300,0 %", -4300.0),
+    ("1,5%", 1.5), ("12,5 %", 12.5), ("12,345,678%", 12345678.0), ("1 234 567,5 %", 1234567.5),
 ])
 def test_evolutions_are_parsed_as_signed_percentages(text, expected):
     assert tiktok.parse_change(text) == expected
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("4,300.0%", 43.0), ("4 300,0 %", 43.0), ("4 300,0 %", 43.0), ("1,5%", 0.015), ("12,5 %", 0.125),
+    ("23,4 %", 0.234), ("1,234.5%", 12.345), ("--", None),
+])
+def test_percentages_accept_a_thousands_separator(text, expected):
+    assert tiktok.parse_percent(text) == expected
+
+
+@pytest.mark.parametrize("text", ["1,2,3%", "1.234.567%", "4,30.0%", "beaucoup", "12 %%"])
+def test_ambiguous_percentages_are_refused(text):
+    with pytest.raises(ValueError):
+        tiktok.parse_change(text)
+    with pytest.raises(ValueError):
+        tiktok.parse_percent(text)
+
+
+@pytest.mark.parametrize("text", ["M", "12,5", "1,2", "abc"])
+def test_ambiguous_counts_stay_refused(text):
+    with pytest.raises(ValueError):
+        tiktok.parse_count(text)
 
 
 def test_an_unreadable_evolution_is_an_error():
