@@ -175,10 +175,8 @@ def read_sidecar(output_dir: str | Path, video_id: str, clip_id: str) -> dict[st
 
 
 def _write_sidecar(output_dir: str | Path, video_id: str, clip_id: str, data: dict[str, Any]) -> None:
-    path = _sidecar_path(output_dir, video_id, clip_id)
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    # meme mecanisme que la file (reessais sur PermissionError sous Windows), pas une copie divergente
+    channel_mod.atomic_write_json(_sidecar_path(output_dir, video_id, clip_id), data)
 
 
 def _series_info(video_id: str, clip_id: str, sidecar: dict[str, Any]) -> tuple[str | None, int | None]:
@@ -515,14 +513,21 @@ def mark_published(
                                    f"(attendu : {' | '.join(states)})")
             entry.update(tiktok_state=tiktok_state, post_url=post_url, post_id=post_id,
                          tiktok_publish_at=publish_at, post_note=post_note, service=service)
+        # l'etat de file (preuve que le post est parti) d'abord : un sidecar qui echoue ensuite ne laisse
+        # jamais l'entree « en cours » ni republiable (TASK-0c97)
+        _upsert_entry(entries, entry)
+        _save_entries(path, entries)
+    if tiktok_state is not None:
+        try:
             sidecar = _read_sidecar(output_dir, video_id, clip_id)
             sidecar["tiktok_post" if service == "tiktok" else "youtube_post"] = {
                 "url": post_url, "id": post_id, "state": tiktok_state, "publish_at": publish_at,
                 "account": account, "note": post_note,
             }
             _write_sidecar(output_dir, video_id, clip_id, sidecar)
-        _upsert_entry(entries, entry)
-        _save_entries(path, entries)
+        except (OSError, PublishError) as exc:
+            log.error("%s/%s : post parti (%s) mais sidecar non réécrit : %s ; l'entrée reste publiée",
+                      video_id, clip_id, post_url or post_id or "sans lien", exc)
     return entry
 
 
@@ -1368,6 +1373,22 @@ def mark_in_progress(
         _upsert_entry(entries, entry)
         _save_entries(path, entries)
     return entry
+
+
+def release_in_progress(video_id: str, clip_id: str, channel: str, reason: str, *,
+                        state_dir: str | Path | None = None) -> None:
+    """Rend au repos une entree prise en main (``mark_in_progress``) mais dont le post n'est pas parti : elle
+    reste ``scheduled``, sans « en cours », avec la raison visible (TASK-0c97)."""
+    path = _state_path(channel, state_dir)
+    with _locked(path):
+        entries = _load_entries(path)
+        entry = _find_entry(entries, video_id, clip_id)
+        if entry is None:
+            raise PublishError(f"clip absent de la file de publication : {video_id}/{clip_id}")
+        entry = dict(entry)
+        entry.update(in_progress_since=None, waiting_reason=reason)
+        _upsert_entry(entries, entry)
+        _save_entries(path, entries)
 
 
 def fail_interrupted(channel: str, *, now: datetime | None = None, state_dir: str | Path | None = None) -> int:

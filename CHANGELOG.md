@@ -12,6 +12,11 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ### Corrigé
 
+- Publication : un post réussi est toujours tracé (revue r-publish 08/10). Le sidecar est réécrit avec les mêmes
+  réessais sous Windows que la file (`channel.atomic_write_json`) ; `mark_published` écrit d'abord l'état de file
+  (preuve que le post est parti), puis le sidecar : un échec d'écriture est journalisé ERROR avec le `post_url` et
+  l'entrée reste `published`, jamais « en cours » ni republiable par Réessayer. La pause d'un compte est revérifiée
+  après la prise en main, juste avant le publisher : entrée relâchée en attente avec la raison, aucun post.
 - Téléchargement : une VOD Twitch en mp4 fragmenté (fMP4 : 1 `moov` + des dizaines de milliers de `moof`/`mdat`,
   aucun index) est remuxée sans réencodage en mp4 indexé (`ffmpeg -c copy -movflags +faststart`) avant l'écriture
   de `meta.json`. Constat du 07/10 (v2894103366, 11 Go) : ~30 s par `-ss` avant `-i` contre 0,4 s après remux,

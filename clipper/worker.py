@@ -839,6 +839,13 @@ class Worker:
         except publish_mod.PublishError as exc:
             log.warning("%s/%s : non pilotée : %s", video_id, clip_id, exc)
             return False
+        paused = next((a for a in accounts_mod.list_accounts(self.config) if a["id"] == account), {}).get("paused_at")
+        if paused:  # pause posee entre la verification et la prise en main : aucun post (TASK-0c97)
+            reason = (f"compte {account} mis en pause (manuel) avant le post : recoche « Prêt à publier » dans "
+                      "Comptes pour reprendre, ou choisis un autre compte")
+            publish_mod.release_in_progress(video_id, clip_id, name, reason, state_dir=paths["state_dir"])
+            log.warning("%s/%s : publication en attente : %s", video_id, clip_id, reason)
+            return False
         try:
             payload = youtube.clip_payload if service == "youtube" else tiktok.clip_payload
             clip = payload(publish_mod.read_sidecar(self.config.output_dir, video_id, clip_id), self.config.output_dir)
