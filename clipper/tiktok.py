@@ -327,7 +327,8 @@ _ABSENT = frozenset({"", "-", "--", "–", "—", "N/A", "n/a"})
 _SUFFIX = {"": 1, "k": 1_000, "m": 1_000_000, "md": 1_000_000_000, "b": 1_000_000_000}
 _COUNT = re.compile(r"(\d[\d ]*)(?:[.,](\d+))?\s*([kKmMbB]|Md)?")
 _COUNT_THOUSANDS = re.compile(r"\d{1,3}(?:,\d{3})+")  # « 1,432 », « 12,345,678 » : virgule + exactement 3 chiffres = milliers anglais
-_PERCENT = re.compile(r"(\d+(?:[.,]\d+)?)\s*%")
+_PERCENT_NUMBER = r"\d(?:[\d ]*\d)?(?:[.,]\d+)*"  # « 4 300,0 », « 4,300.0 », « 12,345,678 » (espaces = milliers)
+_PERCENT = re.compile(rf"({_PERCENT_NUMBER})\s*%")
 _BELOW_ONE = re.compile(r"<\s*\d+(?:[.,]\d+)?\s*%")
 _CLOCK = re.compile(r"(?:(\d+):)?(\d+):(\d{2})")
 _HMS = re.compile(r"(?:(\d+)\s*h\s*:?\s*)?(?:(\d+)\s*m\s*:?\s*)?(?:(\d+(?:[.,]\d+)?)\s*s)?")  # 0h:00m:00s, 12s
@@ -372,6 +373,30 @@ def parse_count(value: Any) -> int | None:
     return int(round(number * _SUFFIX[(match[3] or "").lower()]))
 
 
+def _percent_number(raw: str, text: str) -> float:
+    """Nombre d'un pourcentage avec separateur de milliers eventuel ; ``ValueError`` si ambigu.
+
+    Espaces entre chiffres = milliers ; « , » et « . » ensemble : les « , » sont des milliers ; « , » seule :
+    milliers si au moins deux groupes de exactement 3 chiffres apres le premier, sinon virgule decimale ;
+    « . » seul : un seul point decimal."""
+    digits = raw.replace(" ", "")
+    if "," in digits and "." in digits:
+        if not re.fullmatch(r"\d{1,3}(?:,\d{3})+\.\d+", digits):
+            raise ValueError(f"pourcentage illisible : {text!r}")
+        digits = digits.replace(",", "")
+    elif "," in digits:
+        head, *groups = digits.split(",")
+        if len(groups) >= 2 and all(len(g) == 3 for g in groups):
+            digits = head + "".join(groups)
+        elif len(groups) == 1:
+            digits = head + "." + groups[0]
+        else:
+            raise ValueError(f"pourcentage illisible : {text!r}")
+    if digits.count(".") > 1:
+        raise ValueError(f"pourcentage illisible : {text!r}")
+    return float(digits)
+
+
 def parse_percent(value: Any) -> float | None:
     """« 23,4 % » -> 0.234 (fraction) ; tiret ou vide -> ``None`` ; autre -> ``ValueError``."""
     text = _text(value)
@@ -380,7 +405,7 @@ def parse_percent(value: Any) -> float | None:
     match = _PERCENT.fullmatch(text)
     if match is None:
         raise ValueError(f"pourcentage illisible : {text!r}")
-    return round(float(match[1].replace(",", ".")) / 100, 6)
+    return round(_percent_number(match[1], text) / 100, 6)
 
 
 def parse_duration(value: Any) -> float | None:
@@ -402,7 +427,7 @@ def parse_duration(value: Any) -> float | None:
 
 
 _TILE_DELTA = re.compile(r"(?<=\S)\s+[+\-\u2212\u2013]\d[\d.,]*\s*[kKmM]?$")
-_CHANGE = re.compile(r"([+\-\u2212\u2013]?)\s*(\d+(?:[.,]\d+)?)\s*%")
+_CHANGE = re.compile(rf"([+\-\u2212\u2013]?)\s*({_PERCENT_NUMBER})\s*%")
 _SHORT_DATE = re.compile(r"(\d{1,2})\s+([^\W\d_]+)\.?\s+(\d{4})(?:[,\s]+(\d{1,2})[:h](\d{2}))?")
 # Page Publications : « 2 oct., 12:30 » sans annee (annee de la page, deduite de la date du releve).
 _SHORT_DATE_NO_YEAR = re.compile(r"(\d{1,2})\s+([^\W\d_]+)\.?,?\s*(?:(\d{1,2})[:h](\d{2}))?")
@@ -417,7 +442,7 @@ def parse_change(value: Any) -> float | None:
     match = _CHANGE.fullmatch(text)
     if match is None:
         raise ValueError(f"évolution illisible : {text!r}")
-    number = float(match[2].replace(",", "."))
+    number = _percent_number(match[2], text)
     return -number if match[1] in ("-", "\u2212", "\u2013") else number
 
 

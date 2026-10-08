@@ -5,7 +5,7 @@ slug: plans-scenes-plus-rapides-d-tection-des-fen-tres
 title: "Plans (scenes) plus rapides : détection des fenêtres en parallèle et filtre anti-blocs coupé pour l'analyse"
 created: 2026-10-07T23:33:30Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/scenes.py
   - tests/test_scenes.py
@@ -16,6 +16,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/14d819f7ce6b@aa5ef9a
+    tree: scope/e4657ac5a3f8
+    criteria: 2eb3d22f4524
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---

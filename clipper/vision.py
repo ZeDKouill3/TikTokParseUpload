@@ -26,8 +26,10 @@ les images une a une (ex. ``claude -p`` via l'outil Read, cf. clipper.llm.
 claude_cli) ne fasse un tour de contexte par image d'un meme lot. Les lots
 sont traites jusqu'a ``parallel`` a la fois ; chaque lot reussi est
 enregistre au fil de l'eau dans vision_partial.json (ecriture atomique,
-verrou), relu au demarrage pour ne pas redemander un lot deja decrit apres
-une relance.
+verrou) avec les chemins d'images qu'il couvre, relu au demarrage pour ne pas
+redemander un lot deja decrit apres une relance : un lot n'est repris que si ses
+chemins sont identiques a ceux du lot recalcule ; ``force`` ignore et supprime
+le fichier.
 
 L'etape moments, relancee par clipper.pipeline, lit ``frames`` (description
 et ``striking``) et peut reviser ses notes. Reponse invalide ou LLM
@@ -189,15 +191,20 @@ def _montage(batch: list[dict[str, Any]], video_dir: Path, dest_dir: Path, max_w
     except montage_lib.MontageError as exc:
         raise VisionError(str(exc)) from exc
 
-def _load_partial(path: Path) -> dict[int, list[dict[str, Any]]]:
+def _load_partial(path: Path) -> dict[int, dict[str, Any]]:
     if not path.exists():
         return {}
     data = json.loads(path.read_text(encoding="utf-8"))
     return {int(k): v for k, v in (data.get("batches") or {}).items()}
 
 
-def _save_partial(path: Path, results: list[list[dict[str, Any]] | None]) -> None:
-    batches = {str(n): r for n, r in enumerate(results) if r is not None}
+def _save_partial(
+    path: Path, results: list[list[dict[str, Any]] | None], batches_in: list[list[dict[str, Any]]]
+) -> None:
+    batches = {
+        str(n): {"paths": [f["path"] for f in batches_in[n]], "frames": r}
+        for n, r in enumerate(results) if r is not None
+    }
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps({"batches": batches}, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(path)
@@ -259,8 +266,15 @@ def run(
     batches = [selected[first : first + batch_size] for first in range(0, len(selected), batch_size)]
 
     partial_path = video_dir / "vision_partial.json"
-    done = _load_partial(partial_path)
-    results: list[list[dict[str, Any]] | None] = [done.get(n) for n in range(len(batches))]
+    if force:
+        partial_path.unlink(missing_ok=True)
+    results: list[list[dict[str, Any]] | None] = [None] * len(batches)
+    # Un lot sauve n'est repris que s'il porte exactement les memes images (moments refait :
+    # fenetres et decoupage en lots changent), comme action_partial.json.
+    for n, saved in _load_partial(partial_path).items():
+        # un lot au format d'avant (liste sans chemins) n'est jamais repris
+        if n < len(batches) and isinstance(saved, dict) and saved.get("paths") == [f["path"] for f in batches[n]]:
+            results[n] = saved["frames"]
     lock = threading.Lock()
 
     def process(n: int) -> None:
@@ -288,7 +302,7 @@ def run(
         ]
         results[n] = described
         with lock:
-            _save_partial(partial_path, results)
+            _save_partial(partial_path, results, batches)
 
     resize_dir = video_dir / "vision_resize_tmp"
     resize_dir.mkdir(exist_ok=True)

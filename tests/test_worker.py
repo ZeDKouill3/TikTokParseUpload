@@ -3191,3 +3191,60 @@ def test_the_periodic_stats_fetch_skips_a_paused_account_with_an_expired_connect
     _stats_worker(config, fetcher).tick()
 
     assert fetcher.calls == []
+
+
+# ---- TASK-0c97 : un post parti est toujours trace ; pause revérifiée avant le post
+
+
+def _lock_sidecar(monkeypatch, clip_id: str):
+    """``os.replace`` vers le sidecar du clip leve toujours PermissionError (lecteur qui garde le fichier)."""
+    real = os.replace
+
+    def replace(src, dst, *args, **kwargs):
+        if str(dst).endswith(f"{clip_id}.json"):
+            raise PermissionError(13, "Acces refuse (simule)")
+        return real(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(os, "replace", replace)
+
+
+def test_a_sidecar_stuck_after_a_successful_post_leaves_the_entry_published_with_its_url(tmp_path, monkeypatch, caplog):
+    config = _pub_env(tmp_path, monkeypatch)
+    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1))
+    _lock_sidecar(monkeypatch, "01")
+    pub = FakePublisher()
+    worker_ = _pub_worker(config, pub)
+
+    with caplog.at_level(logging.ERROR):
+        worker_.tick()
+        worker_.tick()
+
+    entry = _entries(tmp_path)[0]
+    assert entry["status"] == "published" and entry["post_url"] == LINK
+    assert not entry.get("in_progress_since") and entry["error"] is None
+    assert any(r.levelname == "ERROR" and LINK in r.getMessage() for r in caplog.records)
+    assert len(pub.calls) == 1  # aucun second post
+    with pytest.raises(publish.PublishError):  # « Réessayer » impossible : le post est parti
+        publish.retry("aaaaaaaaaaa", "01", "ma_chaine", state_dir=tmp_path / "state" / "publish")
+    assert len(pub.calls) == 1
+
+
+def test_an_account_paused_between_takeover_and_post_gets_no_post(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1))
+    real = publish.mark_in_progress
+
+    def take_then_pause(*args, **kwargs):
+        result = real(*args, **kwargs)
+        _pause(config)
+        return result
+
+    monkeypatch.setattr(publish, "mark_in_progress", take_then_pause)
+    pub = FakePublisher()
+
+    _pub_worker(config, pub).tick()
+
+    assert pub.calls == []
+    entry = _entries(tmp_path)[0]
+    assert entry["status"] == "scheduled" and not entry.get("in_progress_since")
+    assert "en pause (manuel)" in entry["waiting_reason"]

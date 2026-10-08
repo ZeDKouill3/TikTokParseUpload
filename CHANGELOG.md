@@ -17,8 +17,24 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
   (constat du 08/10 : VOD Twitch de 11-21 Go à 13-20 Mo/s, plus de 14 min). Le nombre de fragments simultanés
   est journalisé au début du téléchargement. Format, merge mp4, remux fMP4 et reprises réseau inchangés.
 
+- Étape scenes plus rapide : les fenêtres de détection sont analysées par au plus `detect_parallel` processus ffmpeg (défaut 4) ; une fenêtre de plus de `detect_chunk_seconds` (défaut 600 s) est découpée en morceaux contigus détectés en parallèle puis recollés (la scène à cheval sur une jointure est fusionnée, aucune coupure inventée). `analysis_skip_loop_filter` (défaut vrai) ajoute `-skip_loop_filter all` à l'entrée de la détection seulement, jamais à l'extraction des images clés. Un ffmpeg en échec fait échouer l'étape (`ScenesError` nommant la fenêtre) et arrête les autres ; le journal donne fenêtres, parallélisme, durée de détection et d'extraction.
+
 ### Corrigé
 
+- Vision : un lot sauvé dans `vision_partial.json` enregistre les chemins d'images qu'il couvre et n'est repris que
+  si ce sont les mêmes que ceux du lot recalculé (sinon, moments refait, il décrivait d'autres images) ; avec
+  `--force`, le fichier est ignoré et supprimé. Pipeline : quand l'étape moments est refaite en mode review,
+  `review.json` (décisions indexées par moment) est renommé avec horodatage (journal INFO) au lieu d'être appliqué
+  aux moments renumérotés (revue r-pipeline 08/10, Important 3 et 4).
+- Publication : un post réussi est toujours tracé (revue r-publish 08/10). Le sidecar est réécrit avec les mêmes
+  réessais sous Windows que la file (`channel.atomic_write_json`) ; `mark_published` écrit d'abord l'état de file
+  (preuve que le post est parti), puis le sidecar : un échec d'écriture est journalisé ERROR avec le `post_url` et
+  l'entrée reste `published`, jamais « en cours » ni republiable par Réessayer. La pause d'un compte est revérifiée
+  après la prise en main, juste avant le publisher : entrée relâchée en attente avec la raison, aucun post.
+- Stats TikTok : les évolutions et pourcentages avec séparateur de milliers (« 4,300.0% », « 4 300,0 % », espaces
+  fines et insécables comprises) sont lus correctement au lieu de faire échouer le relevé (« valeur illisible
+  (tuile views, 7 jours) ») ; « 1,5% » et « 12,5 % » restent des décimales, les formes ambiguës restent refusées.
+- Jury : la re-notation après vision lit la grille enregistrée dans `moments.json` (`rubric.path`) et non celle du style (un style changé de grille entre moments et vision ne provoque plus `KeyError: 'action'`) ; grille enregistrée introuvable : erreur explicite, jamais de repli. L'exploration ne repêche plus un candidat éliminé par le seuil `[gate]` (les rejets `min_score` restent repêchables).
 - Téléchargement : une VOD Twitch en mp4 fragmenté (fMP4 : 1 `moov` + des dizaines de milliers de `moof`/`mdat`,
   aucun index) est remuxée sans réencodage en mp4 indexé (`ffmpeg -c copy -movflags +faststart`) avant l'écriture
   de `meta.json`. Constat du 07/10 (v2894103366, 11 Go) : ~30 s par `-ss` avant `-i` contre 0,4 s après remux,
