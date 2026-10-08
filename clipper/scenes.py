@@ -46,7 +46,7 @@ from typing import Any
 import cv2
 import numpy as np
 from scenedetect import FrameTimecode
-from scenedetect.detectors import ContentDetector
+from scenedetect.detectors import ContentDetector as _StockContentDetector
 from scenedetect.scene_manager import get_scenes_from_cuts
 
 from clipper.channel import atomic_write_json
@@ -75,15 +75,52 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "analysis_skip_loop_filter": True,
     # Marge (s) ajoutee avant/apres chaque plage de parole avant decodage.
     "speech_margin_seconds": 5.0,
+    # Images cles extraites par processus ffmpeg (une entree -ss par image,
+    # un seul demarrage et une seule ouverture du fichier par lot) ; 1 = un
+    # processus par image.
+    "extract_batch": 8,
+    # Fils de decodage de chaque ffmpeg d'extraction (0 = defaut de ffmpeg :
+    # tous les coeurs, que extract_parallel processus se disputent). Le
+    # decodage h264 est deterministe : memes pixels quel que soit le nombre.
+    "extract_threads": 2,
 }
 
 
 # Un dernier morceau plus court est recolle au precedent (pas de decodage vide).
 MIN_TAIL_SECONDS = 2.0
 
+# Images d'analyse lues d'un coup sur le tube de ffmpeg.
+READ_BLOCK_FRAMES = 32
+
 
 class ScenesError(Exception):
     """Scene detection or frame extraction failed."""
+
+
+class ContentDetector(_StockContentDetector):
+    """PySceneDetect's ContentDetector with the same score, computed faster:
+    the three HSV channels are compared in one ``cv2.absdiff`` and one
+    ``cv2.sumElems`` (exact integer sums) instead of a split and three int32
+    numpy passes. Same operations in the same order on the same integers, so
+    every score, hence every cut, is identical float for float. Only the
+    default weights (hue, saturation, luma at 1, edges at 0) are supported:
+    that is all this step uses."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        if tuple(self._weights) != (1.0, 1.0, 1.0, 0.0):
+            raise ScenesError("ContentDetector rapide : poids par defaut uniquement")
+        self._last_hsv: np.ndarray | None = None
+
+    def _calculate_frame_score(self, timecode: FrameTimecode, frame_img: np.ndarray) -> float:
+        hsv = cv2.cvtColor(frame_img, cv2.COLOR_BGR2HSV)
+        last, self._last_hsv = self._last_hsv, hsv
+        if last is None:
+            return 0.0
+        hue, sat, lum, _ = cv2.sumElems(cv2.absdiff(hsv, last))
+        pixels = float(hsv.shape[0] * hsv.shape[1])
+        # sum() de PySceneDetect : 0 + h*1 + s*1 + l*1 + 0.0*0, puis / 3.0.
+        return (hue / pixels + sat / pixels + lum / pixels) / 3.0
 
 
 def _run(cmd: list[str], what: str) -> bytes:
@@ -217,7 +254,10 @@ def _decode_window_cuts(
     count = 0
     with tempfile.TemporaryFile() as stderr:
         try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=stderr)
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=stderr,
+                bufsize=frame_bytes * READ_BLOCK_FRAMES,
+            )
         except FileNotFoundError as exc:
             raise ScenesError(f"{ffmpeg_bin} introuvable (analyse de {video_path})") from exc
         assert proc.stdout is not None
@@ -225,10 +265,17 @@ def _decode_window_cuts(
             with running_lock:
                 running.add(proc)
         try:
-            while len(buf := proc.stdout.read(frame_bytes)) == frame_bytes:
-                frame = np.frombuffer(buf, np.uint8).reshape(out_h, out_w, 3)
-                cuts += detector.process_frame(FrameTimecode(count, fps), frame)
-                count += 1
+            # Lecture par blocs d'images : un seul appel systeme pour
+            # READ_BLOCK_FRAMES images ; une image incomplete en fin de flux
+            # est ignoree comme avant.
+            while block := proc.stdout.read(frame_bytes * READ_BLOCK_FRAMES):
+                view = np.frombuffer(block, np.uint8)
+                for offset in range(0, len(block) - frame_bytes + 1, frame_bytes):
+                    frame = view[offset:offset + frame_bytes].reshape(out_h, out_w, 3)
+                    cuts += detector.process_frame(FrameTimecode(count, fps), frame)
+                    count += 1
+                if len(block) < frame_bytes * READ_BLOCK_FRAMES:
+                    break
         finally:
             proc.stdout.close()
             returncode = proc.wait()
@@ -392,13 +439,19 @@ def _keyframe_timecodes(start: float, end: float, interval: float) -> list[float
     return timecodes
 
 
-def _extract_frame(video_path: Path, timecode: float, decoder: str, ffmpeg_bin: str):
+def _thread_args(threads: int) -> list[str]:
+    return ["-threads", str(threads)] if threads > 0 else []
+
+
+def _extract_frame(
+    video_path: Path, timecode: float, decoder: str, ffmpeg_bin: str, threads: int = 0
+):
     """Full-resolution image at ``timecode`` (accurate input seek; BMP on a
     pipe, so the size never has to be guessed)."""
     data = _run(
         [
             ffmpeg_bin, "-v", "error", "-nostdin", "-ss", f"{timecode:.3f}",
-            *_decoder_args(decoder), "-i", str(video_path),
+            *_thread_args(threads), *_decoder_args(decoder), "-i", str(video_path),
             "-map", "0:v:0", "-frames:v", "1", "-f", "image2pipe", "-c:v", "bmp", "-",
         ],
         f"extraction de l'image a {timecode:.3f}s de {video_path} ({_decoder_name(decoder)})",
@@ -409,6 +462,40 @@ def _extract_frame(video_path: Path, timecode: float, decoder: str, ffmpeg_bin: 
             f"impossible d'extraire l'image a {timecode:.3f}s ({_decoder_name(decoder)})"
         )
     return frame
+
+
+def _extract_frames(
+    video_path: Path, timecodes: list[float], decoder: str, ffmpeg_bin: str, threads: int = 0
+) -> list[Any]:
+    """Full-resolution images at ``timecodes`` from one ffmpeg process: one
+    accurate input seek (``-ss`` before ``-i``) per image, each written as a
+    BMP -- the same decode, hence the same pixels, as ``_extract_frame`` -- but
+    with a single process start for the whole batch."""
+    if len(timecodes) == 1:
+        return [_extract_frame(video_path, timecodes[0], decoder, ffmpeg_bin, threads)]
+    cmd = [ffmpeg_bin, "-v", "error", "-nostdin"]
+    for timecode in timecodes:
+        cmd += [
+            "-ss", f"{timecode:.3f}", *_thread_args(threads), *_decoder_args(decoder),
+            "-i", str(video_path),
+        ]
+    with tempfile.TemporaryDirectory(prefix="clipper-frames-") as tmp:
+        for index in range(len(timecodes)):
+            cmd += ["-map", f"{index}:v:0", "-frames:v", "1", "-c:v", "bmp", f"{tmp}/{index}.bmp"]
+        _run(
+            cmd,
+            f"extraction de {len(timecodes)} images de {video_path} "
+            f"({_decoder_name(decoder)}) a partir de {timecodes[0]:.3f}s",
+        )
+        frames = []
+        for index, timecode in enumerate(timecodes):
+            frame = cv2.imread(f"{tmp}/{index}.bmp", cv2.IMREAD_COLOR)
+            if frame is None:
+                raise ScenesError(
+                    f"impossible d'extraire l'image a {timecode:.3f}s ({_decoder_name(decoder)})"
+                )
+            frames.append(frame)
+    return frames
 
 
 def detect_scenes(
@@ -423,6 +510,8 @@ def detect_scenes(
     analysis_max_fps: float = 30.0,
     decoder: str = "",
     extract_parallel: int = 4,
+    extract_batch: int = 8,
+    extract_threads: int = 2,
     speech_margin_seconds: float = 5.0,
     detect_parallel: int = 4,
     detect_chunk_seconds: float = 600.0,
@@ -441,6 +530,8 @@ def detect_scenes(
     in at most ``detect_parallel`` ffmpeg processes; a window longer than
     ``detect_chunk_seconds`` is split into contiguous chunks detected in
     parallel then joined (the scene across a seam is merged, no cut invented).
+    Keyframes are extracted ``extract_batch`` per ffmpeg process, each decoding
+    on ``extract_threads`` threads.
     ``analysis_skip_loop_filter`` adds ``-skip_loop_filter all`` to the
     detection input only. One failing ffmpeg fails the step (ScenesError naming
     the window) and the others are killed.
@@ -459,6 +550,14 @@ def detect_scenes(
     if extract_parallel < 1:
         raise ScenesError(
             f"extract_parallel doit etre >= 1 (recu {extract_parallel})"
+        )
+    if extract_batch < 1:
+        raise ScenesError(
+            f"extract_batch doit etre >= 1 (recu {extract_batch})"
+        )
+    if extract_threads < 0:
+        raise ScenesError(
+            f"extract_threads doit etre >= 0 (recu {extract_threads})"
         )
     if detect_parallel < 1:
         raise ScenesError(
@@ -505,23 +604,28 @@ def detect_scenes(
             tasks.append((scene_index, timecode, filename))
 
     frames: list[dict[str, Any]] = []
+    batches = [tasks[i:i + extract_batch] for i in range(0, len(tasks), extract_batch)]
     with ThreadPoolExecutor(max_workers=extract_parallel) as executor:
         extracted = executor.map(
-            lambda task: _extract_frame(video_path, task[1], decoder, ffmpeg_bin), tasks
+            lambda batch: _extract_frames(
+                video_path, [t[1] for t in batch], decoder, ffmpeg_bin, extract_threads
+            ),
+            batches,
         )
-        for (scene_index, timecode, filename), frame in zip(tasks, extracted):
-            cv2.imwrite(
-                str(frames_dir / filename),
-                frame,
-                [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality],
-            )
-            frames.append(
-                {
-                    "path": f"frames/{filename}",
-                    "timecode": timecode,
-                    "scene": scene_index,
-                }
-            )
+        for batch, images in zip(batches, extracted):
+            for (scene_index, timecode, filename), frame in zip(batch, images):
+                cv2.imwrite(
+                    str(frames_dir / filename),
+                    frame,
+                    [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality],
+                )
+                frames.append(
+                    {
+                        "path": f"frames/{filename}",
+                        "timecode": timecode,
+                        "scene": scene_index,
+                    }
+                )
 
     logger.info("extraction : %d image(s) en %.1f s", len(frames), time.monotonic() - detected)
 

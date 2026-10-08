@@ -42,6 +42,20 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ### Modifié
 
+- Étape scenes plus rapide, résultat identique : profil sur un extrait réel de 25 min de la VOD ARC
+  (10 fenêtres de parole, 284 images clés) = détection 29,4 s (décodage ffmpeg, plancher), extraction
+  des images clés 23,5 s, soit 45 % du temps. Le score de contenu (`ContentDetector`) se calcule en
+  un `absdiff` + `sumElems` sur les trois canaux HSV au lieu de trois passes numpy int32 (mêmes
+  entiers, mêmes opérations, scores identiques flottant pour flottant), la lecture du tube ffmpeg se
+  fait par blocs de 32 images, et les images clés sortent par lots (`[scenes] extract_batch`, défaut 8,
+  un seul processus ffmpeg et une seule ouverture du fichier par lot, 1 = un processus par image) avec
+  `[scenes] extract_threads` (défaut 2, 0 = défaut ffmpeg) fils de décodage par processus au lieu de
+  tous les coeurs disputés par `extract_parallel` processus. Mesure avant/après (extrait 25 min,
+  PC à vide, 2 passes) : 53,0 s -> 43,9 s (-17 %), extraction 23,5 s -> 16,5 s (-30 %), détection
+  29,4 s -> 27,3 s (-7 %) ; `scenes.json` identique octet pour octet et les 284 jpg identiques.
+  Extrapolation à la VOD ARC de 294 min (6093 images clés) : extraction ~8,4 min -> ~5,9 min, soit
+  environ 19 min -> ~16 min pour l'étape ; le reste est le décodage ffmpeg, déjà au plancher.
+
 - Téléchargement plus rapide : yt-dlp télécharge les fragments HLS en parallèle (réglage
   `[download] concurrent_fragments`, entier >= 1, défaut 8, refus explicite sinon) au lieu d'un par un
   (constat du 08/10 : VOD Twitch de 11-21 Go à 13-20 Mo/s, plus de 14 min). Le nombre de fragments simultanés
