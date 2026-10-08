@@ -2097,21 +2097,41 @@ def _stable_face_instead(
     return stable[0]
 
 
-def _stable_face_over_null(candidates: list[dict[str, Any]], settings: dict[str, Any]) -> dict[str, Any] | None:
-    """Garde-fou local sur « aucune webcam » (TASK-a769, symetrique de
-    ``_stable_face_instead``) : un unique candidat dont le support ET le visage
-    atteignent ``facecam_face_stable_share`` du plus grand support est retenu
-    malgre la reponse de Claude (override journalise). ``None`` s'il n'y en a
-    aucun (la reponse tient), erreur explicite s'il y en a plusieurs (ADR-ad2e)."""
+def _persistent(candidate: dict[str, Any], periods: Sequence[list[dict[str, Any]]], settings: dict[str, Any]) -> bool:
+    """Le rectangle du candidat revient (IoU >= 0.5) dans au moins
+    ``facecam_face_stable_share`` des periodes qui ont des candidats : une
+    webcam est la meme sur toute la video, un visage de menu n'apparait que par
+    moments. Une seule periode : persistant par construction."""
+    if len(periods) <= 1:
+        return True
+    box = _rect_box(candidate["rect"])
+    seen = sum(any(_iou(box, _rect_box(c["rect"])) >= 0.5 for c in period) for period in periods)
+    return seen >= float(settings["facecam_face_stable_share"]) * len(periods) - 1e-9
+
+
+def _stable_face_over_null(
+    candidates: list[dict[str, Any]],
+    settings: dict[str, Any],
+    periods: Sequence[list[dict[str, Any]]] = (),
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    """Garde-fou local sur « aucune webcam » (TASK-a769, TASK-5979) : un unique
+    candidat dont le support ET le visage atteignent ``facecam_face_stable_share``
+    du plus grand support, et dont le rectangle est persistant sur les periodes
+    de la video (``periods`` : candidats de chacune), est retenu malgre la
+    reponse de Claude (override journalise). Renvoie (retenu | None, ecartes) :
+    les candidats stables mais non persistants (visages de menus) ne
+    contredisent pas Claude ; plusieurs persistants = erreur explicite (ADR-ad2e)."""
     top = max(c["support"] for c in candidates)
     floor = float(settings["facecam_face_stable_share"]) * top - 1e-9
     stable = [c for c in candidates if c["support"] >= floor and (c.get("face_support") or 0) >= floor]
-    if len(stable) > 1:
+    keep = [c for c in stable if _persistent(c, periods, settings)]
+    dropped = [c for c in stable if c not in keep]
+    if len(keep) > 1:
         raise ReframeError(
-            "[reframe] Claude a repondu aucune webcam alors que plusieurs candidats visage stables existent "
-            f"({sorted(c['id'] for c in stable)}) : choix impossible sans deviner"
+            "[reframe] Claude a repondu aucune webcam alors que plusieurs candidats visage stables et persistants "
+            f"existent ({sorted(c['id'] for c in keep)}) : choix impossible sans deviner"
         )
-    return stable[0] if stable else None
+    return (keep[0] if keep else None), dropped
 
 
 def _facecam_check(ids: set[int]) -> Callable[[Any], None]:
@@ -2273,9 +2293,19 @@ def detect_facecam(
             chosen = None
             better = None
             if answer["webcam"] is None:
-                better = _stable_face_over_null(candidates, settings)
+                better, dropped = _stable_face_over_null(
+                    candidates, settings, [i["candidates"] for i in period_inputs if i["candidates"]]
+                )
+                if dropped:
+                    log.warning(
+                        "%s : periode %d, candidat(s) visage %s ecarte(s) : stables ici mais pas persistants sur la "
+                        "video (visages du jeu, pas une webcam)", video_id, index, sorted(c["id"] for c in dropped),
+                    )
                 if better is None:
                     reason = f"Claude : aucune webcam sur cette periode ({answer['reason']})"
+                    if dropped:
+                        reason += (f" ; candidats visage {sorted(c['id'] for c in dropped)} ecartes : "
+                                   "pas persistants sur la video")
                 else:
                     override = {
                         "from": None, "to": better["id"],

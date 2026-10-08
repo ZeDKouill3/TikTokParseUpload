@@ -3144,3 +3144,68 @@ def test_real_aion_clip_webcam_face_found_in_the_enlarged_crop():
     finally:
         detector.close()
     assert rect == period["facecam"], reason
+
+
+# --------------------------------------------------------------------------
+# TASK-5979 : « aucune webcam » de Claude n'est ecartee que par un unique
+# candidat visage stable ET persistant sur la video ; des visages de menus qui
+# n'apparaissent que par moments ne contredisent pas Claude.
+# --------------------------------------------------------------------------
+
+
+def _menu_faces_period(monkeypatch, video_dir, *, menus_per_period, persistent=True):
+    """Deux periodes (chat puis jeu). Candidat 1 : visage de la webcam, meme
+    rectangle dans les deux periodes si ``persistent`` ; ``menus_per_period`` :
+    rectangles de visages de menus ajoutes a chaque periode (differents de l'une
+    a l'autre). Tous sont stables dans leur periode."""
+    from clipper import reframe
+
+    write_timeline(video_dir, [(10.0 * k, "chat" if k < 60 else "game") for k in range(120)])
+    real = reframe._period_candidates
+    calls = []
+
+    def crafted(images, detector, settings):
+        candidates, rejected = real(images, detector, settings)
+        index = len(calls)
+        calls.append(index)
+        panel = {"x": 700, "y": 350, "w": 540, "h": 384}  # STREAM_PANEL, contient STREAM_FACE
+        if index == 0:
+            rect = panel if persistent else {"x": 300, "y": 300, "w": 300, "h": 213}
+            face = {"kind": "visage", "rect": rect, "support": 24, "face_support": 24,
+                    "edge_reason": None, "face": [10.0, 10.0, 50.0, 50.0]}
+        else:
+            face = dict(candidates[0], rect=panel)
+        out = [dict(face, id=1)]
+        for n, rect in enumerate(menus_per_period[index], start=2):
+            out.append(dict(face, id=n, rect=dict(rect)))
+        return out, rejected
+
+    monkeypatch.setattr(reframe, "_period_candidates", crafted)
+
+
+MENUS = [
+    [{"x": 1500, "y": 100 * k, "w": 300, "h": 213} for k in range(1, 4)],
+    [{"x": 100 * k, "y": 800, "w": 300, "h": 213} for k in range(1, 4)],
+]
+
+
+def test_null_answer_with_menu_faces_that_do_not_persist_stays_letterbox(
+    tmp_path, video_dir, monkeypatch, caplog
+):
+    _menu_faces_period(monkeypatch, video_dir, menus_per_period=[MENUS[0], MENUS[1]], persistent=False)
+    with caplog.at_level("WARNING"):
+        path, _ = run_detect(tmp_path, [webcam_answer(None, "personnages de menus")] * 2)
+
+    for period in load(path)["periods"]:
+        assert period["facecam"] is None and period.get("override") is None
+        assert "aucune webcam" in period["reason"]
+    assert "ecarte" in caplog.text
+
+
+def test_null_answer_keeps_the_one_persistent_face_among_non_persistent_ones(tmp_path, video_dir, monkeypatch):
+    _menu_faces_period(monkeypatch, video_dir, menus_per_period=[MENUS[0], MENUS[1]])
+    path, _ = run_detect(tmp_path, [webcam_answer(None, "decor")] * 2)
+
+    periods = load(path)["periods"]
+    assert [p["override"]["to"] for p in periods] == [1, 1]
+    assert contains(periods[1]["facecam"], STREAM_FACE)
