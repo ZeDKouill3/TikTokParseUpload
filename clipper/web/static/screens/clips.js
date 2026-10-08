@@ -291,6 +291,7 @@ function clipDrawerHtml(c) {
     <div class="drawer-head">
       <span class="chip ${s.cls}">${esc(s.label)}</span>
       <h2>${esc(c.screen_title || c.clip_id)}</h2>
+      <a class="btn ghost" href="#/clip/${encodeURIComponent(c.video_id)}/${encodeURIComponent(c.clip_id)}">Fiche complète</a>
       <button type="button" class="icon-btn" data-dismiss aria-label="Fermer">${icon("x")}</button>
     </div>
     <div class="drawer-body">

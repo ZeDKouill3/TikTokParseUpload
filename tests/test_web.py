@@ -7447,7 +7447,7 @@ def test_every_panel_screen_keeps_its_content_off_the_edges():
     css = "\n".join(p.read_text(encoding="utf-8") for p in [STATIC / "style.css", *sorted((STATIC / "screens").glob("*.css"))])
     own_margin = {"videos"}  # .vadd, .vfilters et .job portent 16-24 px de marge
     screens = re.findall(r'<section class="screen" id="screen-(\w+)".*?<div class="([^"]*)" data-body', page, re.S)
-    assert {name for name, _ in screens} == {"dashboard", "veille", "videos", "review", "clips", "publish", "channels", "stats", "accounts", "settings", "journal"}
+    assert {name for name, _ in screens} == {"dashboard", "veille", "videos", "review", "clips", "clip", "publish", "channels", "stats", "accounts", "settings", "journal"}
     for name, classes in screens:
         if "panel" not in classes.split() or name in own_margin:
             continue
@@ -10078,3 +10078,153 @@ def test_dashboard_zero_view_error_is_visible_and_the_rest_stays(tmp_path, monke
     assert data["zero_views"] is None
     assert "zero_view_alert_hours invalide" in data["zero_views_error"]
     assert "queued" in data and "running" in data
+
+
+# --------------------------------------------------------------------------
+# Fiche par clip (TASK-fa7619ccf83a) : GET /api/clips/<video>/<clip>/sheet, lecture seule
+# --------------------------------------------------------------------------
+
+SHEET_URL = f"https://www.youtube.com/watch?v={CLIPS_VIDEO}"
+
+
+def _sheet_sidecar(clip_id="01", **extra):
+    return _clip_sidecar(clip_id, source_url=SHEET_URL, source_title="Le passage source", start=12.5, end=36.5,
+                         **extra)
+
+
+def _sheet(tmp_path, clip_id="01"):
+    return client(tmp_path).get(f"/api/clips/{CLIPS_VIDEO}/{clip_id}/sheet")
+
+
+def test_clip_sheet_gathers_the_clip_video_source_publication_and_jury(tmp_path, isolated_cwd):
+    _write_state(tmp_path, CLIPS_VIDEO, channel="ma_chaine")
+    _write_clip(tmp_path, CLIPS_VIDEO, _sheet_sidecar("01", scores={"hook": 9}, reason="Annonce forte"))
+    _write_publish(tmp_path, "ma_chaine", [
+        _entry("01", "published", published_at="2026-10-02T16:00:00+00:00",
+               post_url="https://www.tiktok.com/@ab12cd/video/1", post_id="1"),
+    ])
+
+    resp = _sheet(tmp_path)
+
+    assert resp.status_code == 200
+    sheet = resp.json()
+    assert sheet["clip"]["title"] == "Titre 01"
+    assert sheet["clip"]["scores"] == {"hook": 9}
+    assert sheet["clip"]["reason"] == "Annonce forte"
+    assert sheet["video"]["title"] == "Le passage source"
+    assert sheet["video"]["deleted"] is False
+    assert sheet["video"]["video_url"] == f"/media/clip/{CLIPS_VIDEO}/01"
+    assert sheet["video"]["passage_url"] == f"{SHEET_URL}&t=12s"
+    assert sheet["clip"]["publish_status"] == "published"
+    assert sheet["clip"]["post_url"] == "https://www.tiktok.com/@ab12cd/video/1"
+    assert sheet["clip"]["published_at_paris"] == "2026-10-02T18:00:00+02:00"
+    assert sheet["clip"]["account"] == "ab12cd"
+    assert "jury_confidence" in sheet["clip"]
+
+
+def test_clip_sheet_with_deleted_video_keeps_the_sheet_and_says_so(tmp_path, isolated_cwd):
+    _write_state(tmp_path, CLIPS_VIDEO, channel="ma_chaine")
+    _write_clip(tmp_path, CLIPS_VIDEO, _sheet_sidecar("01"))
+    (tmp_path / "output" / CLIPS_VIDEO / "01.mp4").unlink()
+    _write_publish(tmp_path, "ma_chaine", [_entry("01", "published", post_url="https://www.tiktok.com/@x/video/2")])
+
+    resp = _sheet(tmp_path)
+
+    assert resp.status_code == 200
+    video = resp.json()["video"]
+    assert video["deleted"] is True
+    assert video["video_url"] is None
+    assert video["note"] == "vidéo supprimée, fiche conservée"
+    assert resp.json()["clip"]["post_url"] == "https://www.tiktok.com/@x/video/2"
+
+
+def test_clip_sheet_never_published_clip_has_no_invented_publication(tmp_path, isolated_cwd):
+    _write_state(tmp_path, CLIPS_VIDEO, channel="ma_chaine")
+    sidecar = _sheet_sidecar("01")
+    del sidecar["score"]
+    _write_clip(tmp_path, CLIPS_VIDEO, sidecar)
+
+    sheet = _sheet(tmp_path).json()
+
+    assert sheet["clip"]["publish_status"] == "à valider"
+    assert sheet["clip"]["post_url"] is None
+    assert sheet["clip"]["published_at_paris"] is None
+    assert sheet["clip"]["score"] is None  # absente = inconnue, jamais 0 (ADR-ad2e)
+    assert sheet["stats"] is None
+
+
+def test_clip_sheet_removed_from_platform_keeps_its_post_link(tmp_path, isolated_cwd):
+    _write_state(tmp_path, CLIPS_VIDEO, channel="ma_chaine")
+    _write_clip(tmp_path, CLIPS_VIDEO, _sheet_sidecar("01"))
+    _write_publish(tmp_path, "ma_chaine", [
+        _entry("01", "removed_from_platform", post_url="https://www.tiktok.com/@ab12cd/video/3"),
+    ])
+
+    clip = _sheet(tmp_path).json()["clip"]
+
+    assert clip["publish_status"] == "removed_from_platform"
+    assert clip["tiktok_status"] == "removed_from_platform"
+    assert clip["post_url"] == "https://www.tiktok.com/@ab12cd/video/3"
+
+
+def test_clip_sheet_reports_stats_error_instead_of_zero_views(tmp_path, isolated_cwd, monkeypatch):
+    from clipper.tiktok import TikTokError
+
+    _write_state(tmp_path, CLIPS_VIDEO, channel="ma_chaine")
+    _write_clip(tmp_path, CLIPS_VIDEO, _sheet_sidecar("01"))
+    _write_publish(tmp_path, "ma_chaine", [_entry("01", "published", post_id="77")])
+
+    def no_history(account, post_id, *, config=None):
+        raise TikTokError(f"vidéo {post_id} introuvable dans les relevés du compte {account}")
+
+    monkeypatch.setattr("clipper.tiktok.video_detail", no_history)
+
+    stats = _sheet(tmp_path).json()["stats"]
+
+    assert stats["views"] is None
+    assert "introuvable" in stats["error"]
+
+
+def test_clip_sheet_unknown_clip_is_404(tmp_path, isolated_cwd):
+    resp = _sheet(tmp_path, clip_id="99")
+
+    assert resp.status_code == 404
+    assert "clip introuvable" in resp.json()["detail"]
+
+
+def test_clips_screen_links_each_clip_to_its_sheet():
+    js = (STATIC / "screens" / "clips.js").read_text(encoding="utf-8")
+
+    assert "#/clip/" in js
+
+
+def test_clip_sheet_screen_is_served_and_routed(tmp_path, isolated_cwd):
+    resp = client(tmp_path).get("/static/screens/clip.js")
+    index = client(tmp_path).get("/").text
+
+    assert resp.status_code == 200
+    assert "screens/clip.js" in index
+    assert '"clip"' in (STATIC / "app.js").read_text(encoding="utf-8")
+
+
+def test_clip_sheet_gives_the_jury_rounds_with_each_judge_argument(tmp_path, isolated_cwd):
+    _write_state(tmp_path, CLIPS_VIDEO, channel="ma_chaine")
+    _write_clip(tmp_path, CLIPS_VIDEO, _sheet_sidecar("01", moment_id="m1"))
+    moment = {"id": "m1", "jury": {"confidence": 72, "trace": {"rounds": [
+        {"round": 1, "judges": {"claude": {"score": 8, "confidence": 72, "argument": "Hook fort"}}}]}}}
+    _write_json(tmp_path / "workspace" / CLIPS_VIDEO / "moments.json", {"moments": [moment]})
+
+    jury = _sheet(tmp_path).json()["jury"]
+
+    assert jury["confidence"] == 72
+    assert jury["rounds"][0]["round"] == 1
+    assert jury["rounds"][0]["judges"]["claude"]["argument"] == "Hook fort"
+
+
+def test_clip_sheet_without_moments_json_has_unknown_jury(tmp_path, isolated_cwd):
+    _write_state(tmp_path, CLIPS_VIDEO, channel="ma_chaine")
+    _write_clip(tmp_path, CLIPS_VIDEO, _sheet_sidecar("01"))
+
+    jury = _sheet(tmp_path).json()["jury"]
+
+    assert jury == {"confidence": None, "judges": None, "rounds": None}

@@ -1758,3 +1758,10 @@ input[type="color"] { width: 36px; height: 36px; padding: 2px; border-radius: va
 @media (max-width: 900px) {
   .cal-day { min-height: 72px; }
 }
+
+/* Fiche clip (screens/clip.js) : grille de panneaux, lignes libelle / valeur (TASK-fa7619ccf83a). */
+.sheet { display: grid; gap: 16px; }
+.sheet-head h2 { margin: 4px 0 2px; }
+.sheet-grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); }
+.sheet-row { display: flex; justify-content: space-between; gap: 12px; padding: 6px 0; border-bottom: 1px solid rgba(127, 127, 127, 0.2); overflow-wrap: anywhere; }
+.sheet-row > span:last-child { text-align: right; }
