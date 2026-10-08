@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import atexit
 import json
 import math
 import os
 import shutil
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -1269,9 +1271,10 @@ class PixelDetectorFactory:
 
 
 def encode_png(image):
-    """PNG sans perte au niveau de compression maximal : le defaut d'OpenCV
-    pese ~10 fois plus sur ces images a grands aplats (TASK-20f1)."""
-    return cv2.imencode(".png", image, [cv2.IMWRITE_PNG_COMPRESSION, 9])[1].tobytes()
+    """PNG sans perte, compression la plus rapide : memes pixels qu'a un
+    niveau eleve, l'encodage au niveau 9 pesait lourd dans la duree des
+    tests (TASK-4633)."""
+    return cv2.imencode(".png", image, [cv2.IMWRITE_PNG_COMPRESSION, 1])[1].tobytes()
 
 
 def coarse_noise(rng, low, high, height, width, cell=16):
@@ -2095,7 +2098,34 @@ PANEL2 = (1380, 600, 1920, 984)  # 540 x 384, colle au bord droit : autre incrus
 FACE2 = (1470, 640, 1600, 790)
 
 
+_TIMELINE_CACHE: dict = {}
+_TIMELINE_CACHE_DIR: Path | None = None
+
+
 def write_timeline(video_dir, specs, *, seed=0):
+    """Copie dans ``video_dir`` la timeline de ``specs`` (voir
+    _write_timeline_uncached), fabriquee une seule fois par processus. Le
+    cache ne sert que de source de copies : aucun test ne lit ni n'ecrit
+    dedans, donc un test ne peut pas corrompre la timeline d'un autre."""
+    global _TIMELINE_CACHE_DIR
+    key = (seed, tuple(tuple(spec) for spec in specs))
+    if key not in _TIMELINE_CACHE:
+        if _TIMELINE_CACHE_DIR is None:
+            _TIMELINE_CACHE_DIR = Path(tempfile.mkdtemp(prefix="timeline-cache-"))
+            atexit.register(shutil.rmtree, _TIMELINE_CACHE_DIR, ignore_errors=True)
+        source = _TIMELINE_CACHE_DIR / str(len(_TIMELINE_CACHE))
+        source.mkdir()
+        _write_timeline_uncached(source, specs, seed=seed)
+        _TIMELINE_CACHE[key] = source
+    source = _TIMELINE_CACHE[key]
+    frames_dir = video_dir / "frames"
+    frames_dir.mkdir(exist_ok=True)
+    for frame in (source / "frames").iterdir():
+        shutil.copyfile(frame, frames_dir / frame.name)
+    shutil.copyfile(source / "scenes.json", video_dir / "scenes.json")
+
+
+def _write_timeline_uncached(video_dir, specs, *, seed=0):
     """scenes.json + images cles synthetiques. ``specs`` : liste de (temps,
     mode) ; mode : "chat" (grand visage blanc plein ecran), "game" (jeu
     bruite + panneau STREAM_PANEL avec un visage), "game2" (idem avec

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 import ast
+import copy
 import json
 import random
 import os
@@ -32,8 +33,16 @@ LINK = "https://www.tiktok.com/@ma_chaine/video/7300000000000000001"
 PARIS = ZoneInfo("Europe/Paris")
 
 
+_SELECTORS: dict | None = None
+
+
 def _sel() -> dict:
-    return tiktok.load_selectors()
+    """Copie profonde des selecteurs, parses une seule fois : chaque appel
+    reste independant (un test qui modifie sa copie n'en touche aucune autre)."""
+    global _SELECTORS
+    if _SELECTORS is None:
+        _SELECTORS = tiktok.load_selectors()
+    return copy.deepcopy(_SELECTORS)
 
 
 # ---------------------------------------------------------------- fausse page
