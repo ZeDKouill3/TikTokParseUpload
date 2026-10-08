@@ -445,7 +445,7 @@ def recorded_extraction_intervals(monkeypatch):
     intervals: list[tuple[float, float]] = []
     lock = threading.Lock()
 
-    def fake_extract_frame(video_path, timecode, decoder, ffmpeg_bin):
+    def fake_extract_frame(video_path, timecode, decoder, ffmpeg_bin, threads=0):
         start = time.monotonic()
         time.sleep(0.05)
         end = time.monotonic()
@@ -481,7 +481,7 @@ def test_extraction_runs_in_parallel_up_to_extract_parallel(
     _full_speech(workspace_dir)
     detect_scenes(
         three_scene_video, workspace_dir, "vid1",
-        keyframe_interval_seconds=100.0, extract_parallel=4,
+        keyframe_interval_seconds=100.0, extract_parallel=4, extract_batch=1,
     )
 
     assert _has_overlap(recorded_extraction_intervals)
@@ -496,7 +496,7 @@ def test_extraction_is_sequential_when_extract_parallel_is_one(
     _full_speech(workspace_dir)
     detect_scenes(
         three_scene_video, workspace_dir, "vid1",
-        keyframe_interval_seconds=100.0, extract_parallel=1,
+        keyframe_interval_seconds=100.0, extract_parallel=1, extract_batch=1,
     )
 
     assert not _has_overlap(recorded_extraction_intervals)
@@ -506,14 +506,14 @@ def test_scenes_json_identical_between_sequential_and_parallel_extraction(
     isolated_cwd, three_scene_video, monkeypatch
 ):
     """Meme sortie (timecodes, noms de fichiers, ordre, octets JPEG) que les
-    extractions se terminent dans l'ordre (extract_parallel=1) ou non
-    (extract_parallel=4, delais inverses pour forcer un ordre d'arrivee
+    extractions se terminent dans l'ordre (extract_parallel=1, extract_batch=1) ou non
+    (extract_parallel=4, extract_batch=1, delais inverses pour forcer un ordre d'arrivee
     different de l'ordre de soumission)."""
     import numpy as np
 
     import clipper.scenes as scenes_module
 
-    def fake_extract_frame(video_path, timecode, decoder, ffmpeg_bin):
+    def fake_extract_frame(video_path, timecode, decoder, ffmpeg_bin, threads=0):
         time.sleep(max(0.0, 0.06 - timecode * 0.001))
         seed = int(timecode * 1000) % 256
         return np.full((4, 4, 3), seed, dtype=np.uint8)
@@ -526,14 +526,14 @@ def test_scenes_json_identical_between_sequential_and_parallel_extraction(
     _full_speech(workspace_seq)
     result_seq = detect_scenes(
         three_scene_video, workspace_seq, "vid1",
-        keyframe_interval_seconds=100.0, extract_parallel=1,
+        keyframe_interval_seconds=100.0, extract_parallel=1, extract_batch=1,
     )
 
     workspace_par = isolated_cwd / "workspace_par"
     _full_speech(workspace_par)
     result_par = detect_scenes(
         three_scene_video, workspace_par, "vid1",
-        keyframe_interval_seconds=100.0, extract_parallel=4,
+        keyframe_interval_seconds=100.0, extract_parallel=4, extract_batch=1,
     )
 
     assert result_seq["scenes"] == result_par["scenes"]
@@ -554,7 +554,7 @@ def test_extraction_failure_propagates_and_does_not_write_scenes_json_when_paral
 ):
     import clipper.scenes as scenes_module
 
-    def failing_extract_frame(video_path, timecode, decoder, ffmpeg_bin):
+    def failing_extract_frame(video_path, timecode, decoder, ffmpeg_bin, threads=0):
         raise scenes_module.ScenesError(f"echec simule a {timecode:.3f}s")
 
     monkeypatch.setattr(scenes_module, "_extract_frame", failing_extract_frame)
@@ -566,7 +566,7 @@ def test_extraction_failure_propagates_and_does_not_write_scenes_json_when_paral
     with pytest.raises(ScenesError, match=r"\d+\.\d+s"):
         detect_scenes(
             three_scene_video, workspace_dir, "vid1",
-            keyframe_interval_seconds=100.0, extract_parallel=4,
+            keyframe_interval_seconds=100.0, extract_parallel=4, extract_batch=1,
         )
 
     assert not (workspace_dir / "vid1" / "scenes.json").exists()
@@ -1064,3 +1064,230 @@ def test_detect_scenes_truncated_scenes_json_raises_explicit_error_naming_file_a
 
     assert "scenes.json" in str(excinfo.value)
     assert "--force" in str(excinfo.value)
+
+
+# -- TASK-03e7 : scenes plus rapide, meme resultat --
+
+
+def _noisy_frames(count: int = 120, seed: int = 7):
+    """Images bruitees avec des coupes nettes tous les 30 images et des
+    variations douces entre deux : des scores proches du seuil, pour que
+    toute difference d'arrondi entre deux calculs se voie."""
+    import numpy as np
+
+    rng = np.random.default_rng(seed)
+    base = rng.integers(0, 256, (36, 64, 3), dtype=np.uint8)
+    frames = []
+    for i in range(count):
+        if i % 30 == 0:
+            base = rng.integers(0, 256, (36, 64, 3), dtype=np.uint8)
+        drift = rng.integers(-6, 7, base.shape)
+        frames.append(np.clip(base.astype(np.int16) + drift, 0, 255).astype(np.uint8))
+    return frames
+
+
+def test_fast_detector_gives_the_same_scores_and_cuts_as_the_stock_content_detector():
+    """Le calcul de score optimise reste egal, flottant pour flottant, a celui
+    de PySceneDetect (meme coupes, memes temps) sur des images bruitees."""
+    from scenedetect import FrameTimecode
+    from scenedetect.detectors import ContentDetector as StockDetector
+
+    from clipper.scenes import ContentDetector
+
+    frames = _noisy_frames()
+    fps = 30000 / 1001
+    for threshold in (3.0, 4.0, 27.0):
+        stock, fast = StockDetector(threshold=threshold), ContentDetector(threshold=threshold)
+        stock_scores, fast_scores = [], []
+        stock_cuts, fast_cuts = [], []
+        for n, frame in enumerate(frames):
+            tc = FrameTimecode(n, fps)
+            stock_cuts += stock.process_frame(tc, frame)
+            fast_cuts += fast.process_frame(tc, frame)
+            stock_scores.append(stock._frame_score)
+            fast_scores.append(fast._frame_score)
+        end = FrameTimecode(len(frames), fps)
+        stock_cuts += stock.post_process(end)
+        fast_cuts += fast.post_process(end)
+        assert any(score for score in stock_scores), "les scores doivent etre calcules"
+        assert fast_scores == stock_scores
+        assert [c.frame_num for c in fast_cuts] == [c.frame_num for c in stock_cuts]
+        if threshold == 27.0:
+            assert len(stock_cuts) >= 3, "les coupes nettes doivent etre detectees"
+
+
+def test_decode_window_cuts_matches_a_stock_detector_run_on_the_same_pipe(
+    isolated_cwd, three_scene_video
+):
+    """Meme coupes que PySceneDetect branche sur le meme flux ffmpeg."""
+    from fractions import Fraction
+
+    import numpy as np
+    from scenedetect import FrameTimecode
+    from scenedetect.detectors import ContentDetector as StockDetector
+    from scenedetect.scene_manager import get_scenes_from_cuts
+
+    from clipper.scenes import _decode_window_cuts
+
+    rate = Fraction(25)
+    got = _decode_window_cuts(
+        three_scene_video, 0.0, 6.0, 27.0, "", "ffmpeg", 25.0, rate, 64, 48, True
+    )
+
+    raw = subprocess.run(
+        ["ffmpeg", "-v", "error", "-nostdin", "-skip_loop_filter", "all",
+         "-i", str(three_scene_video), "-t", "6.000", "-an",
+         "-vf", "fps=25/1,scale=64:48", "-pix_fmt", "bgr24", "-f", "rawvideo", "-"],
+        capture_output=True, check=True,
+    ).stdout
+    size = 64 * 48 * 3
+    detector = StockDetector(threshold=27.0)
+    cuts, count = [], 0
+    for offset in range(0, len(raw) - size + 1, size):
+        frame = np.frombuffer(raw[offset:offset + size], np.uint8).reshape(48, 64, 3)
+        cuts += detector.process_frame(FrameTimecode(count, 25.0), frame)
+        count += 1
+    end = FrameTimecode(count, 25.0)
+    cuts += detector.post_process(end)
+    expected = get_scenes_from_cuts(
+        cut_list=sorted(set(cuts)), start_pos=FrameTimecode(0, 25.0), end_pos=end
+    )
+    assert got == [(a.seconds, b.seconds) for a, b in expected]
+    assert len(got) == 3
+
+
+def test_config_defaults_declares_extract_batch_and_threads():
+    from clipper.scenes import CONFIG_DEFAULTS
+
+    assert CONFIG_DEFAULTS["extract_batch"] == 8
+    assert CONFIG_DEFAULTS["extract_threads"] == 2
+
+
+def test_extract_threads_below_zero_is_refused(isolated_cwd, three_scene_video):
+    from clipper.scenes import ScenesError, detect_scenes
+
+    with pytest.raises(ScenesError, match="extract_threads"):
+        detect_scenes(three_scene_video, isolated_cwd / "workspace", "vid1", extract_threads=-1)
+
+
+def test_extraction_limits_the_decoder_threads_of_each_ffmpeg(
+    isolated_cwd, long_scene_video, monkeypatch
+):
+    import clipper.scenes as scenes_module
+    from clipper.scenes import detect_scenes
+
+    commands: list[list[str]] = []
+    real_run = scenes_module.subprocess.run
+
+    def recording_run(cmd, *args, **kwargs):
+        commands.append(cmd)
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(scenes_module.subprocess, "run", recording_run)
+    for batch, threads in ((8, 3), (1, 3), (8, 0)):
+        commands.clear()
+        root = isolated_cwd / f"thr{batch}{threads}"
+        _full_speech(root)
+        detect_scenes(
+            long_scene_video, root, "vid1", keyframe_interval_seconds=2.0,
+            extract_batch=batch, extract_threads=threads,
+        )
+        extraction = [c for c in commands if c[0] == "ffmpeg"]
+        assert extraction
+        for cmd in extraction:
+            inputs = cmd.count("-i")
+            if threads:
+                assert cmd.count("-threads") == inputs
+                assert all(cmd[i + 1] == str(threads) for i, a in enumerate(cmd) if a == "-threads")
+            else:
+                assert "-threads" not in cmd
+
+
+def test_extract_batch_below_one_is_refused(isolated_cwd, three_scene_video):
+    from clipper.scenes import ScenesError, detect_scenes
+
+    with pytest.raises(ScenesError, match="extract_batch"):
+        detect_scenes(three_scene_video, isolated_cwd / "workspace", "vid1", extract_batch=0)
+
+
+@pytest.fixture
+def long_scene_video(tmp_path):
+    video_path = tmp_path / "long_scenes.mp4"
+    _make_color_video(video_path, ["red", "blue", "green"], segment_seconds=12.0)
+    return video_path
+
+
+def _jpeg_bytes_by_name(result: dict, root: Path) -> dict[str, bytes]:
+    return {f["path"]: (root / "vid1" / f["path"]).read_bytes() for f in result["frames"]}
+
+
+def test_batched_extraction_gives_the_same_scenes_and_the_same_jpeg_bytes(
+    isolated_cwd, long_scene_video
+):
+    """scenes.json et chaque image cle identiques octet pour octet, que les
+    images soient extraites une par processus ffmpeg (extract_batch=1) ou par
+    lots (8, 1000 : tout dans un seul lot)."""
+    from clipper.scenes import detect_scenes
+
+    results, roots = {}, {}
+    for batch, threads in ((1, 0), (8, 2), (1000, 5)):
+        root = isolated_cwd / f"ws{batch}"
+        _full_speech(root)
+        results[batch] = detect_scenes(
+            long_scene_video, root, "vid1", keyframe_interval_seconds=2.0,
+            extract_batch=batch, extract_threads=threads,
+        )
+        roots[batch] = root
+
+    assert len(results[1]["frames"]) >= 9
+    assert results[8] == results[1] == results[1000]
+    assert (roots[8] / "vid1" / "scenes.json").read_bytes() == (
+        roots[1] / "vid1" / "scenes.json"
+    ).read_bytes()
+    assert _jpeg_bytes_by_name(results[8], roots[8]) == _jpeg_bytes_by_name(results[1], roots[1])
+    assert _jpeg_bytes_by_name(results[1000], roots[1000]) == _jpeg_bytes_by_name(
+        results[1], roots[1]
+    )
+
+
+def test_batched_extraction_launches_fewer_ffmpeg_processes(
+    isolated_cwd, long_scene_video, monkeypatch
+):
+    import clipper.scenes as scenes_module
+    from clipper.scenes import detect_scenes
+
+    launches: list[list[str]] = []
+    real_run = scenes_module.subprocess.run
+
+    def counting_run(cmd, *args, **kwargs):
+        launches.append(cmd)
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(scenes_module.subprocess, "run", counting_run)
+
+    def extraction_launches(batch: int) -> int:
+        launches.clear()
+        root = isolated_cwd / f"count{batch}"
+        _full_speech(root)
+        result = detect_scenes(
+            long_scene_video, root, "vid1", keyframe_interval_seconds=2.0, extract_batch=batch
+        )
+        n_frames = len(result["frames"])
+        return n_frames, len([c for c in launches if c[0] == "ffmpeg"])
+
+    n_frames, single = extraction_launches(1)
+    _, batched = extraction_launches(8)
+    assert single == n_frames
+    assert batched == -(-n_frames // 8)
+
+
+def test_batched_extraction_failure_names_the_timecode(isolated_cwd, long_scene_video):
+    from clipper.scenes import ScenesError, detect_scenes
+
+    root = isolated_cwd / "ws"
+    _full_speech(root)
+    with pytest.raises(ScenesError, match=r"decodeur inexistant_xyz"):
+        detect_scenes(
+            long_scene_video, root, "vid1", decoder="inexistant_xyz", extract_batch=8
+        )
+    assert not (root / "vid1" / "scenes.json").exists()
