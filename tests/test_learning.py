@@ -764,7 +764,15 @@ def _veille_dir(config) -> Path:
 def _bilan_config(tmp_path, **learning_overrides) -> Config:
     config = _config(tmp_path, **learning_overrides)
     config._sections["veille"] = {"state_dir": str(tmp_path / "veille")}
+    config._sections["worker"] = {"queue_path": str(tmp_path / "queue.json")}
     return config
+
+
+def _worker_queue(config, *videos):
+    """File d'attente du worker : ces VOD sont encore en traitement (waiting ou running)."""
+    path = Path(config.section("worker")["queue_path"])
+    path.write_text(json.dumps([{"id": f"q{i}", "video_id": v, "status": "running" if i == 0 else "waiting"}
+                                for i, v in enumerate(videos)]), encoding="utf-8")
 
 
 def _queue_vod(config, video, *, day="2026-10-05", at="2026-10-05T08:00:00+00:00", title=None):
@@ -818,7 +826,8 @@ def test_veille_report_gives_figures_from_the_journal_and_a_reason_when_absent(t
     stats = [e for e in _journal(config) if e["kind"] == "stats"][0]["stats"]
     assert entries[VIDEO] == {
         "picked_on": "2026-10-05", "candidate_id": f"twitch:{VIDEO}", "source": "twitch", "game_name": "Jeu Alpha",
-        "channel_name": "streamer_a", "title": "Un titre", "video_id": VIDEO, "clips_published": 1, "clips_mature": 1,
+        "channel_name": "streamer_a", "title": "Un titre", "video_id": VIDEO, "clips_produced": 1, "processing": False,
+        "clips_published": 1, "clips_mature": 1,
         "views_percentile_mean": stats["views_percentile"], "views_at_maturity_max": stats["views_at_maturity"],
         "missing": None}
     assert stats["views_at_maturity"] == 750
@@ -826,6 +835,70 @@ def test_veille_report_gives_figures_from_the_journal_and_a_reason_when_absent(t
         assert entries[video]["missing"] == reason and entries[video]["clips_published"] == published
         assert entries[video]["views_percentile_mean"] is None and entries[video]["views_at_maturity_max"] is None
         assert entries[video]["clips_mature"] == 0
+
+
+def test_veille_report_counts_the_clips_a_vod_really_produced(tmp_path):
+    """Constat 08/10 : VOD choisie (id source twitch:…) dont le worker a produit des clips sous v… : jamais « aucun clip »."""
+    config = _bilan_config(tmp_path)
+    for clip in ("00-p1", "00-p2", "00-p3"):
+        _sidecar(config, clip, video="v2894088024", post_id=None)
+        path = Path(config.output_dir) / "v2894088024" / f"{clip}.json"
+        path.write_text(json.dumps({"caption": "c"}), encoding="utf-8")
+    _queue_vod(config, "v2894088024")
+
+    learning.write_veille_report(NOW, config=config)
+
+    entry = _by_video(_bilan(config))["v2894088024"]
+    assert entry["candidate_id"] == "twitch:v2894088024"
+    assert (entry["clips_produced"], entry["clips_published"], entry["processing"]) == (3, 0, False)
+    assert entry["missing"] == "not_published"
+
+
+def test_veille_report_flags_a_vod_still_in_the_worker_queue_as_processing(tmp_path):
+    config = _bilan_config(tmp_path)
+    _queue_vod(config, "RUNNING1")
+    _queue_vod(config, "WAITING1")
+    _worker_queue(config, "RUNNING1", "WAITING1")
+
+    learning.write_veille_report(NOW, config=config)
+
+    entries = _by_video(_bilan(config))
+    for video in ("RUNNING1", "WAITING1"):
+        assert entries[video]["processing"] is True and entries[video]["missing"] == "processing"
+        assert entries[video]["clips_produced"] == 0
+
+
+def test_veille_report_a_vod_off_the_queue_without_clip_is_a_real_zero(tmp_path):
+    config = _bilan_config(tmp_path)
+    _queue_vod(config, "EMPTYVOD")
+    _worker_queue(config, "OTHERVOD")
+
+    learning.write_veille_report(NOW, config=config)
+
+    entry = _by_video(_bilan(config))["EMPTYVOD"]
+    assert (entry["clips_produced"], entry["processing"], entry["missing"]) == (0, False, "no_clips")
+
+
+def test_veille_report_unreadable_worker_queue_is_an_error_naming_the_file(tmp_path):
+    config = _bilan_config(tmp_path)
+    _queue_vod(config, VIDEO)
+    Path(config.section("worker")["queue_path"]).write_text("{pas du json", encoding="utf-8")
+    with pytest.raises(learning.LearningError, match="queue.json"):
+        learning.write_veille_report(NOW, config=config)
+
+
+def test_run_if_due_refreshes_the_veille_report_even_without_a_new_snapshot(tmp_path, monkeypatch):
+    """Le bilan n'attend plus un relevé TikTok : sinon il reste figé avant que les clips existent."""
+    config = _bilan_config(tmp_path)
+    calls = []
+    monkeypatch.setattr(learning, "link_if_due", lambda *a, **k: [])
+    monkeypatch.setattr(learning, "_snapshot_newer_than_sync", lambda *a, **k: False)
+    monkeypatch.setattr(learning, "coach_if_due", lambda *a, **k: [])
+    monkeypatch.setattr(learning, "write_veille_report", lambda *a, **k: calls.append("bilan"))
+
+    learning.run_if_due(NOW, config=config)
+
+    assert calls == ["bilan"]
 
 
 def _rewrite_seen(config, video, **fields):

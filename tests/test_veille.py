@@ -2187,8 +2187,8 @@ _BILAN_NONE = "Bilan des VOD choisies récemment : aucun (pas encore de résulta
 
 def _bilan_entry(**over):
     return {"picked_on": "2026-10-05", "candidate_id": "twitch:OLD1", "source": "twitch", "game_name": "Jeu Beta",
-            "channel_name": "streamer_b", "title": "Ancienne VOD", "video_id": "OLD1", "clips_published": 2,
-            "clips_mature": 2, "views_percentile_mean": 0.75, "views_at_maturity_max": 4200, "missing": None, **over}
+            "channel_name": "streamer_b", "title": "Ancienne VOD", "video_id": "OLD1", "clips_produced": 3,
+            "processing": False, "clips_published": 2, "clips_mature": 2, "views_percentile_mean": 0.75, "views_at_maturity_max": 4200, "missing": None, **over}
 
 
 def _write_bilan(tmp_path, entries):
@@ -2221,6 +2221,49 @@ def test_prompt_carries_one_line_per_bilan_entry_before_the_candidates(tmp_path)
     for text in ("Récente VOD", "Jeu Gamma", "streamer_c", "immature"):
         assert text in lines[1]
     assert "4200" not in lines[1] and "None" not in lines[1]
+
+
+def _bilan_lines_of(tmp_path, *entries):
+    _write_bilan(tmp_path, list(entries))
+    head = _prompt_with_bilan(tmp_path).split("Candidats (VOD) :")[0]
+    return [line for line in head.split(_BILAN_HEADER, 1)[1].splitlines() if line.startswith("- ")]
+
+
+def test_bilan_line_separates_produced_published_and_matured_clips(tmp_path):
+    (line,) = _bilan_lines_of(tmp_path, _bilan_entry(clips_produced=23, clips_published=4, clips_mature=0,
+                                                     views_percentile_mean=None, views_at_maturity_max=None,
+                                                     missing="immature"))
+    assert "clips_produits=23" in line and "clips_publiés=4" in line and "immature" in line
+    assert "aucun" not in line and "None" not in line
+
+
+def test_bilan_line_never_says_no_clip_for_a_vod_that_produced_some(tmp_path):
+    (line,) = _bilan_lines_of(tmp_path, _bilan_entry(clips_produced=23, clips_published=0, clips_mature=0,
+                                                     views_percentile_mean=None, views_at_maturity_max=None,
+                                                     missing="not_published"))
+    assert "clips_produits=23" in line and "clips_publiés=0" in line
+    assert "no_clips" not in line and "aucun clip" not in line
+
+
+def test_bilan_line_says_processing_for_a_vod_still_in_the_worker(tmp_path):
+    (line,) = _bilan_lines_of(tmp_path, _bilan_entry(clips_produced=0, clips_published=0, clips_mature=0, processing=True,
+                                                     views_percentile_mean=None, views_at_maturity_max=None,
+                                                     missing="processing"))
+    assert "en traitement" in line and "clips_produits" not in line and "clips_publiés" not in line
+
+
+def test_bilan_line_gives_a_real_zero_for_a_vod_without_clip(tmp_path):
+    (line,) = _bilan_lines_of(tmp_path, _bilan_entry(clips_produced=0, clips_published=0, clips_mature=0,
+                                                     views_percentile_mean=None, views_at_maturity_max=None,
+                                                     missing="no_clips"))
+    assert "clips_produits=0" in line and "en traitement" not in line
+
+
+def test_bilan_line_says_missing_for_an_entry_without_the_produced_count(tmp_path):
+    entry = _bilan_entry(views_percentile_mean=None, views_at_maturity_max=None, missing="immature")
+    del entry["clips_produced"]
+    (line,) = _bilan_lines_of(tmp_path, entry)
+    assert "clips_produits=inconnu" in line and "clips_produits=0" not in line
 
 
 def test_prompt_says_no_bilan_without_file(tmp_path):

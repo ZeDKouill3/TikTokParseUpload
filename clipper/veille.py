@@ -1401,10 +1401,19 @@ def _bilan_lines(table: dict[str, object]) -> list[str]:
         return ["", "Bilan des VOD choisies récemment : aucun (pas encore de résultats)"]
     lines = ["", "Bilan des VOD choisies récemment (vues à maturité, rang 0-1 dans le compte) :"]
     for e in entries:
-        result = (f"rang_moyen={_fmt(e.get('views_percentile_mean'))} vues_max={_fmt(e.get('views_at_maturity_max'))}"
-                  if not e.get("missing") else f"résultat inconnu ({e['missing']})")
-        lines.append(f"- {str(e.get('title'))[:80]!r} jeu={str(_fmt(e.get('game_name')))[:60]} "
-                     f"chaîne={str(_fmt(e.get('channel_name')))[:60]} clips_publiés={_fmt(e.get('clips_published'))} {result}")
+        head = (f"- {str(e.get('title'))[:80]!r} jeu={str(_fmt(e.get('game_name')))[:60]} "
+                f"chaîne={str(_fmt(e.get('channel_name')))[:60]}")
+        if e.get("processing"):
+            lines.append(f"{head} en traitement (clips pas encore tous produits)")
+            continue
+        clips = f"clips_produits={_fmt(e.get('clips_produced'))} clips_publiés={_fmt(e.get('clips_published'))}"
+        if not e.get("missing"):
+            result = f"rang_moyen={_fmt(e.get('views_percentile_mean'))} vues_max={_fmt(e.get('views_at_maturity_max'))}"
+        elif e["missing"] == "no_clips":
+            result = "aucune vue : aucun clip produit"
+        else:
+            result = f"vues à maturité inconnues ({e['missing']})"
+        lines.append(f"{head} {clips} {result}")
     return lines
 
 

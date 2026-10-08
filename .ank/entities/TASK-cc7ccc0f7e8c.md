@@ -5,7 +5,7 @@ slug: veille-le-bilan-des-choix-pass-s-transmis-claude
 title: "Veille : le bilan des choix passés transmis à Claude compte les vrais clips produits (plus de « les choix AION passés n'ont donné aucun clip » alors qu'ils en ont donné des dizaines)"
 created: 2026-10-08T10:48:21Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/veille.py
   - clipper/learning.py
@@ -18,6 +18,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/34e8cf24dcf3@f35f250
+    tree: scope/2c3733346a01
+    criteria: 1495860b6f0a
+    verifier: tests@c7b454d16c90
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---
