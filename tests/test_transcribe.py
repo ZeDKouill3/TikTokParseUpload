@@ -1470,3 +1470,72 @@ def test_integration_tiny_model_transcribes_a_short_clip(tmp_path, video_dir):
             assert set(w) == {"word", "start", "end", "probability"}
     if clip:
         assert any(seg["words"] for seg in data["segments"])
+
+
+# -- audio sur la ligne de temps du conteneur (TASK-4880) ---------------------
+
+import shutil as _shutil
+import subprocess as _subprocess
+import wave as _wave
+
+import pytest as _pytest
+
+_needs_ffmpeg = _pytest.mark.skipif(_shutil.which("ffmpeg") is None, reason="ffmpeg absent")
+
+
+def _make_gap_aac(path, gap: bool):
+    """Sine 4 s en aac ; avec `gap`, pts decales de +2 s a T=2 (trou de 2 s, conteneur de 6 s)."""
+    out = path.with_suffix(".mka")
+    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=4"]
+    if gap:
+        cmd += ["-af", "asetpts='if(gte(PTS,2/TB),PTS+2/TB,PTS)'"]
+    _subprocess.run(cmd + ["-c:a", "aac", "-f", "matroska", str(out)], check=True)
+    return out
+
+
+def _wav_info(path):
+    with _wave.open(str(path), "rb") as w:
+        n = w.getnframes()
+        rate = w.getframerate()
+        raw = w.readframes(n)
+    import numpy as np
+    samples = np.frombuffer(raw, dtype="<i2").astype(float)
+    return n / rate, rate, samples
+
+
+def _container_duration(path) -> float:
+    out = _subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(path)],
+        check=True, capture_output=True, text=True).stdout.strip()
+    return float(out)
+
+
+@_needs_ffmpeg
+def test_extract_audio_without_gap_keeps_the_duration(tmp_path):
+    from clipper.transcribe import extract_audio
+
+    src = _make_gap_aac(tmp_path / "v", gap=False)
+    extract_audio(src, tmp_path / "o.wav")
+
+    dur, rate, _ = _wav_info(tmp_path / "o.wav")
+    assert rate == 16000
+    assert abs(dur - 4.0) < 0.1
+
+
+@_needs_ffmpeg
+def test_extract_audio_fills_a_pts_gap_with_silence(tmp_path):
+    from clipper.transcribe import extract_audio
+
+    src = _make_gap_aac(tmp_path / "v", gap=True)
+    container = _container_duration(src)
+    assert container > 5.9  # le fichier synthetique a bien un trou de pts de 2 s
+
+    extract_audio(src, tmp_path / "o.wav")
+
+    dur, rate, s = _wav_info(tmp_path / "o.wav")
+    assert abs(dur - container) < 0.15
+    # silence dans le trou (2.2 s .. 3.8 s), signal avant et apres
+    gap_part = s[int(2.3 * rate):int(3.7 * rate)]
+    assert abs(gap_part).max() < 200
+    assert abs(s[int(0.5 * rate):int(1.5 * rate)]).max() > 2000
+    assert abs(s[int(4.3 * rate):int(5.3 * rate)]).max() > 2000

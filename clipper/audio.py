@@ -110,6 +110,8 @@ def _extract_samples_ffmpeg(
         ffmpeg_bin,
         "-i", str(video_path),
         "-vn",
+        # ligne de temps du conteneur : silence dans un trou de pts (TASK-4880)
+        "-af", "aresample=async=1:first_pts=0",
         "-f", "s16le",
         "-ac", "1",
         "-ar", str(sample_rate),

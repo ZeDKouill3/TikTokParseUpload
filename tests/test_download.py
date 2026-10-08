@@ -359,6 +359,7 @@ def test_config_section_download_resolves_via_clipper_config(isolated_cwd):
         "network_retries": 15,
         "network_retry_pause_s": 5,
         "concurrent_fragments": 8,
+        "fragment_retries": 20,
         "ffmpeg_bin": "ffmpeg",
     }
 
@@ -876,3 +877,35 @@ def test_download_logs_the_number_of_concurrent_fragments(isolated_cwd, caplog):
                  concurrent_fragments=5, ydl_factory=_make_fake_ydl(info, {}))
 
     assert "5 fragments simultanes" in caplog.text
+
+
+# -- fragments indisponibles (TASK-4880) -------------------------------------
+
+
+def test_download_opts_refuse_to_skip_unavailable_fragments(isolated_cwd):
+    from clipper.download import download
+
+    info = _load_fixture("info_dict_full.json")
+    captured_opts: dict = {}
+    download(f"https://youtu.be/{info['id']}", workspace_dir=isolated_cwd / "workspace",
+             ydl_factory=_make_fake_ydl(info, captured_opts))
+
+    assert captured_opts["skip_unavailable_fragments"] is False
+    assert captured_opts["fragment_retries"] == 20
+
+
+def test_download_passes_configured_fragment_retries_to_ydl_opts(isolated_cwd):
+    from clipper.download import download
+
+    info = _load_fixture("info_dict_full.json")
+    captured_opts: dict = {}
+    download(f"https://youtu.be/{info['id']}", workspace_dir=isolated_cwd / "workspace",
+             fragment_retries=7, ydl_factory=_make_fake_ydl(info, captured_opts))
+
+    assert captured_opts["fragment_retries"] == 7
+
+
+def test_config_defaults_declares_fragment_retries_at_20():
+    from clipper.download import CONFIG_DEFAULTS
+
+    assert CONFIG_DEFAULTS["fragment_retries"] == 20

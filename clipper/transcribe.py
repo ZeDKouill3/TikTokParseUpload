@@ -161,7 +161,8 @@ def extract_audio(video_path: str | Path, audio_path: str | Path) -> None:
     """Extrait la piste audio de la video en wav PCM 16 kHz mono."""
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error", "-i", str(video_path),
-        "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(audio_path),
+        "-vn", "-af", "aresample=async=1:first_pts=0",
+        "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(audio_path),
     ]
     try:
         subprocess.run(cmd, check=True, capture_output=True, text=True)

@@ -30,6 +30,9 @@ CONFIG_DEFAULTS: dict[str, object] = {
     # Fragments HLS/DASH telecharges en parallele par yt-dlp (entier >= 1) : un par un, une VOD
     # Twitch de 11-21 Go reste a 13-20 Mo/s.
     "concurrent_fragments": 8,
+    # Reprises d'un fragment HLS/DASH en echec avant d'abandonner : un fragment perdu fait ensuite
+    # echouer le telechargement (jamais de video a trous, ADR-ad2e).
+    "fragment_retries": 20,
     # Binaire ffmpeg du remux d'un mp4 fragmente (resolu par le PATH).
     "ffmpeg_bin": "ffmpeg",
 }
@@ -213,6 +216,7 @@ def _ydl_opts(
     js_runtimes: str | None,
     video_id: str,
     concurrent_fragments: int = 8,
+    fragment_retries: int = 20,
 ) -> dict[str, Any]:
     opts: dict[str, Any] = {
         "format": _FORMAT,
@@ -222,6 +226,10 @@ def _ydl_opts(
         "quiet": True,
         "noprogress": True,
         "concurrent_fragment_downloads": concurrent_fragments,
+        # Un fragment indisponible fait echouer le telechargement au lieu d'etre saute : sinon la
+        # video a un trou de pts et transcript/audio decalent des clips (TASK-4880).
+        "skip_unavailable_fragments": False,
+        "fragment_retries": fragment_retries,
         "progress_hooks": [_progress_hook(video_id, video_dir)],
     }
     if cookies_file:
@@ -346,6 +354,7 @@ def download(
     sleep: Callable[[float], None] = time.sleep,
     ffmpeg_bin: str = "ffmpeg",
     concurrent_fragments: int = 8,
+    fragment_retries: int = 20,
 ) -> dict[str, Any]:
     """Download a YouTube video and write its metadata (ADR-b16b: a step
     reads its inputs and writes workspace/<video_id>/ itself).
@@ -379,7 +388,8 @@ def download(
 
     video_dir.mkdir(parents=True, exist_ok=True)
     opts = _ydl_opts(
-        video_dir, cookies_file, cookies_from_browser, js_runtimes, video_id, concurrent_fragments
+        video_dir, cookies_file, cookies_from_browser, js_runtimes, video_id, concurrent_fragments,
+        fragment_retries,
     )
     log.info("%s : telechargement avec %d fragments simultanes", video_id, concurrent_fragments)
     info = _extract_with_retries(
