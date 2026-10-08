@@ -14,6 +14,7 @@ from urllib.parse import parse_qs, urlparse
 import yt_dlp
 
 from clipper import browser
+from clipper.channel import atomic_write_json
 
 log = logging.getLogger(__name__)
 
@@ -142,7 +143,7 @@ def _save_thumbnail(video_dir: Path, url: str) -> None:
     mais la console a de quoi afficher une image (SPEC console, point 1 de TASK-c32b)."""
     path = video_dir / THUMBNAIL_FILE
     video_dir.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"url": url}), encoding="utf-8")
+    atomic_write_json(path, {"url": url})
 
 
 def is_youtube_url(url: str) -> bool:
@@ -372,7 +373,13 @@ def download(
     video_file = video_dir / f"{video_id}.mp4"
 
     if meta_file.exists() and video_file.exists():
-        return json.loads(meta_file.read_text(encoding="utf-8"))
+        try:
+            return json.loads(meta_file.read_text(encoding="utf-8"))
+        except ValueError as exc:
+            raise DownloadError(
+                f"[download] {meta_file} est illisible ({exc}) : refais l'etape "
+                "download avec --force"
+            ) from exc
 
     if cookies_profile:
         if cookies_file:
@@ -399,5 +406,5 @@ def download(
     _remux_if_fragmented(video_file, video_id, ffmpeg_bin)
 
     meta = _build_meta(info, url)
-    meta_file.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_json(meta_file, meta)
     return meta

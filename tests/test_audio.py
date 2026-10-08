@@ -222,3 +222,58 @@ def test_extract_samples_fills_a_pts_gap_with_silence(tmp_path):
     assert abs(len(s) / 16000 - container) < 0.15
     assert np.abs(s[int(2.3 * 16000):int(3.7 * 16000)]).max() < 0.01
     assert np.abs(s[int(4.3 * 16000):int(5.3 * 16000)]).max() > 0.05
+
+
+def _failing_replace(*args, **kwargs):
+    raise OSError("coupure simulee pendant le remplacement")
+
+
+def test_run_interrupted_write_leaves_no_audio_json(isolated_cwd, monkeypatch):
+    from clipper import audio
+
+    workspace_dir = isolated_cwd / "workspace"
+    samples = _synthetic_signal_with_bursts(8000, duration_s=3, burst_times=[])
+    monkeypatch.setattr("os.replace", _failing_replace)
+
+    with pytest.raises(OSError):
+        audio.run(
+            "abc123", workspace_dir=workspace_dir, sample_rate=8000,
+            extractor=lambda p, sr: samples,
+        )
+
+    assert not (workspace_dir / "abc123" / "audio.json").exists()
+
+
+def test_run_interrupted_forced_write_keeps_previous_audio_json(isolated_cwd, monkeypatch):
+    from clipper import audio
+
+    workspace_dir = isolated_cwd / "workspace"
+    video_dir = workspace_dir / "abc123"
+    video_dir.mkdir(parents=True)
+    (video_dir / "audio.json").write_text(json.dumps({"old": True}), encoding="utf-8")
+    samples = _synthetic_signal_with_bursts(8000, duration_s=3, burst_times=[])
+    monkeypatch.setattr("os.replace", _failing_replace)
+
+    with pytest.raises(OSError):
+        audio.run(
+            "abc123", workspace_dir=workspace_dir, sample_rate=8000,
+            extractor=lambda p, sr: samples, force=True,
+        )
+
+    assert json.loads((video_dir / "audio.json").read_text(encoding="utf-8")) == {"old": True}
+
+
+def test_run_truncated_audio_json_raises_explicit_error_naming_file_and_force(isolated_cwd):
+    from clipper.audio import AudioError, run
+
+    workspace_dir = isolated_cwd / "workspace"
+    video_dir = workspace_dir / "abc123"
+    video_dir.mkdir(parents=True)
+    (video_dir / "audio.json").write_text('{"window_seconds": 1.0, "energy_', encoding="utf-8")
+
+    with pytest.raises(AudioError) as excinfo:
+        run("abc123", workspace_dir=workspace_dir, extractor=lambda p, sr: None)
+
+    message = str(excinfo.value)
+    assert "audio.json" in message
+    assert "--force" in message
