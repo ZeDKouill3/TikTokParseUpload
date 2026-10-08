@@ -8,6 +8,8 @@ from typing import Callable
 
 import numpy as np
 
+from clipper.channel import atomic_write_json
+
 CONFIG_DEFAULTS: dict[str, object] = {
     "sample_rate": 16000,
     "window_seconds": 1.0,
@@ -129,6 +131,17 @@ def _extract_samples_ffmpeg(
     return np.frombuffer(proc.stdout, dtype="<i2").astype(np.float32) / 32768.0
 
 
+def _read_existing(path: Path) -> dict[str, object]:
+    """Relit audio.json ; un fichier tronque (arret pendant une ecriture
+    ancienne) donne une erreur explicite, jamais une reparation silencieuse."""
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except ValueError as exc:
+        raise AudioError(
+            f"{path} est illisible ({exc}) : refais l'etape audio avec --force"
+        ) from exc
+
+
 def run(
     video_id: str,
     workspace_dir: str | Path = "workspace",
@@ -147,7 +160,7 @@ def run(
     video_dir = Path(workspace_dir) / video_id
     out_file = video_dir / "audio.json"
     if out_file.exists() and not force:
-        return json.loads(out_file.read_text(encoding="utf-8"))
+        return _read_existing(out_file)
 
     if extractor is None:
         extractor = functools.partial(_extract_samples_ffmpeg, ffmpeg_bin=ffmpeg_bin)
@@ -163,5 +176,5 @@ def run(
     )
 
     video_dir.mkdir(parents=True, exist_ok=True)
-    out_file.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_json(out_file, result)
     return result

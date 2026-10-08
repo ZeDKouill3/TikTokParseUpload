@@ -49,6 +49,8 @@ from scenedetect import FrameTimecode
 from scenedetect.detectors import ContentDetector
 from scenedetect.scene_manager import get_scenes_from_cuts
 
+from clipper.channel import atomic_write_json
+
 logger = logging.getLogger(__name__)
 
 CONFIG_DEFAULTS: dict[str, object] = {
@@ -472,7 +474,12 @@ def detect_scenes(
     frames_dir = video_dir / "frames"
 
     if scenes_file.exists() and not force:
-        return json.loads(scenes_file.read_text(encoding="utf-8"))
+        try:
+            return json.loads(scenes_file.read_text(encoding="utf-8"))
+        except ValueError as exc:
+            raise ScenesError(
+                f"{scenes_file} est illisible ({exc}) : refais l'etape scenes avec --force"
+            ) from exc
 
     transcript = _read_json(video_dir / "transcript.json")
     audio = _read_json(video_dir / "audio.json") if peak_windows else {}
@@ -524,5 +531,5 @@ def detect_scenes(
     }
     if peak_windows:
         result["peak_windows"] = True
-    scenes_file.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_json(scenes_file, result)
     return result

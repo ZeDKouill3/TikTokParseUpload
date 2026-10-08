@@ -909,3 +909,54 @@ def test_config_defaults_declares_fragment_retries_at_20():
     from clipper.download import CONFIG_DEFAULTS
 
     assert CONFIG_DEFAULTS["fragment_retries"] == 20
+
+
+def _failing_replace(*args, **kwargs):
+    raise OSError("coupure simulee pendant le remplacement")
+
+
+def test_download_interrupted_meta_write_leaves_no_meta_json(isolated_cwd, monkeypatch):
+    from clipper.download import download
+
+    info = _load_fixture("info_dict_full.json")
+    workspace_dir = isolated_cwd / "workspace"
+    ydl_factory = _make_fake_ydl(info, {})
+    monkeypatch.setattr("os.replace", _failing_replace)
+
+    with pytest.raises(OSError):
+        download(
+            f"https://youtu.be/{info['id']}", workspace_dir=workspace_dir, ydl_factory=ydl_factory
+        )
+
+    assert not (workspace_dir / info["id"] / "meta.json").exists()
+
+
+def test_download_truncated_meta_json_raises_explicit_error_naming_file_and_force(isolated_cwd):
+    from clipper.download import DownloadError, download
+
+    info = _load_fixture("info_dict_full.json")
+    workspace_dir = isolated_cwd / "workspace"
+    video_dir = workspace_dir / info["id"]
+    video_dir.mkdir(parents=True)
+    (video_dir / f"{info['id']}.mp4").write_bytes(b"deja la")
+    (video_dir / "meta.json").write_text('{"video_id": "ab', encoding="utf-8")
+
+    with pytest.raises(DownloadError) as excinfo:
+        download(f"https://youtu.be/{info['id']}", workspace_dir=workspace_dir)
+
+    assert "meta.json" in str(excinfo.value)
+    assert "--force" in str(excinfo.value)
+
+
+def test_fetch_thumbnail_interrupted_write_leaves_no_thumbnail_json(tmp_path, monkeypatch):
+    from clipper.download import fetch_thumbnail
+
+    monkeypatch.setattr("os.replace", _failing_replace)
+
+    with pytest.raises(OSError):
+        fetch_thumbnail(
+            "https://www.twitch.tv/videos/55", tmp_path,
+            ydl_factory=_ThumbYDL({"thumbnail": "https://img.example.invalid/a.jpg"}),
+        )
+
+    assert not (tmp_path / "v55" / "thumbnail.json").exists()

@@ -501,3 +501,32 @@ def test_stats_without_the_metric_are_ignored_not_an_error(isolated_cwd):
     result = calibrate(traces, min_clips=5, stats_metric="views_percentile")
 
     assert {"clip_id": "v1-00", "reason": "no_metric", "matches": [["v1", 0]]} in result["ignored_stats"]
+
+
+def test_interrupted_weights_write_keeps_previous_file_intact(isolated_cwd, monkeypatch):
+    first = calibrate(scenario(), min_clips=5, weights_path="w/j.json")
+    target = isolated_cwd / "w" / "j.json"
+    before = target.read_text(encoding="utf-8")
+
+    def failing_replace(*args, **kwargs):
+        raise OSError("coupure simulee pendant le remplacement")
+
+    monkeypatch.setattr("os.replace", failing_replace)
+    with pytest.raises(OSError):
+        calibrate(scenario(), min_clips=5, weights_path="w/j.json")
+
+    assert target.read_text(encoding="utf-8") == before
+    assert json.loads(before)["judges"].keys() == first["judges"].keys()
+
+
+def test_truncated_weights_file_raises_explicit_error_naming_file(isolated_cwd):
+    from clipper.jury_calibration import CalibrationError
+
+    target = isolated_cwd / "w" / "j.json"
+    target.parent.mkdir(parents=True)
+    target.write_text('{"judges": {"retention": {"wei', encoding="utf-8")
+
+    with pytest.raises(CalibrationError) as excinfo:
+        calibrate(scenario(), min_clips=5, weights_path="w/j.json")
+
+    assert "j.json" in str(excinfo.value)

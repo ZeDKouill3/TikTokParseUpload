@@ -74,6 +74,7 @@ from pathlib import Path
 from typing import Any
 
 from clipper import outcomes
+from clipper.channel import atomic_write_json
 
 log = logging.getLogger(__name__)
 
@@ -320,6 +321,5 @@ def calibrate(
         "judges": out,
         "ignored_stats": ignored,
     }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_json(path, record)
     return record

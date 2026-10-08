@@ -1027,3 +1027,40 @@ def test_detection_logs_windows_parallelism_and_durations(
     text = " ".join(record.getMessage() for record in caplog.records)
     assert "fenetre" in text and "parallelisme" in text
     assert "detection" in text and "extraction" in text
+
+
+def test_detect_scenes_interrupted_write_leaves_no_scenes_json(
+    isolated_cwd, three_scene_video, monkeypatch
+):
+    from clipper.scenes import detect_scenes
+
+    workspace_dir = isolated_cwd / "workspace"
+    (workspace_dir / "vid1").mkdir(parents=True)
+    _full_speech(workspace_dir)
+
+    def failing_replace(*args, **kwargs):
+        raise OSError("coupure simulee pendant le remplacement")
+
+    monkeypatch.setattr("os.replace", failing_replace)
+
+    with pytest.raises(OSError):
+        detect_scenes(three_scene_video, workspace_dir, "vid1")
+
+    assert not (workspace_dir / "vid1" / "scenes.json").exists()
+
+
+def test_detect_scenes_truncated_scenes_json_raises_explicit_error_naming_file_and_force(
+    isolated_cwd, three_scene_video
+):
+    from clipper.scenes import ScenesError, detect_scenes
+
+    workspace_dir = isolated_cwd / "workspace"
+    video_dir = workspace_dir / "vid1"
+    video_dir.mkdir(parents=True)
+    (video_dir / "scenes.json").write_text('{"scenes": [{"start": 0.0, "en', encoding="utf-8")
+
+    with pytest.raises(ScenesError) as excinfo:
+        detect_scenes(three_scene_video, workspace_dir, "vid1")
+
+    assert "scenes.json" in str(excinfo.value)
+    assert "--force" in str(excinfo.value)
