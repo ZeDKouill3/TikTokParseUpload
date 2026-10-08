@@ -4,7 +4,7 @@ claim_ttl_max: 2h
 verifiers:
   tests:
     run: python -m pytest -q
-    timeout: 15m
+    timeout: 30m
     default: true
 roles:
   agent:

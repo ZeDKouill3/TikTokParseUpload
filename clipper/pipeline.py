@@ -442,7 +442,14 @@ class _Run:
                     **self.opts("moments"))
 
     def moments(self) -> None:
-        self._moments(self._forced("moments"))
+        # Moments refait : les ids sont renumerotes, les decisions de review.json (indexees par
+        # moment) ne s'appliquent plus (Important 4, revue r-pipeline) : mises de cote.
+        # Seulement s'il est vraiment refait (force, ou moments.json absent) : un passage qui
+        # saute l'etape deja faite garde les decisions.
+        forced = self._forced("moments")
+        if self.config.mode == "review" and (forced or not (self.dir / "moments.json").exists()):
+            _set_aside_review(self.dir)
+        self._moments(forced)
 
     def vision(self) -> None:
         vision.run(self.video_id, self.ws, config=self.config, force=self._forced("vision"), **self.opts("vision"))
@@ -720,6 +727,21 @@ def _read_review(video_dir: Path) -> dict[str, Any]:
     if not path.exists():
         return {"decisions": {}}
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _set_aside_review(video_dir: Path) -> None:
+    """Renomme review.json (horodate) : ses decisions visaient d'anciens moments."""
+    path = video_dir / REVIEW_FILE
+    if not path.exists():
+        return
+    stamp = time.strftime("%Y%m%dT%H%M%S")
+    aside = path.with_name(f"{REVIEW_FILE}.{stamp}")
+    n = 1
+    while aside.exists():
+        aside = path.with_name(f"{REVIEW_FILE}.{stamp}-{n}")
+        n += 1
+    path.rename(aside)
+    log.info("%s : moments refait, %s perime mis de cote (%s)", video_dir.name, REVIEW_FILE, aside.name)
 
 
 def _undecided(video_dir: Path) -> list[int]:
