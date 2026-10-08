@@ -259,6 +259,17 @@ CONFIG_DEFAULTS: dict[str, object] = {
     # rectangle de la webcam, quand celui-ci a été repéré sur le seul visage
     # (aucun bord d'incrustation retrouvé) ; en dessous, le clip reste en letterbox.
     "facecam_clip_face_min_share": 0.5,
+    # Le visage y est cherché dans le recadrage du rectangle élargi de cette
+    # marge (fraction de sa largeur/hauteur, par côté) et agrandi à cette
+    # hauteur en px, pas sur l'image entière : à 1920x1080 le visage ne fait
+    # que 60-80 px et le détecteur courte portée le rate (mesure réelle
+    # v2894178473 : 2/41 sur l'image entière, 39/41 sur le recadrage).
+    "facecam_clip_face_margin": 0.25,
+    "facecam_clip_face_crop_height": 720,
+    # Part minimale de la boîte du visage qui doit tomber dans le rectangle :
+    # une webcam déplacée garde un visage dont le rectangle ne couvre qu'une
+    # partie (0,64-0,73 mesuré, v2894088024 03/09), la bonne en couvre tout (1,0).
+    "facecam_clip_face_min_inside": 0.9,
     # Part du plus grand support à partir de laquelle un candidat visage est stable, et remplace un cadre sans aucun visage choisi par Claude.
     "facecam_face_stable_share": 0.8,
     # Vignettes agrandies de chaque candidat webcam envoyees a Claude en plus de la planche : facecam_zoom_frames recadrages par candidat, chacun facecam_zoom_tile_height px de haut.
@@ -2451,12 +2462,33 @@ def _clip_facecam(
         )
     min_conf = float(settings["min_confidence"])
 
+    margin = float(settings["facecam_clip_face_margin"])
+    target_h = int(settings["facecam_clip_face_crop_height"])
+    min_inside = float(settings["facecam_clip_face_min_inside"])
+
     def face_inside(image: np.ndarray) -> bool:
-        for d in detector.detect(image):
+        height, width = image.shape[:2]
+        mx, my = rect["w"] * margin, rect["h"] * margin
+        x0, y0 = max(0, int(rect["x"] - mx)), max(0, int(rect["y"] - my))
+        x1 = min(width, int(math.ceil(rect["x"] + rect["w"] + mx)))
+        y1 = min(height, int(math.ceil(rect["y"] + rect["h"] + my)))
+        if x1 <= x0 or y1 <= y0:
+            return False
+        crop = image[y0:y1, x0:x1]
+        scale = max(1.0, target_h / crop.shape[0])
+        if scale > 1.0:
+            crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
+        for d in detector.detect(crop):
             if d[4] < min_conf:
                 continue
-            cx, cy = (d[0] + d[2]) / 2, (d[1] + d[3]) / 2
-            if rect["x"] <= cx <= rect["x"] + rect["w"] and rect["y"] <= cy <= rect["y"] + rect["h"]:
+            # coordonnees ramenees dans le repere de l'image entiere
+            bx0, by0, bx1, by1 = x0 + d[0] / scale, y0 + d[1] / scale, x0 + d[2] / scale, y0 + d[3] / scale
+            area = (bx1 - bx0) * (by1 - by0)
+            if area <= 0:
+                continue
+            ix = min(bx1, rect["x"] + rect["w"]) - max(bx0, rect["x"])
+            iy = min(by1, rect["y"] + rect["h"]) - max(by0, rect["y"])
+            if ix > 0 and iy > 0 and ix * iy / area >= min_inside - 1e-9:
                 return True
         return False
 

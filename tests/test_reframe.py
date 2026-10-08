@@ -3012,3 +3012,135 @@ def test_claude_receives_the_board_and_the_zoom_sheet(tmp_path, video_dir):
 
     names = [p.name for p in fake.calls[0].images]
     assert names == ["period_0.jpg", "period_0_zoom.jpg"]
+
+
+# --------------------------------------------------------------------------
+# TASK-0cb1 : le visage du controle par clip est cherche dans le recadrage
+# agrandi du rectangle, pas sur l'image entiere (mesure reelle v2894178473 :
+# 2/41 sur l'image entiere, 39/41 sur le recadrage).
+# --------------------------------------------------------------------------
+
+
+class _SizeSensitiveDetector:
+    """Detecteur factice courte portee : ne voit un visage (pixels clairs)
+    que s'il fait au moins 15 % de la hauteur de l'image qu'on lui donne."""
+
+    def __init__(self):
+        self.closed = False
+        self.shapes: list[tuple[int, ...]] = []
+
+    def detect(self, frame):
+        assert not self.closed
+        self.shapes.append(frame.shape)
+        x, y, w, h = cv2.boundingRect((frame[:, :, 0] > 200).astype(np.uint8))
+        if not (w and h) or h < 0.15 * frame.shape[0]:
+            return []
+        return [(float(x), float(y), float(x + w), float(y + h), 0.9)]
+
+
+_CROP_RECT = {"x": 250, "y": 830, "w": 264, "h": 188}
+
+
+def _crop_facecam(n=10):
+    return {
+        "index": 0,
+        "facecam": dict(_CROP_RECT),
+        "reason": None,
+        "edge_reason": "bords introuvables : rectangle centre sur le visage conserve",
+        "keyframes": [{"timecode": float(i), "path": f"k{i}.jpg"} for i in range(n)],
+    }
+
+
+def _crop_reader(face_box):
+    def read(path: str) -> np.ndarray:
+        image = coarse_noise(np.random.default_rng(int(Path(path).stem[1:])), 40, 120, 1080, 1920)
+        if face_box is not None:
+            x0, y0, x1, y1 = face_box
+            image[y0:y1, x0:x1] = 255
+        return image
+
+    return read
+
+
+def test_clip_facecam_finds_a_small_face_through_the_enlarged_crop(tmp_path):
+    from clipper import reframe
+
+    face = (350, 860, 410, 940)  # 60x80 px sur 1080 : 7 % de l'image, 43 % du rectangle
+    detector = _SizeSensitiveDetector()
+    assert detector.detect(_crop_reader(face)("k0.jpg")) == []  # image entiere : rate
+    rect, reason = reframe._clip_facecam(
+        _crop_facecam(), 0.0, 9.0, dict(reframe.CONFIG_DEFAULTS), tmp_path,
+        image_reader=_crop_reader(face), detector=detector,
+    )
+    assert rect == _CROP_RECT and reason is None
+    assert any(shape[0] < 1080 for shape in detector.shapes)  # le recadrage a ete passe
+
+
+def test_clip_facecam_crop_without_a_face_still_goes_letterbox(tmp_path):
+    from clipper import reframe
+
+    rect, reason = reframe._clip_facecam(
+        _crop_facecam(), 0.0, 9.0, dict(reframe.CONFIG_DEFAULTS), tmp_path,
+        image_reader=_crop_reader(None), detector=_SizeSensitiveDetector(),
+    )
+    assert rect is None and "sans visage" in reason
+
+
+def test_clip_facecam_face_outside_the_rect_margin_is_not_found(tmp_path):
+    from clipper import reframe
+
+    far = (1400, 300, 1560, 520)  # grand visage ailleurs (webcam deplacee)
+    rect, reason = reframe._clip_facecam(
+        _crop_facecam(), 0.0, 9.0, dict(reframe.CONFIG_DEFAULTS), tmp_path,
+        image_reader=_crop_reader(far), detector=_SizeSensitiveDetector(),
+    )
+    assert rect is None and "sans visage" in reason
+
+
+def test_clip_facecam_crop_settings_exist():
+    from clipper.reframe import CONFIG_DEFAULTS
+
+    assert CONFIG_DEFAULTS["facecam_clip_face_margin"] == 0.25
+    assert CONFIG_DEFAULTS["facecam_clip_face_crop_height"] == 720
+
+
+def test_clip_facecam_face_cut_by_the_rect_edge_goes_letterbox(tmp_path):
+    from clipper import reframe
+
+    # webcam deplacee : le visage depasse du rectangle (60 % seulement dedans)
+    cut = (440, 860, 540, 960)  # x 440..540, le rectangle s'arrete a 514
+    rect, reason = reframe._clip_facecam(
+        _crop_facecam(), 0.0, 9.0, dict(reframe.CONFIG_DEFAULTS), tmp_path,
+        image_reader=_crop_reader(cut), detector=_SizeSensitiveDetector(),
+    )
+    assert rect is None and "sans visage" in reason
+
+
+def test_clip_facecam_min_inside_is_a_setting():
+    from clipper.reframe import CONFIG_DEFAULTS
+
+    assert CONFIG_DEFAULTS["facecam_clip_face_min_inside"] == 0.9
+
+
+@pytest.mark.skipif(
+    os.environ.get("CLIPPER_REAL_MODELS") != "1"
+    or not (Path(os.environ.get("CLIPPER_REAL_WORKSPACE", "workspace")) / "v2894178473" / "facecam.json").exists(),
+    reason="vrai mediapipe et workspace/v2894178473 : CLIPPER_REAL_MODELS=1",
+)
+def test_real_aion_clip_webcam_face_found_in_the_enlarged_crop():
+    from clipper import gpu, reframe
+
+    video_dir = Path(os.environ.get("CLIPPER_REAL_WORKSPACE", "workspace")) / "v2894178473"
+    data = json.loads((video_dir / "facecam.json").read_text(encoding="utf-8"))
+    period = data["periods"][0]
+    facecam = {
+        "index": period["index"], "facecam": period["facecam"], "reason": None,
+        "edge_reason": period.get("edge_reason") or "visage seul", "keyframes": data["keyframes"],
+    }
+    settings = dict(reframe.CONFIG_DEFAULTS)
+    detector = reframe.mediapipe_detector(settings, gpu.get_device())
+    try:
+        rect, reason = reframe._clip_facecam(facecam, 0.0, 600.0, settings, video_dir, detector=detector)
+    finally:
+        detector.close()
+    assert rect == period["facecam"], reason
