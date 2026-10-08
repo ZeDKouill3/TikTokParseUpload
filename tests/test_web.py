@@ -9987,3 +9987,64 @@ def test_clips_js_explains_published_clips_keep_their_stats_and_handles_video_de
     js = (STATIC / "screens" / "clips.js").read_text(encoding="utf-8")
     assert "Les clips publiés gardent leurs infos (stats), seule la vidéo est supprimée." in js
     assert "video_deleted" in js and "Vidéo supprimée" in js
+
+
+# --------------------------------------------------------------------------
+# TASK-5a7b750462c4 : « Supprimé de la plateforme »
+# --------------------------------------------------------------------------
+
+
+def _removed_setup(tmp_path):
+    _fable_setup(tmp_path, clips=("01", "02", "03"))
+    _write_publish(tmp_path, "ma_chaine", [
+        _entry("01", "published", tiktok_state="scheduled_on_tiktok", post_id="71", tiktok_publish_at="2026-10-12T18:00:00+00:00",
+               published_at="2026-10-08T08:00:00+00:00"),
+        _entry("02", "published", tiktok_state="published", post_id="72", published_at="2026-10-07T08:00:00+00:00"),
+        _entry("03", "approved"),
+    ])
+    return client(tmp_path)
+
+
+@pytest.mark.parametrize("clip", ["01", "02"])
+def test_post_removed_marks_a_published_entry_and_lists_it_apart(tmp_path, isolated_cwd, clip):
+    c = _removed_setup(tmp_path)
+
+    resp = c.post(f"/api/publish/{CLIPS_VIDEO}/{clip}/removed", json={"reason": "mal cadré"})
+
+    assert resp.status_code == 200 and resp.json()["status"] == "removed_from_platform"
+    assert next(e for e in _publish_file(tmp_path, "ma_chaine") if e["clip_id"] == clip)["removed_reason"] == "mal cadré"
+    body = c.get("/api/publications").json()
+    assert clip not in [p["clip_id"] for p in body["publications"]]  # ni dans la file ni au calendrier
+    removed = body["removed_from_platform"]
+    assert [(r["clip_id"], r["removed_reason"]) for r in removed] == [(clip, "mal cadré")]
+    assert removed[0]["tiktok_status"] == "removed_from_platform" and removed[0]["editable"] is False
+    assert c.post(f"/api/clips/{CLIPS_VIDEO}/{clip}/approve", json={"account": READY}).status_code == 409
+
+
+def test_post_removed_without_body_and_refusals_are_409(tmp_path, isolated_cwd):
+    c = _removed_setup(tmp_path)
+
+    assert c.post(f"/api/publish/{CLIPS_VIDEO}/01/removed").status_code == 200  # raison facultative
+    refused = c.post(f"/api/publish/{CLIPS_VIDEO}/03/removed")  # approuvée, pas publiée
+    again = c.post(f"/api/publish/{CLIPS_VIDEO}/01/removed")
+
+    assert refused.status_code == 409 and "approved" in refused.json()["detail"]
+    assert again.status_code == 409
+
+
+def test_post_removed_is_refused_while_the_worker_drives_the_entry(tmp_path, isolated_cwd):
+    _fable_setup(tmp_path, clips=("01",))
+    _write_publish(tmp_path, "ma_chaine", [_entry("01", "scheduled", slot_at="2026-10-02T18:00:00+00:00",
+                                                  in_progress_since="2026-10-08T08:00:00+00:00")])
+
+    resp = client(tmp_path).post(f"/api/publish/{CLIPS_VIDEO}/01/removed")
+
+    assert resp.status_code == 409 and "en cours" in resp.json()["detail"]
+
+
+def test_publish_screen_has_the_removed_from_platform_button_with_confirmation():
+    js = (STATIC / "screens" / "publish.js").read_text(encoding="utf-8")
+
+    assert "/removed" in js and "Supprimé de la plateforme" in js and "data-removed" in js
+    assert "removed_from_platform" in js
+    assert "confirmDialog" in js[js.index("async function pubMarkRemoved"):js.index("async function pubMarkRemoved") + 900]

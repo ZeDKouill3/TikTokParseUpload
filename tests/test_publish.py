@@ -2750,3 +2750,91 @@ def test_mark_published_keeps_the_entry_published_when_the_sidecar_stays_locked(
     assert entry["status"] == stored["status"] == "published"
     assert stored["post_url"] == "https://example.invalid/v/42" and stored["in_progress_since"] is None
     assert any(r.levelname == "ERROR" and "https://example.invalid/v/42" in r.getMessage() for r in caplog.records)
+
+
+# --------------------------------------------------------------------------
+# TASK-5a7b750462c4 : post « supprimé de la plateforme » (Clipper n'efface rien, il l'enregistre)
+# --------------------------------------------------------------------------
+
+
+def _published_on_tiktok(publish, clip, state):
+    at = datetime(2026, 9, 28, 9, 0, tzinfo=timezone.utc)
+    return publish.mark_published(
+        "vid1", clip, "ma_chaine", now=at, post_url=f"https://example.invalid/@x/video/{clip}", post_id=f"7{clip}",
+        tiktok_state=state, publish_at=at.isoformat(), account=_ACCOUNT)
+
+
+@pytest.mark.parametrize("state", ["scheduled_on_tiktok", "published"])
+def test_mark_removed_from_platform_records_state_reason_and_sidecar(isolated_cwd, state):
+    publish = _tiktok_env(isolated_cwd, ("01", "02"))
+    _published_on_tiktok(publish, "01", state)
+    when = datetime(2026, 10, 8, 10, 0, tzinfo=timezone.utc)
+
+    entry = publish.mark_removed_from_platform("vid1", "01", "ma_chaine", "mal cadré", now=when)
+
+    assert entry["status"] == "removed_from_platform"
+    assert entry["removed_at"] == when.isoformat() and entry["removed_reason"] == "mal cadré"
+    assert entry["slot_at"] is None and entry["tiktok_state"] == state  # l'état d'avant reste lisible
+    assert _read_state(isolated_cwd, "ma_chaine")[0]["status"] == "removed_from_platform"
+    assert _read_sidecar(isolated_cwd, "vid1", "01")["removed_from_platform"] == {"at": when.isoformat(), "reason": "mal cadré"}
+    assert [e["clip_id"] for _, e in publish.removed_from_platform()] == ["01"]
+    assert "removed_from_platform" not in publish.UNFINISHED_STATUSES
+
+
+def test_mark_removed_from_platform_reason_is_optional(isolated_cwd):
+    publish = _tiktok_env(isolated_cwd, ("01",))
+    _published_on_tiktok(publish, "01", "scheduled_on_tiktok")
+
+    entry = publish.mark_removed_from_platform("vid1", "01", "ma_chaine")
+
+    assert entry["removed_reason"] is None
+    assert _read_sidecar(isolated_cwd, "vid1", "01")["removed_from_platform"]["reason"] is None
+
+
+@pytest.mark.parametrize("case", ["approved", "scheduled", "in_progress", "failed", "rejected", "refused", "removed", "missing"])
+def test_mark_removed_from_platform_refuses_anything_but_a_published_entry(isolated_cwd, case):
+    publish = _tiktok_env(isolated_cwd, ("01",))
+    clip = "01"
+    if case == "approved":
+        _write_sidecar(isolated_cwd, "vid1", "02")
+        publish.approve("vid1", "02", "ma_chaine", now=_MON, account=_ACCOUNT)
+        clip = "02"
+    elif case == "in_progress":
+        publish.mark_in_progress("vid1", "01", "ma_chaine", now=_MON)
+    elif case == "failed":
+        publish.mark_failed("vid1", "01", "ma_chaine", "boum", now=_MON)
+    elif case == "rejected":
+        publish.reject("vid1", "01", "ma_chaine")
+    elif case == "refused":
+        publish.mark_refused_by_platform("vid1", "01", "ma_chaine", "problème")
+    elif case == "removed":
+        _published_on_tiktok(publish, "01", "published")
+        publish.mark_removed_from_platform("vid1", "01", "ma_chaine")
+    elif case == "missing":
+        clip = "99"
+    before = _read_state(isolated_cwd, "ma_chaine")
+
+    with pytest.raises(publish.PublishError):
+        publish.mark_removed_from_platform("vid1", clip, "ma_chaine", "x")
+
+    assert _read_state(isolated_cwd, "ma_chaine") == before
+
+
+def test_removed_post_frees_slot_and_caps_and_is_never_republished(isolated_cwd):
+    publish = _tiktok_env(isolated_cwd, ("01",))
+    _published_on_tiktok(publish, "01", "scheduled_on_tiktok")
+    assert publish.account_publish_times(_ACCOUNT) != []
+
+    publish.mark_removed_from_platform("vid1", "01", "ma_chaine", "mal cadré")
+
+    assert publish.account_publish_times(_ACCOUNT) == []  # plus un post programmé/publié pour les plafonds
+    assert publish._account_taken_slots(_ACCOUNT, None, "presets", "config.toml") == set()
+    for call in (lambda: publish.retry("vid1", "01", "ma_chaine"),
+                 lambda: publish.unschedule("vid1", "01", "ma_chaine"),
+                 lambda: publish.set_mode("vid1", "01", "ma_chaine", "immediate"),
+                 lambda: publish.cancel_post("vid1", "01", "ma_chaine"),
+                 lambda: publish.create_post("vid1", "01", "ma_chaine", account=_ACCOUNT, mode="immediate", now=NOW)):
+        with pytest.raises(publish.PublishError, match="removed_from_platform|supprimé"):
+            call()
+    assert publish.approval_refusal(publish.list_entries("ma_chaine")[0]) is not None
+    assert publish.list_entries("ma_chaine")[0]["status"] == "removed_from_platform"

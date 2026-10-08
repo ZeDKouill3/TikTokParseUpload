@@ -7,13 +7,14 @@
 
 const CLIP_FILTERS = [
   ["à valider", "À valider"], ["approved", "Approuvés"], ["scheduled", "Planifiés"],
-  ["published", "Publiés"], ["failed", "Échecs"], ["rejected", "Refusés"], ["refused_by_platform", "Refusés par TikTok"], ["all", "Tous"],
+  ["published", "Publiés"], ["failed", "Échecs"], ["rejected", "Refusés"], ["refused_by_platform", "Refusés par TikTok"], ["removed_from_platform", "Supprimés de la plateforme"], ["all", "Tous"],
 ];
 const CLIP_STATUS = {
   "à valider": { label: "À valider", cls: "info" }, approved: { label: "Approuvé", cls: "ok" },
   scheduled: { label: "Planifié", cls: "info" }, published: { label: "Publié", cls: "ok" },
   failed: { label: "Échec", cls: "bad" }, rejected: { label: "Refusé", cls: "bad" },
   refused_by_platform: { label: "Refusé par TikTok", cls: "bad" },
+  removed_from_platform: { label: "Supprimé de la plateforme", cls: "pending" },
   not_ready: { label: "Pas prêt", cls: "pending" }, // rendu ou contrôle qualité pas terminé : ni à valider ni refusé
 };
 // SPEC-74e9 §4.5 : une entree scheduled/published n'est pas editable sans repasser approved.
