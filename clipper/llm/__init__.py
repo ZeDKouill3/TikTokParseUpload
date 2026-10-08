@@ -174,6 +174,11 @@ def _resolve(usage: str, settings: dict[str, Any]) -> tuple[str, str, dict[str, 
     return name, model, backend_settings
 
 
+def model_for(usage: str, config: Any = None) -> str:
+    """Model ``ask(usage, ...)`` would really use under ``config`` (tier alias resolved to the backend's model name)."""
+    return _resolve(usage, _settings(config))[1]
+
+
 def _with_schema_instruction(prompt: str, schema: dict[str, Any]) -> str:
     return (
         f"{prompt}\n\n"
@@ -210,6 +215,7 @@ _log_lock = threading.Lock()
 def _log_line(log_path: Path, entry: dict[str, Any]) -> None:
     line = json.dumps(entry, ensure_ascii=False) + "\n"
     with _log_lock:
+        Path(log_path).parent.mkdir(parents=True, exist_ok=True)
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(line)
 

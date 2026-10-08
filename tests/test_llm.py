@@ -1152,3 +1152,8 @@ def test_veille_usage_is_declared_on_the_strong_model():
 def test_action_usage_is_declared_on_the_fast_model():
     # SPEC-b0f3 R8 : description des planches d'images de l'etape action, modele rapide
     assert make_config().section("llm")["usages"]["action"] == {"model": "fast"}
+
+
+def test_model_for_resolves_the_model_ask_would_use():
+    assert llm.model_for("veille", make_config()) == "opus"  # défaut [llm.usages.veille] strong -> opus
+    assert llm.model_for("inconnu", make_config()) == "sonnet"  # palier par défaut fast -> sonnet

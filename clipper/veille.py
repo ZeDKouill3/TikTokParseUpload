@@ -1535,6 +1535,15 @@ def _prompt(day_state: dict[str, Any], table: dict[str, object]) -> str:
     return "\n".join(lines)
 
 
+def _model_used(config: Config) -> str | None:
+    """Modèle que ``llm.ask("veille")`` utilise vraiment ; ``None`` si la config LLM est elle-même invalide
+    (l'appel échoue alors avec ce message, écrit dans ``llm.error``)."""
+    try:
+        return llm.model_for("veille", config)
+    except llm.LLMError:
+        return None
+
+
 def decide(day_state: dict[str, Any], config: Config, now: datetime | None = None) -> dict[str, Any]:
     """Un seul appel texte à ``llm.ask("veille", ...)`` (R6) ; rend une copie de l'état avec ``llm``,
     ``proposals`` et ``skipped_note``. Aucun candidat : ``skipped``, Claude n'est pas appelé. Réponse
@@ -1546,13 +1555,13 @@ def decide(day_state: dict[str, Any], config: Config, now: datetime | None = Non
     table = settings(config)
     state = {**day_state}
     candidates = state["candidates"]
-    model = config.section("llm")["usages"].get("veille", {}).get("model")
+    model = _model_used(config)
     if not candidates:
         state.update(llm={"status": "skipped", "error": None, "model": None}, proposals=[], skipped_note="")
         return state
     try:
         answer = llm.ask("veille", _prompt(state, table), [], _schema(int(table["max_vods_per_day"])),
-                         config=config,
+                         config=config, usage_log_path=_state_dir(table) / "llm_usage.jsonl",
                          check=_check_picks(candidates, int(table["max_vods_per_game"])))  # type: ignore[call-overload]
     except llm.TransientLLMError as exc:
         attempts = int(state.get("llm", {}).get("attempts") or 0) + 1
@@ -1656,7 +1665,7 @@ def _safe_decide(state: dict[str, Any], config: Config, now: datetime) -> dict[s
         return decide(state, config, now)
     except Exception as exc:  # noqa: BLE001 : tout échec du choix finit le jour avec son erreur
         log.exception("veille : le choix de Claude a échoué")
-        model = config.section("llm")["usages"].get("veille", {}).get("model")
+        model = _model_used(config)
         return {**state, "llm": {"status": "error", "error": f"{type(exc).__name__} : {exc}", "model": model},
                 "proposals": [], "skipped_note": ""}
 

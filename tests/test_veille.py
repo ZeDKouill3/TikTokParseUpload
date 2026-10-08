@@ -500,6 +500,32 @@ def test_decide_asks_claude_once_with_text_only_and_the_figures(tmp_path):
     assert state["skipped_note"] == "le reste est trop long"
 
 
+def test_decide_writes_the_model_really_used_not_the_config_alias(tmp_path):
+    config = _make_config(tmp_path)  # aucun [llm.usages.veille] : les défauts de clipper.llm (strong -> opus)
+    fake = FakeBackend([_picks("twitch:AAA")])
+    with llm.use_backend(fake):
+        state = veille.decide(_day_state("twitch:AAA"), config)
+    assert fake.calls[0].model == "opus"
+    assert state["llm"]["model"] == "opus"
+
+
+def test_decide_error_state_also_carries_the_resolved_model(tmp_path):
+    config = _make_config(tmp_path)
+    with llm.use_backend(FakeBackend([{"picks": "pas une liste"}] * 3)):
+        state = veille.decide(_day_state("twitch:AAA"), config)
+    assert state["llm"]["status"] == "error" and state["llm"]["model"] == "opus"
+
+
+def test_decide_does_not_leak_into_the_usage_log_of_a_video_in_progress(tmp_path):
+    config = _make_config(tmp_path)
+    video_log = tmp_path / "workspace" / "VIDEO" / "llm_usage.jsonl"
+    with llm.use_backend(FakeBackend([_picks("twitch:AAA")])), llm.usage_log(video_log):
+        veille.decide(_day_state("twitch:AAA"), config)
+    assert not video_log.exists()
+    own = tmp_path / "state" / "veille" / "llm_usage.jsonl"
+    assert [json.loads(line)["usage"] for line in own.read_text(encoding="utf-8").splitlines()] == ["veille"]
+
+
 def test_decide_says_no_declared_preference_when_taste_is_empty(tmp_path):
     fake = FakeBackend([_picks()])
     with llm.use_backend(fake):
