@@ -1,4 +1,4 @@
-﻿"""Etape reframe : cadrage 9:16 plein ecran d'un clip (SPEC-6127).
+"""Etape reframe : cadrage 9:16 plein ecran d'un clip (SPEC-6127).
 
 Deux mises en page (``format`` en config) :
 - ``letterbox`` (defaut) : zoom fixe centre, fond flou, aucun visage suivi,
@@ -261,9 +261,7 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "facecam_clip_face_min_share": 0.5,
     # Part du plus grand support à partir de laquelle un candidat visage est stable, et remplace un cadre sans aucun visage choisi par Claude.
     "facecam_face_stable_share": 0.8,
-    # Vignettes agrandies envoyees a Claude en plus de la planche (TASK-a769) :
-    # une ligne par candidat, facecam_zoom_frames recadrages du rectangle
-    # (images equireparties de la periode), chacun facecam_zoom_tile_height px de haut.
+    # Vignettes agrandies de chaque candidat webcam envoyees a Claude en plus de la planche : facecam_zoom_frames recadrages par candidat, chacun facecam_zoom_tile_height px de haut.
     "facecam_zoom_frames": 3,
     "facecam_zoom_tile_height": 240,
     # Panneau caméra : part de la hauteur de sortie, à partir de stream_top
