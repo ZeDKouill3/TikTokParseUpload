@@ -10,6 +10,10 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ## [Non publié]
 
+### Modifié
+
+- Étape scenes plus rapide : les fenêtres de détection sont analysées par au plus `detect_parallel` processus ffmpeg (défaut 4) ; une fenêtre de plus de `detect_chunk_seconds` (défaut 600 s) est découpée en morceaux contigus détectés en parallèle puis recollés (la scène à cheval sur une jointure est fusionnée, aucune coupure inventée). `analysis_skip_loop_filter` (défaut vrai) ajoute `-skip_loop_filter all` à l'entrée de la détection seulement, jamais à l'extraction des images clés. Un ffmpeg en échec fait échouer l'étape (`ScenesError` nommant la fenêtre) et arrête les autres ; le journal donne fenêtres, parallélisme, durée de détection et d'extraction.
+
 ### Corrigé
 
 - Téléchargement : une VOD Twitch en mp4 fragmenté (fMP4 : 1 `moov` + des dizaines de milliers de `moof`/`mdat`,
