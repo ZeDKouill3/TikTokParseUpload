@@ -4694,7 +4694,7 @@ def test_heartbeat_file_does_not_flood_the_event_stream(tmp_path, isolated_cwd):
 
     _fresh_heartbeat(tmp_path)
 
-    kinds = {kind for _, kind, _ in _scan_watched(tmp_path / "workspace", tmp_path / "state")}
+    kinds = {kind for _, kind, _ in _scan_watched(tmp_path / "workspace", [(tmp_path / "state", None)])}
 
     assert "worker" not in kinds
 
@@ -10343,3 +10343,54 @@ def test_clip_sheet_root_does_not_reuse_the_veille_sheet_class():
 
     assert 'class="clip-sheet" data-body' in html
     assert ".clip-sheet" not in (STATIC / "screens" / "veille.css").read_text(encoding="utf-8")
+
+
+# --------------------------------------------------------------------------
+# TASK-6ef1 : dossiers lus dans les réglages, plus de « presets » / « state » en dur
+# --------------------------------------------------------------------------
+
+
+def test_event_stream_watches_the_configured_publish_state_dir(tmp_path, isolated_cwd):
+    import asyncio
+
+    from clipper.web.app import _event_stream
+
+    pub = tmp_path / "ailleurs" / "pub"
+    config = Config(
+        mode="review", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output",
+        _sections={"web": {"host": "127.0.0.1", "port": 8000, "token": "", "sse_poll_interval_s": 0.05},
+                   "publish": {"state_dir": str(pub)}},
+    )
+
+    async def _run() -> str:
+        agen = _event_stream(config).__aiter__()
+
+        async def _touch_soon() -> None:
+            await asyncio.sleep(0.15)
+            pub.mkdir(parents=True, exist_ok=True)
+            (pub / "ma_chaine.json").write_text("{}", encoding="utf-8")
+
+        asyncio.create_task(_touch_soon())
+        return await asyncio.wait_for(agen.__anext__(), timeout=2.0)
+
+    event = json.loads((asyncio.run(_run()))[len("data: "):].strip())
+
+    assert (event["kind"], event["id"]) == ("publish", "ma_chaine")
+
+
+def test_channels_route_lists_the_configured_presets_dir(tmp_path, isolated_cwd):
+    from clipper import channel as channel_mod
+    from clipper.web import app as app_mod
+
+    styles = tmp_path / "styles"
+    styles.mkdir()
+    (styles / "ma_chaine.toml").write_text('[channel]\nname = "ma_chaine"\n', encoding="utf-8")
+    config = Config(mode="review", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output",
+                    _sections={"watch": {"presets_dir": str(styles), "base_config": str(tmp_path / "base.toml")}})
+    try:
+        app = create_app(config=config)
+        assert app_mod._PRESETS_DIR == str(styles)
+        assert app_mod._BASE_CONFIG == str(tmp_path / "base.toml")
+        assert channel_mod.list_channels(app_mod._PRESETS_DIR) == ["ma_chaine"]
+    finally:
+        app_mod._PRESETS_DIR, app_mod._BASE_CONFIG = "presets", "config.toml"

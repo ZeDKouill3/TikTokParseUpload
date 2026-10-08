@@ -447,19 +447,27 @@ def _reset_download_step(video_id: str, config: Config) -> None:
 _PREFETCH_FIELDS = ("prefetch", "prefetch_pid")
 
 
-def _build_prefetch_command(entry: dict[str, Any]) -> list[str]:
+def _preset_arg(entry: dict[str, Any], config: Config | None) -> str:
+    """Fichier de style de la chaine de l'entree, dans le dossier ``[watch] presets_dir``."""
+    from clipper import watch as watch_mod  # watch importe worker : import tardif
+
+    presets_dir = (config.section("watch") if config is not None else watch_mod.CONFIG_DEFAULTS)["presets_dir"]
+    return (Path(str(presets_dir)) / f"{entry['channel']}.toml").as_posix()
+
+
+def _build_prefetch_command(entry: dict[str, Any], config: Config | None = None) -> list[str]:
     """Commande du prechargement : l'etape download SEULE (``python -m clipper download <url>``)."""
     cmd = [sys.executable, "-m", "clipper"]
     if entry.get("channel"):
-        cmd += ["--config", f"presets/{entry['channel']}.toml"]
+        cmd += ["--config", _preset_arg(entry, config)]
     return cmd + ["download", entry["url"]]
 
 
-def _build_command(entry: dict[str, Any]) -> list[str]:
+def _build_command(entry: dict[str, Any], config: Config | None = None) -> list[str]:
     # --config est une option globale du parseur : avant la sous-commande.
     cmd = [sys.executable, "-m", "clipper"]
     if entry.get("channel"):
-        cmd += ["--config", f"presets/{entry['channel']}.toml"]
+        cmd += ["--config", _preset_arg(entry, config)]
     cmd += [entry["action"], entry["url"] if entry["action"] == "run" else entry["video_id"]]
     for step in entry.get("force_steps") or []:
         cmd += ["--force-step", step]
@@ -1116,7 +1124,7 @@ class Worker:
                 self._sync_channel_mode(entry["channel"])
             self._launched_at = datetime.now(timezone.utc)
             self._keep_channel(entry)
-            process = self._spawn(entry, _build_command(entry))
+            process = self._spawn(entry, _build_command(entry, self.config))
             entry["status"] = "running"
             entry["pid"] = process.pid
             for field in _PREFETCH_FIELDS:
@@ -1258,7 +1266,7 @@ class Worker:
             if entry.get("channel"):
                 self._sync_channel_mode(entry["channel"])
             self._keep_channel(entry)
-            process = self._spawn_prefetch(entry, _build_prefetch_command(entry))
+            process = self._spawn_prefetch(entry, _build_prefetch_command(entry, self.config))
             entry["prefetch"] = "running"
             entry["prefetch_pid"] = process.pid
             _write_queue(self._path, entries)
