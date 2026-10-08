@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from clipper import jury_coach, llm
+from clipper import jury, jury_coach, llm
 from clipper.config import Config
 from clipper.llm.fake import FakeBackend
 
@@ -303,3 +303,31 @@ def test_case_with_only_qa_result_is_not_coached_on_a_constant(isolated_cwd):
         results = jury_coach.propose(cases, RUBRIC, {"retention": OLD_RETENTION}, config=make_config(), now=NOW)
     assert results[0]["accepted"] is False
     assert results[0]["reason"] == "pas assez de cas connus"
+
+
+def test_replay_uses_the_model_of_the_judge_like_the_real_judgment(isolated_cwd):
+    cases = make_cases(n=6)
+    judges = {"retention": OLD_RETENTION, "spectateur": SPECTATEUR}
+    fake = FakeBackend([make_backend({"perspective": NEW_GOOD, "justification": "..."})])
+
+    with llm.use_backend(fake):
+        config = make_config()
+        jury_coach.propose(cases, RUBRIC, judges, config=config, now=NOW,
+                           judge_configs={"retention": jury._JudgeConfig(config, "jury_retention", "strong")})
+
+    replays = [c for c in fake.calls if c.usage == "jury_retention"]
+    assert len(replays) == 10 and {c.model for c in replays} == {"opus"}  # strong -> opus, pas le palier fast (sonnet)
+
+
+def test_propose_logs_its_calls_in_the_given_usage_log_only(isolated_cwd):
+    cases = make_cases(n=6)
+    video_log = Path("workspace/v1/llm_usage.jsonl")
+    own = Path("state/learning/llm_usage.jsonl")
+    fake = FakeBackend([make_backend({"perspective": NEW_GOOD, "justification": "..."})])
+
+    with llm.use_backend(fake), llm.usage_log(video_log):
+        jury_coach.propose(cases, RUBRIC, {"retention": OLD_RETENTION}, config=make_config(), now=NOW, usage_log_path=own)
+
+    assert not video_log.exists()
+    usages = {json.loads(line)["usage"] for line in own.read_text(encoding="utf-8").splitlines()}
+    assert usages == {"coach", "jury_retention"}

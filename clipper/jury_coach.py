@@ -243,14 +243,17 @@ def _predicted_score(scores: Mapping[str, int], criteria: Mapping[str, Any]) -> 
     return sum(scores[name] * c["weight"] for name, c in criteria.items()) / total / 10
 
 
-def _replay(judge: str, perspective: str, criteria: Mapping[str, Any], cases: list[dict[str, Any]], config: Any) -> float:
+def _replay(judge: str, perspective: str, criteria: Mapping[str, Any], cases: list[dict[str, Any]], config: Any,
+            judge_config: Any = None, usage_log_path: Path | None = None) -> float:
     """Rejoue ``perspective`` sur ``cases`` (usage jury_<judge>, comme en
     jugement reel) ; renvoie l'erreur absolue moyenne entre la note predite
     (0-1) et le resultat reel (metrique documentee du module)."""
     schema = _replay_schema(criteria)
     errors = []
     for case in cases:
-        answer = llm.ask(f"jury_{judge}", _replay_prompt(perspective, criteria, case), [], schema, config=config)
+        usage = f"jury_{judge}"
+        answer = llm.ask(usage, _replay_prompt(perspective, criteria, case), [], schema,
+                         config=judge_config if judge_config is not None else config, usage_log_path=usage_log_path)
         predicted = _predicted_score(answer["scores"], criteria)
         errors.append(abs(predicted - case["outcome"]))
     return statistics.mean(errors)
@@ -312,9 +315,13 @@ def propose(
     *,
     config: Any = None,
     now: datetime | None = None,
+    judge_configs: Mapping[str, Any] | None = None,
+    usage_log_path: Path | None = None,
 ) -> list[dict[str, Any]]:
     """Propose une retouche de perspective par juge non exclu de ``judges``,
-    validee par rejeu (voir la docstring du module)."""
+    validee par rejeu (voir la docstring du module). ``judge_configs`` : config vue par chaque juge, avec
+    son modèle (le rejeu « comme en jugement réel » l'utilise ; défaut : ``config``) ; ``usage_log_path`` : journal de consommation propre aux appels
+    LLM du coach (jamais celui d'une vidéo en cours de traitement)."""
     if config is None:
         from clipper.config import load_config
 
@@ -354,7 +361,8 @@ def propose(
             continue
 
         worst = sorted(judge_cases, key=lambda c: abs(c["predicted"] - c["outcome"]), reverse=True)[:lessons_per_call]
-        answer = llm.ask(usage, _lesson_prompt(judge, perspective, criteria, worst), [], _lesson_schema(), config=config)
+        answer = llm.ask(usage, _lesson_prompt(judge, perspective, criteria, worst), [], _lesson_schema(), config=config,
+                         usage_log_path=usage_log_path)
         new_perspective, justification = answer["perspective"], answer["justification"]
 
         clash = _too_similar(judge, new_perspective, judges, threshold)
@@ -362,8 +370,9 @@ def propose(
             _refuse(f"perspective trop proche de {clash}")
             continue
 
-        before = _replay(judge, perspective, criteria, worst, config)
-        after = _replay(judge, new_perspective, criteria, worst, config)
+        judge_config = (judge_configs or {}).get(judge)
+        before = _replay(judge, perspective, criteria, worst, config, judge_config, usage_log_path)
+        after = _replay(judge, new_perspective, criteria, worst, config, judge_config, usage_log_path)
         metric = {"before": before, "after": after, "cases": len(worst)}
         if not after < before:
             _refuse("ne predit pas mieux en rejeu", metric)

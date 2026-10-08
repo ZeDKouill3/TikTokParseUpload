@@ -5,7 +5,7 @@ slug: mineurs-de-la-revue-du-08-10-relev-tiktok-de-l-c
 title: "Mineurs de la revue du 08/10 : relevé TikTok de l'écran pris par l'apprentissage, modèle réel de la veille et du coach, llm_usage par vidéo, horodatage UTC du review.json mis de côté"
 created: 2026-10-08T13:00:18Z
 author: nicoc@zedk_ordi
-status: open
+status: in_progress
 scope:
   - clipper/learning.py
   - clipper/veille.py
@@ -25,5 +25,5 @@ criteria_by: creator
 verify: [tests]
 method: tdd
 schema: 4
-version: 1
+version: 2
 ---

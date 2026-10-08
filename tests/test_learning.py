@@ -222,6 +222,31 @@ def test_link_if_due_only_processes_accounts_with_a_newer_snapshot(tmp_path):
     assert [d["clip_id"] for d in again] == ["clip-03"]
 
 
+def test_link_if_due_takes_a_snapshot_written_after_the_pass_even_if_fetched_before_it(tmp_path):
+    """Un relevé commencé avant le passage du worker mais fini après (fetched_at < last_run) n'est pas ignoré."""
+    config = _config(tmp_path)
+    _sidecar(config, "clip-02")
+    _snapshot(config, "2026-10-07T10:00:00+00:00", ("7000000000000000016", "Un super clip #jeu #fun", "2026-10-07T09:00:00"))
+    learning.link_if_due(datetime(2026, 10, 7, 10, 30, tzinfo=timezone.utc), config=config)
+    _sidecar(config, "clip-03")
+    # relevé web lancé à 10:10, fini après le passage de 10:30 : son fetched_at (10:10) précède last_run
+    _snapshot(config, "2026-10-07T10:10:00+00:00", ("7000000000000000017", "Un super clip #jeu #fun", "2026-10-07T09:10:00"))
+
+    again = learning.link_if_due(datetime(2026, 10, 7, 11, 0, tzinfo=timezone.utc), config=config)
+
+    assert [d["clip_id"] for d in again] == ["clip-03"]
+
+
+def test_snapshot_written_after_the_sync_is_due_even_if_fetched_before_it(tmp_path):
+    config = _config(tmp_path)
+    settings = learning._settings(config)
+    _snapshot(config, "2026-10-07T10:00:00+00:00", ("7000000000000000018", "x", "2026-10-07T09:00:00"))
+    learning.sync(datetime(2026, 10, 7, 10, 30, tzinfo=timezone.utc), config=config)
+    assert learning._snapshot_newer_than_sync(settings, config) is False
+    _snapshot(config, "2026-10-07T10:10:00+00:00", ("7000000000000000019", "x", "2026-10-07T09:10:00"))
+    assert learning._snapshot_newer_than_sync(settings, config) is True
+
+
 def test_link_if_due_disabled_does_nothing(tmp_path):
     config = _config(tmp_path, enabled=False)
     side = _sidecar(config, "clip-02")
@@ -1070,3 +1095,17 @@ def test_link_posts_does_not_attach_a_removed_clip(tmp_path):
     result = learning.link_posts(ACCOUNT, config=config, now=NOW)
 
     assert result["linked"] == [] and not _read(side)["tiktok_post"].get("id")
+
+
+def test_coach_llm_calls_go_to_the_coach_own_usage_log_not_the_one_of_a_video_in_progress(tmp_path):
+    config = _coach_config(tmp_path)
+    _coach_world(config, n=12)
+    video_log = tmp_path / "workspace" / VIDEO / "llm_usage.jsonl"
+    fake = FakeBackend([_coach_responder])
+
+    with llm.use_backend(fake), llm.usage_log(video_log):  # la reprise d'une vidéo journalise ses propres appels
+        learning.coach_if_due(NOW, config=config)
+
+    assert not video_log.exists()
+    own = Path(config.section("learning")["state_dir"]) / "llm_usage.jsonl"
+    assert {json.loads(line)["usage"] for line in own.read_text(encoding="utf-8").splitlines()} >= {"coach"}

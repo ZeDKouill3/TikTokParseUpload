@@ -2396,3 +2396,20 @@ def test_download_only_failure_marks_the_video_failed_and_raises(tmp_path, monke
     assert "reseau coupe" in state["steps"]["download"]["reason"]
     assert state["status"] == "failed"
     assert "reseau coupe" in state["reason"]
+
+
+def test_set_aside_review_stamps_in_explicit_utc_not_pc_local_time(tmp_path):
+    from clipper import pipeline
+
+    video_dir = tmp_path / "v"
+    video_dir.mkdir()
+    (video_dir / pipeline.REVIEW_FILE).write_text("{}", encoding="utf-8")
+    before = datetime.now(timezone.utc).replace(microsecond=0)
+
+    pipeline._set_aside_review(video_dir)
+
+    (aside,) = video_dir.glob("review.json.*")
+    stamp = aside.name.removeprefix("review.json.")
+    assert re.fullmatch(r"\d{8}T\d{6}Z", stamp)
+    written = datetime.strptime(stamp, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+    assert before <= written <= datetime.now(timezone.utc) + timedelta(seconds=1)

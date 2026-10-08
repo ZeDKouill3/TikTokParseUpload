@@ -79,7 +79,7 @@ def _links_path(settings: dict[str, Any]) -> Path:
 def _read_links(settings: dict[str, Any]) -> dict[str, Any]:
     path = _links_path(settings)
     if not path.exists():
-        return {"last_run": {}, "unlinked": [], "counts": {}}
+        return {"last_run": {}, "snapshots": {}, "unlinked": [], "counts": {}}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
@@ -196,6 +196,21 @@ def _link_posts(account: str, settings: dict[str, Any], config: Config | None, n
     return {"linked": linked, "unlinked": {reason: counts[reason] for reason in REASONS}}
 
 
+def _snapshot_names(account: str, config: Config | None) -> list[str]:
+    """Fichiers de relevés du compte, tels qu'ils existent maintenant. Un relevé est « neuf » parce que son fichier
+    n'a pas encore été traité, jamais parce que son ``fetched_at`` (pris au début du relevé, fichier écrit à la fin)
+    dépasse un instant."""
+    folder = tiktok._history_dir(account, tiktok.get_settings(config))
+    if not folder.is_dir():
+        return []
+    return sorted(p.name for p in folder.glob("*.json") if not p.name.endswith(tiktok._ERROR_SUFFIX))
+
+
+def _all_seen(names: list[str], seen: list[str] | None) -> bool:
+    """Vrai si ``seen`` existe (état déjà posé) et couvre chaque fichier de ``names`` ; sans état, tout est dû."""
+    return seen is not None and set(names) <= set(seen)
+
+
 def link_if_due(now: datetime, *, config: Config | None = None) -> list[dict[str, str]]:
     """Passage du worker : traite chaque compte TikTok dont le dernier releve est plus recent que son dernier
     passage (ou jamais traite), note ``last_run`` et rend les rattachements faits. Coupe par ``enabled``."""
@@ -210,13 +225,14 @@ def link_if_due(now: datetime, *, config: Config | None = None) -> list[dict[str
         if not history:
             continue
         links = _read_links(settings)
-        last = links["last_run"].get(account)
-        if last is not None and datetime.fromisoformat(history[-1]["fetched_at"]) <= datetime.fromisoformat(last):
+        names = _snapshot_names(account, config)  # avant le traitement : un relevé qui arrive pendant, reste dû
+        if _all_seen(names, links["snapshots"].get(account)):
             continue
         done.extend(link_posts(account, config=config, now=now)["linked"])
         with channel_mod.file_lock(_links_path(settings)):
             links = _read_links(settings)
             links["last_run"][account] = now.isoformat()
+            links["snapshots"][account] = names
             _write_links(settings, links)
     return done
 
@@ -225,7 +241,7 @@ def link_if_due(now: datetime, *, config: Config | None = None) -> list[dict[str
 
 _CLIP_ID = re.compile(r"(\d{2,})(?:-p\d+)?")
 _SYNC_EMPTY: dict[str, Any] = {"last_sync": None, "last_error": None, "results": [], "scored": [], "excluded": [],
-                               "accounts": {}, "calibration": None}
+                               "accounts": {}, "calibration": None, "snapshots": {}}
 
 
 def _sync_path(settings: dict[str, Any]) -> Path:
@@ -340,6 +356,7 @@ def sync(now: datetime, *, config: Config | None = None) -> dict[str, Any]:
     stamp = _now_iso(now)
     with channel_mod.file_lock(_sync_path(settings)):  # plusieurs workers : un seul verse à la fois
         state = _read_sync(settings)
+        snapshots = {a: _snapshot_names(a, config) for a in _history_accounts(config)}  # avant la lecture des relevés
         sidecars = _read_sidecars(config)
         youtube_accounts = ({a["id"] for a in accounts_mod.list_accounts(config) if a.get("service") == "youtube"}
                             if config is not None else set())
@@ -410,7 +427,7 @@ def sync(now: datetime, *, config: Config | None = None) -> dict[str, Any]:
                 added += 1
 
         state.update(
-            last_sync=stamp, results=sorted(results), scored=sorted(scored), excluded=excluded,
+            last_sync=stamp, snapshots=snapshots, results=sorted(results), scored=sorted(scored), excluded=excluded,
             accounts={a: {"mature_posts": len(v.reference), "viewed_posts": v.viewed, "eligible": v.eligible}
                       for a, v in sorted(views.items())})
         retry = isinstance(state["last_error"], dict) and state["last_error"].get("where") == "calibrate"
@@ -443,12 +460,9 @@ def _calibrate(linked: list[tuple[str, str, int]], config: Config | None, now: d
 
 
 def _snapshot_newer_than_sync(settings: dict[str, Any], config: Config | None) -> bool:
-    last = _read_sync(settings)["last_sync"]
-    for account in _history_accounts(config):
-        history = tiktok.read_history(account, config=config)
-        if history and (last is None or _aware(history[-1]["fetched_at"]) > _aware(last)):
-            return True
-    return False
+    seen = _read_sync(settings).get("snapshots") or {}
+    return any(not _all_seen(_snapshot_names(a, config), seen.get(a))
+               for a in _history_accounts(config) if tiktok.read_history(a, config=config))
 
 
 def run_if_due(now: datetime, *, config: Config | None = None) -> dict[str, Any]:
@@ -587,7 +601,11 @@ def coach_if_due(now: datetime, *, config: Config | None = None) -> list[dict[st
             rubric = moments.load_rubric(moments.resolve_rubric_path(config.section("moments")["rubric_path"]))
         except moments.MomentsError as exc:
             raise jury_coach.CoachError(f"grille des moments illisible : {exc}") from exc
-        results = jury_coach.propose(cases, rubric, active_perspectives(config), config=config, now=now)
+        merged = jury._deep_merge(jury.CONFIG_DEFAULTS, config.section("jury"))
+        judge_configs = {j["name"]: jury._JudgeConfig(config, j["usage"], j["model"]) for j in jury._judges(merged)}
+        results = jury_coach.propose(cases, rubric, active_perspectives(config), config=config, now=now,
+                                     judge_configs=judge_configs,
+                                     usage_log_path=Path(settings["state_dir"]) / "llm_usage.jsonl")
         entries = [{**r, "status": "proposed" if r["accepted"] else "rejected", "decided_at": None, "decided_by": None}
                    for r in results]
         coach["runs"].append({"at": now.isoformat(), "cases": len(cases), "judges": entries})

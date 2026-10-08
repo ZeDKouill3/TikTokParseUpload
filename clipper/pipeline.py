@@ -729,7 +729,7 @@ def _read_review(video_dir: Path) -> dict[str, Any]:
 def _set_aside_review(video_dir: Path) -> None:
     """Renomme review.json (horodate) : ses decisions visaient d'anciens moments."""
     path = video_dir / REVIEW_FILE
-    stamp = time.strftime("%Y%m%dT%H%M%S")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     aside = path.with_name(f"{REVIEW_FILE}.{stamp}")
     n = 1
     while aside.exists():
