@@ -53,7 +53,7 @@ def _css_matches(selector, attrs):
 
 
 class FakeElement:
-    in_modal = False   # bouton d'une fenetre : jamais intercepte par elle
+    owner = None   # fenetre dont l'element fait partie (None : la page elle-meme)
 
     def __init__(self, page, selector, href=None, text="", value=None, on_click=None, visible=True):
         self.page, self.selector, self.href = page, selector, href
@@ -65,8 +65,9 @@ class FakeElement:
         self.page.click_timeouts.append(kwargs.get("timeout"))
         if self.page.fail_click:
             raise RuntimeError("Target page, context or browser has been closed")
-        if self.page.modals_block_clicks and self.page.modals and not self.in_modal:
-            # Playwright : l'overlay d'une fenetre recouvre l'element et attend en vain (TimeoutError)
+        rank = self.page.modals.index(self.owner) if self.owner in self.page.modals else -1
+        if self.page.modals_block_clicks and any(self.page.modals[rank + 1:]):
+            # Playwright : l'overlay d'une fenetre PLUS HAUTE recouvre l'element et attend en vain (TimeoutError)
             raise TimeoutError("Locator.click: Timeout 10000ms exceeded.\n  - <div class=\"TUXModal-overlay\"> "
                                "intercepts pointer events\n  - retrying click action")
         for added in self.page.after_click.get(self.selector, ()):
@@ -117,7 +118,7 @@ class FakeModal(FakeElement):
         template = _sel()["modal"]["button"]
         for label in labels:
             button = FakeElement(page, template.format(label=label), on_click=lambda label=label: self.close(label))
-            button.in_modal = True
+            button.owner = self
             self.children[template.format(label=label)] = button
 
     def close(self, label):
@@ -148,6 +149,12 @@ class FakePage:
         self.fail_click = False
         self.url = "about:blank"
         self.calls: list[tuple] = []
+        self.html, self.content_error = "<html><body>page</body></html>", None
+
+    def content(self):
+        if self.content_error:
+            raise RuntimeError(self.content_error)
+        return self.html
 
     def goto(self, url, **kwargs):
         self.calls.append(("goto", url))
@@ -950,7 +957,7 @@ def test_known_popups_are_closed_with_their_button_and_logged(tmp_path, monkeypa
     with caplog.at_level("INFO"):
         result = env.publish()
 
-    assert env.page.popups_closed == ["Annuler", "J'ai compris"]  # Annuler : jamais « Activer »
+    assert env.page.popups_closed == ["J'ai compris", "Annuler"]  # la dernière dans le DOM = au-dessus, fermée d'abord ; jamais « Activer »
     assert env.page.modals == []
     assert "Activer les vérifications automatiques" in caplog.text and "Annuler" in caplog.text
     assert "Nouvelles fonctionnalités" in caplog.text and "J'ai compris" in caplog.text
@@ -1003,6 +1010,45 @@ def test_a_popup_that_keeps_coming_back_is_an_r4_stop(tmp_path, monkeypatch):
     with pytest.raises(tiktok.TikTokStop) as stop:
         env.publish()
     assert stop.value.code == "unexpected_page" and "fenêtre" in str(stop.value)
+
+
+def test_overlapping_known_windows_close_the_top_one_first_then_the_one_below(tmp_path, monkeypatch):
+    env = Env(tmp_path, monkeypatch)
+    env.page.modals_block_clicks = True    # l'overlay du dessus intercepte tout clic sur la bulle du dessous
+    below = FakeModal(env.page, "Nouvelles fonctionnalités d'édition ajoutées\nJ'ai compris", ["J'ai compris"])
+    top = FakeModal(env.page, "Activer les vérifications automatiques du contenu ?\nAnnuler Activer", ["Annuler", "Activer"])
+    env.page.modals = [below, top]         # ordre du DOM : le portail le plus récent (le dernier) est au-dessus
+
+    result = env.publish()
+
+    assert env.page.popups_closed == ["Annuler", "J'ai compris"]  # au-dessus d'abord, jamais « Activer »
+    assert env.page.modals == [] and result["state"] == "published"
+
+
+def test_r4_stop_with_a_capture_also_saves_the_page_html_next_to_the_screenshot(tmp_path, monkeypatch):
+    env = Env(tmp_path, monkeypatch)
+    env.page.html = "<html><body>Votre compte a été restreint</body></html>"
+    env.page.modals = [FakeModal(env.page, "Votre compte a été restreint\nOK", ["OK"])]
+
+    with pytest.raises(tiktok.TikTokStop) as stop:
+        env.publish()
+
+    html = stop.value.capture.with_suffix(".html")
+    assert html.read_text(encoding="utf-8") == "<html><body>Votre compte a été restreint</body></html>"
+
+
+def test_a_failed_html_save_is_logged_and_never_hides_the_original_r4_stop(tmp_path, monkeypatch, caplog):
+    env = Env(tmp_path, monkeypatch)
+    env.page.content_error = "page fermée"
+    env.page.modals = [FakeModal(env.page, "Votre compte a été restreint\nOK", ["OK"])]
+
+    with caplog.at_level("WARNING"), pytest.raises(tiktok.TikTokStop) as stop:
+        env.publish()
+
+    assert stop.value.code == "unexpected_page" and "Votre compte a été restreint" in str(stop.value)
+    assert stop.value.capture is not None and stop.value.capture.is_file()
+    assert not stop.value.capture.with_suffix(".html").exists()
+    assert "HTML" in caplog.text and "page fermée" in caplog.text
 
 
 def _modal_between_guard_and_click(env, selector, modal, times=1):
