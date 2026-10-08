@@ -82,6 +82,7 @@ import json
 import logging
 import math
 import os
+import threading
 import time
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor
@@ -191,24 +192,20 @@ def new_state(video_id: str, source_url: str, mode: str, *, channel: str | None 
     }
 
 
-# Sous Windows, Path.replace leve PermissionError si un autre processus (CLI
-# de progression, interface web) a le fichier destination ouvert en lecture au
-# meme instant : CreateFile ne pose pas FILE_SHARE_DELETE par defaut, et
-# MoveFileExW echoue tant que ce handle est ouvert. La collision est
-# transitoire (le lecteur referme vite), donc on reessaie avant de relever.
-_REPLACE_ATTEMPTS = 5
-_REPLACE_DELAY_S = 0.05
-
-
+# Remplacement atomique : ``channel.replace_retrying`` reessaie un fichier
+# verrouille par un lecteur (Windows) puis releve l'erreur d'origine. Le
+# fichier temporaire porte le pid et le thread : le worker et l'API web
+# ecrivent les memes pipeline.json sans se voler leur ``.tmp``.
 def _atomic_replace(tmp: Path, path: Path) -> None:
-    for attempt in range(_REPLACE_ATTEMPTS):
-        try:
-            tmp.replace(path)
-            return
-        except PermissionError:
-            if attempt == _REPLACE_ATTEMPTS - 1:
-                raise
-            time.sleep(_REPLACE_DELAY_S)
+    try:
+        channel_mod.replace_retrying(tmp, path)
+    except PermissionError:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _tmp_for(path: Path) -> Path:
+    return path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
 
 
 def save_state(state: dict[str, Any], *, config: Config | None = None) -> Path:
@@ -216,7 +213,7 @@ def save_state(state: dict[str, Any], *, config: Config | None = None) -> Path:
     path = _video_dir(state["video_id"], config) / STATE_FILE
     path.parent.mkdir(parents=True, exist_ok=True)
     state["updated_at"] = _iso(_now())
-    tmp = path.with_suffix(".json.tmp")
+    tmp = _tmp_for(path)
     tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
     _atomic_replace(tmp, path)
     return path
@@ -244,7 +241,7 @@ def _read_json(path: Path) -> Any:
 
 
 def _write_json(path: Path, data: Any) -> None:
-    tmp = path.with_suffix(".json.tmp")
+    tmp = _tmp_for(path)
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     _atomic_replace(tmp, path)
 
@@ -732,15 +729,16 @@ def _read_review(video_dir: Path) -> dict[str, Any]:
 def _set_aside_review(video_dir: Path) -> None:
     """Renomme review.json (horodate) : ses decisions visaient d'anciens moments."""
     path = video_dir / REVIEW_FILE
-    if not path.exists():
-        return
     stamp = time.strftime("%Y%m%dT%H%M%S")
     aside = path.with_name(f"{REVIEW_FILE}.{stamp}")
     n = 1
     while aside.exists():
         aside = path.with_name(f"{REVIEW_FILE}.{stamp}-{n}")
         n += 1
-    path.rename(aside)
+    try:
+        channel_mod.replace_retrying(path, aside)  # pas de test d'existence prealable : un faux negatif laisserait le fichier perime
+    except FileNotFoundError:
+        return
     log.info("%s : moments refait, %s perime mis de cote (%s)", video_dir.name, REVIEW_FILE, aside.name)
 
 

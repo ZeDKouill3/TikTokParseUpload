@@ -48,7 +48,7 @@ class ChannelError(Exception):
 # web sont deux processus (ADR-35b7) qui reecrivent les memes fichiers
 # state/. Un cycle lecture-modification-ecriture se fait sous
 # ``file_lock(path)``, l'ecriture elle-meme par ``atomic_write_json``.
-_REPLACE_ATTEMPTS = 5
+_REPLACE_ATTEMPTS = 20
 _REPLACE_DELAY_S = 0.05
 _LOCK_POLL_S = 0.01
 
@@ -86,6 +86,21 @@ def file_lock(path: str | Path) -> Iterator[None]:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+def replace_retrying(tmp: Path, path: Path) -> None:
+    """``os.replace(tmp, path)``, reessaye tant qu'un lecteur (API web,
+    antivirus, indexeur) tient ``path`` ouvert sous Windows (PermissionError).
+    Si le verrou persiste, releve l'erreur d'origine (``tmp`` reste a la
+    charge de l'appelant) : un etat n'est jamais perdu en silence."""
+    for attempt in range(_REPLACE_ATTEMPTS):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if attempt == _REPLACE_ATTEMPTS - 1:
+                raise
+            time.sleep(_REPLACE_DELAY_S)
+
+
 def atomic_write_json(path: str | Path, data: Any) -> None:
     """Ecrit ``data`` en JSON dans un fichier temporaire du meme dossier puis
     ``os.replace`` (jamais de fichier a moitie ecrit). Sous Windows, le
@@ -94,15 +109,11 @@ def atomic_write_json(path: str | Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    for attempt in range(_REPLACE_ATTEMPTS):
-        try:
-            os.replace(tmp, path)
-            return
-        except PermissionError:
-            if attempt == _REPLACE_ATTEMPTS - 1:
-                tmp.unlink(missing_ok=True)
-                raise
-            time.sleep(_REPLACE_DELAY_S)
+    try:
+        replace_retrying(tmp, path)
+    except PermissionError:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _preset_path(presets_dir: str | Path, name: str) -> Path:
