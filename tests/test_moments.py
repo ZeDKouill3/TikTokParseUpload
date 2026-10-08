@@ -2312,3 +2312,60 @@ def test_rubric_without_gate_rejects_only_for_score(tmp_path, video_dir, rubric_
     data = read_moments(video_dir)
     assert sorted(spans(data)) == [(0.25, 29.65), (100.25, 129.65)]
     assert [r["reason"] for r in data["rejected"]] == ["score 59.2 < min_score 60"]
+
+
+# --- TASK-fdb2 : grille enregistree a la re-notation, exploration et [gate] ---
+
+
+def test_rescore_reads_the_rubric_recorded_in_moments_json_not_the_style_one(tmp_path, video_dir, rubric_path):
+    from clipper import moments as m
+
+    run(tmp_path, rubric_path, [{"moments": [moment(0.25, 29.65, GOOD)]}])
+    (video_dir / "vision.json").write_text(json.dumps({"frames": []}), encoding="utf-8")
+    # le style a change de grille depuis l'etape moments (criteres differents)
+    settings = {**m.CONFIG_DEFAULTS, "rubric_path": "builtin:gaming-action"}
+
+    m._rescore(video_dir, video_dir / "moments.json", settings)
+
+    data = read_moments(video_dir)
+    assert data["rubric"]["path"] == str(rubric_path)
+    assert spans(data) == [(0.25, 29.65)]
+    assert data["rescored"]["changed"] == []
+
+
+def test_rescore_with_a_missing_recorded_rubric_raises_instead_of_using_the_style_one(tmp_path, video_dir):
+    from clipper import moments as m
+
+    p = tmp_path / "gone.toml"
+    p.write_text(TEST_RUBRIC, encoding="utf-8")
+    run(tmp_path, p, [{"moments": [moment(0.25, 29.65, GOOD)]}])
+    (video_dir / "vision.json").write_text(json.dumps({"frames": []}), encoding="utf-8")
+    p.unlink()
+    other = tmp_path / "style.toml"
+    other.write_text(TEST_RUBRIC, encoding="utf-8")
+
+    with pytest.raises(m.MomentsError, match="gone.toml"):
+        m._rescore(video_dir, video_dir / "moments.json", {**m.CONFIG_DEFAULTS, "rubric_path": str(other)})
+
+
+def test_exploration_never_takes_a_candidate_eliminated_by_the_gate(tmp_path, video_dir):
+    p = _rubric_with_gate(tmp_path, '[gate]\ncriterion = "emotion"\nmin = 5\n')
+    # 60 : emotion mediane 3 < 5 (gate), forte dispersion ; 2 retenus -> 1 clip vise
+    notes = {0: GOOD, 10: GOOD, 60: split(TOP)}
+    run_jury(tmp_path, p, list(notes), notes, exploration_share=0.5)
+
+    data = read_moments(video_dir)
+    assert explored(data) == []
+    assert data["exploration"]["target"] == 1 and data["exploration"]["chosen"] == 0
+    [gated] = [r for r in data["rejected"] if r["start"] == 300.25]
+    assert "seuil éliminatoire" in gated["reason"]
+
+
+def test_exploration_still_takes_a_min_score_rejection_when_a_gate_exists(tmp_path, video_dir):
+    p = _rubric_with_gate(tmp_path, '[gate]\ncriterion = "emotion"\nmin = 5\n')
+    mid_split = {**dict.fromkeys(JUDGES, MID), "retention": TOP}  # emotion 5 : passe le gate, 50 < min_score
+    notes = {0: GOOD, 10: GOOD, 50: mid_split, 60: split(TOP)}
+    run_jury(tmp_path, p, list(notes), notes, exploration_share=0.5)
+
+    [x] = explored(read_moments(video_dir))
+    assert x["start"] == 250.25

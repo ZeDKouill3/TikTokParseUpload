@@ -2222,3 +2222,60 @@ def test_classic_style_is_unchanged_by_the_action_feature(tmp_path, isolated_cwd
     moments = json.loads((video_dir / "moments.json").read_text(encoding="utf-8"))
     assert moments["moments"]
     assert all(m.get("source", "transcript") != "action" for m in moments["moments"] + moments["rejected"])
+
+
+# --------------------------------------------------------------------------
+# Revue r-pipeline 08/10 (Important 4) : review.json perime mis de cote quand
+# l'etape moments est refaite, jamais applique aux moments renumerotes.
+# --------------------------------------------------------------------------
+
+
+def _moments_run(tmp_path, monkeypatch, *, mode, force_steps=None):
+    from clipper import pipeline
+
+    config = Config(mode=mode, workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output")
+    state = pipeline.new_state(VIDEO_ID, URL, mode)
+    pipeline.save_state(state, config=config)
+    video_dir = tmp_path / "workspace" / VIDEO_ID
+    review = {"decisions": {"0": {"decision": "rejected", "start": 1.0, "end": 2.0, "comment": None, "at": "t"}}}
+    (video_dir / pipeline.REVIEW_FILE).write_text(json.dumps(review), encoding="utf-8")
+    ran = []
+    monkeypatch.setattr(pipeline.moments, "run", lambda *a, **kw: ran.append(kw["force"]))
+    monkeypatch.setattr(pipeline.feedback, "examples", lambda *a, **kw: [])
+    run = pipeline._start(state, config, False, None, force_steps=force_steps)
+    return pipeline, run, video_dir, review, ran
+
+
+def test_forced_moments_sets_aside_the_stale_review_json(tmp_path, monkeypatch, caplog):
+    pipeline, run, video_dir, review, ran = _moments_run(tmp_path, monkeypatch, mode="review",
+                                                         force_steps=["moments"])
+
+    with caplog.at_level(logging.INFO):
+        run.moments()
+
+    assert ran == [True]
+    assert not (video_dir / pipeline.REVIEW_FILE).exists()
+    aside = list(video_dir.glob("review.json.*"))
+    assert len(aside) == 1
+    assert json.loads(aside[0].read_text(encoding="utf-8")) == review
+    assert "review.json" in caplog.text
+    assert pipeline._read_review(video_dir) == {"decisions": {}}  # jamais appliquee aux nouveaux moments
+
+
+def test_moments_not_rerun_by_vision_keeps_review_json(tmp_path, monkeypatch):
+    pipeline, run, video_dir, review, ran = _moments_run(tmp_path, monkeypatch, mode="review")
+
+    run._moments(False)  # re-notation apres vision : les ids ne changent pas
+
+    assert (video_dir / pipeline.REVIEW_FILE).exists()
+    assert not list(video_dir.glob("review.json.*"))
+
+
+def test_auto_mode_leaves_review_json_alone(tmp_path, monkeypatch):
+    pipeline, run, video_dir, review, ran = _moments_run(tmp_path, monkeypatch, mode="auto",
+                                                         force_steps=["moments"])
+
+    run.moments()
+
+    assert (video_dir / pipeline.REVIEW_FILE).exists()
+    assert not list(video_dir.glob("review.json.*"))

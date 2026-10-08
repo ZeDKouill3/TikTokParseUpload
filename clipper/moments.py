@@ -987,10 +987,12 @@ def _select(
     candidats ecartes par le plafond), jamais sur un retenu."""
     kept: list[dict[str, Any]] = []
     rejected: list[tuple[dict[str, Any], str]] = []
+    gated: set[int] = set()  # eliminés par [gate] : jamais repêchés par l'exploration
     for c in sorted(candidates, key=lambda c: (c["format"] != "multipart", -c["final_score"], c["_start"])):
         gate_reason = _gate_rejection(c, rubric)
         if gate_reason is not None:
             rejected.append((c, gate_reason))
+            gated.add(id(c))
             continue
         if c["final_score"] < rubric["min_score"]:
             rejected.append((c, f"score {c['final_score']} < min_score {rubric['min_score']}"))
@@ -1022,7 +1024,7 @@ def _select(
     info = None
     if exploration is not None:
         share, seed = exploration
-        target, chosen = _explore([c for c, _ in rejected], kept, share, seed)
+        target, chosen = _explore([c for c, _ in rejected if id(c) not in gated], kept, share, seed)
         info = {"share": share, "seed": seed, "target": target, "chosen": len(chosen)}
         kept += chosen
     return kept, [{**_public(c), "reason": reason} for c, reason in rejected if not c.get("exploration")], info
@@ -1481,6 +1483,25 @@ def _short_rubric_keys(previous: dict[str, Any]) -> dict[str, Any]:
     return {k: rubric[k] for k in ("path", "source") if k in rubric} if "source" in rubric else {}
 
 
+def _recorded_rubric_path(previous: dict[str, Any], moments_file: Path) -> Path:
+    """Grille que l'etape moments a utilisee : ``rubric.path`` de moments.json,
+    deja resolue. Absente ou introuvable : MomentsError, jamais de repli sur
+    la grille du style (qui a pu changer depuis)."""
+    rubric = previous.get("rubric")
+    value = rubric.get("path") if isinstance(rubric, dict) else None
+    if not isinstance(value, str) or not value.strip():
+        raise MomentsError(
+            f"{moments_file} : rubric.path absent, impossible de savoir quelle grille a servi a noter ; "
+            "relance l'etape moments (--force)"
+        )
+    path = Path(value)
+    if not path.is_file():
+        raise MomentsError(
+            f"{moments_file} : la grille enregistree {path} est introuvable ; relance l'etape moments (--force)"
+        )
+    return path
+
+
 def _rescore(video_dir: Path, out: Path, settings: dict[str, Any]) -> Path:
     """Re-notation apres vision, sans LLM : sur les candidats deja notes de
     moments.json (retenus, rejetes pour score ou chevauchement), recalcule le
@@ -1495,7 +1516,7 @@ def _rescore(video_dir: Path, out: Path, settings: dict[str, Any]) -> Path:
     vision = _read_json(video_dir / "vision.json")
     sents = split_sentences(_read_json(video_dir / "transcript.json"))
     connectors = _connectors(settings)
-    rubric_path = resolve_rubric_path(settings["rubric_path"])
+    rubric_path = _recorded_rubric_path(previous, out)
     rubric = load_rubric(rubric_path)
     b = rubric["bonus"]
 

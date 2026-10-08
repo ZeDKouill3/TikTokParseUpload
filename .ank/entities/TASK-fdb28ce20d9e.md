@@ -5,7 +5,7 @@ slug: jury-la-re-notation-apr-s-vision-lit-la-grille-d
 title: "Jury : la re-notation après vision lit la grille de moments.json, et l'exploration ne repêche plus un candidat éliminé par [gate]"
 created: 2026-10-07T23:47:28Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/moments.py
   - tests/test_moments.py
@@ -16,6 +16,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/0a75400fa3fa@5e5f52f
+    tree: scope/145177a67e60
+    criteria: 90bedfb01370
+    verifier: tests@904a5eea5add
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---
