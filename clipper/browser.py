@@ -56,9 +56,10 @@ CONFIG_DEFAULTS: dict[str, object] = {
     # Un seul compte piloté à la fois, tous services confondus (ADR-58c0) : attente (s) du compte en cours
     # avant d'abandonner avec une erreur explicite.
     "pilot_wait_s": 300,
+    # Dossier des profils Chrome (un sous-dossier par compte) ; verrou et detenteur du pilotage dans son parent.
+    "state_dir": "state/browser",
 }
 
-STATE_DIR = Path("state") / "browser"
 COOKIES_FILE = "cookies.txt"
 CHANNEL = "chrome"  # le vrai Chrome, jamais un Chromium embarque (SPEC-9225 R1)
 TIMEZONE = "Europe/Paris"  # fuseau de tout contexte piloté (SPEC-5e50 R8), jamais celui du PC
@@ -126,14 +127,18 @@ def validate_account(account: object) -> str:
     return account
 
 
-def profile_dir(account: object) -> Path:
-    return STATE_DIR / validate_account(account)
+def _state_dir(config: Config | None) -> Path:
+    return Path(str(_settings(config)["state_dir"]))
 
 
-def profile_status(account: object) -> dict[str, Any]:
+def profile_dir(account: object, config: Config | None = None) -> Path:
+    return _state_dir(config) / validate_account(account)
+
+
+def profile_status(account: object, config: Config | None = None) -> dict[str, Any]:
     """``{"present": bool, "modified_at": ISO UTC | None}`` : un profil existe quand son
     dossier contient quelque chose (Chrome y ecrit des l'ouverture)."""
-    directory = profile_dir(account)
+    directory = profile_dir(account, config)
     try:
         times = [p.stat().st_mtime for p in directory.iterdir()]
     except FileNotFoundError:
@@ -153,11 +158,11 @@ _COOKIE_FILES = (Path("Default") / "Network" / "Cookies", Path("Default") / "Coo
 _CHROME_EPOCH_S = 11_644_473_600  # 1601-01-01 -> 1970-01-01
 
 
-def _read_profile_cookies(account: str) -> list[dict[str, Any]]:
+def _read_profile_cookies(account: str, config: Config | None = None) -> list[dict[str, Any]]:
     """Cookies du profil lus dans la base SQLite de Chrome (copie temporaire, lecture seule) : nom,
     domaine, expiration (secondes Unix, -1 pour un cookie de session). Les valeurs ne sont jamais
     lues (chiffrees par Chrome, inutiles ici) ; rien n'est lance, rien n'est envoye."""
-    directory = profile_dir(account)
+    directory = profile_dir(account, config)
     source = next((directory / name for name in _COOKIE_FILES if (directory / name).is_file()), None)
     if source is None:
         return []
@@ -197,9 +202,9 @@ def login_state(account: str, *, config: Config | None = None, now: datetime | N
     names = {str(n) for n in settings["login_cookies"]}
     moment = now or datetime.now(timezone.utc)
     stamp = moment.isoformat(timespec="seconds")
-    if not profile_status(account)["present"]:
+    if not profile_status(account, config)["present"]:
         return {"state": "never", "checked_at": stamp, "expires_at": None}
-    reader = _cookie_reader or _read_profile_cookies
+    reader = _cookie_reader or (lambda name: _read_profile_cookies(name, config))
     session = [c for c in reader(account) if c.get("name") in names and _in_domains(str(c.get("domain", "")), domains)]
     if not session:
         return {"state": "never", "checked_at": stamp, "expires_at": None}
@@ -222,10 +227,10 @@ def _is_missing_chrome(message: str) -> bool:
     return "distribution" in low and "not found" in low or "playwright install" in low or "executable doesn't exist" in low
 
 
-def _pilot_paths() -> tuple[Path, Path]:
+def _pilot_paths(config: Config | None = None) -> tuple[Path, Path]:
     """Verrou de pilotage partage par tous les processus (worker, serveur web, CLI) : ``state/pilot.lock``, et
     ``state/pilot.json`` qui nomme le compte pilote (message d'attente)."""
-    root = STATE_DIR.parent
+    root = _state_dir(config).parent
     return root / "pilot.lock", root / "pilot.json"
 
 
@@ -260,9 +265,9 @@ def _unlock(handle: Any) -> None:
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-def _pilot_holder() -> str:
+def _pilot_holder(config: Config | None = None) -> str:
     """Compte pilote par le detenteur du verrou, d'apres ``state/pilot.json`` ; sinon dit pourquoi on l'ignore."""
-    _, holder_path = _pilot_paths()
+    _, holder_path = _pilot_paths(config)
     try:
         holder = json.loads(holder_path.read_text(encoding="utf-8"))
         return f"{holder['account']} (processus {holder['pid']})"
@@ -273,7 +278,7 @@ def _pilot_holder() -> str:
 
 
 @contextmanager
-def _pilot_lock(account: str, wait: float) -> Iterator[None]:
+def _pilot_lock(account: str, wait: float, config: Config | None = None) -> Iterator[None]:
     """Un seul compte piloté à la fois, tous services et tous processus confondus (ADR-58c0) : verrou de fil
     (fils d'un même processus) puis verrou de fichier ``state/pilot.lock`` (worker et serveur web), le tout
     en ``wait`` secondes au plus ; au-delà, ``BrowserError`` qui nomme le compte piloté."""
@@ -286,14 +291,14 @@ def _pilot_lock(account: str, wait: float) -> Iterator[None]:
         )
 
     if not _pilot.acquire(timeout=wait):
-        raise refuse(_pilot_holder())
+        raise refuse(_pilot_holder(config))
     try:
-        lock_path, holder_path = _pilot_paths()
+        lock_path, holder_path = _pilot_paths(config)
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         with lock_path.open("a+b") as handle:
             while not _try_lock(handle):
                 if time.monotonic() >= deadline:
-                    raise refuse(_pilot_holder())
+                    raise refuse(_pilot_holder(config))
                 time.sleep(_PILOT_POLL_S)
             try:
                 tmp = holder_path.with_name(f"{holder_path.name}.{os.getpid()}.tmp")
@@ -316,7 +321,7 @@ def _open_context(account: str, *, headless: bool, config: Config | None = None)
     """Contexte Playwright du profil, en heure de Paris (R8). Un seul compte est piloté à la fois, tous
     services et tous processus confondus : un second appel attend ``[browser] pilot_wait_s`` puis échoue
     explicitement. Hors du pays attendu (``[network]``, TASK-30cc) ou pays inconnu : refus avant toute ouverture."""
-    directory = profile_dir(account)
+    directory = profile_dir(account, config)
     try:
         network.require_expected_country(config)
     except network.NetworkUnknown as exc:
@@ -324,7 +329,7 @@ def _open_context(account: str, *, headless: bool, config: Config | None = None)
     except network.NetworkError as exc:
         raise BrowserError(str(exc)) from None
     wait = float(_settings(config)["pilot_wait_s"])
-    with _pilot_lock(account, wait):
+    with _pilot_lock(account, wait, config):
         manager = _playwright_factory()()
         pw = manager.start()
         try:
@@ -409,7 +414,7 @@ def login(
     validate_account(account)
     target = _login_url(url, config)
     chrome = find_chrome(config)
-    directory = profile_dir(account)
+    directory = profile_dir(account, config)
     directory.mkdir(parents=True, exist_ok=True)
     try:
         process = _popen([str(chrome), f"--user-data-dir={directory.resolve()}", "--no-first-run", target])
@@ -499,12 +504,12 @@ def format_netscape(cookies: list[dict[str, Any]]) -> str:
 def export_cookies(account: str, *, config: Config | None = None) -> Path:
     """Exporte les cookies YouTube/Google du profil vers ``state/browser/<compte>/cookies.txt``
     (ecriture atomique, lisible par le seul utilisateur) et rend son chemin."""
-    directory = profile_dir(account)
+    directory = profile_dir(account, config)
     if account in _active:
         raise BrowserError(
             f"la fenêtre de connexion du compte {account} est encore ouverte : ferme-la avant d'exporter les cookies"
         )
-    if not profile_status(account)["present"]:
+    if not profile_status(account, config)["present"]:
         raise BrowserError(
             f"profil absent pour le compte {account} : connecte-toi d'abord avec "
             f"« clipper browser login {account} --url https://www.youtube.com »"

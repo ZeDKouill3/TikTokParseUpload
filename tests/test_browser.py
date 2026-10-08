@@ -848,3 +848,17 @@ def test_open_context_unknown_country_is_unavailable_but_other_country_is_a_plai
         with browser._open_context("ab12cd", headless=True):
             pytest.fail("le navigateur ne doit pas s'ouvrir hors pays")
     assert not isinstance(caught.value, browser.BrowserUnavailable)
+
+
+def test_profile_is_looked_up_in_the_configured_browser_state_dir(cwd):
+    config = Config(mode="review", workspace_dir=cwd / "w", output_dir=cwd / "o",
+                    _sections={"browser": {"state_dir": str(cwd / "ailleurs" / "profils")}})
+    profile = cwd / "ailleurs" / "profils" / "ab12cd"
+    profile.mkdir(parents=True)
+    (profile / "Local State").write_text("{}", encoding="utf-8")
+
+    assert browser.profile_dir("ab12cd", config) == profile
+    assert browser.profile_status("ab12cd", config)["present"] is True
+    assert browser.profile_status("ab12cd")["present"] is False  # défaut state/browser : rien là-bas
+    assert browser._pilot_paths(config)[0] == cwd / "ailleurs" / "pilot.lock"
+    assert browser.CONFIG_DEFAULTS["state_dir"] == "state/browser"

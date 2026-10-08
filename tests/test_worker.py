@@ -3648,3 +3648,20 @@ def test_main_download_command_runs_only_the_download_step(tmp_path, monkeypatch
     assert main(["download", URL_B]) == 0
     assert seen == {"url": URL_B, "config": config}
     assert f"{VIDEO_B} : download termine" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------
+# TASK-6ef1 : le dossier des styles vient de [watch] presets_dir, jamais « presets/ » en dur
+# --------------------------------------------------------------------------
+
+
+def test_child_commands_use_the_configured_presets_dir(tmp_path):
+    config = Config(mode="auto", workspace_dir=tmp_path / "w", output_dir=tmp_path / "o",
+                    _sections={"watch": {"presets_dir": "styles"}})
+    entry = {**_cmd_entry("run", "ma_chaine"), "url": URL_A}
+
+    run_cmd = worker._build_command(entry, config)
+    prefetch_cmd = worker._build_prefetch_command(entry, config)
+
+    assert run_cmd[3:5] == ["--config", "styles/ma_chaine.toml"]
+    assert prefetch_cmd[3:5] == ["--config", "styles/ma_chaine.toml"]

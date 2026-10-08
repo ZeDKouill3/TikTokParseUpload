@@ -546,14 +546,29 @@ def _state_kind_and_id(path: Path, state_root: Path) -> tuple[str, str]:
     return rel.parts[0], path.stem
 
 
-def _scan_watched(workspace_root: Path, state_root: Path) -> list[tuple[Path, str, str]]:
+def _watched_state_roots(config: Config) -> list[tuple[Path, str | None]]:
+    """Dossiers d'état surveillés, déclarés par les réglages : le dossier de ``[worker] queue_path`` (file,
+    battement...) et, hors de lui, ``[publish] state_dir`` et ``[watch] state_dir``. Le second membre est le
+    genre d'événement des fichiers posés directement dans le dossier (None : déduit du chemin)."""
+    base = Path(str(config.section("worker")["queue_path"])).parent
+    roots: list[tuple[Path, str | None]] = [(base, None)]
+    for kind in ("publish", "watch"):
+        directory = Path(str(config.section(kind)["state_dir"]))
+        if directory != base / kind:  # déjà couvert, avec le même genre, par le dossier de la file
+            roots.append((directory, kind))
+    return roots
+
+
+def _scan_watched(workspace_root: Path, state_roots: list[tuple[Path, str | None]]) -> list[tuple[Path, str, str]]:
     found: list[tuple[Path, str, str]] = []
     if workspace_root.is_dir():
         for p in workspace_root.glob(f"*/{pipeline.STATE_FILE}"):
             found.append((p, "video", p.parent.name))
-    if state_root.is_dir():
+    for state_root, fixed_kind in state_roots:
+        if not state_root.is_dir():
+            continue
         for p in state_root.rglob("*.json"):
-            kind, id_ = _state_kind_and_id(p, state_root)
+            kind, id_ = (fixed_kind, p.stem) if fixed_kind else _state_kind_and_id(p, state_root)
             if (kind, id_) == ("worker", "worker"):  # battement du worker : réécrit en continu, lu par le polling du tableau de bord
                 continue
             found.append((p, kind, id_))
@@ -746,10 +761,10 @@ async def _event_stream(config: Config) -> AsyncIterator[str]:
     jamais pour l'etat deja vu a la connexion."""
     interval = float(config.section("web")["sse_poll_interval_s"])
     workspace_root = Path(config.workspace_dir)
-    state_root = Path("state")
+    state_roots = _watched_state_roots(config)
     mtimes: dict[Path, float] = {}
 
-    for p, _kind, _id in _scan_watched(workspace_root, state_root):
+    for p, _kind, _id in _scan_watched(workspace_root, state_roots):
         try:
             mtimes[p] = p.stat().st_mtime
         except FileNotFoundError:
@@ -757,7 +772,7 @@ async def _event_stream(config: Config) -> AsyncIterator[str]:
 
     while True:
         await asyncio.sleep(interval)
-        for p, kind, id_ in _scan_watched(workspace_root, state_root):
+        for p, kind, id_ in _scan_watched(workspace_root, state_roots):
             try:
                 mtime = p.stat().st_mtime
             except FileNotFoundError:
@@ -2104,10 +2119,10 @@ def _accounts_call(fn, *args, **kwargs) -> Any:
         raise HTTPException(status_code=500, detail=str(exc)) from None
 
 
-def _browser_state(account_id: str) -> dict[str, Any]:
+def _browser_state(account_id: str, config: Config | None = None) -> dict[str, Any]:
     """Etat du profil de navigateur d'un compte : absent / present + date (SPEC-9225 R1)."""
     try:
-        return browser_mod.profile_status(account_id)
+        return browser_mod.profile_status(account_id, config)
     except browser_mod.BrowserError as exc:
         return {"present": False, "modified_at": None, "error": str(exc)}
 
@@ -2341,6 +2356,9 @@ def create_app(config: Config | None = None) -> FastAPI:
 
     app = FastAPI(title="Clipper", default_response_class=JSONResponse)
     app.state.config = config
+    global _PRESETS_DIR, _BASE_CONFIG  # dossier des styles et fichier de base : ceux des réglages [watch]
+    watch_cfg = config.section("watch")
+    _PRESETS_DIR, _BASE_CONFIG = str(watch_cfg["presets_dir"]), str(watch_cfg["base_config"])
     try:  # creneaux et compte d'un ancien style repris sur le compte (SPEC-6076 R2), journalise
         channel_mod.migrate_legacy_presets(config, presets_dir=_PRESETS_DIR, base=_BASE_CONFIG)
     except (channel_mod.ChannelError, ConfigError, OSError, ValueError) as exc:
@@ -3257,7 +3275,7 @@ def create_app(config: Config | None = None) -> FastAPI:
         if not captured:
             raise HTTPException(status_code=404, detail=f"aucune capture pour {video_id}/{clip_id}")
         path = Path(captured).resolve()
-        root = browser_mod.STATE_DIR.resolve()
+        root = browser_mod.profile_dir("x", config).parent.resolve()
         if path.suffix != ".png" or not path.is_file() or root not in path.parents or path.parent.name != "captures":
             raise HTTPException(status_code=404, detail=f"capture introuvable : {captured}")
         return FileResponse(path, media_type="image/png")
@@ -3674,7 +3692,7 @@ def create_app(config: Config | None = None) -> FastAPI:
     @app.get("/api/accounts")
     async def accounts_list() -> list[dict[str, Any]]:
         listed = await run_in_threadpool(_accounts_overview, config)  # connexion verifiee a l'ouverture (R2)
-        return [{**a, "browser": _browser_state(a["id"])} for a in listed]
+        return [{**a, "browser": _browser_state(a["id"], config)} for a in listed]
 
     @app.put("/api/accounts/{account_id}/ready")
     async def accounts_ready(account_id: str) -> dict[str, Any]:
@@ -3739,7 +3757,7 @@ def create_app(config: Config | None = None) -> FastAPI:
     @app.get("/api/accounts/{account_id}/browser")
     async def accounts_browser_state(account_id: str) -> dict[str, Any]:
         await run_in_threadpool(_require_account, config, account_id)
-        return _browser_state(account_id)
+        return _browser_state(account_id, config)
 
     @app.post("/api/accounts/{account_id}/browser/login", status_code=202)
     async def accounts_browser_login(account_id: str, request: Request) -> dict[str, Any]:

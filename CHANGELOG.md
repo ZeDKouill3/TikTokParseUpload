@@ -16,6 +16,7 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ### Corrigé
 
+- Config : plus de dossiers codés en dur. Le worker construit `--config` depuis `[watch] presets_dir`, le serveur web dérive dossier des styles et fichier de base de `[watch] presets_dir` / `base_config`, son flux temps réel surveille les dossiers de `[worker] queue_path`, `[publish] state_dir` et `[watch] state_dir`, et les profils navigateur vivent sous le nouveau réglage `[browser] state_dir` (défaut `state/browser`, comportement identique).
 - Moments : un passage d'action dont la vraie parole commence trop tard est rejeté, avec le délai dans la raison (liste des rejetés de `moments.json`). La parole est mesurée sur les mots horodatés du transcript (plus sur les segments) ; un mot sans espace de plus de `[moments] action_word_max_chars` caractères (défaut 40, hallucination whisper sur la musique) est ignoré ; un premier mot retenu après `[moments] action_max_silent_start_s` secondes (défaut 5) du début du passage rejette le candidat. Un passage sans aucun mot retenu garde la règle « sans parole » (accroche = image). `action.json` inchangé.
 - Captions : un titre d'écran trop long (ex. 7 mots pour 5 au plus) n'arrête plus la vidéo entière après une seule réparation. L'appel qui produit titre d'écran et légende dispose de ses propres essais de réparation, réglage `[captions] title_repair_attempts` (défaut 3) ; les autres usages LLM gardent `[llm] repair_attempts`. Aucun titre de secours : après les essais, l'erreur remonte comme avant.
 
