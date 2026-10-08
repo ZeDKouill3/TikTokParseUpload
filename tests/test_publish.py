@@ -2701,3 +2701,52 @@ def test_create_series_per_clip_dates_is_all_or_nothing(isolated_cwd):
             clip_dates={("vid1", "a"): same, ("vid1", "b"): same}, settings=_series_settings(), now=SERIES_NOW)
 
     assert _read_state(isolated_cwd, "ma_chaine") == []
+
+
+# ---- TASK-0c97 : sidecar réécrit avec réessais sous Windows (revue r-publish I2)
+
+
+def _lock_replace(monkeypatch, suffix: str, times: int | None):
+    """Simule un lecteur qui tient le fichier ouvert : ``os.replace`` vers ``*suffix`` leve PermissionError
+    ``times`` fois (``None`` : toujours), puis laisse passer."""
+    import os
+
+    real, seen = os.replace, {"n": 0}
+
+    def replace(src, dst, *args, **kwargs):
+        if str(dst).endswith(suffix) and (times is None or seen["n"] < times):
+            seen["n"] += 1
+            raise PermissionError(13, "Acces refuse (simule)")
+        return real(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(os, "replace", replace)
+    return seen
+
+
+def test_mark_published_rewrites_a_sidecar_locked_twice_by_a_reader(isolated_cwd, monkeypatch):
+    publish = _tiktok_env(isolated_cwd, ("01",))
+    seen = _lock_replace(monkeypatch, "01.json", 2)
+
+    publish.mark_published("vid1", "01", "ma_chaine", post_url="https://example.invalid/v/42", post_id="42",
+                           tiktok_state="published", publish_at="2026-09-28T09:00:00+00:00", account=_ACCOUNT)
+
+    assert seen["n"] == 2
+    assert _read_sidecar(isolated_cwd, "vid1", "01")["tiktok_post"]["id"] == "42"
+    assert not list((isolated_cwd / "output" / "vid1").glob("*.tmp"))
+
+
+def test_mark_published_keeps_the_entry_published_when_the_sidecar_stays_locked(isolated_cwd, monkeypatch, caplog):
+    import logging
+
+    publish = _tiktok_env(isolated_cwd, ("01",))
+    _lock_replace(monkeypatch, "01.json", None)
+
+    with caplog.at_level(logging.ERROR):
+        entry = publish.mark_published(
+            "vid1", "01", "ma_chaine", post_url="https://example.invalid/v/42", post_id="42",
+            tiktok_state="published", publish_at="2026-09-28T09:00:00+00:00", account=_ACCOUNT)
+
+    stored = _read_state(isolated_cwd, "ma_chaine")[0]
+    assert entry["status"] == stored["status"] == "published"
+    assert stored["post_url"] == "https://example.invalid/v/42" and stored["in_progress_since"] is None
+    assert any(r.levelname == "ERROR" and "https://example.invalid/v/42" in r.getMessage() for r in caplog.records)
