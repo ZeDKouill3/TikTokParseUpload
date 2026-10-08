@@ -1267,6 +1267,25 @@ class PixelDetectorFactory:
         return detector
 
 
+
+def encode_png(image):
+    """PNG sans perte au niveau de compression maximal : le defaut d'OpenCV
+    pese ~10 fois plus sur ces images a grands aplats (TASK-20f1)."""
+    return cv2.imencode(".png", image, [cv2.IMWRITE_PNG_COMPRESSION, 9])[1].tobytes()
+
+
+def coarse_noise(rng, low, high, height, width, cell=16):
+    """Fond bruite par cellules de ``cell`` px, decalees au hasard a chaque
+    image (aucune arete fixe d'une image a l'autre) : meme variation entre
+    images qu'un bruit par pixel, mais un PNG ~10 fois plus leger (le bruit
+    pixel par pixel pesait ~4,7 Mo par image 1920x1080, TASK-20f1)."""
+    rows, cols = -(-height // cell) + 1, -(-width // cell) + 1
+    small = rng.integers(low, high, size=(rows, cols, 3), dtype=np.uint8)
+    big = np.repeat(np.repeat(small, cell, axis=0), cell, axis=1)
+    dy, dx = (int(v) for v in rng.integers(0, cell, size=2))
+    return big[dy:dy + height, dx:dx + width].copy()
+
+
 def write_keyframes(video_dir, faces, *, scenes=((0.0, 100.0),), width=W, height=H):
     """scenes.json avec une image cle par entree de ``faces`` : (temps, boite
     du visage ou None). Images synthetiques noires, visage en blanc."""
@@ -1280,8 +1299,8 @@ def write_keyframes(video_dir, faces, *, scenes=((0.0, 100.0),), width=W, height
             if box is not None:
                 x0, y0, x1, y1 = box
                 image[y0:y1, x0:x1] = 255
-            encoded[box] = cv2.imencode(".bmp", image)[1].tobytes()
-        name = f"scene0000_{k:03d}.bmp"
+            encoded[box] = encode_png(image)
+        name = f"scene0000_{k:03d}.png"
         (frames_dir / name).write_bytes(encoded[box])
         frames.append({"path": f"frames/{name}", "timecode": t, "scene": 0})
     (video_dir / "scenes.json").write_text(
@@ -1436,13 +1455,13 @@ def write_panel_keyframes(
     px0, py0, px1, py1 = panel
     frames = []
     for k, (t, box) in enumerate(faces):
-        image = rng.integers(0, 40, size=(height, width, 3), dtype=np.uint8)
+        image = coarse_noise(rng, 0, 40, height, width)
         image[py0:py1, px0:px1] = panel_color
         if box is not None:
             x0, y0, x1, y1 = box
             image[y0:y1, x0:x1] = 255
-        name = f"scene0000_{k:03d}.bmp"
-        (frames_dir / name).write_bytes(cv2.imencode(".bmp", image)[1].tobytes())
+        name = f"scene0000_{k:03d}.png"
+        (frames_dir / name).write_bytes(encode_png(image))
         frames.append({"path": f"frames/{name}", "timecode": t, "scene": 0})
     (video_dir / "scenes.json").write_text(
         json.dumps({"scenes": [{"start": s, "end": e} for s, e in scenes], "frames": frames}),
@@ -1693,13 +1712,13 @@ def write_stream_clip_fixture(video_dir, clip_specs, *, panel=STREAM_PANEL, face
 
     def write_frame(t, patch, face_box):
         nonlocal index
-        image = rng.integers(0, 40, size=(H, W, 3), dtype=np.uint8)
+        image = coarse_noise(rng, 0, 40, H, W)
         image[py0:py1, px0:px1] = patch
         if face_box is not None:
             x0, y0, x1, y1 = face_box
             image[y0:y1, x0:x1] = 255
-        name = f"scene0000_{index:03d}.bmp"
-        (frames_dir / name).write_bytes(cv2.imencode(".bmp", image)[1].tobytes())
+        name = f"scene0000_{index:03d}.png"
+        (frames_dir / name).write_bytes(encode_png(image))
         frames.append({"path": f"frames/{name}", "timecode": t, "scene": 0})
         index += 1
         return image[py0:py1, px0:px1].copy()
@@ -1714,7 +1733,7 @@ def write_stream_clip_fixture(video_dir, clip_specs, *, panel=STREAM_PANEL, face
         elif mode == "frozen" and prev_patch is not None:
             patch = prev_patch
         else:
-            patch = rng.integers(60, 121, size=(py1 - py0, px1 - px0, 3), dtype=np.uint8)
+            patch = coarse_noise(rng, 60, 121, py1 - py0, px1 - px0, cell=6)
         prev_patch = write_frame(t, patch, None)
 
     (video_dir / "scenes.json").write_text(
@@ -2085,9 +2104,9 @@ def write_timeline(video_dir, specs, *, seed=0):
     frames_dir = video_dir / "frames"
     frames_dir.mkdir(exist_ok=True)
     frames = []
-    static_patch = rng.integers(60, 121, size=(384, 540, 3), dtype=np.uint8)
+    static_patch = coarse_noise(rng, 60, 121, 384, 540, cell=6)
     for k, (t, mode) in enumerate(specs):
-        image = rng.integers(0, 40, size=(H, W, 3), dtype=np.uint8)
+        image = coarse_noise(rng, 0, 40, H, W)
         dx = (k % 3) - 1
         if mode == "chat":
             x0, y0, x1, y1 = CHAT_FACE
@@ -2100,12 +2119,12 @@ def write_timeline(video_dir, specs, *, seed=0):
             image[fy0 - dx:fy1 - dx, fx0 + dx:fx1 + dx] = 255
         elif mode == "live":
             px0, py0, px1, py1 = STREAM_PANEL
-            image[py0:py1, px0:px1] = rng.integers(60, 121, size=(py1 - py0, px1 - px0, 3), dtype=np.uint8)
+            image[py0:py1, px0:px1] = coarse_noise(rng, 60, 121, py1 - py0, px1 - px0, cell=6)
         elif mode == "static":
             px0, py0, px1, py1 = STREAM_PANEL
             image[py0:py1, px0:px1] = static_patch
-        name = f"scene0000_{k:03d}.bmp"
-        (frames_dir / name).write_bytes(cv2.imencode(".bmp", image)[1].tobytes())
+        name = f"scene0000_{k:03d}.png"
+        (frames_dir / name).write_bytes(encode_png(image))
         frames.append({"path": f"frames/{name}", "timecode": t, "scene": 0})
     end = max(t for t, _ in specs) + 10.0
     (video_dir / "scenes.json").write_text(
@@ -2564,7 +2583,7 @@ def refine_images(n=12, *, cam=REAL_CAM, seed=3):
     rng = np.random.default_rng(seed)
     images = []
     for _ in range(n):
-        img = rng.integers(0, 60, size=(H, W, 3), dtype=np.uint8)
+        img = coarse_noise(rng, 0, 60, H, W)
         x0, y0, x1, y1 = cam
         img[y0:y1, x0:x1] = rng.integers(180, 190, size=(y1 - y0, x1 - x0, 3), dtype=np.uint8)
         images.append(img)
@@ -2612,7 +2631,7 @@ def test_refine_margin_is_configurable():
 
 def test_refine_without_any_reliable_edge_changes_nothing_and_journals_it():
     rng = np.random.default_rng(1)
-    images = [rng.integers(0, 60, size=(H, W, 3), dtype=np.uint8) for _ in range(12)]
+    images = [coarse_noise(rng, 0, 60, H, W) for _ in range(12)]
     refined, reason = refine(images)
     assert refined is None
     assert reason and "introuvable" in reason
@@ -2634,8 +2653,8 @@ def write_noise_keyframes(video_dir, n=24, cam=REAL_CAM):
     frames_dir.mkdir(exist_ok=True)
     frames = []
     for k, img in enumerate(refine_images(n, cam=cam)):
-        name = f"scene0000_{k:03d}.bmp"
-        (frames_dir / name).write_bytes(cv2.imencode(".bmp", img)[1].tobytes())
+        name = f"scene0000_{k:03d}.png"
+        (frames_dir / name).write_bytes(encode_png(img))
         frames.append({"path": f"frames/{name}", "timecode": 0.5 + k, "scene": 0})
     (video_dir / "scenes.json").write_text(
         json.dumps({"scenes": [{"start": 0.0, "end": 100.0}], "frames": frames}), encoding="utf-8"
