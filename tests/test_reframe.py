@@ -2211,8 +2211,8 @@ def test_claude_gets_one_board_per_period_and_never_coordinates(tmp_path, video_
 
     [call] = fake.calls
     assert call.usage == "facecam"
-    [image] = call.images
-    assert image.exists()
+    [image, zoom] = call.images  # planche + vignettes (TASK-a769)
+    assert image.exists() and zoom.exists()
     assert str(image).startswith(str(tmp_path / "workspace" / VIDEO_ID))
     board = cv2.imread(str(image))
     assert board is not None and board.shape[1] <= 2400  # une seule planche, taille bornee
@@ -2259,7 +2259,7 @@ def test_a_framed_rectangle_that_never_moves_is_not_a_candidate(tmp_path, video_
 
 
 def test_none_answer_gives_no_webcam_for_the_period_with_claudes_reason(tmp_path, video_dir):
-    write_timeline(video_dir, every(10.0, 120, "game"))
+    write_timeline(video_dir, every(10.0, 120, "live"))  # sans visage stable (TASK-a769)
     path, _ = run_detect(tmp_path, [webcam_answer(None, "c'est un widget de chat")])
 
     [period] = load(path)["periods"]
@@ -2293,7 +2293,7 @@ def test_each_clip_takes_the_rectangle_of_the_period_that_contains_its_start(tmp
 
 
 def test_period_without_webcam_keeps_the_letterbox_rule_with_the_decision_written(tmp_path, video_dir):
-    write_timeline(video_dir, every(10.0, 120, "game"))
+    write_timeline(video_dir, every(10.0, 120, "live"))  # sans visage stable (TASK-a769)
     out, _ = run_stream(tmp_path, start=100.0, end=130.0, answers=[webcam_answer(None, "pas de webcam ici")])
     data = load(out)
     assert data["layout"] == "letterbox"
@@ -2304,12 +2304,12 @@ def test_period_without_webcam_keeps_the_letterbox_rule_with_the_decision_writte
 def test_nothing_is_remembered_from_one_stream_to_another(tmp_path, video_dir):
     from clipper.reframe import detect_facecam
 
-    write_timeline(video_dir, every(10.0, 120, "game"))
+    write_timeline(video_dir, every(10.0, 120, "live"))
     path, _ = run_detect(tmp_path, [webcam_answer(1)])
     other = tmp_path / "workspace" / "zzzzzzzzzzz"
     other.mkdir()
     (other / "zzzzzzzzzzz.mp4").write_bytes(b"x")
-    write_timeline(other, every(10.0, 120, "game"))
+    write_timeline(other, every(10.0, 120, "live"))
 
     fake2 = FakeBackend([webcam_answer(None)])
     with llm.use_backend(fake2):
@@ -2450,7 +2450,7 @@ def test_prompt_does_not_claim_the_face_is_seen_on_all_frames(monkeypatch):
     prompt = reframe._facecam_prompt(candidates, 0, 60)
 
     assert candidates[0]["kind"] == "visage+cadre"
-    assert "visage vu sur 2 image(s)" in prompt
+    assert "visage detecte sur 2 image(s) cle(s)" in prompt
     assert f"cadre net sur {len(images)} image(s)" in prompt
 
 
@@ -2883,3 +2883,132 @@ def test_face_stable_share_is_a_setting():
     from clipper.reframe import CONFIG_DEFAULTS
 
     assert CONFIG_DEFAULTS["facecam_face_stable_share"] == 0.8
+
+
+# --------------------------------------------------------------------------
+# TASK-a769 : Claude voit le contenu de chaque candidat (vignettes, numeros
+# hors du rectangle) et « aucune webcam » contredit par un visage stable n'est
+# pas accepte en silence.
+# --------------------------------------------------------------------------
+
+
+def _null_period(monkeypatch, video_dir, *, face_support=None, extra_face=False):
+    """Candidat 1 : cadre (banniere), 2 : visage ; face_support force le visage du 2."""
+    from clipper import reframe
+
+    write_timeline(video_dir, every(10.0, 120, "game"))
+    real = reframe._period_candidates
+
+    def crafted(images, detector, settings):
+        candidates, rejected = real(images, detector, settings)
+        face = next(c for c in candidates if c["face_support"])
+        banner = dict(face, id=1, kind="cadre", rect={"x": 10, "y": 10, "w": 216, "h": 154},
+                      face_support=0, edge_reason=None, face=None)
+        face = dict(face, id=2)
+        if face_support is not None:
+            face["face_support"] = face_support
+        out = [banner, face]
+        if extra_face:
+            out.append(dict(face, id=3, rect={"x": 1500, "y": 800, "w": 300, "h": 213}))
+        return out, rejected
+
+    monkeypatch.setattr(reframe, "_period_candidates", crafted)
+
+
+def test_null_answer_with_one_stable_face_candidate_is_overridden_and_logged(
+    tmp_path, video_dir, monkeypatch, caplog
+):
+    _null_period(monkeypatch, video_dir)
+    with caplog.at_level("WARNING"):
+        path, _ = run_detect(tmp_path, [webcam_answer(None, "decor")])
+
+    [period] = load(path)["periods"]
+    assert contains(period["facecam"], STREAM_FACE)
+    assert period["answer"]["webcam"] is None  # reponse de Claude gardee telle quelle
+    assert period["override"]["from"] is None and period["override"]["to"] == 2
+    assert "aucune webcam" in period["override"]["reason"]
+    assert "visage" in caplog.text and period["reason"] is None
+
+
+def test_null_answer_with_two_stable_face_candidates_is_an_explicit_error(tmp_path, video_dir, monkeypatch):
+    from clipper.reframe import ReframeError
+
+    _null_period(monkeypatch, video_dir, extra_face=True)
+    with pytest.raises(ReframeError, match="plusieurs"):
+        run_detect(tmp_path, [webcam_answer(None)])
+    assert not (tmp_path / "workspace" / VIDEO_ID / "facecam.json").exists()
+
+
+def test_null_answer_without_a_stable_face_stays_letterbox(tmp_path, video_dir, monkeypatch):
+    _null_period(monkeypatch, video_dir, face_support=1)  # visage vu sur 1 image : pas stable
+    path, _ = run_detect(tmp_path, [webcam_answer(None)])
+
+    [period] = load(path)["periods"]
+    assert period["facecam"] is None and period.get("override") is None
+    assert "aucune webcam" in period["reason"]
+
+
+def test_null_answer_with_no_candidate_at_all_stays_letterbox(tmp_path, video_dir):
+    write_timeline(video_dir, every(10.0, 120, "live"))
+    path, _ = run_detect(tmp_path, [webcam_answer(None)])
+    [period] = load(path)["periods"]
+    assert period.get("override") is None
+
+
+def test_board_numbers_are_drawn_outside_the_candidate_rectangle(tmp_path):
+    from clipper import reframe
+
+    settings = dict(reframe.CONFIG_DEFAULTS)
+    image = np.full((720, 1280, 3), 90, dtype=np.uint8)
+    rect = {"x": 100, "y": 400, "w": 300, "h": 214}
+    candidates = [{"id": 1, "rect": rect}]
+    path = tmp_path / "board.jpg"
+    reframe._draw_board([image], [0.0], candidates, path, {**settings, "jpeg_quality": 100})
+
+    board = cv2.imread(str(path))
+    scale = int(settings["facecam_board_tile_width"]) / 1280
+    x0, y0 = round(rect["x"] * scale), round(rect["y"] * scale)
+    x1, y1 = round((rect["x"] + rect["w"]) * scale), round((rect["y"] + rect["h"]) * scale)
+    inner = board[y0 + 6:y1 - 5, x0 + 6:x1 - 5].astype(int)
+    assert np.abs(inner - 90).max() <= 12  # contenu intact, ni chiffre ni trait dedans
+
+
+def test_zoom_sheet_has_one_row_per_candidate_with_its_content(tmp_path):
+    from clipper import reframe
+
+    settings = dict(reframe.CONFIG_DEFAULTS)
+    image = np.full((720, 1280, 3), 40, dtype=np.uint8)
+    image[420:600, 120:380] = (0, 255, 0)  # contenu du candidat 1 : vert vif
+    candidates = [
+        {"id": 1, "rect": {"x": 100, "y": 400, "w": 300, "h": 214}},
+        {"id": 2, "rect": {"x": 900, "y": 50, "w": 300, "h": 214}},
+    ]
+    path = tmp_path / "zoom.jpg"
+    reframe._draw_zoom([image, image, image], candidates, path, settings)
+
+    sheet = cv2.imread(str(path))
+    rows = len(candidates)
+    assert sheet.shape[0] % rows == 0
+    row_h = sheet.shape[0] // rows
+    assert (sheet[:row_h, :, 1].astype(int) - sheet[:row_h, :, 0]).max() > 150  # vert dans la ligne 1
+    assert (sheet[row_h:, 80:, 1].astype(int) - sheet[row_h:, 80:, 0]).max() < 60  # pas dans la ligne 2
+
+
+def test_prompt_states_the_face_count_of_face_candidates_explicitly():
+    from clipper import reframe
+
+    candidates = [
+        {"id": 6, "kind": "visage", "support": 23, "face_support": 23},
+        {"id": 1, "kind": "cadre", "support": 24, "face_support": 0},
+    ]
+    prompt = reframe._facecam_prompt(candidates, 0, 60)
+    assert "visage detecte sur 23 image(s) cle(s)" in prompt
+    assert "aucun visage" in prompt
+
+
+def test_claude_receives_the_board_and_the_zoom_sheet(tmp_path, video_dir):
+    write_timeline(video_dir, every(10.0, 120, "live"))
+    _, fake = run_detect(tmp_path, [webcam_answer(1)])
+
+    names = [p.name for p in fake.calls[0].images]
+    assert names == ["period_0.jpg", "period_0_zoom.jpg"]
