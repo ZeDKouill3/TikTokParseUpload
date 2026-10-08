@@ -4569,8 +4569,8 @@ def test_clips_and_publish_keep_ready_filter_and_label_paused_accounts():
 def test_guide_and_changelog_describe_manual_account_pause():
     guide = (Path(__file__).resolve().parent.parent / "docs" / "GUIDE.md").read_text(encoding="utf-8")
     changelog = (Path(__file__).resolve().parent.parent / "CHANGELOG.md").read_text(encoding="utf-8")
-    unreleased = changelog[changelog.index("Non publié"):]
-    unreleased = unreleased[:unreleased.index("\n## ", 5)] if "\n## " in unreleased[5:] else unreleased
+    # [Non publié] puis la version en cours (0.6.0) : l'entrée suit la version qui la publie.
+    unreleased = changelog[changelog.index("Non publié"):changelog.index("## [0.5.3]")]
 
     assert "pause" in guide.lower() and "reprise" in guide.lower() and "reprendre" in guide.lower()
     assert "restent en attente" in guide and "côté plateforme" in guide and "boucle suivante" in guide
