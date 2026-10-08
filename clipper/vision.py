@@ -272,7 +272,8 @@ def run(
     # Un lot sauve n'est repris que s'il porte exactement les memes images (moments refait :
     # fenetres et decoupage en lots changent), comme action_partial.json.
     for n, saved in _load_partial(partial_path).items():
-        if n < len(batches) and saved.get("paths") == [f["path"] for f in batches[n]]:
+        # un lot au format d'avant (liste sans chemins) n'est jamais repris
+        if n < len(batches) and isinstance(saved, dict) and saved.get("paths") == [f["path"] for f in batches[n]]:
             results[n] = saved["frames"]
     lock = threading.Lock()
 

@@ -741,6 +741,16 @@ def test_saved_batch_with_the_same_images_is_reused(tmp_path, video_dir):
     assert len(fake.calls) == 1  # seul le lot rate
 
 
+def test_saved_batch_in_the_old_format_is_recomputed(tmp_path, video_dir):
+    # format d'avant TASK-732f : liste de frames sans chemins -> jamais reprise, sans erreur
+    (video_dir / "vision_partial.json").write_text(
+        json.dumps({"batches": {"0": [{"timecode": 91.0, "description": "vieux"}]}}), encoding="utf-8")
+
+    fake, _ = run_vision(tmp_path, [describe_all()], batch_size=1, parallel=4)
+
+    assert len(fake.calls) == 5
+
+
 def test_force_ignores_and_deletes_the_partial_file(tmp_path, video_dir):
     from clipper.vision import run
 
