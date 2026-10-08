@@ -984,7 +984,8 @@ def test_stream_prompt_describes_the_format_uses_screen_title_and_keeps_face_def
     assert "facecam" in prompt
     enum = fake.calls[0].schema["properties"]["issues"]["items"]["properties"]["type"]["enum"]
     # le visage est a l'image en stream : visage coupe et sous-titre dessus restent demandes
-    assert set(enum) == set(qa.DEFECTS)
+    # (empty_webcam n'est demande qu'en stream_split, TASK-9957)
+    assert set(enum) == set(qa.DEFECTS) - {"empty_webcam"}
 
 
 def test_stream_black_screen_measured_on_the_camera_panel(tmp_path, dirs):
@@ -1185,3 +1186,46 @@ def test_letterbox_stream_crop_prompts_unchanged():
     assert "## Format" not in crop
     single = _prompt_for(layout="single", hook_text="H")
     assert _CROP_PROMPT_HOOK in single and "## Format" not in single
+
+
+# --------------------------------------------------------------------------
+# TASK-9957 : panneau webcam d'un clip stream_split sans webcam -> bloquant
+# --------------------------------------------------------------------------
+
+
+def _empty_webcam(fake_issue_detail="le panneau du haut montre l'interface du jeu"):
+    return lambda call: {"issues": [{"type": "empty_webcam", "detail": fake_issue_detail}]}
+
+
+def test_split_schema_and_prompt_ask_for_empty_webcam(tmp_path, dirs):
+    workspace, output = dirs
+    write_split_clip(output)
+    call = ask_prompt(tmp_path, workspace, output)
+    enum = call.schema["properties"]["issues"]["items"]["properties"]["type"]["enum"]
+    assert "empty_webcam" in enum
+    assert "empty_webcam" in call.prompt
+    assert "empty_webcam" in qa._BLOCKING_DEFECTS
+
+
+@pytest.mark.parametrize("fields", [
+    {"layout": "letterbox", "video_rect": {"x": 0, "y": 500, "w": 1080, "h": 900}},
+    {"layout": "stream", "camera_rect": SPLIT_WEBCAM, "video_rect": SPLIT_GAME},
+])
+def test_empty_webcam_defect_only_asked_for_stream_split(fields):
+    clip = clip_json(duration=3.0, screen_title="T", **fields)
+    letterbox = clip["layout"] == "letterbox"
+    schema = qa.response_schema(letterbox=letterbox, part=1)
+    assert "empty_webcam" not in schema["properties"]["issues"]["items"]["properties"]["type"]["enum"]
+    assert "empty_webcam" not in qa._prompt(clip, [(Path("a.jpg"), 0.0, ["debut"])], letterbox=letterbox)
+
+
+def test_split_empty_webcam_blocks_and_rejects_the_clip(tmp_path, dirs):
+    workspace, output = dirs
+    path = write_split_clip(output)
+    with llm.use_backend(FakeBackend([_empty_webcam()])):
+        run(tmp_path, workspace, output)
+    data = read(path)
+    assert data["qa"]["status"] == "rejected"
+    assert data["ready"] is False
+    issue = data["qa"]["issues"][0]
+    assert (issue["type"], issue["severity"], issue["source"]) == ("empty_webcam", "blocking", "llm")

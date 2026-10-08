@@ -135,11 +135,15 @@ DEFECTS: dict[str, str] = {
     "subtitle_on_face": "un sous-titre ou un texte incruste recouvre un visage",
     "starts_mid_sentence": "le clip commence au milieu d'une phrase",
     "weak_hook": "l'accroche (texte affiche et premiers mots) ne donne pas envie de rester",
+    "empty_webcam": (
+        "clip stream_split seulement : le panneau webcam du haut ne montre ni visage ni webcam sur "
+        "la majorite des images (interface du jeu, bras de micro, decor, ecran de pause)"
+    ),
 }
 
 # Seul un clip incomprehensible est rejete par l'IA : les autres defauts
 # signales sont des avertissements (un clip rejete casse toute sa serie).
-_BLOCKING_DEFECTS = {"incomprehensible"}
+_BLOCKING_DEFECTS = {"incomprehensible", "empty_webcam"}
 
 BLOCKING, WARNING = "blocking", "warning"
 
@@ -156,9 +160,15 @@ _LETTERBOX_EXCLUDED_DEFECTS = {"face_cut", "subtitle_on_face"}
 # vraiment sur l'accroche.
 _SERIES_EXCLUDED_DEFECTS = {"starts_mid_sentence"}
 
+# Un panneau webcam vide n'existe qu'en stream_split : ailleurs, ce defaut
+# n'est pas demande (TASK-9957).
+_NON_SPLIT_EXCLUDED_DEFECTS = {"empty_webcam"}
 
-def _excluded_defects(letterbox: bool, part: int) -> set[str]:
+
+def _excluded_defects(letterbox: bool, part: int, split: bool = False) -> set[str]:
     excluded = set()
+    if not split:
+        excluded |= _NON_SPLIT_EXCLUDED_DEFECTS
     if letterbox:
         excluded |= _LETTERBOX_EXCLUDED_DEFECTS
     if part >= 2:
@@ -500,14 +510,14 @@ def _extract_frames(mp4: Path, dest: Path, settings: dict[str, Any]) -> list[tup
 # --------------------------------------------------------------------------
 
 
-def response_schema(letterbox: bool = False, part: int = 1) -> dict[str, Any]:
+def response_schema(letterbox: bool = False, part: int = 1, split: bool = False) -> dict[str, Any]:
     """Ce que le LLM renvoie pour un clip : la liste de ses defauts (vide si
     le clip est bon). En letterbox, face_cut et subtitle_on_face sont hors
     enum : le zoom fixe rogne volontairement les bords et les sous-titres
     sont hors de l'image (SPEC-6127). Partie 2+ d'une serie (``part``) :
     starts_mid_sentence est hors enum, la reprise de la partie precedente
     est voulue (SPEC-0eec)."""
-    excluded = _excluded_defects(letterbox, part)
+    excluded = _excluded_defects(letterbox, part, split)
     defect_types = [d for d in DEFECTS if d not in excluded]
     return {
         "type": "object",
@@ -539,7 +549,7 @@ def _prompt(
     title_enabled: bool = True,
 ) -> str:
     part = int(clip.get("part", 1))
-    excluded = _excluded_defects(letterbox, part)
+    excluded = _excluded_defects(letterbox, part, clip.get("layout") == "stream_split")
     defect_keys = [d for d in DEFECTS if d not in excluded]
     defects = "\n".join(f"- {key} : {DEFECTS[key]}" for key in defect_keys)
     images = "\n".join(
@@ -588,14 +598,24 @@ def _prompt(
         )
     else:
         series_line = ""
+    if clip.get("layout") == "stream_split":
+        blocking_line = (
+            "Seuls incomprehensible et empty_webcam sont bloquants : le clip est alors rejete, et avec lui "
+            "toute sa serie. Ne les signale que si c'est net. "
+        )
+    else:
+        blocking_line = (
+            "Seul incomprehensible est bloquant : le clip est alors rejete, et avec lui toute sa serie. "
+            "Ne le signale que si c'est net. "
+        )
     return (
         "Tu fais le controle qualite d'un clip vertical TikTok deja rendu, avant publication.\n"
         "Tu vois des images fixes extraites du clip et sa transcription ; signale uniquement "
         "les defauts reellement visibles ou lisibles, parmi :\n"
         f"{defects}\n\n"
         "Un clip sans defaut rend une liste vide.\n"
-        "Seul incomprehensible est bloquant : le clip est alors rejete, et avec lui toute sa serie. "
-        "Ne le signale que si c'est net. Les autres defauts ne sont que des avertissements "
+        f"{blocking_line}"
+        "Les autres defauts ne sont que des avertissements "
         "(le clip reste publiable) : en cas de doute franc, signale-les.\n\n"
         f"{format_line}"
         f"{series_line}"
@@ -681,7 +701,8 @@ def check_clip(
     frames = _extract_frames(mp4, frames_dir, settings)
     answer = llm.ask(
         "qa", _prompt(clip, frames, letterbox=letterbox, title_enabled=title_enabled), [p for p, _, _ in frames],
-        response_schema(letterbox=letterbox, part=int(clip.get("part", 1))), config=config,
+        response_schema(letterbox=letterbox, part=int(clip.get("part", 1)), split=layout == "stream_split"),
+        config=config,
     )
     issues = [
         {**issue, "source": "llm", "severity": BLOCKING if issue["type"] in _BLOCKING_DEFECTS else WARNING}
