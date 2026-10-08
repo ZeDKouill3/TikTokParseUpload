@@ -16,6 +16,7 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ### Corrigé
 
+- Jury : la re-notation après vision lit la grille enregistrée dans `moments.json` (`rubric.path`) et non celle du style (un style changé de grille entre moments et vision ne provoque plus `KeyError: 'action'`) ; grille enregistrée introuvable : erreur explicite, jamais de repli. L'exploration ne repêche plus un candidat éliminé par le seuil `[gate]` (les rejets `min_score` restent repêchables).
 - Téléchargement : une VOD Twitch en mp4 fragmenté (fMP4 : 1 `moov` + des dizaines de milliers de `moof`/`mdat`,
   aucun index) est remuxée sans réencodage en mp4 indexé (`ffmpeg -c copy -movflags +faststart`) avant l'écriture
   de `meta.json`. Constat du 07/10 (v2894103366, 11 Go) : ~30 s par `-ss` avant `-i` contre 0,4 s après remux,
