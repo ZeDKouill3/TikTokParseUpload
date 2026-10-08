@@ -51,6 +51,8 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ### Corrigé
 
+- Fiche clip lisible : les libellés ne se coupent plus lettre par lettre, le contrôle qualité affiche le type, la sévérité et le détail de chaque problème (au lieu de « [object Object] »), les créneaux et publications sont à l'heure de Paris au format court français, et le compte s'affiche par son nom avec son id en secondaire (« inconnu » s'il n'existe plus).
+
 - TikTok : deux fenêtres superposées (bulle « Nouvelles fonctionnalités » sous « Activer les vérifications automatiques ») : `close_popups` ferme une fenêtre à la fois, la plus haute d'abord (dernière dans le DOM), puis relit les fenêtres visibles ; le clic sur la bulle du dessous était intercepté par l'overlay du dessus. Un arrêt R4 avec capture enregistre aussi le HTML de la page à côté (`.html`) ; un échec d'écriture du HTML est journalisé sans masquer l'arrêt d'origine. Jamais « Activer », jamais de clic de repli (TASK-0bc5).
 
 - Reframe : la réponse « aucune webcam » de Claude n'est plus refusée quand plusieurs visages stables viennent du jeu (menus, ARC Raiders sur PS5) : seul un unique candidat stable ET persistant sur les périodes de la vidéo la contredit ; les visages non persistants sont écartés (warning avec les candidats, raison écrite dans la période), plusieurs persistants restent une erreur explicite (TASK-5979).

@@ -3,7 +3,7 @@
    (.mp4 absent) garde la fiche avec la mention « vidéo supprimée, fiche conservée ». */
 "use strict";
 
-const clipSheetUi = { key: null, data: null, error: null, loading: null, at: 0 };
+const clipSheetUi = { key: null, data: null, accounts: null, error: null, loading: null, at: 0 };
 const CLIP_SHEET_STALE_MS = 4000;
 
 /* Cle (video/clip) lue dans l'adresse #/clip/<video_id>/<clip_id>. */
@@ -22,8 +22,12 @@ function loadClipSheet(target) {
   clipSheetUi.loading = (async () => {
     try {
       const url = `/api/clips/${encodeURIComponent(target.video)}/${encodeURIComponent(target.clip)}/sheet`;
-      const data = await api(url);
-      if (clipSheetUi.key === key) clipSheetUi.data = data;
+      // Le nom du compte vient de la liste des comptes ; une erreur de l'une ou l'autre reste visible (ADR-ad2e).
+      const [data, accounts] = await Promise.all([api(url), api("/api/accounts")]);
+      if (clipSheetUi.key === key) {
+        clipSheetUi.data = data;
+        clipSheetUi.accounts = accounts;
+      }
     } catch (err) {
       if (clipSheetUi.key === key) clipSheetUi.error = err;
     } finally {
@@ -75,10 +79,38 @@ function clipSheetStatsHtml(stats, clip) {
   return `${sheetRow("Vues", sheetVal(stats.views))}${sheetRow("Likes", sheetVal(stats.likes))}${history}`;
 }
 
-function clipSheetHtml(sheet) {
+/* Date ISO affichee a l'heure de Paris, format court francais (« jeu. 8 oct., 09:00 », comme le tableau de bord).
+   Absente = « inconnu » ; illisible = texte brut, jamais une date inventee. */
+function clipSheetDate(iso) {
+  if (iso == null || iso === "") return "inconnu";
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? esc(iso) : esc(fmtParis(iso, { weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }));
+}
+
+/* Compte de publication : son nom (label de GET /api/accounts), l'id en secondaire ; « inconnu » si le compte n'existe plus. */
+function clipSheetAccountHtml(id, accounts) {
+  if (id == null || id === "") return "inconnu";
+  const found = (accounts || []).find((a) => a.id === id);
+  if (!found) return `inconnu <span class="muted">${esc(id)}</span>`;
+  return `${esc(found.label || id)} <span class="muted">${esc(id)}</span>`;
+}
+
+/* Problemes du controle qualite : type, severite, detail en texte. Un probleme en texte seul reste tel quel. */
+function clipSheetIssuesHtml(issues) {
+  if (!Array.isArray(issues) || !issues.length) return "";
+  const items = issues.map((issue) => {
+    if (typeof issue === "string") return `<li>${esc(issue)}</li>`;
+    const head = [issue.type, issue.severity].filter((x) => x != null && x !== "").map((x) => esc(x)).join(" · ");
+    const detail = issue.detail == null || issue.detail === "" ? "" : esc(issue.detail);
+    return `<li>${head ? `<strong>${head}</strong>` : ""}${detail ? `${head ? " — " : ""}${detail}` : ""}${!head && !detail ? "inconnu" : ""}</li>`;
+  }).join("");
+  return `<ul class="sheet-issues">${items}</ul>`;
+}
+
+function clipSheetHtml(sheet, accounts) {
   const { clip, video, jury, stats } = sheet;
   const s = clipStatus(clip);
-  const qa = clip.qa_status ? `${clip.qa_status}${clip.issues && clip.issues.length ? ` (${clip.issues.join(", ")})` : ""}` : "inconnu";
+  const qa = clip.qa_status ? `${esc(clip.qa_status)}${clipSheetIssuesHtml(clip.issues)}` : "inconnu";
   return `
     <div class="sheet-head">
       <span class="chip ${s.cls}">${esc(s.label)}</span>
@@ -100,14 +132,14 @@ function clipSheetHtml(sheet) {
         ${sheetRow("Début / fin dans la VOD", clip.start == null ? "inconnu" : `${fr(clip.start, 1)} s → ${fr(clip.end, 1)} s`)}
         ${sheetRow("Durée", clip.duration == null ? "inconnu" : clipSeconds(clip.duration))}
         ${sheetRow("Format", sheetVal(clip.layout))}
-        ${sheetRow("Contrôle qualité", esc(qa))}
+        ${sheetRow("Contrôle qualité", qa)}
       </section>
       <section class="panel"><h3>Jury</h3>${clipSheetJuryHtml(jury)}</section>
       <section class="panel"><h3>Publication</h3>
-        ${sheetRow("Compte", sheetVal(clip.account))}
+        ${sheetRow("Compte", clipSheetAccountHtml(clip.account, accounts))}
         ${sheetRow("Statut", esc(s.label))}
-        ${sheetRow("Créneau", sheetVal(clip.slot_at_paris))}
-        ${sheetRow("Publié le", sheetVal(clip.published_at_paris))}
+        ${sheetRow("Créneau", clipSheetDate(clip.slot_at_paris))}
+        ${sheetRow("Publié le", clipSheetDate(clip.published_at_paris))}
         ${sheetRow("Lien du post", sheetLink(clip.post_url))}
         ${clip.publish_error ? sheetRow("Erreur", esc(clip.publish_error)) : ""}
       </section>
@@ -132,6 +164,6 @@ Screens.clip = {
       body.innerHTML = `<div class="skeleton skeleton-line"></div><div class="skeleton skeleton-card"></div>`;
       return;
     }
-    body.innerHTML = clipSheetHtml(clipSheetUi.data);
+    body.innerHTML = clipSheetHtml(clipSheetUi.data, clipSheetUi.accounts);
   },
 };
