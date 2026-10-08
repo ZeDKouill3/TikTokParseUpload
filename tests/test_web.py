@@ -10228,3 +10228,118 @@ def test_clip_sheet_without_moments_json_has_unknown_jury(tmp_path, isolated_cwd
     jury = _sheet(tmp_path).json()["jury"]
 
     assert jury == {"confidence": None, "judges": None, "rounds": None}
+
+
+# --------------------------------------------------------------------------
+# Fiche clip lisible (TASK-d8af48198d84) : issues en objets, dates de Paris, compte par son label,
+# libellés qui ne se coupent pas au milieu d'un mot. Tests sans réseau : la fiche est rendue par node.
+# --------------------------------------------------------------------------
+
+_NODE_SHEET = pytest.mark.skipif(shutil.which("node") is None, reason="node absent du PATH")
+
+_SHEET_JS_NAMES = (
+    ("screens/clip.js", ["sheetVal", "sheetRow", "sheetLink", "clipSheetVideoHtml", "clipSheetJuryHtml",
+                         "clipSheetScoresHtml", "clipSheetStatsHtml", "clipSheetDate", "clipSheetAccountHtml",
+                         "clipSheetIssuesHtml", "clipSheetHtml"]),
+    ("screens/clips.js", ["CLIP_STATUS", "clipStatus", "clipSeconds"]),
+    ("ui.js", ["CLIPPER_TZ", "fmtParis"]),
+)
+_SHEET_JS_FIXTURE = """
+const sheetFixture = (over = {}) => ({
+  clip: Object.assign({ clip_id: '01', video_id: 'v1', title: 'Titre 01', publish_status: 'published',
+    qa_status: 'passed', issues: [], slot_at_paris: null, published_at_paris: null, account: null,
+    post_url: null, scores: null, start: null, end: null, duration: null, layout: null, caption: null,
+    score: null, reason: null, hook_text: null, screen_title: 'Titre 01', publish_error: null }, over.clip || {}),
+  video: { title: 'Source', deleted: false, video_url: '/media/clip/v1/01', passage_url: null, source_url: null },
+  jury: { confidence: null, judges: null, rounds: null },
+  stats: null,
+});
+"""
+
+
+def _sheet_html(sheet, accounts):
+    out = _run_js(_SHEET_JS_NAMES, f"clipSheetHtml(sheetFixture({json.dumps(sheet)}), {json.dumps(accounts)})",
+                  preamble=_SHEET_JS_FIXTURE)
+    return out
+
+
+@_NODE_SHEET
+def test_clip_sheet_reads_qa_issues_as_objects_never_object_object():
+    html = _sheet_html({"clip": {"qa_status": "passed", "issues": [
+        {"type": "sous-titres", "detail": "hors zone", "severity": "warning", "source": "qa"},
+    ]}}, [])
+
+    assert "[object Object]" not in html
+    assert "sous-titres" in html and "hors zone" in html and "warning" in html
+
+
+@_NODE_SHEET
+def test_clip_sheet_qa_without_issues_has_no_empty_list_of_problems():
+    html = _sheet_html({"clip": {"qa_status": "passed", "issues": []}}, [])
+
+    assert "passed" in html
+    assert "[object Object]" not in html
+
+
+@_NODE_SHEET
+def test_clip_sheet_shows_slot_and_publication_dates_in_paris_short_french_format():
+    html = _sheet_html({"clip": {"slot_at_paris": "2026-10-08T09:00:00+02:00",
+                                 "published_at_paris": "2026-10-08T08:07:46.763778+02:00"}}, [])
+
+    assert "8 oct." in html and "09:00" in html and "08:07" in html
+    assert "2026-10-08T" not in html and "763778" not in html
+
+
+@_NODE_SHEET
+def test_clip_sheet_dates_that_are_missing_say_inconnu():
+    html = _sheet_html({"clip": {"slot_at_paris": None, "published_at_paris": None}}, [])
+
+    assert html.count("inconnu") >= 2
+
+
+@_NODE_SHEET
+def test_clip_sheet_account_shows_its_label_with_the_id_in_secondary():
+    html = _sheet_html({"clip": {"account": "ab12cd"}}, [{"id": "ab12cd", "label": "ClipperFou"}])
+
+    assert "ClipperFou" in html and "ab12cd" in html
+    assert html.index("ClipperFou") < html.index("ab12cd")
+
+
+@_NODE_SHEET
+def test_clip_sheet_account_that_no_longer_exists_says_inconnu_not_its_id_alone():
+    html = _sheet_html({"clip": {"account": "ab12cd"}}, [])
+
+    assert "ab12cd" in html
+    assert "inconnu" in html
+    assert "ClipperFou" not in html
+
+
+@_NODE_SHEET
+def test_clip_sheet_without_account_says_inconnu():
+    html = _sheet_html({"clip": {"account": None}}, [{"id": "ab12cd", "label": "ClipperFou"}])
+
+    assert "ClipperFou" not in html
+
+
+def test_clip_sheet_loads_the_accounts_list_to_name_the_account():
+    js = (STATIC / "screens" / "clip.js").read_text(encoding="utf-8")
+
+    assert 'api("/api/accounts")' in js
+
+
+def test_clip_sheet_row_labels_never_break_inside_a_word():
+    css = (STATIC / "style.css").read_text(encoding="utf-8")
+    label_rule = css[css.index(".sheet-row > span:first-child"):]
+    label_rule = label_rule[:label_rule.index("}")]
+
+    assert "overflow-wrap: normal" in label_rule
+    assert "flex: 0 0 auto" in label_rule
+
+
+def test_clip_sheet_root_does_not_reuse_the_veille_sheet_class():
+    # « .sheet » est le style de la fiche Veille (veille.css) : la fiche clip a sa propre classe, sinon elle
+    # se range en deux colonnes étroites (TASK-d8af48198d84).
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+
+    assert 'class="clip-sheet" data-body' in html
+    assert ".clip-sheet" not in (STATIC / "screens" / "veille.css").read_text(encoding="utf-8")
