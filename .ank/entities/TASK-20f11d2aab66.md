@@ -5,7 +5,7 @@ slug: tests-la-suite-compl-te-ne-laisse-plus-19-go-sur
 title: "Tests : la suite complète ne laisse plus ~19 Go sur C: (vidéos synthétiques des tests de reframe/webcam allégées, rétention des dossiers temporaires pytest limitée)"
 created: 2026-10-08T06:56:39Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - tests/test_reframe.py
   - pyproject.toml
@@ -16,6 +16,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/2a8879dfc79d@4140db1
+    tree: scope/896e4beb5dbc
+    criteria: 49d9a810f280
+    verifier: tests@c7b454d16c90
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---
