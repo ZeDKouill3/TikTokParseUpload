@@ -2462,7 +2462,7 @@ def test_two_nested_frames_without_a_face_are_not_labelled_face_plus_frame(monke
 
     assert [c["kind"] for c in candidates] == ["cadre"]
     prompt = reframe._facecam_prompt(candidates, 0, 60)
-    assert "visage" not in prompt.split("Rectangles candidats :")[1].split("Reponds")[0]
+    assert "rectangle visage" not in prompt.split("Rectangles candidats :")[1].split("Reponds")[0]
 
 
 def test_period_candidates_keeps_gray_frames_as_uint8(monkeypatch):
@@ -2780,3 +2780,106 @@ def test_clip_facecam_face_only_without_detector_is_an_explicit_error(tmp_path):
         reframe._clip_facecam(
             facecam, 0.0, 3.0, dict(reframe.CONFIG_DEFAULTS), tmp_path, image_reader=_offset_reader(False)
         )
+
+
+# --------------------------------------------------------------------------
+# TASK-495c : un cadre sans aucun visage (bannière de sponsor animée) n'est
+# pas retenu comme webcam quand un candidat visage stable existe.
+# --------------------------------------------------------------------------
+
+
+class _FaceInFull:
+    """Detecteur : un visage fixe sur l'image entiere (pas sur les vignettes de coin)."""
+
+    def __init__(self, box):
+        self.box = box
+
+    def detect(self, image):
+        return [(*self.box, 0.9)] if image.shape[1] == 1280 else []
+
+
+def test_frame_candidate_counts_the_keyframes_with_a_face_inside_it(monkeypatch):
+    boxes = [(40, 40, 400, 330), (700, 400, 1000, 600)]  # bannière sans visage, cadre avec visage
+    reframe, images, settings = _candidate_setup(monkeypatch, boxes)
+
+    candidates, _ = reframe._period_candidates(images, _FaceInFull((780, 440, 900, 560)), settings)
+
+    by_y = {c["rect"]["y"] < 300: c for c in candidates}
+    assert by_y[True]["kind"] == "cadre" and by_y[True]["face_support"] == 0
+    assert by_y[False]["face_support"] == len(images)
+
+
+def test_prompt_tells_claude_when_a_frame_candidate_has_no_face(monkeypatch):
+    reframe, images, settings = _candidate_setup(monkeypatch, [(40, 40, 400, 330)])
+
+    candidates, _ = reframe._period_candidates(images, _NoFaces(), settings)
+    prompt = reframe._facecam_prompt(candidates, 0, 60)
+
+    assert "aucun visage" in prompt
+
+
+def _sponsor_banner_period(monkeypatch, video_dir, *, banner_face=0, extra_face=False):
+    """Une periode ou le candidat 1 est un cadre (bannière) et le 2 le vrai visage."""
+    from clipper import reframe
+
+    write_timeline(video_dir, every(10.0, 120, "game"))
+    real = reframe._period_candidates
+
+    def crafted(images, detector, settings):
+        candidates, rejected = real(images, detector, settings)
+        face = next(c for c in candidates if c["face_support"])
+        banner = dict(face, id=1, kind="cadre", rect={"x": 10, "y": 10, "w": 216, "h": 154},
+                      face_support=banner_face, edge_reason=None, face=None)
+        face = dict(face, id=2)
+        out = [banner, face]
+        if extra_face:
+            out.append(dict(face, id=3, rect={"x": 1500, "y": 800, "w": 300, "h": 213}))
+        return out, rejected
+
+    monkeypatch.setattr(reframe, "_period_candidates", crafted)
+
+
+def test_a_faceless_frame_is_replaced_by_the_stable_face_candidate(tmp_path, video_dir, monkeypatch, caplog):
+    _sponsor_banner_period(monkeypatch, video_dir)
+    with caplog.at_level("WARNING"):
+        path, _ = run_detect(tmp_path, [webcam_answer(1, "cadre present partout")])
+
+    [period] = load(path)["periods"]
+    assert contains(period["facecam"], STREAM_FACE)
+    assert period["candidate_rect"] != {"x": 10, "y": 10, "w": 216, "h": 154}
+    assert period["answer"]["webcam"] == 1  # reponse de Claude gardee telle quelle
+    assert period["override"]["from"] == 1 and period["override"]["to"] == 2
+    assert "aucun visage" in caplog.text
+
+
+def test_a_faceless_frame_with_two_stable_face_candidates_is_an_explicit_error(tmp_path, video_dir, monkeypatch):
+    from clipper.reframe import ReframeError
+
+    _sponsor_banner_period(monkeypatch, video_dir, extra_face=True)
+    with pytest.raises(ReframeError, match="plusieurs"):
+        run_detect(tmp_path, [webcam_answer(1)])
+    assert not (tmp_path / "workspace" / VIDEO_ID / "facecam.json").exists()
+
+
+def test_a_frame_with_a_face_is_kept_even_if_a_face_candidate_exists(tmp_path, video_dir, monkeypatch):
+    _sponsor_banner_period(monkeypatch, video_dir, banner_face=100)
+    path, _ = run_detect(tmp_path, [webcam_answer(1)])
+
+    [period] = load(path)["periods"]
+    assert period["candidate_rect"] == {"x": 10, "y": 10, "w": 216, "h": 154}
+    assert period.get("override") is None
+
+
+def test_a_faceless_frame_stays_the_webcam_when_no_stable_face_candidate_exists(tmp_path, video_dir):
+    write_timeline(video_dir, every(10.0, 120, "live"))
+    path, _ = run_detect(tmp_path, [webcam_answer(1)])
+
+    [period] = load(path)["periods"]
+    assert contains(period["facecam"], STREAM_PANEL, eps=3)
+    assert period.get("override") is None
+
+
+def test_face_stable_share_is_a_setting():
+    from clipper.reframe import CONFIG_DEFAULTS
+
+    assert CONFIG_DEFAULTS["facecam_face_stable_share"] == 0.8

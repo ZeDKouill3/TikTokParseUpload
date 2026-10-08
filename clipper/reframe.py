@@ -259,6 +259,8 @@ CONFIG_DEFAULTS: dict[str, object] = {
     # rectangle de la webcam, quand celui-ci a été repéré sur le seul visage
     # (aucun bord d'incrustation retrouvé) ; en dessous, le clip reste en letterbox.
     "facecam_clip_face_min_share": 0.5,
+    # Part du plus grand support à partir de laquelle un candidat visage est stable, et remplace un cadre sans aucun visage choisi par Claude.
+    "facecam_face_stable_share": 0.8,
     # Panneau caméra : part de la hauteur de sortie, à partir de stream_top
     # (titre d'écran au-dessus) ; le jeu occupe tout le bas.
     "stream_camera_ratio": 0.4,
@@ -1892,9 +1894,12 @@ def _period_candidates(
                 for other in raw
             ):
                 continue  # doublon cadre/cadre (bordure externe et interne de la meme incrustation)
+            box = _rect_box(rect)
             raw.append({
-                "kind": "cadre", "rect": rect, "support": item["support"], "face_support": None, "edge_reason": None,
-                "face": None,
+                "kind": "cadre", "rect": rect, "support": item["support"], "edge_reason": None, "face": None,
+                "face_support": sum(
+                    any(_contains_point(box, _center(d)) for d in found) for found in detections
+                ),
             })
 
     limit = int(settings["facecam_candidate_max"])
@@ -1972,6 +1977,12 @@ def _facecam_prompt(candidates: list[dict[str, Any]], start: float, end: float) 
     def seen(c: dict[str, Any]) -> str:
         if c["kind"] == "visage+cadre":
             return f"cadre net sur {c['support']} image(s), visage vu sur {c['face_support']} image(s)"
+        if c["kind"] == "cadre":
+            faces = c.get("face_support")
+            if faces == 0:
+                return f"cadre net sur {c['support']} image(s), aucun visage vu dedans"
+            if faces:
+                return f"cadre net sur {c['support']} image(s), visage vu sur {faces} image(s)"
         return f"vu sur {c['support']} image(s)"
 
     listing = "\n".join(f"- {c['id']} : rectangle {c['kind']}, {seen(c)}" for c in candidates)
@@ -1985,6 +1996,33 @@ def _facecam_prompt(candidates: list[dict[str, Any]], start: float, end: float) 
         "(widget, alerte, chat, camera de jeu, zone de l'interface du jeu, personne a l'ecran). "
         "Ne donne jamais de coordonnees : seulement le numero. Explique en une phrase dans reason."
     )
+
+
+def _stable_face_instead(
+    candidates: list[dict[str, Any]], chosen: dict[str, Any], settings: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Garde-fou local sur le choix de Claude (TASK-495c) : un cadre sans aucun
+    visage sur les images de la planche (bannière de sponsor animée) n'est pas
+    la webcam quand un candidat visage stable existe (vu sur au moins
+    ``facecam_face_stable_share`` du plus grand support). Renvoie ce candidat,
+    ``None`` quand le choix tient, une erreur explicite si plusieurs candidats
+    visage stables se disputent la place (ADR-ad2e)."""
+    if chosen["kind"] != "cadre" or chosen.get("face_support") != 0:
+        return None
+    top = max(c["support"] for c in candidates)
+    stable = [
+        c for c in candidates
+        if c is not chosen and (c.get("face_support") or 0) > 0
+        and c["support"] >= float(settings["facecam_face_stable_share"]) * top - 1e-9
+    ]
+    if not stable:
+        return None
+    if len(stable) > 1:
+        raise ReframeError(
+            f"[reframe] Claude a choisi le cadre {chosen['id']} qui n'a aucun visage alors que plusieurs candidats "
+            f"visage stables existent ({sorted(c['id'] for c in stable)}) : choix impossible sans deviner"
+        )
+    return stable[0]
 
 
 def _facecam_check(ids: set[int]) -> Callable[[Any], None]:
@@ -2019,7 +2057,9 @@ def detect_facecam(
                       "refined_rect": candidat recale sur les bords reels | null,
                       "refine_reason": decalage retenu par cote, ou pourquoi rien n'a bouge,
                       "reason": null | pourquoi pas,
-                      "edge_reason": null | pourquoi le rectangle est centre sur le seul visage}],
+                      "edge_reason": null | pourquoi le rectangle est centre sur le seul visage,
+                      "override": null | {"from", "to", "reason"} : cadre sans visage choisi par Claude,
+                                  remplace par le candidat visage stable (TASK-495c)}],
          "keyframes": [{"timecode", "path"}]}
 
     1. PERIODES (local) : une image cle environ par ``facecam_period_step``
@@ -2125,6 +2165,7 @@ def detect_facecam(
         answer: dict[str, Any] | None = None
         rect: dict[str, int] | None = None
         edge_reason: str | None = None
+        override: dict[str, Any] | None = None
         candidate_rect: dict[str, int] | None = None
         refined_rect: dict[str, int] | None = None
         refine_reason: str | None = None
@@ -2142,6 +2183,15 @@ def detect_facecam(
                 reason = f"Claude : aucune webcam sur cette periode ({answer['reason']})"
             else:
                 chosen = next(c for c in candidates if c["id"] == answer["webcam"])
+                better = _stable_face_instead(candidates, chosen, settings)
+                if better is not None:
+                    override = {
+                        "from": chosen["id"], "to": better["id"],
+                        "reason": f"le cadre {chosen['id']} n'a aucun visage sur les images de la planche, "
+                                  f"le candidat {better['id']} a un visage vu sur {better['face_support']} image(s)",
+                    }
+                    log.warning("%s : periode %d, %s", video_id, index, override["reason"])
+                    chosen = better
                 rect, edge_reason, reason = dict(chosen["rect"]), chosen["edge_reason"], None
                 candidate_rect = dict(rect)
                 refined_rect, refine_reason = _refine_rect(
@@ -2164,6 +2214,7 @@ def detect_facecam(
             "refine_reason": refine_reason,
             "reason": reason,
             "edge_reason": edge_reason,
+            "override": override,
         })
         if rect is None:
             log.warning("%s : periode %d sans webcam, clips en letterbox (%s)", video_id, index, reason)
@@ -2183,7 +2234,7 @@ def detect_facecam(
             "index": 0, "start": 0.0, "end": 0.0, "transition": "aucune image cle", "candidates": [],
             "rejected": [], "board": None, "answer": None, "facecam": None,
             "candidate_rect": None, "refined_rect": None, "refine_reason": None,
-            "reason": "aucune image cle dans scenes.json", "edge_reason": None,
+            "reason": "aucune image cle dans scenes.json", "edge_reason": None, "override": None,
         }]
         log.warning("%s : aucune image cle, clips en letterbox", video_id)
     data = {
