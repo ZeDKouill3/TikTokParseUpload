@@ -737,3 +737,68 @@ def test_r7_module_imports_neither_web_nor_a_pipeline_step():
 def test_repartition_source_names_no_real_account_or_channel():
     text = (REPO_ROOT / "clipper" / "repartition.py").read_text(encoding="utf-8")
     assert "tiktok.com/@" not in text
+
+
+# ---------------------------------------------------------------- R3 jeu de la veille : fichiers de jour
+
+
+def _day_file(config, day, *candidates) -> None:
+    """Un fichier ``days/<AAAA-MM-JJ>.json`` de la veille : candidats numérotés sans le préfixe ``v`` (Twitch)."""
+    days = Path(config.section("veille")["state_dir"]) / "days"
+    days.mkdir(parents=True, exist_ok=True)
+    rows = [{"id": f"twitch:{vid}", "source": "twitch", "video_id": vid, "game_name": game} for vid, game in candidates]
+    (days / f"{day}.json").write_text(json.dumps({"date": day, "candidates": rows}), encoding="utf-8")
+
+
+def test_veille_game_of_a_vod_queued_by_hand_is_read_from_the_day_file(tmp_path):
+    config = _config(tmp_path)
+    _accounts(config, _acc("a"))
+    _clip(config, "v2895096466", "01", score=80)
+    _day_file(config, "2026-10-09", ("2895096466", "AION 2"))
+
+    plan = _plan(config)
+
+    line = _line_for(plan, "a", "v2895096466")
+    assert (line["source_key"], line["game_name"], line["source_from"]) == ("jeu:aion 2", "AION 2", "veille")
+
+
+def test_veille_seen_json_queued_keeps_priority_over_the_day_file(tmp_path):
+    config = _config(tmp_path)
+    _accounts(config, _acc("a"))
+    _clip(config, "vP", "01", score=80)
+    veille = Path(config.section("veille")["state_dir"])
+    veille.mkdir(parents=True, exist_ok=True)
+    (veille / "seen.json").write_text(json.dumps({"queued": [
+        {"video_id": "vP", "game_name": "Elden Ring"}], "ignored": []}), encoding="utf-8")
+    _day_file(config, "2026-10-09", ("P", "Autre jeu"))
+
+    plan = _plan(config)
+
+    assert _line_for(plan, "a", "vP")["game_name"] == "Elden Ring"
+
+
+def test_veille_game_from_the_most_recent_day_file_wins(tmp_path):
+    config = _config(tmp_path)
+    _accounts(config, _acc("a"))
+    _clip(config, "vQ", "01", score=80)
+    _day_file(config, "2026-10-07", ("Q", "Ancien"))
+    _day_file(config, "2026-10-08", ("Q", "Recent"))
+
+    plan = _plan(config)
+
+    assert _line_for(plan, "a", "vQ")["game_name"] == "Recent"
+
+
+def test_unreadable_veille_day_file_is_noted_and_the_vod_stays_vod(tmp_path):
+    config = _config(tmp_path)
+    _accounts(config, _acc("a"))
+    _clip(config, "vU", "01", score=80)
+    _day_file(config, "2026-10-07", ("X", "Autre jeu"))
+    veille_days = Path(config.section("veille")["state_dir"]) / "days"
+    (veille_days / "2026-10-08.json").write_text("{bad", encoding="utf-8")
+
+    plan = _plan(config)
+
+    line = _line_for(plan, "a", "vU")
+    assert (line["source_key"], line["game_name"], line["source_from"]) == ("vod:vU", None, "vod")
+    assert any("2026-10-08.json" in n for n in plan["notes"])
