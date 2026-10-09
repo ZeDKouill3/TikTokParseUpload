@@ -5,7 +5,7 @@ slug: scenes-acc-l-rer-l-tape-34-min-pour-7-h-de-vod-e
 title: "Scenes : accélérer l'étape (34 min pour 7 h de VOD) en gardant les mêmes coupes, mesuré sur une vraie VOD"
 created: 2026-10-09T11:23:04Z
 author: nicoc@zedk_ordi
-status: open
+status: closed
 scope:
   - clipper/scenes.py
   - tests/test_scenes.py
@@ -17,5 +17,5 @@ criteria_by: creator
 verify: [tests]
 method: tdd
 schema: 4
-version: 3
+version: 4
 ---
