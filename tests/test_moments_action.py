@@ -590,3 +590,41 @@ def test_a_sentence_begun_before_the_passage_without_word_timing_counts_as_speec
 
     [m] = read_moments(video_dir)["moments"]
     assert m["source"] == "action"
+
+
+def tail(video_dir, *sentences):
+    """Remplace les phrases commencant entre 100 et 140 s par celles donnees :
+    (id, debut, fin, nombre de mots), mots repartis regulierement."""
+    t = make_transcript()
+    t["segments"] = [s for s in t["segments"] if not 100 <= s["words"][0]["start"] < 140]
+    for sid, begin, end, n in sentences:
+        step = (end - begin - 0.8) / (n - 1)
+        words = [{"word": f" tail{sid}_{i}", "start": round(begin + i * step, 2),
+                  "end": round(begin + i * step + 0.8, 2), "probability": 0.9} for i in range(n)]
+        t["segments"].append({"id": sid, "start": begin, "end": end,
+                              "text": "".join(w["word"] for w in words) + ".", "words": words})
+    t["segments"].sort(key=lambda s: s["start"])
+    (video_dir / "transcript.json").write_text(json.dumps(t), encoding="utf-8")
+
+
+def test_a_sentence_begun_inside_the_passage_and_ending_after_it_counts_for_speech(tmp_path, video_dir, rubric_path):
+    # phrase A 101-130 commence dans le passage 100-120 et le depasse ; phrase B 112-118 est dedans
+    tail(video_dir, (20, 101.0, 130.0, 10), (21, 112.0, 118.0, 4))
+    write_action(video_dir, passage(100.0, 120.0, speech_ratio=0.68))
+
+    go(tmp_path, rubric_path, [{"moments": []}, rate(GOOD)])
+
+    [m] = read_moments(video_dir)["moments"]
+    assert m["source"] == "action"
+    assert "tail21_0" in m["hook_text"] and "tail20" not in m["hook_text"]
+
+
+def test_a_sentence_begun_inside_the_passage_and_ending_after_it_alone_is_accepted(tmp_path, video_dir, rubric_path):
+    tail(video_dir, (20, 101.0, 130.0, 10))
+    write_action(video_dir, passage(100.0, 120.0, speech_ratio=0.68, frames=[frame(105.0, "un tir", "combat", 7)]))
+
+    go(tmp_path, rubric_path, [{"moments": []}, rate(GOOD)])
+
+    [m] = read_moments(video_dir)["moments"]
+    assert m["source"] == "action"
+    assert m["hook_text"] == "un tir"
