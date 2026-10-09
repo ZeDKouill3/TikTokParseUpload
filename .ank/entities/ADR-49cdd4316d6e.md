@@ -5,14 +5,18 @@ slug: interface-page-html-locale-servie-par-fastapi-av
 title: "Interface : page HTML locale servie par FastAPI, avec validation de config par les fonctions pures des étapes"
 created: 2026-10-09T01:07:01Z
 author: nicoc@zedk_ordi
-status: proposed
+status: accepted
 scope:
   - clipper/web/**
 constraint: |
   L'interface est une page HTML/CSS/JS statique (sans étape de build) servie par un serveur FastAPI local dans clipper/web/. Elle ne fait qu'appeler clipper.pipeline et lire workspace/ et output/, plus (exception fermée) les fonctions pures de validation/lecture de config nommées dans cet ADR ; aucune logique de traitement vidéo, audio ou LLM dans clipper/web/. Pas de tkinter/customtkinter.
 supersedes: ADR-09ad233678f2
+ratified: 1150b31fcd99
+verified:
+  - by: nicoc@zedk_ordi
+    at: 2026-10-09T01:08:34Z
 schema: 4
-version: 1
+version: 2
 ---
 
 ## Contexte
