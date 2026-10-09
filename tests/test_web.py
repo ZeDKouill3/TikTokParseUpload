@@ -10394,3 +10394,49 @@ def test_channels_route_lists_the_configured_presets_dir(tmp_path, isolated_cwd)
         assert channel_mod.list_channels(app_mod._PRESETS_DIR) == ["ma_chaine"]
     finally:
         app_mod._PRESETS_DIR, app_mod._BASE_CONFIG = "presets", "config.toml"
+
+
+def test_learning_api_with_a_truncated_outcomes_journal_is_422_naming_the_file(tmp_path, isolated_cwd, monkeypatch):
+    (tmp_path / "config.toml").write_text(_LEARN_TOML, encoding="utf-8")
+    journal = tmp_path / "state" / "outcomes.jsonl"
+    journal.parent.mkdir(parents=True)
+    journal.write_text('{"kind": "stats", "video_id": "VVVVVVVVVVV"\n', encoding="utf-8")
+    c, fake, forbidden = _learning_client(tmp_path, monkeypatch)
+
+    resp = c.get("/api/learning")
+
+    assert resp.status_code == 422 and "outcomes.jsonl" in resp.json()["detail"]
+
+
+def _watch_config(tmp_path, **publish_section) -> Config:
+    state = tmp_path / "state"
+    return Config(mode="review", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output",
+                  _sections={"worker": {"queue_path": str(state / "queue.json")},
+                             "publish": publish_section})
+
+
+def test_publish_state_dir_spelled_absolute_emits_each_file_once(tmp_path, isolated_cwd):
+    from clipper.web.app import _scan_watched, _watched_state_roots
+
+    state = tmp_path / "state"
+    (state / "publish").mkdir(parents=True)
+    (state / "publish" / "chaine.json").write_text("{}", encoding="utf-8")
+    spelled = str(state / ".." / "state" / "publish")  # même dossier, écrit autrement
+    config = _watch_config(tmp_path, state_dir=spelled)
+
+    found = _scan_watched(tmp_path / "workspace", _watched_state_roots(config))
+
+    assert [(kind, id_) for _, kind, id_ in found] == [("publish", "chaine")]
+
+
+def test_publish_state_dir_outside_the_queue_folder_emits_one_element_with_its_fixed_kind(tmp_path, isolated_cwd):
+    from clipper.web.app import _scan_watched, _watched_state_roots
+
+    pub2 = tmp_path / "state" / "pub2"
+    pub2.mkdir(parents=True)
+    (pub2 / "chaine.json").write_text("{}", encoding="utf-8")
+    config = _watch_config(tmp_path, state_dir=str(pub2))
+
+    found = _scan_watched(tmp_path / "workspace", _watched_state_roots(config))
+
+    assert [(kind, id_) for _, kind, id_ in found] == [("publish", "chaine")]

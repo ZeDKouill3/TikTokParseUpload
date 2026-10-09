@@ -554,7 +554,7 @@ def _watched_state_roots(config: Config) -> list[tuple[Path, str | None]]:
     roots: list[tuple[Path, str | None]] = [(base, None)]
     for kind in ("publish", "watch"):
         directory = Path(str(config.section(kind)["state_dir"]))
-        if directory != base / kind:  # déjà couvert, avec le même genre, par le dossier de la file
+        if directory.resolve() != (base / kind).resolve():  # déjà couvert, avec le même genre, par le dossier de la file
             roots.append((directory, kind))
     return roots
 
@@ -564,13 +564,19 @@ def _scan_watched(workspace_root: Path, state_roots: list[tuple[Path, str | None
     if workspace_root.is_dir():
         for p in workspace_root.glob(f"*/{pipeline.STATE_FILE}"):
             found.append((p, "video", p.parent.name))
-    for state_root, fixed_kind in state_roots:
+    seen: set[Path] = set()
+    # Racines à genre fixe d'abord : un fichier qu'elles contiennent garde ce genre, même sous la racine de la file.
+    for state_root, fixed_kind in sorted(state_roots, key=lambda root: root[1] is None):
         if not state_root.is_dir():
             continue
         for p in state_root.rglob("*.json"):
             kind, id_ = (fixed_kind, p.stem) if fixed_kind else _state_kind_and_id(p, state_root)
             if (kind, id_) == ("worker", "worker"):  # battement du worker : réécrit en continu, lu par le polling du tableau de bord
                 continue
+            key = p.resolve()
+            if key in seen:
+                continue
+            seen.add(key)
             found.append((p, kind, id_))
     return found
 

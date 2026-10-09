@@ -728,11 +728,15 @@ def proposals(config: Config | None) -> list[dict[str, Any]]:
 def _retention(config: Config | None, settings: dict[str, Any]) -> dict[str, Any]:
     """Tableau de retention a maturite (une ligne par clip scored, meilleure part vue d'abord) ; aucune correlation."""
     journal_path = (config.section("outcomes") if config is not None else outcomes.CONFIG_DEFAULTS)["journal_path"]
+    try:
+        entries = outcomes.read(journal_path)
+    except (OSError, ValueError) as exc:  # JSONDecodeError (ligne tronquée) inclus : jamais ignoré
+        raise LearningError(f"journal des résultats illisible ({journal_path}) : {exc}") from exc
     rows = [{"video_id": e["video_id"], "clip_id": e["clip_id"], "duration": e.get("duration"),
              "watched_full": (e.get("stats") or {}).get("watched_full"), "pct_watched": e.get("pct_watched"),
              "views_percentile": (e.get("stats") or {}).get("views_percentile"),
              "moment_source": e.get("moment_source")}
-            for e in outcomes.read(journal_path) if e.get("kind") == "stats"]
+            for e in entries if e.get("kind") == "stats"]
     rows.sort(key=lambda r: (r["pct_watched"] is None, -(r["pct_watched"] or 0), r["video_id"], r["clip_id"]))
     n, minimum = len(rows), settings["retention_min_n"]
     message = f"n = {n}, trop peu pour conclure (minimum {minimum})" if n < minimum else None
