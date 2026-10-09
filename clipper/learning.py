@@ -374,7 +374,12 @@ def _pct_watched(avg_watch_s: Any, duration: Any) -> float | None:
 
 
 def _moment_source(config: Config | None, video_id: str, moment_id: int, cache: dict[str, Any]) -> str | None:
-    source = (_moment(config, video_id, moment_id, cache) or {}).get("source")
+    moment = _moment(config, video_id, moment_id, cache)
+    if moment is None:
+        return None
+    if "source" not in moment:  # moments.json n'écrit ce champ qu'en transcript+action : sans lui, c'est la transcription
+        return "transcript"
+    source = moment["source"]
     return source if source in MOMENT_SOURCES else None
 
 

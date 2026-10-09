@@ -14,6 +14,10 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 - Apprentissage : rétention à maturité par clip. Chaque entrée `stats` du journal porte la durée du clip (sidecar), `pct_watched` (part moyenne vue, null si la durée ou le temps moyen manque) et la source du moment (`transcript` ou `action`, null si inconnue). L'écran Statistiques affiche un tableau trié par part vue, avec un message « n = X, trop peu pour conclure » sous le réglage nommé `[learning] retention_min_n` (défaut 30). Aucune corrélation calculée.
 
+### Corrigé
+
+- Apprentissage : un moment sans champ `source` dans `moments.json` est un moment de transcription ; la source des entrées `stats` n'est plus nulle pour les chaînes en `[moments] candidates = "transcript"`. Les entrées déjà écrites ne sont pas réécrites.
+
 ### Modifié
 
 - Veille : `extract_video_id` et `DownloadError` vivent dans `clipper/workspace.py` (module sans étape) ; `clipper/download.py` les réexporte, et la veille n'importe plus l'étape download (ADR-ca9a).
