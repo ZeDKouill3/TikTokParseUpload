@@ -104,6 +104,12 @@ def _settings(config: Config | None) -> dict[str, Any]:
 # ---------------------------------------------------------------- fichiers et dates
 
 
+def _worker_video_id(item: dict[str, Any]) -> str:
+    """Id que le worker donne à un candidat de la veille : une VOD Twitch (id numérique) a le préfixe ``v``."""
+    video_id = str(item["video_id"])
+    return video_id if item.get("source") != "twitch" or video_id.startswith("v") else f"v{video_id}"
+
+
 def _as_day(day: date | str) -> date:
     if isinstance(day, datetime):
         return day.date()
@@ -225,6 +231,7 @@ class _World:
         self._meta: dict[str, dict[str, Any]] = {}
         self._games: dict[str, str] | None = None
         self._moments: dict[str, dict[int, bool] | None] = {}
+        self.notes: list[str] = []  # fichiers de jour de la veille ignorés, rapportés dans le plan
 
     def meta(self, video_id: str) -> dict[str, Any]:
         if video_id not in self._meta:
@@ -235,13 +242,27 @@ class _World:
         return self._meta[video_id]
 
     def veille_games(self) -> dict[str, str]:
+        """``video_id`` (préfixe ``v`` comme les dossiers du workspace) -> jeu : ``seen.json`` queued d'abord, puis les
+        candidats de chaque ``days/<jour>.json``, le plus récent gagnant. Un fichier illisible est noté, jamais fatal."""
         if self._games is None:
-            seen = _read_json(Path(str(self.config.section("veille")["state_dir"])) / "seen.json", {})
+            veille = Path(str(self.config.section("veille")["state_dir"]))
+            seen = _read_json(veille / "seen.json", {})
             queued = seen.get("queued", []) if isinstance(seen, dict) else []
             self._games = {}
             for item in queued if isinstance(queued, list) else []:
                 if isinstance(item, dict) and item.get("video_id") and item.get("game_name"):
                     self._games.setdefault(item["video_id"], item["game_name"])
+            days = veille / "days"
+            for path in sorted(days.glob("*.json"), reverse=True) if days.is_dir() else []:
+                try:
+                    data = _read_json(path, {})
+                except RepartitionError as exc:
+                    self.notes.append(f"fichier de jour de la veille ignoré : {exc}")
+                    continue
+                candidates = data.get("candidates", []) if isinstance(data, dict) else []
+                for item in candidates if isinstance(candidates, list) else []:
+                    if isinstance(item, dict) and item.get("video_id") and item.get("game_name"):
+                        self._games.setdefault(_worker_video_id(item), item["game_name"])
         return self._games
 
     def source(self, video_id: str) -> dict[str, Any]:
@@ -440,6 +461,7 @@ def _build(day: date, now: datetime, settings: dict[str, Any], config: Config, c
             notes_here.append(f"{len(state['free'])} créneau(x) sans clip : vivier insuffisant")
         plan_accounts.append({"account": state["account"]["id"], "label": state["account"]["label"],
                               "slots": state["slots"], "lines": lines, "notes": notes_here})
+    notes.extend(world.notes)
     return {"day": day.isoformat(), "computed_at": now.isoformat(), "computed_by": computed_by,
             "status": "proposed", "accounts": plan_accounts, "pool": len(pool), "excluded": excluded,
             "notes": notes, "validated_at": None, "created": []}
