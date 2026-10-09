@@ -868,10 +868,10 @@ def _action_candidate(
 
     included = [k for k in range(len(sents)) if sents[k].start >= start - 1e-6 and sents[k].end <= end + 1e-6]
     hook_text, cut, speech = "", "", None
-    # une phrase deja commencee au debut du passage et qui continue dedans
-    # compte pour la mesure de la parole, sans changer l'accroche
-    straddling = [k for k in range(len(sents)) if sents[k].start < start - 1e-6 < sents[k].end]
-    first_word = _first_real_word(sents, straddling + included, word_max_chars, start)
+    # toute phrase qui chevauche le passage compte pour la mesure de la parole
+    # (commencee avant, ou commencee dedans et finie apres), sans changer l'accroche
+    overlapping = [k for k in range(len(sents)) if sents[k].start < end - 1e-6 and sents[k].end > start + 1e-6]
+    first_word = _first_real_word(sents, overlapping, word_max_chars, start)
     if first_word is not None and first_word - start > max_silent_start + 1e-6:
         reason = (
             f"la parole commence trop tard : premier mot a +{first_word - start:.1f} s du debut du passage "
