@@ -221,6 +221,7 @@ class _World:
         self.output = Path(config.output_dir)
         self.publish_dir = config.section("publish")["state_dir"]
         self.presets_dir = config.section("watch")["presets_dir"]
+        self.base_config = config.section("watch")["base_config"]
         self._meta: dict[str, dict[str, Any]] = {}
         self._games: dict[str, str] | None = None
         self._moments: dict[str, dict[int, bool] | None] = {}
@@ -386,7 +387,7 @@ def _build(day: date, now: datetime, settings: dict[str, Any], config: Config, c
     states: list[dict[str, Any]] = []
     for rank, account in enumerate(active):
         planned_entries = [(n, e) for n, e in publish._account_entries(account["id"], world.publish_dir,
-                                                                      world.presets_dir, "config.toml")
+                                                                      world.presets_dir, world.base_config)
                            if (t := _entry_time(e)) is not None and _paris(t).date() == day]
         planned = publish.planned_times(account["id"], state_dir=world.publish_dir, presets_dir=world.presets_dir)
         planned = [t for t in planned if _paris(t).date() == day]
