@@ -5,7 +5,7 @@ slug: moments-un-passage-d-action-prend-comme-parole-e
 title: "Moments : un passage d'action prend comme parole et accroche les mots prononcés dans le passage, même si leur phrase déborde"
 created: 2026-10-09T07:05:36Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/moments.py
   - tests/test_moments_action.py
@@ -16,6 +16,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/6a8b8bd19b35@b7d4672
+    tree: scope/50fcc3b56d6b
+    criteria: 2e46626d4ecb
+    verifier: tests@c7b454d16c90
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---
