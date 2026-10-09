@@ -28,6 +28,7 @@ ALLOWED = {
 # Motifs affichés dans un échec (Violation.why).
 WHY_SYMBOLE = "symbole hors liste ADR-49cd"
 WHY_MODULE = "module d'étape hors liste ADR-49cd"
+WHY_DYNAMIQUE = "import dynamique hors liste ADR-49cd"
 
 
 class Violation(NamedTuple):
@@ -66,6 +67,40 @@ def _dotted(node: ast.Attribute) -> str | None:
         return None
     parts.append(cur.id)
     return ".".join(reversed(parts))
+
+
+# Chargements dynamiques de modules : leur premier argument doit être une
+# constante hors module d'étape, sinon le scan ne peut pas savoir ce qui est chargé.
+DYNAMIC_IMPORTS = frozenset({"importlib.import_module", "import_module", "__import__"})
+
+
+def _dynamic_import_violations(arg: ast.expr, filename: str, line: int, call: str) -> list[Violation]:
+    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+        if arg.value in STEP_MODULES:
+            return [Violation(filename, line, arg.value, WHY_MODULE)]
+        return []
+    return [Violation(filename, line, f"{call}(argument dynamique)", WHY_DYNAMIQUE)]
+
+
+def _getattr_violations(node: ast.Call, filename: str, aliases: dict[str, str]) -> list[Violation]:
+    # getattr(alias, "nom") sur un module d'étape ; getattr(clipper, "nom") pour un module d'étape.
+    if len(node.args) < 2:
+        return []
+    base = node.args[0].id  # type: ignore[attr-defined]  # appelé seulement sur un Name
+    attr = node.args[1]
+    constant = attr.value if isinstance(attr, ast.Constant) and isinstance(attr.value, str) else None
+    if base == "clipper" and base not in aliases:
+        if constant is not None and f"clipper.{constant}" in STEP_MODULES:
+            return [Violation(filename, node.lineno, f"clipper.{constant}", WHY_MODULE)]
+        return []
+    module = aliases.get(base)
+    if module is None:
+        return []
+    if constant is None:
+        return [Violation(filename, node.lineno, f"{module}.(dynamique)", WHY_SYMBOLE)]
+    if module not in ALLOWED or constant not in ALLOWED[module]:
+        return [Violation(filename, node.lineno, f"{module}.{constant}", WHY_SYMBOLE)]
+    return []
 
 
 def scan_source(source: str, filename: str = "<factice>") -> list[Violation]:
@@ -119,6 +154,20 @@ def scan_source(source: str, filename: str = "<factice>") -> list[Violation]:
                 if module in ALLOWED and symbol not in ALLOWED[module]:
                     found.append(Violation(filename, node.lineno, f"{module}.{symbol}", WHY_SYMBOLE))
                 break
+
+    # Passe 3 : chargement dynamique. Un nom non constant ou une constante
+    # désignant un module d'étape est signalé ; getattr et sys.modules aussi.
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and node.args:
+            name = _dotted(node.func) if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", None)
+            if name in DYNAMIC_IMPORTS:
+                found += _dynamic_import_violations(node.args[0], filename, node.lineno, name)
+            elif name == "getattr" and isinstance(node.args[0], ast.Name):
+                found += _getattr_violations(node, filename, aliases)
+            elif name == "sys.modules.get":
+                found += _dynamic_import_violations(node.args[0], filename, node.lineno, name)
+        elif isinstance(node, ast.Subscript) and _dotted(node.value) == "sys.modules":
+            found += _dynamic_import_violations(node.slice, filename, node.lineno, "sys.modules")
 
     # Un même appel peut apparaître sur plusieurs nœuds (a.b.c) : une seule ligne.
     unique = sorted(set(found), key=lambda v: (v.file, v.line, v.symbol))
@@ -210,4 +259,66 @@ def test_import_direct_puis_appel_nu_est_signale_a_l_import():
 def test_modules_hors_etapes_ne_sont_pas_contraints():
     # pipeline n'est pas un module d'étape : ses attributs ne sont pas dans la liste.
     src = "from clipper import pipeline\npipeline.run_video('x')\n"
+    assert scan_source(src, "x.py") == []
+
+
+def test_import_dynamique_a_nom_non_constant_est_detecte():
+    src = 'import importlib\nimportlib.import_module(f"clipper.{x}")\n'
+    found = scan_source(src, "x.py")
+    assert [(v.line, v.why) for v in found] == [(2, WHY_DYNAMIQUE)]
+
+
+def test_import_dynamique_de_module_hors_etapes_passe():
+    src = 'import importlib\nimportlib.import_module("json")\n'
+    assert scan_source(src, "x.py") == []
+
+
+def test_import_dynamique_de_module_d_etape_constant_est_detecte():
+    src = 'import importlib\nimportlib.import_module("clipper.subtitles")\n'
+    found = scan_source(src, "x.py")
+    assert [(v.line, v.symbol, v.why) for v in found] == [(2, "clipper.subtitles", WHY_MODULE)]
+
+
+def test_dunder_import_dynamique_est_detecte():
+    found = scan_source("mod = __import__(nom)\n", "x.py")
+    assert [(v.line, v.why) for v in found] == [(1, WHY_DYNAMIQUE)]
+
+
+def test_getattr_hors_liste_sur_alias_d_etape_est_detecte():
+    src = "from clipper import reframe as rf\ngetattr(rf, 'run')\n"
+    found = scan_source(src, "x.py")
+    assert [(v.line, v.symbol) for v in found] == [(2, "clipper.reframe.run")]
+
+
+def test_getattr_autorise_sur_alias_d_etape_passe():
+    src = "from clipper import reframe as rf\ngetattr(rf, '_settings')\n"
+    assert scan_source(src, "x.py") == []
+
+
+def test_getattr_avec_nom_dynamique_sur_alias_d_etape_est_detecte():
+    src = "from clipper import render as r\ngetattr(r, nom)\n"
+    found = scan_source(src, "x.py")
+    assert [(v.line, v.why) for v in found] == [(2, WHY_SYMBOLE)]
+
+
+def test_getattr_sur_paquet_clipper_visant_une_etape_est_detecte():
+    src = "import clipper\ngetattr(clipper, 'scenes')\n"
+    found = scan_source(src, "x.py")
+    assert [(v.line, v.symbol) for v in found] == [(2, "clipper.scenes")]
+
+
+def test_sys_modules_visant_une_etape_est_detecte():
+    src = "import sys\nsys.modules['clipper.scenes']\n"
+    found = scan_source(src, "x.py")
+    assert [(v.line, v.symbol) for v in found] == [(2, "clipper.scenes")]
+
+
+def test_sys_modules_avec_nom_dynamique_est_detecte():
+    src = "import sys\nsys.modules.get(nom)\n"
+    found = scan_source(src, "x.py")
+    assert [(v.line, v.why) for v in found] == [(2, WHY_DYNAMIQUE)]
+
+
+def test_sys_modules_hors_etapes_passe():
+    src = "import sys\nsys.modules['json']\n"
     assert scan_source(src, "x.py") == []

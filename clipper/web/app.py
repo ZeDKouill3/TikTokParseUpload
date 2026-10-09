@@ -7,11 +7,8 @@ processus ; le traitement passe toujours par la file (clipper.worker)."""
 
 from __future__ import annotations
 
-import ast
 import asyncio
 import hashlib
-import importlib
-import inspect
 import ipaddress
 import json
 import logging
@@ -59,6 +56,7 @@ from clipper.config import (
     VALID_MODES,
     Config,
     ConfigError,
+    _defaults_documentation,
     _section_defaults,
     load_config,
     write_config,
@@ -1183,52 +1181,6 @@ _NEXT_SLOTS = 10
 _LOGO_MAX_BYTES = 5 * _MIB
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 _TYPE_NAMES = {bool: "booléen", int: "entier", float: "nombre", str: "texte", list: "liste"}
-
-
-def _comment_above(lines: list[str], lineno: int) -> str:
-    """Bloc de lignes de commentaire collees juste au-dessus de la ligne
-    ``lineno`` (1-based) du source, sans le « # » ; vide s'il n'y en a pas."""
-    block: list[str] = []
-    index = lineno - 2
-    while index >= 0 and lines[index].strip().startswith("#"):
-        block.insert(0, lines[index].strip().lstrip("#").strip())
-        index -= 1
-    return " ".join(part for part in block if part)
-
-
-_SENTENCE_END = re.compile(r"(?<=[.!?])\s+(?=[A-ZÀ-Ý«\"])")
-
-
-def _split_help(comment: str) -> tuple[str, str]:
-    """Aide d'un reglage : (premiere phrase, reste). La premiere phrase est le
-    texte simple affiche a l'utilisateur ; le reste (references techniques,
-    cas particuliers) est replie dans un « details » cote interface."""
-    parts = _SENTENCE_END.split(comment.strip(), maxsplit=1)
-    return parts[0], parts[1] if len(parts) > 1 else ""
-
-
-def _defaults_documentation(section: str) -> dict[str, dict[str, Any]]:
-    """CONFIG_DEFAULTS de clipper.<section> : pour chaque cle, son defaut et le
-    commentaire place au-dessus dans le source (inspect.getsource + ast : le
-    source n'est lu que pour ses commentaires, jamais evalue). ``comment`` est
-    la premiere phrase (aide simple), ``details`` le reste du commentaire."""
-    defaults = _section_defaults(section)
-    module = importlib.import_module(f"clipper.{section}")
-    lines = inspect.getsource(module).splitlines()
-    comments: dict[str, str] = {}
-    for node in ast.walk(ast.parse("\n".join(lines))):
-        targets = [node.target] if isinstance(node, ast.AnnAssign) else getattr(node, "targets", [])
-        if not any(isinstance(t, ast.Name) and t.id == "CONFIG_DEFAULTS" for t in targets):
-            continue
-        if isinstance(node.value, ast.Dict):
-            for key in node.value.keys:
-                if isinstance(key, ast.Constant) and isinstance(key.value, str):
-                    comments[key.value] = _comment_above(lines, key.lineno)
-    docs: dict[str, dict[str, Any]] = {}
-    for key, value in defaults.items():
-        simple, details = _split_help(comments.get(key, ""))
-        docs[key] = {"default": value, "comment": simple, "details": details}
-    return docs
 
 
 def _check_preset_types(preset: dict[str, Any]) -> None:
