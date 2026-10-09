@@ -3592,3 +3592,62 @@ def test_r4_capture_follows_the_browser_state_dir_setting(tmp_path, monkeypatch)
         env.publish()
 
     assert stop.value.capture.parent == state / "ma_chaine" / "captures" and stop.value.capture.is_file()
+
+
+# -- TASK-05b430f5416e : deux liens de post a legende commune (tronquee) -> l'heure affichee designe le bon
+
+_NOON_LINK = "https://www.tiktok.com/@ma_chaine/video/7300000000000000012"
+_EVENING_LINK = "https://www.tiktok.com/@ma_chaine/video/7300000000000000019"
+_EVENING_UTC = datetime(2026, 10, 3, 17, 30, tzinfo=timezone.utc)  # 19:30 a Paris (heure d'ete)
+
+
+def _two_same_caption_links(env, *, created=("2026-10-03 12:00", "2026-10-03 19:30")):
+    """Liste de Publications : le lien de 12:00 est d'abord, celui de 19:30 ensuite, meme texte tronque."""
+    env.page.content_links = [("Ma legende #un", _NOON_LINK), ("Ma legende #un", _EVENING_LINK)]
+    rows = [_row("7300000000000000012", caption="Ma legende #un #deux", created=created[0]),
+            _row("7300000000000000019", caption="Ma legende #un #deux", created=created[1])]
+    env.page.lists[_sel()["stats"]["row"]] = rows
+
+
+def test_two_posts_with_the_same_caption_pick_the_link_whose_displayed_time_is_the_slot(tmp_path, monkeypatch):
+    env = Env(tmp_path, monkeypatch)
+    _two_same_caption_links(env)
+
+    result = env.publish(mode="scheduled", schedule_at=_EVENING_UTC)
+
+    assert result["post_id"] == "7300000000000000019" and result["post_url"] == _EVENING_LINK
+    assert result["note"] is None
+
+
+def test_same_caption_without_a_readable_time_keeps_the_first_link_and_warns_once(tmp_path, monkeypatch, caplog):
+    env = Env(tmp_path, monkeypatch)
+    _two_same_caption_links(env)
+    env.page.lists[_sel()["stats"]["row"]] = []  # heure non lisible sur la page
+
+    with caplog.at_level("WARNING"):
+        result = env.publish(mode="scheduled", schedule_at=_EVENING_UTC)
+
+    assert result["post_id"] == "7300000000000000012"  # comportement d'origine : le premier lien
+    assert caplog.text.count("portent la légende") == 1  # ambiguite journalisee, jamais devinee en silence
+
+
+def test_same_caption_none_of_whose_times_is_the_slot_keeps_the_first_link_and_warns(tmp_path, monkeypatch, caplog):
+    env = Env(tmp_path, monkeypatch)
+    _two_same_caption_links(env, created=("2026-10-03 12:00", "2026-10-03 09:00"))
+
+    with caplog.at_level("WARNING"):
+        result = env.publish(mode="scheduled", schedule_at=_EVENING_UTC)
+
+    assert result["post_id"] == "7300000000000000012"
+    assert caplog.text.count("portent la légende") == 1
+
+
+def test_a_unique_caption_link_is_taken_without_any_time_check_or_warning(tmp_path, monkeypatch, caplog):
+    env = Env(tmp_path, monkeypatch, page_kwargs={"content_links": [("Ma legende #un", _EVENING_LINK)]})
+    env.page.lists[_sel()["stats"]["row"]] = [_row("7300000000000000019", created="2026-10-03 09:00")]
+
+    with caplog.at_level("WARNING"):
+        result = env.publish(mode="scheduled", schedule_at=_EVENING_UTC)
+
+    assert result["post_id"] == "7300000000000000019"
+    assert "portent la légende" not in caplog.text
