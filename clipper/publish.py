@@ -597,6 +597,48 @@ def mark_failed(
     return entry
 
 
+def resolve_to_verify(
+    video_id: str,
+    clip_id: str,
+    channel: str,
+    *,
+    post_id: str,
+    post_url: str | None,
+    account: str | None,
+    note: str,
+    now: datetime | None = None,
+    state_dir: str | Path | None = None,
+    output_dir: str | Path = "output",
+) -> bool:
+    """Une entree ``failed`` + ``to_verify`` (programmation sans id de post, ``mark_failed``) dont le post est
+    retrouve dans un releve complet du compte repasse en ``published`` / ``scheduled_on_tiktok`` avec son id et
+    son adresse ; ``to_verify`` est retire. Jamais de reprogrammation. Vrai seulement si l'entree etait encore
+    « a verifier » (le worker ne journalise qu'une fois), faux sinon."""
+    path = _state_path(channel, state_dir)
+    with _locked(path):
+        entries = _load_entries(path)
+        entry = _find_entry(entries, video_id, clip_id)
+        if entry is None or entry["status"] != "failed" or not entry.get("to_verify"):
+            return False
+        entry = dict(entry)
+        publish_at = entry.get("slot_at")
+        entry.update(status="published", published_at=_iso(_now(now)), error=None, capture=None, halted=False,
+                     to_verify=False, waiting_reason=None, in_progress_since=None, tiktok_state="scheduled_on_tiktok",
+                     post_url=post_url, post_id=str(post_id), tiktok_publish_at=publish_at, post_note=note,
+                     service="tiktok")
+        _upsert_entry(entries, entry)
+        _save_entries(path, entries)
+    try:
+        sidecar = _read_sidecar(output_dir, video_id, clip_id)
+        sidecar["tiktok_post"] = {"url": post_url, "id": str(post_id), "state": "scheduled_on_tiktok",
+                                  "publish_at": publish_at, "account": account, "note": note}
+        _write_sidecar(output_dir, video_id, clip_id, sidecar)
+    except (OSError, PublishError) as exc:
+        log.error("%s/%s : post retrouvé (%s) mais sidecar non réécrit : %s ; l'entrée reste publiée",
+                  video_id, clip_id, post_url or post_id, exc)
+    return True
+
+
 def flag_missing_on_tiktok(
     video_id: str,
     clip_id: str,

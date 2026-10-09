@@ -812,6 +812,73 @@ def test_a_post_link_lookup_that_breaks_never_turns_a_proved_publication_into_a_
     assert result["state"] == "published" and result["post_url"] is None and "lien" in result["note"]
 
 
+OTHER_LINKS = [("Une autre legende", "https://www.tiktok.com/@ma_chaine/video/7299999999999999999")]
+
+
+def _lookups(page):
+    return [c for c in page.calls if c == ("wait", _sel()["stats"]["post_link"])]
+
+
+def _lookup_polls(page, ms):
+    return [c for c in page.calls if c == ("poll", ms)]
+
+
+def test_the_post_link_is_read_again_until_the_new_post_appears(tmp_path, monkeypatch, caplog):
+    env = Env(tmp_path, monkeypatch, page_kwargs={"content_links": OTHER_LINKS})
+    page = env.page
+    # 1er et 2e relevé : le post programmé n'est pas encore listé ; il apparaît avant le 3e
+    page.timeline = [lambda: None, lambda: setattr(page, "content_links", [("Ma legende #un #deux", LINK)])]
+
+    with caplog.at_level("INFO"):
+        result = env.publish(mode="scheduled", schedule_at=datetime(2026, 10, 3, 18, 0, tzinfo=timezone.utc))
+
+    assert result["post_id"] == "7300000000000000001" and result["post_url"] == LINK
+    assert len(_lookups(page)) == 3  # trois essais
+    assert len(_lookup_polls(page, 10000)) == 2  # [tiktok] post_lookup_interval_s = 10 entre deux essais
+    assert "3 essai(s)" in caplog.text and "20 s" in caplog.text
+
+
+def test_a_post_that_never_appears_is_left_unfound_after_the_lookup_timeout(tmp_path, monkeypatch, caplog):
+    env = Env(tmp_path, monkeypatch, page_kwargs={"content_links": OTHER_LINKS})
+
+    with caplog.at_level("INFO"):
+        result = env.publish(mode="scheduled", schedule_at=datetime(2026, 10, 3, 18, 0, tzinfo=timezone.utc))
+
+    assert result["post_id"] is None and result["post_url"] is None  # jamais d'id inventé (ADR-ad2e)
+    assert result["state"] == "scheduled_on_tiktok"
+    assert len(_lookups(env.page)) == 7  # 1 essai + un par intervalle de 10 s dans 60 s
+    assert len(_lookup_polls(env.page, 10000)) == 6
+    assert "7 essai(s)" in caplog.text and "60 s" in caplog.text
+
+
+def test_the_lookup_interval_and_timeout_are_settings(tmp_path, monkeypatch):
+    env = Env(tmp_path, monkeypatch, page_kwargs={"content_links": OTHER_LINKS},
+              settings={"post_lookup_interval_s": 5, "post_lookup_timeout_s": 10})
+
+    env.publish()
+
+    assert len(_lookups(env.page)) == 3 and len(_lookup_polls(env.page, 5000)) == 2
+
+
+def test_a_zero_lookup_timeout_reads_the_page_once(tmp_path, monkeypatch):
+    env = Env(tmp_path, monkeypatch, page_kwargs={"content_links": OTHER_LINKS}, settings={"post_lookup_timeout_s": 0})
+
+    result = env.publish()
+
+    assert result["post_id"] is None and len(_lookups(env.page)) == 1
+
+
+def test_lookup_settings_have_defaults_and_invalid_values_are_refused(tmp_path):
+    assert tiktok.CONFIG_DEFAULTS["post_lookup_interval_s"] == 10
+    assert tiktok.CONFIG_DEFAULTS["post_lookup_timeout_s"] == 60
+    for bad in ({"post_lookup_interval_s": 0}, {"post_lookup_interval_s": "x"}, {"post_lookup_timeout_s": -1},
+                {"post_lookup_timeout_s": True}):
+        config = Config(mode="review", workspace_dir=tmp_path / "w", output_dir=tmp_path / "o",
+                        _sections={"tiktok": bad})
+        with pytest.raises(tiktok.TikTokError, match=r"\[tiktok\] post_lookup_"):
+            tiktok.get_settings(config)
+
+
 def test_clip_payload_reads_mp4_caption_and_hashtags_from_the_sidecar(tmp_path):
     clip = tiktok.clip_payload({"video_id": "aaaaaaaaaaa", "clip_id": "01", "caption": "c", "hashtags": ["#a"]}, tmp_path)
     assert clip == {"video_path": tmp_path / "aaaaaaaaaaa" / "01.mp4", "caption": "c", "hashtags": ["#a"]}

@@ -3767,6 +3767,83 @@ def test_a_snapshot_that_shows_the_scheduled_post_flags_nothing(tmp_path, monkey
     assert "missing_on_tiktok" not in _entries(tmp_path, NO_CHANNEL)[0]
 
 
+def _to_verify(tmp_path, clip_id="01", failed_at=None):
+    """Entrée « à vérifier » (TASK-466e961c71bf) : programmation partie, aucun post retrouvé, entrée failed."""
+    _manual(tmp_path, clip_id, datetime.now(timezone.utc) + timedelta(days=1), mode="scheduled", status="failed",
+            to_verify=True, halted=False, post_id=None, post_url=None, error="programmation à vérifier : ...",
+            failed_at=(failed_at or _ago(hours=3)).isoformat())
+
+
+_SHOWN = {"post_id": "7300000000000000009", "post_url": "https://www.tiktok.com/@a/video/7300000000000000009",
+          "caption": "legende 01 #a #b", "posted_at": None}
+
+
+def test_a_to_verify_entry_found_in_a_later_full_snapshot_becomes_scheduled_on_tiktok(tmp_path, monkeypatch, caplog):
+    config = _pub_env(tmp_path, monkeypatch)
+    _to_verify(tmp_path)
+    _write_snapshot(tmp_path, "ef34ab", _ago(hours=1), posts=[_SHOWN])
+    w = _reconcile_worker(config)
+
+    with caplog.at_level(logging.INFO):
+        w.tick()
+        w.tick()
+
+    entry = _entries(tmp_path, NO_CHANNEL)[0]
+    assert entry["status"] == "published" and entry["tiktok_state"] == "scheduled_on_tiktok"
+    assert entry["post_id"] == "7300000000000000009" and entry["post_url"] == _SHOWN["post_url"]
+    assert "to_verify" not in entry or entry["to_verify"] is False
+    assert entry["error"] is None and entry["halted"] is False
+    assert caplog.text.count("retrouvée sur TikTok") == 1  # journal info une seule fois
+    sidecar = json.loads((tmp_path / "output" / "aaaaaaaaaaa" / "01.json").read_text(encoding="utf-8"))
+    assert sidecar["tiktok_post"]["id"] == "7300000000000000009"
+
+
+def test_a_to_verify_entry_is_never_rescheduled_when_reconciled(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    _to_verify(tmp_path)
+    _write_snapshot(tmp_path, "ef34ab", _ago(hours=1), posts=[_SHOWN])
+    pub = FakePublisher()
+
+    _pub_worker(config, pub).tick()
+
+    assert pub.calls == []
+
+
+def test_a_to_verify_entry_absent_from_the_later_snapshot_stays_to_verify(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    _to_verify(tmp_path)
+    _write_snapshot(tmp_path, "ef34ab", _ago(hours=1), posts=[{**_SHOWN, "caption": "une autre legende"}])
+
+    _reconcile_worker(config).tick()
+
+    entry = _entries(tmp_path, NO_CHANNEL)[0]
+    assert entry["status"] == "failed" and entry["to_verify"] is True and not entry.get("post_id")
+
+
+def test_a_to_verify_entry_is_unchanged_by_an_older_or_partial_snapshot(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    _to_verify(tmp_path, failed_at=_ago(hours=3))
+    _write_snapshot(tmp_path, "ef34ab", _ago(hours=5), origin="full", posts=[_SHOWN])  # avant la programmation
+    _write_snapshot(tmp_path, "ef34ab", _ago(hours=1), origin="opportunistic", posts=[_SHOWN])  # releve partiel
+
+    _reconcile_worker(config).tick()
+
+    entry = _entries(tmp_path, NO_CHANNEL)[0]
+    assert entry["status"] == "failed" and entry["to_verify"] is True
+
+
+def test_a_failed_entry_that_is_not_to_verify_is_never_reconciled(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    _to_verify(tmp_path)
+    path = tmp_path / "state" / "publish" / f"{NO_CHANNEL}.json"
+    path.write_text(json.dumps([{**_entries(tmp_path, NO_CHANNEL)[0], "to_verify": False}]), encoding="utf-8")
+    _write_snapshot(tmp_path, "ef34ab", _ago(hours=1), posts=[_SHOWN])
+
+    _reconcile_worker(config).tick()
+
+    assert _entries(tmp_path, NO_CHANNEL)[0]["status"] == "failed"
+
+
 def test_an_opportunistic_or_older_snapshot_flags_nothing(tmp_path, monkeypatch):
     config = _pub_env(tmp_path, monkeypatch)
     _scheduled_without_id(tmp_path, published_at=_ago(hours=3))

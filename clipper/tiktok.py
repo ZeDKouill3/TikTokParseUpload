@@ -79,6 +79,8 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "stats_audience_min_views": 100,   # Spectateurs / Engagement : TikTok ne les remplit qu'a partir de 100 vues
     "stats_scroll_rounds": 100,        # limite de securite : pas de defilement de la liste des Publications (~5 posts chacun) ; atteinte = arret journalise
     "stats_empty_wait_s": 8,           # attente des lignes (ou de l'etat vide) de la page Publications avant de conclure « aucun post »
+    "post_lookup_interval_s": 10,      # apres une publication prouvee, le post n'est pas encore liste : intervalle entre deux relectures de la page Publications
+    "post_lookup_timeout_s": 60,       # delai total de ces relectures avant de conclure « a verifier » (0 = une seule lecture)
 }
 
 MODES = ("immediate", "scheduled")
@@ -151,6 +153,10 @@ def get_settings(config: Config | None) -> dict[str, Any]:
         raise TikTokError(f"[tiktok] stats_dir invalide : {settings['stats_dir']!r} (un chemin est attendu)")
     for key, minimum in (("stats_stale_min", 0), ("stats_detail_days", 0), ("stats_detail_max", 0),
                          ("stats_scroll_rounds", 1), ("stats_empty_wait_s", 0), ("stats_audience_min_views", 0)):
+        value = settings[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < minimum:
+            raise TikTokError(f"[tiktok] {key} invalide : {value!r} (un nombre >= {minimum} est attendu)")
+    for key, minimum in (("post_lookup_interval_s", 1), ("post_lookup_timeout_s", 0)):
         value = settings[key]
         if isinstance(value, bool) or not isinstance(value, (int, float)) or value < minimum:
             raise TikTokError(f"[tiktok] {key} invalide : {value!r} (un nombre >= {minimum} est attendu)")
@@ -1000,9 +1006,33 @@ class _Flow:
 
     def find_post_link(self, clip: dict[str, Any]) -> tuple[str | None, str | None]:
         """Page Publications : le premier lien de post dont le texte est le debut de la legende publiee.
-        Rend (adresse complete, id) ou (None, raison). Ne leve jamais : la publication est deja prouvee."""
+        Rend (adresse complete, id) ou (None, raison). Ne leve jamais : la publication est deja prouvee.
+        TikTok liste le nouveau post avec retard : tant qu'il manque, la page est rechargee toutes les
+        ``post_lookup_interval_s`` pendant au plus ``post_lookup_timeout_s`` (temps d'attente des essais compris)."""
+        interval, timeout = float(self.settings["post_lookup_interval_s"]), float(self.settings["post_lookup_timeout_s"])
+        waited, attempts = 0.0, 0
+        while True:
+            attempts += 1
+            url, found, spent = self._lookup_post_link(clip, reload=attempts > 1)
+            broken, waited = spent < 0, waited + max(spent, 0.0)
+            if url is not None:
+                if attempts > 1:
+                    logger.info("TikTok %s : post retrouvé sur la page Publications après %d essai(s), %g s",
+                                self.account, attempts, waited)
+                return url, found
+            if broken or waited + interval > timeout:  # lecture cassee (pas de nouvel essai) ou delai epuise
+                logger.warning("TikTok %s : post introuvable sur la page Publications après %d essai(s), %g s "
+                               "([tiktok] post_lookup_timeout_s = %g) : %s", self.account, attempts, waited,
+                               timeout, found)
+                return None, found
+            self.page.wait_for_timeout(interval * 1000)
+            waited += interval
+
+    def _lookup_post_link(self, clip: dict[str, Any], *, reload: bool) -> tuple[str | None, str | None, float]:
+        """Un essai de ``find_post_link`` : (adresse, id) ou (None, raison), et le temps d'attente de la page
+        consomme (negatif : l'essai a casse, inutile de recommencer)."""
         try:
-            if not str(self.page.url).startswith(self.sel["expect"]["stats_url_prefix"]):
+            if reload or not str(self.page.url).startswith(self.sel["expect"]["stats_url_prefix"]):
                 self.page.goto(self.sel["urls"]["stats"])
             selector = self.sel["stats"]["post_link"]
             try:
@@ -1010,17 +1040,18 @@ class _Flow:
             except Exception as exc:
                 if "Timeout" not in type(exc).__name__:
                     raise
-                return None, f"aucun lien de post affiché après {float(self.settings['action_timeout_s']):g} s"
+                spent = float(self.settings["action_timeout_s"])
+                return None, f"aucun lien de post affiché après {spent:g} s", spent
             self.harvest()
             published = _squash(" ".join([clip["caption"], *clip["hashtags"]]))
             for link in self.page.query_selector_all(selector):
                 text = _squash(str(link.inner_text())).rstrip("….").rstrip()
                 href = link.get_attribute("href") or ""
                 if text and (published.startswith(text) or text.startswith(published)) and _POST_ID_END.search(href):
-                    return urljoin(str(self.page.url), href), _POST_ID_END.search(href).group(1)
-            return None, "aucun lien dont le texte correspond à la légende publiée"
+                    return urljoin(str(self.page.url), href), _POST_ID_END.search(href).group(1), 0.0
+            return None, "aucun lien dont le texte correspond à la légende publiée", 0.0
         except Exception as exc:  # noqa: BLE001 - dit dans la note, jamais avale
-            return None, f"{type(exc).__name__} : {exc}"
+            return None, f"{type(exc).__name__} : {exc}", -1.0
 
     # -- releve des statistiques (SPEC-86fe R1) : lecture seule, aucun clic hors le menu des periodes
     def stats(self, previous: dict[str, dict[str, Any]], full: bool = False) -> dict[str, Any]:

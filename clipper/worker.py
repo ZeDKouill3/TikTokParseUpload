@@ -828,6 +828,9 @@ class Worker:
             last_full: dict[str, datetime | None] = {}
             for name in [*channel_mod.list_channels(watch["presets_dir"]), publish_mod.NO_CHANNEL]:
                 for entry in publish_mod.list_entries(name, state_dir=state_dir):
+                    if entry["status"] == "failed" and entry.get("to_verify"):
+                        self._reconcile_to_verify(entry, name, state_dir)
+                        continue
                     if (entry["status"] != "published" or entry.get("tiktok_state") != "scheduled_on_tiktok"
                             or entry.get("post_id") or entry.get("missing_on_tiktok")):
                         continue
@@ -860,6 +863,31 @@ class Worker:
             if message not in self._logged_publish_errors:
                 self._logged_publish_errors.add(message)
                 log.error(message)
+
+    def _reconcile_to_verify(self, entry: dict[str, Any], name: str, state_dir: str | Path) -> None:
+        """Une entree ``failed`` « a verifier » (programmation sans id de post retrouve) dont la legende (meme regle
+        que ``find_post_link``) apparait dans un releve COMPLET du compte posterieur a l'echec repasse en
+        ``scheduled_on_tiktok`` avec l'id et l'adresse du releve, journal info une fois. Jamais reprogrammee."""
+        account = publish_mod.entry_account(entry)
+        failed_at = tiktok._naive_utc(entry.get("failed_at"))
+        if not account or failed_at is None:
+            return
+        history = [s for s in tiktok.read_history(account, config=self.config)
+                   if s.get("origin") == "full" and tiktok._naive_utc(s["fetched_at"]) > failed_at]
+        if not history:
+            return  # aucun releve complet posterieur : rien a conclure
+        sidecar = publish_mod.read_sidecar(self.config.output_dir, entry["video_id"], entry["clip_id"])
+        wanted = tiktok._squash(" ".join([str(sidecar.get("caption") or ""), *map(str, sidecar.get("hashtags") or [])]))
+        for post in tiktok.merged_posts(history).values():
+            if post.get("post_id") and _caption_shown(wanted, post.get("caption")):
+                note = "programmation retrouvée dans le relevé de TikTok Studio (rapprochement automatique)"
+                if publish_mod.resolve_to_verify(
+                        entry["video_id"], entry["clip_id"], name, post_id=str(post["post_id"]),
+                        post_url=post.get("post_url"), account=account, note=note, state_dir=state_dir,
+                        output_dir=self.config.output_dir):
+                    log.info("%s/%s : programmation retrouvée sur TikTok (post %s) : « à vérifier » levé",
+                             entry["video_id"], entry["clip_id"], post["post_id"])
+                return
 
     def _service_settings(self, service: str, cache: dict[str, dict[str, Any]]) -> dict[str, Any]:
         """Reglages [tiktok] ou [youtube] du service d'un compte, lus (et valides) une fois par passage."""
