@@ -1487,12 +1487,42 @@ def test_title_repair_attempts_overrides_llm_repair_attempts_for_captions(worksp
 
 
 def test_negative_title_repair_attempts_is_refused_explicitly(workspace, tmp_path):
-    from clipper.captions import run as run_captions
+    from clipper.captions import CaptionsError, run as run_captions
 
     _single_moment(workspace)
     fake = FakeBackend([answer()])
 
-    with llm.use_backend(fake), pytest.raises(llm.LLMError, match="repair_attempts"):
+    with llm.use_backend(fake), pytest.raises(CaptionsError, match="title_repair_attempts"):
         run_captions(VIDEO_ID, workspace, config=make_config(tmp_path, title_repair_attempts=-1))
 
     assert fake.calls == []
+
+
+# --------------------------------------------------------------------------
+# [captions] title_repair_attempts : validé en tête d'étape (entier >= 0)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("value", [2.7, "abc", True, -1])
+def test_invalid_title_repair_attempts_is_an_error_naming_the_setting_before_any_llm_call(workspace, tmp_path, value):
+    from clipper.captions import CaptionsError, run as run_captions
+
+    write_moments(workspace, moment(0))
+    write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
+    fake = FakeBackend([answer()])
+
+    with llm.use_backend(fake), pytest.raises(CaptionsError, match="title_repair_attempts"):
+        run_captions(VIDEO_ID, workspace, config=make_config(tmp_path, title_repair_attempts=value))
+
+    assert fake.calls == []
+
+
+@pytest.mark.parametrize("value", [0, 3])
+def test_valid_title_repair_attempts_is_accepted(workspace, tmp_path, value):
+    write_moments(workspace, moment(0))
+    write_parts(workspace, parts_record(0, "single", 1, [part(1, 0.0, 3.9)]))
+
+    fake, _ = run(workspace, make_config(tmp_path, title_repair_attempts=value), [answer()])
+
+    assert len(fake.calls) == 1
+    assert by_id(read_captions(workspace), "00")["title"] == "Titre choc"

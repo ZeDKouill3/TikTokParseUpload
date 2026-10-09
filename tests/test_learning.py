@@ -1381,3 +1381,12 @@ def test_run_if_due_logs_zero_view_alerts(tmp_path, monkeypatch):
     learning.run_if_due(NOW, config=config)
 
     assert calls == ["alerte"]
+
+
+def test_truncated_outcomes_journal_is_an_explicit_error_naming_the_file(tmp_path):
+    config = _config(tmp_path)
+    journal = Path(config.section("outcomes")["journal_path"])
+    journal.write_text('{"kind": "stats", "video_id": "VVVVVVVVVVV"\n', encoding="utf-8")
+
+    with pytest.raises(learning.LearningError, match="outcomes.jsonl"):
+        learning.status(config)

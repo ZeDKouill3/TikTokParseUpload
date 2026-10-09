@@ -657,6 +657,14 @@ def _apply_cta_line(clips: list[dict[str, Any]], settings: dict[str, Any]) -> No
                     seen.add(tag.lower())
 
 
+def title_repair_attempts(settings: dict[str, Any]) -> int:
+    """Nombre de relances LLM d'un titre ; < 0, non entier ou booleen : CaptionsError qui le nomme (ADR-ad2e)."""
+    value = settings["title_repair_attempts"]
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise CaptionsError(f"[captions] title_repair_attempts doit etre un entier >= 0, recu {value!r}")
+    return value
+
+
 def parallel_workers(settings: dict[str, Any]) -> int:
     """Nombre de moments traites en parallele ; < 1 : CaptionsError qui le nomme."""
     value = settings["parallel"]
@@ -710,7 +718,7 @@ def _process_moment(
         prompt = _prompt(language, video_title, source, part, parts_total, text, settings,
                           screen_title=screen_title, title=title, channel=channel)
         answer = llm.ask("captions", prompt, [], schema, config=config, check=check, log_path=log_path,
-                         repair_attempts=int(settings["title_repair_attempts"]))
+                         repair_attempts=title_repair_attempts(settings))
         if request_screen_title:
             screen_title = answer["screen_title"]
         if request_title:
@@ -757,6 +765,7 @@ def run(
     transcript = _read_json(video_dir / "transcript.json")
     meta = _read_json(video_dir / "meta.json", optional=True) or {}
     settings = _settings(config)
+    title_repair_attempts(settings)  # refusé ici, avant tout appel LLM
     workers = parallel_workers(settings)
     language = transcript.get("language") or ""
     video_title = meta.get("title") or ""
