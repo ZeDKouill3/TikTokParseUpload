@@ -9359,7 +9359,8 @@ def test_get_learning_returns_state_weights_and_every_proposal_with_both_perspec
     with llm.use_backend(fake):
         data = c.get("/api/learning").json()
 
-    assert set(data) == {"enabled", "links", "sync", "weights", "coach", "retention"} and data["enabled"] is True
+    assert set(data) == {"enabled", "links", "sync", "weights", "coach", "retention", "breakdown"} and data["enabled"] is True
+    assert set(data["breakdown"]) == {"n", "min_n", "skipped", "groups"} and set(data["breakdown"]["groups"]) == {"game", "streamer", "hour", "account"}
     assert data["links"]["counts"]["compte_a"]["linked"] == 3 and data["sync"]["last_error"]["message"] == "boom"
     assert data["weights"]["judges"]["retention"]["weight"] == 1.2
     by_judge = {p["judge"]: p for p in data["coach"]}
@@ -9525,6 +9526,60 @@ def test_the_learning_section_says_so_when_nothing_is_known_yet():
 def test_a_failed_learning_read_is_shown_not_hidden():
     html = _learning_screen_run('(statsUi.learningError = new Error("illisible"), statsLearningSection())', _FABRICATED)
     assert "Lecture impossible" in html and "illisible" in html
+
+
+_BREAKDOWN = {
+    "n": 9, "min_n": 5, "skipped": 1,
+    "groups": {
+        "game": [
+            {"key": "Zelda", "label": "Zelda", "n": 6, "median_views": 12345, "median_pct_watched": 0.456,
+             "best": {"video_id": "v111", "clip_id": "03", "views": 99000}, "few": False},
+            {"key": "inconnu", "label": "jeu inconnu", "n": 3, "median_views": 40, "median_pct_watched": None,
+             "best": {"video_id": "v222", "clip_id": "01", "views": 77}, "few": True},
+        ],
+        "streamer": [{"key": "Alice <b>", "label": "Alice <b>", "n": 9, "median_views": 777, "median_pct_watched": None,
+                      "best": {"video_id": "v111", "clip_id": "03", "views": 99000}, "few": False}],
+        "hour": [{"key": "21", "label": "21 h", "n": 9, "median_views": 555, "median_pct_watched": None,
+                  "best": {"video_id": "v111", "clip_id": "03", "views": 99000}, "few": False}],
+        "account": [{"key": "compte_a", "label": "compte_a", "n": 9, "median_views": 333, "median_pct_watched": None,
+                     "best": {"video_id": "v111", "clip_id": "03", "views": 99000}, "few": False}],
+    },
+}
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node absent du PATH")
+def test_the_stats_screen_renders_the_four_breakdown_tables_with_few_and_best_clip_link():
+    html = _learning_screen_run("(statsUi.learning = { ...data, breakdown: " + json.dumps(_BREAKDOWN) + " }, statsLearningSection())",
+                                _FABRICATED)
+
+    assert "Ce qui marche" in html
+    for name in ("game", "streamer", "hour", "account"):
+        assert f'data-breakdown="{name}"' in html
+    for title in ("Jeu", "Streamer", "Heure", "Compte"):
+        assert f">{title}<" in html
+    # lignes telles que rendues par le serveur : n, vues médianes, part vue médiane, libellés échappés
+    assert "Zelda" in html and "45,6 %" in html and ("12 345" in html or "12 345" in html)
+    assert "21 h" in html and "compte_a" in html and "Alice &lt;b>" in html
+    # meilleur clip : lien vers la fiche clip
+    assert 'href="#/clips/v111"' in html and 'href="#/clips/v222"' in html
+    # « trop peu pour conclure » seulement sur la ligne few, jamais masquée
+    assert html.count("trop peu pour conclure") == 1 and "jeu inconnu" in html
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node absent du PATH")
+def test_the_breakdown_section_says_no_mature_stats_when_empty():
+    empty = {"n": 0, "min_n": 5, "skipped": 0, "groups": {"game": [], "streamer": [], "hour": [], "account": []}}
+    html = _learning_screen_run("(statsUi.learning = { ...data, breakdown: " + json.dumps(empty) + " }, statsLearningSection())",
+                                _FABRICATED)
+
+    assert "Ce qui marche" in html and "aucun relevé mûr" in html and "trop peu pour conclure" not in html
+
+
+def test_the_breakdown_block_computes_no_median_in_the_page():
+    js = _static("screens", "stats.js")
+    block = js[js.index("function learningBreakdownBlock"):js.index("function statsLearningSection")]
+    assert "median(" not in block.replace("median_views", "").replace("median_pct_watched", "")
+    assert "sort(" not in block and "reduce(" not in block and "Math." not in block
 
 
 def test_the_stats_screen_reads_learning_and_wires_adopt_and_refuse():

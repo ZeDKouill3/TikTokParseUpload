@@ -1426,3 +1426,175 @@ def test_truncated_outcomes_journal_is_an_explicit_error_naming_the_file(tmp_pat
 
     with pytest.raises(learning.LearningError, match="outcomes.jsonl"):
         learning.status(config)
+
+
+# ---------------------------------------------------------------- vues médianes par jeu, streamer, heure, compte (TASK-3034e047c2d4)
+
+def _bd_config(tmp_path, **learning_overrides) -> Config:
+    config = _config(tmp_path, **learning_overrides)
+    config._sections["veille"] = {"state_dir": str(tmp_path / "veille")}
+    return config
+
+
+def _bd_meta(config, video, **fields):
+    path = Path(config.workspace_dir) / video / "meta.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(fields), encoding="utf-8")
+
+
+def _bd_day(tmp_path, day, candidates):
+    path = tmp_path / "veille" / "days" / f"{day}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"date": day, "candidates": candidates}), encoding="utf-8")
+
+
+def _bd_row(config, video, clip, views, *, account="acc1", posted_at="2026-10-01 14:30", pct=None, **extra):
+    stats = {"views_at_maturity": views, "views": views}
+    outcomes._append({"kind": "stats", "video_id": video, "clip_id": clip, "moment_id": 1, "post_id": f"{video}{clip}",
+                      "account": account, "posted_at": posted_at, "pct_watched": pct, "stats": stats, **extra},
+                     config.section("outcomes")["journal_path"])
+
+
+def _groups(config, name):
+    return {g["key"]: g for g in learning.breakdown(config)["groups"][name]}
+
+
+def test_breakdown_min_n_declared():
+    assert learning.CONFIG_DEFAULTS["breakdown_min_n"] == 5
+
+
+def test_breakdown_median_exact_best_clip_and_sort(tmp_path):
+    config = _bd_config(tmp_path)
+    _bd_meta(config, "vA", game="Zelda", channel="Alice")
+    _bd_meta(config, "vB", game="Mario", channel="Bob")
+    for clip, views in (("01", 100), ("02", 400), ("03", 200), ("04", 1000)):
+        _bd_row(config, "vA", clip, views, pct=0.5 if clip == "01" else None)
+    _bd_row(config, "vB", "01", 900)
+
+    result = learning.breakdown(config)
+
+    assert result["n"] == 5 and result["min_n"] == 5 and result["skipped"] == 0
+    games = result["groups"]["game"]
+    assert [g["key"] for g in games] == ["Mario", "Zelda"]  # 900 puis médiane (200+400)/2 = 300
+    zelda = games[1]
+    assert zelda == {"key": "Zelda", "label": "Zelda", "n": 4, "median_views": 300, "median_pct_watched": 0.5,
+                     "best": {"video_id": "vA", "clip_id": "04", "views": 1000}, "few": True}
+    assert games[0]["median_pct_watched"] is None
+    assert {g["key"] for g in result["groups"]["streamer"]} == {"Alice", "Bob"}
+    assert set(result["groups"]) == {"game", "streamer", "hour", "account"}
+
+
+def test_breakdown_game_from_meta_then_veille_then_unknown_with_v_prefix(tmp_path):
+    config = _bd_config(tmp_path)
+    _bd_meta(config, "v111", game="Meta Game")
+    _bd_meta(config, "v222")  # meta sans jeu : la veille répond
+    _bd_day(tmp_path, "2026-10-05", [{"source": "twitch", "video_id": "111", "game_name": "Veille Ancien"},
+                                      {"source": "twitch", "video_id": "222", "game_name": "Veille Ancien"}])
+    _bd_day(tmp_path, "2026-10-07", [{"source": "twitch", "video_id": "222", "game_name": "Veille Récent"}])
+    for video in ("v111", "v222", "v333"):
+        _bd_row(config, video, "01", 10)
+
+    games = _groups(config, "game")
+
+    assert set(games) == {"Meta Game", "Veille Récent", "inconnu"}
+    assert games["inconnu"]["label"] == "jeu inconnu"
+
+
+def test_breakdown_streamer_from_meta_channel_else_unknown(tmp_path):
+    config = _bd_config(tmp_path)
+    _bd_meta(config, "vA", channel="Alice")
+    _bd_row(config, "vA", "01", 10)
+    _bd_row(config, "vZ", "01", 20)
+
+    streamers = _groups(config, "streamer")
+
+    assert set(streamers) == {"Alice", "inconnu"} and streamers["inconnu"]["label"] == "streamer inconnu"
+
+
+def test_breakdown_hour_is_naive_paris_hour_without_conversion_and_falls_back_to_slot_at(tmp_path):
+    config = _bd_config(tmp_path)
+    _bd_row(config, "vA", "01", 10, posted_at="2026-10-01 23:59")
+    _bd_row(config, "vA", "02", 30, posted_at="2026-10-02 23:05")
+    _bd_row(config, "vA", "03", 50, posted_at=None, slot_at="2026-10-02T08:15:00")
+
+    hours = _groups(config, "hour")
+
+    assert set(hours) == {"23", "08"}
+    assert hours["23"]["n"] == 2 and hours["23"]["median_views"] == 20
+    assert hours["23"]["label"] == "23 h" and hours["08"]["median_views"] == 50
+
+
+def test_breakdown_account_group(tmp_path):
+    config = _bd_config(tmp_path)
+    _bd_row(config, "vA", "01", 10, account="a")
+    _bd_row(config, "vA", "02", 70, account="b")
+
+    assert {k: g["median_views"] for k, g in _groups(config, "account").items()} == {"a": 10, "b": 70}
+
+
+def test_breakdown_few_flag_follows_breakdown_min_n_and_never_hides(tmp_path):
+    config = _bd_config(tmp_path, breakdown_min_n=2)
+    _bd_row(config, "vA", "01", 10, account="a")
+    _bd_row(config, "vA", "02", 20, account="a")
+    _bd_row(config, "vA", "03", 30, account="b")
+
+    accounts = _groups(config, "account")
+
+    assert accounts["a"]["few"] is False and accounts["b"]["few"] is True and accounts["b"]["n"] == 1
+
+
+def test_breakdown_skips_entries_without_views_and_counts_them(tmp_path):
+    config = _bd_config(tmp_path)
+    _bd_row(config, "vA", "01", 100)
+    _bd_row(config, "vA", "02", None)
+    outcomes._append({"kind": "stats", "video_id": "vA", "clip_id": "03", "account": "acc1", "stats": {}},
+                     config.section("outcomes")["journal_path"])
+    outcomes.record("vA", "04", 4, qa=None, human_decision=None, path=config.section("outcomes")["journal_path"])
+
+    result = learning.breakdown(config)
+
+    assert result["n"] == 1 and result["skipped"] == 2
+    assert result["groups"]["account"][0]["median_views"] == 100
+
+
+def test_breakdown_empty_journal_gives_empty_groups(tmp_path):
+    result = learning.breakdown(_bd_config(tmp_path))
+
+    assert result["n"] == 0 and result["groups"] == {"game": [], "streamer": [], "hour": [], "account": []}
+
+
+def test_breakdown_unreadable_journal_is_a_named_error(tmp_path):
+    config = _bd_config(tmp_path)
+    Path(config.section("outcomes")["journal_path"]).write_text("{pas du json\n", encoding="utf-8")
+
+    with pytest.raises(learning.LearningError, match="outcomes.jsonl"):
+        learning.breakdown(config)
+
+
+def test_breakdown_unreadable_meta_or_veille_day_is_a_named_error(tmp_path):
+    config = _bd_config(tmp_path)
+    _bd_row(config, "vA", "01", 10)
+    path = Path(config.workspace_dir) / "vA" / "meta.json"
+    path.parent.mkdir(parents=True)
+    path.write_text("{cassé", encoding="utf-8")
+    with pytest.raises(learning.LearningError, match="meta.json"):
+        learning.breakdown(config)
+    path.write_text("{}", encoding="utf-8")
+    day = tmp_path / "veille" / "days" / "2026-10-01.json"
+    day.parent.mkdir(parents=True)
+    day.write_text("{cassé", encoding="utf-8")
+    with pytest.raises(learning.LearningError, match="2026-10-01.json"):
+        learning.breakdown(config)
+
+
+@pytest.mark.parametrize("bad", [0, -1, 1.5, True, "5"])
+def test_breakdown_min_n_invalid_is_a_named_error(tmp_path, bad):
+    with pytest.raises(learning.LearningError, match="breakdown_min_n"):
+        learning.breakdown(_bd_config(tmp_path, breakdown_min_n=bad))
+
+
+def test_status_carries_the_breakdown(tmp_path):
+    config = _bd_config(tmp_path)
+    _bd_row(config, "vA", "01", 10)
+
+    assert learning.status(config)["breakdown"]["n"] == 1

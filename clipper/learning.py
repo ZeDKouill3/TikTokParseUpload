@@ -12,9 +12,11 @@ from __future__ import annotations
 import json
 import logging
 import re
+import statistics
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from clipper import accounts as accounts_mod
 from clipper import channel as channel_mod
@@ -37,6 +39,7 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "zero_view_alert_hours": 24,  # age (heures depuis la mise en ligne) a partir duquel un post a 0 vue est signale
     "zero_view_alert_max_views": 0,  # vues au plus au dernier releve pour qu'un post soit en alerte
     "zero_view_alert_account_min": 2,  # posts en alerte d'un meme compte pour une alerte au niveau du compte
+    "breakdown_min_n": 5,  # clips mûrs sous ce nombre dans un groupe (jeu, streamer, heure, compte) : « trop peu pour conclure »
     "retention_min_n": 30,  # clips scored sous ce nombre : le tableau de retention est montre avec un avertissement, sans conclusion
 }
 MOMENT_SOURCES = ("transcript", "action")
@@ -59,6 +62,9 @@ def _settings(config: Config | None) -> dict[str, Any]:
     retention_min = settings["retention_min_n"]
     if isinstance(retention_min, bool) or not isinstance(retention_min, int) or retention_min < 1:
         raise LearningError(f"[learning] retention_min_n invalide : {retention_min!r} (un entier >= 1 est attendu)")
+    breakdown_min = settings["breakdown_min_n"]
+    if isinstance(breakdown_min, bool) or not isinstance(breakdown_min, int) or breakdown_min < 1:
+        raise LearningError(f"[learning] breakdown_min_n invalide : {breakdown_min!r} (un entier >= 1 est attendu)")
     days = settings["window_days"]
     if isinstance(days, bool) or not isinstance(days, (int, float)) or days <= 0:
         raise LearningError(f"[learning] window_days invalide : {days!r} (un nombre de jours > 0 est attendu)")
@@ -748,6 +754,114 @@ def _retention(config: Config | None, settings: dict[str, Any]) -> dict[str, Any
     return {"n": n, "min_n": minimum, "message": message, "rows": rows}
 
 
+# ---------------------------------------------------------------- vues médianes par jeu, streamer, heure, compte
+
+_UNKNOWN = "inconnu"
+_BREAKDOWN_LABELS = {"game": "jeu inconnu", "streamer": "streamer inconnu", "hour": "heure inconnue", "account": "compte inconnu"}
+
+
+def _json_file(path: Path, what: str) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise LearningError(f"{what} illisible : {path.name} ({path}) : {exc}") from exc
+
+
+def _veille_days_games(config: Config | None) -> dict[str, str]:
+    """``video_id`` du worker (préfixe ``v`` pour Twitch) -> ``game_name`` des candidats de ``days/*.json``, le jour le plus récent gagnant."""
+    sdir = Path(config.section("veille")["state_dir"] if config is not None else "state/veille")
+    days = sdir / "days"
+    games: dict[str, str] = {}
+    for path in sorted(days.glob("*.json"), reverse=True) if days.is_dir() else []:
+        data = _json_file(path, "jour de la veille")
+        candidates = data.get("candidates", []) if isinstance(data, dict) else []
+        for item in candidates if isinstance(candidates, list) else []:
+            if isinstance(item, dict) and item.get("video_id") and item.get("game_name"):
+                video = str(item["video_id"])
+                if item.get("source") == "twitch" and not video.startswith("v"):
+                    video = f"v{video}"
+                games.setdefault(video, item["game_name"])
+    return games
+
+
+def _post_hour(entry: dict[str, Any]) -> int | None:
+    """Heure pleine de Paris du post : ``posted_at`` des relevés est déjà l'heure de Paris naïve (jamais convertie),
+    sinon ``slot_at`` de l'entrée (converti seulement s'il porte un fuseau)."""
+    for field in ("posted_at", "slot_at"):
+        value = entry.get(field)
+        if not isinstance(value, str) or not value:
+            continue
+        try:
+            moment = datetime.fromisoformat(value)
+        except ValueError:
+            continue
+        if moment.tzinfo is not None:
+            moment = moment.astimezone(ZoneInfo(accounts_mod.DEFAULT_TIMEZONE))
+        return moment.hour
+    return None
+
+
+def _breakdown(config: Config | None, settings: dict[str, Any]) -> dict[str, Any]:
+    journal_path = (config.section("outcomes") if config is not None else outcomes.CONFIG_DEFAULTS)["journal_path"]
+    try:
+        entries = outcomes.read(journal_path)
+    except (OSError, ValueError) as exc:
+        raise LearningError(f"journal des résultats illisible ({journal_path}) : {exc}") from exc
+    workspace = Path(config.workspace_dir) if config is not None else Path("workspace")
+    metas: dict[str, dict[str, Any]] = {}
+    veille_games: dict[str, str] | None = None
+    rows: list[dict[str, Any]] = []
+    skipped = 0
+    for entry in entries:
+        if entry.get("kind") != "stats":
+            continue
+        views = (entry.get("stats") or {}).get("views_at_maturity")
+        if isinstance(views, bool) or not isinstance(views, (int, float)):
+            skipped += 1
+            continue
+        video = entry.get("video_id")
+        if video not in metas:
+            path = workspace / str(video) / "meta.json"
+            data = _json_file(path, "meta.json") if path.exists() else {}
+            metas[video] = data if isinstance(data, dict) else {}
+        meta = metas[video]
+        game = meta.get("game") or None
+        if game is None:
+            if veille_games is None:
+                veille_games = _veille_days_games(config)
+            game = veille_games.get(video)
+        hour = _post_hour(entry)
+        keys = {"game": game, "streamer": meta.get("channel") or None, "hour": None if hour is None else f"{hour:02d}",
+                "account": entry.get("account") or None}
+        rows.append({"video_id": video, "clip_id": entry.get("clip_id"), "views": views, "pct": entry.get("pct_watched"),
+                     "keys": keys})
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for name in _BREAKDOWN_LABELS:
+        buckets: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            buckets.setdefault(row["keys"][name] or _UNKNOWN, []).append(row)
+        lines = []
+        for key, members in buckets.items():
+            pcts = [m["pct"] for m in members if isinstance(m["pct"], (int, float)) and not isinstance(m["pct"], bool)]
+            best = max(members, key=lambda m: m["views"])
+            label = _BREAKDOWN_LABELS[name] if key == _UNKNOWN else f"{key} h" if name == "hour" else key
+            lines.append({"key": key, "label": label, "n": len(members),
+                          "median_views": statistics.median(m["views"] for m in members),
+                          "median_pct_watched": statistics.median(pcts) if pcts else None,
+                          "best": {"video_id": best["video_id"], "clip_id": best["clip_id"], "views": best["views"]},
+                          "few": len(members) < settings["breakdown_min_n"]})
+        lines.sort(key=lambda g: (-g["median_views"], g["key"]))
+        groups[name] = lines
+    return {"n": len(rows), "min_n": settings["breakdown_min_n"], "skipped": skipped, "groups": groups}
+
+
+def breakdown(config: Config | None) -> dict[str, Any]:
+    """Vues médianes à maturité par jeu, streamer, heure pleine de Paris et compte, depuis les entrées ``stats`` du
+    journal des résultats. Rien d'estimé : une entrée sans vues est ignorée et comptée dans ``skipped`` ; un groupe sous
+    ``breakdown_min_n`` porte ``few`` mais reste affiché. Lecture seule, sans réseau."""
+    return _breakdown(config, _settings(config))
+
+
 def status(config: Config | None) -> dict[str, Any]:
     """Etat de la boucle pour l'ecran Statistiques (lecture seule : aucun calcul, aucun appel LLM)."""
     settings = _settings(config)
@@ -757,7 +871,8 @@ def status(config: Config | None) -> dict[str, Any]:
     except (OSError, ValueError) as exc:
         raise LearningError(f"poids du jury illisibles ({weights_path}) : {exc}") from exc
     return {"enabled": settings["enabled"], "links": _read_links(settings), "sync": _read_sync(settings),
-            "weights": weights, "coach": proposals(config), "retention": _retention(config, settings)}
+            "weights": weights, "coach": proposals(config), "retention": _retention(config, settings),
+            "breakdown": _breakdown(config, settings)}
 
 
 # ---------------------------------------------------------------- bilan des VOD de veille (SPEC-00db R8)
