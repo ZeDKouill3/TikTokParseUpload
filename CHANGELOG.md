@@ -16,6 +16,7 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ### Corrigé
 
+- Fiche clip : l'historique des statistiques ne garde qu'un relevé par changement de valeurs (vues, likes, commentaires), le dernier relevé est toujours gardé ; la date « Publié le » devient « Envoyé à TikTok le » (le créneau reste « Créneau ») ; les valeurs des panneaux ne débordent plus de leur bord.
 - Apprentissage : un moment sans champ `source` dans `moments.json` est un moment de transcription ; la source des entrées `stats` n'est plus nulle pour les chaînes en `[moments] candidates = "transcript"`. Les entrées déjà écrites ne sont pas réécrites.
 
 ### Modifié

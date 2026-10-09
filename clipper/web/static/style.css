@@ -1764,6 +1764,8 @@ input[type="color"] { width: 36px; height: 36px; padding: 2px; border-radius: va
 .clip-sheet { display: grid; gap: 16px; }
 .sheet-head h2 { margin: 4px 0 2px; }
 .sheet-grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); }
+/* Panneau de grille : min-width auto laissait son contenu pousser la case au-dela du bord (valeurs coupees). */
+.sheet-grid > * { min-width: 0; }
 .sheet-row { display: flex; justify-content: space-between; gap: 12px; padding: 6px 0; border-bottom: 1px solid rgba(127, 127, 127, 0.2); overflow-wrap: anywhere; }
 /* Libelle : jamais coupe au milieu d'un mot (le retour a la ligne se fait aux espaces), il garde sa largeur. */
 .sheet-row > span:first-child { flex: 0 0 auto; max-width: 60%; overflow-wrap: normal; word-break: normal; }
