@@ -33,7 +33,7 @@ import tomllib
 from clipper import accounts as accounts_mod
 from clipper import browser, network
 from clipper import channel as channel_mod
-from clipper import jury_calibration, learning
+from clipper import jury_calibration, learning, repartition
 from clipper import publish as publish_mod
 from clipper import tiktok, youtube
 from clipper.config import Config, ConfigError, load_config
@@ -527,6 +527,7 @@ class Worker:
         publisher: Callable[..., dict[str, Any]] | None = None,
         stats_fetcher: Callable[..., dict[str, Any]] | None = None,
         learning_runner: Callable[..., dict[str, Any]] | None = None,
+        repartition_runner: Callable[..., Any] | None = None,
         login_checker: Callable[..., dict[str, Any]] | None = None,
         youtube_publisher: Callable[..., dict[str, Any]] | None = None,
         veille_collectors: dict[str, Callable[..., dict[str, Any]]] | None = None,
@@ -552,6 +553,8 @@ class Worker:
         self.stats_fetcher = stats_fetcher or tiktok.fetch_stats
         self.learning_runner = learning_runner or learning.run_if_due  # rattachement puis versement apres releve
         self._logged_learning_errors: set[str] = set()
+        self.repartition_runner = repartition_runner or repartition.run_if_due  # plan du lendemain (SPEC-78dc R7)
+        self._logged_repartition_errors: set[str] = set()
         self.login_checker = login_checker or browser.login_state  # connexion verifiee avant chaque publication
         self._stats_attempts: dict[str, datetime] = {}
         self._content_check_last: dict[str, tuple[str, str]] = {}  # compte -> dernier clip en content_check (streak)
@@ -673,6 +676,7 @@ class Worker:
         if not self._publish_due():
             self._stats_due()
         self._learning_due()
+        self._repartition_due()
         self._reconcile_scheduled()
         self._veille_due()
 
@@ -848,6 +852,21 @@ class Worker:
             if message not in self._logged_learning_errors:
                 self._logged_learning_errors.add(message)
                 log.error("apprentissage impossible : %s", message)
+
+    def _repartition_due(self) -> None:
+        """Plan du lendemain (SPEC-78dc R7) : ``repartition.run_if_due`` à chaque tour, après l'apprentissage ; coupé
+        par ``[repartition] enabled = false``. L'erreur est écrite dans le fichier du jour par la bibliothèque et
+        journalisée une seule fois ici, jamais propagée hors du tour (ADR-ad2e)."""
+        try:
+            if not self.config.section("repartition")["enabled"]:
+                return
+            self.repartition_runner(datetime.now(timezone.utc), config=self.config)
+        except (repartition.RepartitionError, publish_mod.PublishError, accounts_mod.AccountsError,
+                tiktok.TikTokError, ConfigError, OSError, ValueError) as exc:
+            message = str(exc)
+            if message not in self._logged_repartition_errors:
+                self._logged_repartition_errors.add(message)
+                log.error("répartition du lendemain impossible : %s", message)
 
     def _reconcile_scheduled(self) -> None:
         """Rapprochement au releve : une entree ``scheduled_on_tiktok`` sans id de post (meme apres le rattachement
