@@ -554,6 +554,7 @@ class Worker:
         self._logged_learning_errors: set[str] = set()
         self.login_checker = login_checker or browser.login_state  # connexion verifiee avant chaque publication
         self._stats_attempts: dict[str, datetime] = {}
+        self._content_check_last: dict[str, tuple[str, str]] = {}  # compte -> dernier clip en content_check (streak)
         self._logged_stats_errors: set[str] = set()
         self._path = _queue_path(self.config)
         self._process: Any | None = None
@@ -1077,6 +1078,7 @@ class Worker:
             publish_mod.release_in_progress(video_id, clip_id, name, reason, state_dir=paths["state_dir"])
             log.warning("%s/%s : publication en attente : %s", video_id, clip_id, reason)
             return False
+        prev_content_check = self._content_check_last.pop(account, None)  # toute autre issue remet la suite à zéro
         try:
             payload = youtube.clip_payload if service == "youtube" else tiktok.clip_payload
             clip = payload(publish_mod.read_sidecar(self.config.output_dir, video_id, clip_id), self.config.output_dir)
@@ -1088,6 +1090,18 @@ class Worker:
             if stop.code == "content_check_refused":
                 self._refused(entry, name, stop.reason, account=account, capture=stop.capture,
                               state_dir=paths["state_dir"])
+            elif stop.code == "content_check":
+                # vérification jamais terminée : le clip échoue seul ; deux clips de suite (même compte) = le compte
+                key = (video_id, clip_id)
+                self._content_check_last[account] = key
+                halted = prev_content_check is not None and prev_content_check != key
+                reason = stop.reason
+                if halted:
+                    reason = (f"{stop.reason} ; deux clips de suite sans vérification de contenu : "
+                              "le problème vient sans doute du compte, compte arrêté")
+                    self._content_check_last.pop(account, None)
+                self._fail(entry, name, reason, halted=halted, account=account, capture=stop.capture,
+                           state_dir=paths["state_dir"])
             else:
                 self._fail(entry, name, stop.reason, halted=True, account=account, capture=stop.capture,
                            state_dir=paths["state_dir"])
