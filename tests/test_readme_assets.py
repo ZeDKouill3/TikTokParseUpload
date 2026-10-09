@@ -203,9 +203,11 @@ def test_pipeline_svg_readable_in_light_and_dark_github_theme():
 
 SHOTS_DIR = ROOT / "tools" / "readme_shots"
 ASSETS_DIR = ROOT / "docs" / "assets" / "readme"
-SHOT_NAMES = ("tableau-de-bord", "videos", "video-fiche", "radar-jury", "clips", "publication",
-              "stats-ensemble", "stats-video", "comptes")
-THEMES = ("dark", "light")
+SHOT_NAMES = ("tableau-de-bord", "veille", "veille-selection", "videos", "video-fiche", "radar-jury", "clips",
+              "clip-fiche", "publication", "stats-ensemble", "stats-video", "stats-retention")
+# TASK-5142ea3f07cc : captures refaites en theme clair uniquement (plus de variante sombre, plus de <picture>) ;
+# l'ecran Comptes n'est plus capture (adresses e-mail).
+THEMES = ("light",)
 GIF_NAMES = ("progression-en-direct", "radar-du-jury", "nouvelle-publication")
 MAX_IMAGE_BYTES = 400 * 1024
 MAX_GIF_BYTES = 2 * 1024 * 1024
@@ -245,6 +247,18 @@ def _slug(heading: str) -> str:
 def test_every_expected_screenshot_and_gif_exists():
     for path in _expected_assets():
         assert path.is_file(), f"image attendue absente : {path.relative_to(ROOT)} (lance tools/readme_shots/capture.py)"
+
+
+def test_readme_uses_light_screenshots_only_without_picture_or_dark_variant():
+    text = _readme_text()
+    assert "<picture" not in text and "<source" not in text
+    assert "-dark" not in text
+    assert not list(ASSETS_DIR.glob("*-dark.*")), "variante sombre restante dans docs/assets/readme/"
+    assert not (ASSETS_DIR / "comptes-light.webp").exists(), "l'ecran Comptes montre des e-mails : jamais capture"
+    cited = set(re.findall(r"docs/assets/readme/([\w.-]+\.webp)", text))
+    assert cited == {f"{name}-light.webp" for name in SHOT_NAMES}
+    on_disk = {path.name for path in ASSETS_DIR.glob("*.webp")}
+    assert on_disk == cited, f"images non citees dans docs/assets/readme/ : {sorted(on_disk - cited)}"
 
 
 def test_readme_references_every_generated_image_and_gif():
