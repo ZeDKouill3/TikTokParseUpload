@@ -1185,6 +1185,69 @@ def test_r4_a_stop_fails_the_entry_with_reason_and_capture_halts_the_account_and
     assert len(pub.calls) == 2 and _entries(tmp_path)[0]["status"] == "published"
 
 
+CONTENT_CHECK_REASON = ("vérification de contenu TikTok jamais terminée pour ce clip : "
+                        "choisis un autre clip ou réessaie plus tard")
+
+
+def test_a_content_check_timeout_fails_the_clip_and_does_not_halt_the_account(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch, tiktok_settings={"max_posts_per_day": 5, "min_gap_minutes": 0})
+    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=2))
+    _seed(tmp_path, "ma_chaine", "02", _ago(minutes=1))
+    pub = FakePublisher(error=tiktok.TikTokStop("content_check", CONTENT_CHECK_REASON, None))
+    w = _pub_worker(config, pub)
+
+    w.tick()
+
+    first, second = _entries(tmp_path)
+    assert first["status"] == "failed" and first["error"] == CONTENT_CHECK_REASON
+    assert first["halted"] is False
+    assert second["status"] == "scheduled"
+    event = tiktok.read_events(config=config)[-1]
+    assert (event["level"], event["account"], event["reason"]) == ("error", ACCOUNT, CONTENT_CHECK_REASON)
+
+    pub.error = None
+    w.tick()  # le compte n'est pas arrêté : l'entrée due suivante part
+    assert len(pub.calls) == 2
+    assert _entries(tmp_path)[1]["status"] == "published"
+
+
+def test_two_content_check_stops_in_a_row_on_two_clips_halt_the_account(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch, tiktok_settings={"max_posts_per_day": 5, "min_gap_minutes": 0})
+    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=3))
+    _seed(tmp_path, "ma_chaine", "02", _ago(minutes=2))
+    _seed(tmp_path, "ma_chaine", "03", _ago(minutes=1))
+    pub = FakePublisher(error=tiktok.TikTokStop("content_check", CONTENT_CHECK_REASON, None))
+    w = _pub_worker(config, pub)
+
+    w.tick()  # 01 seul : le compte reste ouvert
+    assert _entries(tmp_path)[0]["halted"] is False
+
+    w.tick()  # 02 : deuxième clip de suite -> le problème vient du compte, il s'arrête
+    first, second, third = _entries(tmp_path)
+    assert second["status"] == "failed" and second["halted"] is True
+    assert CONTENT_CHECK_REASON in second["error"] and "compte" in second["error"]
+
+    w.tick()  # 03 n'est pas tenté
+    assert len(pub.calls) == 2 and third["status"] == "scheduled"
+
+
+def test_a_publication_between_two_content_check_stops_resets_the_streak(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch, tiktok_settings={"max_posts_per_day": 5, "min_gap_minutes": 0})
+    _seed(tmp_path, "ma_chaine", "01", _ago(minutes=3))
+    _seed(tmp_path, "ma_chaine", "02", _ago(minutes=2))
+    _seed(tmp_path, "ma_chaine", "03", _ago(minutes=1))
+    pub = FakePublisher(error=tiktok.TikTokStop("content_check", CONTENT_CHECK_REASON, None))
+    w = _pub_worker(config, pub)
+
+    w.tick()  # 01 : content_check
+    pub.error = None
+    w.tick()  # 02 publié : la suite est rompue
+    pub.error = tiktok.TikTokStop("content_check", CONTENT_CHECK_REASON, None)
+    w.tick()  # 03 : content_check isolé, le compte reste ouvert
+
+    assert _entries(tmp_path)[2]["status"] == "failed" and _entries(tmp_path)[2]["halted"] is False
+
+
 def test_a_browser_error_fails_and_halts_a_tiktok_error_only_fails_the_entry(tmp_path, monkeypatch):
     config = _pub_env(tmp_path, monkeypatch)
     _seed(tmp_path, "ma_chaine", "01", _ago(minutes=2))
@@ -2802,7 +2865,7 @@ def test_a_content_check_refusal_marks_the_entry_refused_keeps_the_account_ready
     assert _entries(tmp_path)[0]["status"] == "refused_by_platform"  # jamais republié tout seul
 
 
-def test_a_content_check_timeout_stays_an_explicit_halt_not_a_refusal(tmp_path, monkeypatch):
+def test_a_content_check_timeout_is_an_explicit_clip_failure_not_an_account_halt(tmp_path, monkeypatch):
     config = _pub_env(tmp_path, monkeypatch)
     _seed(tmp_path, "ma_chaine", "01", _ago(minutes=1))
     stop = tiktok.TikTokStop("content_check", "vérification de contenu non terminée après 900 s", None)
@@ -2810,8 +2873,9 @@ def test_a_content_check_timeout_stays_an_explicit_halt_not_a_refusal(tmp_path, 
     _pub_worker(config, FakePublisher(error=stop)).tick()
 
     entry = _entries(tmp_path)[0]
-    assert entry["status"] == "failed" and entry["halted"] is True
-    assert _account_state(tmp_path, ACCOUNT)["ready_to_publish"] is False
+    assert entry["status"] == "failed" and entry["halted"] is False
+    assert "vérification de contenu non terminée après 900 s" in entry["error"]
+    assert _account_state(tmp_path, ACCOUNT)["ready_to_publish"] is True
 
 
 def test_the_next_part_of_a_series_goes_when_the_previous_part_was_refused_by_tiktok(tmp_path, monkeypatch, caplog):
