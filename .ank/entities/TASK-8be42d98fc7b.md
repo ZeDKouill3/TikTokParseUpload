@@ -5,7 +5,7 @@ slug: scenes-m-me-test-en-480p-vitesse-et-coupes-vs-10
 title: "Scenes : même test en 480p (vitesse et coupes vs 1080p), implémenter seulement si la mesure le justifie"
 created: 2026-10-09T12:11:08Z
 author: nicoc@zedk_ordi
-status: open
+status: closed
 scope:
   - clipper/download.py
   - clipper/scenes.py
@@ -21,5 +21,5 @@ criteria_by: creator
 verify: [tests]
 method: tdd
 schema: 4
-version: 3
+version: 4
 ---
