@@ -3,7 +3,7 @@
 
   # clipper
 
-  **Une vidéo longue en entrée, des clips verticaux sous-titrés en sortie, publiés sur TikTok depuis une console web locale.**
+  **Une vidéo longue en entrée, des clips verticaux sous-titrés en sortie, publiés sur TikTok et YouTube Shorts depuis une console web locale.**
 
   <p>
     <img alt="Version" src="https://img.shields.io/badge/version-0.6.0%20pr%C3%A9--version-orange">
@@ -22,176 +22,61 @@
 
 ## Ce que ça fait
 
-`clipper` fait le trajet complet **vidéo longue → clips 9:16 → publication
-TikTok** :
+`clipper` fait le trajet complet **vidéo longue → clips 9:16 → publication** :
 
 1. **Entrée** : une URL YouTube ou une VOD Twitch (live, podcast, reportage,
-   stream de jeu...), seule ou surveillée automatiquement par style.
-2. **Sélection** : la vidéo est transcrite, découpée en scènes, puis les
-   moments forts sont choisis par un LLM noté selon une grille et un jury à
-   cinq juges ; en mode `review`, tu acceptes, refuses ou ajustes chaque
+   stream de jeu...), seule, surveillée par style, ou proposée par la
+   [veille](#veille-des-sujets-chauds).
+2. **Sélection** : transcription, scènes, (pour les jeux) passages d'action,
+   puis moments forts choisis par un LLM, notés selon une grille et par un
+   jury de juges IA ; en mode `review`, tu acceptes, refuses ou ajustes chaque
    moment.
 3. **Rendu** : chaque moment devient un clip vertical (ou plusieurs parties
    s'il est trop long), sous-titré mot par mot, recadré, avec un titre
    d'écran, puis contrôlé par une étape qualité.
-4. **Publication** : la console valide les clips, les place sur un calendrier
-   de créneaux et les publie sur TikTok par un vrai Chrome, puis relève les
-   statistiques de chaque vidéo.
+4. **Publication et suivi** : la console valide les clips, les place sur des
+   créneaux et les publie sur TikTok ou YouTube Shorts par un vrai Chrome,
+   relève les statistiques, et le jury en tire des leçons.
 
-Le pipeline tourne en local : téléchargement, transcription
-(faster-whisper), détection de scènes/visages, rendu (ffmpeg) sur ta
-machine ; seules les étapes qui demandent du jugement (choix des moments,
-points de coupe, titres/légendes, contrôle qualité...) passent par Claude
-via `clipper.llm`.
+Tout tourne en local (téléchargement, transcription faster-whisper, scènes,
+rendu ffmpeg) ; seules les étapes de jugement (moments, points de coupe,
+titres et légendes, contrôle qualité...) passent par Claude via
+`clipper.llm`.
 
 ## Démo
-
-Trois animations de la console, générées sur des données de démonstration
-(voir [Développement](#développement)) :
 
 | Progression en direct | Radar du jury | Nouvelle publication |
 |---|---|---|
 | <img src="docs/assets/readme/progression-en-direct.gif" alt="Animation : une vidéo avance d'étape en étape dans la frise de progression" width="100%"/> | <img src="docs/assets/readme/radar-du-jury.gif" alt="Animation : ouverture du radar du jury, choix d'un moment, avant et après débat" width="100%"/> | <img src="docs/assets/readme/nouvelle-publication.gif" alt="Animation : formulaire Nouvelle publication, choix du clip et d'une date de programmation" width="100%"/> |
-| Frise des 12 étapes et journal en direct. | Les cinq juges, moment par moment. | Un clip, un compte, maintenant ou à une date. |
+| Frise des étapes et journal en direct. | Les juges, moment par moment. | Un clip, un compte, maintenant ou à une date. |
 
+Générées sur des données de démonstration (voir [Développement](#développement)).
 Rejeu d'une vraie session en ligne de commande (identifiants remplacés par un
-id neutre) :
+id neutre), puis le schéma du pipeline :
 
-<img src="docs/assets/demo-terminal.svg" alt="Animation : session python -m clipper -v run, des 12 étapes au clip prêt" width="100%"/>
-
-Les 12 étapes, du téléchargement au clip prêt :
+<img src="docs/assets/demo-terminal.svg" alt="Animation : session python -m clipper -v run, des étapes au clip prêt" width="100%"/>
 
 <img src="docs/assets/pipeline.svg" alt="Schéma animé du pipeline clipper" width="100%"/>
 
-## La console en images
-
-Chaque capture existe en thème sombre et en thème clair (GitHub choisit selon
-ton thème). Toutes montrent des données de démonstration neutres : un style
-`ma_chaine`, un compte `mon_compte`, des titres inventés.
-
-### Tableau de bord
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/tableau-de-bord-dark.webp">
-  <img src="docs/assets/readme/tableau-de-bord-light.webp" alt="Tableau de bord : vidéo en cours, worker actif, clips à valider et prochaines publications" width="100%">
-</picture>
-
-Ce qui tourne, ce qui attend et ce qui demande ta décision : vidéos en cours
-avec leur étape, file, échecs à relancer, clips à valider, prochaines
-publications, état du worker et coût LLM.
-
-### Vidéos : liste et fiche
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/videos-dark.webp">
-  <img src="docs/assets/readme/videos-light.webp" alt="Liste des vidéos avec leur statut et leur frise d'étapes" width="100%">
-</picture>
-
-La liste se filtre par style, statut et texte ; l'ajout d'une vidéo se fait
-par URL avec le choix du style.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/video-fiche-dark.webp">
-  <img src="docs/assets/readme/video-fiche-light.webp" alt="Fiche d'une vidéo en cours : frise des 12 étapes avec un trait animé, détail de l'étape et journal en direct" width="100%">
-</picture>
-
-La fiche d'une vidéo affiche la **frise des 12 étapes** : le trait qui relie
-les étapes avance avec le traitement, l'étape en cours montre sa progression
-et le temps restant, et le journal (`events.jsonl`) se suit en direct. Chaque
-étape peut être relancée depuis ce point.
-
-### Radar du jury
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/radar-jury-dark.webp">
-  <img src="docs/assets/readme/radar-jury-light.webp" alt="Radar du jury : notes des cinq juges par critère pour un moment, avant et après débat" width="100%">
-</picture>
-
-Pour chaque moment retenu ou écarté, un radar superpose la note de chacun des
-cinq juges (rétention, monteur, avocat, spectateur, conformité) sur les
-critères de la grille ; un trait pâle signale un juge peu sûr de lui, et le
-sélecteur « Avant débat / Après débat » montre l'effet de la discussion entre
-juges.
-
-### Clips
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/clips-dark.webp">
-  <img src="docs/assets/readme/clips-light.webp" alt="Galerie des clips verticaux avec leur statut : publié, planifié, échec, refusé, à valider" width="100%">
-</picture>
-
-La galerie 9:16 regroupe les clips par statut (à valider, approuvés,
-planifiés, publiés, échecs, refusés) ; la fiche permet d'éditer description,
-hashtags et titre d'écran, d'approuver, de refuser ou de relancer le rendu.
-
-### Publication
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/publication-dark.webp">
-  <img src="docs/assets/readme/publication-light.webp" alt="Publication : liste des publications en cours et calendrier hebdomadaire des créneaux du compte" width="100%">
-</picture>
-
-À gauche, « Nouvelle publication » et les publications en cours ; à droite, le
-calendrier de la semaine avec les créneaux du compte choisi (clips planifiés,
-publiés, en échec). Un clip se publie maintenant ou à une date, sans créneau
-obligatoire.
-
-### Statistiques
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/stats-ensemble-dark.webp">
-  <img src="docs/assets/readme/stats-ensemble-light.webp" alt="Statistiques TikTok : tuiles et courbe des vues sur 28 jours" width="100%">
-</picture>
-
-Les chiffres relevés sur TikTok Studio, compte par compte : cinq tuiles avec
-leur évolution, courbes par jour sur 7, 28 ou 60 jours, et la liste de toutes
-les vidéos du compte.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/stats-video-dark.webp">
-  <img src="docs/assets/readme/stats-video-light.webp" alt="Fiche d'une vidéo TikTok : vues, temps de visionnage, partages et courbe de rétention" width="100%">
-</picture>
-
-La fiche d'une vidéo détaille les vues, le temps de visionnage, la courbe de
-rétention, les spectateurs et l'engagement, et renvoie au clip Clipper
-d'origine.
-
-### Comptes
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/comptes-dark.webp">
-  <img src="docs/assets/readme/comptes-light.webp" alt="Écran Comptes : compte TikTok connecté, mot de passe masqué rangé dans le coffre de l'OS" width="100%">
-</picture>
-
-Le carnet des comptes : le mot de passe reste dans le coffre de l'OS et
-n'apparaît qu'à la demande (bouton Afficher), l'état de connexion TikTok est
-lu dans les cookies du profil, et la case « prêt à publier » se met à jour
-toute seule.
-
 ## Points forts
 
-- **Mode `auto` de bout en bout** — sélection des moments, découpage,
-  sous-titrage, recadrage, rendu et contrôle qualité sans intervention, avec
-  reprise en file d'attente sur échec transitoire plutôt qu'un résultat
-  dégradé en silence.
-- **Jury IA à cinq juges** (rétention, monteur, avocat, spectateur,
-  conformité) pour la sélection automatique des moments, appris de ses
-  erreurs sans uniformiser les avis.
-- **Deux formats de recadrage** — `letterbox` (zoom fixe, défaut) et
-  `stream` (facecam fixe agrandie + jeu, pour les VOD de streamers).
-- **Appel à l'abonnement optionnel** — pseudo d'affichage discret et carte de
-  fin « Abonne-toi ! », désactivé par défaut, activable par preset de style.
-- **Console web en neuf écrans** — vidéos, revue, clips, styles, publication,
-  statistiques, comptes et réglages, avec progression en temps réel (voir
-  [La console en images](#la-console-en-images)).
-- **Publication et statistiques TikTok** par un vrai Chrome (risques assumés,
-  voir [Publier sur TikTok](#publier-sur-tiktok)), comptes rangés dans le
-  coffre de l'OS.
-- **Tout tourne sur CPU** si besoin (`clipper.gpu` détecte CUDA
-  automatiquement, jamais codé en dur), un seul modèle lourd en VRAM à la
-  fois.
-- **Étapes indépendantes et reprises depuis le cache** — une étape déjà
-  faite ne se relance pas sauf `--force`.
+- **Mode `auto` de bout en bout**, avec reprise en file d'attente sur échec
+  transitoire plutôt qu'un résultat dégradé en silence.
+- **Jury de juges IA** (rétention, spectateur, monteur, avocat, conformité,
+  anonymes, débat sur les divergences, veto conformité) qui apprend de ses
+  erreurs sur les vraies statistiques, sans uniformiser les avis.
+- **Styles gaming** : grilles `builtin:gaming` et `builtin:gaming-action`,
+  candidats d'action tirés du jeu lui-même, format stream avec webcam trouvée
+  par période.
+- **Veille** des sujets chauds (Twitch, YouTube, Steam, IGDB), désactivée par
+  défaut.
+- **Console web** de onze écrans, progression en temps réel.
+- **Publication TikTok et YouTube Shorts** multi-comptes par un vrai Chrome,
+  mots de passe dans le coffre de l'OS (risques assumés).
+- **Installeur portable Windows** : un zip, un double-clic.
+- **CPU possible** (`clipper.gpu` détecte CUDA, jamais codé en dur), un seul
+  modèle lourd en VRAM à la fois ; une étape déjà faite ne se relance pas
+  sauf `--force`.
 
 ## Installation sans outils de développement
 
@@ -200,9 +85,12 @@ portable de la
 [Release GitHub](https://github.com/ZeDKouill3/TiktokClipper/releases)
 (`Clipper-portable-0.6.0.zip`), dézippe-le et double-clique sur
 `Installer.bat` : il installe Python, ffmpeg, `claude` et les modèles dans son
-propre dossier, sans rien toucher d'autre sur ta machine. Parcours complet
-(prérequis, connexion à Claude, premier clip, mise à jour, désinstallation,
-dépannage) : [`docs/INSTALLATION.md`](docs/INSTALLATION.md).
+propre dossier (programme sous `%LOCALAPPDATA%\Clipper`, données sous
+`Documents\Clipper`), CUDA seulement si un GPU NVIDIA est détecté, puis
+vérifie le tout avec `clipper doctor`. Une mise à jour = relancer
+`Installer.bat` depuis le nouveau zip, tes données ne sont pas touchées.
+Parcours complet (prérequis, connexion à Claude, premier clip, mise à jour,
+désinstallation, dépannage) : [`docs/INSTALLATION.md`](docs/INSTALLATION.md).
 
 ## Installation développeur
 
@@ -213,23 +101,21 @@ uv pip install -e ".[test]"
 
 `uv` est **obligatoire** (pas `pip` seul) : `pyproject.toml` déclare sous
 `[tool.uv] override-dependencies` un contournement qui force un seul paquet
-OpenCV installé (`opencv-contrib-python`) — `mediapipe` et `scenedetect` en
-réclament chacun un différent, et `pip` seul ignore ce réglage.
+OpenCV installé — `mediapipe` et `scenedetect` en réclament chacun un
+différent, et `pip` seul ignore ce réglage.
 
 Ou lance `tools/setup.ps1`, qui fait tout ça et vérifie les prérequis (uv,
 Python 3.11, ffmpeg, `claude`, `ank`, GPU optionnel, Google Chrome pour
-[publier sur TikTok](#publier-sur-tiktok)).
+[publier](#publier-sur-tiktok)).
 
-Depuis la release (sans cloner le dépôt) : télécharge le `.whl` de la
-[dernière release](CHANGELOG.md), `uv pip install
-clipper-0.6.0-py3-none-any.whl` puis `clipper init` (écrit `config.toml` et
-`rubric.toml` — la grille par défaut, embarquée dans la wheel — dans le
-dossier courant). La commande `clipper` s'ajoute à `python -m clipper`.
+Depuis la release (sans cloner le dépôt) : télécharge le `.whl`, `uv pip
+install clipper-0.6.0-py3-none-any.whl` puis `clipper init` (écrit
+`config.toml` et `rubric.toml` dans le dossier courant). La commande
+`clipper` s'ajoute à `python -m clipper`.
 
-**Prérequis** : Python 3.11 (géré par uv), [ffmpeg](https://ffmpeg.org/)
-(et `ffprobe`) dans le PATH, [Claude Code CLI](https://docs.claude.com/claude-code)
-(`claude`) connecté (backend LLM par défaut). Pilote NVIDIA optionnel pour
-accélérer transcription et rendu ; sans GPU, tout tourne sur CPU.
+**Prérequis** : Python 3.11 (géré par uv), [ffmpeg](https://ffmpeg.org/) (et
+`ffprobe`) dans le PATH, [Claude Code CLI](https://docs.claude.com/claude-code)
+(`claude`) connecté (backend LLM par défaut). Pilote NVIDIA optionnel.
 
 ## Démarrage rapide
 
@@ -241,42 +127,48 @@ python -m clipper serve              # console web : http://127.0.0.1:8000
 
 **Lanceur Windows.** `Clipper.bat`, à la racine du dépôt, démarre
 `clipper serve` s'il ne tourne pas déjà puis ouvre `http://127.0.0.1:8000`
-dans le navigateur (double-clic ; il demande de lancer `tools/setup.ps1`
-d'abord si Clipper n'est pas installé). `tools/creer-raccourci.ps1` crée un
-raccourci `Clipper.lnk` avec le logo (`tools/clipper.ico`) :
+(double-clic). `tools/creer-raccourci.ps1` crée un raccourci `Clipper.lnk`
+avec le logo :
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools/creer-raccourci.ps1
 ```
 
-En mode `review`, l'interface web (ou `python -m clipper decide`) sert à
-accepter/refuser/ajuster chaque moment proposé, puis `python -m clipper
-render <video_id>` (ou le bouton « rendre » de l'interface) termine le clip.
-Voir [`docs/GUIDE.md`](docs/GUIDE.md) pour le détail des commandes.
+En mode `review`, la console (ou `python -m clipper decide`) sert à
+accepter, refuser ou ajuster chaque moment, puis `python -m clipper render
+<video_id>` (ou le bouton « rendre ») termine le clip. Toutes les commandes :
+[`docs/GUIDE.md`](docs/GUIDE.md).
 
 ## Formats
 
-- **letterbox** (défaut, `[reframe] format = "letterbox"`) — aucune
-  détection de visage : image source zoomée et centrée, fond flou de la
-  même vidéo, titre d'écran dans la bande floue du haut, sous-titres dans
-  celle du bas.
-- **stream** (`layout = "stream_auto"`) — pour les vidéos avec facecam :
-  facecam fixe agrandie en haut, jeu en bas, jamais de bascule de mise en
-  page au sein d'un même clip.
+Le pipeline compte 13 étapes : `download`, `transcribe`, `audio`, `scenes`,
+`action`, `moments`, `vision`, `parts`, `captions`, `reframe`, `subtitles`,
+`render`, `qa`. `action` ne produit qu'un résultat vide sans `[action] enabled
+= true` ; la frise de la console les montre toutes.
 
-Contrat de sortie complet (zones sûres TikTok, style des sous-titres...) :
-`SPEC-6a47` et `SPEC-3a88` dans `AGENTS.md`.
+- **letterbox** (défaut, `[reframe] format = "letterbox"`) : image source
+  zoomée et centrée, fond flou de la même vidéo, titre d'écran dans la bande
+  du haut, sous-titres dans celle du bas.
+- **stream** (`layout = "stream_auto"`) : pour les vidéos avec webcam. La
+  webcam est repérée par période du stream (rectangles candidats numérotés
+  choisis par Claude, garde-fous locaux journalisés) ; un clip en stream
+  exige un visage dans la webcam, et sans webcam réelle le clip repasse en
+  letterbox. Deux variantes : `stream_variant = "top"` (webcam fixe agrandie
+  en haut, jeu en bas) ou `"split"` (webcam en haut, jeu en bas, badge
+  optionnel, sous-titres réglables).
+- `crop` (suivi de visage) reste une option figée, moins travaillée.
+
+Titre d'écran sobre (sans emoji ni superlatif par défaut), `.mp4` + `.json`
+sidecar, appel à l'abonnement désactivé par défaut : contrat de sortie dans
+`AGENTS.md` (SPEC-6a86, SPEC-5b9a).
 
 ## Styles, grille gaming et CTA abonnement
 
 Un fichier de config par style (`presets/<nom>.toml`) active des réglages
 spécifiques sans toucher `config.toml` ; il se crée aussi dans l'écran
-**Styles** de la console (formulaire, éditeur d'agencement, aperçu des
-sous-titres). Un style n'a ni compte de publication ni créneaux : le compte se
-choisit à chaque publication, et les créneaux réguliers se règlent sur le
-compte (écran **Comptes**). Un ancien preset qui porte encore `slots` et
-`tiktok_account` est migré au démarrage (créneaux repris sur ce compte, clés
-retirées du fichier, journalisé). Exemple avec le style neutre `ma_chaine` :
+**Styles** de la console. Un style n'a ni compte de publication ni créneaux :
+le compte se choisit à chaque publication, les créneaux se règlent sur le
+compte (écran **Comptes**). Exemple avec le style neutre `ma_chaine` :
 
 ```toml
 [channel]
@@ -285,7 +177,7 @@ source_url = "https://www.twitch.tv/ma_chaine/videos"
 watch = true                      # nouvelles VOD : en file (auto) ou « à confirmer » (review)
 
 [reframe]
-layout = "stream_auto"            # facecam détectée : agencement stream
+layout = "stream_auto"            # webcam détectée : agencement stream
 stream_variant = "split"          # webcam en haut, jeu en bas
 
 [moments]
@@ -296,59 +188,29 @@ rubric_path = "builtin:gaming"    # grille gaming embarquée
 python -m clipper run <url> --config presets/ma_chaine.toml
 ```
 
-**Grille gaming.** Sur un stream de jeu, l'émotion du streamer compte plus que
-l'information : la grille `builtin:gaming` (`clipper/assets/rubric-gaming.toml`)
-pèse l'émotion plus fort, retient des clips plus courts et abaisse le seuil de
-retenue. La grille standard reste le défaut (`builtin`) ; un chemin de fichier
-choisit une grille personnalisée.
-
-**Grille gaming action.** `builtin:gaming-action`
-(`clipper/assets/rubric-gaming-action.toml`) juge ce qui se passe *dans le jeu* :
-le critère `action` pèse 5, la réaction du streamer au jeu (`emotion`) 3, le
-seuil de retenue est 50 et les clips vont de 20 à 90 s. Elle porte aussi un
-**seuil éliminatoire** : la table optionnelle `[gate]` de toute grille
-(`criterion`, `min`, et `unless_criterion` avec `unless_min` qui vont
-ensemble, notes entières de 0 à 10). Un moment dont la note à `criterion` est
-inférieure à `min` est rejeté, avant le filtre `min_score`, avec la raison
-« action 3 < seuil éliminatoire 4 (grille) » et ses notes dans `rejected`,
-sauf si sa note à `unless_criterion` atteint `unless_min` (une réaction forte
-sauve un monologue). La re-notation après vision le réapplique. Sans `[gate]`,
-rien ne change : `builtin` et `builtin:gaming` n'en ont pas et restent
-identiques.
+**Grilles.** `builtin` (défaut) est la grille standard ; `builtin:gaming` pèse
+plus l'émotion du streamer, retient des clips plus courts et abaisse le seuil ;
+`builtin:gaming-action` juge ce qui se passe *dans le jeu* (critère `action`
+de poids 5, seuil de retenue 50, clips de 20 à 90 s). Un chemin de fichier
+choisit une grille personnalisée. La table optionnelle `[gate]` d'une grille
+fixe un **seuil éliminatoire** (`criterion`, `min`, et `unless_criterion` avec
+`unless_min` : une réaction forte sauve un monologue) ; sans `[gate]`, rien
+ne change.
 
 **Candidats d'action (étape `action`).** Pour un style gaming, les moments ne
-viennent pas que de la transcription : avec `[action] enabled = true`, l'étape
-`action` (entre `scenes` et `moments`) cherche sans LLM les passages de jeu
-(pics audio hors parole, densité de changements de plan), fait décrire leurs
-images par le LLM (planches d'images, `action.json`), et `[moments] candidates
-= "transcript+action"` les ajoute aux candidats de la transcription (source
-« action » dans `moments.json`), notés par le même jury et la même grille.
-Réglages de `[action]` (tous dans `CONFIG_DEFAULTS` de `clipper/action.py`) :
-`window_seconds` 30, `step_seconds` 15, `audio_weight` / `cuts_weight` 1.0,
-`audio_peaks_full` 3, `audio_peak_min_db` 6.0, `cuts_ratio_full` 3.0,
-`min_score` 0.6, `max_passage_seconds` 90, `max_passages_per_hour` 12,
-`frames_per_passage` 4, `max_images_per_hour` 48, `batch_size` 8,
-`max_width` 768, `parallel` 4. Le coût est borné par heure de VOD (au plus 6
-appels `action` aux défauts). `[action] enabled` pilote seul les fenêtres de
-pics de `scenes` : les styles sans `[action]` produisent les mêmes
-`scenes.json`, `moments.json` et clips qu'avant. Les styles `twitch` et
-`classic` servent de témoins pour comparer.
-
-Les deux styles gaming action (fichiers locaux `presets/<nom>.toml`, jamais
-commités) :
+viennent pas que de la transcription : avec `[action] enabled = true`,
+l'étape `action` (entre `scenes` et `moments`) cherche sans LLM les passages
+de jeu (pics audio hors parole, densité de changements de plan), fait
+décrire leurs images par le LLM (`action.json`), et `[moments] candidates =
+"transcript+action"` les ajoute aux candidats de la transcription, notés par
+le même jury et la même grille. Le coût est borné par heure de VOD ; les
+réglages sont dans `CONFIG_DEFAULTS` de `clipper/action.py`.
 
 ```toml
 # Twitch gaming : format stream
-[channel]
-display_name = "ma_chaine"
-source_url = "https://www.twitch.tv/ma_chaine/videos"
-
 [reframe]
 layout = "stream_auto"
 stream_variant = "split"
-fallback = "blur"
-# + les tables split_webcam_dest, split_gameplay_dest, split_subtitle_dest et
-#   badge_dest du style twitch, et [render] comme le style twitch
 
 [moments]
 rubric_path = "builtin:gaming-action"
@@ -356,15 +218,10 @@ candidates = "transcript+action"
 
 [action]
 enabled = true
-max_passage_seconds = 45    # avec short_clips = true : <= short_max, sinon rejet pour durée
 ```
 
 ```toml
-# Letterbox gaming : format letterbox (aucune table [reframe])
-[channel]
-display_name = "ma_chaine"
-source_url = "https://www.twitch.tv/ma_chaine/videos"
-
+# Letterbox gaming : aucune table [reframe]
 [moments]
 rubric_path = "builtin:gaming-action"
 candidates = "transcript+action"
@@ -373,9 +230,8 @@ candidates = "transcript+action"
 enabled = true
 ```
 
-**Appel à l'abonnement.** Il est **désactivé par défaut** ; sans configuration
-explicite, le rendu, le sidecar et la légende restent identiques. Pour
-l'activer dans un preset :
+**Appel à l'abonnement.** **Désactivé par défaut** ; sans configuration
+explicite, rendu, sidecar et légende restent identiques. Dans un preset :
 
 ```toml
 [render]
@@ -389,30 +245,148 @@ moitié activé.
 
 ## Modes review/auto
 
-- **review** (défaut) — rien n'est publié sans validation humaine des
-  moments proposés (accepter / refuser / ajuster les bornes), via
-  l'interface web ou `python -m clipper decide`.
-- **auto** — le pipeline va jusqu'au bout tout seul ; le contrôle qualité
-  (étape `qa`) remplace la revue humaine, et un échec transitoire (Claude
-  indisponible, quota, réseau) remet la vidéo en file d'attente au lieu
-  d'abandonner ou de produire un résultat dégradé en silence.
+- **review** (défaut) : rien n'est publié sans validation humaine des moments
+  (accepter / refuser / ajuster les bornes), dans la console ou par
+  `python -m clipper decide`.
+- **auto** : le pipeline va jusqu'au bout seul ; le contrôle qualité (`qa`)
+  remplace la revue, et un échec transitoire (Claude indisponible, quota,
+  réseau) remet la vidéo en file au lieu d'abandonner ou de dégrader en
+  silence. Aucune valeur de secours silencieuse : un échec remonte, est
+  journalisé, ou met la vidéo en attente.
+
+Le **jury** (`[jury]`) remplace un juge unique : au moins trois juges
+indépendants et anonymes notent chaque moment avec leur confiance, un débat
+ciblé porte sur les divergences, et le juge conformité peut opposer un veto
+motivé.
+
+## La console en images
+
+Chaque capture existe en thème sombre et clair (GitHub choisit selon ton
+thème). Toutes montrent des données de démonstration neutres : un style
+`ma_chaine`, un compte `mon_compte`, des titres inventés.
+
+### Tableau de bord
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/tableau-de-bord-dark.webp">
+  <img src="docs/assets/readme/tableau-de-bord-light.webp" alt="Tableau de bord : vidéo en cours, worker actif, clips à valider et prochaines publications" width="100%">
+</picture>
+
+Ce qui tourne, ce qui attend, ce qui demande ta décision : vidéos en cours,
+file, échecs à relancer, clips à valider, prochaines publications, état du
+worker, coût LLM et alerte « posts à 0 vue » (voir
+[Apprentissage](#apprentissage-du-jury)).
+
+### Vidéos : liste et fiche
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/videos-dark.webp">
+  <img src="docs/assets/readme/videos-light.webp" alt="Liste des vidéos avec leur statut et leur frise d'étapes" width="100%">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/video-fiche-dark.webp">
+  <img src="docs/assets/readme/video-fiche-light.webp" alt="Fiche d'une vidéo en cours : frise des étapes avec un trait animé, détail de l'étape et journal en direct" width="100%">
+</picture>
+
+La liste se filtre par style, statut et texte ; une vidéo s'ajoute par URL. La
+fiche montre la frise des étapes, la progression et le temps restant de
+l'étape en cours, et le journal (`events.jsonl`) en direct ; chaque étape se
+relance depuis là.
+
+### Radar du jury
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/radar-jury-dark.webp">
+  <img src="docs/assets/readme/radar-jury-light.webp" alt="Radar du jury : notes des juges par critère pour un moment, avant et après débat" width="100%">
+</picture>
+
+Pour chaque moment retenu ou écarté, un radar superpose la note de chaque juge
+sur les critères de la grille ; un trait pâle signale un juge peu sûr de lui,
+et « Avant débat / Après débat » montre l'effet de la discussion.
+
+### Clips
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/clips-dark.webp">
+  <img src="docs/assets/readme/clips-light.webp" alt="Galerie des clips verticaux avec leur statut : publié, planifié, échec, refusé, à valider" width="100%">
+</picture>
+
+La galerie 9:16 regroupe les clips par statut ; le tiroir d'un clip permet
+d'éditer description, hashtags et titre d'écran, d'approuver, de refuser ou
+de relancer le rendu, et ouvre la **fiche complète** du clip : score et
+critères, passage dans la VOD, QA, jury, publication (compte, statut,
+créneau, lien du post) et relevés TikTok du post. Une donnée absente s'affiche
+« inconnu », jamais 0. Un clip publié dont la vidéo a été supprimée garde sa
+fiche et ses statistiques.
+
+### Publication
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/publication-dark.webp">
+  <img src="docs/assets/readme/publication-light.webp" alt="Publication : liste des publications en cours et calendrier hebdomadaire des créneaux du compte" width="100%">
+</picture>
+
+À gauche, « Nouvelle publication » et les publications en cours ; à droite,
+le calendrier de la semaine avec les créneaux du compte. Un clip se publie
+maintenant ou à une date, sans créneau obligatoire.
+
+### Statistiques
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/stats-ensemble-dark.webp">
+  <img src="docs/assets/readme/stats-ensemble-light.webp" alt="Statistiques TikTok : tuiles et courbe des vues sur 28 jours" width="100%">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/stats-video-dark.webp">
+  <img src="docs/assets/readme/stats-video-light.webp" alt="Fiche d'une vidéo TikTok : vues, temps de visionnage, partages et courbe de rétention" width="100%">
+</picture>
+
+Les chiffres relevés sur TikTok Studio, compte par compte (détail dans
+[Statistiques TikTok](#statistiques-tiktok)), et la fiche d'une vidéo.
+
+### Comptes
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/comptes-dark.webp">
+  <img src="docs/assets/readme/comptes-light.webp" alt="Écran Comptes : compte TikTok connecté, mot de passe masqué rangé dans le coffre de l'OS" width="100%">
+</picture>
+
+Le carnet des comptes : mot de passe dans le coffre de l'OS (affiché à la
+demande seulement), état de connexion lu dans les cookies du profil, case
+« prêt à publier » mise à jour toute seule, et pause manuelle d'un compte d'un
+clic.
 
 ## Interface web : Console de gestion web (v2)
 
 `python -m clipper serve` lance la console (`http://127.0.0.1:8000`) et le
-worker qui traite une file de vidéos, une à la fois. Neuf écrans : Accueil,
-Vidéos, Revue des moments, Clips, Publication (nouvelle publication,
-calendrier de créneaux), Styles (presets en surcouche, éditeur d'agencement,
-aperçu des sous-titres), Statistiques (relevé de TikTok Studio par compte),
-Comptes (coffre de l'OS) et Réglages ; progression en temps réel, surveillance
-des VOD d'un style, notifications du navigateur. La page est statique
-(HTML/CSS/JS, sans étape de build) et ne fait aucun traitement vidéo, audio ou
-LLM. Les écrans sont montrés dans [La console en images](#la-console-en-images).
+worker, qui traite la file de vidéos une à la fois. Onze écrans : Tableau de
+bord, Veille, Vidéos, Revue des moments, Clips, Publication, Styles
+(presets en surcouche, éditeur d'agencement, aperçu des sous-titres),
+Statistiques, Comptes, Réglages et Journal ; progression en temps réel,
+surveillance des VOD d'un style, notifications du navigateur. Pendant qu'une
+vidéo se traite, le worker précharge le téléchargement de la suivante
+(`[worker] prefetch_download`). La page est statique (HTML/CSS/JS, sans étape
+de build) et ne fait aucun traitement vidéo, audio ou LLM.
 
 Pour l'ouvrir depuis un téléphone du réseau local :
 `python -m clipper serve --host 0.0.0.0`, ce qui exige `[web] token` dans
 `config.toml`. Pas de TLS : ne pas exposer le port sur Internet sans reverse
 proxy TLS. Détails dans [`docs/GUIDE.md`](docs/GUIDE.md).
+
+## Veille des sujets chauds
+
+La veille (`[veille] enabled = true`, désactivée par défaut) relève chaque jour
+à `run_at` (07:00, heure de Paris) ce qui monte, **sources officielles
+seulement** : Twitch (Helix), YouTube, Steam (joueurs simultanés, avis,
+abonnés) et IGDB (dates de sortie et hype, avec le jeton d'app Twitch). Chaque
+jeu retenu a un historique de tendance sur 30 jours, jamais estimé (un jour
+sans relevé reste vide). Claude choisit parmi les VOD accessibles celles à
+proposer ; tu les envoies à Clipper ou les ignores dans l'écran **Veille**, qui
+montre aussi le calendrier des sorties et les meilleurs clips du jour
+(archivés, jamais supprimés). Le relevé tourne dans le worker, dans un fil qui
+ne bloque jamais la file ; l'état vit sous `state/veille/`.
 
 ## Publier sur TikTok
 
@@ -420,30 +394,26 @@ La publication passe par un **vrai Chrome visible** piloté par Playwright, avec
 un profil par compte rangé dans `state/browser/<compte>/` (ignoré par git,
 jamais copié hors de `state/`). Le programme ne saisit **jamais** ton
 identifiant ni ton mot de passe : tu te connectes à la main, une fois, dans un
-**Chrome normal** (voir ci-dessous).
+**Chrome normal**.
 
-1. **Ajouter un compte** — dans la console, écran **Comptes**, ajoute le compte
-   TikTok (libellé, plateforme) ; ses **créneaux** réguliers (jour + heure,
-   fuseau du compte) se règlent dans le même formulaire. Aucun compte n'est
-   rattaché à un style : chaque publication (écran **Publication**) choisit son
-   compte, et une publication sans compte échoue avec un message explicite.
-2. **Se connecter une fois** — bouton **Se connecter dans le navigateur** du
-   compte (console ouverte sur `127.0.0.1`/`localhost` seulement), ou
-   `python -m clipper browser login <compte>` (`--url` pour une autre page,
-   TikTok par défaut). Un **Chrome normal** (lancé comme un programme
-   ordinaire, sur le profil du compte, jamais par Playwright) s'ouvre sur la
-   page de connexion : connecte-toi, puis ferme la fenêtre. La connexion ne
-   passe pas par Playwright parce que TikTok refuse un Chrome piloté (faux
-   message « Nombre maximal de tentatives atteint ») ; une fois connecté,
-   Playwright réutilise la session du profil pour publier. L'écran Comptes
-   affiche l'état du profil (absent ou présent, avec la date).
-3. **Prérequis** — Google Chrome installé (trouvé dans le `PATH` ou aux
-   emplacements usuels ; sinon règle `[browser] chrome_path = "C:\\...\\chrome.exe"`
-   dans `config.toml`) et la dépendance `playwright` (installée par
-   `tools/setup.ps1` ou `uv pip install -e ".[test]"`). Sans Chrome, la
-   connexion échoue avec un message explicite ; sans Playwright, la publication
-   échoue avec la commande à lancer (`playwright install chrome`) : aucun
-   navigateur de remplacement n'est utilisé.
+1. **Ajouter un compte** : écran **Comptes** (libellé, plateforme) ; ses
+   **créneaux** réguliers (jour + heure, fuseau du compte) se règlent dans le
+   même formulaire. Aucun compte n'est rattaché à un style : chaque
+   publication (écran **Publication**) choisit son compte, et une
+   publication sans compte échoue avec un message explicite.
+2. **Se connecter une fois** : bouton **Se connecter dans le navigateur** du
+   compte (console ouverte sur `127.0.0.1` seulement), ou `python -m clipper
+   browser login <compte>` (`--url` pour une autre page). Un **Chrome normal**
+   (lancé comme un programme ordinaire, jamais par Playwright) s'ouvre sur la
+   page de connexion : connecte-toi, puis ferme la fenêtre. TikTok refuse un
+   Chrome piloté (faux message « Nombre maximal de tentatives atteint ») ;
+   ensuite Playwright réutilise la session du profil pour publier.
+3. **Prérequis** : Google Chrome (trouvé dans le `PATH` ou aux emplacements
+   usuels ; sinon `[browser] chrome_path = "C:\\...\\chrome.exe"`) et
+   `playwright`, installé par `tools/setup.ps1`. Sans Chrome, la connexion
+   échoue avec un message explicite ; sans Playwright, la publication échoue
+   avec la commande à lancer (`playwright install chrome`) : aucun navigateur
+   de remplacement.
 
 **Risques assumés** : piloter TikTok par un navigateur n'est pas prévu par ses
 conditions d'utilisation ; le compte peut subir un captcha, une vérification
@@ -451,145 +421,127 @@ ou une restriction. **Captcha, vérification ou page inattendue = arrêt
 immédiat** : le programme ne résout ni ne contourne jamais un captcha, il
 laisse la main à l'utilisateur et remonte l'échec.
 
+**YouTube Shorts.** Même principe sur YouTube Studio : comptes YouTube,
+publication immédiate ou programmée, `#Shorts` ajouté si absent, statistiques
+relevées à l'usage.
+
 ### Publication automatique (worker)
 
 Le worker (`python -m clipper worker`, lancé par `serve`) publie, une à la
-fois et un compte à la fois, les clips **dus** de `state/publish/<style>.json`
-(statut `scheduled`) avec le mp4, la légende et les hashtags du sidecar. Deux
-modes, réglés par `[tiktok] publish_mode` (ou par clip) :
+fois et un compte à la fois, les clips **dus** (`state/publish/<style>.json`,
+statut `scheduled`) avec le mp4, la légende et les hashtags du sidecar. Deux
+modes, par `[tiktok] publish_mode` (ou par clip) :
 
 - `immediate` (défaut) : publié quand le créneau est atteint (le PC doit être
   allumé) ;
-- `scheduled` : programmé côté TikTok à la date du créneau, dès qu'elle est à
-  moins de `schedule_max_days` jours (10 : la limite de TikTok Studio) ; au-delà
-  ou à moins de `schedule_min_minutes` du créneau, la programmation est refusée
+- `scheduled` : programmé côté TikTok à la date du créneau, à moins de
+  `schedule_max_days` jours (10, la limite de TikTok Studio) ; au-delà, ou à
+  moins de `schedule_min_minutes` du créneau, la programmation est refusée
   explicitement.
 
-Le succès enregistre l'URL ou l'id du post dans l'entrée et le sidecar. **Tout
-arrêt** (captcha, vérification, connexion expirée, élément absent, page
-inattendue) met le clip en `failed` avec la raison et une capture d'écran sous
+Le succès enregistre l'URL ou l'id du post. **Tout arrêt** (captcha,
+vérification, connexion expirée, élément absent, page inattendue) met le clip
+en `failed` avec la raison et une capture sous
 `state/browser/<compte>/captures/`, arrête les publications de ce compte et
-notifie la console : bouton **Réessayer** dans l'écran Publication. Les
-sélecteurs de la page TikTok Studio vivent dans
-`clipper/assets/tiktok_selectors.toml` : relevés sur la vraie page d'envoi le
-2026-10-01 (l'en-tête du fichier dit ce qui est vérifié en réel, et ce qui ne
-l'est pas : la confirmation après publication) ; à confirmer avec
-`CLIPPER_TIKTOK_REAL=1 pytest tests/integration/test_tiktok_real.py`, qui
-publie en privé sur un compte de test.
+notifie la console (bouton **Réessayer**). Avant le clic final, le programme
+attend la **vérification de contenu** de TikTok (`content_check_timeout_s`,
+900 s) : problème signalé ou délai dépassé = arrêt, rien n'est publié. Les
+fenêtres connues sont fermées et journalisées, toute autre fenêtre modale est
+un arrêt. Un post supprimé à la main de la plateforme se marque « Supprimé de
+la plateforme » (rien n'est effacé côté plateforme, le clip n'est jamais
+republié). Les sélecteurs de TikTok Studio vivent dans
+`clipper/assets/tiktok_selectors.toml`.
 
-Détails du pilotage de TikTok Studio :
+Rythme (`[tiktok]`, étude [`docs/tiktok-cadence.md`](docs/tiktok-cadence.md)) :
+délais aléatoires entre actions, plafond de posts par jour, écart minimal par
+compte ; un dépassement reporte le clip au prochain créneau libre. Les défauts
+sont ceux d'un **compte neuf** :
 
-- la légende (pré-remplie du nom du fichier) est vidée puis insérée d'un coup ;
-- en mode `scheduled`, la date et l'heure se règlent par les sélecteurs de
-  TikTok (calendrier, flèches de mois, liste des heures) ; les minutes sont
-  arrondies au pas proposé par TikTok (journalisé, noté dans l'entrée) ;
-- avant le clic final, le programme attend le résultat de la **vérification de
-  contenu** de TikTok : « Aucun problème constaté » → il continue ; problème
-  signalé ou délai `[tiktok] content_check_timeout_s` (900 s par défaut)
-  dépassé → arrêt explicite, rien n'est publié ;
-- les fenêtres connues (`[popups]` du fichier : « Activer les vérifications
-  automatiques du contenu ? » → **Annuler**, « Nouvelles fonctionnalités
-  d'édition ajoutées » → **J'ai compris**) sont fermées et journalisées ; toute
-  autre fenêtre modale est un arrêt, jamais un clic au hasard.
-
-Rythme (`[tiktok]`, étude `docs/tiktok-cadence.md` §3.1) : délais aléatoires
-entre actions, plafond de posts par jour et écart minimal par compte ; un
-dépassement reporte le clip au prochain créneau libre, journalisé. Les défauts
-sont ceux d'un **compte neuf** ; pour un **compte établi** (après 14 jours,
-vues stables) :
-
-| Réglage | Compte neuf (défaut) | Compte établi |
+| Réglage | Compte neuf (défaut) | Compte établi (après 14 jours) |
 |---|---|---|
 | `max_posts_per_day` | 1 | 3 |
 | `min_gap_minutes` | 480 | 240 |
-| `min_action_delay_s` | 0.3 | 0.3 |
-| `max_action_delay_s` | 1 | 1 |
-
-```toml
-[tiktok]
-max_posts_per_day = 3
-min_gap_minutes = 240
-min_action_delay_s = 2
-max_action_delay_s = 8
-```
 
 ## Statistiques TikTok
 
 L'écran **Statistiques** affiche ce que TikTok Studio montre pour chaque compte
-relié : tuiles de la page « Données analytiques » (vues, vues du profil,
-j'aime, commentaires, partages) sur 7, 28 et 60 jours, courbes par jour, et la
-liste de toutes les vidéos du compte, y compris celles publiées hors de
-Clipper. Le relevé ouvre le Chrome du profil (lecture seule) :
+relié : tuiles (vues, vues du profil, j'aime, commentaires, partages) sur 7,
+28 et 60 jours, courbes par jour, et toutes les vidéos du compte, y compris
+celles publiées hors de Clipper. Le relevé ouvre le Chrome du profil (lecture
+seule) :
 
-- le relevé n'a lieu que quand tu te sers de Clipper : à l'ouverture de l'écran
-  si le dernier a plus de `[tiktok] stats_stale_min` minutes (60 par défaut,
-  0 = jamais), au passage pendant une publication, et par **« Relever
-  maintenant »** ; un seul relevé à la fois par compte. Le relevé périodique
-  du worker est coupé (`[tiktok] stats_interval_h = 0` ; N > 0 = toutes les N
-  heures pour les comptes prêts à publier) ;
-- une vidéo supprimée sur TikTok (absente du dernier relevé de la page
-  Publications) n'est plus affichée ; son historique est conservé ;
-- chaque relevé est ajouté à l'historique `state/stats/tiktok/<compte>/` et
-  n'écrase jamais le précédent : les courbes sont calculées sur cet
-  historique, un jour sans relevé reste vide ;
+- il n'a lieu que quand tu te sers de Clipper : à l'ouverture de l'écran si le
+  dernier a plus de `[tiktok] stats_stale_min` minutes (60), pendant une
+  publication, et par **« Relever maintenant »** ; un seul à la fois par
+  compte (`[tiktok] stats_interval_h = 0` coupe le relevé périodique) ;
+- chaque relevé s'ajoute à l'historique `state/stats/tiktok/<compte>/` sans
+  écraser le précédent, un jour sans relevé reste vide ;
 - la **fiche d'une vidéo** donne vues, temps de visionnage, courbe de
   rétention, spectateurs et engagement (TikTok ne les remplit qu'à partir de
   100 vues), et renvoie au clip Clipper d'origine ;
-- comme pour la publication, un captcha ou une page inattendue **arrête** le
-  relevé, avec la raison affichée dans la console.
+- un captcha ou une page inattendue **arrête** le relevé, raison affichée.
+
+### Apprentissage du jury
+
+Sous les statistiques, la section **Apprentissage** relie chaque post relevé à
+son clip et à ses juges. La vérité terrain, ce sont les signaux réels (vues
+rapportées aux autres posts du compte). Une vue n'entre dans la mesure qu'**à
+maturité** (`maturity_days`, 3 jours). Le poids des juges est recalibré
+automatiquement, borné ; un **coach** propose des retouches de prompts par
+lots, que tu adoptes ou refuses (jamais appliquées seules) ; le juge
+conformité reste hors apprentissage. Le tableau de **rétention à maturité**
+classe les clips par part vue, avec la mention « n = X, trop peu pour
+conclure » sous `retention_min_n` (30), sans aucune corrélation calculée. Une
+**alerte « 0 vue à 24 h »** (`zero_view_alert_hours`) signale sur le tableau
+de bord les posts sans vue, ou un compte entier quand au moins
+`zero_view_alert_account_min` de ses posts le sont ; un post sans relevé est
+rendu à part, jamais compté à zéro. Réglages dans `[learning]`.
 
 ## Cookies YouTube
 
 Pour télécharger une vidéo qui exige d'être connecté (âge, abonnés...), yt-dlp
-lit les cookies d'un profil du navigateur de clipper plutôt que ceux de
-Firefox :
+lit les cookies d'un profil du navigateur de clipper :
 
 1. connecte le profil à YouTube : `python -m clipper browser login <compte>
-   --url https://www.youtube.com` (connexion à la main, puis fermeture de la
-   fenêtre) ;
+   --url https://www.youtube.com` (à la main, puis ferme la fenêtre) ;
 2. dans `config.toml`, règle `[download] cookies_profile = "<compte>"`.
 
-Au téléchargement, les cookies YouTube/Google du profil sont exportés vers
-`state/browser/<compte>/cookies.txt` (format Netscape, lisible par toi seul ;
-les cookies TikTok n'en sortent pas) et passés à yt-dlp. `cookies_profile`
-prime sur `cookies_from_browser` ; le combiner avec `cookies_file` est une
-erreur. Profil absent ou sans cookie YouTube : le téléchargement s'arrête avec
-un message, sans repli.
+Les cookies YouTube/Google du profil sont exportés vers
+`state/browser/<compte>/cookies.txt` (lisible par toi seul ; les cookies
+TikTok n'en sortent pas). `cookies_profile` prime sur `cookies_from_browser` ;
+le combiner avec `cookies_file` est une erreur. Profil absent ou sans cookie
+YouTube : arrêt avec un message, sans repli.
 
 ## Coûts et performances
 
-Mesures détaillées (VRAM, durée par étape, coût LLM, choix du modèle
-whisper) sur RTX 3050 4 Go : [`docs/benchmarks/rtx3050.md`](docs/benchmarks/rtx3050.md).
-Banc dédié whisper `small` vs `large-v3-turbo` :
+Mesures (VRAM, durée par étape, coût LLM, choix du modèle whisper) sur RTX
+3050 4 Go : [`docs/benchmarks/rtx3050.md`](docs/benchmarks/rtx3050.md) ; banc
+whisper `small` vs `large-v3-turbo` :
 [`docs/bench-whisper-vitesse.md`](docs/bench-whisper-vitesse.md).
 
 ## Configuration
 
-Chaque étape du pipeline (module `clipper/x.py`) déclare son propre dict
-`CONFIG_DEFAULTS` : c'est lui qui rend une table `[x]` de `config.toml`
-valide (clé absente refusée, section sans module ou sans `CONFIG_DEFAULTS`
-refusée). Copie `config.example.toml` vers `config.toml` et ajuste au
-besoin ; les réglages retenus après le banc RTX 3050 y sont documentés en
-commentaire.
+Chaque module du pipeline (`clipper/x.py`) déclare son `CONFIG_DEFAULTS` :
+c'est lui qui rend une table `[x]` de `config.toml` valide (clé inconnue ou
+section sans module refusée). Copie `config.example.toml` vers `config.toml`
+et ajuste ; les presets de style (`presets/`) se superposent. Les réglages
+sont détaillés dans [`docs/GUIDE.md`](docs/GUIDE.md).
 
 ## Documentation
 
-- [`docs/GUIDE.md`](docs/GUIDE.md) — guide utilisateur : les 12 étapes du
-  pipeline, modes, formats, console de gestion, configuration complète, consommation du quota
-  Claude, dépannage.
-- [`docs/versions.md`](docs/versions.md) — plan de versions et critères de la
+- [`docs/GUIDE.md`](docs/GUIDE.md) : guide utilisateur (étapes, modes, formats,
+  console, configuration, quota Claude, dépannage).
+- [`docs/INSTALLATION.md`](docs/INSTALLATION.md) : installeur portable.
+- [`docs/versions.md`](docs/versions.md) : plan de versions et critères de la
   1.0.0.
-- [`docs/tiktok-cadence.md`](docs/tiktok-cadence.md) — étude du rythme de
-  publication sur TikTok (plafonds, écarts, comptes neufs et établis).
-- [`docs/releases/v0.3.0.md`](docs/releases/v0.3.0.md) — notes de la
-  pré-version 0.3.0 (mise à jour depuis la 0.2.0, avertissements).
-- [`docs/releases/v0.2.0.md`](docs/releases/v0.2.0.md) — notes de la
-  pré-version 0.2.0 (mise à jour depuis la 0.1.0, avertissements).
-- [`docs/releases/v0.1.0.md`](docs/releases/v0.1.0.md) — notes de la
-  pré-version 0.1.0.
-- [`CHANGELOG.md`](CHANGELOG.md) — historique des versions.
-- [`AGENTS.md`](AGENTS.md) — conventions du dépôt et décisions ratifiées
-  (ADR/SPEC), pour qui contribue au code.
+- [`docs/tiktok-cadence.md`](docs/tiktok-cadence.md) : rythme de publication
+  sur TikTok.
+- Notes de version :
+  [`v0.3.0`](docs/releases/v0.3.0.md), [`v0.2.0`](docs/releases/v0.2.0.md),
+  [`v0.1.0`](docs/releases/v0.1.0.md).
+- [`CHANGELOG.md`](CHANGELOG.md) : historique des versions.
+- [`AGENTS.md`](AGENTS.md) : conventions du dépôt et décisions ratifiées
+  (ADR/SPEC).
 
 ## Développement
 
@@ -597,51 +549,40 @@ commentaire.
 pytest
 ```
 
-Tout le pipeline doit tourner sur CPU pour les tests (ADR-fb9b) : aucun test
-n'a besoin d'un GPU pour passer. Ce qui a réellement besoin du réseau, d'un
-vrai modèle ou du vrai Claude est un test optionnel, sauté par défaut
-(`skipif`), jamais lancé en CI ni par défaut en local.
+Tout le pipeline tourne sur CPU pour les tests : aucun test n'a besoin d'un
+GPU, du réseau ni du vrai Claude. Ce qui en a besoin est un test optionnel,
+sauté par défaut (`skipif`), jamais lancé en CI. Exemples : candidats d'action
+(`CLIPPER_ACTION_REAL=1`, quota Claude consommé), installeur portable
+(`CLIPPER_INSTALLER_REAL=1`, ~700 Mo téléchargés) ; voir `AGENTS.md`.
 
-**Test réel des candidats d'action** (optionnel, quota Claude consommé) :
-`tests/test_action_real.py` enchaîne transcribe, audio, scenes, action puis
-moments sur un extrait de VOD (10 min au plus) dans un workspace temporaire,
-avec le vrai whisper et le vrai `claude`. Sauté sans `CLIPPER_ACTION_REAL=1`.
-
-```powershell
-$env:CLIPPER_ACTION_REAL = "1"
-$env:CLIPPER_ACTION_REAL_VIDEO = "C:\chemin\extrait.mp4"
-python -m pytest -q tests/test_action_real.py
-```
-
-**Régénérer les captures et animations.** Les images de
-`docs/assets/readme/` viennent d'un script reproductible,
+**Régénérer les captures et animations.** Les images de `docs/assets/readme/`
+viennent d'un script reproductible,
 [`tools/readme_shots/capture.py`](tools/readme_shots/capture.py) : il crée un
-espace de démonstration **temporaire** (workspace, clips, publications et
-statistiques factices, vignettes de synthèse générées par ffmpeg), lance
-`clipper serve` dessus, capture la console avec Playwright (Chromium headless,
-1440×900, thèmes sombre et clair), assemble les GIF puis supprime tout. Il ne
-lit ni n'écrit jamais le vrai `workspace/`, `output/` ni `state/`.
+espace de démonstration **temporaire** (données factices, vignettes de
+synthèse ffmpeg), lance `clipper serve` dessus, capture la console avec
+Playwright (Chromium headless, 1440×900, thèmes sombre et clair), assemble les
+GIF puis supprime tout. Il ne lit ni n'écrit jamais le vrai `workspace/`,
+`output/` ni `state/`.
 
 ```powershell
 python -m playwright install chromium
 python tools/readme_shots/capture.py
 ```
 
-Les tâches et décisions du dépôt vivent dans `.ank/`, gérées par la CLI
+Les tâches et décisions vivent dans `.ank/`, gérées par la CLI
 [`ank`](https://github.com/haksolot/ank) (`ank context`, `ank claim`, `ank
-show`, `ank done`...) — voir `AGENTS.md` pour les règles complètes.
+done`...) ; règles complètes dans `AGENTS.md`.
 
 ## Limites et feuille de route
 
-- Le format `crop` (suivi de visage) reste une option figée, moins
-  travaillée que `letterbox`.
-- Sans GPU, le pipeline tourne mais plus lentement (transcription et rendu
-  en CPU).
-- Le mode `auto` dépend de la disponibilité de Claude ; une panne prolongée
-  met les vidéos en file d'attente plutôt que de les abandonner.
-- La publication et les statistiques TikTok passent par un navigateur piloté :
-  elles dépendent de la page TikTok Studio et peuvent s'arrêter quand elle
-  change (voir [Publier sur TikTok](#publier-sur-tiktok)).
-- Aucun contenu ni capture vidéo tiers n'est utilisé dans ce dépôt ou sa
-  documentation : les images du README viennent de données de démonstration
-  inventées.
+- Le format `crop` (suivi de visage) reste une option figée.
+- Sans GPU, le pipeline tourne plus lentement (transcription et rendu en CPU).
+- Le mode `auto` dépend de Claude ; une panne prolongée met les vidéos en file
+  plutôt que de les abandonner.
+- La publication et les statistiques passent par un navigateur piloté : elles
+  dépendent des pages TikTok Studio et YouTube Studio et peuvent s'arrêter
+  quand elles changent (voir [Publier sur TikTok](#publier-sur-tiktok)).
+- La veille s'appuie sur des sources officielles, mais l'histogramme des avis
+  Steam est un endpoint non documenté ; elle est désactivée par défaut.
+- Aucun contenu ni capture vidéo tiers n'est utilisé dans ce dépôt : les images
+  du README viennent de données de démonstration inventées.

@@ -5,7 +5,7 @@ slug: readme-refonte-compl-te-dans-le-m-me-style-jour
 title: "README : refonte complète dans le même style, à jour du code réel (veille, apprentissage, formats, comptes), captures rafraîchies"
 created: 2026-10-09T08:15:38Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - README.md
   - docs/assets/readme/**
@@ -19,6 +19,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/ee75ba364a00@b67241f
+    tree: scope/1d0bb05a79b0
+    criteria: 781272a256cb
+    verifier: tests@c7b454d16c90
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---
