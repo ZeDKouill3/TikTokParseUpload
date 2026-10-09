@@ -158,13 +158,13 @@ def _fmt(number: float) -> str:
 # ---------------------------------------------------------------- creneaux (R1)
 
 
-def _is_prime(slot: datetime, settings: dict[str, Any]) -> bool:
+def is_prime(slot: datetime, settings: dict[str, Any]) -> bool:
     local = _paris(slot)
     minute = local.hour * 60 + local.minute
     return _minutes(settings, "prime_start") <= minute <= _minutes(settings, "prime_end")
 
 
-def _entry_time(entry: dict[str, Any]) -> datetime | None:
+def entry_time(entry: dict[str, Any]) -> datetime | None:
     """Instant d'une entree de publication, comme ``publish.planned_times`` : publiee -> sa mise en ligne,
     approuvee ou programmee -> son creneau."""
     if entry["status"] == "published":
@@ -209,8 +209,8 @@ def _account_slots(
         notes.append(f"{account['label']} : {possible} créneau(x) possible(s) sur "
                      f"{int(settings['posts_per_day']) - len(planned)} voulus (écart minimal "
                      f"{settings['default_grid_gap_min']} min, jamais de créneau rapproché)")
-    slots = [{"slot_at": s.isoformat(), "kind": "fixed", "prime": _is_prime(s, settings)} for s in kept_fixed]
-    slots += [{"slot_at": s.isoformat(), "kind": "grid", "prime": _is_prime(s, settings)} for s in grid]
+    slots = [{"slot_at": s.isoformat(), "kind": "fixed", "prime": is_prime(s, settings)} for s in kept_fixed]
+    slots += [{"slot_at": s.isoformat(), "kind": "grid", "prime": is_prime(s, settings)} for s in grid]
     slots.sort(key=lambda s: datetime.fromisoformat(s["slot_at"]))
     return slots, notes
 
@@ -218,7 +218,7 @@ def _account_slots(
 # ---------------------------------------------------------------- sources, vivier, bonus (R2-R4)
 
 
-class _World:
+class World:
     """Ce que le calcul lit : files, sidecars, meta.json, instantane de la veille. Lu une fois par calcul."""
 
     def __init__(self, config: Config) -> None:
@@ -293,7 +293,7 @@ class _World:
                 if isinstance(e, dict) and e.get("status") in ("waiting", "running") and e.get("video_id")}
 
 
-def _stats_by_source(world: _World, active: list[dict[str, Any]], now: datetime, settings: dict[str, Any]) -> tuple[
+def source_stats(world: World, active: list[dict[str, Any]], now: datetime, settings: dict[str, Any]) -> tuple[
         dict[str, list[float]], list[float]]:
     """Vues reelles des posts releves dans la fenetre, relies a un clip Clipper (``tiktok_post.id``), tous comptes
     confondus : par ``source_key`` et au total. Rien n'est estime (R4)."""
@@ -325,8 +325,10 @@ def _stats_by_source(world: _World, active: list[dict[str, Any]], now: datetime,
     return by_source, every
 
 
-def _bonus(source_key: str, by_source: dict[str, list[float]], every: list[float], settings: dict[str, Any]) -> tuple[
-        float, str]:
+def source_bonus(
+    source_key: str, by_source: dict[str, list[float]], every: list[float], settings: dict[str, Any],
+) -> tuple[float, str]:
+    """Bonus (points) d'une source d'après la médiane de ses posts relevés contre la médiane de tous, et sa raison."""
     mine = by_source.get(source_key, [])
     if not mine:
         return 0, "no_stats"
@@ -338,7 +340,7 @@ def _bonus(source_key: str, by_source: dict[str, list[float]], every: list[float
             f"{len(mine)} posts, médiane {_fmt(median)} vues, référence {_fmt(reference)}")
 
 
-def _pool(world: _World, active: list[dict[str, Any]], settings: dict[str, Any], notes: list[str]) -> tuple[
+def _pool(world: World, active: list[dict[str, Any]], settings: dict[str, Any], notes: list[str]) -> tuple[
         list[dict[str, Any]], list[dict[str, str]]]:
     """Clips choisissables (R2) avec les comptes qui peuvent les prendre, et les exclusions comptees par raison."""
     clips: dict[tuple[str, str], dict[str, Any]] = {}
@@ -379,7 +381,7 @@ def _pool(world: _World, active: list[dict[str, Any]], settings: dict[str, Any],
 
 
 def _build(day: date, now: datetime, settings: dict[str, Any], config: Config, computed_by: str) -> dict[str, Any]:
-    world = _World(config)
+    world = World(config)
     notes: list[str] = []
     active: list[dict[str, Any]] = []
     for account in accounts.list_accounts(config):
@@ -391,13 +393,13 @@ def _build(day: date, now: datetime, settings: dict[str, Any], config: Config, c
                          " prêt, hors périmètre v1 (non planifié)")
 
     pool, excluded = _pool(world, active, settings, notes)
-    by_source, every = _stats_by_source(world, active, now, settings)
+    by_source, every = source_stats(world, active, now, settings)
     if not every:
         notes.append("aucun relevé récent")
     candidates: list[dict[str, Any]] = []
     for clip in pool:
         source = world.source(clip["video_id"])
-        bonus, reason = _bonus(source["source_key"], by_source, every, settings)
+        bonus, reason = source_bonus(source["source_key"], by_source, every, settings)
         score = clip["score"] if isinstance(clip["score"], (int, float)) and not isinstance(clip["score"], bool) else None
         candidates.append({
             **clip, **source, "score": score, "bonus": bonus, "bonus_reason": reason,
@@ -409,7 +411,7 @@ def _build(day: date, now: datetime, settings: dict[str, Any], config: Config, c
     for rank, account in enumerate(active):
         planned_entries = [(n, e) for n, e in publish._account_entries(account["id"], world.publish_dir,
                                                                       world.presets_dir, world.base_config)
-                           if (t := _entry_time(e)) is not None and _paris(t).date() == day]
+                           if (t := entry_time(e)) is not None and _paris(t).date() == day]
         planned = publish.planned_times(account["id"], state_dir=world.publish_dir, presets_dir=world.presets_dir)
         planned = [t for t in planned if _paris(t).date() == day]
         slots, slot_notes = _account_slots(account, rank, day, settings, planned)
@@ -540,3 +542,63 @@ def run_if_due(now: datetime, *, config: Config | None = None) -> dict[str, Any]
     except (RepartitionError, *_HANDLED) as exc:
         _record_error(path, day, now, exc)
         return None
+
+
+# ---------------------------------------------------------------- API publique (écran et routes web)
+#
+# Ce que les routes ``/api/repartition*`` de clipper.web appellent, seules fonctions de ce module qu'il importe.
+
+
+def read_settings(config: Config | None) -> dict[str, Any]:
+    """Réglages ``[repartition]`` validés (R0) ; ``config`` à ``None`` donne les valeurs par défaut.
+    Une valeur hors domaine est une ``RepartitionError``, jamais corrigée."""
+    return _settings(config)
+
+
+def describe_line(
+    world: World, settings: dict[str, Any], stats: tuple[dict[str, list[float]], list[float]], *,
+    video_id: str, clip_id: str, slot_at: datetime, score: object,
+) -> dict[str, Any]:
+    """Une ligne redécrite depuis le clip : score, bonus, source, exploration, créneau du soir (R2-R6). Le score
+    n'est repris que s'il est un nombre ; ``warning`` reste vide, ``line_warnings`` le remplit."""
+    slot = _paris(slot_at)
+    source = world.source(video_id)
+    bonus, reason = source_bonus(source["source_key"], *stats, settings)
+    number = score if isinstance(score, (int, float)) and not isinstance(score, bool) else None
+    return {"slot_at": slot.isoformat(), "video_id": video_id, "clip_id": clip_id, "score": number,
+            "bonus": bonus, "bonus_reason": reason,
+            "adjusted": None if number is None else round(number + bonus, 2),
+            **source, "exploration": world.exploration(video_id, clip_id, []),
+            "prime": is_prime(slot, settings), "warning": None}
+
+
+def line_warnings(plan: dict[str, Any], day: date | str, settings: dict[str, Any], world: World,
+                  entries: list[tuple[str, dict[str, Any]]]) -> None:
+    """``warning`` de chaque ligne du plan, rempli en place (c'est le choix de l'utilisateur, jamais un refus) : plus
+    de ``max_per_source`` clips d'une même source par compte et par jour, publications déjà prévues comprises (R3) ;
+    plus de ``exploration_per_day`` clips d'exploration par jour, ou un clip d'exploration le soir (R6).
+    ``entries`` : les entrées de publication de tous les canaux, ``(canal, entrée)`` comme ``publish.all_entries``."""
+    target = _as_day(day)
+    counts: dict[tuple[str, str], int] = {}
+    for _channel, entry in entries:
+        when = entry_time(entry)
+        if when is not None and _paris(when).date() == target and entry.get("account"):
+            key = (entry["account"], world.source(entry["video_id"])["source_key"])
+            counts[key] = counts.get(key, 0) + 1
+    every = sorted(((line, account["account"]) for account in plan["accounts"] for line in account["lines"]),
+                   key=lambda found: datetime.fromisoformat(found[0]["slot_at"]))
+    explorations = 0
+    for line, account_id in every:
+        notes = []
+        key = (account_id, line["source_key"])
+        counts[key] = counts.get(key, 0) + 1
+        if counts[key] > int(settings["max_per_source"]):
+            notes.append(f"plus de {settings['max_per_source']} clips de la même source ({line['source_key']}) "
+                         "ce jour-là sur ce compte")
+        if line["exploration"]:
+            explorations += 1
+            if explorations > int(settings["exploration_per_day"]):
+                notes.append(f"plus de {settings['exploration_per_day']} clip(s) d'exploration par jour")
+            if line["prime"]:
+                notes.append("clip d'exploration sur un créneau du soir")
+        line["warning"] = "; ".join(notes) or None
