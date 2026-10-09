@@ -4101,3 +4101,147 @@ def test_a_scheduled_entry_whose_caption_is_shown_only_at_another_hour_is_not_fl
     _reconcile_worker(config).tick()
 
     assert "missing_on_tiktok" not in _entries(tmp_path, NO_CHANNEL)[0]
+
+
+# --- TASK-5e6a1c00b06e : jamais de worker mort sur une exception inattendue ; rapprochement a la minute programmee ---
+
+
+@pytest.mark.parametrize("error", [KeyError("x"), TypeError("x"), AttributeError("x")])
+def test_an_unexpected_exception_under_the_learning_runner_never_leaves_tick(tmp_path, caplog, error):
+    import logging
+
+    def runner(now, *, config):
+        raise error
+
+    config = _learning_config(tmp_path)
+    w = worker.Worker(config=config, spawner=FakeSpawner(), learning_runner=runner)
+    w._veille_due = lambda: None
+    with caplog.at_level(logging.ERROR):
+        w.tick()
+        w.tick()
+    assert len([r for r in caplog.records if r.levelno == logging.ERROR and "apprentissage" in r.getMessage()]) == 1
+    last_error = _sync_json(config)["last_error"]
+    assert last_error["where"] == "run_if_due" and type(error).__name__ in last_error["message"]
+
+
+@pytest.mark.parametrize("error", [KeyError("x"), TypeError("x"), AttributeError("x")])
+def test_an_unexpected_exception_under_the_repartition_runner_never_leaves_tick(tmp_path, caplog, error):
+    import logging
+
+    def runner(now, *, config):
+        raise error
+
+    w = worker.Worker(config=_learning_config(tmp_path), spawner=FakeSpawner(), repartition_runner=runner)
+    w._veille_due = lambda: None
+    with caplog.at_level(logging.ERROR):
+        w.tick()
+        w.tick()
+    assert len([r for r in caplog.records if r.levelno == logging.ERROR and "lendemain" in r.getMessage()]) == 1
+
+
+def test_an_unexpected_exception_under_the_watch_never_leaves_tick(tmp_path, caplog, monkeypatch):
+    import logging
+
+    from clipper import watch
+
+    def boom(*args, **kwargs):
+        raise KeyError("video_id")
+
+    monkeypatch.setattr(watch, "check", boom)
+    config = _watch_env(tmp_path, {"ma_chaine": (True, 1800)})
+    w = worker.Worker(config=config, spawner=FakeSpawner(), watch_lister=_WatchLister())
+    with caplog.at_level(logging.ERROR):
+        w.tick()
+        w.tick()
+    assert len([r for r in caplog.records if r.levelno == logging.ERROR and "surveillance" in r.getMessage()]) == 1
+
+
+_NINE_05 = datetime(2026, 10, 9, 9, 5, tzinfo=_PARIS)
+_NINE_07 = datetime(2026, 10, 9, 9, 7, tzinfo=_PARIS)
+
+
+def test_a_to_verify_entry_with_a_slot_rounded_by_tiktok_is_found_when_the_caption_is_unique(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    _to_verify_at(tmp_path, "02", _NINE_07)
+    _same_caption(tmp_path, ["02"])
+    _write_snapshot(tmp_path, "ef34ab", _ago(hours=1), posts=[
+        _post("7300000000000000019", posted="2026-10-09T09:05:00")])
+
+    _reconcile_worker(config).tick()
+
+    entry = _entries(tmp_path, NO_CHANNEL)[0]
+    assert entry["status"] == "published" and entry["post_id"] == "7300000000000000019"
+
+
+def test_a_to_verify_entry_with_the_recorded_effective_time_matches_exactly(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    _to_verify_at(tmp_path, "02", _NINE_07)
+    path = tmp_path / "state" / "publish" / f"{NO_CHANNEL}.json"
+    entries = json.loads(path.read_text(encoding="utf-8"))
+    entries[0]["tiktok_publish_at"] = _NINE_05.isoformat()
+    path.write_text(json.dumps(entries), encoding="utf-8")
+    _same_caption(tmp_path, ["02"])
+    _write_snapshot(tmp_path, "ef34ab", _ago(hours=1), posts=[
+        _post("7300000000000000019", posted="2026-10-09T09:05:00")])
+
+    _reconcile_worker(config).tick()
+
+    assert _entries(tmp_path, NO_CHANNEL)[0]["status"] == "published"
+
+
+def test_a_to_verify_gap_wider_than_the_selector_step_is_not_accepted(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    _to_verify_at(tmp_path, "02", _NINE_07)
+    _same_caption(tmp_path, ["02"])
+    _write_snapshot(tmp_path, "ef34ab", _ago(hours=1), posts=[
+        _post("7300000000000000019", posted="2026-10-09T09:00:00")])
+
+    _reconcile_worker(config).tick()
+
+    entry = _entries(tmp_path, NO_CHANNEL)[0]
+    assert entry["status"] == "failed" and entry["to_verify"] is True
+
+
+def test_two_same_caption_posts_inside_the_five_minute_window_conclude_nothing(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    _to_verify_at(tmp_path, "02", _NINE_07)
+    _same_caption(tmp_path, ["02"])
+    _write_snapshot(tmp_path, "ef34ab", _ago(hours=1), posts=[
+        _post("7300000000000000019", posted="2026-10-09T09:05:00"),
+        _post("7300000000000000020", posted="2026-10-09T09:10:00")])
+
+    _reconcile_worker(config).tick()
+
+    entry = _entries(tmp_path, NO_CHANNEL)[0]
+    assert entry["status"] == "failed" and entry["to_verify"] is True and not entry.get("post_id")
+
+
+def test_an_unconfirmed_schedule_records_the_effective_scheduled_time(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    _manual(tmp_path, "01", datetime.now(timezone.utc) + timedelta(days=3), mode="scheduled")
+    pub = FakePublisher(scheduled_post_id=None)
+
+    _pub_worker(config, pub).tick()
+
+    entry = _entries(tmp_path, NO_CHANNEL)[0]
+    assert entry["to_verify"] is True
+    assert entry["tiktok_publish_at"] == pub.calls[0]["schedule_at"].isoformat()
+
+
+def test_a_scheduled_entry_is_compared_at_its_effective_time_not_the_requested_minute(tmp_path, monkeypatch, caplog):
+    import logging
+
+    config = _pub_env(tmp_path, monkeypatch)
+    _manual(tmp_path, "01", _NINE_07, mode="scheduled", status="published", tiktok_state="scheduled_on_tiktok",
+            post_id=None, post_url=None, published_at=_ago(hours=3).isoformat(),
+            tiktok_publish_at=_NINE_05.isoformat())
+    _same_caption(tmp_path, ["01"])
+    _write_snapshot(tmp_path, "ef34ab", _ago(hours=1), posts=[
+        _post("7300000000000000019", posted="2026-10-09T09:05:00")])
+
+    with caplog.at_level(logging.INFO):
+        _reconcile_worker(config).tick()
+
+    entry = _entries(tmp_path, NO_CHANNEL)[0]
+    assert "missing_on_tiktok" not in entry
+    assert "rien conclu" not in caplog.text
