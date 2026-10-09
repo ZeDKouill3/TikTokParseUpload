@@ -5,7 +5,7 @@ slug: webcam-du-stream-trouv-e-par-p-riode-rectangles
 title: Webcam du stream trouvée par période, rectangles candidats numérotés choisis par Claude (succède à SPEC-76dc)
 created: 2026-10-05T22:20:19Z
 author: w-57453bb1e834
-status: proposed
+status: accepted
 scope:
   - clipper/reframe.py
   - clipper/render.py
@@ -14,8 +14,12 @@ scope:
   - clipper/llm/__init__.py
 references: [ADR-b16b71007578, ADR-fb9bcb1e98f5, ADR-ad2e562b1810, ADR-b1c17749b528, SPEC-6a867ae54f94]
 supersedes: SPEC-76dc6a1cbccb
+ratified: fb010086e4aa
+verified:
+  - by: nicoc@zedk_ordi
+    at: 2026-10-09T01:00:00Z
 schema: 4
-version: 1
+version: 2
 ---
 
 ## Objet
