@@ -3323,13 +3323,9 @@ def create_app(config: Config | None = None) -> FastAPI:
 
     def _rep_view(plan: dict[str, Any] | None, day: str) -> dict[str, Any]:
         """Le fichier du jour avec, par ligne, titre, vignette, heure de Paris et ``refusal`` ; ``pool`` = les clips
-        choisissables pour remplacer une ligne (``pool_size`` = le nombre de R7)."""
-        pool = _series_units_view(publish_mod.available_series_clips(
-            None, together=False, workspace_dir=Path(config.workspace_dir), output_dir=Path(config.output_dir),
-            state_dir=_publish_dir(config)))
+        choisissables par ce compte pour remplacer une ligne, sous chaque compte (``pool_size`` = le nombre de R7)."""
         base: dict[str, Any] = {"day": day, "status": "absent", "accounts": []} if plan is None else dict(plan)
-        base.update(enabled=config.section("repartition")["enabled"], pool=pool,
-                    pool_size=None if plan is None else plan.get("pool"))
+        base.update(enabled=config.section("repartition")["enabled"], pool_size=None if plan is None else plan.get("pool"))
         accounts_out = []
         for account in base.get("accounts") or []:
             refusals = {} if base["status"] == "validated" else _rep_refusals(account["account"], account["lines"])
@@ -3337,7 +3333,10 @@ def create_app(config: Config | None = None) -> FastAPI:
                       "publish_at_paris": _paris(line["slot_at"]),
                       "refusal": refusals.get((line["video_id"], line["clip_id"])),
                       "warning": line.get("warning")} for line in account["lines"]]
-            accounts_out.append({**account, "lines": lines})
+            pool = _series_units_view(repartition_mod.account_pool(
+                account["account"], workspace_dir=Path(config.workspace_dir), output_dir=Path(config.output_dir),
+                state_dir=_publish_dir(config)))
+            accounts_out.append({**account, "lines": lines, "pool": pool})
         base["accounts"] = accounts_out
         return base
 
@@ -3361,11 +3360,11 @@ def create_app(config: Config | None = None) -> FastAPI:
         return repartition_mod.describe_line(world, settings, stats, video_id=line.video_id, clip_id=line.clip_id,
                                              slot_at=slot, score=sidecar.get("score"))
 
-    def _rep_warnings(plan: dict[str, Any], day: str, settings: dict[str, Any], world: Any) -> None:
+    def _rep_warnings(plan: dict[str, Any], day: str, settings: dict[str, Any], world: Any,
+                      entries: list[tuple[str, dict[str, Any]]]) -> None:
         """``warning`` de chaque ligne (c'est le choix de l'utilisateur, jamais un refus) : plus de ``max_per_source``
         clips d'une même source par compte et par jour, publications déjà prévues comprises (R3) ; plus de
         ``exploration_per_day`` clips d'exploration par jour, ou un clip d'exploration le soir (R6)."""
-        entries = _rep_call(publish_mod.all_entries, state_dir=_publish_dir(config), presets_dir=_PRESETS_DIR)
         repartition_mod.line_warnings(plan, day, settings, world, entries)
 
     @app.put("/api/repartition/{day}")
@@ -3393,6 +3392,16 @@ def create_app(config: Config | None = None) -> FastAPI:
                                             f"{line.video_id}/{line.clip_id}")
                     taken.add((line.video_id, line.clip_id))
             world = repartition_mod.World(config)
+            entries = _rep_call(publish_mod.all_entries, state_dir=_publish_dir(config), presets_dir=_PRESETS_DIR)
+            for account in body.accounts:
+                for line in account.lines:
+                    _validate_video_id(line.video_id)
+                    _validate_clip_id(line.clip_id)
+                    _read_clip_sidecar(config, line.video_id, line.clip_id)  # clip inconnu : 404 avant tout autre refus
+                    problem = _rep_call(repartition_mod.line_error, world, account.account, day, video_id=line.video_id,
+                                        clip_id=line.clip_id, slot_at=_publish_parse_slot(line.slot_at), entries=entries)
+                    if problem:
+                        raise HTTPException(status_code=422, detail=problem)
             active = [a for a in _accounts_call(accounts_mod.list_accounts, config)
                       if a["service"] == "tiktok" and a["ready_to_publish"] and not a.get("paused_at")]
             stats = _rep_call(repartition_mod.source_stats, world, active, datetime.now(_PARIS), settings)
@@ -3400,7 +3409,7 @@ def create_app(config: Config | None = None) -> FastAPI:
                 by_id[account.account]["lines"] = sorted(
                     (_rep_new_line(line, settings, world, stats) for line in account.lines),
                     key=lambda found: datetime.fromisoformat(found["slot_at"]))
-            _rep_warnings(plan, day, settings, world)
+            _rep_warnings(plan, day, settings, world, entries)
             plan["edited_at"] = _now_iso()
             channel_mod.atomic_write_json(path, plan)
         return _rep_view(plan, day)

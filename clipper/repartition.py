@@ -572,6 +572,40 @@ def describe_line(
             "prime": is_prime(slot, settings), "warning": None}
 
 
+def _multi_part(world: World, video_id: str, clip_id: str) -> bool:
+    return (publish.read_sidecar(world.output, video_id, clip_id).get("parts_total") or 1) > 1  # un clip seul est « 1 sur 1 »
+
+
+def account_pool(
+    account_id: str, *, workspace_dir: str | Path, output_dir: str | Path, state_dir: str | Path,
+) -> list[dict[str, Any]]:
+    """Vivier de l'écran pour un compte (R2) : les clips que ``account_id`` peut prendre (jamais un clip validé pour un
+    autre compte), chaque partie seule, sans les parties d'une série en plusieurs parties (que le plan exclut)."""
+    units = publish.available_series_clips(
+        None, account=account_id, together=False, workspace_dir=workspace_dir, output_dir=output_dir,
+        state_dir=state_dir)
+    return [u for u in units if (publish.read_sidecar(output_dir, u["video_id"], u["clip_ids"][0]).get("parts_total") or 1) <= 1]
+
+
+def line_error(
+    world: World, account_id: str, day: date | str, *, video_id: str, clip_id: str, slot_at: datetime,
+    entries: list[tuple[str, dict[str, Any]]],
+) -> str | None:
+    """Raison pour laquelle une ligne n'a pas sa place dans le plan de ``account_id`` ce ``day``, ou ``None`` : créneau
+    sur un autre jour (heure de Paris), partie d'une série en plusieurs parties (``multi_part_series``), clip déjà
+    validé pour un autre compte. Une erreur explicite, jamais une ligne corrigée en silence (ADR-ad2e)."""
+    target = _as_day(day)
+    if _paris(slot_at).date() != target:
+        return f"créneau du {_paris(slot_at).date().isoformat()} hors du jour du plan ({target.isoformat()})"
+    if _multi_part(world, video_id, clip_id):
+        return f"{video_id}/{clip_id} : multi_part_series (partie d'une série en plusieurs parties, jamais planifiée seule)"
+    for _channel, entry in entries:
+        owner = entry.get("account")
+        if (entry["video_id"], entry["clip_id"]) == (video_id, clip_id) and entry["status"] == "approved"                 and owner and owner != account_id:
+            return f"{video_id}/{clip_id} est validé pour le compte {owner}, pas pour {account_id}"
+    return None
+
+
 def line_warnings(plan: dict[str, Any], day: date | str, settings: dict[str, Any], world: World,
                   entries: list[tuple[str, dict[str, Any]]]) -> None:
     """``warning`` de chaque ligne du plan, rempli en place (c'est le choix de l'utilisateur, jamais un refus) : plus
@@ -585,12 +619,18 @@ def line_warnings(plan: dict[str, Any], day: date | str, settings: dict[str, Any
         if when is not None and _paris(when).date() == target and entry.get("account"):
             key = (entry["account"], world.source(entry["video_id"])["source_key"])
             counts[key] = counts.get(key, 0) + 1
+    created = {(made["account"], made["video_id"], made["clip_id"]) for made in plan.get("created") or []}
     every = sorted(((line, account["account"]) for account in plan["accounts"] for line in account["lines"]),
                    key=lambda found: datetime.fromisoformat(found[0]["slot_at"]))
     explorations = 0
     for line, account_id in every:
         notes = []
         key = (account_id, line["source_key"])
+        if (account_id, line["video_id"], line["clip_id"]) in created:
+            # déjà créée : ``entries`` la compte, la compter ici aussi la doublerait ; plus rien à avertir
+            explorations += bool(line["exploration"])
+            line["warning"] = None
+            continue
         counts[key] = counts.get(key, 0) + 1
         if counts[key] > int(settings["max_per_source"]):
             notes.append(f"plus de {settings['max_per_source']} clips de la même source ({line['source_key']}) "
