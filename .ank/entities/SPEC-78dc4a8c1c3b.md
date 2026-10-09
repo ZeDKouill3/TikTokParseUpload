@@ -5,7 +5,7 @@ slug: r-partition-automatique-du-lendemain-plan-par-co
 title: "Répartition automatique du lendemain : plan par compte TikTok préparé chaque soir, modifiable, validé d'un clic avant toute création de publication"
 created: 2026-10-09T13:08:21Z
 author: nicoc@zedk_ordi
-status: proposed
+status: accepted
 scope:
   - clipper/repartition.py
   - clipper/publish.py
@@ -15,8 +15,12 @@ scope:
   - tests/test_repartition.py
   - config.example.toml
 references: [SPEC-1ed39f032124, SPEC-6076cbce2d7f, SPEC-f348954318c1, SPEC-47e204a92fd0, SPEC-00dbf5ef4082, SPEC-c1001cb7cbdb, ADR-49cdd4316d6e, ADR-ad2e562b1810, ADR-35b778a98d22, ADR-b16b71007578]
+ratified: 068108f524ae
+verified:
+  - by: nicoc@zedk_ordi
+    at: 2026-10-09T13:08:28Z
 schema: 4
-version: 1
+version: 2
 ---
 
 ## Objet
