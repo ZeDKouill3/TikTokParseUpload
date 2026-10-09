@@ -45,6 +45,24 @@ output_dir = "output"
 # stats_scroll_rounds = 10  # limite de securite du defilement de la liste des posts (atteinte : releve arrete, journalise)
 # stats_empty_wait_s = 8    # attente de la liste avant de conclure « aucun post » (compte neuf)
 
+# [repartition]  # plan du lendemain par compte TikTok (SPEC-78dc) : prepare chaque soir par le worker, valide d'un clic, rien n'est cree avant
+# enabled = true                 # false : le worker ne calcule rien
+# state_dir = "state/repartition"  # un fichier <AAAA-MM-JJ>.json par jour planifie
+# compute_time = "20:00"         # heure de Paris a partir de laquelle le plan du lendemain est calcule
+# posts_per_day = 6              # posts vises par compte et par jour (publications deja prevues comprises)
+# default_grid_start = "08:00"   # grille par defaut d'un compte sans creneau fixe ce jour-la
+# default_grid_end = "22:00"     # derniere heure de la grille (incluse)
+# default_grid_gap_min = 150     # ecart minimal (minutes) entre deux posts d'un meme compte
+# account_stagger_min = 30       # decalage (minutes) de la grille entre comptes, par rang
+# max_per_source = 2             # clips d'un meme jeu (sinon d'une meme VOD) par compte et par jour
+# excluded_sources = []          # streamers (meta.json) ou styles jamais planifies, ex. ["nom_du_streamer"]
+# prime_start = "18:00"          # creneaux du soir : les meilleurs clips
+# prime_end = "22:00"            # fin des creneaux du soir (incluse)
+# exploration_per_day = 1        # clips d'exploration au plus par jour, tous comptes confondus
+# bonus_window_days = 7          # fenetre des posts releves qui servent au bonus d'une source
+# bonus_min_posts = 2            # posts releves d'une source au moins pour qu'elle ait un bonus
+# bonus_points = 5.0             # amplitude maximale du bonus (points de score), vues reelles seulement
+#
 # [action]  # etape action (SPEC-b0f3, ADR-4e57) : passages d'action des VOD gaming (pics audio, plans, images decrites par le LLM)
 # # Desactivee par defaut : action.json vide, aucun appel LLM, scenes.json inchange. Activee (style gaming
 # # action), elle pilote aussi les fenetres de pics hors parole de l'etape scenes ; relancer scenes --force.

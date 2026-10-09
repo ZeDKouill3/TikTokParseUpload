@@ -1,0 +1,725 @@
+"""repartition.py : plan du lendemain par compte TikTok (SPEC-78dc R0-R7). Aucun reseau, aucun navigateur, CPU."""
+
+from __future__ import annotations
+
+import ast
+import json
+import logging
+import tomllib
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+import pytest
+
+from clipper import pipeline, repartition, tiktok
+from clipper.config import Config
+
+PARIS = ZoneInfo("Europe/Paris")
+DAY = date(2026, 10, 10)  # un samedi
+NOW = datetime(2026, 10, 9, 20, 5, tzinfo=PARIS)
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _config(tmp_path, **overrides) -> Config:
+    return Config(
+        mode="auto", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output",
+        _sections={
+            "tiktok": {"stats_dir": str(tmp_path / "stats")},
+            "publish": {"state_dir": str(tmp_path / "pub")},
+            "accounts": {"state_file": str(tmp_path / "accounts.json")},
+            "veille": {"state_dir": str(tmp_path / "veille")},
+            "worker": {"queue_path": str(tmp_path / "queue.json")},
+            "watch": {"presets_dir": str(tmp_path / "presets")},
+            "repartition": {"state_dir": str(tmp_path / "rep"), **overrides},
+        },
+    )
+
+
+def _accounts(config, *accounts) -> None:
+    path = Path(config.section("accounts")["state_file"])
+    path.write_text(json.dumps({"accounts": list(accounts)}), encoding="utf-8")
+
+
+def _acc(account_id, *, service="tiktok", ready=True, paused=False, slots=None, label=None) -> dict:
+    return {"id": account_id, "label": label or account_id, "service": service, "ready_to_publish": ready,
+            "paused_at": "2026-10-08T10:00:00+00:00" if paused else None,
+            "slots": [{"day": "sat", "time": t} for t in (slots or [])], "timezone": "Europe/Paris"}
+
+
+def _clip(config, video, clip="01", *, score=80, ready=True, part=None, streamer=None, game=None, style=None,
+          exploration=None, post_id=None) -> None:
+    """Un clip pret : sidecar, pipeline.json (style), meta.json (streamer, jeu), moments.json (exploration)."""
+    out = Path(config.output_dir) / video
+    out.mkdir(parents=True, exist_ok=True)
+    sidecar = {"ready": ready, "score": score}
+    if part is not None:
+        sidecar.update(part=part, parts_total=2)
+    if post_id is not None:
+        sidecar["tiktok_post"] = {"id": post_id, "account": "a"}
+    (out / f"{clip}.json").write_text(json.dumps(sidecar), encoding="utf-8")
+    work = Path(config.workspace_dir) / video
+    work.mkdir(parents=True, exist_ok=True)
+    (work / "pipeline.json").write_text(json.dumps({"channel": style}), encoding="utf-8")
+    meta = {}
+    if streamer:
+        meta["channel"] = streamer
+    if game:
+        meta["game"] = game
+    (work / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    if exploration is not None:
+        moments = [{"id": int(clip[:2]), "exploration": exploration}]
+        (work / "moments.json").write_text(json.dumps({"moments": moments}), encoding="utf-8")
+
+
+def _entry(config, video, clip, *, account="a", status="scheduled", slot_at=None, channel="_sans_chaine") -> None:
+    path = Path(config.section("publish")["state_dir"]) / f"{channel}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    entries = json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
+    entries.append({"video_id": video, "clip_id": clip, "series_id": None, "part": None, "status": status,
+                    "slot_at": slot_at, "decided_at": None, "published_at": None, "error": None,
+                    "account": account})
+    path.write_text(json.dumps(entries), encoding="utf-8")
+
+
+def _snapshot(config, account, *posts, fetched_at="2026-10-09T10:00:00+00:00") -> None:
+    snapshot = {"account": account, "fetched_at": fetched_at, "source": "tiktok_studio", "origin": "full",
+                "overview": {}, "posts": [
+                    {"post_id": pid, "post_url": f"https://www.tiktok.com/@x/video/{pid}", "caption": "c",
+                     "posted_at": posted_at, "views": views} for pid, posted_at, views in posts]}
+    tiktok.append_snapshot(account, tiktok.get_settings(config), snapshot)
+
+
+def _plan(config, *, day=DAY, now=NOW) -> dict:
+    return repartition.compute_plan(day, now, config=config)
+
+
+def _acc_plan(plan, account) -> dict:
+    return next(a for a in plan["accounts"] if a["account"] == account)
+
+
+def _hours(account_plan) -> list[str]:
+    return [datetime.fromisoformat(s["slot_at"]).astimezone(PARIS).strftime("%H:%M") for s in account_plan["slots"]]
+
+
+def _line_for(plan, account, video, clip="01") -> dict | None:
+    return next((line for line in _acc_plan(plan, account)["lines"]
+                 if (line["video_id"], line["clip_id"]) == (video, clip)), None)
+
+
+def _hour_of(line) -> str:
+    return datetime.fromisoformat(line["slot_at"]).astimezone(PARIS).strftime("%H:%M")
+
+
+def _stripped(plan: dict) -> dict:
+    return {k: v for k, v in plan.items() if k != "computed_at"}
+
+
+# ---------------------------------------------------------------- R0 reglages
+
+
+def test_r0_defaults_are_exactly_the_spec():
+    assert repartition.CONFIG_DEFAULTS == {
+        "enabled": True, "state_dir": "state/repartition", "compute_time": "20:00", "posts_per_day": 6,
+        "default_grid_start": "08:00", "default_grid_end": "22:00", "default_grid_gap_min": 150,
+        "account_stagger_min": 30, "max_per_source": 2, "excluded_sources": [], "prime_start": "18:00",
+        "prime_end": "22:00", "exploration_per_day": 1, "bonus_window_days": 7, "bonus_min_posts": 2,
+        "bonus_points": 5.0,
+    }
+
+
+@pytest.mark.parametrize("override", [
+    {"compute_time": "8h"}, {"compute_time": "24:00"}, {"posts_per_day": 0}, {"posts_per_day": True},
+    {"default_grid_gap_min": 0}, {"max_per_source": 0}, {"prime_end": "18:00"}, {"prime_end": "17:00"},
+    {"default_grid_end": "07:00"}, {"bonus_points": -1}, {"excluded_sources": "streamer"},
+    {"excluded_sources": [1]}, {"bonus_window_days": 0}, {"bonus_min_posts": 0}, {"enabled": "oui"},
+])
+def test_r0_invalid_setting_is_refused_not_corrected(tmp_path, override):
+    config = _config(tmp_path, **override)
+    _accounts(config, _acc("a"))
+
+    with pytest.raises(repartition.RepartitionError):
+        _plan(config)
+
+
+def test_r0_config_example_documents_the_section():
+    text = (REPO_ROOT / "config.example.toml").read_text(encoding="utf-8")
+
+    assert "[repartition]" in text
+    for key in repartition.CONFIG_DEFAULTS:
+        assert key in text
+
+
+def test_r0_config_example_values_load_with_the_section(tmp_path):
+    lines = (REPO_ROOT / "config.example.toml").read_text(encoding="utf-8").splitlines()
+    start = next(i for i, line in enumerate(lines) if line.startswith("# [repartition]"))
+    block = ["[repartition]"]
+    for line in lines[start + 1:]:
+        if not line.startswith("#") or line.startswith("# ["):
+            break
+        body = line[2:].split("#")[0].strip() if line.startswith("# ") else ""
+        if "=" in body and not body.startswith("#"):
+            block.append(body)
+    path = tmp_path / "config.toml"
+    path.write_text('mode = "review"\n' + "\n".join(block) + "\n", encoding="utf-8")
+    from clipper.config import load_config
+
+    section = load_config(path).section("repartition")
+
+    assert section == repartition.CONFIG_DEFAULTS
+
+
+# ---------------------------------------------------------------- R1 comptes et creneaux
+
+
+def test_r1_only_active_tiktok_accounts_are_planned_and_others_noted(tmp_path):
+    config = _config(tmp_path)
+    _accounts(config, _acc("a"), _acc("pause", paused=True), _acc("off", ready=False),
+              _acc("yt", service="youtube", label="Chaine YT"))
+
+    plan = _plan(config)
+
+    assert [a["account"] for a in plan["accounts"]] == ["a"]
+    assert any("Chaine YT" in note and "hors périmètre v1" in note for note in plan["notes"])
+
+
+def test_r1_default_grid_staggered_by_account_rank(tmp_path):
+    config = _config(tmp_path)
+    _accounts(config, _acc("a"), _acc("b"), _acc("c"))
+
+    plan = _plan(config)
+
+    assert _hours(_acc_plan(plan, "a")) == ["08:00", "10:30", "13:00", "15:30", "18:00", "20:30"]
+    assert _hours(_acc_plan(plan, "b")) == ["08:30", "11:00", "13:30", "16:00", "18:30", "21:00"]
+    assert _hours(_acc_plan(plan, "c")) == ["09:00", "11:30", "14:00", "16:30", "19:00", "21:30"]
+
+
+def test_r1_fixed_slots_are_all_kept_and_grid_completes_with_the_gap(tmp_path):
+    config = _config(tmp_path)
+    _accounts(config, _acc("a", slots=["18:30", "21:30"]))
+
+    plan = _plan(config)
+
+    assert _hours(_acc_plan(plan, "a")) == ["08:00", "10:30", "13:00", "15:30", "18:30", "21:30"]
+    kinds = {_hours({"slots": [s]})[0]: s["kind"] for s in _acc_plan(plan, "a")["slots"]}
+    assert kinds["18:30"] == "fixed" and kinds["08:00"] == "grid"
+
+
+def test_r1_posts_already_planned_that_day_count_and_are_not_doubled(tmp_path):
+    config = _config(tmp_path)
+    _accounts(config, _acc("a"))
+    _entry(config, "VX", "01", slot_at="2026-10-10T10:30:00+02:00")
+
+    plan = _plan(config)
+
+    hours = _hours(_acc_plan(plan, "a"))
+    assert hours == ["08:00", "13:00", "15:30", "18:00", "20:30"]  # 5 + le post prevu = 6 ; rien a moins de 2 h 30
+
+
+def test_r1_fewer_possible_slots_than_wanted_is_said_never_squeezed(tmp_path):
+    config = _config(tmp_path, default_grid_gap_min=600)
+    _accounts(config, _acc("a", label="Compte A"))
+
+    plan = _plan(config)
+
+    assert _hours(_acc_plan(plan, "a")) == ["08:00", "18:00"]
+    assert any("Compte A" in note and "2" in note and "6" in note for note in _acc_plan(plan, "a")["notes"])
+
+
+# ---------------------------------------------------------------- R2 vivier
+
+
+def test_r2_pool_has_only_ready_clips_never_one_already_in_a_queue(tmp_path):
+    config = _config(tmp_path)
+    _accounts(config, _acc("a"))
+    _clip(config, "V1", "01")
+    _clip(config, "V1", "02", ready=False)
+    _clip(config, "V1", "03")
+    _entry(config, "V1", "03", account="other", status="published")
+
+    plan = _plan(config)
+
+    assert plan["pool"] == 1
+    assert _line_for(plan, "a", "V1", "01") is not None
+    assert _line_for(plan, "a", "V1", "03") is None
+
+
+def test_r2_multi_part_series_are_excluded_entirely_and_counted(tmp_path):
+    config = _config(tmp_path)
+    _accounts(config, _acc("a"))
+    _clip(config, "V1", "01-p1", part=1)
+    _clip(config, "V1", "01-p2", part=2)
+    _clip(config, "V2", "01")
+
+    plan = _plan(config)
+
+    assert plan["pool"] == 1
+    assert sorted((e["clip_id"], e["reason"]) for e in plan["excluded"]) == [
+        ("01-p1", "multi_part_series"), ("01-p2", "multi_part_series")]
+    assert {e["video_id"] for e in plan["excluded"]} == {"V1"}
+
+
+def test_r2_excluded_source_by_streamer_and_by_style_case_insensitive(tmp_path):
+    config = _config(tmp_path, excluded_sources=["streamerx", "STYLES"])
+    _accounts(config, _acc("a"))
+    _clip(config, "V1", "01", streamer="StreamerX")
+    _clip(config, "V2", "01", style="styleS")
+    _clip(config, "V3", "01", streamer="Autre")
+
+    plan = _plan(config)
+
+    assert plan["pool"] == 1
+    assert sorted((e["video_id"], e["reason"]) for e in plan["excluded"]) == [
+        ("V1", "excluded_source"), ("V2", "excluded_source")]
+    assert not any("aucune vidéo pour cette source" in n for n in plan["notes"])
+
+
+def test_r2_excluded_source_matching_no_video_is_noted_not_an_error(tmp_path):
+    config = _config(tmp_path, excluded_sources=["fantome"])
+    _accounts(config, _acc("a"))
+    _clip(config, "V1", "01")
+
+    plan = _plan(config)
+
+    assert any("fantome" in n and "aucune vidéo pour cette source" in n for n in plan["notes"])
+
+
+def test_r2_video_still_in_the_processing_queue_is_excluded(tmp_path):
+    config = _config(tmp_path)
+    _accounts(config, _acc("a"))
+    _clip(config, "V1", "01")
+    _clip(config, "V2", "01")
+    (tmp_path / "queue.json").write_text(json.dumps(
+        [{"video_id": "V1", "action": "run", "status": "running"}]), encoding="utf-8")
+
+    plan = _plan(config)
+
+    assert plan["pool"] == 1
+    assert [(e["video_id"], e["reason"]) for e in plan["excluded"]] == [("V1", "in_processing_queue")]
+
+
+# ---------------------------------------------------------------- R3 source et plafond
+
+
+def test_r3_source_key_meta_then_veille_then_vod(tmp_path):
+    config = _config(tmp_path)
+    _accounts(config, _acc("a"))
+    _clip(config, "VM", "01", game="Zelda: Wild!", score=90)
+    _clip(config, "VV", "01", score=80)
+    _clip(config, "VN", "01", score=70)
+    veille = tmp_path / "veille"
+    veille.mkdir()
+    (veille / "seen.json").write_text(json.dumps({"queued": [
+        {"video_id": "VV", "game_name": "Elden Ring"}, {"video_id": "VM", "game_name": "Autre jeu"}],
+        "ignored": []}), encoding="utf-8")
+
+    plan = _plan(config)
+
+    meta, veil, vod = (_line_for(plan, "a", v) for v in ("VM", "VV", "VN"))
+    assert (meta["source_key"], meta["game_name"], meta["source_from"]) == ("jeu:zelda wild", "Zelda: Wild!", "meta")
+    assert (veil["source_key"], veil["game_name"], veil["source_from"]) == ("jeu:elden ring", "Elden Ring", "veille")
+    assert (vod["source_key"], vod["game_name"], vod["source_from"]) == ("vod:VN", None, "vod")
+
+
+def test_r3_max_per_source_per_account_refused_clip_goes_to_the_next(tmp_path):
+    config = _config(tmp_path)
+    _accounts(config, _acc("a"))
+    for i, score in enumerate((90, 85, 80), start=1):
+        _clip(config, "V1", f"0{i}", score=score)
+    _clip(config, "V2", "01", score=70)
+
+    plan = _plan(config)
+
+    taken = {(line["video_id"], line["clip_id"]) for line in _acc_plan(plan, "a")["lines"]}
+    assert taken == {("V1", "01"), ("V1", "02"), ("V2", "01")}
+
+
+def test_r3_max_per_source_counts_the_posts_already_planned(tmp_path):
+    config = _config(tmp_path)
+    _accounts(config, _acc("a"))
+    _entry(config, "V1", "09", slot_at="2026-10-10T09:00:00+02:00")
+    _clip(config, "V1", "01", score=90)
+    _clip(config, "V1", "02", score=85)
+
+    plan = _plan(config)
+
+    assert [(line["video_id"], line["clip_id"]) for line in _acc_plan(plan, "a")["lines"]] == [("V1", "01")]
+
+
+def test_r3_same_game_in_two_videos_shares_the_cap(tmp_path):
+    config = _config(tmp_path)
+    _accounts(config, _acc("a"))
+    for video, score in (("V1", 90), ("V2", 85), ("V3", 80)):
+        _clip(config, video, "01", score=score, game="Jeu")
+
+    plan = _plan(config)
+
+    assert len(_acc_plan(plan, "a")["lines"]) == 2
+
+
+# ---------------------------------------------------------------- R4 bonus
+
+
+def _posted(config, video, game, post_id):
+    _clip(config, video, "01", game=game, ready=False, post_id=post_id)
+
+
+def test_r4_bonus_from_real_medians_only_and_ranks_the_clips(tmp_path):
+    config = _config(tmp_path)
+    _accounts(config, _acc("a"))
+    for video, game, ids in (("H1", "fort", ("p1", "p2")), ("H2", "faible", ("p3", "p4"))):
+        for i, pid in enumerate(ids):
+            _clip(config, f"{video}{i}", "01", game=game, ready=False, post_id=pid)
+    _snapshot(config, "a", ("p1", "2026-10-05T12:00:00", 12000), ("p2", "2026-10-06T12:00:00", 12000),
+              ("p3", "2026-10-05T13:00:00", 3000), ("p4", "2026-10-06T13:00:00", 3000),
+              ("p9", "2026-10-06T14:00:00", 99999),  # non relie a un clip : ignore
+              ("p8", "2026-09-01T14:00:00", 50))  # hors fenetre
+    _clip(config, "PF", "01", game="fort", score=70)
+    _clip(config, "PW", "01", game="faible", score=72)
+
+    plan = _plan(config)
+
+    strong, weak = _line_for(plan, "a", "PF"), _line_for(plan, "a", "PW")
+    assert strong["bonus"] == pytest.approx(3.0) and weak["bonus"] == pytest.approx(-3.0)
+    assert strong["adjusted"] == pytest.approx(73.0) and weak["adjusted"] == pytest.approx(69.0)
+    assert strong["bonus_reason"] == "2 posts, médiane 12 000 vues, référence 7 500"
+    assert _hour_of(strong) == "18:00" and _hour_of(weak) == "20:30"  # le meilleur score ajuste prend le meilleur creneau
+
+
+def test_r4_bonus_is_clamped_to_plus_or_minus_one(tmp_path):
+    config = _config(tmp_path)
+    _accounts(config, _acc("a"))
+    for i in range(3):
+        _posted(config, f"L{i}", "bas", f"l{i}")
+    for i in range(2):
+        _posted(config, f"U{i}", "haut", f"u{i}")
+    _snapshot(config, "a", *[(f"l{i}", "2026-10-05T12:00:00", 1000) for i in range(3)],
+              *[(f"u{i}", "2026-10-05T12:00:00", 100000) for i in range(2)])
+    _clip(config, "PH", "01", game="haut", score=70)
+    _clip(config, "PL", "01", game="bas", score=70)
+
+    plan = _plan(config)
+
+    assert _line_for(plan, "a", "PH")["bonus"] == pytest.approx(5.0)
+    assert _line_for(plan, "a", "PL")["bonus"] == pytest.approx(0.0)
+
+
+def test_r4_source_below_min_posts_has_no_bonus_with_its_reason(tmp_path):
+    config = _config(tmp_path)
+    _accounts(config, _acc("a"))
+    _posted(config, "H1", "rare", "r1")
+    for i in range(2):
+        _posted(config, f"M{i}", "commun", f"m{i}")
+    _snapshot(config, "a", ("r1", "2026-10-05T12:00:00", 90000), ("m0", "2026-10-05T12:00:00", 1000),
+              ("m1", "2026-10-05T12:00:00", 1000))
+    _clip(config, "PR", "01", game="rare", score=70)
+
+    plan = _plan(config)
+
+    line = _line_for(plan, "a", "PR")
+    assert line["bonus"] == 0 and line["bonus_reason"] == "below_min_posts"
+
+
+def test_r4_no_stats_for_the_source_or_at_all(tmp_path):
+    config = _config(tmp_path)
+    _accounts(config, _acc("a"))
+    _clip(config, "PN", "01", game="inconnu", score=70)
+
+    plan = _plan(config)
+
+    line = _line_for(plan, "a", "PN")
+    assert line["bonus"] == 0 and line["bonus_reason"] == "no_stats"
+    assert line["adjusted"] == 70
+    assert "aucun relevé récent" in plan["notes"]
+
+
+def test_r4_stats_of_other_accounts_count_for_a_game(tmp_path):
+    config = _config(tmp_path)
+    _accounts(config, _acc("a"), _acc("b"))
+    for i in range(2):
+        _posted(config, f"H{i}", "fort", f"p{i}")
+    _posted(config, "H9", "faible", "p9")
+    _posted(config, "H8", "faible", "p8")
+    _snapshot(config, "b", ("p0", "2026-10-05T12:00:00", 12000), ("p1", "2026-10-05T12:00:00", 12000),
+              ("p9", "2026-10-05T12:00:00", 3000), ("p8", "2026-10-05T12:00:00", 3000))
+    _clip(config, "PF", "01", game="fort", score=70)
+
+    plan = _plan(config)
+
+    assert _line_for(plan, "a", "PF")["bonus"] == pytest.approx(3.0)
+
+
+def test_r4_clip_without_score_is_ranked_last(tmp_path):
+    config = _config(tmp_path)
+    _accounts(config, _acc("a"))
+    _clip(config, "V1", "01", score=None)
+    _clip(config, "V2", "01", score=10)
+
+    plan = _plan(config)
+
+    assert _hour_of(_line_for(plan, "a", "V2")) == "18:00"
+    assert _line_for(plan, "a", "V1")["adjusted"] is None
+    assert _hour_of(_line_for(plan, "a", "V1")) == "20:30"
+
+
+# ---------------------------------------------------------------- R5 attribution
+
+
+def test_r5_best_clips_take_the_evening_slots_then_the_others_by_time(tmp_path):
+    config = _config(tmp_path)
+    _accounts(config, _acc("a"))
+    for video, score in (("V1", 90), ("V2", 80), ("V3", 70)):
+        _clip(config, video, "01", score=score)
+
+    plan = _plan(config)
+
+    assert [_hour_of(_line_for(plan, "a", v)) for v in ("V1", "V2", "V3")] == ["18:00", "20:30", "08:00"]
+    assert [_line_for(plan, "a", v)["prime"] for v in ("V1", "V2", "V3")] == [True, True, False]
+
+
+def test_r5_round_robin_between_accounts(tmp_path):
+    config = _config(tmp_path, posts_per_day=2)
+    _accounts(config, _acc("a"), _acc("b"))
+    for video, score in (("V1", 90), ("V2", 80), ("V3", 70), ("V4", 60)):
+        _clip(config, video, "01", score=score)
+
+    plan = _plan(config)
+
+    assert sorted(line["video_id"] for line in _acc_plan(plan, "a")["lines"]) == ["V1", "V3"]
+    assert sorted(line["video_id"] for line in _acc_plan(plan, "b")["lines"]) == ["V2", "V4"]
+
+
+def test_r5_a_clip_is_planned_once_across_accounts(tmp_path):
+    config = _config(tmp_path)
+    _accounts(config, _acc("a"), _acc("b"))
+    _clip(config, "V1", "01")
+
+    plan = _plan(config)
+
+    assert sum(len(a["lines"]) for a in plan["accounts"]) == 1
+
+
+def test_r5_ties_are_broken_by_video_then_clip_id(tmp_path):
+    config = _config(tmp_path)
+    _accounts(config, _acc("a"))
+    _clip(config, "VB", "01", score=50)
+    _clip(config, "VA", "02", score=50)
+    _clip(config, "VA", "01", score=50)
+
+    plan = _plan(config)
+
+    assert _hour_of(_line_for(plan, "a", "VA", "01")) == "18:00"
+    assert _hour_of(_line_for(plan, "a", "VA", "02")) == "20:30"
+    assert _hour_of(_line_for(plan, "a", "VB", "01")) == "08:00"
+
+
+# ---------------------------------------------------------------- R6 exploration
+
+
+def test_r6_one_exploration_clip_per_day_on_the_cheapest_slot(tmp_path):
+    config = _config(tmp_path)
+    _accounts(config, _acc("a"), _acc("b"))
+    _clip(config, "V1", "01", score=95, exploration=True)
+    _clip(config, "V2", "01", score=90, exploration=True)
+    for i, video in enumerate(("V3", "V4", "V5")):
+        _clip(config, video, "01", score=80 - i, exploration=False)
+
+    plan = _plan(config)
+
+    explo = [line for a in plan["accounts"] for line in a["lines"] if line["exploration"]]
+    assert [(l["video_id"], l["prime"]) for l in explo] == [("V1", False)]
+    assert _hour_of(explo[0]) == "08:00"
+    assert _line_for(plan, "a", "V2") is None and _line_for(plan, "b", "V2") is None
+
+
+def test_r6_no_off_peak_slot_means_no_exploration_for_that_account(tmp_path):
+    config = _config(tmp_path, prime_start="08:00", prime_end="22:00")
+    _accounts(config, _acc("a"))
+    _clip(config, "V1", "01", score=95, exploration=True)
+    _clip(config, "V2", "01", score=80)
+
+    plan = _plan(config)
+
+    assert _line_for(plan, "a", "V1") is None
+    assert _line_for(plan, "a", "V2") is not None
+
+
+def test_r6_missing_or_unreadable_moments_is_not_exploration_and_noted(tmp_path):
+    config = _config(tmp_path)
+    _accounts(config, _acc("a"))
+    _clip(config, "V1", "01")
+    _clip(config, "V2", "01")
+    (Path(config.workspace_dir) / "V2" / "moments.json").write_text("{bad", encoding="utf-8")
+
+    plan = _plan(config)
+
+    assert _line_for(plan, "a", "V1")["exploration"] is False
+    assert _line_for(plan, "a", "V2")["exploration"] is False
+    assert any("V1" in n and "moments.json" in n for n in plan["notes"])
+    assert any("V2" in n and "moments.json" in n for n in plan["notes"])
+
+
+# ---------------------------------------------------------------- R7 fichier, calcul, obsolescence
+
+
+def _populate(config):
+    _accounts(config, _acc("a", slots=["18:30"]), _acc("b"))
+    for i, video in enumerate(("V1", "V2", "V3", "V4")):
+        _clip(config, video, "01", score=90 - i, game=f"jeu{i}")
+
+
+def test_r7_plan_file_shape_and_location(tmp_path):
+    config = _config(tmp_path)
+    _populate(config)
+
+    plan = _plan(config)
+
+    path = tmp_path / "rep" / "2026-10-10.json"
+    assert json.loads(path.read_text(encoding="utf-8")) == plan
+    assert plan["day"] == "2026-10-10" and plan["status"] == "proposed" and plan["computed_by"] == "worker"
+    assert plan["computed_at"] == NOW.isoformat()
+    assert {"accounts", "pool", "excluded", "notes", "validated_at", "created"} <= set(plan)
+    line = _acc_plan(plan, "a")["lines"][0]
+    assert {"slot_at", "video_id", "clip_id", "score", "bonus", "bonus_reason", "adjusted", "source_key",
+            "game_name", "source_from", "exploration", "prime"} <= set(line)
+    assert datetime.fromisoformat(line["slot_at"]).tzinfo is not None
+    assert _acc_plan(plan, "a")["label"] == "a"
+    assert not list((tmp_path / "rep").glob("*.tmp"))
+
+
+def test_r7_plan_is_deterministic_apart_from_computed_at(tmp_path):
+    config = _config(tmp_path)
+    _populate(config)
+
+    first = _plan(config)
+    second = _plan(config, now=NOW + timedelta(minutes=7))
+
+    assert first["computed_at"] != second["computed_at"]
+    assert _stripped(first) == _stripped(second)
+
+
+def test_r7_recompute_replaces_a_proposed_plan_and_refuses_a_validated_one(tmp_path):
+    config = _config(tmp_path)
+    _populate(config)
+    _plan(config)
+    path = tmp_path / "rep" / "2026-10-10.json"
+
+    again = repartition.compute_plan(DAY, NOW, config=config, computed_by="web")
+    assert again["computed_by"] == "web"
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["status"] = "validated"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(repartition.RepartitionError):
+        _plan(config)
+
+
+def test_r7_run_if_due_waits_for_compute_time_paris(tmp_path):
+    config = _config(tmp_path)
+    _populate(config)
+
+    assert repartition.run_if_due(datetime(2026, 10, 9, 19, 59, tzinfo=PARIS), config=config) is None
+    assert not (tmp_path / "rep").exists() or not list((tmp_path / "rep").glob("*.json"))
+
+    plan = repartition.run_if_due(datetime(2026, 10, 9, 18, 30, tzinfo=timezone.utc), config=config)  # 20:30 Paris
+
+    assert plan is not None and plan["day"] == "2026-10-10" and plan["computed_by"] == "worker"
+    assert (tmp_path / "rep" / "2026-10-10.json").exists()
+
+
+def test_r7_run_if_due_never_computes_twice_for_the_same_day(tmp_path):
+    config = _config(tmp_path)
+    _populate(config)
+    path = tmp_path / "rep" / "2026-10-10.json"
+
+    assert repartition.run_if_due(NOW, config=config) is not None
+    before = path.read_bytes()
+    assert repartition.run_if_due(NOW + timedelta(hours=1), config=config) is None
+    assert path.read_bytes() == before
+
+    data = json.loads(before)
+    data["status"] = "validated"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    assert repartition.run_if_due(NOW + timedelta(hours=2), config=config) is None
+    assert json.loads(path.read_text(encoding="utf-8"))["status"] == "validated"
+
+
+def test_r7_run_if_due_disabled_does_nothing(tmp_path):
+    config = _config(tmp_path, enabled=False)
+    _populate(config)
+
+    assert repartition.run_if_due(NOW, config=config) is None
+    assert not (tmp_path / "rep").exists() or not list((tmp_path / "rep").glob("*.json"))
+
+
+def test_r7_run_if_due_custom_compute_time(tmp_path):
+    config = _config(tmp_path, compute_time="21:30")
+    _populate(config)
+
+    assert repartition.run_if_due(NOW, config=config) is None
+    assert repartition.run_if_due(NOW.replace(hour=21, minute=31), config=config) is not None
+
+
+def test_r7_run_if_due_writes_the_error_and_logs_it_once(tmp_path, caplog):
+    config = _config(tmp_path)
+    (tmp_path / "accounts.json").write_text("{pas du json", encoding="utf-8")
+    path = tmp_path / "rep" / "2026-10-10.json"
+
+    with caplog.at_level(logging.WARNING, logger="clipper.repartition"):
+        assert repartition.run_if_due(NOW, config=config) is None
+        assert repartition.run_if_due(NOW + timedelta(minutes=10), config=config) is None
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["status"] == "error" and data["day"] == "2026-10-10"
+    assert data["error"]["message"] and data["error"]["type"] == "AccountsError"
+    assert len([r for r in caplog.records if r.name == "clipper.repartition"]) == 1
+
+
+def test_r7_run_if_due_retries_after_an_error_once_fixed(tmp_path):
+    config = _config(tmp_path)
+    _populate(config)
+    (tmp_path / "accounts.json").write_text("{pas du json", encoding="utf-8")
+    assert repartition.run_if_due(NOW, config=config) is None
+
+    _accounts(config, _acc("a"))
+    plan = repartition.run_if_due(NOW + timedelta(minutes=10), config=config)
+
+    assert plan is not None and plan["status"] == "proposed"
+
+
+def test_r7_plan_file_is_written_under_a_lock(tmp_path, monkeypatch):
+    config = _config(tmp_path)
+    _populate(config)
+    locked = []
+    real = repartition.channel.file_lock
+
+    def spy(path):
+        locked.append(Path(path).name)
+        return real(path)
+
+    monkeypatch.setattr(repartition.channel, "file_lock", spy)
+
+    _plan(config)
+
+    assert "2026-10-10.json" in locked
+
+
+def test_r7_module_imports_neither_web_nor_a_pipeline_step():
+    tree = ast.parse((REPO_ROOT / "clipper" / "repartition.py").read_text(encoding="utf-8"))
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            base = node.module or ""
+            imported.add(base)
+            imported.update(f"{base}.{alias.name}".strip(".") for alias in node.names)
+
+    forbidden = {"clipper.web", *(f"clipper.{step}" for step in pipeline.STEPS)}
+    assert not [name for name in imported if any(name == f or name.startswith(f + ".") for f in forbidden)]
+    assert {"clipper.publish", "clipper.accounts", "clipper.tiktok", "clipper.channel"} <= imported
+
+
+def test_repartition_source_names_no_real_account_or_channel():
+    text = (REPO_ROOT / "clipper" / "repartition.py").read_text(encoding="utf-8")
+    assert "tiktok.com/@" not in text

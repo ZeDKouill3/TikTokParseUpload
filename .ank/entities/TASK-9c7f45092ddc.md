@@ -5,7 +5,7 @@ slug: r-partition-automatique-1-5-biblioth-que-clipper
 title: "Répartition automatique (1/5) : bibliothèque clipper/repartition.py, calcul du plan et fichier d'état (SPEC-78dc R0-R7)"
 created: 2026-10-09T13:09:00Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/repartition.py
   - tests/test_repartition.py
@@ -17,6 +17,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/c814ebc084f5@f64783b
+    tree: scope/bb42e6b4877c
+    criteria: fefaf3fa1e91
+    verifier: tests@c7b454d16c90
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---
