@@ -5,7 +5,7 @@ slug: publication-tiktok-une-v-rification-de-contenu-j
 title: "Publication TikTok : une vérification de contenu jamais terminée met le clip en échec sans arrêter tout le compte"
 created: 2026-10-09T11:23:04Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/worker.py
   - tests/test_worker.py
@@ -16,6 +16,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/2ebbf369048f@6c5f467
+    tree: scope/ea24733f65e3
+    criteria: 2abb9e2040b8
+    verifier: tests@c7b454d16c90
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---
