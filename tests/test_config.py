@@ -423,3 +423,13 @@ def test_config_example_documents_every_action_setting():
         assert "[action]" in text, name
         for key in CONFIG_DEFAULTS:
             assert f"# {key} = " in text, (name, key)
+
+
+def test_defaults_documentation_lit_le_commentaire_au_dessus_de_chaque_cle():
+    from clipper.config import _defaults_documentation
+
+    docs = _defaults_documentation("moments")
+
+    assert docs["selection"]["default"] == "single"
+    assert docs["selection"]["comment"] == 'Qui note les moments : "single" (le proposeur seul) ou "jury".'
+    assert "ADR-ff87" in docs["selection"]["details"]
