@@ -5,7 +5,7 @@ slug: fiche-clip-historique-des-stats-sans-doublons-li
 title: "Fiche clip : historique des stats sans doublons, libellé « Envoyé à TikTok le », valeurs qui ne débordent plus"
 created: 2026-10-09T01:17:27Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/web/app.py
   - clipper/web/static/screens/clip.js
@@ -18,6 +18,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/be2fbd7e61b7@75e7219
+    tree: scope/da92348938c3
+    criteria: 5828792f00bc
+    verifier: tests@c7b454d16c90
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---
