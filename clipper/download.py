@@ -3,18 +3,18 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 import struct
 import subprocess
 import time
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import urlparse
 
 import yt_dlp
 
 from clipper import browser
 from clipper.channel import atomic_write_json
+from clipper.workspace import _YOUTUBE_HOSTS, DownloadError, extract_video_id  # réexport : même nom public
 
 log = logging.getLogger(__name__)
 
@@ -54,58 +54,6 @@ _FORMAT = (
     "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]"
     "/best[height<=1080][ext=mp4]/best[height<=1080]"
 )
-
-_YOUTUBE_HOSTS = {"youtube.com", "m.youtube.com", "music.youtube.com"}
-_TWITCH_HOSTS = {"twitch.tv"}
-_TWITCH_VOD_PATH = re.compile(r"/videos/(\d+)/?$")
-
-
-class DownloadError(Exception):
-    """The URL couldn't be resolved to a video_id, or yt-dlp failed."""
-
-
-def extract_video_id(url: str) -> str:
-    """Pull the video id out of a YouTube or Twitch URL.
-
-    Handles youtube.com/watch?v=, youtu.be/, /shorts/ and /live/ forms
-    (see TASK-4ca0's done_criteria), and Twitch VOD URLs
-    (twitch.tv/videos/<chiffres>, see TASK-9290's done_criteria). The Twitch
-    id is returned exactly as yt-dlp assigns it (prefixe 'v', ex.
-    v2887271276) : jamais un id YouTube de 11 caracteres, pas de collision
-    possible entre les deux espaces d'id.
-    """
-    parsed = urlparse(url)
-    host = parsed.netloc.lower()
-    if host.startswith("www."):
-        host = host[len("www.") :]
-
-    if host == "youtu.be":
-        video_id = parsed.path.strip("/").split("/")[0]
-        if video_id:
-            return video_id
-
-    if host in _YOUTUBE_HOSTS:
-        if parsed.path == "/watch":
-            values = parse_qs(parsed.query).get("v")
-            if values:
-                return values[0]
-        for prefix in ("/shorts/", "/live/"):
-            if parsed.path.startswith(prefix):
-                video_id = parsed.path[len(prefix) :].strip("/").split("/")[0]
-                if video_id:
-                    return video_id
-
-    if host in _TWITCH_HOSTS:
-        match = _TWITCH_VOD_PATH.match(parsed.path)
-        if match:
-            return f"v{match.group(1)}"
-        raise DownloadError(
-            f"Twitch : seules les VOD (twitch.tv/videos/<id>) sont prises en charge, "
-            f"pas les chaines, clips ou lives ({url!r})"
-        )
-
-    raise DownloadError(f"impossible d'extraire le video_id de {url!r}")
-
 
 def _build_meta(info: dict[str, Any], url: str) -> dict[str, Any]:
     return {

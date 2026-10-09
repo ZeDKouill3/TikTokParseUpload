@@ -65,6 +65,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from clipper import channel as channel_mod
 from clipper import llm, publish, veille_sources
 from clipper.config import Config, load_config
+from clipper.workspace import DownloadError, extract_video_id
 
 CONFIG_DEFAULTS: dict[str, object] = {
     "enabled": False,
@@ -263,13 +264,12 @@ def _queue_video_ids(config: Config) -> set[str]:
 
 
 def _worker_video_id(vod: dict[str, Any]) -> str:
-    """Id que le worker donne à cette VOD (``download.extract_video_id`` : Twitch 2893407960 -> v2893407960) ;
+    """Id que le worker donne à cette VOD (``workspace.extract_video_id`` : Twitch 2893407960 -> v2893407960) ;
     la file et ``seen.json`` le portent. Vide si l'URL n'est pas reconnue : seul l'id source compte alors."""
-    from clipper import download  # import local : veille ne dépend de download que pour cette règle d'id
-
+    # Règle d'id partagée avec le worker (workspace : module sans étape, ADR-ca9a).
     try:
-        return download.extract_video_id(str(vod["url"]))
-    except download.DownloadError:
+        return extract_video_id(str(vod["url"]))
+    except DownloadError:
         return ""
 
 

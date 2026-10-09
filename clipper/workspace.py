@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 log = logging.getLogger(__name__)
 
@@ -18,6 +20,58 @@ PURGE_MARKER = "purged.json"
 # Publications qu'un clip de output/ attend encore (publish.UNFINISHED_STATUSES, sans importer d'etape).
 _BLOCKING_STATUSES = ("approved", "scheduled", "failed")
 _BUSY_STATUSES = ("running", "queued")
+
+
+_YOUTUBE_HOSTS = {"youtube.com", "m.youtube.com", "music.youtube.com"}
+_TWITCH_HOSTS = {"twitch.tv"}
+_TWITCH_VOD_PATH = re.compile(r"/videos/(\d+)/?$")
+
+
+class DownloadError(Exception):
+    """The URL couldn't be resolved to a video_id, or yt-dlp failed."""
+
+
+def extract_video_id(url: str) -> str:
+    """Pull the video id out of a YouTube or Twitch URL.
+
+    Handles youtube.com/watch?v=, youtu.be/, /shorts/ and /live/ forms
+    (see TASK-4ca0's done_criteria), and Twitch VOD URLs
+    (twitch.tv/videos/<chiffres>, see TASK-9290's done_criteria). The Twitch
+    id is returned exactly as yt-dlp assigns it (prefixe 'v', ex.
+    v2887271276) : jamais un id YouTube de 11 caracteres, pas de collision
+    possible entre les deux espaces d'id.
+    """
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    if host.startswith("www."):
+        host = host[len("www.") :]
+
+    if host == "youtu.be":
+        video_id = parsed.path.strip("/").split("/")[0]
+        if video_id:
+            return video_id
+
+    if host in _YOUTUBE_HOSTS:
+        if parsed.path == "/watch":
+            values = parse_qs(parsed.query).get("v")
+            if values:
+                return values[0]
+        for prefix in ("/shorts/", "/live/"):
+            if parsed.path.startswith(prefix):
+                video_id = parsed.path[len(prefix) :].strip("/").split("/")[0]
+                if video_id:
+                    return video_id
+
+    if host in _TWITCH_HOSTS:
+        match = _TWITCH_VOD_PATH.match(parsed.path)
+        if match:
+            return f"v{match.group(1)}"
+        raise DownloadError(
+            f"Twitch : seules les VOD (twitch.tv/videos/<id>) sont prises en charge, "
+            f"pas les chaines, clips ou lives ({url!r})"
+        )
+
+    raise DownloadError(f"impossible d'extraire le video_id de {url!r}")
 
 
 class PurgeRefused(Exception):

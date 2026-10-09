@@ -14,6 +14,10 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 - Apprentissage : rétention à maturité par clip. Chaque entrée `stats` du journal porte la durée du clip (sidecar), `pct_watched` (part moyenne vue, null si la durée ou le temps moyen manque) et la source du moment (`transcript` ou `action`, null si inconnue). L'écran Statistiques affiche un tableau trié par part vue, avec un message « n = X, trop peu pour conclure » sous le réglage nommé `[learning] retention_min_n` (défaut 30). Aucune corrélation calculée.
 
+### Modifié
+
+- Veille : `extract_video_id` et `DownloadError` vivent dans `clipper/workspace.py` (module sans étape) ; `clipper/download.py` les réexporte, et la veille n'importe plus l'étape download (ADR-ca9a).
+
 ### Corrigé
 
 - Installeur : la désinstallation supprime le pointeur `%LOCALAPPDATA%\Clipper\install.json` de cette installation (seulement s'il désigne le dossier app désinstallé, comparaison de chemins normalisée). Un pointeur d'une autre installation ou illisible est laissé et le dit ; `%LOCALAPPDATA%\Clipper` n'est supprimé que s'il est vide. `--dry-run` liste le pointeur (supprimé ou laissé, avec la raison). Le dossier de données n'est pas touché.
