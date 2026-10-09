@@ -3510,3 +3510,18 @@ def test_a_tuxmodal_that_comes_back_after_the_retry_is_an_r4_stop(tmp_path, monk
         env.publish()
 
     assert stop.value.code == "unexpected_page" and env.page.clicks().count(post) == 2 and env.page.posted == []
+
+
+# ---------------------------------------------------------------- captures sous [browser] state_dir (TASK-89dc)
+
+
+def test_r4_capture_follows_the_browser_state_dir_setting(tmp_path, monkeypatch):
+    env = Env(tmp_path, monkeypatch, detect=["captcha"])
+    state = tmp_path / "profils"
+    env.config = Config(mode="review", workspace_dir=tmp_path / "w", output_dir=tmp_path / "output",
+                        _sections={"tiktok": {"content_check": "wait"}, "browser": {"state_dir": str(state)}})
+
+    with pytest.raises(tiktok.TikTokStop) as stop:
+        env.publish()
+
+    assert stop.value.capture.parent == state / "ma_chaine" / "captures" and stop.value.capture.is_file()

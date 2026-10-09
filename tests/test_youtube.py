@@ -1461,3 +1461,42 @@ def test_the_pilot_wait_of_the_config_reaches_the_browser_for_publishing_and_log
             with pytest.raises(browser.BrowserError, match="compte_occupe"):
                 call()
             assert time.monotonic() - started < 2, f"{name} : pilot_wait_s de config.toml ignoré"
+
+
+# -- captures sous [browser] state_dir (TASK-89dc)
+
+
+def _opener_on(page):
+    @contextmanager
+    def opener(account, *, headless):
+        yield FakeContext(page)
+    return opener
+
+
+def test_a_publication_capture_follows_the_browser_state_dir_setting(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    state = tmp_path / "profils"
+    config = Config(mode="review", workspace_dir=tmp_path / "w", output_dir=tmp_path / "o",
+                    _sections={"youtube": {"upload_timeout_s": 3, "publish_confirm_timeout_s": 3, "poll_interval_s": 1,
+                                           "action_timeout_s": 2},
+                               "browser": {"state_dir": str(state)}})
+
+    with pytest.raises(youtube.YouTubeStop) as caught:
+        youtube.publish(_clip(tmp_path), "ma_chaine", mode="immediate", config=config, now=NOW,
+                        opener=_opener_on(FakeUpload(captcha=True)), sleep=lambda s: None, rng=random.Random(1))
+
+    assert Path(caught.value.capture).parent == state / "ma_chaine" / "captures" and Path(caught.value.capture).is_file()
+
+
+def test_a_verification_capture_follows_the_browser_state_dir_setting(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    state = tmp_path / "profils"
+    config = Config(mode="review", workspace_dir=tmp_path / "w", output_dir=tmp_path / "o",
+                    _sections={"youtube": {"action_timeout_s": 2, "poll_interval_s": 1},
+                               "browser": {"state_dir": str(state)}})
+    page = FakeStudio(redirect="https://www.youtube.com/", nav_text=None)
+
+    result = youtube.verify_login("ma_chaine", config=config, now=NOW, opener=_opener_on(page),
+                                  sleep=lambda s: None, rng=random.Random(1))
+
+    assert result["capture"] and Path(result["capture"]).parent == state / "ma_chaine" / "captures"
