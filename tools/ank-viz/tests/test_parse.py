@@ -26,7 +26,7 @@ def test_find_reads_claim_holder_from_state():
     assert viz["status"] == "in_progress"
     assert viz["claimed_by"] == "UP60041549@wl0023729"
     assert viz["short"] == "TASK-7aca"
-    assert entities["ADR-09ad233678f2"]["short"] == "ADR-09ad"
+    assert entities["ADR-49cdd4316d6e"]["short"] == "ADR-49cd"
     assert entities["TASK-7291d843d843"]["claimed_by"] is None
 
 
