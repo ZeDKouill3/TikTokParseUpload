@@ -710,6 +710,19 @@ def test_unreadable_pointer_gets_explicit_message_and_is_kept(tmp_path: Path, in
     assert pointer.exists()
 
 
+def test_pointer_with_invalid_path_chars_is_kept_with_reason_not_crash(tmp_path: Path, installer_dir: Path) -> None:
+    env, pointer_dir, pointer = _pointer_env(tmp_path)
+    app_dir = _make_app_under(pointer_dir)
+    pointer.write_text(json.dumps({"app": "C:\\a|b<x>", "version": NEW_VERSION}), encoding="utf-8")
+
+    result = run_desinstaller(installer_dir, ["--app", str(app_dir), "--dry-run"], env=env, port=_free_port())
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"{pointer} laisse (champ app illisible (C:\\a|b<x>))" in result.stdout
+    assert "remede" in result.stdout
+    assert pointer.exists()
+
+
 def test_no_pointer_means_nothing_listed_for_pointer(tmp_path: Path, installer_dir: Path) -> None:
     env, pointer_dir, pointer = _pointer_env(tmp_path)
     app_dir = _make_app_under(pointer_dir)

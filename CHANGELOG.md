@@ -18,6 +18,7 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 - Fiche clip : l'historique des statistiques ne garde qu'un relevé par changement de valeurs (vues, likes, commentaires), le dernier relevé est toujours gardé ; la date « Publié le » devient « Envoyé à TikTok le » (le créneau reste « Créneau ») ; les valeurs des panneaux ne débordent plus de leur bord.
 - Apprentissage : un moment sans champ `source` dans `moments.json` est un moment de transcription ; la source des entrées `stats` n'est plus nulle pour les chaînes en `[moments] candidates = "transcript"`. Les entrées déjà écrites ne sont pas réécrites.
+- Installeur : un pointeur `%LOCALAPPDATA%\Clipper\install.json` dont le champ `app` contient des caractères interdits dans un chemin (ex. `C:\a|b<x>`) ne fait plus planter la désinstallation (erreur .NET brute, exit 1, avant toute suppression, y compris en `--dry-run`) : il est laissé avec la raison « champ app illisible (...) » et le remède affiché, et la désinstallation continue.
 
 ### Modifié
 
