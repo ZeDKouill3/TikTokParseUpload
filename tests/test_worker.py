@@ -53,6 +53,7 @@ def _config(tmp_path, **worker_overrides) -> Config:
             "jury_calibration": {"weights_path": str(state / "jury_weights.json")},
             "accounts": {"state_file": str(state / "accounts.json")},
             "feedback": {"journal_path": str(state / "feedback.jsonl")},
+            "repartition": {"state_dir": str(state / "repartition")},
         },
     )
 
@@ -3224,6 +3225,64 @@ def test_learning_disabled_does_nothing(tmp_path):
     config._sections["learning"] = {"enabled": False}
     worker.Worker(config=config, spawner=FakeSpawner(),
                   learning_runner=lambda now, *, config: calls.append(1) or {}).tick()
+    assert calls == []
+
+
+# ---- répartition du lendemain (TASK-0350d, SPEC-78dc R7) : appelée à chaque tour, après l'apprentissage
+
+def test_tick_calls_repartition_every_turn_right_after_learning(tmp_path):
+    calls = []
+    w = worker.Worker(
+        config=_learning_config(tmp_path), spawner=FakeSpawner(),
+        learning_runner=lambda now, *, config: calls.append("learning") or {},
+        repartition_runner=lambda now, *, config: calls.append("repartition"),
+    )
+    w._veille_due = lambda: None
+    w.tick()
+    w.tick()
+    assert calls == ["learning", "repartition", "learning", "repartition"]
+
+
+def test_the_default_repartition_runner_is_repartition_run_if_due(tmp_path):
+    from clipper import repartition
+
+    assert worker.Worker(config=_learning_config(tmp_path), spawner=FakeSpawner()).repartition_runner is repartition.run_if_due
+
+
+@pytest.mark.parametrize("error_name", [
+    "RepartitionError", "PublishError", "AccountsError", "TikTokError", "ConfigError", "OSError", "ValueError",
+])
+def test_a_repartition_error_never_leaves_tick_and_is_logged_once(tmp_path, caplog, error_name):
+    import builtins
+    import logging
+
+    from clipper import accounts, publish, repartition, tiktok
+    from clipper.config import ConfigError
+
+    error_class = {
+        "RepartitionError": repartition.RepartitionError, "PublishError": publish.PublishError,
+        "AccountsError": accounts.AccountsError, "TikTokError": tiktok.TikTokError, "ConfigError": ConfigError,
+        "OSError": builtins.OSError, "ValueError": builtins.ValueError,
+    }[error_name]
+
+    def runner(now, *, config):
+        raise error_class("plan illisible (casse-plan.json)")
+
+    w = worker.Worker(config=_learning_config(tmp_path), spawner=FakeSpawner(), repartition_runner=runner)
+    w._veille_due = lambda: None
+    with caplog.at_level(logging.ERROR):
+        w.tick()  # ne doit jamais lever
+        w.tick()
+    assert caplog.text.count("casse-plan.json") == 1
+
+
+def test_repartition_disabled_calls_nothing(tmp_path):
+    calls = []
+    config = _learning_config(tmp_path)
+    config._sections["repartition"] = {"enabled": False}
+    w = worker.Worker(config=config, spawner=FakeSpawner(), repartition_runner=lambda now, *, config: calls.append(1))
+    w._veille_due = lambda: None
+    w.tick()
     assert calls == []
 
 
