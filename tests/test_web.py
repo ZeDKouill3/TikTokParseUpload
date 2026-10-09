@@ -8846,6 +8846,29 @@ def test_videos_screen_offers_resume_and_cancel_on_an_interrupted_video(tmp_path
     assert "confirmDialog(" in js[max(0, idx - 800):idx]
 
 
+def test_purge_completed_shows_calculation_then_purge_state_on_the_button(tmp_path, isolated_cwd):
+    js = _videos_js(tmp_path)
+
+    start = js.index("async function purgeCompleted")
+    body = js[start:js.index("/* ---------- Fiche d'une video", start)]
+    assert "Calcul de l'espace libérable…" in body
+    assert "Purge en cours…" in body
+    assert body.index("Calcul de l'espace libérable…") < body.index('api("/api/purge-completed")')
+    assert body.index('api("/api/purge-completed", { method: "POST" })') > body.index("confirmDialog(")
+    assert body.index("Purge en cours…") > body.index("confirmDialog(")
+
+
+def test_purge_completed_disables_the_button_and_refuses_a_second_run(tmp_path, isolated_cwd):
+    js = _videos_js(tmp_path)
+
+    start = js.index("async function purgeCompleted")
+    body = js[start:js.index("/* ---------- Fiche d'une video", start)]
+    assert "if (purgeBusy) return;" in body
+    assert "btn.disabled = true" in body
+    assert "btn.disabled = false" in body
+    assert body.count("finally") == 1 and "purgeBusy = false" in body[body.index("finally"):]
+
+
 # --------------------------------------------------------------------------
 # Purge des videos (TASK-886a)
 # --------------------------------------------------------------------------

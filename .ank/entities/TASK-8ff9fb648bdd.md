@@ -5,7 +5,7 @@ slug: cran-vid-os-purge-des-vid-os-termin-es-avec-reto
 title: "Écran Vidéos : purge des vidéos terminées avec retour immédiat (calcul, purge en cours, résultat) et calcul de taille plus rapide"
 created: 2026-10-09T12:09:33Z
 author: nicoc@zedk_ordi
-status: open
+status: in_progress
 scope:
   - clipper/web/static/screens/videos.js
   - clipper/web/app.py
@@ -20,5 +20,5 @@ criteria_by: creator
 verify: [tests]
 method: tdd
 schema: 4
-version: 1
+version: 2
 ---

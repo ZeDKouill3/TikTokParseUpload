@@ -190,6 +190,20 @@ def test_disk_usage_totals_workspace_and_output(isolated_cwd):
     assert usage["workspace_bytes"] == 1665 + 3 * 8 + len(json.dumps({"video_id": VID, "status": "done"}))
 
 
+def test_size_totals_every_file_under_a_tree_with_subfolders_and_empty_folders(isolated_cwd):
+    tree = isolated_cwd / "tree"
+    (tree / "sub" / "deep").mkdir(parents=True)
+    (tree / "empty").mkdir()
+    (tree / "a.bin").write_bytes(b"x" * 7)
+    (tree / "sub" / "b.bin").write_bytes(b"x" * 11)
+    (tree / "sub" / "deep" / "c.bin").write_bytes(b"x" * 13)
+
+    assert ws_mod._size(tree) == 7 + 11 + 13
+    assert ws_mod._size(tree / "a.bin") == 7
+    assert ws_mod._size(tree / "empty") == 0
+    assert ws_mod._size(isolated_cwd / "absent") == 0
+
+
 def test_log_records_a_purge(isolated_cwd, caplog):
     _make_video(isolated_cwd)
     with caplog.at_level("INFO", logger="clipper.workspace"):
