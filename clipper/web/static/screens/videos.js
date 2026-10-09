@@ -229,23 +229,38 @@
     } catch (err) { toastError("Purge impossible", err); }
   }
 
+  // Une seule purge groupée à la fois : le bouton reste désactivé pendant le calcul et la purge.
+  let purgeBusy = false;
   async function purgeCompleted() {
-    let plan;
-    try { plan = await api("/api/purge-completed"); }
-    catch (err) { toastError("Purge impossible", err); return; }
-    if (!plan.videos.length) { toast({ kind: "ok", title: "Rien à purger", body: "Aucune vidéo terminée n'a de fichiers lourds." }); return; }
-    const ok = await confirmDialog({
-      title: "Purger les vidéos terminées ?",
-      body: `${plan.videos.length} vidéo${plan.videos.length > 1 ? "s" : ""} terminée${plan.videos.length > 1 ? "s" : ""} : ${fmtBytes(plan.total_bytes)} seront libérés. Les clips rendus sont gardés ; pour retraiter une vidéo purgée, il faudra la retélécharger.`,
-      confirmLabel: "Purger",
-    });
-    if (!ok) return;
+    if (purgeBusy) return;
+    purgeBusy = true;
+    const btn = $("[data-purge-completed]", state.root);
+    const idle = btn.innerHTML;
+    const setState = (label) => { btn.disabled = true; btn.innerHTML = `${icon("loader", "i-xs")}${esc(label)}`; };
     try {
-      const done = await api("/api/purge-completed", { method: "POST" });
-      toast({ kind: "ok", title: "Vidéos purgées", body: `${done.videos.length} vidéo(s) : ${fmtBytes(done.freed_bytes)} libérés${done.skipped.length ? ` · ${done.skipped.length} ignorée(s)` : ""}` });
-      await loadVideos();
-      refreshList();
-    } catch (err) { toastError("Purge impossible", err); }
+      setState("Calcul de l'espace libérable…");
+      let plan;
+      try { plan = await api("/api/purge-completed"); }
+      catch (err) { toastError("Purge impossible", err); return; }
+      if (!plan.videos.length) { toast({ kind: "ok", title: "Rien à purger", body: "Aucune vidéo terminée n'a de fichiers lourds." }); return; }
+      btn.innerHTML = idle; btn.disabled = false;
+      const ok = await confirmDialog({
+        title: "Purger les vidéos terminées ?",
+        body: `${plan.videos.length} vidéo${plan.videos.length > 1 ? "s" : ""} terminée${plan.videos.length > 1 ? "s" : ""} : ${fmtBytes(plan.total_bytes)} seront libérés. Les clips rendus sont gardés ; pour retraiter une vidéo purgée, il faudra la retélécharger.`,
+        confirmLabel: "Purger",
+      });
+      if (!ok) return;
+      setState("Purge en cours…");
+      try {
+        const done = await api("/api/purge-completed", { method: "POST" });
+        toast({ kind: "ok", title: "Vidéos purgées", body: `${done.videos.length} vidéo(s) : ${fmtBytes(done.freed_bytes)} libérés${done.skipped.length ? ` · ${done.skipped.length} ignorée(s)` : ""}` });
+        await loadVideos();
+        refreshList();
+      } catch (err) { toastError("Purge impossible", err); }
+    } finally {
+      btn.innerHTML = idle; btn.disabled = false;
+      purgeBusy = false;
+    }
   }
 
   /* ---------- Fiche d'une video ---------- */

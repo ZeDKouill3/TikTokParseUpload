@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import shutil
 from datetime import datetime, timezone
@@ -114,11 +115,21 @@ class Workspace:
 
 
 def _size(path: Path) -> int:
+    # os.scandir : une seule lecture de dossier, taille lue dans l'entrée (pas de stat séparé par fichier).
     if path.is_file():
         return path.stat().st_size
-    if path.is_dir():
-        return sum(p.stat().st_size for p in path.rglob("*") if p.is_file())
-    return 0
+    if not path.is_dir():
+        return 0
+    total = 0
+    pending = [str(path)]
+    while pending:
+        with os.scandir(pending.pop()) as entries:
+            for entry in entries:
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(entry.path)
+                elif entry.is_file():
+                    total += entry.stat().st_size
+    return total
 
 
 def disk_usage(workspace_root: str | Path, output_root: str | Path) -> dict[str, int]:
