@@ -573,11 +573,14 @@ def mark_failed(
     *,
     capture: str | Path | None = None,
     halted: bool = False,
+    to_verify: bool = False,
     state_dir: str | Path | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """Echec d'une publication (SPEC-9225 R4) : statut ``failed`` avec la raison et la capture
-    d'ecran ; ``halted`` arrete le compte tant que l'entree n'est pas reessayee (``retry``)."""
+    d'ecran ; ``halted`` arrete le compte tant que l'entree n'est pas reessayee (``retry``). ``to_verify`` :
+    la programmation est partie mais sa presence sur le service n'est pas confirmee (aucun id de post) ; l'entree
+    n'est jamais « publiee » ni reprogrammee seule, l'utilisateur verifie dans Studio avant de reessayer."""
     path = _state_path(channel, state_dir)
     with _locked(path):
         entries = _load_entries(path)
@@ -588,10 +591,36 @@ def mark_failed(
             raise PublishError(f"echec impossible pour {video_id}/{clip_id} : statut {entry['status']!r}")
         entry = dict(entry)
         entry.update(status="failed", error=reason, capture=str(capture) if capture else None, halted=halted,
-                     failed_at=_iso(_now(now)), waiting_reason=None, in_progress_since=None)
+                     failed_at=_iso(_now(now)), waiting_reason=None, in_progress_since=None, to_verify=to_verify)
         _upsert_entry(entries, entry)
         _save_entries(path, entries)
     return entry
+
+
+def flag_missing_on_tiktok(
+    video_id: str,
+    clip_id: str,
+    channel: str,
+    note: str,
+    *,
+    now: datetime | None = None,
+    state_dir: str | Path | None = None,
+) -> bool:
+    """Signale une entree programmee sur TikTok, sans id de post, que le releve complet du compte ne montre pas :
+    ``missing_on_tiktok`` et ``post_note`` (visible dans l'ecran Publication). Rend vrai seulement la premiere
+    fois (le worker ne journalise qu'une fois) ; faux si l'entree n'est plus dans cet etat."""
+    path = _state_path(channel, state_dir)
+    with _locked(path):
+        entries = _load_entries(path)
+        entry = _find_entry(entries, video_id, clip_id)
+        if (entry is None or entry["status"] != "published" or entry.get("tiktok_state") != "scheduled_on_tiktok"
+                or entry.get("post_id") or entry.get("missing_on_tiktok")):
+            return False
+        entry = dict(entry)
+        entry.update(missing_on_tiktok=True, missing_checked_at=_iso(_now(now)), post_note=note)
+        _upsert_entry(entries, entry)
+        _save_entries(path, entries)
+    return True
 
 
 def mark_refused_by_platform(
@@ -703,7 +732,8 @@ def retry(
                 f"reessai refuse pour {video_id}/{clip_id} : statut {entry['status']!r} (attendu : 'failed')"
             )
         entry = dict(entry)
-        entry.update(status="scheduled" if entry["slot_at"] else "approved", error=None, capture=None, halted=False)
+        entry.update(status="scheduled" if entry["slot_at"] else "approved", error=None, capture=None, halted=False,
+                     to_verify=False)
         _upsert_entry(entries, entry)
         _save_entries(path, entries)
     return entry

@@ -933,8 +933,9 @@ class FakeLogin:
 class FakePublisher:
     """Remplace tiktok.publish : enregistre les appels, rend un resultat ou leve ``error``."""
 
-    def __init__(self, error=None, state="published", during=None):
+    def __init__(self, error=None, state="published", during=None, scheduled_post_id="7300000000000000002"):
         self.calls, self.error, self.state, self.during = [], error, state, during
+        self.scheduled_post_id = scheduled_post_id  # None : TikTok Studio n'a montre aucun post apres la programmation
 
     def __call__(self, clip, account, *, mode, schedule_at=None, config=None, on_tick=None, **kwargs):
         self.calls.append({"clip": clip, "account": account, "mode": mode, "schedule_at": schedule_at, "on_tick": on_tick,
@@ -944,7 +945,8 @@ class FakePublisher:
         if self.error is not None:
             raise self.error
         scheduled = mode == "scheduled"
-        return {"post_url": None if scheduled else LINK, "post_id": None if scheduled else "7300000000000000001",
+        return {"post_url": None if scheduled else LINK,
+                "post_id": self.scheduled_post_id if scheduled else "7300000000000000001",
                 "state": "scheduled_on_tiktok" if scheduled else "published",
                 "publish_at": (schedule_at if scheduled else datetime.now(timezone.utc)).isoformat(), "note": None}
 
@@ -1373,12 +1375,12 @@ def _no_real_stats_fetch(monkeypatch):
     monkeypatch.setattr(tiktok, "fetch_stats", lambda account, **kwargs: {"account": account})
 
 
-def _write_snapshot(tmp_path, account, at, origin="full"):
+def _write_snapshot(tmp_path, account, at, origin="full", posts=()):
     """Un releve de l'historique du compte (SPEC-86fe R2) : state/stats/tiktok/<compte>/<horodatage>.json."""
     path = tmp_path / "state" / "stats" / "tiktok" / account / f"{at.strftime('%Y%m%dT%H%M%S%f')}Z.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"account": account, "fetched_at": at.isoformat(), "origin": origin, "overview": None,
-                                "posts": []}), encoding="utf-8")
+                                "posts": list(posts)}), encoding="utf-8")
 
 
 class FakeStatsFetcher:
@@ -3692,3 +3694,85 @@ def test_child_commands_use_the_configured_presets_dir(tmp_path):
 
     assert run_cmd[3:5] == ["--config", "styles/ma_chaine.toml"]
     assert prefetch_cmd[3:5] == ["--config", "styles/ma_chaine.toml"]
+
+
+# --- TASK-466e961c71bf : une programmation sans id de post n'est jamais « publiee » ---------------------------
+
+def test_a_scheduled_flow_that_ends_without_a_post_id_is_not_recorded_as_published(tmp_path, monkeypatch, caplog):
+    config = _pub_env(tmp_path, monkeypatch)
+    when = datetime.now(timezone.utc) + timedelta(days=3)
+    _manual(tmp_path, "01", when, mode="scheduled")
+    pub = FakePublisher(scheduled_post_id=None)
+
+    with caplog.at_level(logging.ERROR):
+        _pub_worker(config, pub).tick()
+
+    entry = _entries(tmp_path, NO_CHANNEL)[0]
+    assert entry["status"] == "failed" and entry["to_verify"] is True and entry["halted"] is False
+    assert "à vérifier" in entry["error"] and "doublon" in entry["error"]
+    assert entry.get("tiktok_state") is None and entry["in_progress_since"] is None
+    assert "programmation à vérifier" in caplog.text
+    sidecar = json.loads((tmp_path / "output" / "aaaaaaaaaaa" / "01.json").read_text(encoding="utf-8"))
+    assert "tiktok_post" not in sidecar
+
+
+def test_an_unconfirmed_schedule_is_never_rescheduled_by_itself(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    _manual(tmp_path, "01", datetime.now(timezone.utc) + timedelta(days=3), mode="scheduled")
+    pub = FakePublisher(scheduled_post_id=None)
+    w = _pub_worker(config, pub)
+
+    w.tick()
+    w.tick()
+    w.tick()
+
+    assert len(pub.calls) == 1 and _entries(tmp_path, NO_CHANNEL)[0]["status"] == "failed"
+
+
+def _scheduled_without_id(tmp_path, clip_id="01", published_at=None):
+    _manual(tmp_path, clip_id, datetime.now(timezone.utc) + timedelta(days=1), mode="scheduled", status="published",
+            tiktok_state="scheduled_on_tiktok", post_id=None, post_url=None,
+            published_at=(published_at or _ago(hours=3)).isoformat())
+
+
+def _reconcile_worker(config):
+    return _pub_worker(config, FakePublisher())
+
+
+def test_a_full_stats_snapshot_without_the_scheduled_post_flags_it_once(tmp_path, monkeypatch, caplog):
+    config = _pub_env(tmp_path, monkeypatch)
+    _scheduled_without_id(tmp_path)
+    _write_snapshot(tmp_path, "ef34ab", _ago(hours=1), posts=[
+        {"post_id": "7300000000000000009", "caption": "une autre legende", "posted_at": _ago(days=2).isoformat()}])
+    w = _reconcile_worker(config)
+
+    with caplog.at_level(logging.ERROR):
+        w.tick()
+        w.tick()
+
+    entry = _entries(tmp_path, NO_CHANNEL)[0]
+    assert entry["status"] == "published" and entry["missing_on_tiktok"] is True
+    assert "absente du dernier relevé" in entry["post_note"]
+    assert caplog.text.count("absente du dernier relevé") == 1
+
+
+def test_a_snapshot_that_shows_the_scheduled_post_flags_nothing(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    _scheduled_without_id(tmp_path)
+    _write_snapshot(tmp_path, "ef34ab", _ago(hours=1), posts=[
+        {"post_id": "7300000000000000009", "caption": "legende 01 #a #b", "posted_at": _ago(hours=-20).isoformat()}])
+
+    _reconcile_worker(config).tick()
+
+    assert "missing_on_tiktok" not in _entries(tmp_path, NO_CHANNEL)[0]
+
+
+def test_an_opportunistic_or_older_snapshot_flags_nothing(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    _scheduled_without_id(tmp_path, published_at=_ago(hours=3))
+    _write_snapshot(tmp_path, "ef34ab", _ago(hours=1), origin="opportunistic")  # une partie de la liste seulement
+    _write_snapshot(tmp_path, "ef34ab", _ago(hours=5), origin="full")  # avant la programmation
+
+    _reconcile_worker(config).tick()
+
+    assert "missing_on_tiktok" not in _entries(tmp_path, NO_CHANNEL)[0]

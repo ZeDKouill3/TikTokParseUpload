@@ -16,6 +16,7 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ### Corrigé
 
+- Publication TikTok : une programmation dont aucun id de post n'est retrouvé sur TikTok Studio n'est plus enregistrée comme publiée ; l'entrée passe en échec « à vérifier » (compte non arrêté, jamais reprogrammée seule, risque de doublon indiqué), avec journal et évènement console. Au relevé complet suivant, une entrée « programmée sur TikTok » sans id que le relevé ne montre pas est signalée une fois (note de l'écran Publication, journal). Cas réel : un post programmé 05 pour 17 h, déclaré « programmé » alors qu'il n'existait pas.
 - Moments : un passage d'action prend comme parole et comme accroche les mots horodatés compris dans le passage, même quand leur phrase commence avant ou déborde après (mots géants exclus) ; une phrase sans horodatage des mots ne fournit son texte que si elle est entièrement incluse. Sans aucun mot retenu, l'accroche reste la description de l'image.
 - Publication : un report impossible sur une entrée due (ex. plafond d'un compte sans créneau libre) ne fait plus sauter les autres entrées dues du même passage du worker ; l'entrée en cause attend avec la raison visible et un avertissement journalisé.
 - Fiche clip : l'historique des statistiques ne garde qu'un relevé par changement de valeurs (vues, likes, commentaires), le dernier relevé est toujours gardé ; la date « Publié le » devient « Envoyé à TikTok le » (le créneau reste « Créneau ») ; les valeurs des panneaux ne débordent plus de leur bord.
