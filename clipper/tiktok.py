@@ -360,6 +360,12 @@ def _naive_utc(stamp: Any) -> datetime | None:
     return moment if moment.tzinfo else moment.replace(tzinfo=_PARIS)
 
 
+def _paris_minute(moment: datetime) -> datetime:
+    """Instant en heure de Paris naive, a la minute : la forme des dates affichees par TikTok (sans fuseau)."""
+    aware = moment if moment.tzinfo else moment.replace(tzinfo=_PARIS)
+    return aware.astimezone(_PARIS).replace(tzinfo=None, second=0, microsecond=0)
+
+
 def _text(value: Any) -> str:
     if not isinstance(value, str):
         raise ValueError(f"texte attendu, reçu {value!r}")
@@ -1004,16 +1010,18 @@ class _Flow:
         self.await_published(mode)
         return self.result(clip, mode, schedule_at, effective, note)
 
-    def find_post_link(self, clip: dict[str, Any]) -> tuple[str | None, str | None]:
+    def find_post_link(self, clip: dict[str, Any], target: datetime | None = None) -> tuple[str | None, str | None]:
         """Page Publications : le premier lien de post dont le texte est le debut de la legende publiee.
         Rend (adresse complete, id) ou (None, raison). Ne leve jamais : la publication est deja prouvee.
         TikTok liste le nouveau post avec retard : tant qu'il manque, la page est rechargee toutes les
-        ``post_lookup_interval_s`` pendant au plus ``post_lookup_timeout_s`` (temps d'attente des essais compris)."""
+        ``post_lookup_interval_s`` pendant au plus ``post_lookup_timeout_s`` (temps d'attente des essais compris).
+        ``target`` : l'heure programmee (programmation seulement) ; si plusieurs liens portent la legende, celui dont
+        l'heure affichee est cette minute l'emporte (sinon le premier, ambiguite journalisee)."""
         interval, timeout = float(self.settings["post_lookup_interval_s"]), float(self.settings["post_lookup_timeout_s"])
         waited, attempts = 0.0, 0
         while True:
             attempts += 1
-            url, found, spent = self._lookup_post_link(clip, reload=attempts > 1)
+            url, found, spent = self._lookup_post_link(clip, reload=attempts > 1, target=target)
             broken, waited = spent < 0, waited + max(spent, 0.0)
             if url is not None:
                 if attempts > 1:
@@ -1028,7 +1036,8 @@ class _Flow:
             self.page.wait_for_timeout(interval * 1000)
             waited += interval
 
-    def _lookup_post_link(self, clip: dict[str, Any], *, reload: bool) -> tuple[str | None, str | None, float]:
+    def _lookup_post_link(self, clip: dict[str, Any], *, reload: bool,
+                          target: datetime | None = None) -> tuple[str | None, str | None, float]:
         """Un essai de ``find_post_link`` : (adresse, id) ou (None, raison), et le temps d'attente de la page
         consomme (negatif : l'essai a casse, inutile de recommencer)."""
         try:
@@ -1044,14 +1053,54 @@ class _Flow:
                 return None, f"aucun lien de post affiché après {spent:g} s", spent
             self.harvest()
             published = _squash(" ".join([clip["caption"], *clip["hashtags"]]))
+            matches: list[tuple[str, str]] = []
             for link in self.page.query_selector_all(selector):
                 text = _squash(str(link.inner_text())).rstrip("….").rstrip()
                 href = link.get_attribute("href") or ""
                 if text and (published.startswith(text) or text.startswith(published)) and _POST_ID_END.search(href):
-                    return urljoin(str(self.page.url), href), _POST_ID_END.search(href).group(1), 0.0
-            return None, "aucun lien dont le texte correspond à la légende publiée", 0.0
+                    matches.append((urljoin(str(self.page.url), href), _POST_ID_END.search(href).group(1)))
+            if not matches:
+                return None, "aucun lien dont le texte correspond à la légende publiée", 0.0
+            if len(matches) == 1:
+                return matches[0][0], matches[0][1], 0.0
+            url, post_id = self._ambiguous_link(matches, target)
+            return url, post_id, 0.0
         except Exception as exc:  # noqa: BLE001 - dit dans la note, jamais avale
             return None, f"{type(exc).__name__} : {exc}", -1.0
+
+    def _ambiguous_link(self, matches: list[tuple[str, str]], target: datetime | None) -> tuple[str, str]:
+        """Plusieurs liens portent la legende (texte tronque) : celui dont l'heure affichee est la minute de
+        ``target`` (heure de Paris). Sinon, le premier lien, comme avant, avec l'ambiguite journalisee : jamais
+        devine en silence (ADR-ad2e)."""
+        wanted = _paris_minute(target) if target is not None else None
+        if wanted is not None:
+            times = self._displayed_times()
+            hits = [match for match in matches if times.get(match[1]) == wanted]
+            if len(hits) == 1:
+                logger.info("TikTok %s : %d posts portent la légende, celui de %s désigné par son heure affichée",
+                            self.account, len(matches), wanted.isoformat(timespec="minutes"))
+                return hits[0]
+        logger.warning("TikTok %s : %d liens de post portent la légende publiée (texte tronqué) et l'heure affichée "
+                       "ne désigne pas un seul post (créneau %s) : premier lien retenu, à vérifier (%s)",
+                       self.account, len(matches), wanted.isoformat(timespec="minutes") if wanted else "inconnu",
+                       matches[0][1])
+        return matches[0]
+
+    def _displayed_times(self) -> dict[str, datetime]:
+        """Heure affichée (Paris, à la minute) de chaque post de la page Publications, par id ; un post dont la
+        date n'est pas lisible n'y figure pas (rien n'est inventé)."""
+        sel = self.sel["stats"]
+        times: dict[str, datetime] = {}
+        for row in self.page.query_selector_all(sel["row"]):
+            link = row.query_selector(sel["post_link"])
+            match = _POST_ID.search((link.get_attribute("href") or "") if link is not None else "")
+            cell = row.query_selector(sel["created"])
+            if match is None or cell is None:
+                continue
+            stamp = parse_date(cell.inner_text(), self.sel["calendar"]["months"], self.now)
+            if stamp is not None:
+                times[match.group(1)] = datetime.fromisoformat(stamp).replace(second=0, microsecond=0)
+        return times
 
     # -- releve des statistiques (SPEC-86fe R1) : lecture seule, aucun clic hors le menu des periodes
     def stats(self, previous: dict[str, dict[str, Any]], full: bool = False) -> dict[str, Any]:
@@ -1398,13 +1447,13 @@ class _Flow:
     def result(self, clip: dict[str, Any], mode: str, schedule_at: datetime | None,
                effective: datetime | None = None, rounding: str | None = None) -> dict[str, Any]:
         notes = [rounding] if rounding else []
-        url, found = self.find_post_link(clip)
+        when = (effective if rounding else schedule_at) if mode == "scheduled" else self.now
+        url, found = self.find_post_link(clip, target=when if mode == "scheduled" else None)
         post_id = found if url is not None else None
         if url is None:
             notes.append("post programmé : son adresse publique n'existe pas encore" if mode == "scheduled"
                          else f"publication réussie mais lien du post introuvable sur la page Publications "
                               f"({found}) : à vérifier à la main")
-        when = (effective if rounding else schedule_at) if mode == "scheduled" else self.now
         return {
             "post_url": url,
             "post_id": post_id,

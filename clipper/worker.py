@@ -25,7 +25,7 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 from zoneinfo import ZoneInfo
 
 import tomllib
@@ -116,6 +116,37 @@ def _caption_shown(wanted: str, shown: Any) -> bool:
     commence par l'autre."""
     text = tiktok._squash(shown).rstrip("….").rstrip() if isinstance(shown, str) else ""
     return bool(text and wanted and (wanted.startswith(text) or text.startswith(wanted)))
+
+
+_PARIS = ZoneInfo("Europe/Paris")
+
+
+def _slot_paris(slot_at: Any) -> datetime | None:
+    """Creneau d'une entree en heure de Paris naive, a la minute (comme ``posted_at`` du releve) ; ``None`` si
+    absent, sans fuseau ou illisible : l'heure n'est alors pas connue."""
+    if not isinstance(slot_at, str):
+        return None
+    try:
+        slot = datetime.fromisoformat(slot_at)
+    except ValueError:
+        return None
+    if slot.tzinfo is None:
+        return None
+    return slot.astimezone(_PARIS).replace(tzinfo=None, second=0, microsecond=0)
+
+
+def _posted_paris(post: dict[str, Any]) -> datetime | None:
+    """Date de publication d'un post du releve, heure de Paris naive a la minute ; ``None`` si inconnue."""
+    stamp = post.get("posted_at")
+    if not isinstance(stamp, str):
+        return None
+    try:
+        posted = datetime.fromisoformat(stamp)
+    except ValueError:
+        return None
+    if posted.tzinfo is not None:
+        posted = posted.astimezone(_PARIS).replace(tzinfo=None)
+    return posted.replace(second=0, microsecond=0)
 
 
 class WorkerError(Exception):
@@ -517,6 +548,7 @@ class Worker:
         self.publisher = publisher or tiktok.publish
         self.youtube_publisher = youtube_publisher or youtube.publish  # compte YouTube (SPEC-5e50 R2)
         self._logged_publish_errors: set[str] = set()
+        self._logged_reconcile: set[str] = set()  # rapprochement indecis : journal une seule fois
         self.stats_fetcher = stats_fetcher or tiktok.fetch_stats
         self.learning_runner = learning_runner or learning.run_if_due  # rattachement puis versement apres releve
         self._logged_learning_errors: set[str] = set()
@@ -848,7 +880,9 @@ class Worker:
                     sidecar = publish_mod.read_sidecar(self.config.output_dir, entry["video_id"], entry["clip_id"])
                     wanted = tiktok._squash(" ".join([str(sidecar.get("caption") or ""),
                                                       *map(str, sidecar.get("hashtags") or [])]))
-                    if any(_caption_shown(wanted, post.get("caption")) for post in posts[account].values()):
+                    where = f"{entry['video_id']}/{entry['clip_id']}"
+                    state, _ = self._caption_match(wanted, entry.get("slot_at"), posts[account].values(), where)
+                    if state != "absent":  # trouvee, ou indecise (rien n'est conclu : pas de drapeau)
                         continue
                     note = ("programmée sur TikTok mais absente du dernier relevé de TikTok Studio : "
                             "à vérifier à la main (peut-être jamais programmée)")
@@ -878,16 +912,46 @@ class Worker:
             return  # aucun releve complet posterieur : rien a conclure
         sidecar = publish_mod.read_sidecar(self.config.output_dir, entry["video_id"], entry["clip_id"])
         wanted = tiktok._squash(" ".join([str(sidecar.get("caption") or ""), *map(str, sidecar.get("hashtags") or [])]))
-        for post in tiktok.merged_posts(history).values():
-            if post.get("post_id") and _caption_shown(wanted, post.get("caption")):
-                note = "programmation retrouvée dans le relevé de TikTok Studio (rapprochement automatique)"
-                if publish_mod.resolve_to_verify(
-                        entry["video_id"], entry["clip_id"], name, post_id=str(post["post_id"]),
-                        post_url=post.get("post_url"), account=account, note=note, state_dir=state_dir,
-                        output_dir=self.config.output_dir):
-                    log.info("%s/%s : programmation retrouvée sur TikTok (post %s) : « à vérifier » levé",
-                             entry["video_id"], entry["clip_id"], post["post_id"])
-                return
+        where = f"{entry['video_id']}/{entry['clip_id']}"
+        state, post = self._caption_match(wanted, entry.get("slot_at"),
+                                          [p for p in tiktok.merged_posts(history).values() if p.get("post_id")], where)
+        if state != "found" or post is None:
+            return  # absente, ou indecise : rien n'est conclu (ADR-ad2e), « à vérifier » reste
+        note = "programmation retrouvée dans le relevé de TikTok Studio (rapprochement automatique)"
+        if publish_mod.resolve_to_verify(
+                entry["video_id"], entry["clip_id"], name, post_id=str(post["post_id"]),
+                post_url=post.get("post_url"), account=account, note=note, state_dir=state_dir,
+                output_dir=self.config.output_dir):
+            log.info("%s/%s : programmation retrouvée sur TikTok (post %s) : « à vérifier » levé",
+                     entry["video_id"], entry["clip_id"], post["post_id"])
+
+    def _caption_match(self, wanted: str, slot_at: Any, posts: Iterable[dict[str, Any]],
+                       where: str) -> tuple[str, dict[str, Any] | None]:
+        """Rapprochement d'une entree a un post du releve : la legende (meme regle que ``find_post_link``) et, des
+        que l'heure est connue, la date de publication egale au creneau a la minute (heure de Paris). Rend
+        ``("absent", None)`` si aucun post ne porte la legende, ``("found", post)`` si un seul post verifie les
+        deux (ou si la legende est unique et son heure inconnue : comportement d'origine), ``("undecided", None)``
+        sinon : rien n'est conclu, journal une seule fois (jamais deviner, ADR-ad2e)."""
+        candidates = [post for post in posts if _caption_shown(wanted, post.get("caption"))]
+        if not candidates:
+            return "absent", None
+        slot = _slot_paris(slot_at)
+        if len(candidates) == 1 and (slot is None or _posted_paris(candidates[0]) is None):
+            return "found", candidates[0]
+        matches = [post for post in candidates if slot is not None and _posted_paris(post) == slot]
+        if len(matches) == 1:
+            return "found", matches[0]
+        if matches:
+            message = f"{where} : plusieurs posts portent la légende à l'heure du créneau : rien conclu, à vérifier à la main"
+            if message not in self._logged_reconcile:
+                self._logged_reconcile.add(message)
+                log.warning(message)
+        else:
+            message = f"{where} : légende partagée sans post à l'heure du créneau : rien conclu, à vérifier à la main"
+            if message not in self._logged_reconcile:
+                self._logged_reconcile.add(message)
+                log.info(message)
+        return "undecided", None
 
     def _service_settings(self, service: str, cache: dict[str, dict[str, Any]]) -> dict[str, Any]:
         """Reglages [tiktok] ou [youtube] du service d'un compte, lus (et valides) une fois par passage."""

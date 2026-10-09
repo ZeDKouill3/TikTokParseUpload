@@ -14,6 +14,7 @@ import sys
 import threading
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -3849,6 +3850,130 @@ def test_an_opportunistic_or_older_snapshot_flags_nothing(tmp_path, monkeypatch)
     _scheduled_without_id(tmp_path, published_at=_ago(hours=3))
     _write_snapshot(tmp_path, "ef34ab", _ago(hours=1), origin="opportunistic")  # une partie de la liste seulement
     _write_snapshot(tmp_path, "ef34ab", _ago(hours=5), origin="full")  # avant la programmation
+
+    _reconcile_worker(config).tick()
+
+    assert "missing_on_tiktok" not in _entries(tmp_path, NO_CHANNEL)[0]
+
+
+# -- TASK-05b430f5416e : rapprochement par legende ET heure (deux posts a legende commune, 12:00 et 19:30)
+
+_PARIS = ZoneInfo("Europe/Paris")
+_NOON = datetime(2026, 10, 9, 12, 0, tzinfo=_PARIS)
+_EVENING = datetime(2026, 10, 9, 19, 30, tzinfo=_PARIS)
+_SHARED_CAPTION = "Sur Silent Hill: Townfall, XababTV s'arrête"  # legende de la sidecar (complete)
+_SHARED_SHOWN = "Sur Silent Hill: Townfall, XababTV s'arr…"  # ce que TikTok Studio affiche (tronquee)
+
+
+def _post(post_id, *, posted=None, caption=_SHARED_SHOWN):
+    return {"post_id": post_id, "post_url": f"https://www.tiktok.com/@a/video/{post_id}", "caption": caption,
+            "posted_at": posted}
+
+
+def _same_caption(tmp_path, clip_ids):
+    """Les sidecars des entrees partagent la meme legende (deux posts qui commencent pareil)."""
+    for clip_id in clip_ids:
+        path = tmp_path / "output" / "aaaaaaaaaaa" / f"{clip_id}.json"
+        sidecar = json.loads(path.read_text(encoding="utf-8"))
+        sidecar["caption"] = _SHARED_CAPTION
+        path.write_text(json.dumps(sidecar), encoding="utf-8")
+
+
+def _to_verify_at(tmp_path, clip_id, slot, failed_at=None):
+    _manual(tmp_path, clip_id, slot, mode="scheduled", status="failed", to_verify=True, halted=False,
+            post_id=None, post_url=None, error="programmation à vérifier : ...",
+            failed_at=(failed_at or _ago(hours=3)).isoformat())
+
+
+def _scheduled_at(tmp_path, clip_id, slot):
+    _manual(tmp_path, clip_id, slot, mode="scheduled", status="published", tiktok_state="scheduled_on_tiktok",
+            post_id=None, post_url=None, published_at=_ago(hours=3).isoformat())
+
+
+def test_two_posts_with_the_same_caption_go_to_the_entry_of_their_own_slot(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    _to_verify_at(tmp_path, "01", _NOON)
+    _to_verify_at(tmp_path, "02", _EVENING)
+    _same_caption(tmp_path, ["01", "02"])
+    _write_snapshot(tmp_path, "ef34ab", _ago(hours=1), posts=[
+        _post("7300000000000000012", posted="2026-10-09T12:00:00"),
+        _post("7300000000000000019", posted="2026-10-09T19:30:00")])
+
+    _reconcile_worker(config).tick()
+
+    by_clip = {e["clip_id"]: e for e in _entries(tmp_path, NO_CHANNEL)}
+    assert by_clip["01"]["post_id"] == "7300000000000000012" and by_clip["01"]["status"] == "published"
+    assert by_clip["02"]["post_id"] == "7300000000000000019" and by_clip["02"]["status"] == "published"
+
+
+def test_same_caption_with_no_post_at_the_slot_concludes_nothing_and_logs_info_once(tmp_path, monkeypatch, caplog):
+    config = _pub_env(tmp_path, monkeypatch)
+    _to_verify_at(tmp_path, "02", _EVENING)
+    _same_caption(tmp_path, ["02"])
+    _write_snapshot(tmp_path, "ef34ab", _ago(hours=1), posts=[
+        _post("7300000000000000012", posted="2026-10-09T12:00:00")])
+    w = _reconcile_worker(config)
+
+    with caplog.at_level(logging.INFO):
+        w.tick()
+        w.tick()
+
+    entry = _entries(tmp_path, NO_CHANNEL)[0]
+    assert entry["status"] == "failed" and entry["to_verify"] is True and not entry.get("post_id")
+    infos = [r for r in caplog.records if r.levelno == logging.INFO and "rien conclu" in r.getMessage()]
+    assert len(infos) == 1
+
+
+def test_two_posts_with_the_same_caption_and_slot_conclude_nothing_and_warn_once(tmp_path, monkeypatch, caplog):
+    config = _pub_env(tmp_path, monkeypatch)
+    _to_verify_at(tmp_path, "02", _EVENING)
+    _same_caption(tmp_path, ["02"])
+    _write_snapshot(tmp_path, "ef34ab", _ago(hours=1), posts=[
+        _post("7300000000000000019", posted="2026-10-09T19:30:00"),
+        _post("7300000000000000020", posted="2026-10-09T19:30:00")])
+    w = _reconcile_worker(config)
+
+    with caplog.at_level(logging.INFO):
+        w.tick()
+        w.tick()
+
+    entry = _entries(tmp_path, NO_CHANNEL)[0]
+    assert entry["status"] == "failed" and entry["to_verify"] is True and not entry.get("post_id")
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING and "rien conclu" in r.getMessage()]
+    assert len(warnings) == 1
+
+
+def test_a_single_caption_posted_at_another_hour_is_not_taken_for_the_entry(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    _to_verify_at(tmp_path, "02", _EVENING)
+    _same_caption(tmp_path, ["02"])
+    _write_snapshot(tmp_path, "ef34ab", _ago(hours=1), posts=[
+        _post("7300000000000000012", posted="2026-10-09T12:00:00")])
+
+    _reconcile_worker(config).tick()
+
+    entry = _entries(tmp_path, NO_CHANNEL)[0]
+    assert entry["status"] == "failed" and entry["to_verify"] is True and not entry.get("post_id")
+
+
+def test_a_single_caption_without_posted_time_keeps_the_current_rule(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    _to_verify_at(tmp_path, "02", _EVENING)
+    _same_caption(tmp_path, ["02"])
+    _write_snapshot(tmp_path, "ef34ab", _ago(hours=1), posts=[_post("7300000000000000019", posted=None)])
+
+    _reconcile_worker(config).tick()
+
+    entry = _entries(tmp_path, NO_CHANNEL)[0]
+    assert entry["status"] == "published" and entry["post_id"] == "7300000000000000019"
+
+
+def test_a_scheduled_entry_whose_caption_is_shown_only_at_another_hour_is_not_flagged_missing(tmp_path, monkeypatch):
+    config = _pub_env(tmp_path, monkeypatch)
+    _scheduled_at(tmp_path, "02", _EVENING)
+    _same_caption(tmp_path, ["02"])
+    _write_snapshot(tmp_path, "ef34ab", _ago(hours=1), posts=[
+        _post("7300000000000000012", posted="2026-10-09T12:00:00")])
 
     _reconcile_worker(config).tick()
 
