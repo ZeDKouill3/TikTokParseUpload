@@ -191,9 +191,9 @@ class _Check:
     """Une verification sur une page : chaque etape rend la raison de l'echec (jamais d'exception de page)."""
 
     def __init__(self, page: Any, account: str, sel: dict[str, Any], settings: dict[str, Any], *,
-                 now: datetime, sleep: Callable[[float], None], rng: Any) -> None:
+                 now: datetime, sleep: Callable[[float], None], rng: Any, config: Config | None = None) -> None:
         self.page, self.account, self.sel, self.settings = page, account, sel, settings
-        self.now, self._sleep, self.rng = now, sleep, rng
+        self.now, self._sleep, self.rng, self.config = now, sleep, rng, config
 
     def pause(self) -> None:
         self._sleep(self.rng.uniform(float(self.settings["min_action_delay_s"]),
@@ -202,7 +202,7 @@ class _Check:
     def refuse(self, reason: str, *, capture: bool = False) -> dict[str, Any]:
         path: Path | None = None
         if capture:
-            target = browser.profile_dir(self.account) / "captures" / f"{self.now.strftime('%Y%m%dT%H%M%S')}-youtube.png"
+            target = browser.profile_dir(self.account, self.config) / "captures" / f"{self.now.strftime('%Y%m%dT%H%M%S')}-youtube.png"
             try:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 self.page.screenshot(path=str(target), full_page=True)
@@ -290,7 +290,7 @@ def verify_login(
     with open_profile(account, headless=False) as context:  # visible : jamais de navigateur cache (ADR-58c0)
         page = context.pages[0] if context.pages else context.new_page()
         check = _Check(page, account, sel, settings, now=now or datetime.now(timezone.utc), sleep=sleep,
-                       rng=rng or random.Random())
+                       rng=rng or random.Random(), config=config)
         page.goto(str(sel["urls"]["studio"]))
         check.pause()
         channel_id, reason = check.wait_channel_url()
@@ -375,14 +375,15 @@ class _Flow:
     verification, captcha) avant d'agir."""
 
     def __init__(self, page: Any, account: str, sel: dict[str, Any], settings: dict[str, Any], *,
-                 now: datetime, sleep: Callable[[float], None], rng: Any, on_tick: Callable[[], None] | None) -> None:
+                 now: datetime, sleep: Callable[[float], None], rng: Any, on_tick: Callable[[], None] | None,
+                 config: Config | None = None) -> None:
         self.page, self.account, self.sel, self.settings = page, account, sel, settings
-        self.now, self._sleep, self.rng, self.on_tick = now, sleep, rng, on_tick
+        self.now, self._sleep, self.rng, self.on_tick, self.config = now, sleep, rng, on_tick, config
 
     # -- arret sur (R3)
     def stop(self, code: str, reason: str) -> YouTubeStop:
         capture: Path | None = None
-        target = browser.profile_dir(self.account) / "captures" / f"{self.now.strftime('%Y%m%dT%H%M%S')}-{code}.png"
+        target = browser.profile_dir(self.account, self.config) / "captures" / f"{self.now.strftime('%Y%m%dT%H%M%S')}-{code}.png"
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
             self.page.screenshot(path=str(target), full_page=True)
@@ -723,7 +724,8 @@ def publish(
     open_profile = opener or functools.partial(browser._open_context, config=config)  # pilot_wait_s du config
     with open_profile(account, headless=False) as context:  # visible : jamais de navigateur cache (ADR-58c0)
         page = context.pages[0] if context.pages else context.new_page()
-        flow = _Flow(page, account, sel, settings, now=now, sleep=sleep, rng=rng or random.Random(), on_tick=on_tick)
+        flow = _Flow(page, account, sel, settings, now=now, sleep=sleep, rng=rng or random.Random(), on_tick=on_tick,
+                     config=config)
         try:
             return flow.run(clip, title, mode, schedule_at)
         except YouTubeStop:

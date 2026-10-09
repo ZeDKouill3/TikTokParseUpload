@@ -500,15 +500,16 @@ class _Flow:
 
     def __init__(self, page: Any, account: str, selectors: dict[str, Any], settings: dict[str, Any], *,
                  now: datetime, sleep: Callable[[float], None], rng: Any, on_tick: Callable[[], None] | None,
-                 harvest: bool = False) -> None:
+                 harvest: bool = False, config: Config | None = None) -> None:
         self.page, self.account, self.sel, self.settings = page, account, selectors, settings
+        self.config = config  # [browser] state_dir : dossier de la capture d'arret
         self.now, self._sleep, self.rng, self.on_tick = now, sleep, rng, on_tick
         self.harvesting, self._harvested, self._lenient = harvest, False, False  # releve opportuniste (SPEC-86fe R4)
 
     # -- arret sur
     def stop(self, code: str, reason: str) -> TikTokStop:
         capture: Path | None = None
-        target = browser.profile_dir(self.account) / "captures" / f"{self.now.strftime('%Y%m%dT%H%M%S')}-{code}.png"
+        target = browser.profile_dir(self.account, self.config) / "captures" / f"{self.now.strftime('%Y%m%dT%H%M%S')}-{code}.png"
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
             self.page.screenshot(path=str(target), full_page=True)
@@ -1385,12 +1386,13 @@ class _Flow:
 class BrowserBackend:
     def publish(self, clip: dict[str, Any], account: str, *, mode: str, schedule_at: datetime | None,
                 settings: dict[str, Any], selectors: dict[str, Any], now: datetime, opener: Opener | None,
-                sleep: Callable[[float], None], rng: Any, on_tick: Callable[[], None] | None) -> dict[str, Any]:
+                sleep: Callable[[float], None], rng: Any, on_tick: Callable[[], None] | None,
+                config: Config | None = None) -> dict[str, Any]:
         open_profile = opener or browser._open_context
         with open_profile(account, headless=False) as context:  # visible : jamais de navigateur cache (ADR-1a58)
             page = context.pages[0] if context.pages else context.new_page()
             flow = _Flow(page, account, selectors, settings, now=now, sleep=sleep, rng=rng, on_tick=on_tick,
-                         harvest=True)
+                         harvest=True, config=config)
             try:
                 return flow.run(clip, mode, schedule_at)
             except TikTokStop:
@@ -1400,11 +1402,13 @@ class BrowserBackend:
 
     def fetch_stats(self, account: str, previous: dict[str, dict[str, Any]], *, settings: dict[str, Any],
                     selectors: dict[str, Any], now: datetime, opener: Opener | None, sleep: Callable[[float], None],
-                    rng: Any, on_tick: Callable[[], None] | None, full: bool = False) -> dict[str, Any]:
+                    rng: Any, on_tick: Callable[[], None] | None, full: bool = False,
+                    config: Config | None = None) -> dict[str, Any]:
         open_profile = opener or browser._open_context
         with open_profile(account, headless=False) as context:
             page = context.pages[0] if context.pages else context.new_page()
-            flow = _Flow(page, account, selectors, settings, now=now, sleep=sleep, rng=rng, on_tick=on_tick)
+            flow = _Flow(page, account, selectors, settings, now=now, sleep=sleep, rng=rng, on_tick=on_tick,
+                         config=config)
             try:
                 return flow.stats(previous, full=full)
             except TikTokStop:
@@ -1464,7 +1468,7 @@ def publish(
     return backend.publish(
         clip, browser.validate_account(account), mode=mode, schedule_at=schedule_at, settings=settings,
         selectors=selectors or load_selectors(), now=now, opener=opener or _default_opener(config), sleep=sleep,
-        rng=rng or random.Random(), on_tick=on_tick,
+        rng=rng or random.Random(), on_tick=on_tick, config=config,
     )
 
 
@@ -1678,7 +1682,7 @@ def fetch_stats(
         data = backend.fetch_stats(
             account, previous, settings=settings, selectors=selectors or load_selectors(), now=now,
             opener=opener or _default_opener(config),
-            sleep=sleep, rng=rng or random.Random(), on_tick=on_tick, full=full)
+            sleep=sleep, rng=rng or random.Random(), on_tick=on_tick, full=full, config=config)
     except (TikTokStop, browser.BrowserError) as exc:
         _record_stats_failure(account, exc, config, settings, now)
         raise
