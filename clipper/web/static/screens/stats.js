@@ -544,12 +544,31 @@ function learningRetentionBlock(data) {
     <div style="overflow-x:auto"><table class="table"><thead><tr><th>Clip</th><th>Durée</th><th>% vu</th><th>% vu en entier</th><th>Rang des vues</th><th>Source du moment</th></tr></thead><tbody>${body}</tbody></table></div></div>`;
 }
 
+/* « Ce qui marche » : quatre tableaux (jeu, streamer, heure, compte) ; groupes, medianes et `few` viennent du serveur, aucun calcul ici (ADR-49cd). */
+const LEARNING_BREAKDOWN_TABLES = [["game", "Jeu"], ["streamer", "Streamer"], ["hour", "Heure"], ["account", "Compte"]];
+
+function learningBreakdownTable(name, title, groups) {
+  const body = groups.map((g) => `<tr><td>${esc(g.label)}${g.few ? ` <span class="muted" data-breakdown-few>trop peu pour conclure</span>` : ""}</td><td>${fr(g.n)}</td><td>${fr(g.median_views)}</td><td>${statsPctValue(g.median_pct_watched, 1)}</td><td><a href="#/clips/${encodeURIComponent(g.best.video_id)}">${esc(g.best.video_id)} · ${esc(g.best.clip_id)}</a> (${fr(g.best.views)} vues)</td></tr>`).join("");
+  return `<div data-breakdown="${name}"><h4>${esc(title)}</h4><div style="overflow-x:auto"><table class="table"><thead><tr><th>${esc(title)}</th><th>n</th><th>Vues médianes</th><th>Part vue médiane</th><th>Meilleur clip</th></tr></thead><tbody>${body}</tbody></table></div></div>`;
+}
+
+function learningBreakdownBlock(data) {
+  const b = data.breakdown;
+  if (!b) return "";
+  const body = b.n
+    ? LEARNING_BREAKDOWN_TABLES.map(([name, title]) => learningBreakdownTable(name, title, b.groups[name])).join("")
+    : `<p class="muted" data-breakdown-empty>aucun relevé mûr</p>`;
+  const skipped = b.skipped ? `<p class="muted">${fr(b.skipped)} relevé(s) sans vues ignoré(s).</p>` : "";
+  return `<div class="panel panel-pad" data-learning-breakdown><h3>Ce qui marche</h3>
+    <p class="muted">Vues médianes à maturité, relevés réels seulement (${fr(b.n)} clips).</p>${skipped}${body}</div>`;
+}
+
 function statsLearningSection() {
   if (statsUi.learningError) {
     return `<section class="learning"><h2>Apprentissage</h2><p class="reason bad">Lecture impossible : ${esc(statsUi.learningError.message || statsUi.learningError)}</p></section>`;
   }
   if (!statsUi.learning) return "";
-  return `<section class="learning"><h2>Apprentissage</h2>${learningStateBlock(statsUi.learning)}${learningWeightsBlock(statsUi.learning)}${learningRetentionBlock(statsUi.learning)}${learningCoachBlock(statsUi.learning)}</section>`;
+  return `<section class="learning"><h2>Apprentissage</h2>${learningStateBlock(statsUi.learning)}${learningWeightsBlock(statsUi.learning)}${learningRetentionBlock(statsUi.learning)}${learningBreakdownBlock(statsUi.learning)}${learningCoachBlock(statsUi.learning)}</section>`;
 }
 
 /* Adopter ecrit la perspective dans config.toml (le serveur), Refuser ne touche a rien ; l'humain decide, jamais le coach. */
