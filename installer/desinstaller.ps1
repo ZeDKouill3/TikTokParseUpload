@@ -118,16 +118,28 @@ if (Test-Path $pointerPath) {
     }
     if (-not $pointerApp) {
         $pointerRaison = "illisible ou sans champ app"
-    } elseif ((Get-CheminNormalise $pointerApp) -ieq (Get-CheminNormalise $App)) {
-        $pointerSupprime = $true
     } else {
-        $pointerRaison = "autre installation : $pointerApp"
+        # Normalisation hors du try precedent : un chemin aux caracteres
+        # interdits leve ArgumentException ; le pointeur est alors laisse.
+        $memeApp = $false
+        try {
+            $memeApp = (Get-CheminNormalise $pointerApp) -ieq (Get-CheminNormalise $App)
+        } catch {
+            $pointerRaison = "champ app illisible ($pointerApp)"
+        }
+        if (-not $pointerRaison) {
+            if ($memeApp) {
+                $pointerSupprime = $true
+            } else {
+                $pointerRaison = "autre installation : $pointerApp"
+            }
+        }
     }
     if ($pointerSupprime) {
         Write-Host "Desinstallation : $pointerPath sera supprime"
     } else {
         Write-Host "Desinstallation : $pointerPath laisse ($pointerRaison)" -ForegroundColor Yellow
-        if ($pointerRaison -like "illisible*") {
+        if ($pointerRaison -like "*illisible*") {
             Write-Host "  remede : verifie ou supprime ce fichier a la main, il n'est pas lu par cette desinstallation" -ForegroundColor Yellow
         }
     }
