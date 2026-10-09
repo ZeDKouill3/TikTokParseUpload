@@ -11046,3 +11046,278 @@ def test_repartition_validate_refuses_a_plan_without_any_line(tmp_path, isolated
 
     assert resp.status_code == 409 and "aucune ligne" in resp.json()["detail"]
     assert _rep_read(tmp_path, day)["status"] == "proposed" and _rep_scheduled(tmp_path) == []
+
+
+# --------------------------------------------------------------------------
+# Écran Publication : section « Plan de demain » (TASK-b645, SPEC-78dc R9)
+# --------------------------------------------------------------------------
+
+_REP_NODE = pytest.mark.skipif(shutil.which("node") is None, reason="node absent du PATH")
+_REP_DAY = "2026-10-10"
+
+_REP_STUBS = """
+globalThis.__handlers = {};
+globalThis.document = { addEventListener(name, fn) { (globalThis.__handlers[name] = globalThis.__handlers[name] || []).push(fn); } };
+const Screens = {}; let currentScreen = "publish";
+const emptyState = (i, t, x) => `<empty>${t} ${x}</empty>`;
+const calls = [], toasts = [], errors = []; let renders = 0, netOk = true, hold = false, release = null;
+const RESP = %RESP%;
+const renderCurrent = () => { renders++; };
+const jsonBody = (method, payload) => ({ method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+const toast = (o) => toasts.push(o); const toastError = (t, e) => errors.push([t, e.message]);
+const netGuard = async () => netOk;
+const api = (url, opts) => {
+  const method = (opts && opts.method) || "GET";
+  calls.push({ url, method, body: opts && opts.body ? JSON.parse(opts.body) : null });
+  const answer = () => { const r = RESP[method + " " + url]; if (r && r.__error) throw new Error(r.__error); return r === undefined ? {} : r; };
+  if (hold && method !== "GET") { hold = false; return new Promise((res, rej) => { release = () => { try { res(answer()); } catch (e) { rej(e); } }; }); }
+  return Promise.resolve().then(answer);
+};
+// Faux DOM : $$("[data-x-y]") rend un element par balise portant cet attribut, avec son dataset et ses gestionnaires.
+const __els = {};
+const $$ = (sel) => {
+  if (__els[sel]) return __els[sel];
+  const attr = sel.slice(1, -1), key = attr.slice(5).replace(/-(\\w)/g, (m, c) => c.toUpperCase());
+  const re = new RegExp("<(\\\\w+)([^>]*?) " + attr + "(?:=\\"([^\\"]*)\\")?([^>]*)>", "g");
+  const found = []; let m;
+  while ((m = re.exec(globalThis.__html))) found.push({ tag: m[1], dataset: { [key]: m[3] === undefined ? "" : m[3] }, value: "", onclick: null, onchange: null });
+  return (__els[sel] = found);
+};
+const $ = (sel) => $$(sel)[0] || null;
+"""
+
+_REP_ACC = "acc_a"
+_REP_UNIT = {"video_id": "vid00000001", "clip_id": "01", "clip_ids": ["01"], "channel": "ma_chaine", "score": 80.0,
+             "parts_total": 1, "screen_title": "Pool un", "title": "t", "validated": True,
+             "thumbnail_url": "/media/clip/vid00000001/01/thumbnail"}
+
+
+def _rep_pline(hhmm, clip, **extra):
+    base = {"slot_at": f"{_REP_DAY}T{hhmm}:00+02:00", "publish_at_paris": f"{_REP_DAY}T{hhmm}:00+02:00",
+            "video_id": "vid00000001", "clip_id": clip, "screen_title": f"Titre {clip}",
+            "thumbnail_url": f"/media/clip/vid00000001/{clip}/thumbnail", "score": 72.5, "bonus": 1.5,
+            "bonus_reason": "4 posts, médiane 12 000 vues, référence 7 500", "adjusted": 74.0,
+            "source_key": "jeu:foo", "game_name": "Foo", "source_from": "veille", "exploration": False,
+            "prime": False, "refusal": None, "warning": None}
+    base.update(extra)
+    return base
+
+
+def _rep_plan(lines=None, **top):
+    lines = lines if lines is not None else [_rep_pline("10:00", "01"), _rep_pline("19:00", "02", prime=True)]
+    plan = {"day": _REP_DAY, "status": "proposed", "enabled": True, "computed_by": "worker",
+            "computed_at": "2026-10-09T20:00:05+02:00", "validated_at": None, "created": [], "excluded": [],
+            "pool_size": 3, "notes": ["aucun relevé récent"],
+            "pool": [_REP_UNIT, {**_REP_UNIT, "clip_id": "09", "clip_ids": ["09"], "screen_title": "Pool neuf"}],
+            "accounts": [{"account": _REP_ACC, "label": "Compte A", "notes": ["1 créneau(x) sans clip : vivier insuffisant"],
+                          "slots": [{"slot_at": f"{_REP_DAY}T10:00:00+02:00", "prime": False},
+                                    {"slot_at": f"{_REP_DAY}T19:00:00+02:00", "prime": True},
+                                    {"slot_at": f"{_REP_DAY}T21:00:00+02:00", "prime": True}],
+                          "lines": lines}]}
+    plan.update(top)
+    return plan
+
+
+def _rep_js(expr, plan=None, responses=None, setup=""):
+    """Évalue publish.js sous node (bouchons ci-dessus) avec ``pubRep.data = plan`` puis ``expr``."""
+    source = (STATIC / "screens" / "publish.js").read_text(encoding="utf-8")
+    stubs = _REP_STUBS.replace("%RESP%", json.dumps(responses or {}))
+    script = (_JS_PRELUDE + stubs + source + f"\npubRep.data = {json.dumps(plan)}; pubRep.day = {json.dumps(_REP_DAY)};\n"
+              "globalThis.__html = ''; const __render = () => (globalThis.__html = repHtml());\n"
+              + setup + f"\n(async () => {{ const out = await ({expr}); console.log(JSON.stringify(out)); }})();")
+    return json.loads(_node_run(script))
+
+
+@_REP_NODE
+def test_plan_section_renders_one_row_per_slot_with_its_details():
+    html = _rep_js("repHtml()", _rep_plan(lines=[
+        _rep_pline("10:00", "01"),
+        _rep_pline("19:00", "02", prime=True, exploration=True, game_name=None, source_from="vod", source_key="vod:vid00000001"),
+    ]))
+
+    assert "Plan de demain" in html and "10 octobre" in html
+    assert html.count("data-rep-row") == 3                                  # 2 lignes + le créneau de 21:00 sans clip
+    assert "10:00" in html and "19:00" in html and "21:00" in html           # heure de Paris
+    assert "/media/clip/vid00000001/01/thumbnail" in html and "Titre 01" in html
+    assert "72,5" in html and "+1,5" in html and 'title="4 posts, médiane 12 000 vues, référence 7 500"' in html
+    assert "Foo" in html and "jeu inconnu : VOD" in html
+    assert html.count("exploration</span>") == 1 and html.count("soir</span>") == 1
+    assert "aucun clip disponible" in html and "Compte A" in html
+    assert "aucun relevé récent" in html and "vivier insuffisant" in html     # notes telles quelles
+    assert "proposé" in html
+
+
+@_REP_NODE
+def test_plan_section_shows_refusal_in_red_and_warning_in_orange():
+    html = _rep_js("repHtml()", _rep_plan(lines=[
+        _rep_pline("10:00", "01", refusal="créneau trop proche"),
+        _rep_pline("19:00", "02", warning="plus de 2 clips de la même source"),
+    ]))
+
+    assert re.search(r'class="[^"]*\bbad\b[^"]*"[^>]*>[^<]*créneau trop proche', html)
+    assert re.search(r'class="[^"]*\bwarn\b[^"]*"[^>]*>[^<]*plus de 2 clips de la même source', html)
+
+
+@_REP_NODE
+def test_plan_section_states_validated_error_disabled_and_absent():
+    validated = _rep_js("repHtml()", _rep_plan(status="validated", validated_at="2026-10-09T21:10:00+02:00"))
+    assert "validé le" in validated and "21:10" in validated
+    assert re.search(r"data-rep-validate[^>]*disabled", validated)
+    assert "data-rep-remove" not in validated and "data-rep-time" not in validated   # plus modifiable
+
+    failed = _rep_js("repHtml()", _rep_plan(status="error", accounts=[], error={"message": "grille impossible"}))
+    assert "erreur" in failed and "grille impossible" in failed and "data-rep-compute" in failed
+
+    off = _rep_js("repHtml()", _rep_plan(enabled=False))
+    assert "désactivé" in off and "data-rep-compute" not in off and "data-rep-validate" not in off
+
+    absent = _rep_js("repHtml()", {"day": _REP_DAY, "status": "absent", "enabled": True, "accounts": [], "pool": []})
+    assert "Aucun plan" in absent and "data-rep-compute" in absent
+    assert re.search(r"data-rep-validate[^>]*disabled", absent)
+
+    loading = _rep_js("repHtml()", None)
+    assert "Plan de demain" in loading
+
+
+@_REP_NODE
+def test_validate_button_needs_at_least_one_acceptable_line():
+    ok = _rep_js("repHtml()", _rep_plan(lines=[_rep_pline("10:00", "01", refusal="non"), _rep_pline("19:00", "02")]))
+    assert not re.search(r"data-rep-validate[^>]*disabled", ok)
+
+    refused = _rep_js("repHtml()", _rep_plan(lines=[_rep_pline("10:00", "01", refusal="non")]))
+    assert re.search(r"data-rep-validate[^>]*disabled", refused)
+
+    empty = _rep_js("repHtml()", _rep_plan(lines=[]))
+    assert re.search(r"data-rep-validate[^>]*disabled", empty)
+
+
+@_REP_NODE
+def test_remove_button_puts_the_account_without_that_line():
+    answer = _rep_plan(lines=[_rep_pline("19:00", "02")])
+    calls = _rep_js("(async () => { __render(); repWire({}); $$('[data-rep-remove]')[0].onclick(); await pubRep.busyPromise; return calls; })()",
+                    _rep_plan(), {f"PUT /api/repartition/{_REP_DAY}": answer})
+
+    put = [c for c in calls if c["method"] == "PUT"]
+    assert len(put) == 1 and put[0]["url"] == f"/api/repartition/{_REP_DAY}"
+    assert put[0]["body"] == {"accounts": [{"account": _REP_ACC, "lines": [
+        {"slot_at": f"{_REP_DAY}T19:00:00+02:00", "video_id": "vid00000001", "clip_id": "02"}]}]}
+
+
+@_REP_NODE
+def test_change_hour_puts_the_new_paris_instant_and_change_clip_puts_the_pool_clip():
+    out = _rep_js("""(async () => {
+      __render(); repWire({});
+      const time = $$('[data-rep-time]')[1]; time.value = '2026-10-10T14:30'; time.onchange();
+      await pubRep.busyPromise;
+      const clip = $$('[data-rep-clip]')[0]; clip.value = 'vid00000001/09'; clip.onchange();
+      await pubRep.busyPromise;
+      return calls.filter((c) => c.method === 'PUT').map((c) => c.body.accounts[0].lines);
+    })()""", _rep_plan(), {f"PUT /api/repartition/{_REP_DAY}": _rep_plan()})
+
+    assert out[0] == [{"slot_at": f"{_REP_DAY}T10:00:00+02:00", "video_id": "vid00000001", "clip_id": "01"},
+                      {"slot_at": f"{_REP_DAY}T12:30:00.000Z", "video_id": "vid00000001", "clip_id": "02"}]  # 14:30 Paris, été
+    assert out[1][0] == {"slot_at": f"{_REP_DAY}T10:00:00+02:00", "video_id": "vid00000001", "clip_id": "09"}
+    assert out[1][1]["clip_id"] == "02"
+
+
+@_REP_NODE
+def test_a_slot_without_clip_offers_the_pool_and_puts_the_chosen_clip():
+    out = _rep_js("""(async () => {
+      __render(); repWire({});
+      const clip = $$('[data-rep-clip]')[2]; clip.value = 'vid00000001/09'; clip.onchange();
+      await pubRep.busyPromise;
+      return calls.filter((c) => c.method === 'PUT').map((c) => c.body.accounts[0].lines);
+    })()""", _rep_plan(), {f"PUT /api/repartition/{_REP_DAY}": _rep_plan()})
+
+    assert [x["clip_id"] for x in out[0]] == ["01", "02", "09"]
+    assert out[0][2]["slot_at"] == f"{_REP_DAY}T21:00:00+02:00"
+
+
+@_REP_NODE
+def test_recalculate_posts_compute_and_validate_posts_validate_then_toasts_the_count():
+    done = _rep_plan(status="validated", created=[{"account": _REP_ACC, "video_id": "v", "clip_id": "01"},
+                                                  {"account": _REP_ACC, "video_id": "v", "clip_id": "02"}])
+    out = _rep_js("""(async () => {
+      __render(); repWire({});
+      $$('[data-rep-compute]')[0].onclick(); await pubRep.busyPromise;
+      __render(); delete __els['[data-rep-validate]']; repWire({});
+      $$('[data-rep-validate]')[0].onclick(); await pubRep.busyPromise;
+      return { calls: calls.filter((c) => c.method !== 'GET'), toasts, errors, status: pubRep.data.status };
+    })()""", _rep_plan(), {"POST /api/repartition/compute": _rep_plan(),
+                           f"POST /api/repartition/{_REP_DAY}/validate": done})
+
+    assert [(c["method"], c["url"], c["body"]) for c in out["calls"]] == [
+        ("POST", "/api/repartition/compute", {"day": _REP_DAY}),
+        ("POST", f"/api/repartition/{_REP_DAY}/validate", None)]
+    assert [t["title"] for t in out["toasts"]] == ["2 publications créées"] and out["errors"] == []
+    assert out["status"] == "validated"
+
+
+@_REP_NODE
+def test_a_refused_validation_shows_the_error_and_keeps_the_plan():
+    out = _rep_js("""(async () => {
+      __render(); repWire({});
+      $$('[data-rep-validate]')[0].onclick(); await pubRep.busyPromise;
+      return { toasts, errors, status: pubRep.data.status };
+    })()""", _rep_plan(), {f"POST /api/repartition/{_REP_DAY}/validate": {"__error": "compte en pause"},
+                                         "GET /api/repartition": _rep_plan()})
+
+    assert out["toasts"] == [] and out["errors"][0][1] == "compte en pause" and out["status"] == "proposed"
+
+
+@_REP_NODE
+def test_each_request_shows_a_wait_state_on_the_disabled_buttons():
+    out = _rep_js("""(async () => {
+      __render(); repWire({});
+      hold = true;
+      $$('[data-rep-compute]')[0].onclick(); await new Promise((r) => setTimeout(r, 0));
+      const during = repHtml();
+      release(); await pubRep.busyPromise;
+      return { during, after: repHtml() };
+    })()""", _rep_plan(), {"POST /api/repartition/compute": _rep_plan()})
+
+    assert re.search(r"data-rep-compute[^>]*disabled[^>]*>[^<]*Calcul en cours", out["during"])
+    assert re.search(r"data-rep-validate[^>]*disabled", out["during"])
+    assert "Calcul en cours" not in out["after"] and "Recalculer" in out["after"]
+    assert not re.search(r"data-rep-compute[^>]*disabled", out["after"])
+
+
+@_REP_NODE
+def test_validate_waits_with_its_own_label_and_respects_the_network_guard():
+    out = _rep_js("""(async () => {
+      __render(); repWire({});
+      hold = true;
+      $$('[data-rep-validate]')[0].onclick(); await new Promise((r) => setTimeout(r, 0));
+      const during = repHtml();
+      release(); await pubRep.busyPromise;
+      netOk = false; calls.length = 0;
+      $$('[data-rep-validate]')[0].onclick(); await pubRep.busyPromise;
+      return { during, blocked: calls.filter((c) => c.method !== 'GET') };
+    })()""", _rep_plan(), {f"POST /api/repartition/{_REP_DAY}/validate": _rep_plan(status="proposed")})
+
+    assert re.search(r"data-rep-validate[^>]*disabled[^>]*>[^<]*Validation en cours", out["during"])
+    assert out["blocked"] == []
+
+
+@_REP_NODE
+def test_a_repartition_event_reloads_the_plan_and_the_section_sits_above_the_waiting_list():
+    out = _rep_js("""(async () => {
+      for (const fn of globalThis.__handlers['clipper:event']) fn({ detail: { kind: 'repartition' } });
+      await pubRep.loading;
+      return calls.filter((c) => c.url.startsWith('/api/repartition')).map((c) => c.url);
+    })()""", None, {"GET /api/repartition": _rep_plan()}, setup="pubRep.at = 0;")
+    assert out and out[0].startswith("/api/repartition")
+
+    source = (STATIC / "screens" / "publish.js").read_text(encoding="utf-8")
+    view = source[source.index("function pubView("):]
+    assert view.index("repHtml()") < view.index("pubPostsSection()")
+
+
+def test_plan_section_computes_no_rule_in_the_page():
+    source = (STATIC / "screens" / "publish.js").read_text(encoding="utf-8")
+    start = source.index("/* ---------- Plan de demain")
+    block = source[start:source.index("/* ---------- fin Plan de demain", start)]
+
+    for rule in ("max_per_source", "posts_per_day", "exploration_per_day", "bonus_points", "max_posts_per_day",
+                 "min_gap_minutes", "default_grid", "prime_start", "adjusted +", "score +", "bonus *"):
+        assert rule not in block, rule
