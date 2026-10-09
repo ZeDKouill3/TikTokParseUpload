@@ -261,33 +261,38 @@ motivé.
 
 ## La console en images
 
-Chaque capture existe en thème sombre et clair (GitHub choisit selon ton
-thème). Toutes montrent des données de démonstration neutres : un style
-`ma_chaine`, un compte `mon_compte`, des titres inventés.
+Captures en thème clair de la vraie console (`python -m clipper serve`), prises
+en lecture seule. Le dépôt est public : les vignettes, jaquettes, miniatures,
+titres de VOD et noms de chaînes tiers sont floutés, et l'écran Comptes
+(adresses e-mail) n'est pas montré. Les animations plus bas viennent de
+données de démonstration neutres.
 
 ### Tableau de bord
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/tableau-de-bord-dark.webp">
-  <img src="docs/assets/readme/tableau-de-bord-light.webp" alt="Tableau de bord : vidéo en cours, worker actif, clips à valider et prochaines publications" width="100%">
-</picture>
+<img src="docs/assets/readme/tableau-de-bord-light.webp" alt="Tableau de bord : vidéo en cours, worker actif, clips à valider et prochaines publications" width="100%">
 
 Ce qui tourne, ce qui attend, ce qui demande ta décision : vidéos en cours,
 file, échecs à relancer, clips à valider, prochaines publications, état du
 worker, coût LLM et alerte « posts à 0 vue » (voir
 [Apprentissage](#apprentissage-du-jury)).
 
+### Veille
+
+<img src="docs/assets/readme/veille-light.webp" alt="Veille : état des sources du relevé du jour, jeux qui montent, VOD proposées et prochain relevé" width="100%">
+
+<img src="docs/assets/readme/veille-selection-light.webp" alt="Veille : sélection du jour (meilleurs clips, vignettes floutées) et tableau Ce qui monte" width="100%">
+
+Le relevé du jour (une pastille par source, avec ses comptes d'éléments
+demandés, trouvés et écartés), les VOD que Claude propose de clipper (envoi
+ou « Ignorer » en un clic), la sélection des meilleurs clips du jour et le
+tableau des jeux qui montent. Détail dans
+[Veille des sujets chauds](#veille-des-sujets-chauds).
+
 ### Vidéos : liste et fiche
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/videos-dark.webp">
-  <img src="docs/assets/readme/videos-light.webp" alt="Liste des vidéos avec leur statut et leur frise d'étapes" width="100%">
-</picture>
+<img src="docs/assets/readme/videos-light.webp" alt="Liste des vidéos avec leur statut et leur frise d'étapes" width="100%">
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/video-fiche-dark.webp">
-  <img src="docs/assets/readme/video-fiche-light.webp" alt="Fiche d'une vidéo en cours : frise des étapes avec un trait animé, détail de l'étape et journal en direct" width="100%">
-</picture>
+<img src="docs/assets/readme/video-fiche-light.webp" alt="Fiche d'une vidéo en cours : frise des étapes avec un trait animé, détail de l'étape et journal en direct" width="100%">
 
 La liste se filtre par style, statut et texte ; une vidéo s'ajoute par URL. La
 fiche montre la frise des étapes, la progression et le temps restant de
@@ -296,10 +301,7 @@ relance depuis là.
 
 ### Radar du jury
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/radar-jury-dark.webp">
-  <img src="docs/assets/readme/radar-jury-light.webp" alt="Radar du jury : notes des juges par critère pour un moment, avant et après débat" width="100%">
-</picture>
+<img src="docs/assets/readme/radar-jury-light.webp" alt="Radar du jury : notes des juges par critère pour un moment, avant et après débat" width="100%">
 
 Pour chaque moment retenu ou écarté, un radar superpose la note de chaque juge
 sur les critères de la grille ; un trait pâle signale un juge peu sûr de lui,
@@ -307,10 +309,7 @@ et « Avant débat / Après débat » montre l'effet de la discussion.
 
 ### Clips
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/clips-dark.webp">
-  <img src="docs/assets/readme/clips-light.webp" alt="Galerie des clips verticaux avec leur statut : publié, planifié, échec, refusé, à valider" width="100%">
-</picture>
+<img src="docs/assets/readme/clips-light.webp" alt="Galerie des clips verticaux avec leur statut : publié, planifié, échec, refusé, à valider" width="100%">
 
 La galerie 9:16 regroupe les clips par statut ; le tiroir d'un clip permet
 d'éditer description, hashtags et titre d'écran, d'approuver, de refuser ou
@@ -320,12 +319,11 @@ créneau, lien du post) et relevés TikTok du post. Une donnée absente s'affich
 « inconnu », jamais 0. Un clip publié dont la vidéo a été supprimée garde sa
 fiche et ses statistiques.
 
+<img src="docs/assets/readme/clip-fiche-light.webp" alt="Fiche d'un clip publié : vidéo, titre d'écran, score et critères, passage dans la VOD, qualité (vignette et textes floutés)" width="100%">
+
 ### Publication
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/publication-dark.webp">
-  <img src="docs/assets/readme/publication-light.webp" alt="Publication : liste des publications en cours et calendrier hebdomadaire des créneaux du compte" width="100%">
-</picture>
+<img src="docs/assets/readme/publication-light.webp" alt="Publication : liste des publications en cours et calendrier hebdomadaire des créneaux du compte" width="100%">
 
 À gauche, « Nouvelle publication » et les publications en cours ; à droite,
 le calendrier de la semaine avec les créneaux du compte. Un clip se publie
@@ -333,25 +331,20 @@ maintenant ou à une date, sans créneau obligatoire.
 
 ### Statistiques
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/stats-ensemble-dark.webp">
-  <img src="docs/assets/readme/stats-ensemble-light.webp" alt="Statistiques TikTok : tuiles et courbe des vues sur 28 jours" width="100%">
-</picture>
+<img src="docs/assets/readme/stats-ensemble-light.webp" alt="Statistiques TikTok : tuiles et courbe des vues sur 28 jours" width="100%">
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/stats-video-dark.webp">
-  <img src="docs/assets/readme/stats-video-light.webp" alt="Fiche d'une vidéo TikTok : vues, temps de visionnage, partages et courbe de rétention" width="100%">
-</picture>
+<img src="docs/assets/readme/stats-video-light.webp" alt="Fiche d'une vidéo TikTok : vues, temps de visionnage, partages et courbe de rétention" width="100%">
 
 Les chiffres relevés sur TikTok Studio, compte par compte (détail dans
 [Statistiques TikTok](#statistiques-tiktok)), et la fiche d'une vidéo.
 
-### Comptes
+<img src="docs/assets/readme/stats-retention-light.webp" alt="Statistiques : poids par juge et bloc Rétention à maturité, avec le message « n = 0, trop peu pour conclure (minimum 30) »" width="100%">
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/comptes-dark.webp">
-  <img src="docs/assets/readme/comptes-light.webp" alt="Écran Comptes : compte TikTok connecté, mot de passe masqué rangé dans le coffre de l'OS" width="100%">
-</picture>
+Le bloc « Rétention à maturité » liste la part vue de chaque clip mûr, sans
+corrélation calculée : sous le minimum de clips (`[learning] retention_min_n`),
+il le dit au lieu de conclure (voir [Apprentissage du jury](#apprentissage-du-jury)).
+
+### Comptes
 
 Le carnet des comptes : mot de passe dans le coffre de l'OS (affiché à la
 demande seulement), état de connexion lu dans les cookies du profil, case
@@ -555,14 +548,16 @@ sauté par défaut (`skipif`), jamais lancé en CI. Exemples : candidats d'actio
 (`CLIPPER_ACTION_REAL=1`, quota Claude consommé), installeur portable
 (`CLIPPER_INSTALLER_REAL=1`, ~700 Mo téléchargés) ; voir `AGENTS.md`.
 
-**Régénérer les captures et animations.** Les images de `docs/assets/readme/`
-viennent d'un script reproductible,
+**Régénérer les animations.** Les trois GIF de `docs/assets/readme/` viennent
+d'un script reproductible,
 [`tools/readme_shots/capture.py`](tools/readme_shots/capture.py) : il crée un
 espace de démonstration **temporaire** (données factices, vignettes de
 synthèse ffmpeg), lance `clipper serve` dessus, capture la console avec
-Playwright (Chromium headless, 1440×900, thèmes sombre et clair), assemble les
-GIF puis supprime tout. Il ne lit ni n'écrit jamais le vrai `workspace/`,
-`output/` ni `state/`.
+Playwright (Chromium headless, 1440×900), assemble les GIF puis supprime tout.
+Il ne lit ni n'écrit jamais le vrai `workspace/`, `output/` ni `state/`. Les
+captures `*-light.webp` de « La console en images » sont prises à la main sur
+la vraie console (thème clair, lecture seule), avec vignettes, titres et noms
+tiers floutés avant publication.
 
 ```powershell
 python -m playwright install chromium

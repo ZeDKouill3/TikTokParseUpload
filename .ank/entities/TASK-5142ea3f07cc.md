@@ -5,7 +5,7 @@ slug: readme-captures-refaites-en-th-me-clair-vignette
 title: "README : captures refaites en thème clair, vignettes et noms tiers floutés, nouveaux écrans (veille, fiche clip, rétention)"
 created: 2026-10-09T11:59:54Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - README.md
   - docs/assets/readme/**
@@ -19,6 +19,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/d10be6c413fc@6782ffa
+    tree: scope/c41a2c49bb3c
+    criteria: 0e39f533e4db
+    verifier: tests@c7b454d16c90
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---

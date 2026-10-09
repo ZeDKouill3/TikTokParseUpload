@@ -29,6 +29,7 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ### Modifié
 
+- README : captures refaites en thème clair sur la vraie console (plus de variante sombre ni de `<picture>`), vignettes, titres de VOD et noms tiers floutés ; nouveaux écrans Veille, fiche clip et bloc « Rétention à maturité » ; l'écran Comptes n'est plus montré (e-mails) ; `tests/test_readme_assets.py` n'exige plus de variantes sombres.
 - README refondu (même style, plus court) : à jour du code réel (13 étapes dont `action`, styles et formats gaming, jury et apprentissage, veille, YouTube Shorts, installeur portable) ; captures existantes gardées.
 - Veille : `extract_video_id` et `DownloadError` vivent dans `clipper/workspace.py` (module sans étape) ; `clipper/download.py` les réexporte, et la veille n'importe plus l'étape download (ADR-ca9a).
 - Web : la documentation des défauts du formulaire des styles vient de `clipper.config` (`_defaults_documentation`) ; `clipper/web` n'importe plus dynamiquement de module d'étape, et le test de garde ADR-49cd signale tout import dynamique, `getattr` ou `sys.modules` visant une étape (ADR-49cd).
