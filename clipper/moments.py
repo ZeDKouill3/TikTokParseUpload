@@ -833,6 +833,14 @@ def _first_real_word(
     return None
 
 
+def _window_words(sent: Sentence, start: float, end: float, word_max_chars: int) -> list[tuple[float, str]]:
+    """Mots horodates de ``sent`` compris dans [start, end[ (mots geants exclus)."""
+    return [
+        (t, w) for t, w in sent.words
+        if w.strip() and len(w.strip()) <= word_max_chars and start - 1e-6 <= t < end - 1e-6
+    ]
+
+
 def _action_candidate(
     p: dict[str, Any], sents: list[Sentence], rubric: dict[str, Any], excluded: list[dict[str, Any]],
     connectors: Connectors, snap: float, word_max_chars: int = 40, max_silent_start: float = 5,
@@ -894,11 +902,29 @@ def _action_candidate(
                     return reject(f"premiere phrase reduite au connecteur {cut}")
                 start, hook_text = head.words[k][0], "".join(w for _, w in head.words[k:]).strip()
                 cut = f" apres retrait du connecteur {cut}"
-        speech = " ".join([hook_text, *(sents[k].text for k in included[1:])])
-    elif p["frames"]:
-        hook_text = max(p["frames"], key=lambda f: (f["intensity"], -f["timecode"]))["description"]
+        # parole : phrases incluses (texte entier, la premiere sans ses connecteurs de tete)
+        # et, pour celles qui debordent, seulement leurs mots compris dans le passage
+        parts_text = []
+        for k in overlapping:
+            if k == included[0]:
+                parts_text.append(hook_text)
+            elif k in included:
+                parts_text.append(sents[k].text)
+            else:
+                parts_text.append("".join(w for _, w in _window_words(sents[k], start, end, word_max_chars)).strip())
+        speech = " ".join(t for t in parts_text if t)
     else:
-        return reject("passage sans parole ni image decrite : pas d'accroche possible")
+        # aucune phrase entierement incluse : les mots horodates compris dans le
+        # passage (phrase debordante) donnent la parole et l'accroche
+        pieces = [_window_words(sents[k], start, end, word_max_chars) for k in overlapping]
+        pieces = [w for w in pieces if w]
+        if pieces:
+            hook_text = "".join(w for _, w in pieces[0]).strip()
+            speech = " ".join("".join(w for _, w in piece).strip() for piece in pieces)
+    if not hook_text:
+        if not p["frames"]:
+            return reject("passage sans parole ni image decrite : pas d'accroche possible")
+        hook_text = max(p["frames"], key=lambda f: (f["intensity"], -f["timecode"]))["description"]
 
     reason = _bounds_rejection(start, end, "single", rubric, excluded, cut)
     if reason is not None:

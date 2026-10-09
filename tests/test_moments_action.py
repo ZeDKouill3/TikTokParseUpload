@@ -627,4 +627,54 @@ def test_a_sentence_begun_inside_the_passage_and_ending_after_it_alone_is_accept
 
     [m] = read_moments(video_dir)["moments"]
     assert m["source"] == "action"
-    assert m["hook_text"] == "un tir"
+    assert m["hook_text"] == "tail20_0 tail20_1 tail20_2 tail20_3 tail20_4 tail20_5 tail20_6"  # plus l'image
+
+
+def overflow(video_dir, *, with_words=True, giant=False):
+    """Phrase 8.5-40 s (mots toutes les secondes) qui deborde un passage 5-30 s."""
+    t = make_transcript()
+    t["segments"] = [s for s in t["segments"] if not 3 <= s["words"][0]["start"] < 30]
+    words = [{"word": f" ov{i}", "start": 8.5 + i, "end": 9.3 + i, "probability": 0.9} for i in range(32)]
+    if giant:
+        words[1]["word"] = " " + "x" * 60
+    text = "".join(w["word"] for w in words) if with_words else " ov0 ov1 ov2 ov3."
+    t["segments"].append({"id": 90, "start": 8.5, "end": 40.0, "text": text, "words": words if with_words else []})
+    t["segments"].sort(key=lambda s: s["start"])
+    (video_dir / "transcript.json").write_text(json.dumps(t), encoding="utf-8")
+
+
+def test_an_overflowing_sentence_gives_its_words_inside_the_passage_as_speech_and_hook(tmp_path, video_dir, rubric_path):
+    overflow(video_dir)
+    write_action(video_dir, passage(5.0, 30.0, speech_ratio=0.5, frames=[frame(10.0, "image decrite", "combat", 7)]))
+
+    fake = go(tmp_path, rubric_path, [{"moments": []}, rate(GOOD)])
+
+    [m] = read_moments(video_dir)["moments"]
+    assert m["hook_text"] == "ov0 ov1 ov2 ov3 ov4 ov5 ov6 ov7 ov8 ov9 ov10 ov11 ov12 ov13 ov14 ov15 ov16 ov17 ov18 ov19 ov20 ov21"
+    prompts = "\n".join(c.prompt for c in fake.calls)
+    assert 'Parole : "ov0 ov1 ov2 ov3 ov4 ov5 ov6 ov7 ov8 ov9 ov10 ov11 ov12 ov13 ov14 ov15 ov16 ov17 ov18 ov19 ov20 ov21"' in prompts
+    assert [l for l in prompts.splitlines() if l.startswith("Parole")] == [
+        'Parole : "' + " ".join(f"ov{i}" for i in range(22)) + '"'
+    ]
+
+
+def test_giant_words_are_left_out_of_the_overflowing_speech(tmp_path, video_dir, rubric_path):
+    overflow(video_dir, giant=True)
+    write_action(video_dir, passage(5.0, 30.0, speech_ratio=0.5))
+
+    go(tmp_path, rubric_path, [{"moments": []}, rate(GOOD)])
+
+    [m] = read_moments(video_dir)["moments"]
+    assert m["hook_text"] == "ov0 ov2 ov3 ov4 ov5 ov6 ov7 ov8 ov9 ov10 ov11 ov12 ov13 ov14 ov15 ov16 ov17 ov18 ov19 ov20 ov21"
+
+
+def test_an_overflowing_sentence_without_word_timing_gives_no_text_and_keeps_the_image_hook(
+    tmp_path, video_dir, rubric_path
+):
+    overflow(video_dir, with_words=False)
+    write_action(video_dir, passage(5.0, 30.0, speech_ratio=0.5, frames=[frame(10.0, "image decrite", "combat", 7)]))
+
+    go(tmp_path, rubric_path, [{"moments": []}, rate(GOOD)])
+
+    [m] = read_moments(video_dir)["moments"]
+    assert m["hook_text"] == "image decrite"
