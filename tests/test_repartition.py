@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import json
 import logging
+import re
 import tomllib
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -802,3 +803,105 @@ def test_unreadable_veille_day_file_is_noted_and_the_vod_stays_vod(tmp_path):
     line = _line_for(plan, "a", "vU")
     assert (line["source_key"], line["game_name"], line["source_from"]) == ("vod:vU", None, "vod")
     assert any("2026-10-08.json" in n for n in plan["notes"])
+
+
+# ---------------------------------------------------------------- API publique (écran et routes web)
+
+
+def _line(video, clip, source_key, slot, *, exploration=False, prime=False) -> dict:
+    return {"video_id": video, "clip_id": clip, "source_key": source_key, "slot_at": slot,
+            "exploration": exploration, "prime": prime, "warning": "non calculé"}
+
+
+def test_public_read_settings_is_the_validated_section(tmp_path):
+    assert repartition.read_settings(_config(tmp_path, posts_per_day=4))["posts_per_day"] == 4
+    assert repartition.read_settings(None) == repartition.CONFIG_DEFAULTS
+
+
+def test_public_read_settings_refuses_an_out_of_domain_value(tmp_path):
+    with pytest.raises(repartition.RepartitionError):
+        repartition.read_settings(_config(tmp_path, prime_end="17:00"))
+
+
+def test_public_source_bonus_is_the_median_ratio_with_its_reason():
+    settings = repartition.read_settings(None)
+
+    bonus, reason = repartition.source_bonus("jeu:fort", {"jeu:fort": [200, 200]}, [200, 200, 100, 100], settings)
+
+    assert (bonus, reason) == (1.67, "2 posts, médiane 200 vues, référence 150")
+
+
+def test_public_source_bonus_without_posts_is_zero_and_says_why():
+    assert repartition.source_bonus("jeu:x", {}, [], repartition.read_settings(None)) == (0, "no_stats")
+
+
+def test_public_describe_line_gives_the_line_as_the_plan_writes_it(tmp_path):
+    config = _config(tmp_path)
+    _clip(config, "V1", "01", game="Fort", exploration=True)
+    world = repartition.World(config)
+
+    line = repartition.describe_line(
+        world, repartition.read_settings(config), ({}, []), video_id="V1", clip_id="01",
+        slot_at=datetime(2026, 10, 10, 20, 0, tzinfo=PARIS), score=80)
+
+    assert line == {
+        "slot_at": "2026-10-10T20:00:00+02:00", "video_id": "V1", "clip_id": "01", "score": 80, "bonus": 0,
+        "bonus_reason": "no_stats", "adjusted": 80, "source_key": "jeu:fort", "game_name": "Fort",
+        "source_from": "meta", "exploration": True, "prime": True, "warning": None}
+
+
+def test_public_describe_line_without_a_numeric_score_has_no_adjusted_value(tmp_path):
+    config = _config(tmp_path)
+    _clip(config, "V1", "01", game="Fort")
+
+    line = repartition.describe_line(
+        repartition.World(config), repartition.read_settings(config), ({}, []), video_id="V1", clip_id="01",
+        slot_at=datetime(2026, 10, 10, 9, 0, tzinfo=PARIS), score=True)
+
+    assert (line["score"], line["adjusted"], line["prime"], line["exploration"]) == (None, None, False, False)
+
+
+def test_public_line_warnings_flags_the_clip_over_the_source_cap(tmp_path):
+    config = _config(tmp_path, max_per_source=1)
+    first = _line("V1", "01", "jeu:fort", "2026-10-10T09:00:00+02:00")
+    second = _line("V1", "02", "jeu:fort", "2026-10-10T10:00:00+02:00")
+    plan = {"accounts": [{"account": "a", "lines": [first, second]}]}
+
+    repartition.line_warnings(plan, DAY.isoformat(), repartition.read_settings(config), repartition.World(config), [])
+
+    assert first["warning"] is None
+    assert second["warning"] == "plus de 1 clips de la même source (jeu:fort) ce jour-là sur ce compte"
+
+
+def test_public_line_warnings_counts_the_posts_already_scheduled(tmp_path):
+    config = _config(tmp_path, max_per_source=1)
+    _clip(config, "V0", "01", game="Fort")
+    first = _line("V1", "01", "jeu:fort", "2026-10-10T09:00:00+02:00")
+    plan = {"accounts": [{"account": "a", "lines": [first]}]}
+    entries = [("_sans_chaine", {"video_id": "V0", "clip_id": "01", "account": "a", "status": "scheduled",
+                                 "slot_at": "2026-10-10T08:00:00+02:00"})]
+
+    repartition.line_warnings(plan, DAY.isoformat(), repartition.read_settings(config),
+                              repartition.World(config), entries)
+
+    assert first["warning"] == "plus de 1 clips de la même source (jeu:fort) ce jour-là sur ce compte"
+
+
+def test_public_line_warnings_flags_exploration_over_the_day_and_on_prime(tmp_path):
+    config = _config(tmp_path, exploration_per_day=1)
+    first = _line("V1", "01", "vod:V1", "2026-10-10T09:00:00+02:00", exploration=True)
+    second = _line("V2", "01", "vod:V2", "2026-10-10T20:00:00+02:00", exploration=True, prime=True)
+    plan = {"accounts": [{"account": "a", "lines": [first, second]}]}
+
+    repartition.line_warnings(plan, DAY.isoformat(), repartition.read_settings(config),
+                              repartition.World(config), [])
+
+    assert first["warning"] is None
+    assert second["warning"] == ("plus de 1 clip(s) d'exploration par jour; "
+                                 "clip d'exploration sur un créneau du soir")
+
+
+def test_web_routes_call_only_public_repartition_functions():
+    text = (REPO_ROOT / "clipper" / "web" / "app.py").read_text(encoding="utf-8")
+
+    assert not re.search(r"repartition_mod\._", text)

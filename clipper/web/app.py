@@ -3358,49 +3358,21 @@ def create_app(config: Config | None = None) -> FastAPI:
         _validate_clip_id(line.clip_id)
         slot = _publish_parse_slot(line.slot_at).astimezone(_PARIS)
         sidecar = _read_clip_sidecar(config, line.video_id, line.clip_id)
-        source = world.source(line.video_id)
-        bonus, reason = repartition_mod._bonus(source["source_key"], *stats, settings)
-        score = sidecar.get("score")
-        score = score if isinstance(score, (int, float)) and not isinstance(score, bool) else None
-        return {"slot_at": slot.isoformat(), "video_id": line.video_id, "clip_id": line.clip_id, "score": score,
-                "bonus": bonus, "bonus_reason": reason, "adjusted": None if score is None else round(score + bonus, 2),
-                **source, "exploration": world.exploration(line.video_id, line.clip_id, []),
-                "prime": repartition_mod._is_prime(slot, settings), "warning": None}
+        return repartition_mod.describe_line(world, settings, stats, video_id=line.video_id, clip_id=line.clip_id,
+                                             slot_at=slot, score=sidecar.get("score"))
 
     def _rep_warnings(plan: dict[str, Any], day: str, settings: dict[str, Any], world: Any) -> None:
         """``warning`` de chaque ligne (c'est le choix de l'utilisateur, jamais un refus) : plus de ``max_per_source``
         clips d'une même source par compte et par jour, publications déjà prévues comprises (R3) ; plus de
         ``exploration_per_day`` clips d'exploration par jour, ou un clip d'exploration le soir (R6)."""
-        target = date.fromisoformat(day)
-        counts: dict[tuple[str, str], int] = {}
-        for _channel, entry in _rep_call(publish_mod.all_entries, state_dir=_publish_dir(config), presets_dir=_PRESETS_DIR):
-            when = repartition_mod._entry_time(entry)
-            if when is not None and repartition_mod._paris(when).date() == target and entry.get("account"):
-                key = (entry["account"], world.source(entry["video_id"])["source_key"])
-                counts[key] = counts.get(key, 0) + 1
-        every = sorted(((line, account["account"]) for account in plan["accounts"] for line in account["lines"]),
-                       key=lambda found: datetime.fromisoformat(found[0]["slot_at"]))
-        explorations = 0
-        for line, account_id in every:
-            notes = []
-            key = (account_id, line["source_key"])
-            counts[key] = counts.get(key, 0) + 1
-            if counts[key] > int(settings["max_per_source"]):
-                notes.append(f"plus de {settings['max_per_source']} clips de la même source ({line['source_key']}) "
-                             "ce jour-là sur ce compte")
-            if line["exploration"]:
-                explorations += 1
-                if explorations > int(settings["exploration_per_day"]):
-                    notes.append(f"plus de {settings['exploration_per_day']} clip(s) d'exploration par jour")
-                if line["prime"]:
-                    notes.append("clip d'exploration sur un créneau du soir")
-            line["warning"] = "; ".join(notes) or None
+        entries = _rep_call(publish_mod.all_entries, state_dir=_publish_dir(config), presets_dir=_PRESETS_DIR)
+        repartition_mod.line_warnings(plan, day, settings, world, entries)
 
     @app.put("/api/repartition/{day}")
     def put_repartition(day: str, body: RepartitionPutBody) -> dict[str, Any]:
         day = _rep_day(day)
         path = _rep_call(repartition_mod.plan_path, day, config)
-        settings = _rep_call(repartition_mod._settings, config)
+        settings = _rep_call(repartition_mod.read_settings, config)
         with channel_mod.file_lock(path):
             plan = _rep_editable(day, "il n'est plus modifiable")
             by_id = {account["account"]: account for account in plan["accounts"]}
@@ -3420,10 +3392,10 @@ def create_app(config: Config | None = None) -> FastAPI:
                         raise HTTPException(status_code=422, detail=f"clip présent deux fois dans le plan : "
                                             f"{line.video_id}/{line.clip_id}")
                     taken.add((line.video_id, line.clip_id))
-            world = repartition_mod._World(config)
+            world = repartition_mod.World(config)
             active = [a for a in _accounts_call(accounts_mod.list_accounts, config)
                       if a["service"] == "tiktok" and a["ready_to_publish"] and not a.get("paused_at")]
-            stats = _rep_call(repartition_mod._stats_by_source, world, active, datetime.now(_PARIS), settings)
+            stats = _rep_call(repartition_mod.source_stats, world, active, datetime.now(_PARIS), settings)
             for account in body.accounts:
                 by_id[account.account]["lines"] = sorted(
                     (_rep_new_line(line, settings, world, stats) for line in account.lines),
