@@ -641,15 +641,51 @@ def test_pct_watched_is_null_when_a_part_is_missing(tmp_path, avg_watch_s, durat
     assert _stats_entry(config)["pct_watched"] is None
 
 
-def test_moment_source_is_null_when_the_moment_does_not_say(tmp_path):
+@pytest.mark.parametrize("moments, expected", [
+    ([{"id": 3}], "transcript"),  # sans champ source : moments.json n'écrit ce champ qu'en transcript+action
+    ([{"id": 3, "source": "transcript"}], "transcript"),
+    ([{"id": 3, "source": "action"}], "action"),
+    ([{"id": 3, "source": "xyz"}], None),  # valeur inconnue : jamais devinée
+    ([{"id": 4, "source": "action"}], None),  # id du clip absent de moments.json
+], ids=["sans-source", "transcript", "action", "source-inconnue", "id-absent"])
+def test_moment_source_is_read_from_the_moment(tmp_path, moments, expected):
+    config = _config(tmp_path)
+    _linked_clip(config, "03")
+    _sidecar_fields(config, "03", duration=24.47)
+    _moments(config, VIDEO, moments)
+    _scored_account(config, avg_watch_s=13.38)
+
+    learning.sync(NOW, config=config)
+
+    assert _stats_entry(config)["moment_source"] == expected
+
+
+def test_moment_source_is_null_when_moments_json_is_absent(tmp_path):
+    config = _config(tmp_path)
+    _linked_clip(config, "03")
+    _sidecar_fields(config, "03", duration=24.47)
+    _scored_account(config, avg_watch_s=13.38)
+
+    learning.sync(NOW, config=config)
+
+    assert _stats_entry(config)["moment_source"] is None
+
+
+def test_sync_does_not_rewrite_stats_entries_already_in_the_journal(tmp_path):
     config = _config(tmp_path)
     _linked_clip(config, "03")
     _sidecar_fields(config, "03", duration=24.47)
     _moments(config, VIDEO, [{"id": 3}])
     _scored_account(config, avg_watch_s=13.38)
+    outcomes._append({"kind": "stats", "recorded_at": NOW.isoformat(), "video_id": VIDEO, "clip_id": "03",
+                      "moment_id": 3, "post_id": POST, "duration": 24.47, "pct_watched": 0.547,
+                      "moment_source": None, "stats": {"views_percentile": 0.5, "watched_full": 0.1}},
+                     config.section("outcomes")["journal_path"])  # entrée déjà écrite avant la correction
+    before = [e for e in _journal(config) if e["kind"] == "stats"]
 
     learning.sync(NOW, config=config)
 
+    assert [e for e in _journal(config) if e["kind"] == "stats"] == before
     assert _stats_entry(config)["moment_source"] is None
 
 
