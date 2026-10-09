@@ -80,8 +80,11 @@ Liste régénérée depuis `ank find --type adr --status accepted` et `ank find 
 - **ADR-ad2e** — mode `review`/`auto` en config ; aucune valeur de secours
   silencieuse (légende générique, moments par défaut, backend dégradé) : un
   échec remonte, est journalisé, ou met la vidéo en attente.
-- **ADR-09ad** — interface web (`clipper/web/`) : page statique servie par
-  FastAPI, aucune logique de traitement vidéo/audio/LLM dedans.
+- **ADR-49cd** — interface web (`clipper/web/`) : page statique servie par
+  FastAPI, aucune logique de traitement vidéo/audio/LLM dedans ; seule
+  exception, une liste fermée de fonctions pures de validation de config des
+  étapes (`moments.resolve_rubric_path`, `reframe._settings`,
+  `render.check_cta_handle_gap`...). Succède à ADR-09ad.
 - **ADR-e1da** / **SPEC-38f7** — installeur portable Windows : zip
   d'amorçage (`uv.exe` + wheel + `installer/`) construit par
   `tools/build_portable.py` ; programme sous `%LOCALAPPDATA%\Clipper\app`
@@ -128,9 +131,12 @@ Liste régénérée depuis `ank find --type adr --status accepted` et `ank find 
   emoji ni superlatif par défaut. Succède à SPEC-6a47 (reprise à l'identique
   pour le reste : format letterbox par défaut, `.mp4` + `.json` sidecar,
   appel à l'abonnement désactivé par défaut).
-- **SPEC-76dc** — agencement stream `split` réglable : webcam en haut, jeu en
-  bas, badge de chaîne optionnel, style des sous-titres réglable. Succède à
-  SPEC-8257 (format stream par présence de la webcam).
+- **SPEC-5b9a** — webcam du stream trouvée par période (rectangles candidats
+  numérotés choisis par Claude, garde-fous locaux journalisés, recalage),
+  visage exigé par clip sans bords réels, `empty_webcam` bloquant en
+  `stream_split` ; reprend l'agencement `split` (webcam en haut, jeu en bas,
+  badge optionnel, sous-titres réglables). Succède à SPEC-4a9b (elle-même
+  successeur de SPEC-76dc).
 - **SPEC-4063** — grille de notation des moments v4 (plafond souple par heure
   avec plancher `min_moments_cap`). Succède à SPEC-53f3.
 - **SPEC-9216** — grille gaming embarquée (`builtin:gaming`), choisie par
@@ -175,9 +181,6 @@ Liste régénérée depuis `ank find --type adr --status accepted` et `ank find 
 
 ### SPEC proposée (pas encore `ank accept`)
 
-- **SPEC-4a9b** — proposée, pas encore `ank accept` : webcam du stream trouvée
-  par période, rectangles candidats numérotés choisis par Claude. Succède à
-  SPEC-76dc.
 - **SPEC-2a1e** — doublon vide créé par erreur (corps absent), à ne pas
   ratifier : la vraie spec est SPEC-0eec, remplacée par SPEC-4063.
 
