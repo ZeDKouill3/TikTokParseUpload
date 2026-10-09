@@ -455,6 +455,58 @@ sont ceux d'un **compte neuf** :
 | `max_posts_per_day` | 1 | 3 |
 | `min_gap_minutes` | 480 | 240 |
 
+### Plan de demain (répartition automatique)
+
+Chaque soir, à partir de `compute_time` (20:00, heure de Paris), Clipper prépare
+seul le plan des publications du **lendemain** pour chaque compte TikTok prêt et
+non en pause. Le plan se voit dans l'écran **Publication**, section **Plan de
+demain** (en haut, au-dessus de « En attente ») : une ligne par créneau, avec
+l'heure, la vignette, le titre d'écran, le score et son bonus (raison au survol),
+le jeu ou « jeu inconnu : regroupé par VOD », et les badges « soir » et
+« exploration ».
+
+- **Modifier** : « Changer le clip » (liste des clips disponibles), « Changer
+  l'heure », « Retirer ». Un refus (plafond, créneau déjà pris) s'affiche en
+  rouge ; une répétition de source ou une exploration en trop s'affiche en orange.
+- **Recalculer** remplace le plan proposé (les modifications faites à la main sont perdues).
+- **Valider le plan** crée une publication programmée par ligne, compte par
+  compte. Rien n'est créé ni envoyé sans ce clic : tant que le plan n'est pas
+  validé, il ne fait que proposer. Un compte en pause ou non prêt arrête la
+  validation avec un message explicite ; les comptes déjà créés restent créés.
+
+Le calcul ne retient que des clips prêts et jamais planifiés ; les séries en
+plusieurs parties ne passent pas par le plan (elles se programment à la main,
+« Programmer une série »). Le bonus d'une source vient des **vues réellement
+relevées**, jamais estimées : sans relevé récent, il est nul et le plan le dit.
+Un jeu inconnu : regroupé par VOD, le plafond par source s'applique alors à la
+vidéo source.
+
+Réglages `[repartition]` (défauts du code, `clipper/repartition.py`) :
+
+| Réglage | Défaut | Rôle |
+|---|---|---|
+| `enabled` | `true` | `false` : le worker ne calcule rien, l'écran le dit |
+| `state_dir` | `"state/repartition"` | un fichier `<AAAA-MM-JJ>.json` par jour planifié |
+| `compute_time` | `"20:00"` | heure de Paris à partir de laquelle le plan de demain est calculé |
+| `posts_per_day` | `6` | posts visés par compte et par jour, publications déjà prévues comprises |
+| `default_grid_start` | `"08:00"` | début de la grille par défaut d'un compte sans créneau fixe ce jour-là |
+| `default_grid_end` | `"22:00"` | dernière heure de la grille par défaut (incluse) |
+| `default_grid_gap_min` | `150` | écart minimal (minutes) entre deux posts d'un même compte |
+| `account_stagger_min` | `30` | décalage (minutes) entre comptes à même heure de grille |
+| `max_per_source` | `2` | clips d'une même source (jeu, sinon VOD) par compte et par jour |
+| `excluded_sources` | `[]` | streamers ou styles jamais planifiés |
+| `prime_start` | `"18:00"` | début des créneaux du soir |
+| `prime_end` | `"22:00"` | fin (incluse) des créneaux du soir |
+| `exploration_per_day` | `1` | clips d'exploration au plus par jour, tous comptes confondus |
+| `bonus_window_days` | `7` | fenêtre des posts relevés qui servent au bonus |
+| `bonus_min_posts` | `2` | posts relevés d'une source au moins pour qu'elle ait un bonus |
+| `bonus_points` | `5.0` | amplitude maximale du bonus, en points de score |
+
+Un réglage hors domaine (heure non `HH:MM`, `prime_end` avant `prime_start`,
+`bonus_points` négatif...) est refusé avec son nom : il n'est jamais corrigé en
+silence. Les plafonds `[tiktok] max_posts_per_day` et `min_gap_minutes` restent
+appliqués par-dessus.
+
 ## Statistiques TikTok
 
 L'écran **Statistiques** affiche ce que TikTok Studio montre pour chaque compte

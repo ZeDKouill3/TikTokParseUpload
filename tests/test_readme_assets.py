@@ -495,3 +495,71 @@ def test_demo_workspace_is_neutral_complete_and_written_only_under_its_folder(tm
                 assert token not in text, f"{token!r} dans {path.relative_to(root)}"
     accounts = json.loads((root / "state" / "accounts.json").read_text(encoding="utf-8"))["accounts"]
     assert all("password" not in a or a["password"] in (None, "") for a in accounts)
+
+
+# --------------------------------------------------------------------------
+# TASK-8c49973515c4 : README et CHANGELOG de la répartition automatique (SPEC-78dc R9-R10)
+# --------------------------------------------------------------------------
+
+CHANGELOG = ROOT / "CHANGELOG.md"
+
+
+def _repartition_section() -> str:
+    """Sous-section « Plan de demain » du README, jusqu'au titre suivant de même niveau ou plus haut."""
+    text = _readme_text()
+    start = text.index("### Plan de demain")
+    body = text.index("\n", start) + 1
+    following = re.search(r"^#{1,3}\s", text[body:], flags=re.MULTILINE)
+    return text[start:body + following.start()] if following else text[start:]
+
+
+def _unreleased_changelog() -> str:
+    text = CHANGELOG.read_text(encoding="utf-8")
+    start = text.index("## [Non publié]")
+    following = re.search(r"^## \[", text[start + 1:], flags=re.MULTILINE)
+    return text[start:start + 1 + following.start()] if following else text[start:]
+
+
+def test_readme_documents_the_plan_de_demain_section():
+    section = _repartition_section()
+    for needle in ("Plan de demain", "compute_time", "20:00", "Recalculer", "Valider le plan", "Publication"):
+        assert needle in section, f"« {needle} » absent de la section Plan de demain"
+
+
+def test_readme_plan_de_demain_says_nothing_is_sent_without_a_click():
+    section = _repartition_section()
+    assert re.search(r"rien\s+n'est\s+(créé|cr[ée]e|envoy)", section, flags=re.IGNORECASE), (
+        "la règle « rien ne part sans clic » manque")
+    assert "clic" in section
+
+
+def test_readme_plan_de_demain_states_the_unknown_game_rule():
+    assert "jeu inconnu : regroupé par VOD" in _repartition_section()
+
+
+def test_readme_repartition_defaults_match_config_defaults():
+    """Les défauts cités dans le README sont ceux du dict CONFIG_DEFAULTS de clipper/repartition.py."""
+    import json
+
+    repartition = _load_module_from_clipper("repartition")
+    rows = re.findall(r"^\|\s*`([a-z_]+)`\s*\|\s*`([^`]*)`\s*\|", _repartition_section(), flags=re.MULTILINE)
+    cited = {key: json.loads(default) for key, default in rows}
+    assert set(cited) == set(repartition.CONFIG_DEFAULTS), (
+        f"clés citées et clés réelles diffèrent : {sorted(set(cited) ^ set(repartition.CONFIG_DEFAULTS))}")
+    for key, default in cited.items():
+        assert default == repartition.CONFIG_DEFAULTS[key], f"[repartition] {key} : README {default!r}, code {repartition.CONFIG_DEFAULTS[key]!r}"
+
+
+def test_changelog_unreleased_lists_the_5_of_5_repartition_entry():
+    unreleased = _unreleased_changelog()
+    marker = "Répartition automatique (5/5, SPEC-78dc"
+    assert marker in unreleased
+    assert "README" in unreleased.split(marker, 1)[1].split("\n", 1)[0]
+
+
+def _load_module_from_clipper(name: str):
+    sys.path.insert(0, str(ROOT))
+    try:
+        return importlib.import_module(f"clipper.{name}")
+    finally:
+        sys.path.remove(str(ROOT))
