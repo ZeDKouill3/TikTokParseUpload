@@ -139,7 +139,7 @@ function clipSheetHtml(sheet, accounts) {
         ${sheetRow("Compte", clipSheetAccountHtml(clip.account, accounts))}
         ${sheetRow("Statut", esc(s.label))}
         ${sheetRow("Créneau", clipSheetDate(clip.slot_at_paris))}
-        ${sheetRow("Publié le", clipSheetDate(clip.published_at_paris))}
+        ${sheetRow("Envoyé à TikTok le", clipSheetDate(clip.published_at_paris))}
         ${sheetRow("Lien du post", sheetLink(clip.post_url))}
         ${clip.publish_error ? sheetRow("Erreur", esc(clip.publish_error)) : ""}
       </section>

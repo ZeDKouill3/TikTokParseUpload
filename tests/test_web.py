@@ -10440,3 +10440,84 @@ def test_publish_state_dir_outside_the_queue_folder_emits_one_element_with_its_f
     found = _scan_watched(tmp_path / "workspace", _watched_state_roots(config))
 
     assert [(kind, id_) for _, kind, id_ in found] == [("publish", "chaine")]
+
+# --------------------------------------------------------------------------
+# TASK-28dac454afef : fiche clip lisible (historique sans doublons, « Envoyé à TikTok le », valeurs qui débordent plus)
+# Tests sans réseau : TikTok est remplacé par un faux relevé, la fiche est rendue par node.
+# --------------------------------------------------------------------------
+
+
+def _history_row(fetched_at, views, likes, comments):
+    return {"fetched_at": fetched_at, "views": views, "likes": likes, "comments": comments}
+
+
+def test_clip_sheet_history_keeps_one_row_per_change_and_always_the_last(tmp_path, isolated_cwd, monkeypatch):
+    # 6 relevés : 3 identiques consécutifs (06:06 à 06:12), puis une hausse, puis deux relevés identiques
+    # (le dernier doit rester). Attendu : 06:06, 06:20, 06:30, 06:40 : 4 lignes, ordre chronologique.
+    history = [
+        _history_row("2026-10-07T06:06:00+00:00", 1056, 40, 3),
+        _history_row("2026-10-07T06:09:00+00:00", 1056, 40, 3),
+        _history_row("2026-10-07T06:12:00+00:00", 1056, 40, 3),
+        _history_row("2026-10-07T06:20:00+00:00", 1100, 41, 3),
+        _history_row("2026-10-07T06:30:00+00:00", 1200, 45, 4),
+        _history_row("2026-10-07T06:40:00+00:00", 1200, 45, 4),
+    ]
+    _write_state(tmp_path, CLIPS_VIDEO, channel="ma_chaine")
+    _write_clip(tmp_path, CLIPS_VIDEO, _sheet_sidecar("01"))
+    _write_publish(tmp_path, "ma_chaine", [_entry("01", "published", post_id="77")])
+    monkeypatch.setattr("clipper.tiktok.video_detail", lambda account, post_id, *, config=None: {
+        "views": 1200, "likes": 45, "history": history})
+
+    stats = _sheet(tmp_path).json()["stats"]
+
+    assert [row["fetched_at"] for row in stats["history"]] == [
+        "2026-10-07T06:06:00+00:00", "2026-10-07T06:20:00+00:00",
+        "2026-10-07T06:30:00+00:00", "2026-10-07T06:40:00+00:00"]
+    assert stats["history"][-1]["views"] == 1200 and stats["history"][-1]["comments"] == 4
+
+
+def test_clip_sheet_history_keeps_unknown_values_as_null_never_invented(tmp_path, isolated_cwd, monkeypatch):
+    history = [
+        _history_row("2026-10-07T06:06:00+00:00", None, None, None),
+        _history_row("2026-10-07T06:09:00+00:00", None, None, None),
+        _history_row("2026-10-07T06:12:00+00:00", 5, None, None),
+    ]
+    _write_state(tmp_path, CLIPS_VIDEO, channel="ma_chaine")
+    _write_clip(tmp_path, CLIPS_VIDEO, _sheet_sidecar("01"))
+    _write_publish(tmp_path, "ma_chaine", [_entry("01", "published", post_id="77")])
+    monkeypatch.setattr("clipper.tiktok.video_detail", lambda account, post_id, *, config=None: {
+        "views": 5, "likes": None, "history": history})
+
+    stats = _sheet(tmp_path).json()["stats"]
+
+    assert [row["fetched_at"] for row in stats["history"]] == [
+        "2026-10-07T06:06:00+00:00", "2026-10-07T06:12:00+00:00"]
+    assert stats["history"][0]["views"] is None and stats["history"][0]["likes"] is None
+
+
+def test_clip_sheet_names_the_publication_date_as_sent_to_tiktok_static():
+    js = (STATIC / "screens" / "clip.js").read_text(encoding="utf-8")
+
+    assert "Envoyé à TikTok le" in js
+    assert "Publié le" not in js
+    assert "Créneau" in js
+
+
+@_NODE_SHEET
+def test_clip_sheet_shows_sent_to_tiktok_not_published_and_keeps_the_slot():
+    html = _sheet_html({"clip": {"slot_at_paris": "2026-10-07T21:00:00+02:00",
+                                 "published_at_paris": "2026-10-06T20:35:00+02:00"}}, [])
+
+    assert "Envoyé à TikTok le" in html
+    assert "Publié le" not in html
+    assert "Créneau" in html and "7 oct." in html and "6 oct." in html
+
+
+def test_clip_sheet_grid_panels_can_shrink_so_values_never_overflow_the_panel():
+    # Un panneau de grille garde min-width auto par défaut : son contenu le fait déborder du bord droit.
+    css = (STATIC / "style.css").read_text(encoding="utf-8")
+    panel_rule = css[css.index(".sheet-grid > *"):]
+    panel_rule = panel_rule[:panel_rule.index("}")]
+
+    assert "min-width: 0" in panel_rule
+    assert "overflow-wrap: anywhere" in css[css.index(".sheet-row {"):].split("}")[0]

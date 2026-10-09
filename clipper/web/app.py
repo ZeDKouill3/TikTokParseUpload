@@ -887,6 +887,24 @@ def _require_clip_video(config: Config, video_id: str, clip_id: str) -> None:
                             "fichier vidéo (seules ses infos et ses stats sont gardées)")
 
 
+def _stats_history_changes(history: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+    """Historique de la fiche : un releve dont vues, likes et commentaires sont identiques au releve garde
+    precedent est omis ; le dernier releve est toujours garde. Ordre conserve, valeurs inconnues restent None."""
+    if history is None:
+        return None
+    kept: list[dict[str, Any]] = []
+    last = len(history) - 1
+    for index, row in enumerate(history):
+        if kept and index != last and _stats_values(row) == _stats_values(kept[-1]):
+            continue
+        kept.append(row)
+    return kept
+
+
+def _stats_values(row: dict[str, Any]) -> tuple[Any, Any, Any]:
+    return row.get("views"), row.get("likes"), row.get("comments")
+
+
 def _clip_view(sidecar: dict[str, Any], channel: str | None, entry: dict[str, Any] | None,
                jury: dict[Any, tuple[Any, Any]] | None = None, *, video_deleted: bool = False) -> dict[str, Any]:
     """``jury`` : moment_id -> confiance du jury (voir _moments_jury_confidences) ; ``video_deleted`` : le .mp4
@@ -2761,7 +2779,8 @@ def create_app(config: Config | None = None) -> FastAPI:
         if post_id and entry.get("account") and entry.get("service") != "youtube":
             try:
                 detail = tiktok_mod.video_detail(entry["account"], str(post_id), config=config)
-                stats = {"views": detail.get("views"), "likes": detail.get("likes"), "history": detail.get("history"),
+                stats = {"views": detail.get("views"), "likes": detail.get("likes"),
+                         "history": _stats_history_changes(detail.get("history")),
                          "error": None}
             except tiktok_mod.TikTokError as exc:
                 stats = {"views": None, "likes": None, "history": [], "error": str(exc)}
