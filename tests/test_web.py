@@ -10544,3 +10544,505 @@ def test_clip_sheet_grid_panels_can_shrink_so_values_never_overflow_the_panel():
 
     assert "min-width: 0" in panel_rule
     assert "overflow-wrap: anywhere" in css[css.index(".sheet-row {"):].split("}")[0]
+
+
+# --------------------------------------------------------------------------
+# TASK-486c : répartition automatique (3/5), SPEC-78dc R8 : GET / compute / PUT / validate
+# + événement SSE. Plans écrits à la main (R7), clips de _publish_setup, jamais le réseau.
+# --------------------------------------------------------------------------
+
+_REP_PARIS = ZoneInfo("Europe/Paris")
+
+
+def _rep_day(days: int = 2) -> str:
+    return (_dt.now(_REP_PARIS) + _td(days=days)).date().isoformat()
+
+
+def _rep_slot(day: str, hhmm: str) -> str:
+    return datetime.fromisoformat(f"{day}T{hhmm}:00").replace(tzinfo=_REP_PARIS).isoformat()
+
+
+def _rep_line(day: str, hhmm: str, clip: str, **extra) -> dict:
+    return {"slot_at": _rep_slot(day, hhmm), "video_id": CLIPS_VIDEO, "clip_id": clip, "score": 80.0, "bonus": 0,
+            "bonus_reason": "no_stats", "adjusted": 80.0, "source_key": f"vod:{CLIPS_VIDEO}", "game_name": None,
+            "source_from": "vod", "exploration": False, "prime": False, **extra}
+
+
+def _rep_put_line(day: str, hhmm: str, clip: str) -> dict:
+    return {"slot_at": _rep_slot(day, hhmm), "video_id": CLIPS_VIDEO, "clip_id": clip}
+
+
+def _rep_path(tmp_path, day: str) -> Path:
+    return tmp_path / "state" / "repartition" / f"{day}.json"
+
+
+def _rep_write(tmp_path, day: str, accounts, status: str = "proposed", **extra) -> None:
+    plan = {"day": day, "computed_at": "2026-10-09T20:00:00+02:00", "computed_by": "worker", "status": status,
+            "accounts": [{"account": acc, "label": acc, "slots": [], "lines": lines, "notes": []}
+                         for acc, lines in accounts],
+            "pool": 6, "excluded": [], "notes": [], "validated_at": None, "created": [], **extra}
+    path = _rep_path(tmp_path, day)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(plan), encoding="utf-8")
+
+
+def _rep_read(tmp_path, day: str) -> dict:
+    return json.loads(_rep_path(tmp_path, day).read_text(encoding="utf-8"))
+
+
+def _rep_client(tmp_path, ready=(READY, SPARE), **tiktok_settings) -> TestClient:
+    _publish_setup(tmp_path, slots=False)
+    _accounts_state(tmp_path, ready=ready)
+    config = Config(mode="review", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output",
+                    _sections={"tiktok": {"max_posts_per_day": 10, "min_gap_minutes": 0, **tiktok_settings}})
+    return TestClient(create_app(config=config))
+
+
+def _rep_pause(tmp_path, account: str) -> None:
+    path = tmp_path / "state" / "accounts.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    for row in data["accounts"]:
+        if row["id"] == account:
+            row["paused_at"] = "2026-10-08T10:00:00+00:00"
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
+def _rep_moments(tmp_path, *exploration_ids: int) -> None:
+    moments = [{"id": i, "exploration": True} for i in exploration_ids]
+    (tmp_path / "workspace" / CLIPS_VIDEO / "moments.json").write_text(json.dumps({"moments": moments}), encoding="utf-8")
+
+
+def _rep_scheduled(tmp_path) -> list[dict]:
+    path = tmp_path / "state" / "publish" / "ma_chaine.json"
+    entries = json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
+    return sorted((e for e in entries if e["status"] == "scheduled"), key=lambda e: (e["account"], e["slot_at"]))
+
+
+def _rep_two_accounts(tmp_path, day: str) -> None:
+    _rep_write(tmp_path, day, [
+        (READY, [_rep_line(day, "10:00", "01"), _rep_line(day, "13:00", "02")]),
+        (SPARE, [_rep_line(day, "10:30", "03"), _rep_line(day, "13:30", "04")])])
+
+
+def _rep_past() -> str:
+    return (_dt.now(_REP_PARIS) - _td(hours=2)).replace(microsecond=0).isoformat()
+
+
+def test_repartition_get_describes_each_line_and_gives_the_pool(tmp_path, isolated_cwd):
+    c, day = _rep_client(tmp_path), _rep_day()
+    _rep_write(tmp_path, day, [(READY, [_rep_line(day, "10:00", "01"), _rep_line(day, "13:00", "02")])])
+
+    resp = c.get("/api/repartition", params={"day": day})
+
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["day"] == day and data["status"] == "proposed" and data["computed_by"] == "worker"
+    first, second = data["accounts"][0]["lines"]
+    assert first["screen_title"] == "Titre 01" and first["thumbnail_url"] == f"/media/clip/{CLIPS_VIDEO}/01/thumbnail"
+    assert first["publish_at_paris"] == _rep_slot(day, "10:00") and first["refusal"] is None
+    assert second["clip_id"] == "02" and second["refusal"] is None
+    assert {u["clip_id"] for u in data["pool"]} == {"01", "02", "03", "04", "05", "06"}
+    assert {"screen_title", "thumbnail_url", "score", "channel"} <= set(data["pool"][0])
+    assert data["pool_size"] == 6
+
+
+def test_repartition_get_gives_each_line_its_own_refusal_from_preview_series(tmp_path, isolated_cwd):
+    c, day = _rep_client(tmp_path), _rep_day()
+    _rep_write(tmp_path, day, [(READY, [{**_rep_line(day, "10:00", "01"), "slot_at": _rep_past()},
+                                        _rep_line(day, "13:00", "02")])])
+
+    lines = c.get("/api/repartition", params={"day": day}).json()["accounts"][0]["lines"]
+
+    assert lines[0]["refusal"] and lines[1]["refusal"] is None
+
+
+def test_repartition_get_refuses_a_slot_that_breaks_the_account_gap(tmp_path, isolated_cwd):
+    c, day = _rep_client(tmp_path, min_gap_minutes=180), _rep_day()
+    _rep_write(tmp_path, day, [(READY, [_rep_line(day, "10:00", "01"), _rep_line(day, "11:00", "02")])])
+
+    lines = c.get("/api/repartition", params={"day": day}).json()["accounts"][0]["lines"]
+
+    assert lines[0]["refusal"] is None and "180" in lines[1]["refusal"]
+
+
+def test_repartition_get_defaults_to_tomorrow_in_paris_and_says_when_there_is_no_plan(tmp_path, isolated_cwd):
+    c = _rep_client(tmp_path)
+    tomorrow = _rep_day(1)
+
+    empty = c.get("/api/repartition")
+    _rep_write(tmp_path, tomorrow, [(READY, [_rep_line(tomorrow, "10:00", "01")])])
+    found = c.get("/api/repartition")
+
+    assert empty.status_code == 200 and empty.json()["day"] == tomorrow and empty.json()["status"] == "absent"
+    assert empty.json()["accounts"] == [] and empty.json()["enabled"] is True
+    assert found.json()["status"] == "proposed" and found.json()["accounts"][0]["lines"][0]["clip_id"] == "01"
+
+
+def test_repartition_get_rejects_a_day_that_is_not_a_date(tmp_path, isolated_cwd):
+    resp = _rep_client(tmp_path).get("/api/repartition", params={"day": "demain"})
+
+    assert resp.status_code == 422 and "AAAA-MM-JJ" in resp.json()["detail"]
+
+
+def test_repartition_get_shows_an_error_plan_with_its_message(tmp_path, isolated_cwd):
+    c, day = _rep_client(tmp_path), _rep_day()
+    path = _rep_path(tmp_path, day)
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"day": day, "computed_at": "2026-10-09T20:00:00+02:00", "computed_by": "worker",
+                                "status": "error", "error": {"type": "PublishError", "message": "boum"}}), encoding="utf-8")
+
+    data = c.get("/api/repartition", params={"day": day}).json()
+
+    assert data["status"] == "error" and data["error"]["message"] == "boum" and data["accounts"] == []
+
+
+def test_repartition_get_on_a_validated_plan_does_not_preview_lines_already_created(tmp_path, isolated_cwd):
+    c, day = _rep_client(tmp_path), _rep_day()
+    _rep_write(tmp_path, day, [(READY, [_rep_line(day, "10:00", "01")])], status="validated",
+               validated_at="2026-10-09T21:00:00+02:00", created=[{"account": READY, "video_id": CLIPS_VIDEO, "clip_id": "01"}])
+    assert c.post("/api/publications", json={"video_id": CLIPS_VIDEO, "clip_id": "01", "account": READY,
+                                             "mode": "scheduled", "publish_at": _rep_slot(day, "10:00")}).status_code == 201
+
+    data = c.get("/api/repartition", params={"day": day}).json()
+
+    assert data["status"] == "validated" and data["accounts"][0]["lines"][0]["refusal"] is None
+    assert data["accounts"][0]["lines"][0]["screen_title"] == "Titre 01"
+
+
+def test_repartition_compute_writes_a_web_plan_and_refuses_a_validated_one(tmp_path, isolated_cwd):
+    c, day = _rep_client(tmp_path), _rep_day()
+
+    resp = c.post("/api/repartition/compute", json={"day": day})
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["computed_by"] == "web" and resp.json()["status"] == "proposed"
+    assert [a["account"] for a in resp.json()["accounts"]] == [READY, SPARE]
+    assert _rep_read(tmp_path, day)["computed_by"] == "web"
+    _rep_write(tmp_path, day, [(READY, [_rep_line(day, "10:00", "01")])], status="validated")
+    before = _rep_path(tmp_path, day).read_text(encoding="utf-8")
+
+    refused = c.post("/api/repartition/compute", json={"day": day})
+
+    assert refused.status_code == 409 and "validé" in refused.json()["detail"]
+    assert _rep_path(tmp_path, day).read_text(encoding="utf-8") == before
+
+
+def test_repartition_compute_replaces_a_proposed_plan_the_user_had_edited(tmp_path, isolated_cwd):
+    c, day = _rep_client(tmp_path), _rep_day()
+    _rep_write(tmp_path, day, [(READY, [_rep_line(day, "09:07", "06")])])
+
+    resp = c.post("/api/repartition/compute", json={"day": day})
+
+    assert resp.status_code == 200
+    assert "09:07" not in json.dumps(_rep_read(tmp_path, day)) and resp.json()["computed_by"] == "web"
+
+
+def test_repartition_put_changes_a_clip_an_hour_and_removes_a_line(tmp_path, isolated_cwd):
+    c, day = _rep_client(tmp_path), _rep_day()
+    _rep_two_accounts(tmp_path, day)
+
+    resp = c.put(f"/api/repartition/{day}", json={"accounts": [
+        {"account": READY, "lines": [_rep_put_line(day, "10:00", "05"), _rep_put_line(day, "15:15", "02")]},
+        {"account": SPARE, "lines": [_rep_put_line(day, "10:30", "03")]}]})
+
+    assert resp.status_code == 200, resp.text
+    ready, spare = _rep_read(tmp_path, day)["accounts"]
+    assert [(line["clip_id"], line["slot_at"]) for line in ready["lines"]] == [
+        ("05", _rep_slot(day, "10:00")), ("02", _rep_slot(day, "15:15"))]
+    assert [line["clip_id"] for line in spare["lines"]] == ["03"]
+    assert [line["clip_id"] for line in resp.json()["accounts"][0]["lines"]] == ["05", "02"]
+    assert resp.json()["accounts"][0]["lines"][0]["screen_title"] == "Titre 05"
+    assert _rep_read(tmp_path, day)["status"] == "proposed"
+
+
+def test_repartition_put_leaves_an_account_that_is_not_in_the_body_untouched(tmp_path, isolated_cwd):
+    c, day = _rep_client(tmp_path), _rep_day()
+    _rep_two_accounts(tmp_path, day)
+
+    resp = c.put(f"/api/repartition/{day}", json={"accounts": [{"account": READY, "lines": []}]})
+
+    assert resp.status_code == 200
+    ready, spare = _rep_read(tmp_path, day)["accounts"]
+    assert ready["lines"] == [] and [line["clip_id"] for line in spare["lines"]] == ["03", "04"]
+
+
+def test_repartition_put_describes_the_line_again_from_the_clip_not_from_the_page(tmp_path, isolated_cwd):
+    c, day = _rep_client(tmp_path), _rep_day()
+    _series_scored(tmp_path, {"05": 91})
+    _rep_write(tmp_path, day, [(READY, [_rep_line(day, "10:00", "01")])])
+
+    c.put(f"/api/repartition/{day}", json={"accounts": [{"account": READY, "lines": [
+        {**_rep_put_line(day, "19:00", "05"), "score": 1, "bonus": 99, "exploration": True, "prime": False}]}]})
+
+    line = _rep_read(tmp_path, day)["accounts"][0]["lines"][0]
+    assert line["score"] == 91 and line["bonus"] == 0 and line["bonus_reason"] == "no_stats" and line["adjusted"] == 91
+    assert line["exploration"] is False and line["prime"] is True
+    assert line["source_key"] == f"vod:{CLIPS_VIDEO}" and line["source_from"] == "vod" and line["game_name"] is None
+
+
+def test_repartition_put_accepts_a_third_clip_of_one_source_with_a_visible_warning(tmp_path, isolated_cwd):
+    c, day = _rep_client(tmp_path), _rep_day()
+    _rep_write(tmp_path, day, [(READY, [])])
+
+    resp = c.put(f"/api/repartition/{day}", json={"accounts": [{"account": READY, "lines": [
+        _rep_put_line(day, "09:00", "01"), _rep_put_line(day, "12:00", "02"), _rep_put_line(day, "15:00", "03")]}]})
+
+    assert resp.status_code == 200, resp.text
+    lines = resp.json()["accounts"][0]["lines"]
+    assert [line["warning"] for line in lines[:2]] == [None, None]
+    assert "2" in lines[2]["warning"] and "source" in lines[2]["warning"]
+    assert _rep_read(tmp_path, day)["accounts"][0]["lines"][2]["warning"] == lines[2]["warning"]
+
+
+def test_repartition_put_counts_the_posts_already_planned_that_day_for_the_source_cap(tmp_path, isolated_cwd):
+    c, day = _rep_client(tmp_path), _rep_day()
+    _rep_write(tmp_path, day, [(READY, [])])
+    assert c.post("/api/publications", json={"video_id": CLIPS_VIDEO, "clip_id": "06", "account": READY,
+                                             "mode": "scheduled", "publish_at": _rep_slot(day, "08:00")}).status_code == 201
+
+    lines = c.put(f"/api/repartition/{day}", json={"accounts": [{"account": READY, "lines": [
+        _rep_put_line(day, "11:00", "01"), _rep_put_line(day, "14:00", "02")]}]}).json()["accounts"][0]["lines"]
+
+    assert lines[0]["warning"] is None and "source" in lines[1]["warning"]
+
+
+def test_repartition_put_warns_about_a_second_exploration_clip_and_an_evening_one(tmp_path, isolated_cwd):
+    c, day = _rep_client(tmp_path), _rep_day()
+    _rep_moments(tmp_path, 1, 2, 3)
+    _rep_write(tmp_path, day, [(READY, []), (SPARE, [])])
+
+    resp = c.put(f"/api/repartition/{day}", json={"accounts": [
+        {"account": READY, "lines": [_rep_put_line(day, "10:00", "01"), _rep_put_line(day, "12:00", "04")]},
+        {"account": SPARE, "lines": [_rep_put_line(day, "11:00", "02"), _rep_put_line(day, "19:00", "03")]}]})
+
+    assert resp.status_code == 200, resp.text
+    ready, spare = resp.json()["accounts"]
+    assert ready["lines"][0]["exploration"] is True and ready["lines"][0]["warning"] is None
+    assert ready["lines"][1]["exploration"] is False and ready["lines"][1]["warning"] is None
+    assert spare["lines"][0]["exploration"] is True and "exploration" in spare["lines"][0]["warning"]
+    assert spare["lines"][1]["prime"] is True and "exploration" in spare["lines"][1]["warning"]
+
+
+def test_repartition_put_keeps_the_refusal_of_a_line_that_breaks_a_cap(tmp_path, isolated_cwd):
+    c, day = _rep_client(tmp_path), _rep_day()
+    _rep_write(tmp_path, day, [(READY, [])])
+
+    resp = c.put(f"/api/repartition/{day}", json={"accounts": [{"account": READY, "lines": [
+        {"slot_at": _rep_past(), "video_id": CLIPS_VIDEO, "clip_id": "01"}]}]})
+
+    assert resp.status_code == 200 and resp.json()["accounts"][0]["lines"][0]["refusal"]
+
+
+def test_repartition_put_is_refused_on_a_validated_plan(tmp_path, isolated_cwd):
+    c, day = _rep_client(tmp_path), _rep_day()
+    _rep_write(tmp_path, day, [(READY, [_rep_line(day, "10:00", "01")])], status="validated")
+    before = _rep_path(tmp_path, day).read_text(encoding="utf-8")
+
+    resp = c.put(f"/api/repartition/{day}", json={"accounts": [{"account": READY, "lines": []}]})
+
+    assert resp.status_code == 409 and "validé" in resp.json()["detail"]
+    assert _rep_path(tmp_path, day).read_text(encoding="utf-8") == before
+
+
+@pytest.mark.parametrize("body,status", [
+    ({"accounts": [{"account": "inconnu", "lines": []}]}, 422),
+    ({"accounts": [{"account": READY, "lines": [
+        {"slot_at": "2026-10-12T10:00:00", "video_id": CLIPS_VIDEO, "clip_id": "01"}]}]}, 422),
+    ({"accounts": [{"account": READY, "lines": [
+        {"slot_at": "2026-10-12T10:00:00+02:00", "video_id": CLIPS_VIDEO, "clip_id": "99"}]}]}, 404),
+])
+def test_repartition_put_refuses_a_malformed_body(tmp_path, isolated_cwd, body, status):
+    c, day = _rep_client(tmp_path), _rep_day()
+    _rep_write(tmp_path, day, [(READY, [_rep_line(day, "10:00", "01")])])
+    before = _rep_path(tmp_path, day).read_text(encoding="utf-8")
+
+    resp = c.put(f"/api/repartition/{day}", json=body)
+
+    assert resp.status_code == status and _rep_path(tmp_path, day).read_text(encoding="utf-8") == before
+
+
+def test_repartition_put_refuses_the_same_clip_twice_and_an_unknown_day(tmp_path, isolated_cwd):
+    c, day = _rep_client(tmp_path), _rep_day()
+    _rep_write(tmp_path, day, [(READY, []), (SPARE, [])])
+
+    twice = c.put(f"/api/repartition/{day}", json={"accounts": [
+        {"account": READY, "lines": [_rep_put_line(day, "10:00", "01")]},
+        {"account": SPARE, "lines": [_rep_put_line(day, "11:00", "01")]}]})
+    absent = c.put(f"/api/repartition/{_rep_day(5)}", json={"accounts": []})
+
+    assert twice.status_code == 422 and "01" in twice.json()["detail"]
+    assert absent.status_code == 404
+
+
+def test_repartition_validate_creates_exactly_one_scheduled_entry_per_line(tmp_path, isolated_cwd):
+    c, day = _rep_client(tmp_path), _rep_day()
+    _rep_two_accounts(tmp_path, day)
+
+    resp = c.post(f"/api/repartition/{day}/validate")
+
+    assert resp.status_code == 200, resp.text
+    entries = _rep_scheduled(tmp_path)
+    assert [(e["account"], e["clip_id"], e["publish_mode"]) for e in entries] == [
+        (READY, "01", "scheduled"), (READY, "02", "scheduled"), (SPARE, "03", "scheduled"), (SPARE, "04", "scheduled")]
+    assert [datetime.fromisoformat(e["slot_at"]) for e in entries] == [
+        datetime.fromisoformat(_rep_slot(day, hhmm)) for hhmm in ("10:00", "13:00", "10:30", "13:30")]
+    plan = _rep_read(tmp_path, day)
+    assert plan["status"] == "validated" and plan["validated_at"] and len(plan["created"]) == 4
+    assert plan["created"][0] == {"account": READY, "video_id": CLIPS_VIDEO, "clip_id": "01"}
+    assert resp.json()["status"] == "validated" and len(resp.json()["created"]) == 4
+
+
+def test_repartition_validate_twice_does_not_create_a_second_set(tmp_path, isolated_cwd):
+    c, day = _rep_client(tmp_path), _rep_day()
+    _rep_two_accounts(tmp_path, day)
+    c.post(f"/api/repartition/{day}/validate")
+
+    again = c.post(f"/api/repartition/{day}/validate")
+
+    assert again.status_code == 409 and "validé" in again.json()["detail"] and len(_rep_scheduled(tmp_path)) == 4
+
+
+def test_repartition_validate_a_paused_account_is_refused_explicitly_and_creates_nothing_for_it(tmp_path, isolated_cwd):
+    c, day = _rep_client(tmp_path), _rep_day()
+    _rep_two_accounts(tmp_path, day)
+    _rep_pause(tmp_path, SPARE)
+
+    resp = c.post(f"/api/repartition/{day}/validate")
+
+    assert resp.status_code == 409 and "pause" in resp.json()["detail"]
+    assert [e["account"] for e in _rep_scheduled(tmp_path)] == [READY, READY]
+    plan = _rep_read(tmp_path, day)
+    assert plan["status"] == "proposed" and "pause" in plan["last_error"]
+    assert [x["clip_id"] for x in plan["created"]] == ["01", "02"]
+    assert [x["clip_id"] for x in resp.json()["created"]] == ["01", "02"]
+
+
+def test_repartition_validate_failing_on_the_second_account_cancels_that_account_only(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import publish as publish_lib
+
+    c, day = _rep_client(tmp_path), _rep_day()
+    _rep_two_accounts(tmp_path, day)
+    real, calls = publish_lib.create_post, []
+
+    def flaky(*args, **kwargs):
+        calls.append(kwargs.get("account"))
+        if len(calls) == 4:  # 2 lignes du premier compte, 1re ligne du second, echec sur sa 2e
+            raise publish_lib.PublishError("TikTok indisponible")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(publish_lib, "create_post", flaky)
+
+    resp = c.post(f"/api/repartition/{day}/validate")
+
+    assert resp.status_code == 409 and "TikTok indisponible" in resp.json()["detail"]
+    assert [(e["account"], e["clip_id"]) for e in _rep_scheduled(tmp_path)] == [(READY, "01"), (READY, "02")]
+    plan = _rep_read(tmp_path, day)
+    assert plan["status"] == "proposed" and "TikTok indisponible" in plan["last_error"]
+    assert [x["clip_id"] for x in plan["created"]] == ["01", "02"] and plan["validated_at"] is None
+    monkeypatch.setattr(publish_lib, "create_post", real)
+
+    retry = c.post(f"/api/repartition/{day}/validate")
+
+    assert retry.status_code == 200, retry.text
+    assert [(e["account"], e["clip_id"]) for e in _rep_scheduled(tmp_path)] == [
+        (READY, "01"), (READY, "02"), (SPARE, "03"), (SPARE, "04")]
+    final = _rep_read(tmp_path, day)
+    assert final["status"] == "validated" and len(final["created"]) == 4 and final.get("last_error") is None
+
+
+def test_repartition_validate_refuses_an_account_whose_line_breaks_a_cap_and_creates_nothing_for_it(tmp_path, isolated_cwd):
+    c, day = _rep_client(tmp_path), _rep_day()
+    _rep_write(tmp_path, day, [(READY, [_rep_line(day, "10:00", "01")]),
+                               (SPARE, [{**_rep_line(day, "10:30", "03"), "slot_at": _rep_past()},
+                                        _rep_line(day, "13:30", "04")])])
+
+    resp = c.post(f"/api/repartition/{day}/validate")
+
+    assert resp.status_code == 409 and "03" in resp.json()["detail"]
+    assert [(e["account"], e["clip_id"]) for e in _rep_scheduled(tmp_path)] == [(READY, "01")]
+    assert _rep_read(tmp_path, day)["status"] == "proposed"
+
+
+def test_repartition_validate_never_creates_an_immediate_publication(tmp_path, isolated_cwd):
+    c, day = _rep_client(tmp_path), _rep_day()
+    _rep_two_accounts(tmp_path, day)
+
+    c.post(f"/api/repartition/{day}/validate")
+
+    entries = json.loads((tmp_path / "state" / "publish" / "ma_chaine.json").read_text(encoding="utf-8"))
+    assert entries and {e["publish_mode"] for e in entries} == {"scheduled"}
+    assert {e["status"] for e in entries} == {"scheduled"}
+
+
+def test_repartition_validate_refuses_an_absent_or_error_plan(tmp_path, isolated_cwd):
+    c, day = _rep_client(tmp_path), _rep_day()
+    absent = c.post(f"/api/repartition/{day}/validate")
+    path = _rep_path(tmp_path, day)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"day": day, "status": "error", "error": {"type": "X", "message": "boum"}}), encoding="utf-8")
+
+    erreur = c.post(f"/api/repartition/{day}/validate")
+
+    assert absent.status_code == 404
+    assert erreur.status_code == 409 and "boum" in erreur.json()["detail"]
+
+
+def test_repartition_state_dir_is_watched_and_emits_one_repartition_event_per_file(tmp_path, isolated_cwd):
+    from clipper.web.app import _scan_watched, _watched_state_roots
+
+    plans = tmp_path / "state" / "repartition"
+    plans.mkdir(parents=True)
+    (plans / "2026-10-11.json").write_text("{}", encoding="utf-8")
+    config = Config(mode="review", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output",
+                    _sections={"worker": {"queue_path": str(tmp_path / "state" / "queue.json")}})
+
+    found = _scan_watched(tmp_path / "workspace", _watched_state_roots(config))
+
+    assert [(kind, id_) for _, kind, id_ in found] == [("repartition", "2026-10-11")]
+
+
+def test_repartition_state_dir_elsewhere_keeps_its_kind(tmp_path, isolated_cwd):
+    from clipper.web.app import _scan_watched, _watched_state_roots
+
+    plans = tmp_path / "ailleurs"
+    plans.mkdir()
+    (plans / "2026-10-11.json").write_text("{}", encoding="utf-8")
+    config = Config(mode="review", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output",
+                    _sections={"worker": {"queue_path": str(tmp_path / "state" / "queue.json")},
+                               "repartition": {"state_dir": str(plans)}})
+
+    found = _scan_watched(tmp_path / "workspace", _watched_state_roots(config))
+
+    assert [(kind, id_) for _, kind, id_ in found] == [("repartition", "2026-10-11")]
+
+
+def test_repartition_put_refuses_an_account_whose_publications_are_already_created(tmp_path, isolated_cwd, monkeypatch):
+    from clipper import publish as publish_lib
+
+    c, day = _rep_client(tmp_path), _rep_day()
+    _rep_two_accounts(tmp_path, day)
+    real, calls = publish_lib.create_post, []
+
+    def flaky(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 3:
+            raise publish_lib.PublishError("TikTok indisponible")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(publish_lib, "create_post", flaky)
+    assert c.post(f"/api/repartition/{day}/validate").status_code == 409
+
+    resp = c.put(f"/api/repartition/{day}", json={"accounts": [{"account": READY, "lines": []}]})
+
+    assert resp.status_code == 409 and READY in resp.json()["detail"]
+    assert [x["clip_id"] for x in _rep_read(tmp_path, day)["accounts"][0]["lines"]] == ["01", "02"]
+
+
+def test_repartition_validate_refuses_a_plan_without_any_line(tmp_path, isolated_cwd):
+    c, day = _rep_client(tmp_path), _rep_day()
+    _rep_write(tmp_path, day, [(READY, []), (SPARE, [])])
+
+    resp = c.post(f"/api/repartition/{day}/validate")
+
+    assert resp.status_code == 409 and "aucune ligne" in resp.json()["detail"]
+    assert _rep_read(tmp_path, day)["status"] == "proposed" and _rep_scheduled(tmp_path) == []

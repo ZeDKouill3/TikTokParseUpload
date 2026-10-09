@@ -45,6 +45,7 @@ from clipper import pipeline
 from clipper import publish as publish_mod
 from clipper import reframe as reframe_mod
 from clipper import render as render_mod
+from clipper import repartition as repartition_mod
 from clipper import tiktok as tiktok_mod
 from clipper import youtube as youtube_mod
 from clipper import veille as veille_mod
@@ -546,11 +547,11 @@ def _state_kind_and_id(path: Path, state_root: Path) -> tuple[str, str]:
 
 def _watched_state_roots(config: Config) -> list[tuple[Path, str | None]]:
     """Dossiers d'état surveillés, déclarés par les réglages : le dossier de ``[worker] queue_path`` (file,
-    battement...) et, hors de lui, ``[publish] state_dir`` et ``[watch] state_dir``. Le second membre est le
+    battement...) et, hors de lui, ``[publish]``, ``[watch]`` et ``[repartition]`` ``state_dir``. Le second membre est le
     genre d'événement des fichiers posés directement dans le dossier (None : déduit du chemin)."""
     base = Path(str(config.section("worker")["queue_path"])).parent
     roots: list[tuple[Path, str | None]] = [(base, None)]
-    for kind in ("publish", "watch"):
+    for kind in ("publish", "watch", "repartition"):
         directory = Path(str(config.section(kind)["state_dir"]))
         if directory.resolve() != (base / kind).resolve():  # déjà couvert, avec le même genre, par le dossier de la file
             roots.append((directory, kind))
@@ -3185,6 +3186,12 @@ def create_app(config: Config | None = None) -> FastAPI:
         scope = {"workspace_dir": Path(config.workspace_dir), "output_dir": Path(config.output_dir),
                  "state_dir": _publish_dir(config)}
         units = publish_mod.available_series_clips(style or None, together=together, **scope)
+        out = _series_units_view(units)
+        available = publish_mod.auto_series_capacity(style or None, account, together=together, **scope) if account else None
+        return {"units": out, "default_interval_h": config.section("publish")["series_default_interval_h"],
+                "available": available}
+
+    def _series_units_view(units: list[dict[str, Any]]) -> list[dict[str, Any]]:
         out = []
         for unit in units:
             lead = _read_clip_sidecar(config, unit["video_id"], unit["clip_ids"][0])
@@ -3195,9 +3202,7 @@ def create_app(config: Config | None = None) -> FastAPI:
                 "thumbnail_url": f"/media/clip/{unit['video_id']}/{unit['clip_ids'][0]}/thumbnail",
                 "validated": unit["validated"],
             })
-        available = publish_mod.auto_series_capacity(style or None, account, together=together, **scope) if account else None
-        return {"units": out, "default_interval_h": config.section("publish")["series_default_interval_h"],
-                "available": available}
+        return out
 
     def _series_view(item: dict[str, Any]) -> dict[str, Any]:
         sidecar = _read_clip_sidecar(config, item["video_id"], item["clip_id"])
@@ -3239,6 +3244,237 @@ def create_app(config: Config | None = None) -> FastAPI:
         kwargs = _series_kwargs(body)
         created = _publication_call(publish_mod.create_series, **kwargs)
         return {"created": len(created)}
+
+    # ----------------------------------------------------------------
+    # Répartition automatique du lendemain (TASK-486c, SPEC-78dc R8) : lire, recalculer, modifier, valider le
+    # plan. Le calcul est celui de clipper.repartition, les refus ceux de publish.preview_series, la création
+    # celle de publish.create_series ; ici seulement la mise en forme, le verrou du fichier et les 409.
+    # ----------------------------------------------------------------
+
+    def _rep_call(fn, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return _accounts_call(_publication_call, fn, *args, **kwargs)
+        except repartition_mod.RepartitionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    def _rep_day(day: str | None) -> str:
+        if day is None:  # demain, en heure de Paris
+            return (datetime.now(_PARIS) + timedelta(days=1)).date().isoformat()
+        try:
+            return date.fromisoformat(day).isoformat()
+        except ValueError:
+            raise HTTPException(status_code=422, detail=f"jour invalide : {day!r} (AAAA-MM-JJ est attendu)") from None
+
+    def _rep_editable(day: str, then: str) -> dict[str, Any]:
+        """Plan ``proposed`` du jour (à lire sous le verrou du fichier) : 404 sans plan, 409 s'il est validé ou en erreur."""
+        plan = _rep_call(repartition_mod.read_plan, day, config)
+        if plan is None:
+            raise HTTPException(status_code=404, detail=f"aucun plan pour le {day} : calcule-le d'abord (Recalculer)")
+        if plan.get("status") == "validated":
+            raise HTTPException(status_code=409, detail=f"le plan du {day} est déjà validé : {then}")
+        if plan.get("status") != "proposed":
+            message = (plan.get("error") or {}).get("message")
+            raise HTTPException(status_code=409, detail=f"le plan du {day} est en erreur ({message}) : recalcule-le")
+        return plan
+
+    def _rep_refusals(account_id: str, lines: list[dict[str, Any]]) -> dict[tuple[str, str], str | None]:
+        """``refusal`` de chaque ligne d'un compte, issu de ``publish.preview_series`` (mode manuel, une date par clip,
+        chaque clip seul) : plafonds, avance minimale, créneau déjà pris. Une ligne dont le clip n'est plus
+        choisissable est refusée seule, les autres restent prévisualisées ensemble."""
+        if not lines:
+            return {}
+        try:
+            schedule = _account_schedule(config, account_id)
+        except HTTPException as exc:
+            return {(line["video_id"], line["clip_id"]): str(exc.detail) for line in lines}
+        common = dict(mode="manual", style=None, account=account_id, service="tiktok", together=False,
+                      schedule=schedule, **_series_scope("tiktok"))
+
+        def preview(subset: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            return publish_mod.preview_series(
+                selection=[(line["video_id"], line["clip_id"]) for line in subset],
+                clip_dates={(line["video_id"], line["clip_id"]): _publish_parse_slot(line["slot_at"]) for line in subset},
+                **common)["items"]
+
+        out: dict[tuple[str, str], str | None] = {}
+        try:
+            items = preview(lines)
+        except publish_mod.PublishError:
+            keep = []
+            for line in lines:
+                try:
+                    preview([line])
+                    keep.append(line)
+                except publish_mod.PublishError as exc:
+                    out[(line["video_id"], line["clip_id"])] = str(exc)
+            items = preview(keep) if keep else []
+        out.update({(item["video_id"], item["clip_id"]): item["refusal"] for item in items})
+        return out
+
+    def _rep_clip_fields(video_id: str, clip_id: str) -> dict[str, Any]:
+        try:
+            sidecar = _read_clip_sidecar(config, video_id, clip_id)
+        except HTTPException:  # clip supprimé depuis le calcul : la ligne reste visible, sans titre
+            sidecar = {}
+        return {"screen_title": sidecar.get("screen_title"), "title": sidecar.get("title"),
+                "thumbnail_url": f"/media/clip/{video_id}/{clip_id}/thumbnail"}
+
+    def _rep_view(plan: dict[str, Any] | None, day: str) -> dict[str, Any]:
+        """Le fichier du jour avec, par ligne, titre, vignette, heure de Paris et ``refusal`` ; ``pool`` = les clips
+        choisissables pour remplacer une ligne (``pool_size`` = le nombre de R7)."""
+        pool = _series_units_view(publish_mod.available_series_clips(
+            None, together=False, workspace_dir=Path(config.workspace_dir), output_dir=Path(config.output_dir),
+            state_dir=_publish_dir(config)))
+        base: dict[str, Any] = {"day": day, "status": "absent", "accounts": []} if plan is None else dict(plan)
+        base.update(enabled=config.section("repartition")["enabled"], pool=pool,
+                    pool_size=None if plan is None else plan.get("pool"))
+        accounts_out = []
+        for account in base.get("accounts") or []:
+            refusals = {} if base["status"] == "validated" else _rep_refusals(account["account"], account["lines"])
+            lines = [{**line, **_rep_clip_fields(line["video_id"], line["clip_id"]),
+                      "publish_at_paris": _paris(line["slot_at"]),
+                      "refusal": refusals.get((line["video_id"], line["clip_id"])),
+                      "warning": line.get("warning")} for line in account["lines"]]
+            accounts_out.append({**account, "lines": lines})
+        base["accounts"] = accounts_out
+        return base
+
+    @app.get("/api/repartition")
+    def get_repartition(day: str | None = None) -> dict[str, Any]:
+        day = _rep_day(day)
+        return _rep_view(_rep_call(repartition_mod.read_plan, day, config), day)
+
+    @app.post("/api/repartition/compute")
+    def compute_repartition(body: RepartitionComputeBody | None = None) -> dict[str, Any]:
+        day = _rep_day(body.day if body else None)
+        plan = _rep_call(repartition_mod.compute_plan, day, datetime.now(_PARIS), config=config, computed_by="web")
+        return _rep_view(plan, day)
+
+    def _rep_new_line(line: RepartitionLineBody, settings: dict[str, Any], world: Any, stats: tuple[Any, Any]) -> dict[str, Any]:
+        """Une ligne redécrite depuis le clip (score, bonus, source, exploration, soir) : jamais depuis la page."""
+        _validate_video_id(line.video_id)
+        _validate_clip_id(line.clip_id)
+        slot = _publish_parse_slot(line.slot_at).astimezone(_PARIS)
+        sidecar = _read_clip_sidecar(config, line.video_id, line.clip_id)
+        source = world.source(line.video_id)
+        bonus, reason = repartition_mod._bonus(source["source_key"], *stats, settings)
+        score = sidecar.get("score")
+        score = score if isinstance(score, (int, float)) and not isinstance(score, bool) else None
+        return {"slot_at": slot.isoformat(), "video_id": line.video_id, "clip_id": line.clip_id, "score": score,
+                "bonus": bonus, "bonus_reason": reason, "adjusted": None if score is None else round(score + bonus, 2),
+                **source, "exploration": world.exploration(line.video_id, line.clip_id, []),
+                "prime": repartition_mod._is_prime(slot, settings), "warning": None}
+
+    def _rep_warnings(plan: dict[str, Any], day: str, settings: dict[str, Any], world: Any) -> None:
+        """``warning`` de chaque ligne (c'est le choix de l'utilisateur, jamais un refus) : plus de ``max_per_source``
+        clips d'une même source par compte et par jour, publications déjà prévues comprises (R3) ; plus de
+        ``exploration_per_day`` clips d'exploration par jour, ou un clip d'exploration le soir (R6)."""
+        target = date.fromisoformat(day)
+        counts: dict[tuple[str, str], int] = {}
+        for _channel, entry in _rep_call(publish_mod.all_entries, state_dir=_publish_dir(config), presets_dir=_PRESETS_DIR):
+            when = repartition_mod._entry_time(entry)
+            if when is not None and repartition_mod._paris(when).date() == target and entry.get("account"):
+                key = (entry["account"], world.source(entry["video_id"])["source_key"])
+                counts[key] = counts.get(key, 0) + 1
+        every = sorted(((line, account["account"]) for account in plan["accounts"] for line in account["lines"]),
+                       key=lambda found: datetime.fromisoformat(found[0]["slot_at"]))
+        explorations = 0
+        for line, account_id in every:
+            notes = []
+            key = (account_id, line["source_key"])
+            counts[key] = counts.get(key, 0) + 1
+            if counts[key] > int(settings["max_per_source"]):
+                notes.append(f"plus de {settings['max_per_source']} clips de la même source ({line['source_key']}) "
+                             "ce jour-là sur ce compte")
+            if line["exploration"]:
+                explorations += 1
+                if explorations > int(settings["exploration_per_day"]):
+                    notes.append(f"plus de {settings['exploration_per_day']} clip(s) d'exploration par jour")
+                if line["prime"]:
+                    notes.append("clip d'exploration sur un créneau du soir")
+            line["warning"] = "; ".join(notes) or None
+
+    @app.put("/api/repartition/{day}")
+    def put_repartition(day: str, body: RepartitionPutBody) -> dict[str, Any]:
+        day = _rep_day(day)
+        path = _rep_call(repartition_mod.plan_path, day, config)
+        settings = _rep_call(repartition_mod._settings, config)
+        with channel_mod.file_lock(path):
+            plan = _rep_editable(day, "il n'est plus modifiable")
+            by_id = {account["account"]: account for account in plan["accounts"]}
+            sent = [account.account for account in body.accounts]
+            unknown = [a for a in sent if a not in by_id]
+            if unknown or len(set(sent)) != len(sent):
+                raise HTTPException(status_code=422, detail=f"comptes du plan : {sorted(by_id)} ; reçus : {sent}")
+            locked = {made["account"] for made in plan.get("created") or []} & set(sent)
+            if locked:
+                raise HTTPException(status_code=409, detail=f"publications déjà créées pour {sorted(locked)} : "
+                                    "ces comptes ne sont plus modifiables (valide le plan pour terminer)")
+            taken = {(line["video_id"], line["clip_id"]) for acc_id, account in by_id.items() if acc_id not in sent
+                     for line in account["lines"]}
+            for account in body.accounts:
+                for line in account.lines:
+                    if (line.video_id, line.clip_id) in taken:
+                        raise HTTPException(status_code=422, detail=f"clip présent deux fois dans le plan : "
+                                            f"{line.video_id}/{line.clip_id}")
+                    taken.add((line.video_id, line.clip_id))
+            world = repartition_mod._World(config)
+            active = [a for a in _accounts_call(accounts_mod.list_accounts, config)
+                      if a["service"] == "tiktok" and a["ready_to_publish"] and not a.get("paused_at")]
+            stats = _rep_call(repartition_mod._stats_by_source, world, active, datetime.now(_PARIS), settings)
+            for account in body.accounts:
+                by_id[account.account]["lines"] = sorted(
+                    (_rep_new_line(line, settings, world, stats) for line in account.lines),
+                    key=lambda found: datetime.fromisoformat(found["slot_at"]))
+            _rep_warnings(plan, day, settings, world)
+            plan["edited_at"] = _now_iso()
+            channel_mod.atomic_write_json(path, plan)
+        return _rep_view(plan, day)
+
+    @app.post("/api/repartition/{day}/validate")
+    def validate_repartition(day: str) -> Any:
+        """Crée une entrée programmée par ligne, compte après compte (``create_series`` : tout ou rien par compte).
+        Un compte refusé arrête la validation : les comptes déjà créés restent créés (``created``), le plan garde
+        ``proposed`` avec ``last_error`` ; valider de nouveau ne recrée que les comptes restants."""
+        day = _rep_day(day)
+        path = _rep_call(repartition_mod.plan_path, day, config)
+        with channel_mod.file_lock(path):
+            plan = _rep_editable(day, "rien à créer de plus")
+            if not any(account["lines"] for account in plan["accounts"]):
+                raise HTTPException(status_code=409, detail=f"le plan du {day} n'a aucune ligne : rien à valider")
+            created = list(plan.get("created") or [])
+            done = {(made["account"], made["video_id"], made["clip_id"]) for made in created}
+            failure: dict[str, Any] | None = None
+            for account in plan["accounts"]:
+                lines = [line for line in account["lines"]
+                         if (account["account"], line["video_id"], line["clip_id"]) not in done]
+                if not lines:
+                    continue
+                try:
+                    account_id = _require_ready_account(config, account["account"])
+                    _publication_call(
+                        publish_mod.create_series, mode="manual", style=None, account=account_id, service="tiktok",
+                        selection=[(line["video_id"], line["clip_id"]) for line in lines],
+                        clip_dates={(line["video_id"], line["clip_id"]): _publish_parse_slot(line["slot_at"])
+                                    for line in lines},
+                        together=False, schedule=_account_schedule(config, account_id), **_series_scope("tiktok"))
+                except (HTTPException, _LimitRefused) as exc:
+                    failure = {"detail": exc.detail, "account": account["account"],
+                               "next_at": getattr(exc, "next_at", None)}
+                    break
+                created.extend({"account": account["account"], "video_id": line["video_id"],
+                                "clip_id": line["clip_id"]} for line in lines)
+            plan["created"] = created
+            if failure is not None:
+                plan["last_error"] = failure["detail"]
+                channel_mod.atomic_write_json(path, plan)
+                return JSONResponse(status_code=409, content={**failure, "status": "proposed", "created": created})
+            plan.update(status="validated", validated_at=datetime.now(_PARIS).isoformat())
+            plan.pop("last_error", None)
+            channel_mod.atomic_write_json(path, plan)
+        return _rep_view(plan, day)
 
     @app.get("/api/publish/{video_id}/{clip_id}/capture")
     def publish_capture(video_id: str, clip_id: str) -> FileResponse:
@@ -3856,6 +4092,28 @@ class SeriesBody(BaseModel):
     selection: list[SeriesSelectionItem] | None = None  # requis en mode manuel, dans l'ordre choisi
     clip_dates: list[SeriesClipDate] | None = None      # coche « Heure par clip » (manuel) : une date par clip
     parts_together: bool = True                 # coche « Parties ensemble » (TASK-fc561e4dc7e9), ON par defaut
+
+
+class RepartitionComputeBody(BaseModel):
+    """« Recalculer » (SPEC-78dc R8) : le jour planifié, demain (Paris) par défaut."""
+    day: str | None = None
+
+
+class RepartitionLineBody(BaseModel):
+    """Une ligne du plan telle que l'écran la renvoie : seuls le créneau et le clip comptent, le reste est relu
+    depuis le clip (jamais pris dans la page)."""
+    slot_at: str                                # date ISO avec fuseau
+    video_id: str
+    clip_id: str
+
+
+class RepartitionAccountBody(BaseModel):
+    account: str
+    lines: list[RepartitionLineBody]
+
+
+class RepartitionPutBody(BaseModel):
+    accounts: list[RepartitionAccountBody]      # les comptes absents gardent leurs lignes
 
 
 class PublicationPatchBody(BaseModel):
