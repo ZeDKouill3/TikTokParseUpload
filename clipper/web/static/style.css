@@ -1771,3 +1771,16 @@ input[type="color"] { width: 36px; height: 36px; padding: 2px; border-radius: va
 .sheet-row > span:first-child { flex: 0 0 auto; max-width: 60%; overflow-wrap: normal; word-break: normal; }
 .sheet-row > span:last-child { text-align: right; min-width: 0; }
 .sheet-issues { margin: 4px 0 0; padding-left: 18px; text-align: left; }
+
+/* Plan de demain (SPEC-78dc R9) */
+.rep-plan { margin-bottom: 18px; }
+.rep-account { margin-top: 10px; }
+.rep-account-title { font-weight: 600; margin-bottom: 6px; }
+.rep-row { align-items: flex-start; gap: 8px 12px; }
+.rep-hour { font-family: var(--mono, "JetBrains Mono", monospace); min-width: 44px; padding-top: 2px; }
+.rep-row .li-main { min-width: 0; overflow-wrap: anywhere; }
+.rep-row .li-sub.bad { color: var(--bad, #c0392b); }
+.rep-row .li-sub.warn { color: var(--warn, #b7791f); }
+.rep-score[title] { cursor: help; text-decoration: underline dotted; }
+.rep-tools { gap: 6px; margin-top: 6px; }
+.rep-tools .input { width: auto; min-width: 0; max-width: 100%; font-size: 12px; padding: 3px 6px; }

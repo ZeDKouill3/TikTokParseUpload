@@ -157,9 +157,11 @@ function pubPostsLoad() {
 document.addEventListener("clipper:event", () => {
   pubUi.at = 0;
   pubPosts.at = 0;
+  pubRep.at = 0;
   if (currentScreen === "publish" && !pubUi.dragKey) {
     pubLoad();
     pubPostsLoad();
+    repLoad();
   }
 });
 
@@ -346,13 +348,195 @@ function pubLayoutHtml(d, postsHtml) {
 }
 
 function pubView(body) {
-  const html = pubLayoutHtml(pubUi.data, pubPostsSection());
+  const html = pubLayoutHtml(pubUi.data, repHtml() + pubPostsSection());
   if (pubUi.html === html && body.childElementCount) return false; // rien de change : on garde les vignettes et le survol
   pubUi.html = html;
   body.innerHTML = html;
   return true;
 }
 
+
+/* ---------- Plan de demain (SPEC-78dc R9) ----------
+   Répartition automatique : le plan vient de l'API (/api/repartition*) et la page l'affiche, rien d'autre. Aucun
+   score, plafond ni créneau n'est calculé ici (ADR-49cd) : une modification renvoie les lignes au serveur, qui
+   les redécrit, les prévisualise (refusal) et les valide. */
+
+const pubRep = { data: null, error: null, loading: null, busy: null, busyPromise: null, at: 0 };
+
+function repLoad() {
+  if (pubRep.loading) return pubRep.loading;
+  pubRep.loading = (async () => {
+    try {
+      pubRep.data = await api("/api/repartition");
+      pubRep.error = null;
+    } catch (err) {
+      pubRep.error = err;
+    } finally {
+      pubRep.loading = null;
+      pubRep.at = Date.now();
+    }
+    if (currentScreen === "publish") renderCurrent();
+  })();
+  return pubRep.loading;
+}
+
+const repClock = (iso) => new Date(iso).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit", timeZone: PUB_TZ });
+const repInstant = (iso) => new Date(iso).getTime();
+const repSplit = (key) => { const i = key.lastIndexOf("|"); return [key.slice(0, i), key.slice(i + 1)]; };
+
+/* Les lignes du compte et, entre elles, ses créneaux restés sans clip (« aucun clip disponible »), par heure. */
+function repRows(account) {
+  const taken = new Set(account.lines.map((l) => repInstant(l.slot_at)));
+  const rows = account.lines.map((line, index) => ({ at: repInstant(line.slot_at), line, index }));
+  (account.slots || []).forEach((slot) => { if (!taken.has(repInstant(slot.slot_at))) rows.push({ at: repInstant(slot.slot_at), slot }); });
+  return rows.sort((a, b) => a.at - b.at);
+}
+
+function repScore(l) {
+  if (typeof l.score !== "number") return `<span class="muted">sans score</span>`;
+  const bonus = typeof l.bonus === "number" && l.bonus !== 0 ? ` <span class="rep-bonus">${l.bonus > 0 ? "+" : "−"}${fr(Math.abs(l.bonus), 1)}</span>` : "";
+  return `<span class="rep-score"${l.bonus_reason ? ` title="${esc(l.bonus_reason)}"` : ""}>${fr(l.score, 1)}${bonus}</span>`;
+}
+
+function repClipSelect(d, account, key, usedKey) {
+  const used = new Set(d.accounts.flatMap((a) => a.lines.map(pubKey)));
+  const options = (d.pool || []).filter((u) => pubKey(u) === usedKey || !used.has(pubKey(u)))
+    .map((u) => `<option value="${esc(pubKey(u))}">${esc(pubTitle(u))}${typeof u.score === "number" ? ` · ${fr(u.score, 1)}` : ""}</option>`).join("");
+  return `<select class="input rep-clip" data-rep-clip="${esc(account.account)}|${esc(key)}" aria-label="Changer le clip" ${pubRep.busy ? "disabled" : ""}><option value="">Changer le clip</option>${options}</select>`;
+}
+
+function repLineRow(d, account, row, editable) {
+  const l = row.line;
+  const where = l.game_name ? esc(l.game_name) : "jeu inconnu : VOD";
+  const badges = `${l.exploration ? `<span class="chip info">exploration</span>` : ""}${l.prime ? `<span class="chip">soir</span>` : ""}`;
+  const tools = editable ? `<div class="row wrap rep-tools">
+      ${repClipSelect(d, account, String(row.index), pubKey(l))}
+      <input type="datetime-local" class="input rep-time" data-rep-time="${esc(account.account)}|${row.index}" value="${esc(pubLocalInput(l.slot_at))}" aria-label="Changer l'heure" ${pubRep.busy ? "disabled" : ""}>
+      <button type="button" class="btn btn-xs btn-ghost" data-rep-remove="${esc(account.account)}|${row.index}" ${pubRep.busy ? "disabled" : ""}>Retirer</button></div>` : "";
+  return `<div class="list-item rep-row" data-rep-row>
+    <span class="rep-hour">${esc(repClock(l.slot_at))}</span>
+    <div class="mini-clip">${l.thumbnail_url ? `<img loading="lazy" decoding="async" width="36" height="64" src="${esc(l.thumbnail_url)}" alt="">` : ""}</div>
+    <div class="li-main grow"><div class="li-title">${esc(l.screen_title || l.title || l.clip_id)}</div>
+      <div class="li-sub muted">${repScore(l)} · ${where} ${badges}</div>
+      ${l.refusal ? `<div class="li-sub bad">${esc(l.refusal)}</div>` : ""}
+      ${l.warning ? `<div class="li-sub warn">${esc(l.warning)}</div>` : ""}
+      ${tools}</div></div>`;
+}
+
+function repEmptyRow(d, account, row, editable) {
+  const pick = editable ? repClipSelect(d, account, `@${row.slot.slot_at}`, "") : "";
+  return `<div class="list-item rep-row rep-empty" data-rep-row>
+    <span class="rep-hour">${esc(repClock(row.slot.slot_at))}</span>
+    <div class="li-main grow"><div class="li-sub muted">aucun clip disponible</div>${pick}</div></div>`;
+}
+
+function repAccountHtml(d, account, editable) {
+  const locked = (d.created || []).some((c) => c.account === account.account);
+  const can = editable && !locked;
+  const rows = repRows(account).map((row) => (row.line ? repLineRow(d, account, row, can) : repEmptyRow(d, account, row, can))).join("");
+  const notes = (account.notes || []).map((n) => `<p class="li-sub muted">${esc(n)}</p>`).join("");
+  return `<div class="rep-account"><div class="rep-account-title">${esc(account.label || account.account)}${locked ? ` <span class="chip ok">publications créées</span>` : ""}</div>
+    <div class="panel">${rows || `<p class="muted" style="padding:10px">aucun créneau</p>`}</div>${notes}</div>`;
+}
+
+function repStateChip(d) {
+  if (d.enabled === false) return `<span class="chip pending">désactivé</span>`;
+  if (d.status === "validated") return `<span class="chip ok">validé le ${esc(d.validated_at ? pubWhen(d.validated_at) : "")}</span>`;
+  if (d.status === "error") return `<span class="chip bad">erreur</span>`;
+  if (d.status === "proposed") return `<span class="chip info">proposé</span>`;
+  return `<span class="chip pending">aucun plan</span>`;
+}
+
+function repSection(body) {
+  return `<section id="pub-plan" class="rep-plan"><div class="section-title">${icon("calendar-days")}Plan de demain</div>${body}</section>`;
+}
+
+function repHtml() {
+  const d = pubRep.data;
+  if (!d) {
+    return repSection(pubRep.error ? `<p class="reason bad">Chargement impossible : ${esc(pubRep.error.message || pubRep.error)}</p>` : `<div class="skeleton skeleton-line"></div>`);
+  }
+  const head = `<div class="row wrap" style="gap:8px;align-items:center"><span class="muted">${esc(d.day ? pubFmt(d.day, { weekday: "long", day: "numeric", month: "long" }) : "")}</span>${repStateChip(d)}</div>`;
+  if (d.enabled === false) {
+    return repSection(`${head}<p class="muted" style="font-size:13px">La répartition automatique est désactivée (<code>[repartition] enabled = false</code>) : aucun plan n'est calculé.</p>`);
+  }
+  const accounts = d.accounts || [];
+  const proposed = d.status === "proposed";
+  const accepted = proposed && accounts.some((a) => a.lines.some((l) => !l.refusal));
+  const computed = d.computed_at ? `<p class="li-sub muted">calculé le ${esc(pubWhen(d.computed_at))}${d.computed_by === "web" ? " (à la demande)" : ""}</p>` : "";
+  const failure = d.status === "error" ? `<p class="reason bad">Calcul en erreur : ${esc((d.error && d.error.message) || "erreur inconnue")}</p>` : "";
+  const absent = d.status === "absent" ? `<p class="muted" style="font-size:13px">Aucun plan calculé pour ce jour : « Calculer » le prépare tout de suite (le worker le fait chaque soir).</p>` : "";
+  const last = d.last_error ? `<p class="reason bad">Dernière validation refusée : ${esc(d.last_error)}</p>` : "";
+  const canCompute = !pubRep.busy && d.status !== "validated";
+  const buttons = `<div class="row wrap" style="gap:8px;margin:8px 0">
+    <button type="button" class="btn btn-xs" data-rep-compute ${canCompute ? "" : "disabled"}>${pubRep.busy === "compute" ? "Calcul en cours…" : (d.status === "absent" ? "Calculer" : "Recalculer")}</button>
+    <button type="button" class="btn btn-xs btn-primary" data-rep-validate ${!pubRep.busy && accepted ? "" : "disabled"}>${pubRep.busy === "validate" ? "Validation en cours…" : "Valider le plan"}</button></div>`;
+  const notes = (d.notes || []).map((n) => `<p class="li-sub muted">${esc(n)}</p>`).join("");
+  return repSection(`${head}${computed}${failure}${absent}${last}${buttons}${accounts.map((a) => repAccountHtml(d, a, proposed)).join("")}${notes}`);
+}
+
+/* Une requête à la fois : pendant qu'elle court, les boutons sont désactivés et libellés « en cours ». */
+function repRun(label, errorTitle, work) {
+  if (pubRep.busy) return pubRep.busyPromise;
+  pubRep.busy = label;
+  renderCurrent();
+  pubRep.busyPromise = (async () => {
+    try {
+      await work();
+    } catch (err) {
+      toastError(errorTitle, err);
+      await repLoad();
+    } finally {
+      pubRep.busy = null;
+    }
+    renderCurrent();
+  })();
+  return pubRep.busyPromise;
+}
+
+const repCompute = () => repRun("compute", "Impossible de recalculer le plan", async () => {
+  pubRep.data = await api("/api/repartition/compute", jsonBody("POST", { day: pubRep.data && pubRep.data.day }));
+});
+
+const repValidate = () => repRun("validate", "Impossible de valider le plan", async () => {
+  if (!(await netGuard())) return;
+  const res = await api(`/api/repartition/${pubEnc(pubRep.data.day)}/validate`, { method: "POST" });
+  pubRep.data = res;
+  const n = (res.created || []).length;
+  toast({ kind: "ok", title: `${n} publication${n > 1 ? "s" : ""} créée${n > 1 ? "s" : ""}`, body: "Elles sont dans « En attente » et au calendrier.", ms: 3600 });
+  pubPosts.at = 0; pubPostsLoad();
+  pubUi.at = 0; pubLoad();
+});
+
+/* Remplace les lignes d'un compte (PUT) : le serveur redécrit chaque ligne et renvoie le plan à jour. */
+function repSave(accountId, change) {
+  const d = pubRep.data;
+  const account = d.accounts.find((a) => a.account === accountId);
+  const lines = change(account.lines.map((l) => ({ slot_at: l.slot_at, video_id: l.video_id, clip_id: l.clip_id })))
+    .sort((a, b) => repInstant(a.slot_at) - repInstant(b.slot_at));
+  return repRun("save", "Impossible de modifier le plan", async () => {
+    pubRep.data = await api(`/api/repartition/${pubEnc(d.day)}`, jsonBody("PUT", { accounts: [{ account: accountId, lines }] }));
+  });
+}
+
+const repRemove = (accountId, index) => repSave(accountId, (lines) => lines.filter((_, i) => i !== Number(index)));
+const repSetTime = (accountId, index, local) => repSave(accountId, (lines) => lines.map((l, i) => (i === Number(index) ? { ...l, slot_at: pubParisInstant(local).toISOString() } : l)));
+function repSetClip(accountId, where, clipKey) {
+  const [video_id, clip_id] = clipKey.split("/");
+  return repSave(accountId, (lines) => (where.startsWith("@")
+    ? [...lines, { slot_at: where.slice(1), video_id, clip_id }]
+    : lines.map((l, i) => (i === Number(where) ? { ...l, video_id, clip_id } : l))));
+}
+
+function repWire(body) {
+  const compute = $("[data-rep-compute]", body), validate = $("[data-rep-validate]", body);
+  if (compute) compute.onclick = () => repCompute();
+  if (validate) validate.onclick = () => repValidate();
+  $$("[data-rep-remove]", body).forEach((b) => (b.onclick = () => repRemove(...repSplit(b.dataset.repRemove))));
+  $$("[data-rep-time]", body).forEach((input) => (input.onchange = () => { if (input.value) repSetTime(...repSplit(input.dataset.repTime), input.value); }));
+  $$("[data-rep-clip]", body).forEach((select) => (select.onchange = () => { if (select.value) repSetClip(...repSplit(select.dataset.repClip), select.value); }));
+}
+/* ---------- fin Plan de demain ---------- */
 
 /* ---------- Publications pilotees : liste, statuts, modifier / annuler (SPEC-1ed3 R5) ---------- */
 
@@ -1413,6 +1597,7 @@ function pubWireTouch(body) {
 }
 
 function pubWire(body) {
+  repWire(body);
   const fresh = $("[data-pub-new]", body);
   if (fresh) fresh.onclick = () => pubOpenForm(null);
   const series = $("[data-pub-series]", body);
@@ -1479,6 +1664,7 @@ Screens.publish = {
   render(body) {
     if (!pubPosts.data && !pubPosts.loading) pubPostsLoad();
     else if (Date.now() - pubPosts.at > PUB_STALE_MS) pubPostsLoad();
+    if (!pubRep.busy && Date.now() - pubRep.at > PUB_STALE_MS) repLoad();
     if (pubUi.dragKey) return; // pas de rendu pendant un glisser-deposer
     if (pubUi.key !== pubWantedKey() || Date.now() - pubUi.at > PUB_STALE_MS) pubLoad();
     if (pubView(body)) pubWire(body);
