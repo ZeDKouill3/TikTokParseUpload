@@ -119,6 +119,7 @@ def _caption_shown(wanted: str, shown: Any) -> bool:
 
 
 _PARIS = ZoneInfo("Europe/Paris")
+_SELECTOR_STEP_MIN = 5  # pas du selecteur de minutes de TikTok (tiktok.schedule_later) : ecart maximal accepte
 
 
 def _slot_paris(slot_at: Any) -> datetime | None:
@@ -725,8 +726,9 @@ class Worker:
                     continue
                 if watch.is_due(name, settings["watch_interval_s"], now, config=self.config):
                     watch.check(name, now, lister=self.watch_lister, config=self.config)
-        except (channel_mod.ChannelError, ConfigError, watch.WatchError) as exc:
-            message = str(exc)
+        except Exception as exc:  # noqa: BLE001 - jamais un worker mort : l'echec est journalise une fois
+            message = str(exc) if isinstance(exc, (channel_mod.ChannelError, ConfigError, watch.WatchError)) \
+                else f"{type(exc).__name__} : {exc}"
             if message not in self._logged_watch_errors:
                 self._logged_watch_errors.add(message)
                 log.error("surveillance des chaines impossible : %s", message)
@@ -842,12 +844,14 @@ class Worker:
             done = self.learning_runner(datetime.now(timezone.utc), config=self.config)
             for linked in (done or {}).get("linked", []):
                 log.info("%s/%s : rattaché au post TikTok %s", linked["video_id"], linked["clip_id"], linked["post_id"])
-        except (learning.LearningError, jury_calibration.CalibrationError, tiktok.TikTokError, publish_mod.PublishError,
-                channel_mod.ChannelError, ConfigError, OSError, ValueError) as exc:
-            message = str(exc)
+        except Exception as exc:  # noqa: BLE001 - jamais un worker mort : l'echec est journalise une fois
+            message = str(exc) if isinstance(
+                exc, (learning.LearningError, jury_calibration.CalibrationError, tiktok.TikTokError,
+                      publish_mod.PublishError, channel_mod.ChannelError, ConfigError, OSError, ValueError)
+            ) else f"{type(exc).__name__} : {exc}"
             try:
-                learning.record_error(self.config, getattr(exc, "where", "run_if_due"), exc)
-            except (learning.LearningError, ConfigError, OSError, ValueError) as write_exc:
+                learning.record_error(self.config, getattr(exc, "where", "run_if_due"), learning.LearningError(message))
+            except Exception as write_exc:  # noqa: BLE001 - l'ecriture de l'erreur ne tue jamais le worker
                 log.error("erreur d'apprentissage non écrite dans sync.json : %s", write_exc)
             if message not in self._logged_learning_errors:
                 self._logged_learning_errors.add(message)
@@ -861,9 +865,10 @@ class Worker:
             if not self.config.section("repartition")["enabled"]:
                 return
             self.repartition_runner(datetime.now(timezone.utc), config=self.config)
-        except (repartition.RepartitionError, publish_mod.PublishError, accounts_mod.AccountsError,
-                tiktok.TikTokError, ConfigError, OSError, ValueError) as exc:
-            message = str(exc)
+        except Exception as exc:  # noqa: BLE001 - jamais un worker mort : l'echec est journalise une fois
+            message = str(exc) if isinstance(
+                exc, (repartition.RepartitionError, publish_mod.PublishError, accounts_mod.AccountsError,
+                      tiktok.TikTokError, ConfigError, OSError, ValueError)) else f"{type(exc).__name__} : {exc}"
             if message not in self._logged_repartition_errors:
                 self._logged_repartition_errors.add(message)
                 log.error("répartition du lendemain impossible : %s", message)
@@ -901,7 +906,8 @@ class Worker:
                     wanted = tiktok._squash(" ".join([str(sidecar.get("caption") or ""),
                                                       *map(str, sidecar.get("hashtags") or [])]))
                     where = f"{entry['video_id']}/{entry['clip_id']}"
-                    state, _ = self._caption_match(wanted, entry.get("slot_at"), posts[account].values(), where)
+                    state, _ = self._caption_match(wanted, entry.get("tiktok_publish_at") or entry.get("slot_at"),
+                                              posts[account].values(), where)
                     if state != "absent":  # trouvee, ou indecise (rien n'est conclu : pas de drapeau)
                         continue
                     note = ("programmée sur TikTok mais absente du dernier relevé de TikTok Studio : "
@@ -933,8 +939,10 @@ class Worker:
         sidecar = publish_mod.read_sidecar(self.config.output_dir, entry["video_id"], entry["clip_id"])
         wanted = tiktok._squash(" ".join([str(sidecar.get("caption") or ""), *map(str, sidecar.get("hashtags") or [])]))
         where = f"{entry['video_id']}/{entry['clip_id']}"
-        state, post = self._caption_match(wanted, entry.get("slot_at"),
-                                          [p for p in tiktok.merged_posts(history).values() if p.get("post_id")], where)
+        effective = entry.get("tiktok_publish_at")  # heure reellement programmee, connue : comparaison exacte
+        state, post = self._caption_match(wanted, effective or entry.get("slot_at"),
+                                          [p for p in tiktok.merged_posts(history).values() if p.get("post_id")], where,
+                                          tolerance_min=0 if effective else _SELECTOR_STEP_MIN)
         if state != "found" or post is None:
             return  # absente, ou indecise : rien n'est conclu (ADR-ad2e), « à vérifier » reste
         note = "programmation retrouvée dans le relevé de TikTok Studio (rapprochement automatique)"
@@ -946,7 +954,7 @@ class Worker:
                      entry["video_id"], entry["clip_id"], post["post_id"])
 
     def _caption_match(self, wanted: str, slot_at: Any, posts: Iterable[dict[str, Any]],
-                       where: str) -> tuple[str, dict[str, Any] | None]:
+                       where: str, tolerance_min: int = 0) -> tuple[str, dict[str, Any] | None]:
         """Rapprochement d'une entree a un post du releve : la legende (meme regle que ``find_post_link``) et, des
         que l'heure est connue, la date de publication egale au creneau a la minute (heure de Paris). Rend
         ``("absent", None)`` si aucun post ne porte la legende, ``("found", post)`` si un seul post verifie les
@@ -958,7 +966,9 @@ class Worker:
         slot = _slot_paris(slot_at)
         if len(candidates) == 1 and (slot is None or _posted_paris(candidates[0]) is None):
             return "found", candidates[0]
-        matches = [post for post in candidates if slot is not None and _posted_paris(post) == slot]
+        tolerance = timedelta(minutes=tolerance_min)
+        matches = [post for post in candidates if slot is not None and _posted_paris(post) is not None
+                   and abs(_posted_paris(post) - slot) <= tolerance]
         if len(matches) == 1:
             return "found", matches[0]
         if matches:
@@ -1140,7 +1150,7 @@ class Worker:
         else:
             if service == "tiktok" and result["state"] == "scheduled_on_tiktok" and not result["post_id"]:
                 # aucune preuve que le post programmé existe : jamais « publiée » (ADR-ad2e), ni reprogrammée seule
-                self._unconfirmed(entry, name, account, result["note"], paths["state_dir"])
+                self._unconfirmed(entry, name, account, result["note"], paths["state_dir"], result.get("publish_at"))
                 return True
             publish_mod.mark_published(
                 video_id, clip_id, name, state_dir=paths["state_dir"], output_dir=self.config.output_dir,
@@ -1248,7 +1258,7 @@ class Worker:
                            "capture": str(capture) if capture else None}, config=self.config)
 
     def _unconfirmed(self, entry: dict[str, Any], channel: str, account: str, note: str | None,
-                     state_dir: str | Path) -> None:
+                     state_dir: str | Path, publish_at: str | None = None) -> None:
         """Programmation TikTok sans id de post retrouve : entree ``failed`` « a verifier » (compte non arrete,
         aucune reprogrammation automatique : le post a pu partir), journal et evenement console."""
         video_id, clip_id = entry["video_id"], entry["clip_id"]
@@ -1256,7 +1266,8 @@ class Worker:
                   + (f" ({note})" if note else "")
                   + " ; vérifie TikTok Studio avant de réessayer (risque de doublon)")
         log.error("%s/%s : %s", video_id, clip_id, reason)
-        publish_mod.mark_failed(video_id, clip_id, channel, reason, halted=False, to_verify=True, state_dir=state_dir)
+        publish_mod.mark_failed(video_id, clip_id, channel, reason, halted=False, to_verify=True, state_dir=state_dir,
+                                publish_at=publish_at)
         tiktok.emit_event({"level": "error", "account": account, "channel": channel, "video_id": video_id,
                            "clip_id": clip_id, "reason": reason, "capture": None}, config=self.config)
 

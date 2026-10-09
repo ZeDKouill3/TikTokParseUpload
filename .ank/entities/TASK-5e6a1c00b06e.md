@@ -5,7 +5,7 @@ slug: worker-jamais-mort-sur-une-exception-inattendue
 title: "Worker : jamais mort sur une exception inattendue (apprentissage, répartition, surveillance) et rapprochement à la minute réellement programmée"
 created: 2026-10-09T22:43:15Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/worker.py
   - clipper/publish.py
@@ -18,6 +18,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/59a273513cd2@6bd6e53
+    tree: scope/f4580d531f43
+    criteria: 92e7cc8d4262
+    verifier: tests@c7b454d16c90
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---

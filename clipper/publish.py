@@ -574,13 +574,15 @@ def mark_failed(
     capture: str | Path | None = None,
     halted: bool = False,
     to_verify: bool = False,
+    publish_at: str | None = None,
     state_dir: str | Path | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """Echec d'une publication (SPEC-9225 R4) : statut ``failed`` avec la raison et la capture
     d'ecran ; ``halted`` arrete le compte tant que l'entree n'est pas reessayee (``retry``). ``to_verify`` :
     la programmation est partie mais sa presence sur le service n'est pas confirmee (aucun id de post) ; l'entree
-    n'est jamais « publiee » ni reprogrammee seule, l'utilisateur verifie dans Studio avant de reessayer."""
+    n'est jamais « publiee » ni reprogrammee seule, l'utilisateur verifie dans Studio avant de reessayer. `publish_at` :
+    heure effective de la programmation quand elle est connue (enregistree en `tiktok_publish_at`)."""
     path = _state_path(channel, state_dir)
     with _locked(path):
         entries = _load_entries(path)
@@ -592,6 +594,8 @@ def mark_failed(
         entry = dict(entry)
         entry.update(status="failed", error=reason, capture=str(capture) if capture else None, halted=halted,
                      failed_at=_iso(_now(now)), waiting_reason=None, in_progress_since=None, to_verify=to_verify)
+        if to_verify and publish_at:  # heure reellement programmee (arrondie par TikTok) : sert au rapprochement
+            entry["tiktok_publish_at"] = publish_at
         _upsert_entry(entries, entry)
         _save_entries(path, entries)
     return entry
