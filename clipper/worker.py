@@ -889,9 +889,16 @@ class Worker:
                 self._wait(entry, name, account, f"{blocked} : le compte n'a aucun créneau pour reporter la publication "
                            "(Comptes > Créneaux), modifie son heure ou annule-la", paths["state_dir"])
                 return False
-            moved = publish_mod.postpone(
-                video_id, clip_id, name, blocked, now=now, schedule=schedule,
-                allowed=lambda candidate: tiktok.check_limits(times, candidate, settings, tz), **scope)
+            try:
+                moved = publish_mod.postpone(
+                    video_id, clip_id, name, blocked, now=now, schedule=schedule,
+                    allowed=lambda candidate: tiktok.check_limits(times, candidate, settings, tz), **scope)
+            except publish_mod.PublishError as exc:
+                # report impossible (ex. plafond sans creneau libre) : cette entree attend avec la raison ; les
+                # autres entrees dues de ce passage sont tentees (TASK-748696ea666f), rien n'est avale
+                log.warning("%s/%s : report impossible : %s", video_id, clip_id, exc)
+                self._wait(entry, name, account, str(exc), paths["state_dir"])
+                return False
             log.warning("%s/%s : %s", video_id, clip_id, moved["postponed_reason"])
             tiktok.emit_event({"level": "warn", "account": account, **where, "reason": moved["postponed_reason"],
                                "capture": None}, config=self.config)

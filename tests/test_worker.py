@@ -1320,6 +1320,33 @@ def test_r6_a_published_post_counts_for_the_account_across_channels(tmp_path, mo
     assert pub.calls == []
 
 
+def test_a_postpone_error_on_one_due_entry_does_not_skip_the_other_due_entries(tmp_path, monkeypatch, caplog):
+    # TASK-748696ea666f : postpone leve PublishError pour la 1re entree due (plafond sans creneau libre) ;
+    # la 2e entree due, sur un autre compte, doit quand meme partir dans ce meme passage
+    config = _pub_env(tmp_path, monkeypatch, channels=("ma_chaine", "autre"),
+                      tiktok_settings={"max_posts_per_day": 1, "min_gap_minutes": 0})
+    now = _frozen_now(monkeypatch, datetime(2026, 6, 14, 12, 0, tzinfo=timezone.utc))
+    _seed(tmp_path, "ma_chaine", "00", now - timedelta(minutes=10), status="published",
+          tiktok_publish_at=(now - timedelta(minutes=5)).isoformat(), published_at=now.isoformat())
+    _seed(tmp_path, "ma_chaine", "01", now - timedelta(minutes=3))
+    _seed(tmp_path, "autre", "02", now - timedelta(minutes=2), video_id="bbbbbbbbbbb", account="ef34ab")
+
+    def no_free_slot(*args, **kwargs):
+        raise publish.PublishError("aucun créneau libre avant la fin du plafond")
+
+    monkeypatch.setattr(publish, "postpone", no_free_slot)
+    pub = FakePublisher()
+
+    with caplog.at_level(logging.WARNING):
+        _pub_worker(config, pub).tick()
+
+    assert [(c["account"], c["clip"]["caption"]) for c in pub.calls] == [("ef34ab", "legende 02")]
+    waiting = next(e for e in _entries(tmp_path) if e["clip_id"] == "01")
+    assert waiting["status"] == "scheduled"
+    assert "aucun créneau libre" in waiting["waiting_reason"]
+    assert "aucun créneau libre" in caplog.text and "01" in caplog.text
+
+
 def test_a_broken_publish_file_is_logged_once_and_does_not_kill_the_worker(tmp_path, monkeypatch, caplog):
     config = _pub_env(tmp_path, monkeypatch)
     path = tmp_path / "state" / "publish" / "ma_chaine.json"
