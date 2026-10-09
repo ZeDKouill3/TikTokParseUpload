@@ -344,7 +344,7 @@ def _pool(world: _World, active: list[dict[str, Any]], settings: dict[str, Any],
         clip = clips[key]
         sidecar = publish.read_sidecar(world.output, *key)
         own = {n.casefold() for n in (world.meta(key[0]).get("channel"), clip["style"]) if isinstance(n, str)}
-        reason = ("multi_part_series" if sidecar.get("part") is not None
+        reason = ("multi_part_series" if (sidecar.get("parts_total") or 1) > 1  # un clip seul est « 1 sur 1 »
                   else "excluded_source" if own & excluded_sources
                   else "in_processing_queue" if key[0] in queued else None)
         if reason:

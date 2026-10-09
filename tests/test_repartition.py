@@ -259,6 +259,20 @@ def test_r2_multi_part_series_are_excluded_entirely_and_counted(tmp_path):
     assert {e["video_id"] for e in plan["excluded"]} == {"V1"}
 
 
+def test_r2_single_clip_with_part_1_of_1_stays_in_the_pool(tmp_path):
+    """Un clip seul porte ``part: 1, parts_total: 1`` dans son sidecar (render) : ce n'est pas une série."""
+    config = _config(tmp_path)
+    _accounts(config, _acc("a"))
+    _clip(config, "V1", "01")
+    sidecar = Path(config.output_dir) / "V1" / "01.json"
+    sidecar.write_text(json.dumps({"ready": True, "score": 80, "part": 1, "parts_total": 1}), encoding="utf-8")
+
+    plan = _plan(config)
+
+    assert plan["pool"] == 1
+    assert plan["excluded"] == []
+
+
 def test_r2_excluded_source_by_streamer_and_by_style_case_insensitive(tmp_path):
     config = _config(tmp_path, excluded_sources=["streamerx", "STYLES"])
     _accounts(config, _acc("a"))
