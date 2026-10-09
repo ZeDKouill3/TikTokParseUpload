@@ -400,7 +400,7 @@ function repScore(l) {
 
 function repClipSelect(d, account, key, usedKey) {
   const used = new Set(d.accounts.flatMap((a) => a.lines.map(pubKey)));
-  const options = (d.pool || []).filter((u) => pubKey(u) === usedKey || !used.has(pubKey(u)))
+  const options = (account.pool || []).filter((u) => pubKey(u) === usedKey || !used.has(pubKey(u)))
     .map((u) => `<option value="${esc(pubKey(u))}">${esc(pubTitle(u))}${typeof u.score === "number" ? ` · ${fr(u.score, 1)}` : ""}</option>`).join("");
   return `<select class="input rep-clip" data-rep-clip="${esc(account.account)}|${esc(key)}" aria-label="Changer le clip" ${pubRep.busy ? "disabled" : ""}><option value="">Changer le clip</option>${options}</select>`;
 }
@@ -411,7 +411,7 @@ function repLineRow(d, account, row, editable) {
   const badges = `${l.exploration ? `<span class="chip info">exploration</span>` : ""}${l.prime ? `<span class="chip">soir</span>` : ""}`;
   const tools = editable ? `<div class="row wrap rep-tools">
       ${repClipSelect(d, account, String(row.index), pubKey(l))}
-      <input type="datetime-local" class="input rep-time" data-rep-time="${esc(account.account)}|${row.index}" value="${esc(pubLocalInput(l.slot_at))}" aria-label="Changer l'heure" ${pubRep.busy ? "disabled" : ""}>
+      <input type="datetime-local" class="input rep-time" data-rep-time="${esc(account.account)}|${row.index}" min="${esc(d.day)}T00:00" max="${esc(d.day)}T23:59" value="${esc(pubLocalInput(l.slot_at))}" aria-label="Changer l'heure" ${pubRep.busy ? "disabled" : ""}>
       <button type="button" class="btn btn-xs btn-ghost" data-rep-remove="${esc(account.account)}|${row.index}" ${pubRep.busy ? "disabled" : ""}>Retirer</button></div>` : "";
   return `<div class="list-item rep-row" data-rep-row>
     <span class="rep-hour">${esc(repClock(l.slot_at))}</span>
