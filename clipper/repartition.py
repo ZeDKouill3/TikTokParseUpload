@@ -601,7 +601,8 @@ def line_error(
         return f"{video_id}/{clip_id} : multi_part_series (partie d'une série en plusieurs parties, jamais planifiée seule)"
     for _channel, entry in entries:
         owner = entry.get("account")
-        if (entry["video_id"], entry["clip_id"]) == (video_id, clip_id) and entry["status"] == "approved"                 and owner and owner != account_id:
+        if ((entry["video_id"], entry["clip_id"]) == (video_id, clip_id) and entry["status"] == "approved"
+                and owner and owner != account_id):
             return f"{video_id}/{clip_id} est validé pour le compte {owner}, pas pour {account_id}"
     return None
 
