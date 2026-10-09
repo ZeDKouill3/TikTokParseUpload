@@ -111,6 +111,13 @@ def read_heartbeat(config: Config, now: datetime | None = None) -> dict[str, Any
     return {**out, "state": "active", "reason": None}
 
 
+def _caption_shown(wanted: str, shown: Any) -> bool:
+    """Meme regle que ``tiktok.find_post_link`` : la legende relevee (parfois tronquee) et la voulue, l'une
+    commence par l'autre."""
+    text = tiktok._squash(shown).rstrip("….").rstrip() if isinstance(shown, str) else ""
+    return bool(text and wanted and (wanted.startswith(text) or text.startswith(wanted)))
+
+
 class WorkerError(Exception):
     """Operation de file impossible en l'etat : entree inconnue, doublon en
     attente."""
@@ -633,6 +640,7 @@ class Worker:
         if not self._publish_due():
             self._stats_due()
         self._learning_due()
+        self._reconcile_scheduled()
         self._veille_due()
 
         self._prefetch_collect()
@@ -808,6 +816,51 @@ class Worker:
                 self._logged_learning_errors.add(message)
                 log.error("apprentissage impossible : %s", message)
 
+    def _reconcile_scheduled(self) -> None:
+        """Rapprochement au releve : une entree ``scheduled_on_tiktok`` sans id de post (meme apres le rattachement
+        de ``learning``) que le releve COMPLET du compte, posterieur a sa programmation, ne montre pas, est signalee
+        (``missing_on_tiktok``, note visible dans l'ecran Publication) et journalisee une seule fois. Jamais
+        reprogrammee ni modifiee autrement (ADR-ad2e : visible, pas devinee)."""
+        try:
+            state_dir = self.config.section("publish")["state_dir"]
+            watch = self.config.section("watch")
+            posts: dict[str, dict[str, dict[str, Any]]] = {}
+            last_full: dict[str, datetime | None] = {}
+            for name in [*channel_mod.list_channels(watch["presets_dir"]), publish_mod.NO_CHANNEL]:
+                for entry in publish_mod.list_entries(name, state_dir=state_dir):
+                    if (entry["status"] != "published" or entry.get("tiktok_state") != "scheduled_on_tiktok"
+                            or entry.get("post_id") or entry.get("missing_on_tiktok")):
+                        continue
+                    account = publish_mod.entry_account(entry)
+                    if not account:
+                        continue
+                    if account not in posts:
+                        history = tiktok.read_history(account, config=self.config)
+                        posts[account] = tiktok.merged_posts(history)
+                        fulls = [tiktok._naive_utc(s["fetched_at"]) for s in history if s.get("origin") == "full"]
+                        last_full[account] = max(fulls) if fulls else None
+                    done_at, seen_at = tiktok._naive_utc(entry.get("published_at")), last_full[account]
+                    if seen_at is None or done_at is None or seen_at <= done_at:
+                        continue  # aucun releve complet posterieur a la programmation : rien a conclure
+                    sidecar = publish_mod.read_sidecar(self.config.output_dir, entry["video_id"], entry["clip_id"])
+                    wanted = tiktok._squash(" ".join([str(sidecar.get("caption") or ""),
+                                                      *map(str, sidecar.get("hashtags") or [])]))
+                    if any(_caption_shown(wanted, post.get("caption")) for post in posts[account].values()):
+                        continue
+                    note = ("programmée sur TikTok mais absente du dernier relevé de TikTok Studio : "
+                            "à vérifier à la main (peut-être jamais programmée)")
+                    if publish_mod.flag_missing_on_tiktok(entry["video_id"], entry["clip_id"], name, note,
+                                                          state_dir=state_dir):
+                        log.error("%s/%s : %s", entry["video_id"], entry["clip_id"], note)
+                        tiktok.emit_event({"level": "error", "account": account, "channel": name,
+                                           "video_id": entry["video_id"], "clip_id": entry["clip_id"],
+                                           "reason": note, "capture": None}, config=self.config)
+        except Exception as exc:  # noqa: BLE001 - jamais un worker mort : l'echec est journalise une fois
+            message = f"rapprochement des programmations impossible : {type(exc).__name__} : {exc}"
+            if message not in self._logged_publish_errors:
+                self._logged_publish_errors.add(message)
+                log.error(message)
+
     def _service_settings(self, service: str, cache: dict[str, dict[str, Any]]) -> dict[str, Any]:
         """Reglages [tiktok] ou [youtube] du service d'un compte, lus (et valides) une fois par passage."""
         if service not in cache:
@@ -960,6 +1013,10 @@ class Worker:
             self._fail(entry, name, f"erreur inattendue : {type(exc).__name__} : {exc}", halted=True,
                        account=account, state_dir=paths["state_dir"])
         else:
+            if service == "tiktok" and result["state"] == "scheduled_on_tiktok" and not result["post_id"]:
+                # aucune preuve que le post programmé existe : jamais « publiée » (ADR-ad2e), ni reprogrammée seule
+                self._unconfirmed(entry, name, account, result["note"], paths["state_dir"])
+                return True
             publish_mod.mark_published(
                 video_id, clip_id, name, state_dir=paths["state_dir"], output_dir=self.config.output_dir,
                 tiktok_state=result["state"], post_url=result["post_url"], post_id=result["post_id"],
@@ -1064,6 +1121,19 @@ class Worker:
         tiktok.emit_event({"level": "error", "account": account, "channel": channel, "video_id": video_id,
                            "clip_id": clip_id, "reason": f"refusé par TikTok : {reason}",
                            "capture": str(capture) if capture else None}, config=self.config)
+
+    def _unconfirmed(self, entry: dict[str, Any], channel: str, account: str, note: str | None,
+                     state_dir: str | Path) -> None:
+        """Programmation TikTok sans id de post retrouve : entree ``failed`` « a verifier » (compte non arrete,
+        aucune reprogrammation automatique : le post a pu partir), journal et evenement console."""
+        video_id, clip_id = entry["video_id"], entry["clip_id"]
+        reason = ("programmation à vérifier : aucun post retrouvé sur TikTok après la programmation"
+                  + (f" ({note})" if note else "")
+                  + " ; vérifie TikTok Studio avant de réessayer (risque de doublon)")
+        log.error("%s/%s : %s", video_id, clip_id, reason)
+        publish_mod.mark_failed(video_id, clip_id, channel, reason, halted=False, to_verify=True, state_dir=state_dir)
+        tiktok.emit_event({"level": "error", "account": account, "channel": channel, "video_id": video_id,
+                           "clip_id": clip_id, "reason": reason, "capture": None}, config=self.config)
 
     def _fail(self, entry: dict[str, Any], channel: str, reason: str, *, halted: bool, account: str | None,
               state_dir: str | Path, capture: Path | None = None) -> None:

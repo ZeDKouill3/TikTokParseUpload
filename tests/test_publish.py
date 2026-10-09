@@ -668,6 +668,29 @@ def test_mark_failed_records_reason_capture_and_halt_then_retry_puts_it_back(iso
     assert publish.halted_account(_ACCOUNT) is None
 
 
+def test_a_to_verify_failure_is_flagged_not_halting_and_retry_clears_the_flag(isolated_cwd):
+    publish = _tiktok_env(isolated_cwd, ("01",))
+
+    entry = publish.mark_failed("vid1", "01", "ma_chaine", "programmation à vérifier", to_verify=True)
+
+    assert entry["status"] == "failed" and entry["to_verify"] is True and not entry["halted"]
+    assert publish.halted_account(_ACCOUNT) is None
+    assert publish.retry("vid1", "01", "ma_chaine")["to_verify"] is False
+
+
+def test_flag_missing_on_tiktok_only_touches_a_scheduled_entry_without_post_id_and_only_once(isolated_cwd):
+    publish = _tiktok_env(isolated_cwd, ("01", "02"))
+    publish.mark_published("vid1", "01", "ma_chaine", tiktok_state="scheduled_on_tiktok", post_url=None, post_id=None)
+    publish.mark_published("vid1", "02", "ma_chaine", tiktok_state="scheduled_on_tiktok", post_id="7300000000000000001")
+
+    assert publish.flag_missing_on_tiktok("vid1", "01", "ma_chaine", "absente du relevé") is True
+    assert publish.flag_missing_on_tiktok("vid1", "01", "ma_chaine", "absente du relevé") is False
+    assert publish.flag_missing_on_tiktok("vid1", "02", "ma_chaine", "absente du relevé") is False
+    first, second = publish.list_entries("ma_chaine")
+    assert first["missing_on_tiktok"] is True and first["post_note"] == "absente du relevé"
+    assert "missing_on_tiktok" not in second
+
+
 def test_retry_refuses_an_entry_that_did_not_fail(isolated_cwd):
     publish = _tiktok_env(isolated_cwd, ("01",))
     with pytest.raises(publish.PublishError, match="failed"):
