@@ -5,7 +5,7 @@ slug: durcissements-de-la-nuit-sse-sans-doublons-journ
 title: "Durcissements de la nuit : SSE sans doublons, journal des résultats illisible = erreur explicite, title_repair_attempts validé"
 created: 2026-10-09T00:04:51Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/web/app.py
   - clipper/learning.py
@@ -20,6 +20,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/152ce2db6165@c753e7d
+    tree: scope/ea7730e791a3
+    criteria: 473c95797415
+    verifier: tests@c7b454d16c90
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---
