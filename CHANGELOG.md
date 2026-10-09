@@ -39,6 +39,7 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 
 ### Modifié
 
+- Répartition : le bonus de source ne compte que les posts relevés d'au moins `bonus_min_age_h` heures (défaut 24, nouveau réglage `[repartition]`, validé entier >= 0 dans `_settings`), référence comprise : à 12 h un post n'a que 45-95 % de ses vues finales, et une source publiée récemment était pénalisée (ex. 100-200 vues à 1-2 h contre 2 400 à 26 h). `bonus_min_posts` passe de 2 à 3 (avec 2 posts, un seul mauvais créneau fait la médiane). `bonus_reason` dit l'âge minimal retenu. Tests CPU sans réseau dans `tests/test_repartition.py`.
 - README : captures refaites en thème clair sur la vraie console (plus de variante sombre ni de `<picture>`), vignettes, titres de VOD et noms tiers floutés ; nouveaux écrans Veille, fiche clip et bloc « Rétention à maturité » ; l'écran Comptes n'est plus montré (e-mails) ; `tests/test_readme_assets.py` n'exige plus de variantes sombres.
 - README refondu (même style, plus court) : à jour du code réel (13 étapes dont `action`, styles et formats gaming, jury et apprentissage, veille, YouTube Shorts, installeur portable) ; captures existantes gardées.
 - Veille : `extract_video_id` et `DownloadError` vivent dans `clipper/workspace.py` (module sans étape) ; `clipper/download.py` les réexporte, et la veille n'importe plus l'étape download (ADR-ca9a).

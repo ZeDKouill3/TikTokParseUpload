@@ -557,6 +557,11 @@ def test_changelog_unreleased_lists_the_5_of_5_repartition_entry():
     assert "README" in unreleased.split(marker, 1)[1].split("\n", 1)[0]
 
 
+def test_changelog_unreleased_says_the_bonus_min_age_changed():
+    unreleased = _unreleased_changelog()
+    assert "bonus_min_age_h" in unreleased and "Modifié" in unreleased
+
+
 def _load_module_from_clipper(name: str):
     sys.path.insert(0, str(ROOT))
     try:

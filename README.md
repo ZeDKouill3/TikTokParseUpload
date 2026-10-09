@@ -499,7 +499,8 @@ Réglages `[repartition]` (défauts du code, `clipper/repartition.py`) :
 | `prime_end` | `"22:00"` | fin (incluse) des créneaux du soir |
 | `exploration_per_day` | `1` | clips d'exploration au plus par jour, tous comptes confondus |
 | `bonus_window_days` | `7` | fenêtre des posts relevés qui servent au bonus |
-| `bonus_min_posts` | `2` | posts relevés d'une source au moins pour qu'elle ait un bonus |
+| `bonus_min_age_h` | `24` | âge minimal (heures) d'un post relevé pour compter dans le bonus : les vues mûrissent |
+| `bonus_min_posts` | `3` | posts relevés d'une source au moins pour qu'elle ait un bonus |
 | `bonus_points` | `5.0` | amplitude maximale du bonus, en points de score |
 
 Un réglage hors domaine (heure non `HH:MM`, `prime_end` avant `prime_start`,
