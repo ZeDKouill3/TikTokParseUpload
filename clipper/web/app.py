@@ -558,26 +558,55 @@ def _watched_state_roots(config: Config) -> list[tuple[Path, str | None]]:
     return roots
 
 
+# Sous-dossiers de state/ dont les fichiers déclenchent un événement temps réel (ce que l'interface écoute :
+# publish, watch, veille, tiktok...). Tout autre sous-dossier n'est jamais parcouru : state/browser/<compte>/ contient
+# les profils Chrome persistants (~19 000 entrées), les parcourir bloquait la boucle (TASK-40f1).
+_WATCHED_SUBDIRS = ("publish", "watch", "repartition", "veille", "learning", "tiktok", "youtube")
+
+
 def _scan_watched(workspace_root: Path, state_roots: list[tuple[Path, str | None]]) -> list[tuple[Path, str, str]]:
     found: list[tuple[Path, str, str]] = []
     if workspace_root.is_dir():
         for p in workspace_root.glob(f"*/{pipeline.STATE_FILE}"):
             found.append((p, "video", p.parent.name))
     seen: set[Path] = set()
+
+    def _add(p: Path, kind: str, id_: str) -> None:
+        if (kind, id_) == ("worker", "worker"):  # battement du worker : réécrit en continu, lu par le polling du tableau de bord
+            return
+        key = p.resolve()
+        if key not in seen:
+            seen.add(key)
+            found.append((p, kind, id_))
+
     # Racines à genre fixe d'abord : un fichier qu'elles contiennent garde ce genre, même sous la racine de la file.
     for state_root, fixed_kind in sorted(state_roots, key=lambda root: root[1] is None):
         if not state_root.is_dir():
             continue
-        for p in state_root.rglob("*.json"):
-            kind, id_ = (fixed_kind, p.stem) if fixed_kind else _state_kind_and_id(p, state_root)
-            if (kind, id_) == ("worker", "worker"):  # battement du worker : réécrit en continu, lu par le polling du tableau de bord
-                continue
-            key = p.resolve()
-            if key in seen:
-                continue
-            seen.add(key)
-            found.append((p, kind, id_))
+        if fixed_kind:  # dossier d'état nommé par les réglages : parcouru en entier
+            for p in state_root.rglob("*.json"):
+                _add(p, fixed_kind, p.stem)
+            continue
+        # Racine de la file (state/) : ses fichiers, puis seulement les sous-dossiers d'état nommés ci-dessus.
+        for p in state_root.glob("*.json"):
+            _add(p, *_state_kind_and_id(p, state_root))
+        for name in _WATCHED_SUBDIRS:
+            sub = state_root / name
+            if sub.is_dir():
+                for p in sub.rglob("*.json"):
+                    _add(p, *_state_kind_and_id(p, state_root))
     return found
+
+
+def _scan_watched_mtimes(workspace_root: Path, state_roots: list[tuple[Path, str | None]]) -> list[tuple[Path, str, str, float]]:
+    """``_scan_watched`` + mtime de chaque fichier : tout le travail disque d'un tour, destiné à un thread."""
+    out: list[tuple[Path, str, str, float]] = []
+    for p, kind, id_ in _scan_watched(workspace_root, state_roots):
+        try:
+            out.append((p, kind, id_, p.stat().st_mtime))
+        except FileNotFoundError:
+            continue
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -760,33 +789,74 @@ def _dashboard(config: Config) -> dict[str, Any]:
     return out
 
 
-async def _event_stream(config: Config) -> AsyncIterator[str]:
-    """Scrute workspace/*/pipeline.json et state/**/*.json par mtime,
-    sans broker (ADR-35b7 §4) ; un evenement {kind, id, at} par changement,
-    jamais pour l'etat deja vu a la connexion."""
-    interval = float(config.section("web")["sse_poll_interval_s"])
-    workspace_root = Path(config.workspace_dir)
-    state_roots = _watched_state_roots(config)
-    mtimes: dict[Path, float] = {}
+class _SseHub:
+    """Un seul scanner par configuration, partagé par tous les clients SSE : une tâche qui scrute hors de la boucle
+    (thread) à chaque intervalle et distribue les événements à N abonnés ; arrêtée quand plus aucun client."""
 
-    for p, _kind, _id in _scan_watched(workspace_root, state_roots):
+    def __init__(self, config: Config) -> None:
+        self.interval = float(config.section("web")["sse_poll_interval_s"])
+        self.workspace_root = Path(config.workspace_dir)
+        self.state_roots = _watched_state_roots(config)
+        self.subscribers: set[asyncio.Queue[str]] = set()
+        self.mtimes: dict[Path, float] = {}
+        self.task: asyncio.Task | None = None
+        self.ready: asyncio.Event = asyncio.Event()
+
+    async def _scan(self) -> list[tuple[Path, str, str, float]]:
+        return await asyncio.to_thread(_scan_watched_mtimes, self.workspace_root, self.state_roots)
+
+    async def _run(self) -> None:
         try:
-            mtimes[p] = p.stat().st_mtime
-        except FileNotFoundError:
-            pass
+            for p, _kind, _id, mtime in await self._scan():
+                self.mtimes[p] = mtime  # état déjà présent à la connexion : jamais d'événement
+        finally:
+            self.ready.set()
+        while True:
+            await asyncio.sleep(self.interval)
+            for p, kind, id_, mtime in await self._scan():
+                previous = self.mtimes.get(p)
+                if previous is None or mtime > previous:
+                    self.mtimes[p] = mtime
+                    chunk = f"data: {json.dumps({'kind': kind, 'id': id_, 'at': _now_iso()}, ensure_ascii=False)}\n\n"
+                    for queue in self.subscribers:
+                        queue.put_nowait(chunk)
 
-    while True:
-        await asyncio.sleep(interval)
-        for p, kind, id_ in _scan_watched(workspace_root, state_roots):
-            try:
-                mtime = p.stat().st_mtime
-            except FileNotFoundError:
-                continue
-            previous = mtimes.get(p)
-            if previous is None or mtime > previous:
-                mtimes[p] = mtime
-                event = {"kind": kind, "id": id_, "at": _now_iso()}
-                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+    async def subscribe(self) -> asyncio.Queue[str]:
+        queue: asyncio.Queue[str] = asyncio.Queue()
+        self.subscribers.add(queue)
+        if self.task is None:
+            self.task = asyncio.get_running_loop().create_task(self._run())
+        await self.ready.wait()
+        if self.task.done() and not self.task.cancelled():  # le scan a échoué : l'erreur remonte au client, pas de flux muet
+            self.subscribers.discard(queue)
+            self.task.result()
+        return queue
+
+    def unsubscribe(self, queue: asyncio.Queue[str]) -> None:
+        self.subscribers.discard(queue)
+        if not self.subscribers and self.task is not None:
+            self.task.cancel()
+            self.task = None
+
+
+_SSE_HUBS: dict[int, _SseHub] = {}
+
+
+async def _event_stream(config: Config) -> AsyncIterator[str]:
+    """Événements temps réel (ADR-35b7 §4) : workspace/*/pipeline.json et les fichiers d'état nommés de state/, par
+    mtime, sans broker ; un événement {kind, id, at} par changement, jamais pour l'état déjà vu à la connexion.
+    Le scan est partagé entre clients et tourne hors de la boucle asyncio."""
+    hub = _SSE_HUBS.get(id(config))
+    if hub is None:
+        hub = _SSE_HUBS[id(config)] = _SseHub(config)
+    queue = await hub.subscribe()
+    try:
+        while True:
+            yield await queue.get()
+    finally:
+        hub.unsubscribe(queue)
+        if not hub.subscribers:
+            _SSE_HUBS.pop(id(config), None)
 
 
 # --------------------------------------------------------------------------

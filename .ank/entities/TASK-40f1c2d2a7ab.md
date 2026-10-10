@@ -5,7 +5,7 @@ slug: web-le-temps-r-el-sse-ne-parcourt-plus-les-profi
 title: "Web : le temps réel (SSE) ne parcourt plus les profils Chrome et ne bloque plus le serveur"
 created: 2026-10-10T18:09:22Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/web/app.py
   - tests/test_web.py
@@ -15,6 +15,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: diagnose
+proof:
+  - type: test
+    ref: local/f0872c400108@8b50027
+    tree: scope/3557d144c0d7
+    criteria: 12b7298d6361
+    verifier: tests@c7b454d16c90
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---

@@ -924,6 +924,133 @@ def test_event_stream_generator_ignores_files_present_before_connecting(tmp_path
     assert got_event is False
 
 
+def _browser_profile_tree(state_dir: Path, files: int) -> None:
+    root = state_dir / "browser" / "compte" / "Default"
+    root.mkdir(parents=True)
+    for i in range(files):
+        (root / f"f{i}.json").write_text("{}", encoding="utf-8")
+
+
+def test_scan_watched_never_visits_the_browser_profiles(tmp_path, monkeypatch, isolated_cwd):
+    from clipper.web import app as web_app
+
+    state = tmp_path / "state"
+    _browser_profile_tree(state, 50)
+    (state / "queue.json").write_text("[]", encoding="utf-8")
+    (state / "publish").mkdir()
+    (state / "publish" / "chaine.json").write_text("{}", encoding="utf-8")
+    visited: list[Path] = []
+    real_rglob = Path.rglob
+    real_glob = Path.glob
+
+    def spy_rglob(self, pattern):
+        for p in real_rglob(self, pattern):
+            visited.append(p)
+            yield p
+
+    def spy_glob(self, pattern):
+        for p in real_glob(self, pattern):
+            visited.append(p)
+            yield p
+
+    monkeypatch.setattr(Path, "rglob", spy_rglob)
+    monkeypatch.setattr(Path, "glob", spy_glob)
+
+    found = web_app._scan_watched(tmp_path / "workspace", [(state, None)])
+
+    assert {(k, i) for _, k, i in found} == {("queue", "queue"), ("publish", "chaine")}
+    assert visited and not any("browser" in p.parts for p in visited)
+
+
+def test_event_stream_ignores_unnamed_state_folders_but_keeps_named_events(tmp_path, isolated_cwd):
+    import asyncio
+
+    from clipper.web.app import _event_stream
+
+    state = tmp_path / "state"
+    _browser_profile_tree(state, 5)
+    config = _sse_config(tmp_path)
+
+    async def _run() -> dict:
+        agen = _event_stream(config).__aiter__()
+
+        async def _touch() -> None:
+            await asyncio.sleep(0.15)
+            (state / "browser" / "compte" / "Default" / "nouveau.json").write_text("{}", encoding="utf-8")
+            (state / "veille").mkdir()
+            (state / "veille" / "jour.json").write_text("{}", encoding="utf-8")
+
+        asyncio.create_task(_touch())
+        chunk = await asyncio.wait_for(agen.__anext__(), timeout=2.0)
+        await agen.aclose()
+        return json.loads(chunk[len("data: "):])
+
+    assert asyncio.run(_run())["kind"] == "veille"  # jamais un événement « browser »
+
+
+def test_two_sse_clients_trigger_a_single_scan_per_interval(tmp_path, monkeypatch, isolated_cwd):
+    import asyncio
+
+    from clipper.web import app as web_app
+
+    config = _sse_config(tmp_path)
+    config._sections["web"]["sse_poll_interval_s"] = 0.3
+    scans: list[int] = []
+    real = web_app._scan_watched
+
+    def counting(*args, **kwargs):
+        scans.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(web_app, "_scan_watched", counting)
+
+    async def _run() -> tuple[str, str]:
+        a, b = web_app._event_stream(config).__aiter__(), web_app._event_stream(config).__aiter__()
+        ta = asyncio.create_task(a.__anext__())
+        tb = asyncio.create_task(b.__anext__())
+        await asyncio.sleep(0.1)  # les deux sont abonnés, baseline faite
+        baseline = len(scans)
+        (tmp_path / "state").mkdir(exist_ok=True)
+        (tmp_path / "state" / "queue.json").write_text("[]", encoding="utf-8")
+        ra, rb = await asyncio.wait_for(asyncio.gather(ta, tb), timeout=3.0)
+        assert baseline == 1  # un seul scan de départ pour deux clients
+        await a.aclose()
+        await b.aclose()
+        assert web_app._SSE_HUBS == {}  # plus aucun client : scanner arrêté et retiré
+        return ra, rb
+
+    ra, rb = asyncio.run(_run())
+    assert json.loads(ra[len("data: "):])["kind"] == "queue" and ra == rb
+
+
+def test_scan_tour_is_at_least_10x_faster_without_browser_profiles(tmp_path, isolated_cwd):
+    import time
+
+    from clipper.web import app as web_app
+
+    state = tmp_path / "state"
+    _browser_profile_tree(state, 19000)
+    (state / "queue.json").write_text("[]", encoding="utf-8")
+    for i in range(50):
+        (state / "publish").mkdir(exist_ok=True)
+        (state / "publish" / f"c{i}.json").write_text("{}", encoding="utf-8")
+
+    def tour_old() -> float:  # ancien comportement : rglob de toute la racine
+        t = time.perf_counter()
+        list(state.rglob("*.json"))
+        return time.perf_counter() - t
+
+    def tour_new() -> float:
+        t = time.perf_counter()
+        web_app._scan_watched(tmp_path / "workspace", [(state, None)])
+        return time.perf_counter() - t
+
+    old = min(tour_old() for _ in range(3))
+    new = min(tour_new() for _ in range(3))
+    print(f"MESURE tour scan : avant {old * 1000:.1f} ms, apres {new * 1000:.1f} ms")
+    assert old >= 10 * new
+
+
 # --------------------------------------------------------------------------
 # P : jeton d'acces (ADR-4f6e §5)
 # --------------------------------------------------------------------------
