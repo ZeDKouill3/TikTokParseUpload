@@ -1865,3 +1865,61 @@ def test_moment_without_jury_gives_a_stats_entry_without_perspectives(tmp_path):
     learning.sync(NOW, config=config)
 
     assert "perspectives" not in _stats_entry(config)
+
+
+# ---------------------------------------------------------------- revue des merges : jeu de seen.json, métrique avant écriture (TASK-c93eae4732c6)
+
+
+def _bd_seen(tmp_path, queued):
+    path = tmp_path / "veille" / "seen.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"queued": queued, "ignored": []}), encoding="utf-8")
+
+
+def test_queued_vod_takes_its_game_from_seen_json_when_days_are_gone(tmp_path):
+    config = _bd_config(tmp_path)  # aucun days/ : seul seen.json porte le jeu
+    _bd_seen(tmp_path, [{"candidate_id": "twitch:123", "video_id": "123", "game_name": "Jeu Q"},
+                        {"candidate_id": "twitch:456", "video_id": "v456", "game_name": "Jeu R"}])
+    _bd_meta(config, "v123")
+    _bd_meta(config, "v456")
+    _bd_row(config, "v123", "01", 500)
+    _bd_row(config, "v456", "01", 300)
+
+    games = _groups(config, "game")
+
+    assert games["Jeu Q"]["n"] == 1 and games["Jeu R"]["n"] == 1
+    assert "jeu inconnu" not in {g["label"] for g in games.values()}
+
+
+def test_seen_json_wins_over_days_for_the_same_vod(tmp_path):
+    config = _bd_config(tmp_path)
+    _bd_seen(tmp_path, [{"candidate_id": "twitch:789", "video_id": "789", "game_name": "Jeu Q"}])
+    _bd_day(tmp_path, "2026-10-05", [{"video_id": "789", "source": "twitch", "game_name": "Jeu D"}])
+    _bd_meta(config, "v789")
+    _bd_row(config, "v789", "01", 500)
+
+    assert set(_groups(config, "game")) == {"Jeu Q"}
+
+
+def test_vod_only_in_days_keeps_its_game(tmp_path):
+    config = _bd_config(tmp_path)
+    _bd_day(tmp_path, "2026-10-05", [{"video_id": "789", "source": "twitch", "game_name": "Jeu D"}])
+    _bd_meta(config, "v789")
+    _bd_row(config, "v789", "01", 500)
+
+    assert set(_groups(config, "game")) == {"Jeu D"}
+
+
+def test_absent_metric_leaves_the_existing_weights_file_untouched(tmp_path):
+    config = _config_metric(tmp_path, "watched_full")  # aucune entrée stats ne porte watched_full
+    _linked_clip(config, "03")
+    _moments(config, VIDEO, [{"id": 3, "jury": {"trace": _trace(80)}}])
+    _scored_account(config)
+    weights = tmp_path / "jury_weights.json"
+    jury_calibration.calibrate([], config=config, now=NOW)  # poids valides déjà appris (fichier réel)
+    before = weights.read_bytes()
+
+    with pytest.raises(jury_calibration.CalibrationError, match="watched_full"):
+        learning.sync(NOW, config=config)
+
+    assert weights.read_bytes() == before

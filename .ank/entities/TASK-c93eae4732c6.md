@@ -5,7 +5,7 @@ slug: apprentissage-jeu-lu-dans-seen-json-pour-ce-qui
 title: "Apprentissage : jeu lu dans seen.json pour « Ce qui marche » et métrique vérifiée avant d'écrire les poids"
 created: 2026-10-10T10:03:02Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/learning.py
   - clipper/jury_calibration.py
@@ -17,6 +17,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: diagnose
+proof:
+  - type: test
+    ref: local/e3b0c44298fc@9cebd36
+    tree: scope/80db4c5c3339
+    criteria: f70532ca55ab
+    verifier: tests@c7b454d16c90
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---

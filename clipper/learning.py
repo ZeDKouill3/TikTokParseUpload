@@ -523,15 +523,16 @@ def _calibrate(linked: list[tuple[str, str, int]], config: Config | None, now: d
             untraced += 1
         else:
             traces[(video_id, moment_id)] = {"video_id": video_id, "moment_id": moment_id, "candidate": {"trace": trace}}
-    record = jury_calibration.calibrate(list(traces.values()), config=config, now=now)
-    metric = record["stats_metric"]
+    section = config.section("jury_calibration") if config is not None else jury_calibration.CONFIG_DEFAULTS
+    metric = section["stats_metric"]
     journal = outcomes.read((config.section("outcomes") if config is not None else outcomes.CONFIG_DEFAULTS)["journal_path"])
     stats = [e for e in journal if e.get("kind") == "stats"]
     if stats and not any((e.get("stats") or {}).get(metric) is not None for e in stats):  # ADR-ad2e : jamais en silence
-        raise jury_calibration.CalibrationError(
+        raise jury_calibration.CalibrationError(  # avant tout appel qui écrit jury_weights.json
             f"[jury_calibration] stats_metric = {metric!r} : aucune des {len(stats)} entrées stats du journal ne porte "
             "cette métrique, la calibration n'a rien appris")
-    weights = (config.section("jury_calibration") if config is not None else jury_calibration.CONFIG_DEFAULTS)["weights_path"]
+    jury_calibration.calibrate(list(traces.values()), config=config, now=now)
+    weights = section["weights_path"]
     return {"at": _now_iso(now), "clips": len(traces), "untraced": untraced, "weights_path": str(weights)}
 
 
@@ -832,10 +833,20 @@ def _json_file(path: Path, what: str) -> Any:
 
 
 def _veille_days_games(config: Config | None) -> dict[str, str]:
-    """``video_id`` du worker (préfixe ``v`` pour Twitch) -> ``game_name`` des candidats de ``days/*.json``, le jour le plus récent gagnant."""
+    """``video_id`` du worker (préfixe ``v`` pour Twitch) -> ``game_name`` : ``seen.json`` queued d'abord (SPEC-6d1f,
+    SPEC-8a45 : une VOD mise en file garde son jeu même quand son jour est rejoué), puis les candidats de ``days/*.json``,
+    le plus récent gagnant. Même correspondance d'identifiant que ``repartition`` : forme brute Twitch et forme ``v<id>``."""
     sdir = Path(config.section("veille")["state_dir"] if config is not None else "state/veille")
     days = sdir / "days"
     games: dict[str, str] = {}
+    seen_path = sdir / "seen.json"
+    seen = _json_file(seen_path, "seen.json de la veille") if seen_path.exists() else {}
+    queued = seen.get("queued", []) if isinstance(seen, dict) else []
+    for item in queued if isinstance(queued, list) else []:
+        if isinstance(item, dict) and item.get("video_id") and item.get("game_name"):
+            raw = str(item["video_id"])
+            for video in (raw, raw if raw.startswith("v") else f"v{raw}"):
+                games.setdefault(video, item["game_name"])
     for path in sorted(days.glob("*.json"), reverse=True) if days.is_dir() else []:
         data = _json_file(path, "jour de la veille")
         candidates = data.get("candidates", []) if isinstance(data, dict) else []
