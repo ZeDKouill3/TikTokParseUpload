@@ -2051,7 +2051,7 @@ def test_a_scheduled_post_not_yet_online_has_an_unknown_eligibility(tmp_path, mo
 
     got = env.fetch()["posts"][0]
 
-    assert got["fyf_eligible"] is None and got["fyf_notice"] is None  # jamais devine
+    assert got.get("fyf_eligible") is None and got.get("fyf_notice") is None  # jamais devine : pas lu en detail
 
 
 def test_the_restriction_selector_matches_the_french_and_english_texts_without_generated_classes():
@@ -2797,6 +2797,32 @@ def test_two_real_fetches_where_a_post_disappears(tmp_path, monkeypatch):
 
     assert [v["post_id"] for v in tiktok.list_videos("ma_chaine", config=second.config)] == [ID_A]
     assert len(tiktok.read_history("ma_chaine", config=second.config)) == 2
+
+
+def test_a_post_seen_only_after_the_latest_full_snapshot_is_not_deleted_and_a_real_deletion_still_is(tmp_path, monkeypatch):
+    env = StatsEnv(tmp_path, monkeypatch, [])
+    opportunistic = {**_full(3, **{ID_A: {"views": 15}, ID_C: {"views": 0}}), "origin": "opportunistic", "overview": None}
+    _seed_history(env, _full(1, **{ID_A: {"views": 10}, ID_B: {"views": 20}}), _full(2, **{ID_A: {"views": 15}}), opportunistic)
+
+    history = tiktok.read_history("ma_chaine", config=env.config)
+    assert tiktok.deleted_post_ids(history) == {ID_B}  # C vu apres le dernier complet : jamais supprime
+    assert {v["post_id"] for v in tiktok.list_videos("ma_chaine", config=env.config)} == {ID_A, ID_C}
+    assert tiktok.video_detail("ma_chaine", ID_C, config=env.config)["views"] == 0  # la fiche le rend, pas « supprimee »
+    with pytest.raises(tiktok.TikTokError, match="introuvable"):
+        tiktok.video_detail("ma_chaine", ID_B, config=env.config)  # vraie suppression toujours detectee
+
+
+def test_a_scheduled_post_not_yet_online_is_listed_but_never_read_in_detail(tmp_path, monkeypatch):
+    scheduled = Post(ID_A, row=_row(ID_A, created="2026-10-02 18:00"))  # programme : apres NOW
+    env = StatsEnv(tmp_path, monkeypatch, [scheduled, Post(ID_B)])
+
+    snapshot = env.fetch()
+
+    assert analytics_url(ID_A) not in env.page.gotos()  # aucune page d'analyse ouverte pour lui
+    by_id = {p["post_id"]: p for p in snapshot["posts"]}
+    assert by_id[ID_A]["detail_not_read"] is True and "detailed_at" not in by_id[ID_A]  # pas de mesure inventee
+    assert "avg_watch_s" not in by_id[ID_A] or by_id[ID_A]["avg_watch_s"] is None
+    assert by_id[ID_B]["detailed_at"] and by_id[ID_B]["avg_watch_s"] == 12.0  # le post en ligne est lu comme avant
 
 
 # -- (5) releve opportuniste : la page Publications est deja affichee pour autre chose

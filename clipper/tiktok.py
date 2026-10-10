@@ -1269,11 +1269,13 @@ class _Flow:
         fresh, others = [], []
         within = list(rows.items()) if full else list(rows.items())[: int(self.settings["stats_detail_max"])]
         for post_id, row in within:
+            posted = _naive_utc(row.get("posted_at"))
+            if posted is not None and posted > self.now:
+                continue  # programme, pas encore en ligne : rien a lire (jamais de mesure inventee, ADR-ad2e)
             old = previous.get(post_id)
             if old is None or not old.get("detailed_at"):
                 fresh.append(post_id)
                 continue
-            posted = _naive_utc(row.get("posted_at"))
             if old.get("views") is None or (posted is not None and self.now - posted < recent):
                 others.append(post_id)
         if len(within) < len(rows):
@@ -1706,14 +1708,18 @@ def merged_posts(history: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
 
 
 def deleted_post_ids(history: list[dict[str, Any]]) -> set[str]:
-    """Posts supprimes sur TikTok : releves un jour mais absents du DERNIER releve complet (la page Publications
-    defilee en entier). Un releve opportuniste ne voit qu'une partie de la liste : il ne supprime rien ; sans releve
-    complet, rien n'est declare supprime. L'historique n'est jamais modifie (SPEC-47e2 R2)."""
+    """Posts supprimes sur TikTok : releves AVANT le DERNIER releve complet (la page Publications defilee en
+    entier) et absents de ce releve. Un post vu seulement apres le dernier complet (programme par Clipper, page
+    opportuniste) n'est jamais declare supprime. Un releve opportuniste ne voit qu'une partie de la liste : il ne
+    supprime rien ; sans releve complet, rien n'est declare supprime. L'historique n'est jamais modifie (SPEC-47e2 R2)."""
     last = _last_full(history)
     if last is None:
         return set()
+    last_at = datetime.fromisoformat(last["fetched_at"])
     shown = {post["post_id"] for post in last["posts"]}
-    return {post["post_id"] for snapshot in history for post in snapshot["posts"]} - shown
+    seen_before = {post["post_id"] for snapshot in history if datetime.fromisoformat(snapshot["fetched_at"]) <= last_at
+                   for post in snapshot["posts"]}
+    return seen_before - shown
 
 
 def _published_posts(account: str, config: Config | None) -> list[dict[str, Any]]:
