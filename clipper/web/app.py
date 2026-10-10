@@ -561,7 +561,7 @@ def _watched_state_roots(config: Config) -> list[tuple[Path, str | None]]:
 # Sous-dossiers de state/ dont les fichiers déclenchent un événement temps réel (ce que l'interface écoute :
 # publish, watch, veille, tiktok...). Tout autre sous-dossier n'est jamais parcouru : state/browser/<compte>/ contient
 # les profils Chrome persistants (~19 000 entrées), les parcourir bloquait la boucle (TASK-40f1).
-_WATCHED_SUBDIRS = ("publish", "watch", "repartition", "veille", "learning", "tiktok", "youtube")
+_WATCHED_SUBDIRS = ("publish", "watch", "repartition", "veille", "learning", "stats", "tiktok", "youtube")
 
 
 def _scan_watched(workspace_root: Path, state_roots: list[tuple[Path, str | None]]) -> list[tuple[Path, str, str]]:
