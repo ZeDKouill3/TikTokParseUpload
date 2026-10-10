@@ -383,6 +383,45 @@ def _pool(world: World, active: list[dict[str, Any]], settings: dict[str, Any], 
 # ---------------------------------------------------------------- calcul (R1-R7)
 
 
+def _take(state: dict[str, Any], slot: dict[str, Any], clip: dict[str, Any]) -> None:
+    """Pose le clip sur le créneau du compte : la ligne du plan, le créneau consommé, le compte de la source."""
+    state["free"].remove(slot)
+    state["counts"][clip["source_key"]] = state["counts"].get(clip["source_key"], 0) + 1
+    state["lines"].append({
+        "slot_at": slot["slot_at"], "video_id": clip["video_id"], "clip_id": clip["clip_id"],
+        "score": clip["score"], "bonus": clip["bonus"], "bonus_reason": clip["bonus_reason"],
+        "adjusted": clip["adjusted"], "source_key": clip["source_key"], "game_name": clip["game_name"],
+        "source_from": clip["source_from"], "exploration": clip["exploration"], "prime": slot["prime"]})
+
+
+def _reserve_exploration(states: list[dict[str, Any]], remaining: list[dict[str, Any]], settings: dict[str, Any],
+                         notes: list[str]) -> None:
+    """R6 : avant le remplissage par score, réserve min(exploration_per_day, clips d'exploration disponibles)
+    créneaux, au plus un par compte et par jour, tourniquet des comptes, sur le premier créneau hors soir de
+    chaque compte, avec le meilleur clip d'exploration qu'il peut prendre. Sans aucun créneau hors soir, rien
+    n'est réservé et une note le dit."""
+    wanted = min(int(settings["exploration_per_day"]), sum(1 for c in remaining if c["exploration"]))
+    if wanted == 0:
+        return
+    if not any(not s["prime"] for state in states for s in state["free"]):
+        notes.append("exploration : aucun créneau hors soir, aucun clip d'exploration réservé")
+        return
+    reserved = 0
+    for state in states:
+        if reserved == wanted:
+            break
+        off_peak = next((s for s in state["free"] if not s["prime"]), None)
+        clip = next((c for c in remaining if c["exploration"] and state["account"]["id"] in c["accounts"]
+                     and state["counts"].get(c["source_key"], 0) < int(settings["max_per_source"])), None)
+        if off_peak is None or clip is None:
+            continue
+        _take(state, off_peak, clip)
+        remaining.remove(clip)
+        reserved += 1
+        at = _paris(datetime.fromisoformat(off_peak["slot_at"])).strftime("%H:%M")
+        notes.append(f"exploration : {clip['video_id']}/{clip['clip_id']} sur {state['account']['label']} à {at}")
+
+
 def _build(day: date, now: datetime, settings: dict[str, Any], config: Config, computed_by: str) -> dict[str, Any]:
     world = World(config)
     notes: list[str] = []
@@ -426,8 +465,8 @@ def _build(day: date, now: datetime, settings: dict[str, Any], config: Config, c
         states.append({"account": account, "slots": slots, "free": order, "counts": counts, "lines": [],
                        "notes": slot_notes})
 
-    explorations = 0
     remaining = list(candidates)
+    _reserve_exploration(states, remaining, settings, notes)
     progressed = True
     while progressed:
         progressed = False
@@ -435,25 +474,11 @@ def _build(day: date, now: datetime, settings: dict[str, Any], config: Config, c
             if not state["free"]:
                 continue
             for clip in remaining:
-                if state["account"]["id"] not in clip["accounts"]:
+                if state["account"]["id"] not in clip["accounts"] or clip["exploration"]:
                     continue
                 if state["counts"].get(clip["source_key"], 0) >= int(settings["max_per_source"]):
                     continue
-                if clip["exploration"]:
-                    off_peak = next((s for s in state["free"] if not s["prime"]), None)
-                    if explorations >= int(settings["exploration_per_day"]) or off_peak is None:
-                        continue
-                    slot = off_peak
-                else:
-                    slot = state["free"][0]
-                state["free"].remove(slot)
-                state["counts"][clip["source_key"]] = state["counts"].get(clip["source_key"], 0) + 1
-                explorations += 1 if clip["exploration"] else 0
-                state["lines"].append({
-                    "slot_at": slot["slot_at"], "video_id": clip["video_id"], "clip_id": clip["clip_id"],
-                    "score": clip["score"], "bonus": clip["bonus"], "bonus_reason": clip["bonus_reason"],
-                    "adjusted": clip["adjusted"], "source_key": clip["source_key"], "game_name": clip["game_name"],
-                    "source_from": clip["source_from"], "exploration": clip["exploration"], "prime": slot["prime"]})
+                _take(state, state["free"][0], clip)
                 remaining.remove(clip)
                 progressed = True
                 break
