@@ -178,6 +178,10 @@ Liste régénérée depuis `ank find --type adr --status accepted` et `ank find 
 - **SPEC-df51** — veille : calendrier des sorties de jeux (IGDB, J-15..J+14),
   Steam officiel à la place de SteamDB, filtre de communauté, au plus N VOD
   par jeu.
+- **SPEC-6d1f** — répartition automatique du lendemain : plan par compte TikTok
+  calculé chaque soir, modifiable, validé d'un clic (rien ne part sans) ; bonus
+  sur posts d'au moins 24 h, exploration réservée, vivier par compte, refus
+  explicites. Succède à SPEC-78dc.
 
 ### SPEC proposée (pas encore `ank accept`)
 
