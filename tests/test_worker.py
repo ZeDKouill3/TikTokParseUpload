@@ -8,6 +8,7 @@ terminaison / orphelin) au lieu de subprocess.Popen. Aucun reseau.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import sys
@@ -18,6 +19,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from clipper import channel as channel_mod
 from clipper import pipeline, worker
 from clipper.config import Config
 
@@ -859,6 +861,44 @@ def test_heartbeat_is_rewritten_only_once_the_interval_has_passed(tmp_path, monk
     clock["t"] += 4
     w.tick()
     assert path.exists() and first
+
+
+def _locked_replace(monkeypatch, failures: int | None):
+    """os.replace vers worker.json leve PermissionError ``failures`` fois (None : toujours), comme un lecteur Windows."""
+    real = os.replace
+    calls = {"n": 0}
+
+    def fake(src, dst):
+        if Path(dst).name == "worker.json" and (failures is None or calls["n"] < failures):
+            calls["n"] += 1
+            raise PermissionError(5, "Accès refusé", str(dst))
+        return real(src, dst)
+
+    monkeypatch.setattr(os, "replace", fake)
+    monkeypatch.setattr(channel_mod.time, "sleep", lambda s: None)
+    return calls
+
+
+def test_heartbeat_retries_while_a_reader_holds_worker_json(tmp_path, monkeypatch):
+    config = _hb_config(tmp_path)
+    calls = _locked_replace(monkeypatch, failures=3)
+
+    worker.Worker(config=config, spawner=FakeSpawner(FakeProcess())).tick()
+
+    assert calls["n"] == 3
+    assert json.loads((tmp_path / "state" / "worker.json").read_text(encoding="utf-8"))["pid"] == os.getpid()
+
+
+def test_heartbeat_still_locked_skips_the_beat_without_killing_tick(tmp_path, monkeypatch, caplog):
+    config = _hb_config(tmp_path)
+    _locked_replace(monkeypatch, failures=None)
+
+    with caplog.at_level(logging.WARNING, logger=worker.log.name):
+        worker.Worker(config=config, spawner=FakeSpawner(FakeProcess())).tick()  # ne leve pas
+
+    assert not (tmp_path / "state" / "worker.json").exists()
+    assert not list((tmp_path / "state").glob("worker.json.*.tmp"))
+    assert any("battement" in r.getMessage() for r in caplog.records)
 
 
 def test_read_heartbeat_reports_active_stale_and_stopped(tmp_path):

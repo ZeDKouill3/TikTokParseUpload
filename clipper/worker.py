@@ -626,7 +626,15 @@ class Worker:
         tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
         tmp.write_text(json.dumps({"pid": os.getpid(), "at": datetime.now(timezone.utc).isoformat(), "busy": busy}),
                        encoding="utf-8")
-        os.replace(tmp, path)
+        try:
+            channel_mod.replace_retrying(tmp, path)  # un lecteur (API web) peut tenir worker.json ouvert sous Windows
+        except PermissionError as exc:
+            # 10/10 : cette erreur tuait la boucle du worker. Un battement manqué n'est qu'un retard : journalisé,
+            # le suivant réessaie au prochain tick (_last_beat inchangé).
+            tmp.unlink(missing_ok=True)
+            log.warning("battement du worker non écrit (%s verrouillé par un lecteur) : %s ; réessai au prochain tick",
+                        path, exc)
+            return
         self._last_beat = now
 
     def _recover_orphans(self) -> None:
