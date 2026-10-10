@@ -1038,3 +1038,29 @@ def test_integration_real_claude_jury():
     scores = {c["id"]: c["score"] for c in result["candidates"]}
     assert scores["fort"] > scores["faible"]
     assert all(len(c["trace"]["rounds"][0]["judges"]) == 5 for c in result["candidates"])
+
+
+# --------------------------------------------------------------------------
+# Traçabilité de la version de perspective (TASK-4e58554d15d3)
+# --------------------------------------------------------------------------
+
+
+def test_perspective_sha_is_the_12_first_hex_chars_of_sha1_of_utf8_text():
+    assert jury.perspective_sha("Évaluer le moment") == "f87084fffd75"
+
+
+def test_same_perspective_text_gives_same_sha_and_different_text_another():
+    assert jury.perspective_sha("Autre perspective") == "0bd5e25e82a2"
+    assert jury.perspective_sha("Autre perspective") == jury.perspective_sha("Autre perspective")
+    assert jury.perspective_sha("Autre perspective") != jury.perspective_sha("Évaluer le moment")
+
+
+def test_each_judge_in_the_result_carries_the_sha_of_its_perspective():
+    script = ScriptedJury({1: uniform({"secret-id-0": 7, "secret-id-1": 5, "secret-id-2": 3})})
+    result, _ = run(script)
+    judges = {j["name"]: j for j in result["judges"]}
+    assert set(judges) == set(JUDGES)
+    for name, judge in judges.items():
+        assert len(judge["perspective_sha"]) == 12
+        assert all(ch in "0123456789abcdef" for ch in judge["perspective_sha"])
+    assert len({j["perspective_sha"] for j in judges.values()}) == len(JUDGES)

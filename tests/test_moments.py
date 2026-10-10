@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from clipper import llm
+from clipper import jury, llm
 from clipper.config import Config
 from clipper.llm.fake import FakeBackend
 
@@ -2505,3 +2505,18 @@ def test_rescore_keeps_the_speech_density_malus_in_the_total():
     # Le total d'un bonus qui porte speech_density = replayed + audio + visual + speech_density (plafonne).
     old = {"replayed": 1.0, "audio_peaks": 2.0, "visual": 0.0, "speech_density": -6.0, "total": -3.0}
     assert m._rescored_bonus_total(_v2_rubric(), old, 2.0) == -1.0
+
+
+def test_moments_json_judges_carry_the_sha_of_their_perspective(tmp_path, video_dir, rubric_path):
+    # TASK-4e58554d15d3 : chaque juge de moments.json porte l'empreinte de sa perspective, jamais le texte
+    proposal = {"moments": [moment(10.25, 44.65), moment(100.25, 134.65)]}
+    notes = {2: dict.fromkeys(JUDGES, GOOD), 20: WEAK}
+    run(tmp_path, rubric_path, with_jury(proposal, jury_notes(notes)), config=auto_config(tmp_path, rubric_path))
+
+    judges = {j["name"]: j for j in read_moments(video_dir)["jury"]["judges"]}
+    configured = jury.CONFIG_DEFAULTS["judges"]
+    assert set(judges) == set(configured)
+    for name, judge in judges.items():
+        assert judge["perspective_sha"] == jury.perspective_sha(configured[name]["perspective"])
+        assert "perspective" not in judge
+    assert len({j["perspective_sha"] for j in judges.values()}) == len(judges)

@@ -358,6 +358,7 @@ def _moment(config: Config | None, video_id: str, moment_id: int, cache: dict[st
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
                 cache[video_id] = {m["id"]: m for m in data["moments"]}
+                cache[f"{video_id}#judges"] = (data.get("jury") or {}).get("judges") or []  # juges : niveau fichier
             except (OSError, ValueError, KeyError, TypeError) as exc:
                 raise LearningError(f"moments.json illisible ({path}) : {exc}") from exc
     return (cache[video_id] or {}).get(moment_id)
@@ -381,6 +382,15 @@ def _pct_watched(avg_watch_s: Any, duration: Any) -> float | None:
     if watch is None or length is None or length <= 0:
         return None
     return round(watch / length, 3)
+
+
+def _perspectives(cache: dict[str, Any], video_id: str) -> dict[str, str] | None:
+    """Empreinte de perspective par juge, lue dans moments.json (jury.judges[].perspective_sha, au niveau du
+    fichier comme l'ecrit moments.run) ; None si absente (moments.json ancien ou sans jury) : jamais inventee
+    (TASK-4e58554d15d3). ``cache`` est celui de ``_moment``, deja rempli pour ``video_id``."""
+    judges = cache.get(f"{video_id}#judges") or []
+    perspectives = {j["name"]: j["perspective_sha"] for j in judges if j.get("perspective_sha")}
+    return perspectives or None
 
 
 def _moment_source(config: Config | None, video_id: str, moment_id: int, cache: dict[str, Any]) -> str | None:
@@ -473,8 +483,12 @@ def sync(now: datetime, *, config: Config | None = None) -> dict[str, Any]:
                     "pct_watched": pct_watched,
                     "moment_source": _moment_source(config, video_id, moment_id, moments),
                 }
-                if (_moment(config, video_id, moment_id, moments) or {}).get("exploration") is True:
+                moment = _moment(config, video_id, moment_id, moments)
+                if (moment or {}).get("exploration") is True:
                     entry["exploration"] = True
+                perspectives = _perspectives(moments, video_id)
+                if perspectives is not None:
+                    entry["perspectives"] = perspectives
                 outcomes._append(entry, journal_path)
                 scored.add(key)
                 added += 1
