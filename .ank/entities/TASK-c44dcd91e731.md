@@ -5,7 +5,7 @@ slug: audit-lot-h-download-fichier-v-rifi-restes-netto
 title: "Audit lot H : download : fichier vérifié, restes nettoyés"
 created: 2026-10-10T18:25:23Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/download.py
   - clipper/workspace.py
@@ -17,6 +17,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: diagnose
+proof:
+  - type: test
+    ref: local/d30a3b149989@31d42ef
+    tree: scope/5dbac92ea40b
+    criteria: be8e216f0308
+    verifier: tests@c7b454d16c90
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---

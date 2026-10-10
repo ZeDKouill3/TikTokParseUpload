@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import glob
 import json
 import logging
 import os
@@ -17,6 +18,8 @@ log = logging.getLogger(__name__)
 SOURCE_SUFFIX = ".mp4"  # la video source telechargee : <id>.mp4
 HEAVY_FILES = ("transcribe_audio.wav",)
 HEAVY_DIRS = ("frames", "qa", "vision_resize_tmp", "render")
+# Restes de yt-dlp (<id>.mp4.part, .part-Frag*, .ytdl) et du remux (<id>.remux.mp4) : motifs relatifs a <id>.
+HEAVY_GLOBS = ("{id}.mp4.part*", "{id}.mp4.ytdl", "{id}.remux.mp4")
 PURGE_MARKER = "purged.json"
 # Publications qu'un clip de output/ attend encore (publish.UNFINISHED_STATUSES, sans importer d'etape).
 _BLOCKING_STATUSES = ("approved", "scheduled", "failed")
@@ -140,6 +143,8 @@ def heavy_paths(video_id: str, root: str | Path = "workspace") -> list[Path]:
     video_dir = Path(root) / video_id
     candidates = [video_dir / f"{video_id}{SOURCE_SUFFIX}", *(video_dir / n for n in HEAVY_FILES),
                   *(video_dir / n for n in HEAVY_DIRS)]
+    for pattern in HEAVY_GLOBS:
+        candidates.extend(sorted(video_dir.glob(pattern.format(id=glob.escape(video_id)))))
     return [p for p in candidates if p.exists()]
 
 

@@ -414,3 +414,21 @@ def test_workspace_extract_video_id_raises_workspace_download_error():
 
     with pytest.raises(DownloadError):
         extract_video_id("https://example.com/not-youtube")
+
+
+def test_purge_heavy_removes_ytdlp_part_files_and_remux_leftover(isolated_cwd):
+    from clipper import workspace as ws_mod
+
+    video_dir = isolated_cwd / "workspace" / "abc123"
+    video_dir.mkdir(parents=True)
+    leftovers = ["abc123.mp4.part", "abc123.mp4.part-Frag7", "abc123.mp4.part-Frag8.part",
+                 "abc123.mp4.ytdl", "abc123.remux.mp4"]
+    for name in leftovers:
+        (video_dir / name).write_bytes(b"x" * 10)
+    (video_dir / "meta.json").write_text("{}")
+
+    assert ws_mod.heavy_size("abc123", isolated_cwd / "workspace") == 10 * len(leftovers)
+    freed = ws_mod.purge_heavy("abc123", isolated_cwd / "workspace")
+
+    assert freed == 10 * len(leftovers)
+    assert sorted(p.name for p in video_dir.iterdir()) == ["meta.json", "purged.json"]

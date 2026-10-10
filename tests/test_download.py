@@ -5,6 +5,8 @@ from pathlib import Path
 
 import pytest
 
+from clipper.download import _probe_duration as _REAL_PROBE  # noqa: E402
+
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 
@@ -76,6 +78,19 @@ def _load_fixture(name: str) -> dict:
     return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
 
 
+_LAST_DECLARED: dict = {"duration": None}
+
+
+@pytest.fixture(autouse=True)
+def _probe_follows_declared_duration(monkeypatch):
+    """Les faux yt-dlp ecrivent des octets bidon : ffprobe est remplace par la duree annoncee de la
+    derniere video (les tests de duree reelle remplacent la sonde a leur tour)."""
+    _LAST_DECLARED["duration"] = None
+    monkeypatch.setattr(
+        "clipper.download._probe_duration", lambda path, ffprobe_bin: _LAST_DECLARED["duration"] or 10.0
+    )
+
+
 def _make_fake_ydl(info: dict, captured_opts: dict):
     """Stand-in for yt_dlp.YoutubeDL: records the opts it is built with and
     returns a pre-recorded info_dict instead of touching the network. Writes
@@ -95,6 +110,7 @@ def _make_fake_ydl(info: dict, captured_opts: dict):
 
         def extract_info(self, url, download=True):
             if download:
+                _LAST_DECLARED["duration"] = info.get("duration")
                 video_path = Path(self._opts["outtmpl"] % {"id": info["id"], "ext": "mp4"})
                 video_path.parent.mkdir(parents=True, exist_ok=True)
                 video_path.write_bytes(b"fake video bytes")
@@ -123,6 +139,7 @@ def test_download_writes_meta_json_with_full_fields(isolated_cwd):
         "title": info["title"],
         "description": info["description"],
         "duration": info["duration"],
+        "declared_duration": info["duration"],
         "channel": info["channel"],
         "language": info["language"],
         "chapters": info["chapters"],
@@ -361,6 +378,7 @@ def test_config_section_download_resolves_via_clipper_config(isolated_cwd):
         "concurrent_fragments": 8,
         "fragment_retries": 20,
         "ffmpeg_bin": "ffmpeg",
+        "ffprobe_bin": "ffprobe",
     }
 
 
@@ -726,6 +744,7 @@ def _fragmented_ydl(info: dict, make):
             return False
 
         def extract_info(self, url, download=True):
+            _LAST_DECLARED["duration"] = info.get("duration")
             path = Path(self._opts["outtmpl"] % {"id": info["id"], "ext": "mp4"})
             path.parent.mkdir(parents=True, exist_ok=True)
             make(path)
@@ -960,3 +979,166 @@ def test_fetch_thumbnail_interrupted_write_leaves_no_thumbnail_json(tmp_path, mo
         )
 
     assert not (tmp_path / "v55" / "thumbnail.json").exists()
+
+
+# --- TASK-c44dcd91e731 (audit lot H) : fichier verifie, restes nettoyes ------------------------------
+
+
+def _ydl_writing(info: dict, on_download):
+    class Ydl:
+        def __init__(self, opts):
+            self._opts = opts
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        def extract_info(self, url, download=True):
+            on_download(Path(self._opts["outtmpl"]).parent)
+            return info
+
+    return Ydl
+
+
+_URL = "https://www.youtube.com/watch?v=abcdefghijk"
+_INFO = {"id": "abcdefghijk", "webpage_url": _URL, "title": "t", "duration": 3600}
+
+
+def _probe_returns(monkeypatch, seconds: float) -> None:
+    monkeypatch.setattr("clipper.download._probe_duration", lambda path, ffprobe_bin: seconds)
+
+
+def test_download_refuses_a_file_far_shorter_than_announced_and_writes_no_meta(isolated_cwd, monkeypatch):
+    from clipper.download import DownloadError, download
+
+    _probe_returns(monkeypatch, 3.0)
+    ydl = _ydl_writing(_INFO, lambda d: (d / "abcdefghijk.mp4").write_bytes(b"x" * 100))
+
+    with pytest.raises(DownloadError, match="3600"):
+        download(_URL, isolated_cwd / "workspace", ydl_factory=ydl)
+
+    video_dir = isolated_cwd / "workspace" / "abcdefghijk"
+    assert not (video_dir / "meta.json").exists()
+    assert (video_dir / "abcdefghijk.mp4").exists()  # garde pour la reprise
+
+
+def test_download_refuses_an_empty_file(isolated_cwd, monkeypatch):
+    from clipper.download import DownloadError, download
+
+    _probe_returns(monkeypatch, 3600.0)
+    ydl = _ydl_writing(_INFO, lambda d: (d / "abcdefghijk.mp4").write_bytes(b""))
+
+    with pytest.raises(DownloadError, match="vide"):
+        download(_URL, isolated_cwd / "workspace", ydl_factory=ydl)
+
+    assert not (isolated_cwd / "workspace" / "abcdefghijk" / "meta.json").exists()
+
+
+def test_download_accepts_a_gap_within_max_5s_or_1_percent(isolated_cwd, monkeypatch):
+    from clipper.download import download
+
+    _probe_returns(monkeypatch, 3570.0)  # 30 s d'ecart : sous 1 % de 3600
+    ydl = _ydl_writing(_INFO, lambda d: (d / "abcdefghijk.mp4").write_bytes(b"x" * 100))
+
+    meta = download(_URL, isolated_cwd / "workspace", ydl_factory=ydl)
+
+    assert meta["duration"] == 3570.0
+    assert meta["declared_duration"] == 3600
+
+
+def test_download_records_the_real_duration_and_the_declared_one(isolated_cwd, monkeypatch):
+    from clipper.download import download
+
+    _probe_returns(monkeypatch, 62.5)
+    ydl = _ydl_writing({**_INFO, "duration": 60}, lambda d: (d / "abcdefghijk.mp4").write_bytes(b"x" * 100))
+
+    meta = download(_URL, isolated_cwd / "workspace", ydl_factory=ydl)
+
+    assert (meta["duration"], meta["declared_duration"]) == (62.5, 60)
+    on_disk = json.loads((isolated_cwd / "workspace" / "abcdefghijk" / "meta.json").read_text(encoding="utf-8"))
+    assert on_disk["duration"] == 62.5 and on_disk["declared_duration"] == 60
+
+
+def test_download_unreadable_file_is_an_error_not_a_pass(isolated_cwd, monkeypatch):
+    from clipper.download import DownloadError, download
+
+    def boom(path, ffprobe_bin):
+        raise DownloadError("ffprobe illisible")
+
+    monkeypatch.setattr("clipper.download._probe_duration", boom)
+    ydl = _ydl_writing(_INFO, lambda d: (d / "abcdefghijk.mp4").write_bytes(b"x" * 100))
+
+    with pytest.raises(DownloadError):
+        download(_URL, isolated_cwd / "workspace", ydl_factory=ydl)
+
+    assert not (isolated_cwd / "workspace" / "abcdefghijk" / "meta.json").exists()
+
+
+def test_download_names_the_real_container_when_it_is_not_mp4(isolated_cwd):
+    from clipper.download import DownloadError, download
+
+    ydl = _ydl_writing(_INFO, lambda d: (d / "abcdefghijk.webm").write_bytes(b"x" * 100))
+
+    with pytest.raises(DownloadError, match="webm"):
+        download(_URL, isolated_cwd / "workspace", ydl_factory=ydl)
+
+
+def test_download_without_any_output_file_is_a_download_error(isolated_cwd):
+    from clipper.download import DownloadError, download
+
+    with pytest.raises(DownloadError, match="absent"):
+        download(_URL, isolated_cwd / "workspace", ydl_factory=_ydl_writing(_INFO, lambda d: None))
+
+
+def test_download_removes_ytdlp_leftovers_after_success(isolated_cwd, monkeypatch):
+    from clipper.download import download
+
+    _probe_returns(monkeypatch, 3600.0)
+
+    def write(d: Path) -> None:
+        (d / "abcdefghijk.mp4").write_bytes(b"x" * 100)
+        (d / "abcdefghijk.mp4.part-Frag7").write_bytes(b"x" * 10)
+        (d / "abcdefghijk.mp4.part-Frag8.part").write_bytes(b"x" * 10)
+        (d / "abcdefghijk.mp4.part").write_bytes(b"x" * 10)
+        (d / "abcdefghijk.mp4.ytdl").write_text("{}")
+
+    download(_URL, isolated_cwd / "workspace", ydl_factory=_ydl_writing(_INFO, write))
+
+    names = sorted(p.name for p in (isolated_cwd / "workspace" / "abcdefghijk").iterdir())
+    assert names == ["abcdefghijk.mp4", "meta.json"]
+
+
+def test_download_keeps_leftovers_when_the_check_fails(isolated_cwd, monkeypatch):
+    from clipper.download import DownloadError, download
+
+    _probe_returns(monkeypatch, 3.0)
+
+    def write(d: Path) -> None:
+        (d / "abcdefghijk.mp4").write_bytes(b"x" * 100)
+        (d / "abcdefghijk.mp4.ytdl").write_text("{}")
+
+    with pytest.raises(DownloadError):
+        download(_URL, isolated_cwd / "workspace", ydl_factory=_ydl_writing(_INFO, write))
+
+    assert (isolated_cwd / "workspace" / "abcdefghijk" / "abcdefghijk.mp4.ytdl").exists()
+
+
+def test_config_defaults_declares_ffprobe_bin():
+    from clipper.download import CONFIG_DEFAULTS
+
+    assert CONFIG_DEFAULTS["ffprobe_bin"] == "ffprobe"
+
+
+@needs_ffmpeg
+def test_real_ffprobe_reads_the_duration_and_refuses_garbage(tmp_path):
+    from clipper.download import DownloadError
+
+    good, junk = tmp_path / "good.mp4", tmp_path / "junk.mp4"
+    _make_mp4(good, fragmented=False, seconds=3)
+    junk.write_bytes(b"fake video bytes")
+
+    assert _REAL_PROBE(good, "ffprobe") == pytest.approx(3.0, abs=0.5)
+    with pytest.raises(DownloadError):
+        _REAL_PROBE(junk, "ffprobe")
