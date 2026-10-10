@@ -625,7 +625,7 @@ def resolve_to_verify(
         if entry is None or entry["status"] != "failed" or not entry.get("to_verify"):
             return False
         entry = dict(entry)
-        publish_at = entry.get("slot_at")
+        publish_at = entry.get("tiktok_publish_at") or entry.get("slot_at")  # heure effective si connue (arrondie par TikTok)
         entry.update(status="published", published_at=_iso(_now(now)), error=None, capture=None, halted=False,
                      to_verify=False, waiting_reason=None, in_progress_since=None, tiktok_state="scheduled_on_tiktok",
                      post_url=post_url, post_id=str(post_id), tiktok_publish_at=publish_at, post_note=note,

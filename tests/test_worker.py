@@ -4186,7 +4186,9 @@ def test_a_to_verify_entry_with_the_recorded_effective_time_matches_exactly(tmp_
 
     _reconcile_worker(config).tick()
 
-    assert _entries(tmp_path, NO_CHANNEL)[0]["status"] == "published"
+    entry = _entries(tmp_path, NO_CHANNEL)[0]
+    assert entry["status"] == "published"
+    assert entry["tiktok_publish_at"] == _NINE_05.isoformat()  # l'heure effective est gardee, pas l'heure demandee
 
 
 def test_a_to_verify_gap_wider_than_the_selector_step_is_not_accepted(tmp_path, monkeypatch):
