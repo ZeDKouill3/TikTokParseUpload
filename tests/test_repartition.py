@@ -124,8 +124,8 @@ def test_r0_defaults_are_exactly_the_spec():
         "enabled": True, "state_dir": "state/repartition", "compute_time": "20:00", "posts_per_day": 6,
         "default_grid_start": "08:00", "default_grid_end": "22:00", "default_grid_gap_min": 150,
         "account_stagger_min": 30, "max_per_source": 2, "excluded_sources": [], "prime_start": "18:00",
-        "prime_end": "22:00", "exploration_per_day": 1, "bonus_window_days": 7, "bonus_min_posts": 2,
-        "bonus_points": 5.0,
+        "prime_end": "22:00", "exploration_per_day": 1, "bonus_window_days": 7, "bonus_min_age_h": 24,
+        "bonus_min_posts": 3, "bonus_points": 5.0,
     }
 
 
@@ -134,6 +134,7 @@ def test_r0_defaults_are_exactly_the_spec():
     {"default_grid_gap_min": 0}, {"max_per_source": 0}, {"prime_end": "18:00"}, {"prime_end": "17:00"},
     {"default_grid_end": "07:00"}, {"bonus_points": -1}, {"excluded_sources": "streamer"},
     {"excluded_sources": [1]}, {"bonus_window_days": 0}, {"bonus_min_posts": 0}, {"enabled": "oui"},
+    {"bonus_min_age_h": -1}, {"bonus_min_age_h": True}, {"bonus_min_age_h": "24"},
 ])
 def test_r0_invalid_setting_is_refused_not_corrected(tmp_path, override):
     config = _config(tmp_path, **override)
@@ -382,11 +383,13 @@ def _posted(config, video, game, post_id):
 def test_r4_bonus_from_real_medians_only_and_ranks_the_clips(tmp_path):
     config = _config(tmp_path)
     _accounts(config, _acc("a"))
-    for video, game, ids in (("H1", "fort", ("p1", "p2")), ("H2", "faible", ("p3", "p4"))):
+    for video, game, ids in (("H1", "fort", ("p1", "p2", "p5")), ("H2", "faible", ("p3", "p4", "p6"))):
         for i, pid in enumerate(ids):
             _clip(config, f"{video}{i}", "01", game=game, ready=False, post_id=pid)
     _snapshot(config, "a", ("p1", "2026-10-05T12:00:00", 12000), ("p2", "2026-10-06T12:00:00", 12000),
+              ("p5", "2026-10-06T12:30:00", 12000),
               ("p3", "2026-10-05T13:00:00", 3000), ("p4", "2026-10-06T13:00:00", 3000),
+              ("p6", "2026-10-06T13:30:00", 3000),
               ("p9", "2026-10-06T14:00:00", 99999),  # non relie a un clip : ignore
               ("p8", "2026-09-01T14:00:00", 50))  # hors fenetre
     _clip(config, "PF", "01", game="fort", score=70)
@@ -397,19 +400,19 @@ def test_r4_bonus_from_real_medians_only_and_ranks_the_clips(tmp_path):
     strong, weak = _line_for(plan, "a", "PF"), _line_for(plan, "a", "PW")
     assert strong["bonus"] == pytest.approx(3.0) and weak["bonus"] == pytest.approx(-3.0)
     assert strong["adjusted"] == pytest.approx(73.0) and weak["adjusted"] == pytest.approx(69.0)
-    assert strong["bonus_reason"] == "2 posts, médiane 12 000 vues, référence 7 500"
+    assert strong["bonus_reason"] == "3 posts, médiane 12 000 vues, référence 7 500, posts d'au moins 24 h"
     assert _hour_of(strong) == "18:00" and _hour_of(weak) == "20:30"  # le meilleur score ajuste prend le meilleur creneau
 
 
 def test_r4_bonus_is_clamped_to_plus_or_minus_one(tmp_path):
     config = _config(tmp_path)
     _accounts(config, _acc("a"))
-    for i in range(3):
+    for i in range(5):
         _posted(config, f"L{i}", "bas", f"l{i}")
-    for i in range(2):
+    for i in range(3):
         _posted(config, f"U{i}", "haut", f"u{i}")
-    _snapshot(config, "a", *[(f"l{i}", "2026-10-05T12:00:00", 1000) for i in range(3)],
-              *[(f"u{i}", "2026-10-05T12:00:00", 100000) for i in range(2)])
+    _snapshot(config, "a", *[(f"l{i}", "2026-10-05T12:00:00", 1000) for i in range(5)],
+              *[(f"u{i}", "2026-10-05T12:00:00", 100000) for i in range(3)])
     _clip(config, "PH", "01", game="haut", score=70)
     _clip(config, "PL", "01", game="bas", score=70)
 
@@ -448,15 +451,78 @@ def test_r4_no_stats_for_the_source_or_at_all(tmp_path):
     assert "aucun relevé récent" in plan["notes"]
 
 
+def test_r4_post_younger_than_min_age_is_ignored_and_one_exactly_at_min_age_counted(tmp_path):
+    config = _config(tmp_path)
+    _accounts(config, _acc("a"))
+    for pid in ("m0", "m1", "m2", "o0", "b24", "y0"):
+        _posted(config, pid.upper(), "fort", pid)
+    _snapshot(config, "a", *[(f"m{i}", "2026-10-05T12:00:00", 12000) for i in range(3)],
+              ("o0", "2026-10-08T14:05:00", 12000),  # 30 h avant now : comptée
+              ("b24", "2026-10-08T20:05:00", 12000),  # exactement 24 h avant now : comptée (bord inclus)
+              ("y0", "2026-10-09T18:05:00", 900000))  # 2 h avant now : ignorée
+    _clip(config, "PF", "01", game="fort", score=70)
+
+    line = _line_for(_plan(config), "a", "PF")
+
+    assert line["bonus_reason"].startswith("5 posts, médiane 12 000 vues")
+
+
+def test_r4_source_with_only_young_posts_has_no_stats(tmp_path):
+    config = _config(tmp_path)
+    _accounts(config, _acc("a"))
+    for i in range(3):
+        _posted(config, f"Y{i}", "neuf", f"y{i}")
+    _snapshot(config, "a", *[(f"y{i}", "2026-10-09T18:05:00", 50000) for i in range(3)])
+    _clip(config, "PN", "01", game="neuf", score=70)
+
+    line = _line_for(_plan(config), "a", "PN")
+
+    assert line["bonus"] == 0 and line["bonus_reason"] == "no_stats"
+
+
+def test_r4_reference_is_the_median_of_mature_posts_only(tmp_path):
+    config = _config(tmp_path)
+    _accounts(config, _acc("a"))
+    for i in range(3):
+        _posted(config, f"H{i}", "fort", f"h{i}")
+        _posted(config, f"B{i}", "faible", f"b{i}")
+        _posted(config, f"J{i}", "faible", f"j{i}")
+    _snapshot(config, "a", *[(f"h{i}", "2026-10-05T12:00:00", 12000) for i in range(3)],
+              *[(f"b{i}", "2026-10-05T12:00:00", 3000) for i in range(3)],
+              *[(f"j{i}", "2026-10-09T18:05:00", 900000) for i in range(3)])  # jeunes : hors référence
+    _clip(config, "PF", "01", game="fort", score=70)
+
+    line = _line_for(_plan(config), "a", "PF")
+
+    assert line["bonus_reason"] == "3 posts, médiane 12 000 vues, référence 7 500, posts d'au moins 24 h"
+
+
+def test_r4_bonus_reason_says_the_min_age_kept(tmp_path):
+    config = _config(tmp_path, bonus_min_age_h=6)
+    _accounts(config, _acc("a"))
+    for pid in ("m0", "m1", "m2", "y0"):
+        _posted(config, pid.upper(), "fort", pid)
+    _snapshot(config, "a", *[(f"m{i}", "2026-10-05T12:00:00", 12000) for i in range(3)],
+              ("y0", "2026-10-09T16:05:00", 900000))  # 4 h avant now : ignorée avec un minimum de 6 h
+    _clip(config, "PF", "01", game="fort", score=70)
+
+    line = _line_for(_plan(config), "a", "PF")
+
+    assert line["bonus_reason"] == "3 posts, médiane 12 000 vues, référence 12 000, posts d'au moins 6 h"
+
+
 def test_r4_stats_of_other_accounts_count_for_a_game(tmp_path):
     config = _config(tmp_path)
     _accounts(config, _acc("a"), _acc("b"))
-    for i in range(2):
+    for i in range(3):
         _posted(config, f"H{i}", "fort", f"p{i}")
     _posted(config, "H9", "faible", "p9")
     _posted(config, "H8", "faible", "p8")
+    _posted(config, "H7", "faible", "p7")
     _snapshot(config, "b", ("p0", "2026-10-05T12:00:00", 12000), ("p1", "2026-10-05T12:00:00", 12000),
-              ("p9", "2026-10-05T12:00:00", 3000), ("p8", "2026-10-05T12:00:00", 3000))
+              ("p2", "2026-10-05T12:00:00", 12000),
+              ("p9", "2026-10-05T12:00:00", 3000), ("p8", "2026-10-05T12:00:00", 3000),
+              ("p7", "2026-10-05T12:00:00", 3000))
     _clip(config, "PF", "01", game="fort", score=70)
 
     plan = _plan(config)
@@ -826,9 +892,9 @@ def test_public_read_settings_refuses_an_out_of_domain_value(tmp_path):
 def test_public_source_bonus_is_the_median_ratio_with_its_reason():
     settings = repartition.read_settings(None)
 
-    bonus, reason = repartition.source_bonus("jeu:fort", {"jeu:fort": [200, 200]}, [200, 200, 100, 100], settings)
+    bonus, reason = repartition.source_bonus("jeu:fort", {"jeu:fort": [200, 200, 200]}, [200, 200, 100, 100], settings)
 
-    assert (bonus, reason) == (1.67, "2 posts, médiane 200 vues, référence 150")
+    assert (bonus, reason) == (1.67, "3 posts, médiane 200 vues, référence 150, posts d'au moins 24 h")
 
 
 def test_public_source_bonus_without_posts_is_zero_and_says_why():

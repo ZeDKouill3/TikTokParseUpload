@@ -39,7 +39,8 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "prime_end": "22:00",  # fin (incluse) des creneaux du soir
     "exploration_per_day": 1,  # clips d'exploration au plus par jour, tous comptes confondus
     "bonus_window_days": 7,  # fenetre des posts releves qui servent au bonus d'une source
-    "bonus_min_posts": 2,  # posts releves d'une source au moins pour qu'elle ait un bonus
+    "bonus_min_age_h": 24,  # age minimal (heures) d'un post releve pour compter : les vues mûrissent
+    "bonus_min_posts": 3,  # posts releves d'une source au moins pour qu'elle ait un bonus
     "bonus_points": 5.0,  # amplitude maximale du bonus, en points de score
 }
 
@@ -83,8 +84,8 @@ def _settings(config: Config | None) -> dict[str, Any]:
     for key in ("compute_time", "default_grid_start", "default_grid_end", "prime_start", "prime_end"):
         _minutes(settings, key)
     for key, minimum in (("posts_per_day", 1), ("default_grid_gap_min", 1), ("max_per_source", 1),
-                         ("bonus_window_days", 1), ("bonus_min_posts", 1), ("account_stagger_min", 0),
-                         ("exploration_per_day", 0)):
+                         ("bonus_window_days", 1), ("bonus_min_age_h", 0), ("bonus_min_posts", 1),
+                         ("account_stagger_min", 0), ("exploration_per_day", 0)):
         _integer(settings, key, minimum)
     if _minutes(settings, "prime_end") <= _minutes(settings, "prime_start"):
         raise RepartitionError(
@@ -304,6 +305,7 @@ def source_stats(world: World, active: list[dict[str, Any]], now: datetime, sett
         if isinstance(post, dict) and post.get("id"):
             linked[str(post["id"])] = path.parent.name
     since = now - timedelta(days=int(settings["bonus_window_days"]))
+    mature = now - timedelta(hours=int(settings["bonus_min_age_h"]))  # un post plus recent n'a pas encore ses vues finales
     by_source: dict[str, list[float]] = {}
     every: list[float] = []
     seen: set[str] = set()
@@ -317,7 +319,7 @@ def source_stats(world: World, active: list[dict[str, Any]], now: datetime, sett
                 posted = _paris(datetime.fromisoformat(stamp)) if isinstance(stamp, str) else None
             except ValueError:
                 posted = None
-            if posted is None or not since <= posted <= now:
+            if posted is None or not since <= posted <= mature:
                 continue
             seen.add(post_id)
             by_source.setdefault(world.source(linked[post_id])["source_key"], []).append(views)
@@ -337,7 +339,8 @@ def source_bonus(
     median, reference = statistics.median(mine), statistics.median(every)
     ratio = max(-1.0, min(1.0, median / reference - 1)) if reference > 0 else 0.0
     return (round(float(settings["bonus_points"]) * ratio, 2),
-            f"{len(mine)} posts, médiane {_fmt(median)} vues, référence {_fmt(reference)}")
+            f"{len(mine)} posts, médiane {_fmt(median)} vues, référence {_fmt(reference)}, "
+            f"posts d'au moins {int(settings['bonus_min_age_h'])} h")
 
 
 def _pool(world: World, active: list[dict[str, Any]], settings: dict[str, Any], notes: list[str]) -> tuple[
