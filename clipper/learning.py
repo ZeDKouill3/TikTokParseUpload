@@ -458,6 +458,7 @@ def sync(now: datetime, *, config: Config | None = None) -> dict[str, Any]:
             elif key not in scored:
                 fetched, fetched_at, at_maturity, posted = seen.mature[post_id]
                 row = seen.latest[post_id]
+                pct_watched = _pct_watched(row.get("avg_watch_s"), sidecar.get("duration"))
                 entry = {
                     "kind": "stats", "video_id": video_id, "clip_id": clip_id, "moment_id": moment_id, "post_id": post_id,
                     "account": account, "posted_at": row.get("posted_at"), "fetched_at": fetched_at,
@@ -465,10 +466,11 @@ def sync(now: datetime, *, config: Config | None = None) -> dict[str, Any]:
                     "stats": {"views": row.get("views"), "views_at_maturity": at_maturity,
                               "views_percentile": seen.percentile(post_id),
                               **{k: row.get(k) for k in ("likes", "comments", "shares", "avg_watch_s", "watched_full",
-                                                         "new_followers")}},
+                                                         "new_followers")},
+                              "pct_watched": pct_watched},  # aussi dans stats : la calibration y lit sa métrique
                     "recorded_at": stamp,
                     "duration": _number(sidecar.get("duration")),
-                    "pct_watched": _pct_watched(row.get("avg_watch_s"), sidecar.get("duration")),
+                    "pct_watched": pct_watched,
                     "moment_source": _moment_source(config, video_id, moment_id, moments),
                 }
                 if (_moment(config, video_id, moment_id, moments) or {}).get("exploration") is True:
@@ -507,7 +509,14 @@ def _calibrate(linked: list[tuple[str, str, int]], config: Config | None, now: d
             untraced += 1
         else:
             traces[(video_id, moment_id)] = {"video_id": video_id, "moment_id": moment_id, "candidate": {"trace": trace}}
-    jury_calibration.calibrate(list(traces.values()), config=config, now=now)
+    record = jury_calibration.calibrate(list(traces.values()), config=config, now=now)
+    metric = record["stats_metric"]
+    journal = outcomes.read((config.section("outcomes") if config is not None else outcomes.CONFIG_DEFAULTS)["journal_path"])
+    stats = [e for e in journal if e.get("kind") == "stats"]
+    if stats and not any((e.get("stats") or {}).get(metric) is not None for e in stats):  # ADR-ad2e : jamais en silence
+        raise jury_calibration.CalibrationError(
+            f"[jury_calibration] stats_metric = {metric!r} : aucune des {len(stats)} entrées stats du journal ne porte "
+            "cette métrique, la calibration n'a rien appris")
     weights = (config.section("jury_calibration") if config is not None else jury_calibration.CONFIG_DEFAULTS)["weights_path"]
     return {"at": _now_iso(now), "clips": len(traces), "untraced": untraced, "weights_path": str(weights)}
 

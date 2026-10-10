@@ -93,7 +93,6 @@ CONFIG_DEFAULTS: dict[str, object] = {
 # des resultats (ADR-1cf0 point 5).
 EXCLUDED_JUDGES = ("conformite",)
 
-_METRIC = "views_percentile"
 _VERSION_RE = re.compile(r"^v(\d+)\.md$")
 
 
@@ -111,7 +110,7 @@ def _at(value: str) -> datetime:
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
-def _real_outcomes(journal: list[dict[str, Any]], since: datetime) -> dict[tuple[Any, Any], float]:
+def _real_outcomes(journal: list[dict[str, Any]], since: datetime, metric: str) -> dict[tuple[Any, Any], float]:
     """(video_id, moment_id) -> resultat reel (0-1) : ``views_percentile`` des
     entrees ``stats`` du journal depuis ``since`` qui portent ``video_id`` et
     ``moment_id`` (rang des vues a maturite, clipper.learning), moyenne s'il
@@ -124,7 +123,7 @@ def _real_outcomes(journal: list[dict[str, Any]], since: datetime) -> dict[tuple
             continue
         if e.get("video_id") is None or e.get("moment_id") is None:
             continue
-        percentile = (e.get("stats") or {}).get(_METRIC)
+        percentile = (e.get("stats") or {}).get(metric)
         if percentile is None:
             continue
         values[(e["video_id"], e["moment_id"])].append(float(percentile))
@@ -330,7 +329,7 @@ def propose(
     now = now or datetime.now(timezone.utc)
     since = now - timedelta(days=float(settings["window_days"]))
     journal = outcomes.read(config.section("outcomes")["journal_path"])
-    real_outcomes = _real_outcomes(journal, since)
+    real_outcomes = _real_outcomes(journal, since, config.section("jury_calibration")["stats_metric"])
     prompts_dir = Path(settings["prompts_dir"])
     min_cases = int(settings["min_cases"])
     lessons_per_call = int(settings["lessons_per_call"])
