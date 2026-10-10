@@ -5,7 +5,7 @@ slug: r-partition-web-le-vivier-de-l-cran-et-le-put-ap
 title: "Répartition web : le vivier de l'écran et le PUT appliquent aussi les exclusions R2 (sources exclues, vidéo en traitement)"
 created: 2026-10-10T02:45:16Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/repartition.py
   - clipper/web/app.py
@@ -18,6 +18,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/8b262f4e44cd@95beeb7
+    tree: scope/9c8a11fd764c
+    criteria: 6aa1d93e3fed
+    verifier: tests@c7b454d16c90
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---

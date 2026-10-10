@@ -3326,6 +3326,8 @@ def create_app(config: Config | None = None) -> FastAPI:
         choisissables par ce compte pour remplacer une ligne, sous chaque compte (``pool_size`` = le nombre de R7)."""
         base: dict[str, Any] = {"day": day, "status": "absent", "accounts": []} if plan is None else dict(plan)
         base.update(enabled=config.section("repartition")["enabled"], pool_size=None if plan is None else plan.get("pool"))
+        settings = _rep_call(repartition_mod.read_settings, config)
+        world = repartition_mod.World(config)
         accounts_out = []
         for account in base.get("accounts") or []:
             refusals = {} if base["status"] == "validated" else _rep_refusals(account["account"], account["lines"])
@@ -3333,9 +3335,7 @@ def create_app(config: Config | None = None) -> FastAPI:
                       "publish_at_paris": _paris(line["slot_at"]),
                       "refusal": refusals.get((line["video_id"], line["clip_id"])),
                       "warning": line.get("warning")} for line in account["lines"]]
-            pool = _series_units_view(repartition_mod.account_pool(
-                account["account"], workspace_dir=Path(config.workspace_dir), output_dir=Path(config.output_dir),
-                state_dir=_publish_dir(config)))
+            pool = _series_units_view(repartition_mod.account_pool(account["account"], world=world, settings=settings))
             accounts_out.append({**account, "lines": lines, "pool": pool})
         base["accounts"] = accounts_out
         return base
