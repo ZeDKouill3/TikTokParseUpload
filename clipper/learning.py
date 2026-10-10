@@ -417,7 +417,7 @@ def sync(now: datetime, *, config: Config | None = None) -> dict[str, Any]:
             if history:
                 views[account] = _Account(history, settings, now)
         excluded: list[dict[str, Any]] = []
-        linked: list[tuple[str, str, int]] = []  # clips reliés, pour la calibration
+        linked: list[tuple[str, str, int]] = []  # clips reliés ET notés, pour la calibration
         added = 0
         moments: dict[str, Any] = {}
 
@@ -447,7 +447,6 @@ def sync(now: datetime, *, config: Config | None = None) -> dict[str, Any]:
             if seen is None or post_id not in seen.latest:
                 excluded.append({**where, "reason": "not_in_stats"})
                 continue
-            linked.append((video_id, clip_id, moment_id))
             if key not in results:
                 outcomes.record(video_id, clip_id, moment_id, qa=sidecar.get("qa"), human_decision=None, path=journal_path)
                 results.add(key)
@@ -477,6 +476,8 @@ def sync(now: datetime, *, config: Config | None = None) -> dict[str, Any]:
                 outcomes._append(entry, journal_path)
                 scored.add(key)
                 added += 1
+            if key in scored:  # seul un clip qui a des statistiques compte dans la calibration (ADR-1cf0, ADR-ad2e)
+                linked.append((video_id, clip_id, moment_id))
 
         state.update(
             last_sync=stamp, snapshots=snapshots, results=sorted(results), scored=sorted(scored), excluded=excluded,

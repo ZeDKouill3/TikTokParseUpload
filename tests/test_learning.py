@@ -1704,3 +1704,35 @@ def test_run_if_due_recomputes_the_veille_report_at_once_when_a_sync_ran(tmp_pat
     learning.run_if_due(NOW + timedelta(seconds=2), config=config)
 
     assert len(calls) == 2
+
+
+def test_an_immature_clip_does_not_enter_the_calibration(tmp_path, monkeypatch):
+    config = _config(tmp_path)
+    _linked_clip(config, "03")
+    _linked_clip(config, "04", post_id=OTHER_POST)  # relié mais sans aucune statistique à maturité
+    for fetched, own in (("2026-09-21T12:00:00+00:00", 10), ("2026-09-24T12:00:00+00:00", 750), ("2026-10-10T12:00:00+00:00", 2000)):
+        _stats_snapshot(config, fetched, {**_others(range(100, 1100, 100)), POST: (CLIP_POSTED, own, {}),
+                                          OTHER_POST: ("2026-10-09T09:00:00", 5, {})})
+    seen = []
+    monkeypatch.setattr(learning, "_calibrate", lambda linked, *a, **k: seen.append(list(linked)) or {})
+
+    sync = _sync(config)
+
+    assert seen == [[(VIDEO, "03", 3)]]
+    assert {"video_id": VIDEO, "clip_id": "04", "account": ACCOUNT, "reason": "immature"} in sync["excluded"]
+
+
+def test_a_clip_already_scored_by_an_earlier_sync_stays_in_the_calibration(tmp_path, monkeypatch):
+    config = _config(tmp_path)
+    _linked_clip(config, "03")
+    _scored_account(config)
+    learning.sync(NOW, config=config)
+    _linked_clip(config, "04", post_id=OTHER_POST)  # nouveau résultat : déclenche une calibration
+    _stats_snapshot(config, "2026-10-10T12:00:00+00:00", {**_others(range(100, 1100, 100)), POST: (CLIP_POSTED, 2000, {}),
+                                                          OTHER_POST: ("2026-10-09T09:00:00", 5, {})})
+    seen = []
+    monkeypatch.setattr(learning, "_calibrate", lambda linked, *a, **k: seen.append(list(linked)) or {})
+
+    learning.sync(NOW, config=config)
+
+    assert seen == [[(VIDEO, "03", 3)]]
