@@ -523,12 +523,14 @@ def test_youtube_account_is_excluded_without_stats(tmp_path):
     assert sync["excluded"] == [{"video_id": VIDEO, "clip_id": "03", "account": "yt1", "reason": "service_without_stats"}]
 
 
-def _moments(config, video, moments, rubric=None):
+def _moments(config, video, moments, rubric=None, jury=None):
     path = Path(config.workspace_dir) / video / "moments.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     data = {"video_id": video, "moments": moments}
     if rubric is not None:
         data["rubric"] = rubric
+    if jury is not None:  # comme moments.run : le jury (juges, perspective_sha) est au niveau du fichier
+        data["jury"] = jury
     path.write_text(json.dumps(data), encoding="utf-8")
 
 
@@ -1811,3 +1813,55 @@ def test_coach_cases_carry_the_grid_that_scored_them_and_unreadable_ones_are_ski
     assert {c["rubric"]["id"] for c in cases} == {"builtin:gaming"} and len(cases) == 4
     assert [(s["video_id"], s["moment_id"]) for s in skipped] == [("autre", 99)]
     assert "rubric.path absent" in skipped[0]["reason"]
+
+
+# --------------------------------------------------------------------------
+# Version de perspective recopiée dans le journal (TASK-4e58554d15d3)
+# --------------------------------------------------------------------------
+
+
+def _judges_moments(config, judges):
+    _moments(config, VIDEO, [{"id": 3, "source": "action", "jury": {"score": 70}}], jury={"judges": judges})
+
+
+def test_stats_entry_copies_the_perspective_sha_of_each_judge(tmp_path):
+    config = _config(tmp_path)
+    _linked_clip(config, "03")
+    _sidecar_fields(config, "03", duration=24.47)
+    _judges_moments(config, [
+        {"name": "retention", "usage": "jury_retention", "model": "strong", "veto": False, "perspective_sha": "f87084fffd75"},
+        {"name": "conformite", "usage": "jury_conformite", "model": "fast", "veto": True, "perspective_sha": "0bd5e25e82a2"},
+    ])
+    _scored_account(config, avg_watch_s=13.38)
+
+    learning.sync(NOW, config=config)
+
+    assert _stats_entry(config)["perspectives"] == {"retention": "f87084fffd75", "conformite": "0bd5e25e82a2"}
+
+
+def test_moments_json_without_sha_gives_a_stats_entry_without_perspectives(tmp_path):
+    config = _config(tmp_path)
+    _linked_clip(config, "03")
+    _sidecar_fields(config, "03", duration=24.47)
+    _judges_moments(config, [
+        {"name": "retention", "usage": "jury_retention", "model": "strong", "veto": False},
+    ])
+    _scored_account(config, avg_watch_s=13.38)
+
+    learning.sync(NOW, config=config)
+
+    entry = _stats_entry(config)
+    assert "perspectives" not in entry
+    assert entry["moment_source"] == "action"
+
+
+def test_moment_without_jury_gives_a_stats_entry_without_perspectives(tmp_path):
+    config = _config(tmp_path)
+    _linked_clip(config, "03")
+    _sidecar_fields(config, "03", duration=24.47)
+    _moments(config, VIDEO, [{"id": 3, "source": "transcript"}])
+    _scored_account(config, avg_watch_s=13.38)
+
+    learning.sync(NOW, config=config)
+
+    assert "perspectives" not in _stats_entry(config)

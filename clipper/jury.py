@@ -101,6 +101,7 @@ c'est [llm] qui decide pour cet usage.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import random
@@ -215,6 +216,13 @@ def _deep_merge(base: Mapping[str, Any], top: Mapping[str, Any]) -> dict[str, An
         else:
             out[key] = value
     return out
+
+
+def perspective_sha(perspective: str) -> str:
+    """Empreinte d'une perspective : 12 premiers caracteres hexa du sha1 du texte exact (UTF-8).
+
+    Permet de dire, apres coup, quelle version d'un juge a note un moment (TASK-4e58554d15d3)."""
+    return hashlib.sha1(perspective.encode("utf-8")).hexdigest()[:12]
 
 
 def _judges(settings: dict[str, Any]) -> list[dict[str, Any]]:
@@ -783,7 +791,10 @@ def deliberate(
         )
 
     return {
-        "judges": [{k: j[k] for k in ("name", "usage", "model", "veto")} for j in judges],
+        "judges": [
+            {**{k: j[k] for k in ("name", "usage", "model", "veto")}, "perspective_sha": perspective_sha(j["perspective"])}
+            for j in judges
+        ],
         "seed": seed,
         "threshold": threshold,
         "debate_confidence_below": conf_below,
