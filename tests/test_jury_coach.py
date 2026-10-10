@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import re
@@ -270,7 +270,7 @@ def test_conformite_judge_is_never_coached(isolated_cwd):
 
 
 def real_outcomes(journal):
-    return jury_coach._real_outcomes(journal, NOW - timedelta(days=90))
+    return jury_coach._real_outcomes(journal, NOW - timedelta(days=90), "views_percentile")
 
 
 def test_published_clips_with_different_percentiles_have_different_outcomes():
@@ -331,3 +331,31 @@ def test_propose_logs_its_calls_in_the_given_usage_log_only(isolated_cwd):
     assert not video_log.exists()
     usages = {json.loads(line)["usage"] for line in own.read_text(encoding="utf-8").splitlines()}
     assert usages == {"coach", "jury_retention"}
+
+
+def test_coach_reads_the_metric_from_the_calibration_setting():
+    entry = stats_entry("v1", 0, 0.9)
+    entry["stats"]["watched_full"] = 0.2
+    out = jury_coach._real_outcomes([entry], NOW - timedelta(days=90), "watched_full")
+    assert out == {("v1", 0): pytest.approx(0.2)}
+    assert jury_coach._real_outcomes([entry], NOW - timedelta(days=90), "views_percentile") == {("v1", 0): pytest.approx(0.9)}
+
+
+def test_propose_learns_on_the_configured_metric(isolated_cwd):
+    cases = make_cases(n=6)  # views_percentile 1.0/0.0, predictions a l'envers
+    entries = Path("state/outcomes.jsonl").read_text(encoding="utf-8").splitlines()
+    rewritten = []
+    for line in entries:
+        e = json.loads(line)
+        if e["kind"] == "stats":
+            e["stats"]["watched_full"] = 1.0 - e["stats"]["views_percentile"]  # verite inversee
+        rewritten.append(json.dumps(e))
+    Path("state/outcomes.jsonl").write_text("\n".join(rewritten) + "\n", encoding="utf-8")
+    fake = FakeBackend([make_backend({"perspective": NEW_GOOD, "justification": "x"})])
+
+    with llm.use_backend(fake):
+        results = jury_coach.propose(cases, RUBRIC, {"retention": OLD_RETENTION}, config=make_config(
+            jury_calibration={"stats_metric": "watched_full"}), now=NOW)
+
+    assert results[0]["accepted"] is False  # sur watched_full, l'ancienne perspective predit deja juste
+    assert results[0]["metric"]["before"] == pytest.approx(0.0)

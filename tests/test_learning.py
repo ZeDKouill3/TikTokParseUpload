@@ -408,7 +408,7 @@ def test_sync_writes_one_result_and_one_stats_entry_per_mature_clip(tmp_path):
     assert stats["fetched_at"] == "2026-09-24T12:00:00+00:00"
     assert stats["age_days"] == pytest.approx(4.21, abs=0.01)
     assert stats["stats"] == {"views": 2000, "views_at_maturity": 750, "views_percentile": 0.7, "likes": 42, "comments": None,
-                              "shares": None, "avg_watch_s": None, "watched_full": None, "new_followers": 0}
+                              "shares": None, "avg_watch_s": None, "watched_full": None, "new_followers": 0, "pct_watched": None}
 
 
 def test_two_syncs_add_nothing_more(tmp_path):
@@ -1736,3 +1736,53 @@ def test_a_clip_already_scored_by_an_earlier_sync_stays_in_the_calibration(tmp_p
     learning.sync(NOW, config=config)
 
     assert seen == [[(VIDEO, "03", 3)]]
+
+
+# ---------------------------------------------------------------- métrique de calibration (TASK-93343051750b)
+
+
+def _config_metric(tmp_path, metric) -> Config:
+    config = _config(tmp_path)
+    config._sections["jury_calibration"]["stats_metric"] = metric
+    return config
+
+
+def test_sync_also_writes_pct_watched_into_stats_and_keeps_the_entry_key(tmp_path):
+    config = _config(tmp_path)
+    _linked_clip(config, "03")
+    _sidecar_fields(config, "03", duration=24.47)
+    _scored_account(config, avg_watch_s=13.38)
+
+    learning.sync(NOW, config=config)
+
+    stats = _stats_entry(config)
+    assert stats["stats"]["pct_watched"] == pytest.approx(0.547, abs=1e-3)
+    assert stats["pct_watched"] == stats["stats"]["pct_watched"]
+
+
+def test_calibration_on_pct_watched_ignores_no_stats_entry_after_sync(tmp_path):
+    config = _config_metric(tmp_path, "pct_watched")
+    _linked_clip(config, "03")
+    _sidecar_fields(config, "03", duration=24.47)
+    _moments(config, VIDEO, [{"id": 3, "jury": {"trace": _trace(80)}}])
+    _scored_account(config, avg_watch_s=13.38)
+
+    sync = _sync(config)
+
+    weights = _read(tmp_path / "jury_weights.json")
+    assert weights["stats_metric"] == "pct_watched"
+    assert weights["ignored_stats"] == []
+    assert sync["last_error"] is None
+
+
+def test_metric_absent_from_every_stats_entry_is_a_visible_error(tmp_path):
+    config = _config_metric(tmp_path, "watched_full")  # le relevé ne porte pas watched_full
+    _linked_clip(config, "03")
+    _moments(config, VIDEO, [{"id": 3, "jury": {"trace": _trace(80)}}])
+    _scored_account(config)
+
+    with pytest.raises(jury_calibration.CalibrationError, match="watched_full"):
+        learning.sync(NOW, config=config)
+
+    error = _read(Path(config.section("learning")["state_dir"]) / "sync.json")["last_error"]
+    assert error["where"] == "calibrate" and "watched_full" in error["message"]
