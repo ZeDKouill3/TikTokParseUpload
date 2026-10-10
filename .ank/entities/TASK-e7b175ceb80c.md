@@ -5,7 +5,7 @@ slug: tiktok-un-post-programm-vu-apr-s-le-dernier-rele
 title: "TikTok : un post programmé vu après le dernier relevé complet n'est plus « supprimé », et un post futur n'est plus lu en détail"
 created: 2026-10-09T22:52:41Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/tiktok.py
   - tests/test_tiktok.py
@@ -16,6 +16,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/8887728eecc0@fa1b0c6
+    tree: scope/c64797dad479
+    criteria: 87e769fb28e0
+    verifier: tests@c7b454d16c90
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---
