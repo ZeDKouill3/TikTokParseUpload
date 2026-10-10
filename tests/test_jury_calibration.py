@@ -473,7 +473,7 @@ def test_stats_with_video_and_moment_are_linked_directly_even_when_clip_id_repea
         for video in ("va", "vb"):
             # le meme clip_id dans les deux videos, resultats inverses entre elles
             journal.append(result_entry(video, k, f"{k:02d}", qa="passed"))
-            percentile = k / 5 if video == "va" else 1 - k / 5
+            percentile = k / 5 if video == "va" else round(1 - k / 5, 2)  # arrondi : 1 - 0.8 != 0.2 en flottant, qa ne lissait plus ce bruit
             journal.append(direct_stats(video, k, f"{k:02d}", percentile))
             scores = {"retention": 10 * k if video == "va" else 10 * (5 - k), "spectateur": 50, "monteur": 50,
                       "avocat": 50, "conformite": 50}
@@ -530,3 +530,36 @@ def test_truncated_weights_file_raises_explicit_error_naming_file(isolated_cwd):
         calibrate(scenario(), min_clips=5, weights_path="w/j.json")
 
     assert "j.json" in str(excinfo.value)
+
+
+def _percentile_stats(video_id, moment_id, clip_id, percentile):
+    return {"kind": "stats", "video_id": video_id, "clip_id": clip_id, "moment_id": moment_id,
+            "stats": {"views": 1000, "views_percentile": percentile}, "recorded_at": (NOW - timedelta(days=1)).isoformat()}
+
+
+def _ranked_fixture():
+    """A (rang 0.99) et B (0.01) scorés ; C relié mais immature : résultat qa passed, aucune statistique."""
+    write_journal([
+        result_entry("v1", 0, "a"), _percentile_stats("v1", 0, "a", 0.99),
+        result_entry("v1", 1, "b"), _percentile_stats("v1", 1, "b", 0.01),
+        result_entry("v1", 2, "c"),
+    ])
+    return [{"video_id": "v1", "moment_id": k, "candidate": candidate(
+        {"retention": s, "spectateur": 50, "monteur": 50, "avocat": 50, "conformite": 50})}
+        for k, s in ((0, 90), (1, 10), (2, 95))]
+
+
+def test_a_clip_without_stats_is_absent_from_the_platform_calibration(isolated_cwd):
+    result = calibrate(_ranked_fixture(), min_clips=2, stats_metric="views_percentile")
+
+    assert result["judges"]["retention"]["clips"] == 2
+    assert result["judges"]["retention"]["agreement"] == pytest.approx(1.0)
+
+
+def test_platform_metric_ranks_the_high_percentile_above_the_low_one(isolated_cwd):
+    from clipper import jury_calibration, outcomes
+
+    _ranked_fixture()
+    results, _ = jury_calibration._outcomes(outcomes.read("state/outcomes.jsonl"), NOW - timedelta(days=30), "views_percentile")
+
+    assert results == {("v1", 0): pytest.approx(0.99), ("v1", 1): pytest.approx(0.01)}

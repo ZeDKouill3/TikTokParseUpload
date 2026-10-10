@@ -5,7 +5,7 @@ slug: apprentissage-un-clip-publi-sans-statistique-ne
 title: "Apprentissage : un clip publié sans statistique ne compte plus comme « résultat parfait » dans la calibration du jury"
 created: 2026-10-09T22:52:42Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/learning.py
   - clipper/jury_calibration.py
@@ -18,6 +18,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/4ba84e121d43@0224aba
+    tree: scope/482f526337fe
+    criteria: 78438c027a82
+    verifier: tests@c7b454d16c90
+    via: verifier
 schema: 4
-version: 1
+version: 5
 ---

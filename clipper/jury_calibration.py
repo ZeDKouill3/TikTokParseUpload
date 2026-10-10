@@ -100,6 +100,7 @@ FIXED_JUDGES = ("conformite",)
 
 _POSITIVE_DECISIONS = ("accepted", "approved", "adjusted")
 _NEGATIVE_DECISIONS = ("rejected",)
+PLATFORM_METRICS = ("views_percentile", "pct_watched")
 _QA = {"passed": 1.0, "rejected": 0.0}
 
 
@@ -166,6 +167,7 @@ def _outcomes(
         """Entree qui porte elle-meme son video_id et son moment_id : reliee sans chercher par clip_id."""
         return e.get("video_id") is not None and e.get("moment_id") is not None
 
+    platform = metric in PLATFORM_METRICS  # le rang/la retention mesuree est le resultat : qa et decision ne diluent rien
     values: dict[tuple[Any, Any], list[float]] = defaultdict(list)
     ignored: list[dict[str, Any]] = []
     for e in journal:
@@ -186,6 +188,8 @@ def _outcomes(
                 ignored.append({"clip_id": e["clip_id"], "reason": reason, "matches": [list(m) for m in matches]})
                 continue
             key = matches[0]
+        elif platform:
+            continue  # un moment sans statistique n'a pas de resultat (un clip publie a toujours qa passed)
         else:
             key = (e["video_id"], e["moment_id"])
         values[key].extend(_signals(e, metric))
