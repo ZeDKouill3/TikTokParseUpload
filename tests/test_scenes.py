@@ -1291,3 +1291,72 @@ def test_batched_extraction_failure_names_the_timecode(isolated_cwd, long_scene_
             long_scene_video, root, "vid1", decoder="inexistant_xyz", extract_batch=8
         )
     assert not (root / "vid1" / "scenes.json").exists()
+
+
+# -- audit lot I : ecriture verifiee des images, --force propre (media-I3, media-M1) --
+
+
+def test_unwritten_keyframe_fails_the_step_and_writes_no_scenes_json(
+    isolated_cwd, tmp_path, monkeypatch
+):
+    """cv2.imwrite renvoie False sans lever (disque plein, dossier disparu) :
+    l'etape doit echouer, pas publier scenes.json qui liste une image absente."""
+    import clipper.scenes as scenes_module
+
+    monkeypatch.setattr(
+        scenes_module, "_detect_scene_list", lambda *a, **k: [(0.0, 2.0)]
+    )
+    monkeypatch.setattr(
+        scenes_module,
+        "_extract_frames",
+        lambda video_path, timecodes, *a, **k: [b"\0"] * len(timecodes),
+    )
+    monkeypatch.setattr(scenes_module.cv2, "imwrite", lambda *a, **k: False)
+
+    workspace_dir = isolated_cwd / "workspace"
+    _full_speech(workspace_dir)
+    with pytest.raises(scenes_module.ScenesError, match="ecriture impossible"):
+        scenes_module.detect_scenes(
+            tmp_path / "vid.mp4", workspace_dir, "vid1", keyframe_interval_seconds=0
+        )
+
+    assert not (workspace_dir / "vid1" / "scenes.json").exists()
+
+
+def test_force_empties_frames_dir_before_writing_new_keyframes(
+    isolated_cwd, tmp_path, monkeypatch
+):
+    """Une passe --force qui trouve moins de plans ne doit pas laisser les
+    images de la passe precedente dans frames/."""
+    import clipper.scenes as scenes_module
+
+    import numpy as np
+
+    monkeypatch.setattr(
+        scenes_module,
+        "_extract_frames",
+        lambda video_path, timecodes, *a, **k: [np.zeros((8, 8, 3), np.uint8)] * len(timecodes),
+    )
+    workspace_dir = isolated_cwd / "workspace"
+    _full_speech(workspace_dir)
+    video_path = tmp_path / "vid.mp4"
+
+    monkeypatch.setattr(
+        scenes_module, "_detect_scene_list", lambda *a, **k: [(0.0, 2.0), (2.0, 4.0)]
+    )
+    scenes_module.detect_scenes(
+        video_path, workspace_dir, "vid1", keyframe_interval_seconds=0
+    )
+    before = sorted(p.name for p in (workspace_dir / "vid1" / "frames").iterdir())
+    assert before == ["scene0000_000.jpg", "scene0001_000.jpg"]
+
+    monkeypatch.setattr(
+        scenes_module, "_detect_scene_list", lambda *a, **k: [(0.0, 4.0)]
+    )
+    result = scenes_module.detect_scenes(
+        video_path, workspace_dir, "vid1", keyframe_interval_seconds=0, force=True
+    )
+
+    after = sorted(p.name for p in (workspace_dir / "vid1" / "frames").iterdir())
+    assert [f["path"] for f in result["frames"]] == ["frames/scene0000_000.jpg"]
+    assert after == ["scene0000_000.jpg"]
