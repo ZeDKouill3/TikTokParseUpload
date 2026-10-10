@@ -5,7 +5,7 @@ slug: jury-grille-embarqu-e-builtin-gaming-v2-non-acti
 title: "Jury : grille embarquée builtin:gaming-v2 (non activée), signal mesuré speech_density, outil de rejeu hors ligne sur les posts connus"
 created: 2026-10-10T02:06:39Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/assets/rubric-gaming-v2.toml
   - clipper/moments.py
@@ -20,6 +20,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: tdd
+proof:
+  - type: test
+    ref: local/74798c152bfa@13a2e7f
+    tree: scope/474c27bc149d
+    criteria: dd433f322f74
+    verifier: tests@c7b454d16c90
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---

@@ -126,6 +126,8 @@ CONFIG_DEFAULTS: dict[str, object] = {
     # "builtin:gaming" : grille gaming embarquée (rubric-gaming.toml, SPEC-9216 ;
     # "builtin:gaming-action" : grille d'action avec seuil éliminatoire [gate]
     # (rubric-gaming-action.toml, SPEC-b0f3 ;
+    # "builtin:gaming-v2" : grille gaming v2 de l'experience A/B du jury
+    # (rubric-gaming-v2.toml, avec le signal mesure speech_density ;
     # un "builtin:<nom>" inconnu est une erreur), utile
     # sans fichier local (ex. juste après installation de la wheel, avant
     # 'clipper init'). Toute autre valeur est un chemin utilisé tel quel ;
@@ -192,6 +194,9 @@ class MomentsError(Exception):
 
 _DURATION_KEYS = ("single_min", "single_max", "part_min", "part_max", "min_parts", "max_parts", "tolerance")
 _BONUS_KEYS = ("max_total", "replayed", "audio_peaks", "audio_peaks_full", "visual")
+# Signal mesure speech_density : facultatif, mais les trois cles vont ensemble ;
+# absent, il est desactive et le bonus garde sa forme d'avant.
+_SPEECH_KEYS = ("speech_density_min_wps", "speech_density_max_first_word_s", "speech_density_malus")
 
 
 def _number(value: Any) -> bool:
@@ -204,6 +209,7 @@ _BUILTIN_RUBRICS = {
     "builtin": "rubric.toml",
     "builtin:gaming": "rubric-gaming.toml",
     "builtin:gaming-action": "rubric-gaming-action.toml",
+    "builtin:gaming-v2": "rubric-gaming-v2.toml",
 }
 
 
@@ -264,6 +270,15 @@ def load_rubric(path: str | Path) -> dict[str, Any]:
         for key in keys:
             if not _number(values.get(key)):
                 raise MomentsError(f"{path} : [{table}] {key} manquant ou invalide")
+    present = [k for k in _SPEECH_KEYS if k in rubric["bonus"]]
+    if present:
+        for key in _SPEECH_KEYS:
+            value = rubric["bonus"].get(key)
+            if not _number(value) or value < 0:
+                raise MomentsError(
+                    f"{path} : [bonus] {key} manquant ou invalide (speech_density : les trois cles "
+                    f"{', '.join(_SPEECH_KEYS)} vont ensemble, nombres >= 0)"
+                )
     categories = rubric.get("exclusions", {}).get("sponsorblock_categories")
     if not isinstance(categories, list):
         raise MomentsError(f"{path} : [exclusions] sponsorblock_categories manquant")
@@ -978,9 +993,43 @@ def _visual_bonus(start: float, end: float, vision: dict[str, Any] | None, rubri
     return float(rubric["bonus"]["visual"]) if striking else 0.0
 
 
+def _speech_density(start: float, end: float, sents: list[Sentence]) -> tuple[float, float]:
+    """(mots par seconde, delai du premier mot en secondes) du moment, depuis
+    les mots horodates des phrases ; zero mot : (0, duree)."""
+    times = sorted(t for s in sents for t, _ in s.words if start <= t < end)
+    duration = end - start
+    if not times:
+        return 0.0, duration
+    return len(times) / duration, times[0] - start
+
+
+def _speech_density_malus(
+    start: float, end: float, sents: list[Sentence] | None, rubric: dict[str, Any]
+) -> float | None:
+    """Malus (<= 0) du signal speech_density, None si la grille ne le definit
+    pas (signal desactive : aucune note ne change)."""
+    b = rubric["bonus"]
+    if "speech_density_malus" not in b:
+        return None
+    if sents is None:
+        raise MomentsError("speech_density : phrases horodatees manquantes pour le calcul du bonus")
+    wps, first = _speech_density(start, end, sents)
+    sparse = wps < b["speech_density_min_wps"] or first > b["speech_density_max_first_word_s"]
+    return -float(b["speech_density_malus"]) if sparse else 0.0
+
+
+def _rescored_bonus_total(rubric: dict[str, Any], old: dict[str, float], visual: float) -> float:
+    """Total du bonus apres nouvelle image marquante : replayed + audio + visual
+    (+ speech_density quand la grille la definit), plafonne a max_total."""
+    return min(
+        float(rubric["bonus"]["max_total"]),
+        old["replayed"] + old["audio_peaks"] + visual + old.get("speech_density", 0.0),
+    )
+
+
 def _bonus(
     start: float, end: float, meta: dict[str, Any], audio: dict[str, Any], vision: dict[str, Any] | None,
-    rubric: dict[str, Any],
+    rubric: dict[str, Any], sents: list[Sentence] | None = None,
 ) -> dict[str, float]:
     b = rubric["bonus"]
     duration = end - start
@@ -992,13 +1041,17 @@ def _bonus(
     n_peaks = sum(1 for p in audio.get("peaks") or [] if start <= p["timecode"] <= end)
     audio_bonus = b["audio_peaks"] * min(1.0, n_peaks / b["audio_peaks_full"]) if b["audio_peaks_full"] > 0 else 0.0
     visual = _visual_bonus(start, end, vision, rubric)
-    total = min(float(b["max_total"]), replayed + audio_bonus + visual)
-    return {
+    speech = _speech_density_malus(start, end, sents, rubric)
+    total = min(float(b["max_total"]), replayed + audio_bonus + visual + (speech or 0.0))
+    out = {
         "replayed": round(replayed, 2),
         "audio_peaks": round(audio_bonus, 2),
         "visual": round(visual, 2),
-        "total": round(total, 2),
     }
+    if speech is not None:
+        out["speech_density"] = round(speech, 2)
+    out["total"] = round(total, 2)
+    return out
 
 
 def final_score(scores: dict[str, float], rubric: dict[str, Any], bonus_total: float = 0.0) -> float:
@@ -1471,7 +1524,7 @@ def run(
             candidates = sorted(candidates + action_candidates, key=lambda c: c["_start"])
 
     for c in candidates:
-        c["bonus"] = _bonus(c["_start"], c["_end"], meta, audio, vision, rubric)
+        c["bonus"] = _bonus(c["_start"], c["_end"], meta, audio, vision, rubric, sents)
         c["final_score"] = final_score(c["scores"], rubric, c["bonus"]["total"])
 
     kept, rejected_scored, exploration_info = _select(candidates, rubric, meta, exploration)
@@ -1593,7 +1646,6 @@ def _rescore(video_dir: Path, out: Path, settings: dict[str, Any]) -> Path:
     connectors = _connectors(settings)
     rubric_path = _recorded_rubric_path(previous, out)
     rubric = load_rubric(rubric_path)
-    b = rubric["bonus"]
 
     candidates = [_restore(m, sents, True, connectors) for m in previous["moments"]]
     candidates += [_restore(r, sents, False, connectors) for r in previous["rejected"] if "final_score" in r]
@@ -1602,7 +1654,7 @@ def _rescore(video_dir: Path, out: Path, settings: dict[str, Any]) -> Path:
         old = c["bonus"]
         visual = _visual_bonus(c["_start"], c["_end"], vision, rubric)
         if visual != old["visual"]:
-            total = min(float(b["max_total"]), old["replayed"] + old["audio_peaks"] + visual)
+            total = _rescored_bonus_total(rubric, old, visual)
             c["bonus"] = {**old, "visual": round(visual, 2), "total": round(total, 2)}
         c["final_score"] = final_score(c["scores"], rubric, c["bonus"]["total"])
 
