@@ -2369,3 +2369,139 @@ def test_exploration_still_takes_a_min_score_rejection_when_a_gate_exists(tmp_pa
 
     [x] = explored(read_moments(video_dir))
     assert x["start"] == 250.25
+
+
+# --------------------------------------------------------------------------
+# Grille builtin:gaming-v2 et signal mesure speech_density (plan jury retention)
+# --------------------------------------------------------------------------
+
+
+def _words(first_at, n, per_second):
+    """n mots horodates, le premier a ``first_at`` s, ``per_second`` mots par seconde."""
+    return tuple((first_at + k / per_second, f" mot{k}") for k in range(n))
+
+
+def _sents_for(words):
+    from clipper import moments
+
+    return [moments.Sentence(words[0][0], words[-1][0] + 0.2, "".join(w for _, w in words), words)]
+
+
+def _density_bonus(rubric, start, end, words):
+    from clipper import moments
+
+    meta = {"duration": 500.0}
+    return moments._bonus(start, end, meta, {"peaks": []}, None, rubric, sents=_sents_for(words))
+
+
+def _v2_rubric():
+    from clipper import moments
+
+    return moments.load_rubric(moments.resolve_rubric_path("builtin:gaming-v2"))
+
+
+def test_speech_density_gives_a_malus_for_a_sparse_candidate():
+    # 0,5 mot/s sur 20 s : 10 mots, premier mot a 0 s
+    bonus = _density_bonus(_v2_rubric(), 100.0, 120.0, _words(100.0, 10, 0.5))
+
+    assert bonus["speech_density"] == -_v2_rubric()["bonus"]["speech_density_malus"]
+    assert bonus["total"] == bonus["speech_density"]
+
+
+def test_speech_density_gives_a_malus_when_the_first_word_comes_late():
+    # dense (3 mots/s) mais premier mot a 3 s du debut
+    bonus = _density_bonus(_v2_rubric(), 100.0, 120.0, _words(103.0, 51, 3.0))
+
+    assert bonus["speech_density"] < 0
+
+
+def test_speech_density_is_zero_for_a_dense_candidate_starting_on_a_word():
+    # 3 mots/s, premier mot a 0 s
+    bonus = _density_bonus(_v2_rubric(), 100.0, 120.0, _words(100.0, 60, 3.0))
+
+    assert bonus["speech_density"] == 0
+    assert bonus["total"] == 0
+
+
+def test_speech_density_ignores_words_outside_the_candidate():
+    # mots avant et apres : seuls ceux de [start, end[ comptent
+    words = _words(90.0, 10, 1.0) + _words(100.0, 60, 3.0) + _words(125.0, 50, 5.0)
+    bonus = _density_bonus(_v2_rubric(), 100.0, 120.0, words)
+
+    assert bonus["speech_density"] == 0
+
+
+def test_rubrics_without_speech_density_keys_do_not_change_their_bonus():
+    from clipper import moments
+
+    for name in ("builtin", "builtin:gaming", "builtin:gaming-action"):
+        rubric = moments.load_rubric(moments.resolve_rubric_path(name))
+        bonus = moments._bonus(
+            100.0, 120.0, {"duration": 500.0}, {"peaks": []}, None, rubric, sents=_sents_for(_words(100.0, 10, 0.5)),
+        )
+        assert "speech_density" not in bonus, name
+        assert bonus == {"replayed": 0.0, "audio_peaks": 0.0, "visual": 0.0, "total": 0.0}, name
+
+
+def test_speech_density_keys_must_come_together_and_be_numbers(tmp_path):
+    from clipper import moments
+
+    text = (REPO / "clipper" / "assets" / "rubric-gaming.toml").read_text(encoding="utf-8")
+    partial = tmp_path / "partial.toml"
+    partial.write_text(text.replace("[bonus]\n", "[bonus]\nspeech_density_malus = 5\n"), encoding="utf-8")
+    with pytest.raises(moments.MomentsError, match="speech_density"):
+        moments.load_rubric(partial)
+
+
+def test_builtin_gaming_v2_has_exactly_the_plan_values():
+    from clipper import moments
+
+    v1 = moments.load_rubric(moments.resolve_rubric_path("builtin:gaming"))
+    v2 = _v2_rubric()
+
+    assert {n: c["weight"] for n, c in v2["criteria"].items()} == {
+        "hook": 3, "standalone": 2, "payoff": 3, "emotion": 2, "value": 2, "trend": 0,
+    }
+    assert v2["min_score"] == v1["min_score"] == 45
+    assert (v2["durations"]["single_max"], v2["durations"]["part_max"]) == (60, 60)
+    for key in ("single_min", "part_min", "min_parts", "max_parts", "tolerance"):
+        assert v2["durations"][key] == v1["durations"][key], key
+    for key in ("max_moments_per_hour", "always_keep_score", "min_moments_cap", "trend_keywords", "exclusions"):
+        assert v2[key] == v1[key], key
+    b = v2["bonus"]
+    assert (b["speech_density_min_wps"], b["speech_density_max_first_word_s"]) == (1.5, 2)
+    assert b["speech_density_malus"] > 0
+    assert {k: b[k] for k in v1["bonus"]} == v1["bonus"]
+    q = v2["criteria"]
+    assert "ENTENDUE" in q["hook"]["question"] and "t = 0" in q["hook"]["question"]
+    assert "DERNIÈRE phrase" in q["payoff"]["question"]
+    assert "ne connaît ni le jeu ni le streamer" in q["standalone"]["question"]
+    assert q["emotion"]["question"] == v1["criteria"]["emotion"]["question"]
+
+
+def test_builtin_gaming_v2_is_in_the_unknown_builtin_listing_and_package_data():
+    import importlib.resources
+
+    from clipper import moments
+
+    with pytest.raises(moments.MomentsError) as excinfo:
+        moments.resolve_rubric_path("builtin:inconnue")
+    assert '"builtin:gaming-v2"' in str(excinfo.value)
+    assert importlib.resources.files("clipper").joinpath("assets", "rubric-gaming-v2.toml").is_file()
+
+
+def test_the_existing_embedded_rubrics_stay_byte_identical_with_gaming_v2_added():
+    import hashlib
+
+    from clipper import moments
+
+    for value, digest in (("builtin", _STANDARD_SHA256), ("builtin:gaming", _GAMING_SHA256)):
+        assert hashlib.sha256(moments.resolve_rubric_path(value).read_bytes()).hexdigest() == digest, value
+
+
+def test_rescore_keeps_the_speech_density_malus_in_the_total():
+    from clipper import moments as m
+
+    # Le total d'un bonus qui porte speech_density = replayed + audio + visual + speech_density (plafonne).
+    old = {"replayed": 1.0, "audio_peaks": 2.0, "visual": 0.0, "speech_density": -6.0, "total": -3.0}
+    assert m._rescored_bonus_total(_v2_rubric(), old, 2.0) == -1.0

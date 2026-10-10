@@ -1,0 +1,91 @@
+# Grille de notation gaming v2 (experience A/B du jury, plan jury-retention),
+# livree avec le paquet a cote de builtin:gaming, qui reste inchange. Choisie
+# par chaine dans le preset : [moments] rubric_path = "builtin:gaming-v2".
+# Non activee par defaut : aucun preset ne la reference.
+#
+# Copie de rubric-gaming.toml, avec les changements mesures sur 32 posts reels
+# (Spearman avec la part vue) : value passe de 0 a 2 (+0,45), emotion de 4 a 2
+# (-0,23), les questions hook / payoff / standalone portent sur le texte tel
+# qu'il est ENTENDU, les durees maximales passent a 60 s, et le bonus mesure
+# speech_density (zero LLM) sanctionne une parole peu dense ou un premier mot
+# tardif. min_score reste a 45 pour que l'A/B ne restreigne pas l'etendue.
+#
+# Score final 0-100 = moyenne des notes (0-10) ponderee par `weight` (un
+# critere a weight = 0 est note mais hors moyenne), x10, plus un bonus de
+# signaux mesures (malus speech_density compris) plafonne a [bonus] max_total.
+# Retenus : les moments dont le score final >= min_score, avec un plafond
+# souple : au plus max_moments_per_hour moments par heure de video source
+# (plafond = arrondi superieur de max_moments_per_hour x duree en heures),
+# jamais moins que min_moments_cap ; un moment dont le score atteint
+# always_keep_score est toujours retenu, meme au-dela du plafond, et compte
+# dans le plafond.
+
+min_score = 45
+max_moments_per_hour = 6
+always_keep_score = 70
+min_moments_cap = 3
+
+# Mots-cles tendance (critere trend) : aucun pour le gaming, trend est a poids 0.
+trend_keywords = []
+
+# Chaque critere : poids dans la moyenne et question posee au LLM.
+[criteria.hook]
+weight = 3
+question = "La première phrase ENTENDUE (le texte commence au premier mot prononcé, pas à une accroche réécrite) est-elle complète, compréhensible seule, et pose-t-elle un enjeu dès t = 0 ? 0-2 si elle est tronquée, commence par un connecteur, ou si rien n'est dit pendant plus de 2 s."
+
+[criteria.standalone]
+weight = 2
+question = "Un spectateur qui ne connaît ni le jeu ni le streamer comprend-il l'enjeu dès la première phrase, sans le chat ni l'image ?"
+
+[criteria.payoff]
+weight = 3
+question = "La DERNIÈRE phrase est-elle un verdict, une révélation, une prédiction ou une punchline qui clôt ? 0-3 pour un salut, un aparté, une rétractation, un cri sans suite ou une phrase coupée. En multi-parties, chaque partie finit-elle sur un suspense ?"
+
+[criteria.emotion]
+weight = 2
+question = "Y a-t-il rire, cri, sursaut, peur, rage, victoire ou defaite, retournement de situation, ou reaction forte au jeu ou au chat ?"
+
+[criteria.value]
+weight = 2
+question = "Le clip apporte-t-il une info, un leak, un avis tranche, une theorie ou une controverse ?"
+
+[criteria.trend]
+weight = 0
+question = "Le clip touche-t-il les mots-cles tendance listes ?"
+
+# Durees en secondes : clips gaming plus courts que la grille standard.
+[durations]
+# Histoire complete qui tient en un clip unique.
+single_min = 30
+single_max = 60
+# Long passage fort (une affaire entiere, typiquement 5 a 15 min) : serie de
+# min_parts a max_parts parties de part_min a part_max qui se suivent.
+part_min = 30
+part_max = 60
+min_parts = 2
+max_parts = 12
+# Marge acceptee apres recalage des bornes sur des frontieres de phrase.
+tolerance = 3
+
+# Bonus des signaux mesures, en points sur 100, plafonne a max_total.
+[bonus]
+max_total = 10
+# x valeur moyenne (0-1) de la courbe YouTube "most replayed" sur le moment.
+replayed = 5
+# x min(1, pics d'energie audio dans le moment / audio_peaks_full).
+audio_peaks = 3
+audio_peaks_full = 3
+# Si une image cle du moment est marquee "striking" par l'etape vision.
+visual = 2
+# Densite de parole (signal mesure, zero LLM) : mots horodates par seconde du
+# moment et delai du premier mot. Sous speech_density_min_wps mots/s, ou si le
+# premier mot arrive apres speech_density_max_first_word_s secondes, le bonus
+# prend un malus fixe de speech_density_malus points (une seule fois). Sans ces
+# trois cles, le signal est desactive (les autres grilles n'en ont pas).
+speech_density_min_wps = 1.5
+speech_density_max_first_word_s = 2
+speech_density_malus = 6
+
+# Regle 2 : segments exclus d'office.
+[exclusions]
+sponsorblock_categories = ["sponsor", "intro", "outro", "selfpromo"]
