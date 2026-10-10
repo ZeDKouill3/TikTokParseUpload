@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -595,6 +596,10 @@ def detect_scenes(
     )
     detected = time.monotonic()
 
+    # Passe --force : les images de la passe precedente ne doivent pas survivre
+    # (un seuil ou peak_windows different change le nombre de plans).
+    if frames_dir.exists():
+        shutil.rmtree(frames_dir)
     frames_dir.mkdir(parents=True, exist_ok=True)
     tasks: list[tuple[int, float, str]] = []
     for scene_index, (start, end) in enumerate(scene_list):
@@ -614,11 +619,13 @@ def detect_scenes(
         )
         for batch, images in zip(batches, extracted):
             for (scene_index, timecode, filename), frame in zip(batch, images):
-                cv2.imwrite(
+                written = cv2.imwrite(
                     str(frames_dir / filename),
                     frame,
                     [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality],
                 )
+                if not written:
+                    raise ScenesError(f"ecriture impossible : {frames_dir / filename}")
                 frames.append(
                     {
                         "path": f"frames/{filename}",
