@@ -314,6 +314,39 @@ def test_r2_video_still_in_the_processing_queue_is_excluded(tmp_path):
     assert [(e["video_id"], e["reason"]) for e in plan["excluded"]] == [("V1", "in_processing_queue")]
 
 
+def test_r2_account_pool_drops_excluded_source_and_queued_video(tmp_path):
+    config = _config(tmp_path, excluded_sources=["banni"])
+    _accounts(config, _acc("a"))
+    _clip(config, "V1", "01", streamer="Banni")
+    _clip(config, "V2", "01")
+    _clip(config, "V3", "01")
+    (tmp_path / "queue.json").write_text(json.dumps(
+        [{"video_id": "V2", "action": "run", "status": "waiting"}]), encoding="utf-8")
+
+    pool = repartition.account_pool("a", world=repartition.World(config), settings=repartition.read_settings(config))
+
+    assert [unit["video_id"] for unit in pool] == ["V3"]
+
+
+def test_r2_line_error_refuses_excluded_source_and_queued_video(tmp_path):
+    config = _config(tmp_path, excluded_sources=["banni"])
+    _accounts(config, _acc("a"))
+    _clip(config, "V1", "01", streamer="Banni")
+    _clip(config, "V2", "01")
+    _clip(config, "V3", "01")
+    (tmp_path / "queue.json").write_text(json.dumps(
+        [{"video_id": "V2", "action": "run", "status": "waiting"}]), encoding="utf-8")
+    world = repartition.World(config)
+    slot = datetime(2026, 10, 10, 10, 0, tzinfo=PARIS)
+
+    def error(video_id):
+        return repartition.line_error(world, "a", DAY, video_id=video_id, clip_id="01", slot_at=slot, entries=[])
+
+    assert "excluded_source" in error("V1")
+    assert "in_processing_queue" in error("V2")
+    assert error("V3") is None
+
+
 # ---------------------------------------------------------------- R3 source et plafond
 
 

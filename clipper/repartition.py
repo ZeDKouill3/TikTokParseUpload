@@ -242,6 +242,12 @@ class World:
             self._meta[video_id] = data
         return self._meta[video_id]
 
+    def style(self, video_id: str) -> str | None:
+        """Style (chaîne) de la vidéo : ``channel`` de son ``pipeline.json``, ``None`` si absent."""
+        state = _read_json(self.workspace / video_id / "pipeline.json", {})
+        channel = state.get("channel") if isinstance(state, dict) else None
+        return channel if isinstance(channel, str) else None
+
     def veille_games(self) -> dict[str, str]:
         """``video_id`` (préfixe ``v`` comme les dossiers du workspace) -> jeu : ``seen.json`` queued d'abord, puis les
         candidats de chaque ``days/<jour>.json``, le plus récent gagnant. Un fichier illisible est noté, jamais fatal."""
@@ -343,6 +349,27 @@ def source_bonus(
             f"posts d'au moins {int(settings['bonus_min_age_h'])} h")
 
 
+_EXCLUSION_TEXT = {
+    "multi_part_series": "partie d'une série en plusieurs parties, jamais planifiée seule",
+    "excluded_source": "source exclue par excluded_sources",
+    "in_processing_queue": "vidéo encore dans la file de traitement",
+}
+
+
+def clip_exclusion(world: World, video_id: str, clip_id: str, excluded_sources: list[str],
+                   queued: set[str]) -> str | None:
+    """Raison pour laquelle un clip ne peut pas être choisi (R2), ou ``None`` : partie d'une série en plusieurs parties
+    (``multi_part_series``), source exclue (``excluded_source``, streamer ou style), vidéo dans la file de traitement
+    (``in_processing_queue``). Source unique de ces règles : le vivier, le compte et le PUT du plan s'y réfèrent."""
+    if _multi_part(world, video_id, clip_id):
+        return "multi_part_series"
+    excluded = {s.casefold() for s in excluded_sources}
+    own = {n.casefold() for n in (world.meta(video_id).get("channel"), world.style(video_id)) if isinstance(n, str)}
+    if own & excluded:
+        return "excluded_source"
+    return "in_processing_queue" if video_id in queued else None
+
+
 def _pool(world: World, active: list[dict[str, Any]], settings: dict[str, Any], notes: list[str]) -> tuple[
         list[dict[str, Any]], list[dict[str, str]]]:
     """Clips choisissables (R2) avec les comptes qui peuvent les prendre, et les exclusions comptees par raison."""
@@ -357,7 +384,6 @@ def _pool(world: World, active: list[dict[str, Any]], settings: dict[str, Any], 
                     "video_id": unit["video_id"], "clip_id": clip_id, "style": unit["channel"],
                     "score": unit["score"], "accounts": set()})
                 found["accounts"].add(acc["id"])
-    excluded_sources = {s.casefold() for s in settings["excluded_sources"]}
     queued = world.queued_videos()
     names = {n.casefold() for c in clips.values() for n in (world.meta(c["video_id"]).get("channel"), c["style"])
              if isinstance(n, str)}
@@ -368,11 +394,7 @@ def _pool(world: World, active: list[dict[str, Any]], settings: dict[str, Any], 
     excluded: list[dict[str, str]] = []
     for key in sorted(clips):
         clip = clips[key]
-        sidecar = publish.read_sidecar(world.output, *key)
-        own = {n.casefold() for n in (world.meta(key[0]).get("channel"), clip["style"]) if isinstance(n, str)}
-        reason = ("multi_part_series" if (sidecar.get("parts_total") or 1) > 1  # un clip seul est « 1 sur 1 »
-                  else "excluded_source" if own & excluded_sources
-                  else "in_processing_queue" if key[0] in queued else None)
+        reason = clip_exclusion(world, key[0], key[1], settings["excluded_sources"], queued)
         if reason:
             excluded.append({"video_id": key[0], "clip_id": key[1], "reason": reason})
         else:
@@ -604,15 +626,15 @@ def _multi_part(world: World, video_id: str, clip_id: str) -> bool:
     return (publish.read_sidecar(world.output, video_id, clip_id).get("parts_total") or 1) > 1  # un clip seul est « 1 sur 1 »
 
 
-def account_pool(
-    account_id: str, *, workspace_dir: str | Path, output_dir: str | Path, state_dir: str | Path,
-) -> list[dict[str, Any]]:
+def account_pool(account_id: str, *, world: World, settings: dict[str, Any]) -> list[dict[str, Any]]:
     """Vivier de l'écran pour un compte (R2) : les clips que ``account_id`` peut prendre (jamais un clip validé pour un
-    autre compte), chaque partie seule, sans les parties d'une série en plusieurs parties (que le plan exclut)."""
+    autre compte), chaque partie seule, sans ce que le plan exclut (``clip_exclusion``)."""
     units = publish.available_series_clips(
-        None, account=account_id, together=False, workspace_dir=workspace_dir, output_dir=output_dir,
-        state_dir=state_dir)
-    return [u for u in units if (publish.read_sidecar(output_dir, u["video_id"], u["clip_ids"][0]).get("parts_total") or 1) <= 1]
+        None, account=account_id, together=False, workspace_dir=world.workspace, output_dir=world.output,
+        state_dir=world.publish_dir)
+    queued = world.queued_videos()
+    return [u for u in units if clip_exclusion(world, u["video_id"], u["clip_ids"][0], settings["excluded_sources"],
+                                               queued) is None]
 
 
 def line_error(
@@ -620,13 +642,15 @@ def line_error(
     entries: list[tuple[str, dict[str, Any]]],
 ) -> str | None:
     """Raison pour laquelle une ligne n'a pas sa place dans le plan de ``account_id`` ce ``day``, ou ``None`` : créneau
-    sur un autre jour (heure de Paris), partie d'une série en plusieurs parties (``multi_part_series``), clip déjà
-    validé pour un autre compte. Une erreur explicite, jamais une ligne corrigée en silence (ADR-ad2e)."""
+    sur un autre jour (heure de Paris), clip exclu par R2 (``clip_exclusion``), clip déjà validé pour un autre compte.
+    Une erreur explicite, jamais une ligne corrigée en silence (ADR-ad2e)."""
     target = _as_day(day)
     if _paris(slot_at).date() != target:
         return f"créneau du {_paris(slot_at).date().isoformat()} hors du jour du plan ({target.isoformat()})"
-    if _multi_part(world, video_id, clip_id):
-        return f"{video_id}/{clip_id} : multi_part_series (partie d'une série en plusieurs parties, jamais planifiée seule)"
+    reason = clip_exclusion(world, video_id, clip_id, read_settings(world.config)["excluded_sources"],
+                            world.queued_videos())
+    if reason:
+        return f"{video_id}/{clip_id} : {reason} ({_EXCLUSION_TEXT[reason]})"
     for _channel, entry in entries:
         owner = entry.get("account")
         if ((entry["video_id"], entry["clip_id"]) == (video_id, clip_id) and entry["status"] == "approved"

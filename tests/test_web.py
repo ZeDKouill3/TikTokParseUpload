@@ -10645,11 +10645,12 @@ def _rep_read(tmp_path, day: str) -> dict:
     return json.loads(_rep_path(tmp_path, day).read_text(encoding="utf-8"))
 
 
-def _rep_client(tmp_path, ready=(READY, SPARE), **tiktok_settings) -> TestClient:
+def _rep_client(tmp_path, ready=(READY, SPARE), *, repartition=None, **tiktok_settings) -> TestClient:
     _publish_setup(tmp_path, slots=False)
     _accounts_state(tmp_path, ready=ready)
     config = Config(mode="review", workspace_dir=tmp_path / "workspace", output_dir=tmp_path / "output",
-                    _sections={"tiktok": {"max_posts_per_day": 10, "min_gap_minutes": 0, **tiktok_settings}})
+                    _sections={"tiktok": {"max_posts_per_day": 10, "min_gap_minutes": 0, **tiktok_settings},
+                               **({"repartition": repartition} if repartition else {})})
     return TestClient(create_app(config=config))
 
 
@@ -11417,6 +11418,50 @@ def test_repartition_put_refuses_a_clip_validated_for_another_account_and_leaves
 
     assert put.status_code == 422, put.text
     assert SPARE in put.json()["detail"] and "01" in put.json()["detail"]
+    assert _rep_path(tmp_path, day).read_text(encoding="utf-8") == before
+
+
+def test_repartition_pool_hides_the_clips_of_an_excluded_source(tmp_path, isolated_cwd):
+    c, day = _rep_client(tmp_path, repartition={"excluded_sources": ["ma_chaine"]}), _rep_day()
+    _rep_write(tmp_path, day, [(READY, [])])
+
+    data = c.get("/api/repartition", params={"day": day}).json()
+
+    assert _rep_account_pool(data, READY) == set()
+
+
+def test_repartition_pool_hides_the_clips_of_a_video_in_the_processing_queue(tmp_path, isolated_cwd):
+    c, day = _rep_client(tmp_path), _rep_day()
+    _write_json(tmp_path / "state" / "queue.json", [{"video_id": CLIPS_VIDEO, "action": "run", "status": "waiting"}])
+    _rep_write(tmp_path, day, [(READY, [])])
+
+    data = c.get("/api/repartition", params={"day": day}).json()
+
+    assert _rep_account_pool(data, READY) == set()
+
+
+def test_repartition_put_refuses_a_clip_of_an_excluded_source_and_leaves_the_file(tmp_path, isolated_cwd):
+    c, day = _rep_client(tmp_path, repartition={"excluded_sources": ["ma_chaine"]}), _rep_day()
+    _rep_write(tmp_path, day, [(READY, [])])
+    before = _rep_path(tmp_path, day).read_text(encoding="utf-8")
+
+    put = c.put(f"/api/repartition/{day}", json={"accounts": [{"account": READY, "lines": [_rep_put_line(day, "10:00", "01")]}]})
+
+    assert put.status_code == 422, put.text
+    assert "excluded_source" in put.json()["detail"]
+    assert _rep_path(tmp_path, day).read_text(encoding="utf-8") == before
+
+
+def test_repartition_put_refuses_a_clip_of_a_video_in_the_processing_queue_and_leaves_the_file(tmp_path, isolated_cwd):
+    c, day = _rep_client(tmp_path), _rep_day()
+    _write_json(tmp_path / "state" / "queue.json", [{"video_id": CLIPS_VIDEO, "action": "run", "status": "waiting"}])
+    _rep_write(tmp_path, day, [(READY, [])])
+    before = _rep_path(tmp_path, day).read_text(encoding="utf-8")
+
+    put = c.put(f"/api/repartition/{day}", json={"accounts": [{"account": READY, "lines": [_rep_put_line(day, "10:00", "01")]}]})
+
+    assert put.status_code == 422, put.text
+    assert "in_processing_queue" in put.json()["detail"]
     assert _rep_path(tmp_path, day).read_text(encoding="utf-8") == before
 
 
