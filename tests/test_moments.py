@@ -2431,6 +2431,40 @@ def test_speech_density_ignores_words_outside_the_candidate():
     assert bonus["speech_density"] == 0
 
 
+def _untimed_sents(segments):
+    """Phrases de segments sans words (transcript ancien ou mots retires) : split_sentences."""
+    from clipper import moments
+
+    return moments.split_sentences({"segments": segments})
+
+
+def test_speech_density_without_timed_words_is_not_a_malus_but_a_note():
+    # Moment dont les phrases ont du texte sans aucun mot horodate, dans un transcript qui a
+    # ailleurs des mots : pas de -6 (0 mot/s fabrique), signal non applique, note lisible.
+    from clipper import moments
+
+    sents = _untimed_sents([
+        {"start": 100.0, "end": 110.0, "text": " on joue une partie"},
+        {"start": 110.0, "end": 120.0, "text": " la fin du moment"},
+    ]) + _sents_for(_words(200.0, 60, 3.0))
+
+    bonus = moments._bonus(100.0, 120.0, {"duration": 500.0}, {"peaks": []}, None, _v2_rubric(), sents=sents)
+
+    assert "speech_density" not in bonus
+    assert bonus["total"] == 0
+    assert "speech_density_note" in bonus
+
+
+def test_speech_density_raises_when_no_sentence_of_the_transcript_has_timed_words():
+    # Transcript entier sans mots horodates : erreur explicite, jamais -6 sur chaque moment.
+    from clipper import moments
+
+    sents =_untimed_sents([{"start": 100.0, "end": 120.0, "text": " tout le texte sans mots"}])
+
+    with pytest.raises(moments.MomentsError, match="speech_density"):
+        moments._bonus(100.0, 120.0, {"duration": 500.0}, {"peaks": []}, None, _v2_rubric(), sents=sents)
+
+
 def test_rubrics_without_speech_density_keys_do_not_change_their_bonus():
     from clipper import moments
 
