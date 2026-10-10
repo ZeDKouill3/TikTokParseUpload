@@ -20,6 +20,10 @@ Notes de version détaillées : [`docs/releases/`](docs/releases/).
 - Répartition automatique (2/5, SPEC-78dc R7) : le worker appelle `repartition.run_if_due` à chaque tour, juste après l'apprentissage ; `[repartition] enabled = false` ne fait rien, et une erreur de répartition est journalisée une fois sans arrêter le worker.
 - Répartition automatique (5/5, SPEC-78dc R10) : README et CHANGELOG. Le README documente la section « Plan de demain » (calcul à `compute_time`, 20:00 Paris ; modification ; validation obligatoire, rien n'est créé ni envoyé sans clic ; règle « jeu inconnu : regroupé par VOD ») et la table des réglages `[repartition]`. Les défauts cités sont comparés au dict `CONFIG_DEFAULTS` de `clipper/repartition.py` par `tests/test_readme_assets.py`. Aucune capture d'écran pour l'instant : l'écran Publication sera capturé plus tard.
 
+### Modifié
+
+- Répartition (SPEC-78dc R6) : un clip d'exploration atteint vraiment la publication. Jusqu'ici `exploration_per_day` était un plafond jamais atteint : un clip d'exploration (score bas par construction) ne passait jamais devant les autres du vivier. Désormais, avant le remplissage par score, `min(exploration_per_day, clips d'exploration disponibles)` créneaux sont réservés, un par compte et par jour au plus, sur le premier créneau hors soir du compte, avec le meilleur clip d'exploration que ce compte peut prendre (tourniquet des comptes). Le plan note « exploration : <clip> sur <compte> à <heure> » ; sans créneau hors soir, rien n'est réservé et une note le dit. Sans clip d'exploration, le plan est inchangé.
+
 ### Corrigé
 
 - Apprentissage : un clip publié sans statistique ne compte plus comme « résultat parfait » dans la calibration du jury. `learning.sync` ne passe à la calibration que les clips qui ont une entrée `stats` (un clip immature ou d'un compte sous `min_account_posts` en est écarté), et `jury_calibration` utilise la statistique seule (`views_percentile`, `pct_watched`) comme résultat du moment, sans y mélanger le `qa` constant des clips publiés ; un moment sans statistique est exclu.

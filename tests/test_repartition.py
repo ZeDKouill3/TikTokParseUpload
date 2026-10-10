@@ -640,6 +640,90 @@ def test_r6_missing_or_unreadable_moments_is_not_exploration_and_noted(tmp_path)
     assert any("V2" in n and "moments.json" in n for n in plan["notes"])
 
 
+def _explo_lines(plan) -> list[tuple[str, dict]]:
+    return [(a["account"], line) for a in plan["accounts"] for line in a["lines"] if line["exploration"]]
+
+
+def test_r6_low_score_exploration_clip_is_reserved_ahead_of_the_scores(tmp_path):
+    config = _config(tmp_path)
+    _accounts(config, _acc("a"), _acc("b"))
+    _clip(config, "EXP1", "01", score=20, exploration=True)
+    _clip(config, "EXP2", "01", score=10, exploration=True)
+    for i in range(28):
+        _clip(config, f"V{i:02d}", "01", score=90 - i, exploration=False)
+
+    plan = _plan(config)
+
+    explo = _explo_lines(plan)
+    assert [(account, line["video_id"]) for account, line in explo] == [("a", "EXP1")]
+    assert explo[0][1]["prime"] is False
+    assert _hour_of(explo[0][1]) == "08:00"
+    assert "EXP2" not in [line["video_id"] for a in plan["accounts"] for line in a["lines"]]
+    assert "exploration : EXP1/01 sur a à 08:00" in plan["notes"]
+
+
+def test_r6_per_day_two_goes_to_two_different_accounts_off_peak(tmp_path):
+    config = _config(tmp_path, exploration_per_day=2)
+    _accounts(config, _acc("a"), _acc("b"))
+    _clip(config, "EXP1", "01", score=20, exploration=True)
+    _clip(config, "EXP2", "01", score=10, exploration=True)
+    for i in range(30):
+        _clip(config, f"V{i:02d}", "01", score=80 - i, exploration=False)
+
+    plan = _plan(config)
+
+    explo = _explo_lines(plan)
+    assert sorted(line["video_id"] for _account, line in explo) == ["EXP1", "EXP2"]
+    assert sorted(account for account, _line in explo) == ["a", "b"]
+    assert all(line["prime"] is False for _account, line in explo)
+
+
+def test_r6_per_day_zero_reserves_no_exploration(tmp_path):
+    config = _config(tmp_path, exploration_per_day=0)
+    _accounts(config, _acc("a"), _acc("b"))
+    _clip(config, "EXP1", "01", score=20, exploration=True)
+    for i in range(4):
+        _clip(config, f"V{i}", "01", score=80 - i, exploration=False)
+
+    plan = _plan(config)
+
+    assert _explo_lines(plan) == []
+    assert _line_for(plan, "a", "EXP1") is None and _line_for(plan, "b", "EXP1") is None
+
+
+def test_r6_no_off_peak_slot_reserves_nothing_and_says_so(tmp_path):
+    config = _config(tmp_path, prime_start="00:00", prime_end="23:59")
+    _accounts(config, _acc("a"))
+    _clip(config, "EXP1", "01", score=20, exploration=True)
+    _clip(config, "V1", "01", score=80)
+
+    plan = _plan(config)
+
+    assert _explo_lines(plan) == []
+    assert _line_for(plan, "a", "EXP1") is None
+    assert any("exploration" in n and "aucun créneau hors soir" in n for n in plan["notes"])
+
+
+def test_r6_no_exploration_clip_keeps_today_s_plan_exactly(tmp_path):
+    config = _config(tmp_path)
+    _accounts(config, _acc("a"), _acc("b"))
+    for i in range(8):
+        _clip(config, f"V{i}", "01", score=90 - i, exploration=False)
+
+    plan = _plan(config)
+
+    assert [
+        (line["video_id"], _hour_of(line), line["prime"], line["score"], line["bonus"])
+        for line in _acc_plan(plan, "a")["lines"]
+    ] == [("V4", "08:00", False, 86, 0), ("V6", "10:30", False, 84, 0),
+          ("V0", "18:00", True, 90, 0), ("V2", "20:30", True, 88, 0)]
+    assert [
+        (line["video_id"], _hour_of(line), line["prime"], line["score"], line["bonus"])
+        for line in _acc_plan(plan, "b")["lines"]
+    ] == [("V5", "08:30", False, 85, 0), ("V7", "11:00", False, 83, 0),
+          ("V1", "18:30", True, 89, 0), ("V3", "21:00", True, 87, 0)]
+
+
 # ---------------------------------------------------------------- R7 fichier, calcul, obsolescence
 
 
