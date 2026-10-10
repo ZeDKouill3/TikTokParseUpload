@@ -636,7 +636,7 @@ def _video_text(meta: dict[str, Any]) -> str:
 
 _ROLE = (
     "Tu es monteur video, specialiste des clips verticaux courts (TikTok, Shorts, Reels) tires "
-    "de videos longues : lives, podcasts, reportages, souvent sur GTA 6. "
+    "de videos longues : lives, podcasts, reportages. "
 )
 
 
