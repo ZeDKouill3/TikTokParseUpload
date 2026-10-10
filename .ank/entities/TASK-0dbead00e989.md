@@ -5,7 +5,7 @@ slug: worker-un-worker-json-verrouill-par-un-lecteur-n
 title: "Worker : un worker.json verrouillé par un lecteur ne tue plus la boucle (battement réessayé)"
 created: 2026-10-10T13:37:48Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/worker.py
   - tests/test_worker.py
@@ -15,6 +15,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: diagnose
+proof:
+  - type: test
+    ref: local/36a9116d8cc5@3c10a07
+    tree: scope/95bc0ae57f2f
+    criteria: e7d9410890f5
+    verifier: tests@c7b454d16c90
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---
