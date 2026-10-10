@@ -5,7 +5,7 @@ slug: reframe-un-cran-d-attente-dessin-ne-bloque-plus
 title: "Reframe : un écran d'attente dessiné ne bloque plus la vidéo (faux visages, période unique)"
 created: 2026-10-10T10:09:49Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/reframe.py
   - tests/test_reframe.py
@@ -15,6 +15,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: diagnose
+proof:
+  - type: test
+    ref: local/4d6762b30c04@a540681
+    tree: scope/c415a6f661e4
+    criteria: 71c91b7f7e66
+    verifier: tests@c7b454d16c90
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---

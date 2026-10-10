@@ -2126,6 +2126,11 @@ def _stable_face_over_null(
     stable = [c for c in candidates if c["support"] >= floor and (c.get("face_support") or 0) >= floor]
     keep = [c for c in stable if _persistent(c, periods, settings)]
     dropped = [c for c in stable if c not in keep]
+    if len(keep) > 1 and len(periods) <= 1:
+        # Une seule periode ne prouve aucune persistance (ecran d'attente dessine
+        # dont les nuages passent pour des visages) : Claude fait foi, pas d'erreur
+        # bloquante ; l'appelant journalise les candidats ecartes.
+        return None, stable
     if len(keep) > 1:
         raise ReframeError(
             "[reframe] Claude a repondu aucune webcam alors que plusieurs candidats visage stables et persistants "
@@ -2297,15 +2302,19 @@ def detect_facecam(
                     candidates, settings, [i["candidates"] for i in period_inputs if i["candidates"]]
                 )
                 if dropped:
+                    single = sum(1 for i in period_inputs if i["candidates"]) <= 1
+                    why = (
+                        "une seule periode a des candidats, persistance non prouvee, Claude fait foi" if single
+                        else "pas persistants sur la video"
+                    )
                     log.warning(
-                        "%s : periode %d, candidat(s) visage %s ecarte(s) : stables ici mais pas persistants sur la "
-                        "video (visages du jeu, pas une webcam)", video_id, index, sorted(c["id"] for c in dropped),
+                        "%s : periode %d, candidat(s) visage %s ecarte(s) : stables ici mais %s (visages du jeu ou "
+                        "du decor, pas une webcam)", video_id, index, sorted(c["id"] for c in dropped), why,
                     )
                 if better is None:
                     reason = f"Claude : aucune webcam sur cette periode ({answer['reason']})"
                     if dropped:
-                        reason += (f" ; candidats visage {sorted(c['id'] for c in dropped)} ecartes : "
-                                   "pas persistants sur la video")
+                        reason += f" ; candidats visage {sorted(c['id'] for c in dropped)} ecartes : {why}"
                 else:
                     override = {
                         "from": None, "to": better["id"],

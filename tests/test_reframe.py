@@ -2960,12 +2960,31 @@ def test_null_answer_with_one_stable_face_candidate_is_overridden_and_logged(
     assert "visage" in caplog.text and period["reason"] is None
 
 
-def test_null_answer_with_two_stable_face_candidates_is_an_explicit_error(tmp_path, video_dir, monkeypatch):
+def test_null_answer_with_two_stable_faces_on_a_single_period_is_trusted_and_logged(
+    tmp_path, video_dir, monkeypatch, caplog
+):
+    """TASK-c5b2e09ab02e : une seule periode ne prouve aucune persistance (ecran
+    d'attente dessine dont les nuages passent pour des visages) : Claude fait foi,
+    rien ne bloque la video, la decision est journalisee."""
+    _null_period(monkeypatch, video_dir, extra_face=True)
+    with caplog.at_level("WARNING"):
+        path, _ = run_detect(tmp_path, [webcam_answer(None, "ecran d'attente dessine")])
+
+    [period] = load(path)["periods"]
+    assert period["facecam"] is None and period.get("override") is None
+    assert "aucune webcam" in period["reason"] and "une seule periode" in period["reason"]
+    assert "ecarte" in caplog.text and "une seule periode" in caplog.text
+
+
+def test_null_answer_with_two_persistent_faces_over_several_periods_is_an_explicit_error(
+    tmp_path, video_dir, monkeypatch
+):
     from clipper.reframe import ReframeError
 
-    _null_period(monkeypatch, video_dir, extra_face=True)
+    twice = [MENUS[0], MENUS[0]]  # memes rectangles dans les deux periodes : persistants
+    _menu_faces_period(monkeypatch, video_dir, menus_per_period=[twice[0][:1], twice[1][:1]])
     with pytest.raises(ReframeError, match="plusieurs"):
-        run_detect(tmp_path, [webcam_answer(None)])
+        run_detect(tmp_path, [webcam_answer(None)] * 2)
     assert not (tmp_path / "workspace" / VIDEO_ID / "facecam.json").exists()
 
 
