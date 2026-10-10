@@ -530,7 +530,13 @@ def _fake_ydl_with_progress(info: dict, events: list[dict]):
     return FakeYoutubeDL
 
 
-def test_download_logs_progress_percent_and_speed(tmp_path, caplog):
+@pytest.fixture
+def _no_ffprobe(monkeypatch):
+    """Les faux yt-dlp ecrivent des octets bidon : la sonde de duree du download est remplacee."""
+    monkeypatch.setattr("clipper.download._probe_duration", lambda path, ffprobe_bin: 10.0)
+
+
+def test_download_logs_progress_percent_and_speed(tmp_path, caplog, _no_ffprobe):
     from clipper.download import download
 
     info = {"id": "dQw4w9WgXcQ", "webpage_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"}
@@ -556,7 +562,7 @@ def test_download_logs_progress_percent_and_speed(tmp_path, caplog):
     assert any("Mo/s" in line for line in progress)
 
 
-def test_download_debug_logs_every_progress_event(tmp_path, caplog):
+def test_download_debug_logs_every_progress_event(tmp_path, caplog, _no_ffprobe):
     from clipper.download import download
 
     info = {"id": "dQw4w9WgXcQ", "webpage_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"}

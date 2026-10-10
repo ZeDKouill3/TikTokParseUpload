@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import glob
 import json
 import logging
 import os
@@ -36,7 +37,14 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "fragment_retries": 20,
     # Binaire ffmpeg du remux d'un mp4 fragmente (resolu par le PATH).
     "ffmpeg_bin": "ffmpeg",
+    # Binaire ffprobe qui mesure la duree reelle du fichier telecharge (resolu par le PATH).
+    "ffprobe_bin": "ffprobe",
 }
+
+# Ecart tolere entre la duree annoncee par la plateforme et la duree reelle du fichier :
+# le plus grand de _DURATION_TOLERANCE_S secondes et de _DURATION_TOLERANCE_RATIO de la duree annoncee.
+_DURATION_TOLERANCE_S = 5.0
+_DURATION_TOLERANCE_RATIO = 0.01
 
 # Marqueurs d'une erreur de transport reseau (connexion fermee/coupee), cherches dans le message
 # de l'erreur et de ses causes. Rien d'autre n'est reessaye ici (abonnes, prive, format...).
@@ -289,6 +297,70 @@ def _remux_if_fragmented(video_file: Path, video_id: str, ffmpeg_bin: str) -> No
              video_id, size / 1e9, time.monotonic() - started)
 
 
+def _probe_duration(video_file: Path, ffprobe_bin: str) -> float:
+    """Duree reelle (secondes) du fichier selon ffprobe ; DownloadError si ffprobe est absent,
+    echoue ou ne donne aucune duree (jamais une duree supposee, ADR-ad2e)."""
+    cmd = [ffprobe_bin, "-v", "error", "-show_entries", "format=duration", "-of", "json", str(video_file)]
+    try:
+        proc = subprocess.run(cmd, capture_output=True)
+    except FileNotFoundError as exc:
+        raise DownloadError(f"duree de {video_file.name} illisible, ffprobe introuvable ({ffprobe_bin})") from exc
+    if proc.returncode != 0:
+        detail = proc.stderr.decode(errors="replace").strip()[-300:]
+        raise DownloadError(f"ffprobe a echoue sur {video_file.name} (code {proc.returncode}) : {detail}")
+    try:
+        return float((json.loads(proc.stdout or b"{}").get("format") or {})["duration"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise DownloadError(f"duree inconnue pour {video_file.name} : fichier illisible") from exc
+
+
+def _check_file_present(video_file: Path, video_id: str) -> None:
+    """DownloadError (fichier laisse en place pour la reprise) si le fichier attendu est absent,
+    d'un autre conteneur que mp4, ou vide."""
+    if not video_file.exists():
+        others = sorted(
+            p.name for p in video_file.parent.glob(f"{glob.escape(video_id)}.*")
+            if ".part" not in p.name and not p.name.endswith((".ytdl", ".json"))
+        )
+        if others:
+            raise DownloadError(
+                f"{video_id} : conteneur inattendu {others[0]!r} (attendu {video_file.name}) : "
+                "le format choisi par yt-dlp n'est pas un mp4"
+            )
+        raise DownloadError(f"{video_id} : fichier video absent apres le telechargement ({video_file.name})")
+    if video_file.stat().st_size == 0:
+        raise DownloadError(f"{video_id} : fichier video vide apres le telechargement")
+
+
+def _check_duration(real: float, declared: Any, video_id: str) -> None:
+    """DownloadError si la duree reelle s'ecarte de la duree annoncee de plus de max(5 s, 1 %).
+    Sans duree annoncee, rien a comparer (journalise)."""
+    if real <= 0:
+        raise DownloadError(f"{video_id} : fichier video vide apres le telechargement (duree {real:g} s)")
+    if not isinstance(declared, (int, float)) or isinstance(declared, bool) or declared <= 0:
+        log.info("%s : duree annoncee absente, duree reelle %.0f s non comparee", video_id, real)
+        return
+    tolerance = max(_DURATION_TOLERANCE_S, _DURATION_TOLERANCE_RATIO * declared)
+    if abs(real - declared) > tolerance:
+        raise DownloadError(
+            f"{video_id} : telechargement incomplet, {real:.0f} s dans le fichier pour {declared:.0f} s "
+            f"annoncees (ecart tolere {tolerance:.0f} s) ; relance l'etape download pour reprendre"
+        )
+
+
+def _remove_ytdlp_leftovers(video_dir: Path, video_id: str) -> None:
+    """Supprime les restes de yt-dlp (<id>.mp4.part*, <id>.mp4.ytdl) une fois le fichier verifie."""
+    removed = freed = 0
+    esc = glob.escape(video_id)
+    for path in [*video_dir.glob(f"{esc}.mp4.part*"), video_dir / f"{video_id}.mp4.ytdl"]:
+        if path.is_file():
+            freed += path.stat().st_size
+            path.unlink()
+            removed += 1
+    if removed:
+        log.info("%s : %d reste(s) de yt-dlp supprime(s) (%.1f Mo)", video_id, removed, freed / 1e6)
+
+
 def download(
     url: str,
     workspace_dir: str | Path = "workspace",
@@ -304,12 +376,17 @@ def download(
     ffmpeg_bin: str = "ffmpeg",
     concurrent_fragments: int = 8,
     fragment_retries: int = 20,
+    ffprobe_bin: str = "ffprobe",
 ) -> dict[str, Any]:
     """Download a YouTube video and write its metadata (ADR-b16b: a step
     reads its inputs and writes workspace/<video_id>/ itself).
 
     A video already present (video file and meta.json both on disk) is not
     re-downloaded; the recorded meta.json is returned as-is instead.
+
+    Le fichier produit est verifie avant meta.json : present, mp4, non vide, duree ffprobe a
+    max(5 s, 1 %) de la duree annoncee (meta.json : `duration` = reelle, `declared_duration` =
+    annoncee). Sinon DownloadError, meta.json non ecrit, fichier garde pour la reprise.
     """
     video_id = extract_video_id(url)
     if isinstance(concurrent_fragments, bool) or not isinstance(concurrent_fragments, int)             or concurrent_fragments < 1:
@@ -351,8 +428,14 @@ def download(
         url, opts, ydl_factory, video_id, network_retries, network_retry_pause_s, sleep
     )
 
+    _check_file_present(video_file, video_id)
     _remux_if_fragmented(video_file, video_id, ffmpeg_bin)
+    real_duration = _probe_duration(video_file, ffprobe_bin)
+    _check_duration(real_duration, info.get("duration"), video_id)
+    _remove_ytdlp_leftovers(video_dir, video_id)
 
     meta = _build_meta(info, url)
+    meta["declared_duration"] = meta["duration"]
+    meta["duration"] = real_duration
     atomic_write_json(meta_file, meta)
     return meta
