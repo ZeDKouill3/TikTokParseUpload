@@ -5,7 +5,7 @@ slug: audit-lot-i-scenes-criture-v-rifi-e-force-propre
 title: "Audit lot I : scenes : écriture vérifiée, `--force` propre"
 created: 2026-10-10T18:25:23Z
 author: nicoc@zedk_ordi
-status: open
+status: done
 scope:
   - clipper/scenes.py
   - tests/test_scenes.py
@@ -15,6 +15,13 @@ done_criteria: |
 criteria_by: creator
 verify: [tests]
 method: diagnose
+proof:
+  - type: test
+    ref: local/f7a3300e15be@9f0d3aa
+    tree: scope/ff1647e22b6c
+    criteria: 70ba4fe29336
+    verifier: tests@c7b454d16c90
+    via: verifier
 schema: 4
-version: 1
+version: 3
 ---
