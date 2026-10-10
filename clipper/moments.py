@@ -993,6 +993,22 @@ def _visual_bonus(start: float, end: float, vision: dict[str, Any] | None, rubri
     return float(rubric["bonus"]["visual"]) if striking else 0.0
 
 
+def _require_timed_words(sents: list[Sentence]) -> None:
+    """Transcript avec du texte mais aucun mot horodate : erreur explicite, jamais
+    un malus speech_density sur chaque moment (ADR-ad2e)."""
+    if sents and not any(s.words for s in sents):
+        raise MomentsError(
+            "speech_density : aucune phrase horodatee dans la transcription (mots absents) ; "
+            "relancer transcribe ou retirer speech_density de la grille"
+        )
+
+
+def _untimed_overlap(start: float, end: float, sents: list[Sentence]) -> bool:
+    """Vrai si une phrase recouvrant le moment n'a pas de mots horodates : la densite
+    serait fausse (0 mot compte pour du silence)."""
+    return any(not s.words for s in sents if s.start < end and s.end > start)
+
+
 def _speech_density(start: float, end: float, sents: list[Sentence]) -> tuple[float, float]:
     """(mots par seconde, delai du premier mot en secondes) du moment, depuis
     les mots horodates des phrases ; zero mot : (0, duree)."""
@@ -1041,7 +1057,13 @@ def _bonus(
     n_peaks = sum(1 for p in audio.get("peaks") or [] if start <= p["timecode"] <= end)
     audio_bonus = b["audio_peaks"] * min(1.0, n_peaks / b["audio_peaks_full"]) if b["audio_peaks_full"] > 0 else 0.0
     visual = _visual_bonus(start, end, vision, rubric)
-    speech = _speech_density_malus(start, end, sents, rubric)
+    speech = None
+    untimed = False
+    if "speech_density_malus" in b and sents is not None:
+        _require_timed_words(sents)
+        untimed = _untimed_overlap(start, end, sents)
+    if not untimed:
+        speech = _speech_density_malus(start, end, sents, rubric)
     total = min(float(b["max_total"]), replayed + audio_bonus + visual + (speech or 0.0))
     out = {
         "replayed": round(replayed, 2),
@@ -1050,6 +1072,8 @@ def _bonus(
     }
     if speech is not None:
         out["speech_density"] = round(speech, 2)
+    if untimed:
+        out["speech_density_note"] = "phrases sans mots horodates : signal speech_density non applique"
     out["total"] = round(total, 2)
     return out
 
