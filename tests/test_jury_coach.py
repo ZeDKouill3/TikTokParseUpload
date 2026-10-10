@@ -71,7 +71,7 @@ def trace_for(judge, score):
     }
 
 
-def make_cases(judge="retention", n=6, video_id="v1"):
+def make_cases(judge="retention", n=12, video_id="v1", rubric=None):
     """n cas au resultat reel connu (percentile de vues 1.0/0.0 en alternance), avec
     une note passee du juge a l'envers du resultat reel : un rejeu qui
     predit juste doit donc faire mieux que l'ancienne perspective."""
@@ -88,6 +88,7 @@ def make_cases(judge="retention", n=6, video_id="v1"):
                 "text": f"texte {k}",
                 "context": f"[{k * 10}-{k * 10 + 5}] s",
                 "trace": trace_for(judge, wrong_score),
+                **({"rubric": rubric} if rubric else {}),
             }
         )
     write_journal(journal)
@@ -122,7 +123,7 @@ def make_backend(lesson_response, *, judge="retention"):
 
 
 def test_writes_versioned_prompt_when_replay_improves(isolated_cwd):
-    cases = make_cases(n=6)
+    cases = make_cases(n=12)
     judges = {"retention": OLD_RETENTION, "spectateur": SPECTATEUR}
     fake = FakeBackend([make_backend({"perspective": NEW_GOOD, "justification": "predit mieux les cas rejoues"})])
 
@@ -133,6 +134,7 @@ def test_writes_versioned_prompt_when_replay_improves(isolated_cwd):
     retention = by_judge["retention"]
     assert retention["accepted"] is True
     assert retention["version"] == 1
+    assert retention["metric"]["lessons"] == 5 and retention["metric"]["validation"] == 7
     assert retention["metric"]["before"] == pytest.approx(1.0)
     assert retention["metric"]["after"] == pytest.approx(0.0)
 
@@ -144,7 +146,7 @@ def test_writes_versioned_prompt_when_replay_improves(isolated_cwd):
 
 
 def test_skips_judge_without_enough_known_outcomes(isolated_cwd):
-    cases = make_cases(n=6)  # trace ne porte que le juge "retention"
+    cases = make_cases(n=12)  # trace ne porte que le juge "retention"
     judges = {"retention": OLD_RETENTION, "spectateur": SPECTATEUR}
     fake = FakeBackend([make_backend({"perspective": NEW_GOOD, "justification": "..."})])
 
@@ -163,7 +165,7 @@ def test_skips_judge_without_enough_known_outcomes(isolated_cwd):
 
 
 def test_rejects_proposal_that_does_not_predict_better(isolated_cwd):
-    cases = make_cases(n=6)
+    cases = make_cases(n=12)
     judges = {"retention": OLD_RETENTION, "spectateur": SPECTATEUR}
 
     def _respond(request):
@@ -191,7 +193,7 @@ def test_rejects_proposal_that_does_not_predict_better(isolated_cwd):
 
 
 def test_rejects_proposal_too_similar_to_another_judge(isolated_cwd):
-    cases = make_cases(n=6)
+    cases = make_cases(n=12)
     judges = {"retention": OLD_RETENTION, "spectateur": SPECTATEUR}
     fake = FakeBackend([make_backend({"perspective": SPECTATEUR, "justification": "..."})])
 
@@ -212,7 +214,7 @@ def test_rejects_proposal_too_similar_to_another_judge(isolated_cwd):
 
 
 def test_respects_lessons_cap_per_judge(isolated_cwd):
-    cases = make_cases(n=6)
+    cases = make_cases(n=12)
     judges = {"retention": OLD_RETENTION}
     judge_dir = Path("prompts/jury/retention")
     judge_dir.mkdir(parents=True)
@@ -231,7 +233,7 @@ def test_respects_lessons_cap_per_judge(isolated_cwd):
 
 
 def test_writes_next_free_version_number(isolated_cwd):
-    cases = make_cases(n=6)
+    cases = make_cases(n=12)
     judges = {"retention": OLD_RETENTION}
     judge_dir = Path("prompts/jury/retention")
     judge_dir.mkdir(parents=True)
@@ -252,7 +254,7 @@ def test_writes_next_free_version_number(isolated_cwd):
 
 
 def test_conformite_judge_is_never_coached(isolated_cwd):
-    cases = make_cases(judge="conformite", n=6)
+    cases = make_cases(judge="conformite", n=12)
     judges = {"conformite": CONFORMITE, "retention": OLD_RETENTION}
     fake = FakeBackend([make_backend({"perspective": NEW_GOOD, "justification": "..."})])
 
@@ -295,7 +297,7 @@ def test_stats_without_percentile_or_ids_or_outside_window_are_excluded():
 
 
 def test_case_with_only_qa_result_is_not_coached_on_a_constant(isolated_cwd):
-    cases = make_cases(n=6)
+    cases = make_cases(n=12)
     Path("state/outcomes.jsonl").write_text(
         "".join(json.dumps(result_entry("v1", k)) + "\n" for k in range(6)), encoding="utf-8")
     fake = FakeBackend([make_backend({"perspective": NEW_GOOD, "justification": "..."})])
@@ -306,7 +308,7 @@ def test_case_with_only_qa_result_is_not_coached_on_a_constant(isolated_cwd):
 
 
 def test_replay_uses_the_model_of_the_judge_like_the_real_judgment(isolated_cwd):
-    cases = make_cases(n=6)
+    cases = make_cases(n=12)
     judges = {"retention": OLD_RETENTION, "spectateur": SPECTATEUR}
     fake = FakeBackend([make_backend({"perspective": NEW_GOOD, "justification": "..."})])
 
@@ -316,11 +318,11 @@ def test_replay_uses_the_model_of_the_judge_like_the_real_judgment(isolated_cwd)
                            judge_configs={"retention": jury._JudgeConfig(config, "jury_retention", "strong")})
 
     replays = [c for c in fake.calls if c.usage == "jury_retention"]
-    assert len(replays) == 10 and {c.model for c in replays} == {"opus"}  # strong -> opus, pas le palier fast (sonnet)
+    assert len(replays) == 14 and {c.model for c in replays} == {"opus"}  # strong -> opus, pas le palier fast (sonnet)
 
 
 def test_propose_logs_its_calls_in_the_given_usage_log_only(isolated_cwd):
-    cases = make_cases(n=6)
+    cases = make_cases(n=12)
     video_log = Path("workspace/v1/llm_usage.jsonl")
     own = Path("state/learning/llm_usage.jsonl")
     fake = FakeBackend([make_backend({"perspective": NEW_GOOD, "justification": "..."})])
@@ -342,7 +344,7 @@ def test_coach_reads_the_metric_from_the_calibration_setting():
 
 
 def test_propose_learns_on_the_configured_metric(isolated_cwd):
-    cases = make_cases(n=6)  # views_percentile 1.0/0.0, predictions a l'envers
+    cases = make_cases(n=12)  # views_percentile 1.0/0.0, predictions a l'envers
     entries = Path("state/outcomes.jsonl").read_text(encoding="utf-8").splitlines()
     rewritten = []
     for line in entries:
@@ -359,3 +361,94 @@ def test_propose_learns_on_the_configured_metric(isolated_cwd):
 
     assert results[0]["accepted"] is False  # sur watched_full, l'ancienne perspective predit deja juste
     assert results[0]["metric"]["before"] == pytest.approx(0.0)
+
+
+# --------------------------------------------------------------------------
+# Une grille par cas (Important 3) et validation hors lecons (Important 2)
+# --------------------------------------------------------------------------
+
+GRID_A = {"id": "builtin", "criteria": {"hook": {"weight": 1, "question": "QUESTION-EMOTION-STANDARD ?"}}}
+GRID_B = {"id": "builtin:gaming", "criteria": {"hook": {"weight": 3, "question": "QUESTION-EMOTION-GAMING ?"}}}
+
+
+def two_grid_cases():
+    a = make_cases(n=12, video_id="va", rubric=GRID_A)
+    b = make_cases(n=12, video_id="vb", rubric=GRID_B)
+    return a + b
+
+
+def test_cases_of_two_grids_get_one_lesson_and_replays_each_with_their_own_grid(isolated_cwd):
+    cases = two_grid_cases()
+    fake = FakeBackend([make_backend({"perspective": NEW_GOOD, "justification": "x"})])
+
+    with llm.use_backend(fake):
+        results = jury_coach.propose(cases, None, {"retention": OLD_RETENTION}, config=make_config(), now=NOW)
+
+    lessons = [c for c in fake.calls if c.usage == "coach"]
+    assert len(lessons) == 2
+    assert sum("QUESTION-EMOTION-STANDARD" in c.prompt for c in lessons) == 1
+    assert sum("QUESTION-EMOTION-GAMING" in c.prompt for c in lessons) == 1
+    assert all(("STANDARD" in c.prompt) != ("GAMING" in c.prompt) for c in fake.calls)  # jamais deux grilles melangees
+    replays = [c for c in fake.calls if c.usage == "jury_retention"]
+    assert len(replays) == 28 and sum("QUESTION-EMOTION-GAMING" in c.prompt for c in replays) == 14
+    assert sorted(r["rubric"] for r in results) == ["builtin", "builtin:gaming"]
+
+
+def test_validation_cases_are_distinct_from_the_lessons(isolated_cwd):
+    cases = make_cases(n=12, rubric=GRID_A)
+    fake = FakeBackend([make_backend({"perspective": NEW_GOOD, "justification": "x"})])
+
+    with llm.use_backend(fake):
+        jury_coach.propose(cases, None, {"retention": OLD_RETENTION}, config=make_config(), now=NOW)
+
+    lesson_texts = set(re.findall(r"texte \d+", next(c for c in fake.calls if c.usage == "coach").prompt))
+    replayed = {re.search(r"texte \d+", c.prompt)[0] for c in fake.calls if c.usage == "jury_retention"}
+    assert len(lesson_texts) == 5 and len(replayed) == 7
+    assert lesson_texts & replayed == set()
+
+
+def test_validation_sample_is_the_same_on_every_run(isolated_cwd):
+    runs = []
+    for _ in range(2):
+        cases = make_cases(n=20, rubric=GRID_A)
+        fake = FakeBackend([make_backend({"perspective": NEW_GOOD, "justification": "x"})])
+        with llm.use_backend(fake):
+            jury_coach.propose(cases, None, {"retention": OLD_RETENTION}, config=make_config(), now=NOW)
+        runs.append([re.search(r"texte \d+", c.prompt)[0] for c in fake.calls if c.usage == "jury_retention"])
+        for p in Path("prompts").rglob("*"):
+            if p.is_file():
+                p.unlink()
+    assert runs[0] == runs[1] and len(set(runs[0])) == 10  # plafond validation_cases
+
+
+def test_not_enough_validation_cases_means_no_proposal_and_a_reason(isolated_cwd):
+    cases = make_cases(n=9, rubric=GRID_A)  # 5 lecons + 4 < min_cases (5)
+    fake = FakeBackend([make_backend({"perspective": NEW_GOOD, "justification": "x"})])
+
+    with llm.use_backend(fake):
+        results = jury_coach.propose(cases, None, {"retention": OLD_RETENTION}, config=make_config(), now=NOW)
+
+    assert results[0]["accepted"] is False
+    assert results[0]["reason"] == "pas assez de cas de validation distincts des lecons"
+    assert fake.calls == [] and not Path("prompts/jury/retention").exists()
+
+
+def test_accepted_version_file_records_lessons_and_validation(isolated_cwd):
+    cases = make_cases(n=12, rubric=GRID_A)
+    fake = FakeBackend([make_backend({"perspective": NEW_GOOD, "justification": "x"})])
+
+    with llm.use_backend(fake):
+        jury_coach.propose(cases, None, {"retention": OLD_RETENTION}, config=make_config(), now=NOW)
+
+    content = Path("prompts/jury/retention/v1.md").read_text(encoding="utf-8")
+    assert "- lecons : 5" in content and "- validation : 7" in content
+
+
+def test_case_without_any_grid_is_never_replayed(isolated_cwd):
+    cases = make_cases(n=12)  # aucune grille, aucun repli
+    fake = FakeBackend([make_backend({"perspective": NEW_GOOD, "justification": "x"})])
+
+    with llm.use_backend(fake):
+        results = jury_coach.propose(cases, None, {"retention": OLD_RETENTION}, config=make_config(), now=NOW)
+
+    assert fake.calls == [] and results[0]["accepted"] is False

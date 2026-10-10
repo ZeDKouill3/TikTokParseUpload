@@ -621,10 +621,33 @@ def _new_scored(scored: set[str], last_run: datetime | None, journal_path: str) 
     return len(scored & fresh)
 
 
-def _coach_cases(scored: set[str], config: Config) -> list[dict[str, Any]]:
+def _case_rubric(config: Config, video_id: str) -> dict[str, Any]:
+    """Grille qui a note la video : ``rubric.path`` de son moments.json (ecrit par l'etape moments), chargee.
+    ``LearningError`` si elle est absente ou illisible : jamais une autre grille (ADR-ad2e)."""
+    from clipper import moments  # lazy : la grille est lue, aucune etape n'est lancee
+    path = Path(config.workspace_dir) / video_id / "moments.json"
+    try:
+        rubric = json.loads(path.read_text(encoding="utf-8")).get("rubric")
+    except (OSError, ValueError, AttributeError) as exc:
+        raise LearningError(f"moments.json illisible ({path}) : {exc}") from exc
+    value = rubric.get("path") if isinstance(rubric, dict) else None
+    if not isinstance(value, str) or not value.strip():
+        raise LearningError(f"{path} : rubric.path absent, grille du clip inconnue")
+    try:
+        criteria = moments.load_rubric(value)["criteria"]
+    except moments.MomentsError as exc:
+        raise LearningError(f"grille {value} illisible : {exc}") from exc
+    return {"id": str(rubric.get("source") or value), "criteria": criteria}
+
+
+def _coach_cases(scored: set[str], config: Config, skipped: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    """Cas du coach, chacun avec sa grille. Un clip dont la grille est illisible est ecarte et ajoute a
+    ``skipped`` (``{video_id, moment_id, reason}``), jamais rejoue avec une autre grille."""
+    rubrics: dict[str, Any] = {}
     sidecars = {f"{p.parent.name}/{p.stem}": d for p, d in _read_sidecars(config)}
     cache: dict[str, Any] = {}
     cases = []
+    skipped = skipped if skipped is not None else []
     for key in sorted(scored):
         video_id, clip_id = key.split("/", 1)
         sidecar = sidecars.get(key)
@@ -634,9 +657,19 @@ def _coach_cases(scored: set[str], config: Config) -> list[dict[str, Any]]:
         trace = ((_moment(config, video_id, moment_id, cache) or {}).get("jury") or {}).get("trace")
         if trace is None:
             continue
+        if video_id not in rubrics:
+            try:
+                rubrics[video_id] = _case_rubric(config, video_id)
+            except LearningError as exc:
+                rubrics[video_id] = str(exc)
+        rubric = rubrics[video_id]
+        if isinstance(rubric, str):
+            skipped.append({"video_id": video_id, "moment_id": moment_id, "reason": rubric})
+            log.warning("coach : clip %s ecarte, grille illisible : %s", key, rubric)
+            continue
         context = " — ".join(str(sidecar[k]) for k in ("source_title", "screen_title") if sidecar.get(k))
         cases.append({"video_id": video_id, "moment_id": moment_id, "text": str(sidecar.get("transcript") or ""),
-                      "context": context, "trace": trace})
+                      "context": context, "trace": trace, "rubric": rubric})
     return cases
 
 
@@ -667,22 +700,18 @@ def coach_if_due(now: datetime, *, config: Config | None = None) -> list[dict[st
         scored = set(_read_sync(settings)["scored"])
         if _new_scored(scored, last_run, journal_path) < settings["coach_min_new_cases"]:
             return []
-        cases = _coach_cases(scored, config)
+        skipped: list[dict[str, Any]] = []
+        cases = _coach_cases(scored, config, skipped)
         if not cases:
             return []
-        from clipper import moments  # lazy : la grille est lue, aucune etape n'est lancee
-        try:
-            rubric = moments.load_rubric(moments.resolve_rubric_path(config.section("moments")["rubric_path"]))
-        except moments.MomentsError as exc:
-            raise jury_coach.CoachError(f"grille des moments illisible : {exc}") from exc
         merged = jury._deep_merge(jury.CONFIG_DEFAULTS, config.section("jury"))
         judge_configs = {j["name"]: jury._JudgeConfig(config, j["usage"], j["model"]) for j in jury._judges(merged)}
-        results = jury_coach.propose(cases, rubric, active_perspectives(config), config=config, now=now,
+        results = jury_coach.propose(cases, None, active_perspectives(config), config=config, now=now,
                                      judge_configs=judge_configs,
                                      usage_log_path=Path(settings["state_dir"]) / "llm_usage.jsonl")
         entries = [{**r, "status": "proposed" if r["accepted"] else "rejected", "decided_at": None, "decided_by": None}
                    for r in results]
-        coach["runs"].append({"at": now.isoformat(), "cases": len(cases), "judges": entries})
+        coach["runs"].append({"at": now.isoformat(), "cases": len(cases), "skipped": skipped, "judges": entries})
         coach["last_run"] = now.isoformat()
         channel_mod.atomic_write_json(_coach_path(settings), coach)
         return entries

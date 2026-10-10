@@ -523,10 +523,13 @@ def test_youtube_account_is_excluded_without_stats(tmp_path):
     assert sync["excluded"] == [{"video_id": VIDEO, "clip_id": "03", "account": "yt1", "reason": "service_without_stats"}]
 
 
-def _moments(config, video, moments):
+def _moments(config, video, moments, rubric=None):
     path = Path(config.workspace_dir) / video / "moments.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"video_id": video, "moments": moments}), encoding="utf-8")
+    data = {"video_id": video, "moments": moments}
+    if rubric is not None:
+        data["rubric"] = rubric
+    path.write_text(json.dumps(data), encoding="utf-8")
 
 
 def _trace(score):
@@ -744,7 +747,13 @@ def _coach_config(tmp_path, **learning_overrides) -> Config:
     return config
 
 
-def _coach_world(config, n=12, *, traced=True, at=NOW - timedelta(days=1)) -> None:
+def _builtin_rubric(source="builtin"):
+    """Bloc ``rubric`` d'un moments.json : la grille embarquee ``source`` (comme l'ecrit l'etape moments)."""
+    from clipper import moments as moments_mod
+    return {"path": str(moments_mod.resolve_rubric_path(source)), "source": source}
+
+
+def _coach_world(config, n=12, *, traced=True, at=NOW - timedelta(days=1), rubric="default") -> None:
     """n clips scored (moments 1..n) : sidecar avec transcript, trace du jury, result et stats au journal."""
     journal = config.section("outcomes")["journal_path"]
     moments, scored = [], []
@@ -761,7 +770,7 @@ def _coach_world(config, n=12, *, traced=True, at=NOW - timedelta(days=1)) -> No
         trace = {"rounds": [{"round": 1, "judges": {j: {"score": wrong, "argument": "..."} for j in JUDGES}}]}
         moments.append({"id": k, "jury": {"trace": trace}} if traced else {"id": k})
         scored.append(f"{VIDEO}/{clip_id}")
-    _moments(config, VIDEO, moments)
+    _moments(config, VIDEO, moments, _builtin_rubric() if rubric == "default" else rubric)
     state = Path(config.section("learning")["state_dir"])
     state.mkdir(parents=True, exist_ok=True)
     (state / "sync.json").write_text(json.dumps({"last_sync": at.isoformat(), "scored": scored, "results": scored}), encoding="utf-8")
@@ -862,7 +871,8 @@ def test_coach_passes_the_documented_cases_to_propose(tmp_path, monkeypatch):
     entries = learning.coach_if_due(NOW, config=config)
 
     first = seen["cases"][0]
-    assert set(first) == {"video_id", "moment_id", "text", "context", "trace"}
+    assert set(first) == {"video_id", "moment_id", "text", "context", "trace", "rubric"}
+    assert first["rubric"]["id"] == "builtin" and "emotion" in first["rubric"]["criteria"]
     assert first["video_id"] == VIDEO and first["moment_id"] == 1 and first["text"] == "texte 1"
     assert first["context"] == "Titre source — Titre ecran 1" and "rounds" in first["trace"]
     assert len(seen["cases"]) == 12
@@ -1786,3 +1796,18 @@ def test_metric_absent_from_every_stats_entry_is_a_visible_error(tmp_path):
 
     error = _read(Path(config.section("learning")["state_dir"]) / "sync.json")["last_error"]
     assert error["where"] == "calibrate" and "watched_full" in error["message"]
+
+
+def test_coach_cases_carry_the_grid_that_scored_them_and_unreadable_ones_are_skipped_visibly(tmp_path, caplog):
+    config = _coach_config(tmp_path)
+    _coach_world(config, n=4, rubric=_builtin_rubric("builtin:gaming"))
+    _moments(config, "autre", [{"id": 99, "jury": {"trace": {"rounds": []}}}])  # aucune grille enregistree
+    _sidecar(config, "99", video="autre", post_id="700000000000199", state="published")
+    skipped: list = []
+    scored = {f"{VIDEO}/{k:02d}" for k in range(1, 5)} | {"autre/99"}
+
+    cases = learning._coach_cases(scored, config, skipped)
+
+    assert {c["rubric"]["id"] for c in cases} == {"builtin:gaming"} and len(cases) == 4
+    assert [(s["video_id"], s["moment_id"]) for s in skipped] == [("autre", 99)]
+    assert "rubric.path absent" in skipped[0]["reason"]

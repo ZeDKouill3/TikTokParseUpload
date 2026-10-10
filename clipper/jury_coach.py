@@ -11,11 +11,17 @@ reelle du prompt (le faire lire par clipper.jury) reste un acte separe.
     proposals = jury_coach.propose(cases, rubric, judges, config=config)
 
 ``cases`` : candidats passes dont le resultat est connu, chacun avec son
-texte/contexte d'origine et la trace du jury qui l'a juge (voir
-clipper.jury.deliberate) :
+texte/contexte d'origine, la trace du jury qui l'a juge (voir
+clipper.jury.deliberate) et la grille qui l'a note :
 
     {"video_id", "moment_id", "text", "context",
-     "trace": <candidat["trace"] de jury.deliberate()>}
+     "trace": <candidat["trace"] de jury.deliberate()>,
+     "rubric": {"id": <nom de la grille>, "criteria": {...}}}
+
+Les cas sont regroupes par grille : une lecon et un rejeu par juge ET par
+grille, chacun avec les criteres et poids de cette grille. ``rubric`` (argument)
+n'est que la grille des cas qui n'en portent pas ; sans l'un ni l'autre le cas
+n'est pas rejoue.
 
 ``judges`` : nom de juge -> perspective actuelle (le texte du prompt en
 place), pour tout juge actif du jury -- sert a rejouer l'ancienne version et
@@ -34,7 +40,7 @@ jamais coache meme s'il figure dans ``judges`` ou ``cases``) :
    prompts/jury/<juge>/vN.md existants) : refus immediat (raison ``plafond
    de lecons atteint``), rien n'est demande a clipper.llm non plus.
 3. Retient les ``lessons_per_call`` cas ou la note passee du juge (dernier
-   tour de sa trace) s'ecarte le plus du resultat reel, et demande a
+   tour de sa trace) s'ecarte le plus du resultat reel (les lecons), et demande a
    clipper.llm (usage ``[jury_coach] usage``, defaut ``coach``) une
    retouche de perspective avec sa justification.
 4. Refuse (raison ``perspective trop proche de <juge>``) si la nouvelle
@@ -42,8 +48,12 @@ jamais coache meme s'il figure dans ``judges`` ou ``cases``) :
    au-dela de ``similarity_threshold``) de la perspective d'un autre juge
    actif : le jury n'a pas interet a uniformiser ses perspectives
    (ADR-1cf0). Aucun rejeu n'est tente dans ce cas.
-5. Sinon rejoue l'ANCIENNE puis la NOUVELLE perspective sur les memes cas
-   (un appel clipper.llm par cas et par version, usage ``jury_<juge>``,
+   Les cas restants de la meme grille servent de validation : au moins
+   ``min_cases`` (raison ``pas assez de cas de validation distincts des
+   lecons`` sinon, rien n'est demande), au plus ``validation_cases``, tires a
+   graine fixe ``validation_seed``, jamais un cas des lecons.
+5. Sinon rejoue l'ANCIENNE puis la NOUVELLE perspective sur les cas de
+   validation (un appel clipper.llm par cas et par version, usage ``jury_<juge>``,
    comme en jugement reel). Metrique documentee : erreur absolue moyenne
    entre la note predite (0-1) et le resultat reel sur ces cas, plus bas
    est mieux. La proposition n'est adoptable que si cette erreur baisse
@@ -52,15 +62,17 @@ jamais coache meme s'il figure dans ``judges`` ou ``cases``) :
    utilisee pour ce juge) avec la perspective proposee, sa justification et
    la metrique avant/apres.
 
-Retour : une entree par juge non exclu present dans ``judges`` :
+Retour : une entree par juge non exclu present dans ``judges`` et par grille :
 
-    {"judge", "accepted", "reason": str | None, "version": int | None,
-     "path": str | None, "metric": {"before", "after", "cases"} | None}
+    {"judge", "rubric": <id de grille>, "accepted", "reason": str | None,
+     "version": int | None, "path": str | None,
+     "metric": {"before", "after", "cases", "lessons", "validation"} | None}
 """
 
 from __future__ import annotations
 
 import difflib
+import random
 import re
 import statistics
 from collections import defaultdict
@@ -87,6 +99,10 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "similarity_threshold": 0.6,
     # Fenetre des resultats pris en compte (jours avant l'appel).
     "window_days": 90,
+    # Cas de validation (disjoints des lecons, meme grille) au plus rejoues ;
+    # tires a graine fixe parmi les cas relies restants.
+    "validation_cases": 10,
+    "validation_seed": 0,
 }
 
 # Jamais coache, meme recalibre sur l'audience : son veto reste independant
@@ -156,6 +172,8 @@ def _judge_cases(
             continue
         matched.append(
             {
+                "video_id": case["video_id"],
+                "moment_id": case["moment_id"],
                 "text": case["text"],
                 "context": case.get("context", ""),
                 "argument": entry["argument"],
@@ -285,7 +303,8 @@ def _existing_versions(judge_dir: Path) -> list[int]:
     return sorted(versions)
 
 
-def _write_version(judge_dir: Path, version: int, perspective: str, justification: str, metric: dict[str, Any]) -> Path:
+def _write_version(judge_dir: Path, version: int, perspective: str, justification: str, metric: dict[str, Any],
+                   grid_id: str | None = None) -> Path:
     judge_dir.mkdir(parents=True, exist_ok=True)
     path = judge_dir / f"v{version}.md"
     content = (
@@ -297,6 +316,9 @@ def _write_version(judge_dir: Path, version: int, perspective: str, justificatio
         f"- avant : {metric['before']:.4f}\n"
         f"- apres : {metric['after']:.4f}\n"
         f"- cas rejoues : {metric['cases']}\n"
+        f"- lecons : {metric['lessons']}\n"
+        f"- validation : {metric['validation']}\n"
+        f"- grille : {grid_id}\n"
     )
     path.write_text(content, encoding="utf-8")
     return path
@@ -309,7 +331,7 @@ def _write_version(judge_dir: Path, version: int, perspective: str, justificatio
 
 def propose(
     cases: Sequence[Mapping[str, Any]],
-    rubric: Mapping[str, Any],
+    rubric: Mapping[str, Any] | None,
     judges: Mapping[str, str],
     *,
     config: Any = None,
@@ -336,51 +358,71 @@ def propose(
     max_lessons = int(settings["max_lessons_per_judge"])
     threshold = float(settings["similarity_threshold"])
     usage = settings["usage"]
-    criteria = rubric["criteria"]
+    validation_cap = int(settings["validation_cases"])
+    seed = int(settings["validation_seed"])
+
+    groups: dict[str, dict[str, Any]] = {}  # grille (id) -> {"criteria", "cases"}
+    for case in cases:
+        grid = case.get("rubric") or rubric
+        if grid is None:
+            continue  # sans grille : l'appelant l'ecarte et le dit, jamais de grille d'un autre (ADR-ad2e)
+        group = groups.setdefault(grid.get("id") or "", {"criteria": grid["criteria"], "cases": []})
+        group["cases"].append(case)
 
     results: list[dict[str, Any]] = []
     for judge, perspective in judges.items():
         if judge in EXCLUDED_JUDGES:
             continue
 
-        def _refuse(reason: str, metric: dict[str, Any] | None = None) -> None:
-            results.append(
-                {"judge": judge, "accepted": False, "reason": reason, "version": None, "path": None, "metric": metric}
-            )
+        def _refuse(reason: str, grid_id: str | None, metric: dict[str, Any] | None = None) -> None:
+            results.append({"judge": judge, "rubric": grid_id, "accepted": False, "reason": reason, "version": None,
+                            "path": None, "metric": metric})
 
-        judge_cases = _judge_cases(cases, judge, real_outcomes)
-        if len(judge_cases) < min_cases:
-            _refuse("pas assez de cas connus")
+        if not groups:
+            _refuse("pas assez de cas connus", None)
             continue
+        for grid_id, group in groups.items():
+            criteria = group["criteria"]
+            judge_cases = _judge_cases(group["cases"], judge, real_outcomes)
+            if len(judge_cases) < min_cases:
+                _refuse("pas assez de cas connus", grid_id)
+                continue
 
-        judge_dir = prompts_dir / judge
-        versions = _existing_versions(judge_dir)
-        if len(versions) >= max_lessons:
-            _refuse("plafond de lecons atteint")
-            continue
+            judge_dir = prompts_dir / judge
+            versions = _existing_versions(judge_dir)
+            if len(versions) >= max_lessons:
+                _refuse("plafond de lecons atteint", grid_id)
+                continue
 
-        worst = sorted(judge_cases, key=lambda c: abs(c["predicted"] - c["outcome"]), reverse=True)[:lessons_per_call]
-        answer = llm.ask(usage, _lesson_prompt(judge, perspective, criteria, worst), [], _lesson_schema(), config=config,
-                         usage_log_path=usage_log_path)
-        new_perspective, justification = answer["perspective"], answer["justification"]
+            judge_cases.sort(key=lambda c: abs(c["predicted"] - c["outcome"]), reverse=True)
+            worst = judge_cases[:lessons_per_call]
+            rest = sorted(judge_cases[lessons_per_call:], key=lambda c: (str(c["video_id"]), str(c["moment_id"])))
+            if len(rest) < min_cases:
+                _refuse("pas assez de cas de validation distincts des lecons", grid_id)
+                continue
+            validation = random.Random(seed).sample(rest, min(len(rest), validation_cap))
 
-        clash = _too_similar(judge, new_perspective, judges, threshold)
-        if clash is not None:
-            _refuse(f"perspective trop proche de {clash}")
-            continue
+            answer = llm.ask(usage, _lesson_prompt(judge, perspective, criteria, worst), [], _lesson_schema(),
+                             config=config, usage_log_path=usage_log_path)
+            new_perspective, justification = answer["perspective"], answer["justification"]
 
-        judge_config = (judge_configs or {}).get(judge)
-        before = _replay(judge, perspective, criteria, worst, config, judge_config, usage_log_path)
-        after = _replay(judge, new_perspective, criteria, worst, config, judge_config, usage_log_path)
-        metric = {"before": before, "after": after, "cases": len(worst)}
-        if not after < before:
-            _refuse("ne predit pas mieux en rejeu", metric)
-            continue
+            clash = _too_similar(judge, new_perspective, judges, threshold)
+            if clash is not None:
+                _refuse(f"perspective trop proche de {clash}", grid_id)
+                continue
 
-        version = (max(versions) if versions else 0) + 1
-        path = _write_version(judge_dir, version, new_perspective, justification, metric)
-        results.append(
-            {"judge": judge, "accepted": True, "reason": None, "version": version, "path": str(path), "metric": metric}
-        )
+            judge_config = (judge_configs or {}).get(judge)
+            before = _replay(judge, perspective, criteria, validation, config, judge_config, usage_log_path)
+            after = _replay(judge, new_perspective, criteria, validation, config, judge_config, usage_log_path)
+            metric = {"before": before, "after": after, "cases": len(validation), "lessons": len(worst),
+                      "validation": len(validation)}
+            if not after < before:
+                _refuse("ne predit pas mieux en rejeu", grid_id, metric)
+                continue
+
+            version = (max(versions) if versions else 0) + 1
+            path = _write_version(judge_dir, version, new_perspective, justification, metric, grid_id)
+            results.append({"judge": judge, "rubric": grid_id, "accepted": True, "reason": None, "version": version,
+                            "path": str(path), "metric": metric})
 
     return results
