@@ -36,6 +36,7 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "coach_min_interval_days": 7,  # jours minimaux entre deux passages du coach (ADR-c260 : cout borne)
     "veille_report_days": 30,  # fenetre (jours) des VOD mises en file que reprend state/veille/bilan.json
     "veille_report_max": 20,  # nombre maximal d entrees du bilan, les plus recentes d abord
+    "veille_report_min_interval_s": 60,  # secondes minimales entre deux calculs du bilan (hors relevé qui vient de tourner)
     "zero_view_alert_hours": 24,  # age (heures depuis la mise en ligne) a partir duquel un post a 0 vue est signale
     "zero_view_alert_max_views": 0,  # vues au plus au dernier releve pour qu'un post soit en alerte
     "zero_view_alert_account_min": 2,  # posts en alerte d'un meme compte pour une alerte au niveau du compte
@@ -81,6 +82,9 @@ def _settings(config: Config | None) -> dict[str, Any]:
         value = settings[key]
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise LearningError(f"[learning] {key} invalide : {value!r} (un entier >= 1 est attendu)")
+    interval_s = settings["veille_report_min_interval_s"]
+    if isinstance(interval_s, bool) or not isinstance(interval_s, (int, float)) or interval_s < 0:
+        raise LearningError(f"[learning] veille_report_min_interval_s invalide : {interval_s!r} (un nombre de secondes >= 0 est attendu)")
     hours = settings["zero_view_alert_hours"]
     if isinstance(hours, bool) or not isinstance(hours, (int, float)) or hours <= 0:
         raise LearningError(f"[learning] zero_view_alert_hours invalide : {hours!r} (un nombre d'heures > 0 est attendu)")
@@ -513,6 +517,9 @@ def _snapshot_newer_than_sync(settings: dict[str, Any], config: Config | None) -
                for a in _history_accounts(config) if tiktok.read_history(a, config=config))
 
 
+_veille_report_computed: dict[str, datetime] = {}  # dernier calcul du bilan par fichier (TASK-1e46f) : mémoire du worker
+
+
 def run_if_due(now: datetime, *, config: Config | None = None) -> dict[str, Any]:
     """Passage du worker (SPEC-00db R4) : ``link_if_due``, puis ``sync`` seulement si un relevé est plus récent que
     ``sync.json.last_sync``. Coupé par ``enabled``. Une erreur porte ``where`` (``link`` | ``sync`` | ``calibrate``) et
@@ -533,11 +540,15 @@ def run_if_due(now: datetime, *, config: Config | None = None) -> dict[str, Any]
             if not hasattr(exc, "where"):
                 exc.where = "sync"  # type: ignore[attr-defined]
             raise
-    try:  # à chaque passage : clips produits et VOD en traitement bougent sans nouveau relevé TikTok
-        write_veille_report(now, config=config)
-    except Exception as exc:
-        exc.where = "veille_report"  # type: ignore[attr-defined]
-        raise
+    target = str(_veille_report_target(config))  # bilan : recalculé au plus une fois par intervalle, ou dès qu'un relevé tourne
+    last = _veille_report_computed.get(target)
+    if due or last is None or now - last >= timedelta(seconds=settings["veille_report_min_interval_s"]):
+        try:
+            write_veille_report(now, config=config)
+        except Exception as exc:
+            exc.where = "veille_report"  # type: ignore[attr-defined]
+            raise
+        _veille_report_computed[target] = now
     try:  # apres le releve : une alerte ne se journalise qu'une fois par post (TASK-974e)
         log_zero_view_alerts(now, config=config)
     except Exception as exc:
@@ -911,14 +922,33 @@ def _vod_missing(clips: int, published: int, mature: int, excluded: list[dict[st
     return "account_below_min" if any(e.get("reason") == "account_below_min" for e in excluded) else "immature"
 
 
+def _veille_report_target(config: Config | None) -> Path:
+    return Path(config.section("veille")["state_dir"] if config is not None else "state/veille") / "bilan.json"
+
+
+def _same_report(path: Path, report: dict[str, Any]) -> bool:
+    """Le fichier porte déjà ce contenu hors ``computed_at`` (lu sous le verrou). Illisible : faux, donc réécrit."""
+    if not path.exists():
+        return False
+    try:
+        previous = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(previous, dict):
+        return False
+    return ({k: v for k, v in previous.items() if k != "computed_at"}
+            == {k: v for k, v in report.items() if k != "computed_at"})
+
+
 def write_veille_report(now: datetime, *, config: Config | None = None) -> dict[str, Any]:
     """Écrit ``<[veille] state_dir>/bilan.json`` (SPEC-00db R8) : pour les VOD mises en file (``seen.json``) dans les
     ``veille_report_days`` derniers jours, au plus ``veille_report_max``, les plus récentes d'abord : clips produits
     (sidecars réels de la VOD), ``processing`` (encore dans la file du worker), clips publiés, clips mûrs, rang moyen et vues max à maturité lus dans les entrées ``stats`` du journal (jamais recalculés), ou
     ``missing`` (la raison) et des chiffres ``null``. Le fichier est le contrat avec ``clipper.veille`` (qui ne
-    l'importe pas) ; déterministe hors ``computed_at``. Rend le contenu écrit."""
+    l'importe pas) ; déterministe hors ``computed_at``. N'écrit le fichier que si son contenu hors ``computed_at``
+    change (TASK-1e46f) ; rend le rapport dans tous les cas."""
     settings = _settings(config)
-    sdir = Path(config.section("veille")["state_dir"] if config is not None else "state/veille")
+    sdir = _veille_report_target(config).parent
     journal_path = (config.section("outcomes") if config is not None else outcomes.CONFIG_DEFAULTS)["journal_path"]
     seen = _read_state_json(sdir / "seen.json", {"queued": []})
     since = now - timedelta(days=int(settings["veille_report_days"]))
@@ -959,9 +989,10 @@ def write_veille_report(now: datetime, *, config: Config | None = None) -> dict[
                                   video in processing_videos),
         })
     report = {"computed_at": _now_iso(now), "days": settings["veille_report_days"], "entries": entries}
-    target = sdir / "bilan.json"
+    target = _veille_report_target(config)
     with channel_mod.file_lock(target):
-        channel_mod.atomic_write_json(target, report)
+        if not _same_report(target, report):
+            channel_mod.atomic_write_json(target, report)
     return report
 
 # ---------------------------------------------------------------- alerte « 0 vue à 24 h » (TASK-974e)
