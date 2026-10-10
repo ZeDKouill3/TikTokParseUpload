@@ -200,7 +200,7 @@ CONFIG_DEFAULTS: dict[str, object] = {
     # près de la même position et qu'elles font au moins facecam_refine_agreement
     # des images qui votent (0,5 : majorité) ; sinon le côté reste tel quel et
     # la raison est journalisée. Une webcam qui change de place dans la période
-    # (Hctuan : haut 410 puis 358) n'a pas de rectangle exact : le mode majoritaire gagne.
+    # (VOD de test : haut 410 puis 358) n'a pas de rectangle exact : le mode majoritaire gagne.
     # La recherche exclut le visage stable (son contour n'est pas un bord).
     # Le rectangle affiné est agrandi au minimum au format du panneau caméra
     # (il couvre toute l'incrustation retrouvée) et ne coupe jamais le visage.

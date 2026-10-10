@@ -2599,11 +2599,11 @@ def test_clip_facecam_still_rejects_a_rect_with_no_edge_anywhere_near(tmp_path):
 # Recalage des bords du rectangle choisi sur la vraie incrustation (TASK-893d)
 # : Claude choisit le bon candidat, mais son rectangle est decale (visage
 # centre faute de bords retrouves) ou englobe la bordure noire / la bande de
-# l'overlay. Mesure reelle : Hctuan v2888230655 gauche +35 droit +26 haut -8
+# l'overlay. Mesure reelle (VOD de test) : gauche +35 droit +26 haut -8
 # bas -42 px ; TheGuill v2887364910 +-6 px de bordure noire par cote.
 # --------------------------------------------------------------------------
 
-# Webcam reelle (non au format du panneau camera, comme Hctuan : 430 x 300).
+# Webcam reelle (non au format du panneau camera, comme la VOD de test : 430 x 300).
 REAL_CAM = (700, 300, 1130, 600)
 # Rectangle candidat au format du panneau camera mais decale de la webcam.
 SHIFTED_RECT = {"x": 660, "y": 290, "w": 540, "h": 384}
