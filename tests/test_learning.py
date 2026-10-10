@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -1185,7 +1186,8 @@ def test_veille_report_twice_gives_the_same_content(tmp_path):
     first = _bilan(config)
     learning.write_veille_report(NOW + timedelta(hours=1), config=config)
     second = _bilan(config)
-    assert first["computed_at"] != second["computed_at"]
+    # TASK-1e46f : contenu inchangé = fichier non réécrit, donc computed_at reste celui du premier calcul
+    assert first["computed_at"] == second["computed_at"]
     assert {**first, "computed_at": None} == {**second, "computed_at": None}
 
 
@@ -1598,3 +1600,107 @@ def test_status_carries_the_breakdown(tmp_path):
     _bd_row(config, "vA", "01", 10)
 
     assert learning.status(config)["breakdown"]["n"] == 1
+
+
+# ---------------------------------------------------------------- bilan réécrit seulement quand son contenu change (TASK-1e46f)
+
+SENTINEL_MTIME = 1_000_000_000  # une date fixe : un bilan réécrit en sort, un bilan intact y reste
+
+
+def _age_bilan(config) -> Path:
+    path = Path(config.section("veille")["state_dir"]) / "bilan.json"
+    os.utime(path, (SENTINEL_MTIME, SENTINEL_MTIME))
+    return path
+
+
+def _quiet_run(monkeypatch) -> None:
+    """Un passage du worker sans réseau ni relevé : seul le bilan est en jeu."""
+    monkeypatch.setattr(learning, "link_if_due", lambda *a, **k: [])
+    monkeypatch.setattr(learning, "_snapshot_newer_than_sync", lambda *a, **k: False)
+    monkeypatch.setattr(learning, "coach_if_due", lambda *a, **k: [])
+
+
+def test_veille_report_keeps_the_file_when_only_computed_at_would_change(tmp_path):
+    config = _bilan_config(tmp_path)
+    _queue_vod(config, VIDEO)
+    learning.write_veille_report(NOW, config=config)
+    path = _age_bilan(config)
+
+    learning.write_veille_report(NOW + timedelta(minutes=5), config=config)
+
+    assert path.stat().st_mtime == SENTINEL_MTIME
+    assert _bilan(config)["computed_at"].startswith("2026-10-10T13:00")
+
+
+def test_veille_report_rewrites_the_file_when_its_content_changes(tmp_path):
+    config = _bilan_config(tmp_path)
+    _queue_vod(config, VIDEO)
+    learning.write_veille_report(NOW, config=config)
+    path = _age_bilan(config)
+    _queue_vod(config, "NEWVOD")
+
+    learning.write_veille_report(NOW, config=config)
+
+    assert path.stat().st_mtime != SENTINEL_MTIME
+    assert "NEWVOD" in _by_video(_bilan(config))
+
+
+def test_veille_report_returns_the_report_even_when_the_file_is_kept(tmp_path):
+    config = _bilan_config(tmp_path)
+    _queue_vod(config, VIDEO)
+    learning.write_veille_report(NOW, config=config)
+
+    report = learning.write_veille_report(NOW + timedelta(minutes=5), config=config)
+
+    assert report["computed_at"].startswith("2026-10-10T13:05")
+    assert report["entries"] == _bilan(config)["entries"]
+
+
+def test_veille_report_min_interval_is_declared_and_validated(tmp_path):
+    assert learning.CONFIG_DEFAULTS["veille_report_min_interval_s"] == 60
+    for bad in (-1, True, "60"):
+        config = _config(tmp_path, veille_report_min_interval_s=bad)
+        with pytest.raises(learning.LearningError, match="veille_report_min_interval_s"):
+            learning.run_if_due(NOW, config=config)
+
+
+def test_run_if_due_does_not_recompute_the_veille_report_twice_within_the_interval(tmp_path, monkeypatch):
+    config = _bilan_config(tmp_path)
+    _quiet_run(monkeypatch)
+    _queue_vod(config, VIDEO)
+    learning.run_if_due(NOW, config=config)
+    path = _age_bilan(config)
+
+    learning.run_if_due(NOW + timedelta(seconds=2), config=config)
+
+    assert path.stat().st_mtime == SENTINEL_MTIME
+
+
+def test_run_if_due_rewrites_the_veille_report_once_the_interval_has_passed(tmp_path, monkeypatch):
+    config = _bilan_config(tmp_path)
+    _quiet_run(monkeypatch)
+    _queue_vod(config, VIDEO)
+    learning.run_if_due(NOW, config=config)
+    _queue_vod(config, "NEWVOD")
+    path = _age_bilan(config)
+
+    learning.run_if_due(NOW + timedelta(seconds=30), config=config)
+    assert path.stat().st_mtime == SENTINEL_MTIME and "NEWVOD" not in _by_video(_bilan(config))
+
+    learning.run_if_due(NOW + timedelta(seconds=61), config=config)
+    assert "NEWVOD" in _by_video(_bilan(config))
+
+
+def test_run_if_due_recomputes_the_veille_report_at_once_when_a_sync_ran(tmp_path, monkeypatch):
+    config = _bilan_config(tmp_path)
+    _quiet_run(monkeypatch)
+    monkeypatch.setattr(learning, "_snapshot_newer_than_sync", lambda *a, **k: True)
+    monkeypatch.setattr(learning, "sync", lambda *a, **k: {})
+    calls = []
+    real = learning.write_veille_report
+    monkeypatch.setattr(learning, "write_veille_report", lambda *a, **k: calls.append(1) or real(*a, **k))
+
+    learning.run_if_due(NOW, config=config)
+    learning.run_if_due(NOW + timedelta(seconds=2), config=config)
+
+    assert len(calls) == 2
